@@ -86,6 +86,26 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-domain-mixed-with-number-compares-as-numeric {
+    -- A domain mixed with another type is its base type, numeric, so 9.5 sorts
+    -- before 10 instead of comparing as stored bytes.
+    CREATE DOMAIN money AS numeric;
+    CREATE TABLE a(n money) STRICT;
+    INSERT INTO a VALUES (10), (9.5);
+    SELECT x FROM (SELECT n x FROM a UNION ALL SELECT 2) ORDER BY x;
+    SELECT x FROM (SELECT n x FROM a UNION ALL SELECT 2) WHERE x > 9.6;
+    SELECT coalesce(n, 2) x FROM a ORDER BY x;
+}
+expect {
+    2
+    9.5
+    10
+    10
+    9.5
+    10
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-operands-evaluated-once {
     -- Every n is 0, so each row's left side is 0, 1 or 2, and every
     -- comparison below is true for every row if the left side runs once.

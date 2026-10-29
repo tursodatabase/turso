@@ -888,6 +888,12 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         // PostgreSQL: coalesce(date_column, '2024-01-01') is a date.
         (custom @ ExprType::Custom { .. }, ExprType::Untyped)
         | (ExprType::Untyped, custom @ ExprType::Custom { .. }) => custom,
+        // As in PostgreSQL, a domain mixed with any other type is a value of the
+        // type it is based on: with `CREATE DOMAIN money AS numeric`,
+        // coalesce(money_column, 2) is a numeric.
+        (a, b) if is_domain(&a) || is_domain(&b) => {
+            common_scalar_type(without_domain(a, schema), without_domain(b, schema), schema)
+        }
         // A number mixed with a type in numeric order is that type without
         // parameters: in `SELECT n FROM t UNION SELECT 10` and `SELECT n FROM t
         // UNION SELECT 2.5`, the column compares in numeric order. Its stored
@@ -908,6 +914,34 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
             common_scalar_type(stored_type(&type_def, schema), other, schema)
         }
         _ => ExprType::Builtin(BuiltinType::Any),
+    }
+}
+
+fn is_domain(ty: &ExprType) -> bool {
+    matches!(ty, ExprType::Custom { type_def, .. } if type_def.is_domain)
+}
+
+/// The type a domain is based on, without parameters: the first custom type
+/// under the domain, or the built-in type it is stored as. Other types are
+/// returned unchanged.
+fn without_domain(ty: ExprType, schema: &Schema) -> ExprType {
+    let ExprType::Custom { type_def, .. } = &ty else {
+        return ty;
+    };
+    if !type_def.is_domain {
+        return ty;
+    }
+    let base = schema
+        .resolve_type_unchecked(&type_def.name)
+        .ok()
+        .flatten()
+        .and_then(|resolved| resolved.chain.into_iter().find(|td| !td.is_domain));
+    match base {
+        Some(type_def) => ExprType::Custom {
+            type_def,
+            params: Vec::new(),
+        },
+        None => stored_type(type_def, schema),
     }
 }
 
