@@ -62,7 +62,7 @@ use in_seek::{emit_in_seek_end, emit_in_seek_key, emit_in_seek_start, open_in_se
 pub(crate) use init::{init_distinct, InitLoop};
 use multi_index::emit_multi_index_scan_loop;
 pub(crate) use open::OpenLoop;
-use seek::{encode_seek_keys_for_custom_types, SeekEmitter};
+use seek::{index_key_stored_form, SeekEmitter};
 
 #[derive(Debug)]
 pub struct LeftJoinMetadata {
