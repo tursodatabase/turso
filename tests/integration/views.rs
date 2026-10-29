@@ -71,3 +71,86 @@ fn create_materialized_view_is_rejected_in_mvcc_mode() {
     let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, v FROM t");
     assert_eq!(rows, vec![(1, 10)]);
 }
+
+#[test]
+fn view_columns_are_worked_out_after_the_whole_schema_loads() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("view_columns_reopen.db");
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a, b)").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+        conn.execute("CREATE VIEW v2 AS SELECT * FROM v").unwrap();
+        conn.execute("CREATE TABLE u(a, b)").unwrap();
+        conn.execute("CREATE VIEW w AS SELECT * FROM u").unwrap();
+        conn.execute("DROP TABLE t").unwrap();
+        // The row of `u` now comes after the row of `w`.
+        conn.execute("DROP TABLE u").unwrap();
+        conn.execute("CREATE TABLE u(x, y, z)").unwrap();
+        conn.close().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    let views: Vec<(String, i64)> = conn
+        .exec_rows("SELECT name, ncol FROM pragma_table_list WHERE type = 'view' ORDER BY name");
+    assert_eq!(
+        views,
+        vec![("v".into(), 0), ("v2".into(), 0), ("w".into(), 3)]
+    );
+    let columns: Vec<(String,)> = conn.exec_rows("SELECT name FROM pragma_table_info('w')");
+    assert_eq!(columns, vec![("x".into(),), ("y".into(),), ("z".into(),)]);
+}
+
+#[test]
+fn views_over_a_dropped_table_have_no_columns_after_reopen() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("views_over_dropped_table.db");
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a, b)").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+        conn.execute("CREATE VIEW w AS SELECT 1 FROM t").unwrap();
+        conn.execute("DROP TABLE t").unwrap();
+        conn.close().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    let views: Vec<(String, i64)> = conn
+        .exec_rows("SELECT name, ncol FROM pragma_table_list WHERE type = 'view' ORDER BY name");
+    assert_eq!(views, vec![("v".into(), 0), ("w".into(), 0)]);
+}
+
+#[test]
+fn view_columns_are_worked_out_after_an_mvcc_database_is_reopened() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("view_columns_reparse.db");
+    {
+        let db = TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(a, b)").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+        conn.execute("CREATE VIEW v2 AS SELECT * FROM v").unwrap();
+        conn.execute("DROP TABLE t").unwrap();
+        // The row of `t` now comes after the rows of `v` and `v2`.
+        conn.execute("CREATE TABLE t(x, y, z)").unwrap();
+        conn.close().unwrap();
+    }
+
+    // Opening an MVCC database builds the schema from the recovered
+    // sqlite_schema rows.
+    let db = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_mvcc(true)
+        .build();
+    let conn = db.connect_limbo();
+    let views: Vec<(String, i64)> = conn
+        .exec_rows("SELECT name, ncol FROM pragma_table_list WHERE type = 'view' ORDER BY name");
+    assert_eq!(views, vec![("v".into(), 3), ("v2".into(), 3)]);
+}

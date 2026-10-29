@@ -15122,7 +15122,8 @@ pub fn op_drop_table(
             schema.remove_indices_for_table(*namespace, table_name);
             schema.remove_triggers_for_table(*namespace, table_name);
             schema.remove_table(*namespace, table_name);
-        })?;
+            schema.refresh_view_columns(*db, &[(*namespace, table_name)])
+        })??;
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database. We must
         // scope the removal to triggers whose `target_database_id`
@@ -15161,7 +15162,8 @@ pub fn op_drop_view(
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(*namespace, view_name).ok();
         schema.remove_broken_view(*namespace, view_name);
-    })?;
+        schema.refresh_view_columns(*db, &[(*namespace, view_name)])
+    })??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -15979,6 +15981,9 @@ pub struct OpParseSchemaInner {
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, crate::schema::StoredMaterializedView>,
+    /// Names of the tables and views read from `sqlite_schema`, as stored
+    /// there, so mangled when they belong to a namespace.
+    parsed_tables_and_views: std::vec::Vec<String>,
     trigger_target_database_id: Option<usize>,
     db: usize,
     previous_auto_commit: bool,
@@ -16092,6 +16097,7 @@ pub fn op_parse_schema(
         dbsp_state_roots: Default::default(),
         dbsp_state_index_roots: Default::default(),
         materialized_view_info: Default::default(),
+        parsed_tables_and_views: std::vec::Vec::new(),
         trigger_target_database_id: *trigger_target_database_id,
         db: *db,
         previous_auto_commit,
@@ -16148,6 +16154,9 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     &attached_resolver,
                     conn.dialect().as_ref(),
                 )?;
+                if ty == "table" || ty == "view" {
+                    inner.parsed_tables_and_views.push(name.to_string());
+                }
                 if ty == "trigger" {
                     if let Some(target_database_id) = inner.trigger_target_database_id {
                         schema.set_trigger_target_database_id(
@@ -16169,6 +16178,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     dbsp_state_roots,
                     dbsp_state_index_roots,
                     materialized_view_info,
+                    parsed_tables_and_views,
                     trigger_target_database_id: _,
                     db,
                     previous_auto_commit,
@@ -16181,15 +16191,24 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
-                let populate_result = schema.populate_materialized_views_then_indices(
-                    &syms,
-                    materialized_view_info,
-                    dbsp_state_roots,
-                    dbsp_state_index_roots,
-                    from_sql_indexes,
-                    automatic_indices,
-                    mv_store.is_some(),
-                );
+                let populate_result = schema
+                    .populate_materialized_views_then_indices(
+                        &syms,
+                        materialized_view_info,
+                        dbsp_state_roots,
+                        dbsp_state_index_roots,
+                        from_sql_indexes,
+                        automatic_indices,
+                        mv_store.is_some(),
+                    )
+                    .and_then(|()| {
+                        let parsed_names: std::vec::Vec<(NamespaceId, &str)> =
+                            parsed_tables_and_views
+                                .iter()
+                                .map(|name| schema.demangle_name(name))
+                                .collect();
+                        schema.refresh_view_columns(db, &parsed_names)
+                    });
 
                 // Store the modified schema back
                 if db == crate::TEMP_DB_ID {
@@ -17951,8 +17970,7 @@ pub fn op_rename_table(
                     .view_mut(view_namespace, &view_name)
                     .expect("view being rewritten should be in schema"),
             );
-            view.sql = new_sql;
-            view.select_stmt = new_select;
+            view.replace_select(new_sql, new_select);
         }
 
         Ok(())
@@ -18127,7 +18145,7 @@ pub fn op_drop_column(
         });
 
         btree.shift_generated_column_indices_after_drop(*column_index)?;
-        Ok(())
+        schema.refresh_view_columns(*db, &[(*namespace, &normalized_table_name)])
     })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
@@ -18250,7 +18268,7 @@ pub fn op_add_column(
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
-        Ok(())
+        schema.refresh_view_columns(data.db, &[(data.namespace, &normalized_table_name)])
     })??;
 
     state.pc += 1;
@@ -18560,8 +18578,7 @@ pub fn op_alter_column(
                 move |schema| -> crate::Result<()> {
                     if let Some(view_arc) = schema.view_mut(view_namespace.id, &view_name) {
                         let view = Arc::make_mut(view_arc);
-                        view.sql = rewritten.sql;
-                        view.select_stmt = rewritten.select_stmt;
+                        view.replace_select(rewritten.sql, rewritten.select_stmt);
                         view.columns = rewritten.columns;
                     }
                     Ok(())

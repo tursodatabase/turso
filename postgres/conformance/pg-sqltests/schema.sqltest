@@ -403,6 +403,41 @@ expect {
     1
 }
 
+test rename-column-while-a-view-of-a-schema-reads-a-table-of-public {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    CREATE TABLE p (y int);
+    CREATE VIEW app.v AS SELECT * FROM public.p;
+    ALTER TABLE app.t RENAME COLUMN x TO z;
+    SELECT z FROM app.t;
+}
+expect {
+    1
+}
+
+test rename-column-while-a-view-reads-information-schema {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW v AS SELECT table_name FROM information_schema.tables;
+    ALTER TABLE t RENAME COLUMN x TO z;
+    SELECT z FROM t;
+}
+expect {
+    1
+}
+
+test rename-column-while-a-view-reads-pg-views {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW v AS SELECT viewname FROM pg_views;
+    ALTER TABLE t RENAME COLUMN x TO z;
+    SELECT z FROM t;
+}
+expect {
+    1
+}
+
 test rename-table-with-an-automatic-index-frees-the-old-name {
     CREATE TABLE t (id int UNIQUE);
     ALTER TABLE t RENAME TO u;

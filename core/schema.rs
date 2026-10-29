@@ -19,7 +19,7 @@ use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_co
 use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord};
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::{exprs_are_equivalent, normalize_ident, ViewTableFound};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
 use crate::{turso_assert, turso_debug_assert};
@@ -33,6 +33,9 @@ pub struct View {
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
     pub explicit_columns: Vec<String>,
+    /// The tables and views `select_stmt` names, each with the database or
+    /// namespace it is written with, if any.
+    pub read_names: std::vec::Vec<(Option<String>, String)>,
 }
 
 impl View {
@@ -46,10 +49,17 @@ impl View {
         Self {
             name,
             sql,
+            read_names: IncrementalView::referenced_tables(&select_stmt),
             select_stmt,
             columns,
             explicit_columns,
         }
+    }
+
+    pub(crate) fn replace_select(&mut self, sql: String, select_stmt: ast::Select) {
+        self.sql = sql;
+        self.read_names = IncrementalView::referenced_tables(&select_stmt);
+        self.select_stmt = select_stmt;
     }
 }
 
@@ -2054,6 +2064,196 @@ impl Schema {
         objects.views.get(&name).cloned()
     }
 
+    /// Work out the columns again of every view once the whole schema has
+    /// loaded. A view's columns are first worked out when its schema row is
+    /// read, which can come before the rows of the tables it reads.
+    /// `database_id` is the database of this schema.
+    pub fn refresh_all_view_columns(&mut self, database_id: usize) -> Result<()> {
+        let mut names = std::vec::Vec::new();
+        for namespace in self.namespace_ids() {
+            let objects = self.namespace(namespace);
+            for name in objects.tables.keys().chain(objects.views.keys()) {
+                names.push((namespace, name.clone()));
+            }
+        }
+        let names: std::vec::Vec<(NamespaceId, &str)> = names
+            .iter()
+            .map(|(namespace, name)| (*namespace, name.as_str()))
+            .collect();
+        self.refresh_view_columns(database_id, &names)
+    }
+
+    /// Work out the columns again of every view in `changed_names` and every
+    /// view that reads one of them, directly or through other views, from its SELECT and
+    /// the current schema. Call it after a statement creates, drops or alters
+    /// those tables or views; otherwise `View::columns` keeps the columns the
+    /// view had before. As in SQLite, a view has no columns when its FROM
+    /// clause names a missing table or a view that has no columns, when it
+    /// reads itself, or when its SELECT no longer resolves.
+    /// `database_id` is the database of this schema.
+    pub fn refresh_view_columns(
+        &mut self,
+        database_id: usize,
+        changed_names: &[(NamespaceId, &str)],
+    ) -> Result<()> {
+        let changed_names_are_read = self.namespace_ids().any(|namespace| {
+            self.namespace(namespace).views.values().any(|view| {
+                view.read_names.iter().any(|(_, read_name)| {
+                    changed_names
+                        .iter()
+                        .any(|(_, changed_name)| read_name.eq_ignore_ascii_case(changed_name))
+                })
+            })
+        });
+        let changed_names_include_a_view = changed_names
+            .iter()
+            .any(|(namespace, name)| self.get_view(*namespace, name).is_some());
+        if !changed_names_are_read && !changed_names_include_a_view {
+            return Ok(());
+        }
+        // The names a view reads only decide which views to refresh and in
+        // what order. Whether they resolve is decided by working out the
+        // view's columns.
+        let mut view_reads: HashMap<(NamespaceId, String), Vec<(NamespaceId, String)>> =
+            HashMap::default();
+        let mut readers: HashMap<(NamespaceId, String), Vec<(NamespaceId, String)>> =
+            HashMap::default();
+        for namespace in self.namespace_ids() {
+            for (view_name, view) in &self.namespace(namespace).views {
+                let Some(reads) = self.names_read_by_view(database_id, namespace, view) else {
+                    continue;
+                };
+                let view = (namespace, view_name.clone());
+                for read in &reads {
+                    readers.entry(read.clone()).or_default().push(view.clone());
+                }
+                view_reads.insert(view, reads);
+            }
+        }
+        let mut views_to_refresh: HashSet<(NamespaceId, String)> = HashSet::default();
+        let mut pending: std::vec::Vec<(NamespaceId, String)> = changed_names
+            .iter()
+            .map(|(namespace, name)| (*namespace, normalize_ident(name)))
+            .collect();
+        views_to_refresh.extend(pending.iter().cloned());
+        while let Some(name) = pending.pop() {
+            for reader in readers.get(&name).into_iter().flatten() {
+                if views_to_refresh.insert(reader.clone()) {
+                    pending.push(reader.clone());
+                }
+            }
+        }
+        let mut views_in_progress = HashSet::default();
+        let mut refreshed = HashSet::default();
+        for view in &views_to_refresh {
+            self.refresh_columns_of_view(
+                view,
+                database_id,
+                &view_reads,
+                &views_to_refresh,
+                &mut views_in_progress,
+                &mut refreshed,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The tables and views `view` of `namespace` names. None for a TEMP
+    /// view that names another database: this schema does not hold that
+    /// database's objects, so the view's columns cannot be worked out here.
+    fn names_read_by_view(
+        &self,
+        database_id: usize,
+        namespace: NamespaceId,
+        view: &View,
+    ) -> Option<Vec<(NamespaceId, String)>> {
+        if database_id != crate::TEMP_DB_ID {
+            return Some(self.resolve_qualified_tables(namespace, view.read_names.iter().cloned()));
+        }
+        let mut reads = vec![];
+        for (database, name) in &view.read_names {
+            if database
+                .as_deref()
+                .is_some_and(|database| database != "temp")
+            {
+                return None;
+            }
+            reads.push((NamespaceId::ROOT, name.clone()));
+        }
+        Some(reads)
+    }
+
+    /// Refreshes the views `view` reads first, so its columns are worked
+    /// out from their current columns.
+    fn refresh_columns_of_view(
+        &mut self,
+        view: &(NamespaceId, String),
+        database_id: usize,
+        view_reads: &HashMap<(NamespaceId, String), Vec<(NamespaceId, String)>>,
+        views_to_refresh: &HashSet<(NamespaceId, String)>,
+        views_in_progress: &mut HashSet<(NamespaceId, String)>,
+        refreshed: &mut HashSet<(NamespaceId, String)>,
+    ) -> Result<()> {
+        if !views_to_refresh.contains(view) || refreshed.contains(view) {
+            return Ok(());
+        }
+        let Some(reads) = view_reads.get(view) else {
+            return Ok(());
+        };
+        refreshed.insert(view.clone());
+        views_in_progress.insert(view.clone());
+        for read in reads {
+            self.refresh_columns_of_view(
+                read,
+                database_id,
+                view_reads,
+                views_to_refresh,
+                views_in_progress,
+                refreshed,
+            )?;
+        }
+        views_in_progress.remove(view);
+
+        let (namespace, view_name) = view;
+        let reads_itself = reads
+            .iter()
+            .any(|read| read == view || views_in_progress.contains(read));
+        let view_definition = self
+            .get_view(*namespace, view_name)
+            .expect("a view in view_reads is in the schema");
+        let columns = if reads_itself {
+            vec![]
+        } else {
+            match crate::util::extract_view_columns(*namespace, &view_definition.select_stmt, self)
+            {
+                Ok(column_schema) => {
+                    // A TEMP view can read the tables of other databases,
+                    // which this schema does not hold.
+                    let reads_unreadable_table =
+                        column_schema.tables.iter().any(|table| match table.found {
+                            ViewTableFound::Readable => false,
+                            ViewTableFound::Nothing => database_id != crate::TEMP_DB_ID,
+                            ViewTableFound::UnreadableView => true,
+                        });
+                    if reads_unreadable_table {
+                        vec![]
+                    } else {
+                        crate::util::view_columns_with_names(
+                            column_schema,
+                            &view_definition.explicit_columns,
+                        )?
+                    }
+                }
+                Err(LimboError::ParseError(_)) => vec![],
+                Err(err) => return Err(err),
+            }
+        };
+        if let Some(view) = self.namespace_mut(*namespace).views.get_mut(view_name) {
+            Arc::make_mut(view).columns = columns;
+        }
+        Ok(())
+    }
+
     pub fn add_trigger(
         &mut self,
         namespace: NamespaceId,
@@ -2617,6 +2817,9 @@ impl Schema {
                             acc.automatic_indices,
                             mv_cursor.is_some(),
                         )?;
+                        // Only TEMP views are refreshed differently, and a
+                        // TEMP database is empty when it is opened.
+                        self.refresh_all_view_columns(crate::MAIN_DB_ID)?;
 
                         state.phase = MakeFromBtreePhase::Done;
                         return Ok(IOResult::Done(()));
@@ -3131,8 +3334,19 @@ impl Schema {
         namespace: NamespaceId,
         select: &ast::Select,
     ) -> Vec<(NamespaceId, String)> {
-        let mut tables = vec![];
-        for (qualifier, name) in IncrementalView::referenced_tables(select) {
+        self.resolve_qualified_tables(namespace, IncrementalView::referenced_tables(select))
+    }
+
+    /// The namespace each of `tables` resolves to when it is read by an
+    /// object of `namespace`. A table of a namespace the schema does not
+    /// know is left out.
+    fn resolve_qualified_tables(
+        &self,
+        namespace: NamespaceId,
+        tables: impl IntoIterator<Item = (Option<String>, String)>,
+    ) -> Vec<(NamespaceId, String)> {
+        let mut resolved = vec![];
+        for (qualifier, name) in tables {
             let table_namespace = match qualifier.as_deref() {
                 None => namespace,
                 Some("main") => NamespaceId::ROOT,
@@ -3141,9 +3355,9 @@ impl Schema {
                     None => continue,
                 },
             };
-            tables.push((table_namespace, name));
+            resolved.push((table_namespace, name));
         }
-        tables
+        resolved
     }
 
     /// Populate materialized views and then indices from rows collected
@@ -3490,19 +3704,24 @@ impl Schema {
                             select,
                             ..
                         } => {
-                            let mut view_column_schema =
-                                crate::util::extract_view_columns(namespace, &select, self)?;
-                            view_column_schema.rename_columns(&column_names);
-                            let view = View::new(
+                            let mut view = View::new(
                                 view_name,
                                 sql.to_string(),
                                 select,
-                                view_column_schema.flat_columns()?,
+                                vec![],
                                 column_names
                                     .iter()
                                     .map(|column| column.col_name.as_str().to_string())
                                     .try_collect()?,
                             );
+                            view.columns = crate::util::view_columns_with_names(
+                                crate::util::extract_view_columns(
+                                    namespace,
+                                    &view.select_stmt,
+                                    self,
+                                )?,
+                                &view.explicit_columns,
+                            )?;
                             self.add_view(namespace, view)?;
                         }
                         _ => {}
@@ -3968,6 +4187,7 @@ impl TryClone for View {
             select_stmt: self.select_stmt.clone(),
             columns: self.columns.try_clone()?,
             explicit_columns: self.explicit_columns.try_clone()?,
+            read_names: self.read_names.clone(),
         })
     }
 }

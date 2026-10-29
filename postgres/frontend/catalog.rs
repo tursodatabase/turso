@@ -210,6 +210,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn rename_column_fails_on_view_of_missing_table(&self) -> bool {
+        false
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }

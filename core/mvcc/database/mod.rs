@@ -9527,6 +9527,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             automatic_indices,
             mv_store.is_some(),
         )?;
+        fresh.refresh_all_view_columns(crate::MAIN_DB_ID)?;
 
         Ok(Arc::new(fresh))
     }
@@ -10464,6 +10465,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             automatic_indices,
             mv_store.is_some(),
         )?;
+        fresh.refresh_all_view_columns(crate::MAIN_DB_ID)?;
 
         Ok(Arc::new(fresh))
     }

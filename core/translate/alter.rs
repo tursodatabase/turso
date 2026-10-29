@@ -1965,6 +1965,7 @@ pub fn translate_alter_table(
                 // in the update list. This matches SQLite's approach and avoids
                 // incomplete detection heuristics that miss expression-level refs
                 // (e.g., `SELECT b FROM src` in a trigger on a different table).
+                reject_rename_with_unresolvable_view(resolver, namespace)?;
                 let target_table_name = normalize_ident(table_name);
                 for trigger_entry in collect_triggers_for_alter_target(resolver, namespace) {
                     if let Some(missing_table) = validate_trigger_table_refs_after_rename(
@@ -2346,6 +2347,53 @@ pub fn translate_alter_table(
     };
 
     Ok(())
+}
+
+/// Like SQLite, RENAME COLUMN fails when a view of the database reads a
+/// missing table or view. A trigger that reads such a view would otherwise
+/// have its columns resolved against the wrong table and renamed.
+/// SQLite also fails on any other error in a view's SELECT, such as a missing
+/// column, and checks TEMP views; this checks only missing tables, and only
+/// in views of the database being altered.
+fn reject_rename_with_unresolvable_view(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+) -> Result<()> {
+    if !resolver
+        .catalog
+        .dialect
+        .rename_column_fails_on_view_of_missing_table()
+    {
+        return Ok(());
+    }
+    // A TEMP view can read the tables of other databases, which the temp
+    // schema does not hold.
+    if namespace.database_id == crate::TEMP_DB_ID {
+        return Ok(());
+    }
+    let database_name = resolver.namespace_name(namespace.database_id);
+    resolver.with_schema(namespace.database_id, |s| {
+        for (view_name, view) in s.views(namespace.id) {
+            let Ok(column_schema) =
+                crate::util::extract_view_columns(namespace.id, &view.select_stmt, s)
+            else {
+                continue;
+            };
+            let missing_table = column_schema
+                .tables
+                .iter()
+                .find(|table| table.found == crate::util::ViewTableFound::Nothing);
+            match (missing_table, &database_name) {
+                (None, _) => {}
+                (Some(missing_table), Some(database_name)) => crate::bail_parse_error!(
+                    "error in view {view_name}: no such table: {database_name}.{}",
+                    missing_table.name
+                ),
+                (Some(_), None) => crate::bail_parse_error!("error in view {view_name}"),
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Reject ALTER TABLE on a plain or materialized view with SQLite's messages

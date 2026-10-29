@@ -351,6 +351,8 @@ pub fn parse_schema_rows(
         inner.automatic_indices,
         has_mv_store,
     )?;
+    // The connection reparses only the main schema.
+    schema.refresh_all_view_columns(crate::MAIN_DB_ID)?;
 
     Ok(IOResult::Done(()))
 }
@@ -1606,6 +1608,19 @@ pub struct ViewTable {
     pub db_name: Option<String>,
     /// Optional alias (e.g., "c" in "FROM customers c")
     pub alias: Option<String>,
+    /// What the view finds under `name`.
+    pub found: ViewTableFound,
+}
+
+/// What a view finds under the name of a table it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewTableFound {
+    /// A table, or a view that has columns.
+    Readable,
+    /// No table or view.
+    Nothing,
+    /// A view that has no columns because it cannot be read either.
+    UnreadableView,
 }
 
 /// Information about a column in the view's output
@@ -2148,14 +2163,6 @@ fn view_source_from_select_table(
             }
 
             let table_index = tables.len();
-            tables.push(ViewTable {
-                name: table_name.clone(),
-                db_name: name
-                    .namespace
-                    .as_ref()
-                    .map(|db| normalize_ident(db.as_str())),
-                alias: table_alias,
-            });
             let table_namespace = view_source_namespace(schema, namespace, name);
             let mut table = schema.get_table(table_namespace, &table_name);
             let mut view = table
@@ -2173,11 +2180,23 @@ fn view_source_from_select_table(
                     view = None;
                 }
             }
-            let source_columns: &[Column] = match (&table, &view) {
-                (Some(table), _) => table.columns(),
-                (None, Some(view)) => &view.columns,
-                (None, None) => &[],
+            let (source_columns, found): (&[Column], _) = match (&table, &view) {
+                (Some(table), _) => (table.columns(), ViewTableFound::Readable),
+                (None, Some(view)) if view.columns.is_empty() => {
+                    (&[], ViewTableFound::UnreadableView)
+                }
+                (None, Some(view)) => (&view.columns, ViewTableFound::Readable),
+                (None, None) => (&[], ViewTableFound::Nothing),
             };
+            tables.push(ViewTable {
+                name: table_name,
+                db_name: name
+                    .namespace
+                    .as_ref()
+                    .map(|db| normalize_ident(db.as_str())),
+                alias: table_alias,
+                found,
+            });
             let columns = source_columns
                 .iter()
                 .cloned()
@@ -2241,6 +2260,7 @@ fn view_source_from_select_table(
                     .as_ref()
                     .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
+                found: ViewTableFound::Readable,
             });
             let columns = schema
                 .get_table(namespace, &table_name)
@@ -2540,13 +2560,27 @@ fn extract_view_columns_inner(
     let mut columns = Vec::new();
     let mut column_name_counts = HashMap::default();
 
-    let ast::OneSelect::Select {
-        from,
-        columns: select_columns,
-        ..
-    } = &select_stmt.body.select
-    else {
-        return Ok(ViewColumnSchema { tables, columns });
+    let (from, select_columns) = match &select_stmt.body.select {
+        ast::OneSelect::Select { from, columns, .. } => (from, columns),
+        ast::OneSelect::Values(rows) => {
+            // Like SQLite, the columns of VALUES are named column1, column2, ...
+            let (no_type, _) = type_from_name("");
+            for number in 1..=rows.first().map_or(0, Vec::len) {
+                columns.push(ViewColumn {
+                    table_index: usize::MAX,
+                    column: Column::new(
+                        Some(format!("column{number}")),
+                        String::new(),
+                        None,
+                        None,
+                        no_type,
+                        None,
+                        ColDef::default(),
+                    ),
+                });
+            }
+            return Ok(ViewColumnSchema { tables, columns });
+        }
     };
 
     let sources = from
@@ -2733,6 +2767,42 @@ pub fn extract_view_columns(
     extract_view_columns_inner(namespace, select_stmt, schema, &HashMap::default())
 }
 
+/// The columns of a view whose `CREATE VIEW v(x, y)` column list is
+/// `explicit_names`. Like SQLite, that list decides how many columns the view
+/// has. The SELECT gives their types only when it has as many columns as the
+/// list, which stops being true when ALTER TABLE adds or drops a column of a
+/// table that `SELECT *` reads.
+pub(crate) fn view_columns_with_names(
+    column_schema: ViewColumnSchema,
+    explicit_names: &[String],
+) -> Result<crate::alloc::Vec<Column>> {
+    let mut columns = column_schema.flat_columns()?;
+    if explicit_names.is_empty() {
+        return Ok(columns);
+    }
+    if columns.len() != explicit_names.len() {
+        let (no_type, _) = type_from_name("");
+        return Ok(explicit_names
+            .iter()
+            .map(|name| {
+                Column::new(
+                    Some(name.clone()),
+                    String::new(),
+                    None,
+                    None,
+                    no_type,
+                    None,
+                    ColDef::default(),
+                )
+            })
+            .try_collect()?);
+    }
+    for (column, name) in columns.iter_mut().zip(explicit_names) {
+        column.name = Some(name.clone());
+    }
+    Ok(columns)
+}
+
 pub fn rewrite_fk_parent_cols_if_self_ref(
     clause: &mut ast::ForeignKeyClause,
     table: &str,
@@ -2873,8 +2943,14 @@ mod rename_column_view {
 
         let rewrite_result = (|| -> Result<Option<RewrittenView>> {
             let original_select = select.clone();
-            let original_columns =
-                view_columns_from_select(&original_select, schema, namespace, &view_columns)?;
+            let explicit_names: Vec<String> = view_columns
+                .iter()
+                .map(|column| column.col_name.as_str().to_string())
+                .collect();
+            let original_columns = view_columns_with_names(
+                extract_view_columns(namespace, &original_select, schema)?,
+                &explicit_names,
+            )?;
 
             let ctx = ViewRewriteCtx::new(
                 schema,
@@ -2890,10 +2966,14 @@ mod rename_column_view {
             let view_column_schema = extract_view_columns(namespace, &select, schema)?;
             let mut final_columns = apply_view_column_rename(view_column_schema, &ctx);
 
-            for (i, indexed_col) in view_columns.iter().enumerate() {
-                if let Some(col) = final_columns.get_mut(i) {
-                    col.name = Some(indexed_col.col_name.as_str().to_string());
+            if final_columns.len() == explicit_names.len() {
+                for (column, name) in final_columns.iter_mut().zip(&explicit_names) {
+                    column.name = Some(name.clone());
                 }
+            } else if !explicit_names.is_empty() {
+                // The column list alone gives the view's columns, and renaming
+                // a column of the table does not change it.
+                final_columns.clone_from(&original_columns);
             }
 
             let columns_changed = !columns_equivalent(&original_columns, &final_columns);
@@ -2956,22 +3036,6 @@ mod rename_column_view {
             .map(|vc| vc.column)
             .try_collect()
             .expect(crate::alloc::ALLOC_ERR_MSG)
-    }
-
-    fn view_columns_from_select(
-        select: &ast::Select,
-        schema: &Schema,
-        namespace: NamespaceId,
-        explicit: &[ast::IndexedColumn],
-    ) -> Result<crate::alloc::Vec<Column>> {
-        let view_column_schema = extract_view_columns(namespace, select, schema)?;
-        let mut columns = view_column_schema.flat_columns()?;
-        for (i, indexed_col) in explicit.iter().enumerate() {
-            if let Some(col) = columns.get_mut(i) {
-                col.name = Some(indexed_col.col_name.as_str().to_string());
-            }
-        }
-        Ok(columns)
     }
 
     fn columns_equivalent(left: &[Column], right: &[Column]) -> bool {
