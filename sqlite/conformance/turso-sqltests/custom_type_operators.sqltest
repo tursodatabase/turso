@@ -1147,7 +1147,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test unchanged-decode-type-compares-literal-as-is-with-and-without-index {
+test unchanged-decode-type-encodes-literal-with-and-without-index {
     CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
     CREATE TABLE plain(x upper_text) STRICT;
     CREATE TABLE indexed(x upper_text PRIMARY KEY) STRICT;
@@ -1162,5 +1162,5 @@ test unchanged-decode-type-compares-literal-as-is-with-and-without-index {
         (SELECT count(*) FROM indexed WHERE x IN ('hello', 'HELLO'));
 }
 expect {
-    0|0|1|1|1|1
+    1|1|1|1|1|1
 }
