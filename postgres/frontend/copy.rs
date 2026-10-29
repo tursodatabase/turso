@@ -9,76 +9,118 @@
 //! - Empty field = empty string (not NULL)
 //! - Lines starting with `\.` = end of data
 
+use std::collections::VecDeque;
 use std::num::NonZero;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::session::{database_of, relation_lookup_namespaces};
-use turso_core::{LimboError, Result, Value};
+use turso_core::schema::BTreeTable;
+use turso_core::{Connection, IOResult, LimboError, Qualifier, Result, Statement, Value};
 use turso_pg_parser::{copy::CopyToStdout, quote_identifier};
 
-pub(crate) fn prepare_copy_to_stdout(
-    conn: &std::sync::Arc<turso_core::Connection>,
-    spec: &CopyToStdout,
-) -> Result<turso_core::Statement> {
-    let mut found = None;
-    for namespace in relation_lookup_namespaces(conn, spec.schema.as_deref()) {
-        let mut stmt = conn.prepare_sqlite(format!(
-            "SELECT type, rootpage, sql FROM {}.sqlite_schema \
-             WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1",
-            quote_identifier(&database_of(conn, &namespace))
-        ))?;
-        stmt.bind_at(
-            NonZero::new(1).unwrap(),
-            Value::build_text(namespace.mangle_name(&spec.table)),
-        )?;
-        let mut table = None;
-        stmt.run_with_row_callback(|row| {
-            let kind = row.get::<String>(0)?;
-            let root_page = row.get::<i64>(1)?;
-            if kind != "table" || root_page == 0 {
-                return Err(LimboError::ParseError(
-                    "COPY TO STDOUT requires a plain table".to_owned(),
-                ));
-            }
-            table = Some(
-                conn.dialect()
-                    .parse_table_sql(&row.get::<String>(2)?, root_page)?,
-            );
-            Ok(())
-        })?;
-        if let Some(table) = table {
-            found = Some((namespace, table));
-            break;
+pub(crate) struct CopyTo {
+    spec: CopyToStdout,
+    namespaces: VecDeque<Qualifier>,
+    query: Option<Box<Statement>>,
+    table: Option<Box<BTreeTable>>,
+}
+
+impl CopyTo {
+    pub(crate) fn new(conn: &Arc<Connection>, spec: CopyToStdout) -> Self {
+        Self {
+            namespaces: relation_lookup_namespaces(conn, spec.schema.as_deref()).into(),
+            spec,
+            query: None,
+            table: None,
         }
     }
-    let (namespace, table) = found.ok_or_else(|| {
-        LimboError::ParseError(format!("COPY table '{}' does not exist", spec.table))
-    })?;
-    let columns = if spec.columns.is_empty() {
-        table
-            .columns()
-            .iter()
-            .filter(|column| !column.hidden() && !column.is_generated())
-            .map(|column| column.name.as_ref().expect("table columns have names"))
-            .collect::<Vec<_>>()
-    } else {
-        for name in &spec.columns {
-            let (_, column) = table.get_column(name).ok_or_else(|| {
-                LimboError::ParseError(format!("COPY column '{name}' does not exist"))
+
+    pub(crate) fn step(
+        &mut self,
+        conn: &Arc<Connection>,
+        inner: &mut Statement,
+        timeout: Option<Option<Duration>>,
+        interrupted: bool,
+    ) -> Result<IOResult<()>> {
+        loop {
+            let namespace = self.namespaces.front().ok_or_else(|| {
+                LimboError::ParseError(format!("COPY table '{}' does not exist", self.spec.table))
             })?;
-            column.ensure_not_generated("COPY", name)?;
+            if self.query.is_none() {
+                if interrupted {
+                    return Err(LimboError::Interrupt);
+                }
+                let mut query = conn.prepare_sqlite(format!(
+                    "SELECT type, rootpage, sql FROM {}.sqlite_schema \
+                     WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1",
+                    quote_identifier(&database_of(conn, namespace))
+                ))?;
+                query.bind_at(
+                    NonZero::new(1).unwrap(),
+                    Value::build_text(namespace.mangle_name(&self.spec.table)),
+                )?;
+                self.query = Some(Box::new(query));
+            }
+            let query = self.query.as_mut().unwrap();
+            query.set_query_timeout_override(timeout);
+            if interrupted {
+                query.interrupt();
+            }
+            if let IOResult::IO(io) = query
+                .run_with_row_callback_nonblock(|row| {
+                    let kind = row.get::<String>(0)?;
+                    let root_page = row.get::<i64>(1)?;
+                    if kind != "table" || root_page == 0 {
+                        return Err(LimboError::ParseError(
+                            "COPY TO STDOUT requires a plain table".to_owned(),
+                        ));
+                    }
+                    self.table = Some(Box::new(
+                        conn.dialect()
+                            .parse_table_sql(&row.get::<String>(2)?, root_page)?,
+                    ));
+                    Ok(())
+                })
+                .map_err(|error| *error)?
+            {
+                return Ok(IOResult::IO(io));
+            }
+            self.query = None;
+            let Some(table) = self.table.take() else {
+                self.namespaces.pop_front();
+                continue;
+            };
+            let columns = if self.spec.columns.is_empty() {
+                table
+                    .columns()
+                    .iter()
+                    .filter(|column| !column.hidden() && !column.is_generated())
+                    .map(|column| column.name.as_ref().expect("table columns have names"))
+                    .collect::<Vec<_>>()
+            } else {
+                for name in &self.spec.columns {
+                    let (_, column) = table.get_column(name).ok_or_else(|| {
+                        LimboError::ParseError(format!("COPY column '{name}' does not exist"))
+                    })?;
+                    column.ensure_not_generated("COPY", name)?;
+                }
+                self.spec.columns.iter().collect()
+            };
+            let columns = columns
+                .into_iter()
+                .map(|column| quote_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            *inner = conn.prepare_sqlite(format!(
+                "SELECT {columns} FROM {}.{}",
+                quote_identifier(&namespace.name),
+                quote_identifier(&self.spec.table)
+            ))?;
+            inner.set_query_timeout_override(timeout);
+            return Ok(IOResult::Done(()));
         }
-        spec.columns.iter().collect()
-    };
-    let columns = columns
-        .into_iter()
-        .map(|column| quote_identifier(column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    conn.prepare_sqlite(format!(
-        "SELECT {columns} FROM {}.{}",
-        quote_identifier(&namespace.name),
-        quote_identifier(&spec.table)
-    ))
+    }
 }
 
 /// A parsed row from COPY text format: each element is None for NULL, Some for a value.

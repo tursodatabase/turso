@@ -159,9 +159,10 @@ impl PgConnection {
         &self,
         spec: &turso_pg_parser::copy::CopyToStdout,
     ) -> crate::Result<crate::Statement> {
-        crate::copy::prepare_copy_to_stdout(&self.inner.conn, spec)
-            .map(crate::Statement::new)
-            .map_err(Into::into)
+        Ok(crate::Statement::with_execution(
+            noop_statement(&self.inner.conn)?,
+            Execution::new(self.inner.clone(), Plan::CopyTo(spec.clone())),
+        ))
     }
 
     pub fn query(&self, sql: impl AsRef<str>) -> crate::Result<Option<crate::Statement>> {
