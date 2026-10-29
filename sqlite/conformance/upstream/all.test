@@ -310,7 +310,7 @@ set test_files {
   init                 fail
   insert               fail
   insert2              pass
-  insert3              fail
+  insert3              pass
   insert4              fail
   insert5              pass
   instr                pass

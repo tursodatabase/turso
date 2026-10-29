@@ -241,6 +241,7 @@ pub enum TypeDefKind {
         params: std::vec::Vec<ast::TypeParam>,
         base: String,
         encode: Option<Box<ast::Expr>>,
+        coerce: Option<Box<ast::Expr>>,
         decode: Option<Box<ast::Expr>>,
         operators: std::vec::Vec<TypeOperator>,
         default: Option<Box<ast::Expr>>,
@@ -335,6 +336,19 @@ impl TypeDef {
         }
     }
 
+    /// Returns the coerce expression (Custom types only).
+    pub fn coerce(&self) -> Option<&ast::Expr> {
+        match &self.kind {
+            TypeDefKind::Custom { coerce, .. } => coerce.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Whether storing a value of this type may change it.
+    pub fn has_encode_or_coerce(&self) -> bool {
+        self.encode().is_some() || self.coerce().is_some()
+    }
+
     /// Returns the decode expression (Custom types only).
     pub fn decode(&self) -> Option<&ast::Expr> {
         match &self.kind {
@@ -420,25 +434,32 @@ impl TypeDef {
                 params,
                 base,
                 encode,
+                coerce,
                 decode,
                 operators,
                 default,
-            } => Self {
-                name: type_name.to_string(),
-                is_builtin,
-                not_null: false,
-                is_domain: false,
-                sql,
-                domain_checks: std::vec::Vec::new(),
-                kind: TypeDefKind::Custom {
-                    params: params.clone(),
-                    base: base.clone(),
-                    encode: encode.clone(),
-                    decode: decode.clone(),
-                    operators: operators.clone(),
-                    default: default.clone(),
-                },
-            },
+            } => {
+                // CREATE TYPE checks where type parameters are used. A type
+                // already stored by an earlier version is loaded unchecked, so
+                // the database still opens and DROP TYPE can remove it.
+                Self {
+                    name: type_name.to_string(),
+                    is_builtin,
+                    not_null: false,
+                    is_domain: false,
+                    sql,
+                    domain_checks: std::vec::Vec::new(),
+                    kind: TypeDefKind::Custom {
+                        params: params.clone(),
+                        base: base.clone(),
+                        encode: encode.clone(),
+                        coerce: coerce.clone(),
+                        decode: decode.clone(),
+                        operators: operators.clone(),
+                        default: default.clone(),
+                    },
+                }
+            }
             ast::CreateTypeBody::Struct(fields) => {
                 let struct_fields: Vec<StructFieldDef> = fields
                     .iter()
@@ -522,6 +543,7 @@ impl TypeDef {
                 params: std::vec::Vec::new(),
                 base: base_type.to_string(),
                 encode: None,
+                coerce: None,
                 decode: None,
                 operators: std::vec::Vec::new(),
                 default,
@@ -552,6 +574,39 @@ impl TypeDef {
     pub fn to_sql(&self) -> &str {
         &self.sql
     }
+}
+
+/// The type parameters, such as numeric's precision and scale, limit what a
+/// column may store, so only COERCE may read them. ENCODE also converts index
+/// seek keys and operator arguments, which are compared and never limited: on a
+/// numeric(10,2) column `n = 3.504` matches no row instead of matching 3.50.
+pub(crate) fn check_type_param_use(
+    params: &[ast::TypeParam],
+    encode: &Option<Box<ast::Expr>>,
+    decode: &Option<Box<ast::Expr>>,
+) -> crate::Result<()> {
+    let type_params: std::vec::Vec<String> = params
+        .iter()
+        .map(|p| normalize_ident(&p.name))
+        .filter(|name| name != "value")
+        .collect();
+    for (clause, expr) in [("ENCODE", encode), ("DECODE", decode)] {
+        let Some(expr) = expr else {
+            continue;
+        };
+        walk_expr(expr, &mut |e| {
+            if let Expr::Id(name) | Expr::Name(name) = e {
+                let name = normalize_ident(name.as_str());
+                if type_params.contains(&name) {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "{clause} cannot use type parameter \"{name}\": only COERCE can"
+                    )));
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(())
 }
 
 /// A materialized view the loader met, before it is built: its namespace,
@@ -893,7 +948,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
+        "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
         "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '+' date_plus OPERATOR '-' date_minus OPERATOR '<'",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
@@ -906,14 +961,14 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
         "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
         "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
+        "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'",
         "CREATE TYPE bigint(value integer) BASE integer",
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
         "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
-        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
     ];
 
     for sql in type_sqls {
