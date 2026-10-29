@@ -1050,7 +1050,9 @@ fn ctas_column_type(arms: &[&SelectPlan], column_index: usize, resolver: &Resolv
 }
 
 /// A column of a STRICT table keeps the type it was declared with, including
-/// its parameters and array dimensions.
+/// its parameters and array dimensions. The name of a type made with CREATE
+/// TYPE or CREATE DOMAIN is quoted when it has to be, such as `"select"` or
+/// `"Mood X"`.
 fn result_column_strict_type(
     select: &SelectPlan,
     column_index: usize,
@@ -1064,8 +1066,12 @@ fn result_column_strict_type(
             .filter(|(_, table)| table.is_strict())
             .and_then(|(_, table)| table.get_column_at(*column));
         if let Some(declared) = declared {
+            let name = match resolver.schema().get_type_def_unchecked(&declared.ty_str) {
+                Some(type_def) if !type_def.is_builtin => quote_identifier(&declared.ty_str),
+                _ => declared.ty_str.clone(),
+            };
             return ast::Type {
-                name: declared.ty_str.clone(),
+                name,
                 size: type_size(declared.ty_params.clone()),
                 array_dimensions: declared.array_dimensions(),
             };
@@ -1096,7 +1102,7 @@ fn strict_column_type(ty: ExprType) -> ast::Type {
         ExprType::Custom { type_def, params }
             if type_def.is_domain || (params.is_empty() && type_def.user_params().count() == 0) =>
         {
-            (type_def.name.clone(), array_dimensions)
+            (quote_identifier(&type_def.name), array_dimensions)
         }
         ExprType::Untyped | ExprType::Null if array_dimensions == 0 => ("TEXT".to_string(), 0),
         _ => ("ANY".to_string(), 0),

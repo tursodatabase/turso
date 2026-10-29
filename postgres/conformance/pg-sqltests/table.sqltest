@@ -214,6 +214,38 @@ test table-create-table-as-compound-keeps-column-type {
 }
 expect error {}
 
+test table-create-table-as-keeps-keyword-named-type {
+    CREATE TYPE "select" AS ENUM ('a');
+    CREATE TABLE src_kw (b "select");
+    CREATE TABLE dst AS SELECT * FROM src_kw;
+    INSERT INTO dst VALUES ('a');
+    SELECT b FROM dst;
+}
+expect {
+    a
+}
+
+test table-create-table-as-keeps-mixed-case-type-checks {
+    CREATE TYPE "Mood X" AS ENUM ('a');
+    CREATE TABLE src_mc (b "Mood X");
+    CREATE TABLE dst AS SELECT * FROM src_mc;
+    INSERT INTO dst VALUES ('zz');
+}
+expect error {}
+
+test table-create-table-as-keeps-keyword-named-type-of-expression {
+    CREATE TYPE "order" AS ENUM ('a');
+    CREATE TABLE src_ex (b "order");
+    INSERT INTO src_ex VALUES (NULL);
+    CREATE TABLE dst AS SELECT coalesce(b, 'a'::"order") AS b FROM src_ex;
+    INSERT INTO dst VALUES ('a');
+    SELECT b FROM dst;
+}
+expect {
+    a
+    a
+}
+
 @setup typed_src
 test table-select-into-rejects-invalid-boolean {
     SELECT * INTO dst FROM src;
