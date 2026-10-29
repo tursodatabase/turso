@@ -683,8 +683,9 @@ pub(crate) fn column_stored_form(
 
 /// The type whose stored form a value of type `ty` compares in. A domain
 /// stores its values as its base type does, so it compares as that type. None
-/// for a type with its own order and for a type whose stored form is the
-/// value itself (no ENCODE or DECODE, as `varchar`).
+/// for a type with its own order and for a type without ENCODE, such as
+/// `varchar`: it stores the value as it is, so a `varchar` compares with a
+/// `text` like two texts do.
 fn stored_form_type(ty: &ExprType, schema: &Schema) -> Result<Option<ResolvedType>> {
     let ExprType::Custom { type_def, .. } = ty else {
         return Ok(None);
@@ -698,11 +699,7 @@ fn stored_form_type(ty: &ExprType, schema: &Schema) -> Result<Option<ResolvedTyp
     let Some(stored) = without_domains(resolved)? else {
         return Ok(None);
     };
-    if stored
-        .chain
-        .iter()
-        .all(|td| td.encode().is_none() && td.decode().is_none())
-    {
+    if stored.chain.iter().all(|td| td.encode().is_none()) {
         return Ok(None);
     }
     Ok(Some(stored))
