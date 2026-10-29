@@ -1206,14 +1206,14 @@ test cmp-row-value-components-use-stored-value {
     SELECT 'lt', id FROM t WHERE (c, d) < (5, 9) ORDER BY id;
     SELECT 'eq', id FROM t WHERE (c, d) = (5, 5) ORDER BY id;
     SELECT 'in', id FROM t WHERE (c, d) IN ((5, 5), (7, 0)) ORDER BY id;
-    SELECT 'subquery', id FROM t WHERE (c, d) >= (SELECT 5, 5) ORDER BY id;
+    SELECT 'subquery', id FROM t WHERE (c, d) >= (SELECT CAST(5 AS neg), 5) ORDER BY id;
     CREATE INDEX t_cd ON t(c, d);
     SELECT 'gt', id FROM t WHERE (c, d) > (1, 0) ORDER BY id;
     SELECT 'gt-none', id FROM t WHERE (c, d) > (1, 9) ORDER BY id;
     SELECT 'lt', id FROM t WHERE (c, d) < (5, 9) ORDER BY id;
     SELECT 'eq', id FROM t WHERE (c, d) = (5, 5) ORDER BY id;
     SELECT 'in', id FROM t WHERE (c, d) IN ((5, 5), (7, 0)) ORDER BY id;
-    SELECT 'subquery', id FROM t WHERE (c, d) >= (SELECT 5, 5) ORDER BY id;
+    SELECT 'subquery', id FROM t WHERE (c, d) >= (SELECT CAST(5 AS neg), 5) ORDER BY id;
 }
 expect {
     gt|1
@@ -1232,22 +1232,22 @@ expect {
     subquery|2
 }
 
-# Comparing a neg column with an integer column ENCODEs the integer, so
-# d.x < t.s is -x < -s, which holds where x > s. An index or rowid on t holds
-# s itself, not -s, so it can't find these rows and the query scans t instead.
+# CAST(t.s AS neg) is ENCODEd for the comparison, so
+# d.x < CAST(t.s AS neg) is -x < -s, which holds where x > s. An index or rowid
+# on t holds s itself, not -s, so the query scans t instead.
 @requires strict "uses STRICT tables"
-test cmp-plain-column-index-unused-when-column-is-encoded {
+test cmp-plain-column-index-unused-when-cast-is-encoded {
     CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
     CREATE TABLE d(x neg) STRICT;
     CREATE TABLE t(id INTEGER PRIMARY KEY, s integer) STRICT;
     INSERT INTO d VALUES (1), (2), (3);
     INSERT INTO t VALUES (1, 1), (2, 2), (5, 5);
-    SELECT 'scan', count(*) FROM d NOT INDEXED CROSS JOIN t NOT INDEXED WHERE d.x < t.s;
-    SELECT 'automatic index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < t.s;
-    SELECT 'rowid', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < t.id;
+    SELECT 'scan', count(*) FROM d NOT INDEXED CROSS JOIN t NOT INDEXED WHERE d.x < CAST(t.s AS neg);
+    SELECT 'automatic index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < CAST(t.s AS neg);
+    SELECT 'rowid', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < CAST(t.id AS neg);
     CREATE INDEX t_s ON t(s);
-    SELECT 'index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < t.s;
-    SELECT 'index or', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < t.s OR d.x > t.s;
+    SELECT 'index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < CAST(t.s AS neg);
+    SELECT 'index or', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < CAST(t.s AS neg) OR d.x > CAST(t.s AS neg);
 }
 expect {
     scan|3
@@ -1257,21 +1257,22 @@ expect {
     index or|7
 }
 
-# The date ENCODE drops the time, so t.s = d.x matches '2024-01-01 10:00'.
-# An index on t.s holds the text with the time and would miss it.
+# The date ENCODE drops the time, so CAST(t.s AS date) = d.x matches
+# '2024-01-01 10:00'. An index on t.s holds the text with the time and would
+# miss it.
 @requires strict "uses STRICT tables"
-test cmp-date-with-text-column-same-rows-with-and-without-index {
+test cmp-date-with-text-cast-same-rows-with-and-without-index {
     CREATE TABLE d(x date) STRICT;
     INSERT INTO d VALUES ('2024-01-01');
     CREATE TABLE t(s text) STRICT;
     INSERT INTO t VALUES ('2024-01-01 10:00'), ('2024-01-02');
-    SELECT 'scan', count(*) FROM d NOT INDEXED CROSS JOIN t NOT INDEXED WHERE d.x = t.s;
-    SELECT 'automatic index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x = t.s;
-    SELECT 'in list', count(*) FROM t WHERE t.s IN (CAST('2024-01-01' AS date), CAST('2024-01-03' AS date));
+    SELECT 'scan', count(*) FROM d NOT INDEXED CROSS JOIN t NOT INDEXED WHERE d.x = CAST(t.s AS date);
+    SELECT 'automatic index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x = CAST(t.s AS date);
+    SELECT 'in list', count(*) FROM t WHERE CAST(t.s AS date) IN (CAST('2024-01-01' AS date), CAST('2024-01-03' AS date));
     CREATE INDEX t_s ON t(s);
-    SELECT 'index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x = t.s;
-    SELECT 'index in list', count(*) FROM t WHERE t.s IN (CAST('2024-01-01' AS date), CAST('2024-01-03' AS date));
-    SELECT 'index constant', count(*) FROM t WHERE t.s = CAST('2024-01-01' AS date);
+    SELECT 'index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x = CAST(t.s AS date);
+    SELECT 'index in list', count(*) FROM t WHERE CAST(t.s AS date) IN (CAST('2024-01-01' AS date), CAST('2024-01-03' AS date));
+    SELECT 'index constant', count(*) FROM t WHERE CAST(t.s AS date) = CAST('2024-01-01' AS date);
 }
 expect {
     scan|1
@@ -1280,6 +1281,48 @@ expect {
     index|1
     index in list|1
     index constant|1
+}
+
+# As in PostgreSQL, a text column is not compared with a date column as is:
+# the date would need to ENCODE every text value, and a hash join or an IN
+# subquery would compare them without it.
+@requires strict "uses STRICT tables"
+test cmp-date-with-text-column-is-an-error {
+    CREATE TABLE d(x date) STRICT;
+    CREATE TABLE t(s text) STRICT;
+    SELECT count(*) FROM d JOIN t ON d.x = t.s;
+}
+expect error {
+    cannot compare type date with text: cast it to date first
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-with-text-in-subquery-is-an-error {
+    CREATE TABLE d(x date) STRICT;
+    CREATE TABLE t(s text) STRICT;
+    SELECT count(*) FROM t WHERE t.s IN (SELECT x FROM d);
+}
+expect error {
+    cannot compare type date with text: cast it to date first
+}
+
+# A value cast to a type compares the same in a nested loop, a hash join and
+# an IN subquery.
+@requires strict "uses STRICT tables"
+test cmp-cast-same-rows-in-every-plan {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE a(x neg) STRICT;
+    CREATE TABLE b(i integer) STRICT;
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (2), (3);
+    SELECT 'loop', count(*) FROM a NOT INDEXED CROSS JOIN b NOT INDEXED WHERE a.x = CAST(b.i AS neg);
+    SELECT 'join', count(*) FROM a JOIN b ON a.x = CAST(b.i AS neg);
+    SELECT 'in', count(*) FROM a WHERE a.x IN (SELECT CAST(i AS neg) FROM b);
+}
+expect {
+    loop|1
+    join|1
+    in|1
 }
 
 # coalesce(c, c) > 4 compares stored values: -c > -4, which holds for c = 1.

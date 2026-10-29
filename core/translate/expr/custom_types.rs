@@ -536,10 +536,15 @@ pub(crate) fn stored_comparison_type_across_queries<'a, 'c, 's: 'c>(
     operands: impl IntoIterator<Item = (&'a ast::Expr, impl Borrow<ExprContext<'c, 's>>)>,
 ) -> Result<Option<ResolvedType>> {
     let mut found: Option<ResolvedType> = None;
+    // Operands of no custom type whose value changes per row.
+    let mut varying_others = Vec::new();
     for (operand, context) in operands {
         let context = context.borrow();
-        let ty = type_of(operand, &context.type_env());
-        let Some(ty) = stored_form_type(&ty, context.schema())? else {
+        let operand_type = type_of(operand, &context.type_env());
+        let Some(ty) = stored_form_type(&operand_type, context.schema())? else {
+            if !operand.is_constant(context.resolver()) {
+                varying_others.push(operand_type);
+            }
             continue;
         };
         match &found {
@@ -554,16 +559,30 @@ pub(crate) fn stored_comparison_type_across_queries<'a, 'c, 's: 'c>(
             None => found = Some(ty),
         }
     }
+    // As in PostgreSQL, only a constant becomes a value of the type it is
+    // compared with. A value of another type that changes per row, as in
+    // `date_col = text_col`, would have to go through ENCODE on every row,
+    // and a hash join or an IN subquery compares it as it is, so the answer
+    // would depend on the plan.
+    if let Some(compared_as) = &found {
+        if let Some(operand_type) = varying_others.first() {
+            crate::bail_parse_error!(
+                "cannot compare type {} with {}: cast it to {} first",
+                compared_as.leaf().name,
+                operand_type.name(),
+                compared_as.leaf().name
+            );
+        }
+    }
     Ok(found)
 }
 
 /// Translates `expr`, an operand of a comparison, into `target_register`. When
 /// the comparison is between values of the custom type `compared_as` (see
 /// [stored_comparison_type]), the operand is put in that type's stored form:
-/// a column of the type is read without its DECODE, a CAST to the type is
-/// already in stored form, and any other value goes through the type's ENCODE,
-/// as an index search key does. `c = 42` compares the stored `c` with `42`
-/// encoded.
+/// a column of the type is read without its DECODE, and any other value goes
+/// through the type's ENCODE, as an index search key does. `c = 42` compares
+/// the stored `c` with `42` encoded.
 pub(crate) fn translate_compared_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -583,9 +602,6 @@ pub(crate) fn translate_compared_expr(
                 translate_expr(program, referenced_tables, expr, target_register, resolver);
             program.flags.set_suppress_custom_type_decode(suppressed);
             return result;
-        }
-        ComparedOperandForm::CastToType => {
-            return translate_expr(program, referenced_tables, expr, target_register, resolver);
         }
         ComparedOperandForm::Encoded => {}
     }
@@ -608,9 +624,10 @@ pub(crate) fn translate_compared_expr(
 }
 
 /// Whether comparing `operand` with `others` runs `operand` through a custom
-/// type's ENCODE (see [translate_compared_expr]). `text_col = date_col` encodes
-/// `text_col` as a date. An index or rowid holds the column's own values, not
-/// encoded ones, so a seek on it can't find the rows such a comparison matches.
+/// type's ENCODE (see [translate_compared_expr]). `CAST(text_col AS date) =
+/// date_col` encodes the cast text as a date. An index or rowid holds the
+/// column's own values, not encoded ones, so a seek on it can't find the rows
+/// such a comparison matches.
 pub(crate) fn comparison_encodes_operand<'a>(
     operand: &'a ast::Expr,
     others: impl IntoIterator<Item = &'a ast::Expr>,
@@ -637,8 +654,6 @@ pub(crate) fn comparison_encodes_operand<'a>(
 enum ComparedOperandForm {
     /// A table column of the type, read without its DECODE.
     StoredColumn,
-    /// A CAST to the type, which gives the stored form already.
-    CastToType,
     /// Any other value, put through the type's ENCODE.
     Encoded,
 }
@@ -657,9 +672,6 @@ fn compared_operand_form(
     }
     if reads_stored_column(expr, referenced_tables, resolver) {
         return Ok(ComparedOperandForm::StoredColumn);
-    }
-    if matches!(unwrap_parens(expr)?, ast::Expr::Cast { .. }) {
-        return Ok(ComparedOperandForm::CastToType);
     }
     Ok(ComparedOperandForm::Encoded)
 }
@@ -699,21 +711,7 @@ pub(crate) fn emit_presentation_form(
     ty: &ResolvedType,
     resolver: &Resolver,
 ) -> Result<()> {
-    if ty.chain.iter().all(|td| td.decode().is_none()) {
-        return Ok(());
-    }
-    let skip_null = program.allocate_label();
-    program.emit_insn(Insn::IsNull {
-        reg,
-        target_pc: skip_null,
-    });
-    for td in ty.chain.iter().rev() {
-        if let Some(decode) = td.decode() {
-            emit_type_expr(program, decode, reg, reg, resolver)?;
-        }
-    }
-    program.preassign_label_to_next_insn(skip_null);
-    Ok(())
+    emit_decode(program, &ty.chain, reg, resolver)
 }
 
 /// The type whose ENCODE turns a value into what a column declared as

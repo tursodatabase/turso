@@ -55,6 +55,10 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
         TypeEnv::new(self.tables.tables, self.resolver)
     }
 
+    pub(crate) fn resolver(&self) -> &'a Resolver<'schema> {
+        self.resolver
+    }
+
     pub(crate) fn catalog(&self) -> &CatalogContext<'schema> {
         &self.resolver.catalog
     }

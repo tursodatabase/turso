@@ -108,10 +108,10 @@ expect {
 
 @requires strict "uses STRICT tables"
 test cast-to-parametric-type {
-    SELECT typeof(CAST(42 AS numeric(10,2)));
+    SELECT typeof(CAST(42 AS numeric(10,2))), CAST('3.504' AS numeric(10,2));
 }
 expect {
-    text
+    text|3.50
 }
 
 # A CAST gives the value a column of the type reads back after ENCODE and
@@ -140,6 +140,7 @@ expect {
     100
 }
 
+# A CAST reads back like a column of the type: ENCODE, then DECODE.
 @requires strict "uses STRICT tables"
 test cast-to-custom-type-in-check-compares-with-column-error {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;

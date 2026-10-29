@@ -106,6 +106,19 @@ impl ExprType {
             _ => 0,
         }
     }
+
+    /// The type's name for an error message: `date`, `integer`, ...
+    pub(crate) fn name(&self) -> String {
+        match self {
+            Self::Builtin(BuiltinType::Any) => "value".to_string(),
+            Self::Builtin(BuiltinType::Decimal) => "numeric".to_string(),
+            Self::Builtin(builtin) => format!("{builtin:?}").to_lowercase(),
+            Self::Custom { type_def, .. } => type_def.name.clone(),
+            Self::Untyped => "text".to_string(),
+            Self::Null => "null".to_string(),
+            Self::Array { .. } | Self::Unknown => "value".to_string(),
+        }
+    }
 }
 
 /// Type names are unique within a schema, so two definitions with the same name
