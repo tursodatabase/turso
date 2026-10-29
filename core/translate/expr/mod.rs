@@ -94,8 +94,9 @@ pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{
-    emit_dml_expr_index_value, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
-    emit_user_facing_column_value,
+    custom_type_eq_func_for_byte_compare, emit_dml_expr_index_value, emit_store_value,
+    emit_trigger_decode_registers, emit_type_expr, emit_user_facing_column_value,
+    index_search_matches_custom_type_eq,
 };
 pub use emission::{
     emit_function_call, emit_literal, process_returning_clause, ReturningBufferCtx,

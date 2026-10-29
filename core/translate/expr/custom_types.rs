@@ -207,10 +207,21 @@ pub(super) fn find_custom_type_operator(
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Option<ResolvedOperator> {
-    let op_str = operator_to_str(op)?;
     let env = TypeEnv::new(referenced_tables, resolver);
     let lhs_info = operand_custom_type(e1, &env, resolver);
     let rhs_info = operand_custom_type(e2, &env, resolver);
+    resolve_custom_type_operator(e1, lhs_info.as_ref(), e2, rhs_info.as_ref(), op)
+}
+
+/// The rules of [find_custom_type_operator], given the custom type of each operand.
+fn resolve_custom_type_operator(
+    e1: &ast::Expr,
+    lhs_info: Option<&ColumnCustomType>,
+    e2: &ast::Expr,
+    rhs_info: Option<&ColumnCustomType>,
+    op: &ast::Operator,
+) -> Option<ResolvedOperator> {
+    let op_str = operator_to_str(op)?;
 
     // Try to find a direct or derived operator match on a type definition.
     let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
@@ -224,13 +235,7 @@ pub(super) fn find_custom_type_operator(
         }
 
         // Derive missing operators from < and =
-        let find_op = |sym: &str| -> Option<String> {
-            type_def
-                .operators()
-                .iter()
-                .find(|o| o.op == sym)
-                .and_then(|o| o.func_name.clone())
-        };
+        let find_op = |sym: &str| type_def.operator_func(sym).cloned();
 
         match *op {
             // a > b  →  lt(b, a)
@@ -246,7 +251,7 @@ pub(super) fn find_custom_type_operator(
     };
 
     // Case 1: Both operands are custom type columns of the SAME type.
-    if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
+    if let (Some(lhs), Some(rhs)) = (lhs_info, rhs_info) {
         if same_type_def(&lhs.type_def, &rhs.type_def) {
             if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
                 return Some(ResolvedOperator {
@@ -287,7 +292,7 @@ pub(super) fn find_custom_type_operator(
             })
         };
 
-    match (&lhs_info, &rhs_info) {
+    match (lhs_info, rhs_info) {
         (Some(lhs), None) => resolve_one_custom_operand(lhs, e2, EncodeArg::Second),
         (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
         _ => None,
@@ -307,6 +312,76 @@ fn operand_custom_type(
         }
     }
     column_custom_type(expr, env)
+}
+
+/// Return the `=` function of a custom type when `lhs = rhs` calls it, so a
+/// plan that compares the bytes of the two sides (a hash join, an index
+/// search, an ephemeral index) could miss matches that the function finds.
+/// A custom-type column compared with a plain column or another expression,
+/// such as `numeric_col = int_col + 0`, also calls the type's `=` function
+/// (see [find_custom_type_operator]).
+///
+/// Two columns of the same built-in type with the same parameters are the
+/// exception: the type's `=` function finds two such values equal only when
+/// they have the same bytes. A user-defined `=` function can find `'1'` equal
+/// to `'01'`, and the same type with different parameters can store `1.00`
+/// and `1.000`.
+pub(crate) fn custom_type_eq_func_for_byte_compare(
+    lhs: &ast::Expr,
+    lhs_tables: &TableReferences,
+    rhs: &ast::Expr,
+    rhs_tables: &TableReferences,
+    resolver: &Resolver,
+) -> Option<String> {
+    custom_type_eq_for_byte_compare(lhs, lhs_tables, rhs, rhs_tables, resolver)
+        .map(|resolved| resolved.func_name)
+}
+
+/// Return whether an index search for `lhs = rhs` finds the rows that `=`
+/// finds. The search encodes the value it looks up with the column's type
+/// and parameters, then compares bytes. `=` encodes the other side the same
+/// way only when it is a literal; a built-in type's `=` then finds the two
+/// values equal only when they have the same bytes. Any other side, such as
+/// `?` or a subquery, reaches the `=` function unencoded, so
+/// `numeric(10,1) = 1.25` is false while the search would find `1.3`.
+pub(crate) fn index_search_matches_custom_type_eq(
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> bool {
+    custom_type_eq_for_byte_compare(lhs, tables, rhs, tables, resolver).is_none_or(|resolved| {
+        resolved
+            .encode_info
+            .is_some_and(|info| info.type_def.is_builtin)
+    })
+}
+
+/// The `=` operator of [custom_type_eq_func_for_byte_compare].
+fn custom_type_eq_for_byte_compare(
+    lhs: &ast::Expr,
+    lhs_tables: &TableReferences,
+    rhs: &ast::Expr,
+    rhs_tables: &TableReferences,
+    resolver: &Resolver,
+) -> Option<ResolvedOperator> {
+    let lhs_info = operand_custom_type(lhs, &TypeEnv::new(Some(lhs_tables), resolver), resolver);
+    let rhs_info = operand_custom_type(rhs, &TypeEnv::new(Some(rhs_tables), resolver), resolver);
+    if let (Some(lhs_info), Some(rhs_info)) = (&lhs_info, &rhs_info) {
+        if lhs_info.type_def.is_builtin
+            && same_type_def(&lhs_info.type_def, &rhs_info.type_def)
+            && lhs_info.params == rhs_info.params
+        {
+            return None;
+        }
+    }
+    resolve_custom_type_operator(
+        lhs,
+        lhs_info.as_ref(),
+        rhs,
+        rhs_info.as_ref(),
+        &ast::Operator::Equals,
+    )
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).

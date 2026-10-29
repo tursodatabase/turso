@@ -12,7 +12,8 @@ use crate::stats::AnalyzeStats;
 use crate::translate::collate::comparison_collation;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    as_binary_components, do_comparison_affinity, walk_expr, WalkControl,
+    as_binary_components, custom_type_eq_func_for_byte_compare, do_comparison_affinity, walk_expr,
+    WalkControl,
 };
 use crate::translate::expr_context::ExprContext;
 use crate::translate::optimizer::constraints::{
@@ -1251,6 +1252,9 @@ fn one_table_in_expr(expr: &ast::Expr) -> Option<TableInternalId> {
 /// Return the two tables used by one equal test.
 /// The two tables of an equal test that a hash join can use: each side reads
 /// one table, and the test compares with a collation that can be hashed.
+///
+/// A hash join compares keys byte for byte, so it cannot use a test between
+/// columns whose equal values can have different bytes.
 pub(super) fn tables_in_hashable_equal_test(
     expr: &ast::Expr,
     tables: &TableReferences,
@@ -1260,6 +1264,9 @@ pub(super) fn tables_in_hashable_equal_test(
         return Ok(None);
     };
     if !matches!(operator.as_ast_operator(), Some(ast::Operator::Equals)) {
+        return Ok(None);
+    }
+    if custom_type_eq_func_for_byte_compare(left, tables, right, tables, resolver).is_some() {
         return Ok(None);
     }
     let (Some(left_table), Some(right_table)) = (one_table_in_expr(left), one_table_in_expr(right))

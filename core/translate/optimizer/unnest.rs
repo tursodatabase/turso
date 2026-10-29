@@ -133,9 +133,9 @@ use crate::sync::Arc;
 use crate::translate::{
     emitter::Resolver,
     expr::{
-        expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-        expr_references_subquery_id, expression_can_fail_on_input, get_expr_affinity, walk_expr,
-        walk_expr_mut, WalkControl,
+        custom_type_eq_func_for_byte_compare, expr_contains_nondeterministic_scalar_function,
+        expr_references_any_subquery, expr_references_subquery_id, expression_can_fail_on_input,
+        get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
     },
     plan::{
         plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinOrigin, JoinType, JoinedTable,
@@ -1121,12 +1121,18 @@ fn read_column_pair(
 /// number `1` and the text `'1'` in two groups, while a numeric outer key joins
 /// to both. Either case would return the outer row twice. Use the grouped form
 /// only when both columns use the same number/text conversion rule and the same
-/// text order.
+/// text order. Grouping also compares values byte for byte, so it cannot be
+/// used for columns whose equal values can have different bytes.
 fn column_pair_compares_the_same(
     pair: &ColumnPair,
     tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<bool> {
+    if custom_type_eq_func_for_byte_compare(&pair.inner, tables, &pair.outer, tables, resolver)
+        .is_some()
+    {
+        return Ok(false);
+    }
     let affinity_metadata = TableMetadata::new(Some(tables));
     if get_expr_affinity(&pair.inner, &affinity_metadata)
         != get_expr_affinity(&pair.outer, &affinity_metadata)

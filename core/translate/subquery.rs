@@ -12,7 +12,7 @@ use super::{
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{comparison_affinity, custom_type_eq_func_for_byte_compare};
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
@@ -1006,6 +1006,7 @@ fn get_subquery_parser<'a>(
                 // for its NotFound/Found probes.
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
                 let mut lhs_exprs = Vec::with_capacity(lhs_column_count);
+                let mut custom_type_eq_funcs = Vec::with_capacity(lhs_column_count);
                 for (i, lhs_expr) in lhs_columns.enumerate() {
                     let lhs_affinity =
                         get_expr_affinity(lhs_expr, &TableMetadata::new(Some(referenced_tables)));
@@ -1018,8 +1019,16 @@ fn get_subquery_parser<'a>(
                         .aff_mask(),
                     );
                     lhs_exprs.push(lhs_expr);
+                    custom_type_eq_funcs.push(in_subquery_custom_type_eq_func(
+                        lhs_expr,
+                        referenced_tables,
+                        &plan,
+                        i,
+                        resolver,
+                    ));
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
+                let custom_type_eq_funcs: Arc<[Option<String>]> = custom_type_eq_funcs.into();
 
                 let columns = result_columns
                     .iter()
@@ -1074,6 +1083,7 @@ fn get_subquery_parser<'a>(
                     query_type: SubqueryType::In {
                         cursor_id,
                         affinity_str: in_affinity_str.clone(),
+                        custom_type_eq_funcs: custom_type_eq_funcs.clone(),
                     },
                 };
 
@@ -1083,6 +1093,7 @@ fn get_subquery_parser<'a>(
                     query_type: SubqueryType::In {
                         cursor_id,
                         affinity_str: in_affinity_str,
+                        custom_type_eq_funcs,
                     },
                     state: SubqueryState::Unevaluated {
                         plan: Some(Box::new(plan)),
@@ -1095,6 +1106,53 @@ fn get_subquery_parser<'a>(
                 Ok(WalkControl::Continue)
             }
             _ => Ok(WalkControl::Continue),
+        }
+    }
+}
+
+/// The `=` function of a custom type that `lhs IN (SELECT ...)` must call to
+/// compare `lhs` with result column `column` of the subquery (see
+/// [custom_type_eq_func_for_byte_compare]). For a compound SELECT, the first
+/// component SELECT that needs one decides.
+fn in_subquery_custom_type_eq_func(
+    lhs: &ast::Expr,
+    lhs_tables: &TableReferences,
+    plan: &Plan,
+    column: usize,
+    resolver: &Resolver,
+) -> Option<String> {
+    let select_eq_func = |select_plan: &SelectPlan| {
+        custom_type_eq_func_for_byte_compare(
+            lhs,
+            lhs_tables,
+            &select_plan.result_columns[column].expr,
+            &select_plan.table_references,
+            resolver,
+        )
+    };
+    match plan {
+        Plan::Select(select_plan) => select_eq_func(select_plan),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left
+            .iter()
+            .map(|(select_plan, _)| select_plan)
+            .chain(core::iter::once(right_most.as_ref()))
+            .find_map(select_eq_func),
+        Plan::RecursiveCte(plan) => {
+            in_subquery_custom_type_eq_func(lhs, lhs_tables, &plan.initial_query, column, resolver)
+                .or_else(|| {
+                    in_subquery_custom_type_eq_func(
+                        lhs,
+                        lhs_tables,
+                        &plan.recursive_query,
+                        column,
+                        resolver,
+                    )
+                })
+        }
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("an IN subquery is a SELECT")
         }
     }
 }
