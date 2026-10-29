@@ -202,6 +202,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn default_namespaces(&self) -> &'static [&'static str] {
+        &["public"]
+    }
+
     fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
         true
     }
@@ -3857,7 +3861,6 @@ mod tests {
     /// Connects like the frontend does: with the `public` schema in place
     /// and on the search path.
     fn connect_with_public(db: &Arc<Database>) -> Arc<Connection> {
-        crate::session::set_up_new_database(db).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.set_search_path(Some(vec!["public".to_string()]));
         conn

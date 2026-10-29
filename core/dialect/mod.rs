@@ -205,6 +205,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// The namespaces of a database that has never created or dropped one.
+    /// They have ids from 1 in this order and no rows until the first
+    /// CREATE SCHEMA or DROP SCHEMA creates the namespaces table, which then
+    /// stores them with the change.
+    ///
+    /// PostgreSQL has the schema public. SQLite has no namespaces.
+    fn default_namespaces(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether `INSERT ... ON CONFLICT DO UPDATE` fails when the conflicting
     /// row was already inserted or updated by the same statement.
     ///

@@ -798,6 +798,10 @@ pub struct Schema {
     /// under their mangled names, as the dialect of the database says.
     supports_namespaces: bool,
 
+    /// The namespaces of a database without a namespaces table, as the
+    /// dialect of the database says.
+    default_namespaces: &'static [&'static str],
+
     /// Whether the names of the namespaces are loaded. They come from the
     /// namespaces table, which is read after the schema rows.
     namespace_names_loaded: bool,
@@ -997,6 +1001,7 @@ impl Schema {
             dropped_root_pages: HashSet::default(),
             type_registry,
             supports_namespaces: dialect.supports_namespaces(),
+            default_namespaces: dialect.default_namespaces(),
             namespace_names_loaded: !dialect.supports_namespaces(),
             pending_materialized_views: None,
         };
@@ -1084,10 +1089,18 @@ impl Schema {
 
     /// Records the names of the namespaces from the `(id, name)` rows of the
     /// namespaces table, and builds the materialized views that waited for
-    /// them. A schema that does not support namespaces has none.
+    /// them. A database without a namespaces table has the default
+    /// namespaces. A schema that does not support namespaces has none.
     pub fn load_namespace_names(&mut self, rows: &[(i64, String)]) -> Result<()> {
         if !self.supports_namespaces {
             return Ok(());
+        }
+        if !self.has_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME) {
+            turso_assert!(rows.is_empty(), "namespace rows without a namespaces table");
+            for (index, name) in self.default_namespaces.iter().enumerate() {
+                let id = u32::try_from(index + 1).expect("few default namespaces");
+                self.name_namespace(NamespaceId::new(id), name);
+            }
         }
         for (id, name) in rows {
             let id = u32::try_from(*id)
@@ -4097,6 +4110,7 @@ impl TryClone for Schema {
             schema_version: self.schema_version,
             analyze_stats: self.analyze_stats.clone(),
             supports_namespaces: self.supports_namespaces,
+            default_namespaces: self.default_namespaces,
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
