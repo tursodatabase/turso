@@ -1361,7 +1361,6 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                 joined_tables,
                 constraints,
                 order_target,
-                schema,
             ),
             _ => false,
         };
@@ -1602,7 +1601,6 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                                 joined_tables,
                                 constraints,
                                 order_target,
-                                schema,
                             )
                         } else {
                             false
@@ -1652,7 +1650,6 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                                 joined_tables,
                                 constraints,
                                 order_target,
-                                schema,
                             )
                         } else {
                             false

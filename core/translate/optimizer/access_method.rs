@@ -309,7 +309,6 @@ pub(super) fn choose_best_btree_candidate(
                     &usable_constraint_refs,
                     order_target,
                     0,
-                    schema,
                     EqualityPrefixScope::AnyEquality,
                 )
                 .consumed
@@ -321,7 +320,6 @@ pub(super) fn choose_best_btree_candidate(
                     &usable_constraint_refs,
                     order_target,
                     0,
-                    schema,
                     EqualityPrefixScope::AnyEquality,
                 )
                 .consumed
@@ -822,7 +820,6 @@ pub fn find_best_access_method_for_join_order(
             join_order,
             planning_context,
             ready_where,
-            schema,
             input_cardinality,
             base_row_count,
             params,
@@ -1749,7 +1746,6 @@ fn intrinsic_subquery_scan_direction(
     subquery: &FromClauseSubquery,
     maybe_order_target: Option<&OrderTarget>,
     table_materialization_required: bool,
-    schema: &Schema,
 ) -> Option<IterationDirection> {
     let order_target = maybe_order_target?;
     let cols = &order_target.columns;
@@ -1759,7 +1755,6 @@ fn intrinsic_subquery_scan_direction(
         subquery,
         IterationDirection::Forwards,
         cols,
-        schema,
     ) == cols.len();
     if matches_forwards {
         return Some(IterationDirection::Forwards);
@@ -1771,7 +1766,6 @@ fn intrinsic_subquery_scan_direction(
             subquery,
             IterationDirection::Backwards,
             cols,
-            schema,
         ) == cols.len();
     matches_backwards.then_some(IterationDirection::Backwards)
 }
@@ -1790,7 +1784,6 @@ fn find_best_access_method_for_subquery(
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
     ready_where: &[(usize, usize)],
-    schema: &Schema,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
@@ -1910,7 +1903,6 @@ fn find_best_access_method_for_subquery(
             subquery,
             maybe_order_target,
             table_materialization_required,
-            schema,
         ) {
             return Ok(Some(AccessMethod {
                 cost: scan_cost,
@@ -2002,7 +1994,6 @@ fn find_best_access_method_for_subquery(
             &ephemeral_index,
             &usable_constraint_refs,
             maybe_order_target,
-            schema,
             base_row_count,
             params,
         );
@@ -2183,7 +2174,6 @@ fn materialized_subquery_order_properties(
     index: &Arc<Index>,
     constraint_refs: &[RangeConstraintRef],
     maybe_order_target: Option<&OrderTarget>,
-    schema: &Schema,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> (IterationDirection, bool, Cost) {
@@ -2200,7 +2190,6 @@ fn materialized_subquery_order_properties(
         constraint_refs,
         order_target,
         0,
-        schema,
         EqualityPrefixScope::AnyEquality,
     )
     .consumed
@@ -2212,7 +2201,6 @@ fn materialized_subquery_order_properties(
         constraint_refs,
         order_target,
         0,
-        schema,
         EqualityPrefixScope::AnyEquality,
     )
     .consumed

@@ -4,7 +4,7 @@ use turso_parser::ast;
 
 use crate::{
     function::{AccumulatorFunc, AggFunc},
-    schema::Table,
+    schema::{ResolvedType, Table},
     sync::Arc,
     translate::collate::CollationSeq,
     vdbe::{
@@ -17,8 +17,9 @@ use crate::{
 use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
     expr::{
-        resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        emit_presentation_form, emit_stored_form, resolve_expr, stored_comparison_type,
+        translate_compared_expr, translate_condition_expr, translate_expr,
+        translate_expr_no_constant_opt, ConditionMetadata, NoConstantOptReason,
     },
     plan::{
         Aggregate, Distinctness, EvalAt, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
@@ -329,6 +330,81 @@ impl<'a> AggArgumentSource<'a> {
             }
         }
     }
+
+    /// [Self::translate] for an argument that compares with the other values
+    /// of the aggregate, in the stored form of `compared_as` when it is a
+    /// custom type (see [translate_compared_expr]).
+    fn translate_compared(
+        &self,
+        program: &mut ProgramBuilder,
+        referenced_tables: &TableReferences,
+        resolver: &Resolver,
+        arg_idx: usize,
+        compared_as: Option<&ResolvedType>,
+    ) -> Result<usize> {
+        let Some(compared_as) = compared_as else {
+            return self.translate(program, referenced_tables, resolver, arg_idx);
+        };
+        let reg = program.alloc_register();
+        match self {
+            AggArgumentSource::Register {
+                src_reg_start: start_reg,
+                ..
+            } => {
+                program.emit_insn(Insn::Copy {
+                    src_reg: *start_reg + arg_idx,
+                    dst_reg: reg,
+                    extra_amount: 0,
+                });
+                emit_stored_form(program, reg, compared_as, resolver)?;
+            }
+            AggArgumentSource::Expression { args, .. } => {
+                translate_compared_expr(
+                    program,
+                    Some(referenced_tables),
+                    &args[arg_idx],
+                    reg,
+                    resolver,
+                    Some(compared_as),
+                )?;
+            }
+        }
+        Ok(reg)
+    }
+}
+
+/// The custom type whose stored form the values of a min or max aggregate
+/// compare in. The aggregate keeps the stored value, and its result is decoded
+/// when it is finalized (see [emit_aggregate_result_presentation_form]), so
+/// `max(c)` is the value `ORDER BY c DESC` puts first.
+pub(crate) fn aggregate_stored_comparison_type(
+    func: &AggFunc,
+    args: &[ast::Expr],
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    match (func, args) {
+        (AggFunc::Min | AggFunc::Max, [arg]) => {
+            stored_comparison_type([arg], Some(referenced_tables), resolver)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Decodes the finalized result in `reg` of an aggregate whose values compare
+/// in a custom type's stored form.
+pub(crate) fn emit_aggregate_result_presentation_form(
+    program: &mut ProgramBuilder,
+    func: &AggFunc,
+    args: &[ast::Expr],
+    referenced_tables: &TableReferences,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if let Some(ty) = aggregate_stored_comparison_type(func, args, referenced_tables, resolver)? {
+        emit_presentation_form(program, reg, &ty, resolver)?;
+    }
+    Ok(())
 }
 
 pub fn emit_aggregate_step(
@@ -468,7 +544,14 @@ pub fn emit_aggregate_final(
         register: target_register,
         func: AccumulatorFunc::Agg(aggregate.func.clone()),
     });
-    Ok(())
+    emit_aggregate_result_presentation_form(
+        program,
+        &aggregate.func,
+        &aggregate.args,
+        tables,
+        target_register,
+        resolver,
+    )
 }
 
 pub(crate) fn open_aggregate_sorter(
@@ -608,13 +691,25 @@ pub fn translate_aggregation_step(
 
             target_register
         }
-        AggFunc::Max => {
+        AggFunc::Max | AggFunc::Min => {
             if num_args != 1 {
-                crate::bail_parse_error!("max bad number of arguments");
+                crate::bail_parse_error!("{} bad number of arguments", func.as_str());
             }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
+            let expr = agg_arg_source.arg_at(0);
+            let compared_as = aggregate_stored_comparison_type(
+                func,
+                std::slice::from_ref(expr),
+                referenced_tables,
+                resolver,
+            )?;
+            let expr_reg = agg_arg_source.translate_compared(
+                program,
+                referenced_tables,
+                resolver,
+                0,
+                compared_as.as_ref(),
+            )?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
-            let expr = &agg_arg_source.arg_at(0);
             let arg_collation =
                 ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
             program.emit_insn(Insn::AggStep {
@@ -622,27 +717,7 @@ pub fn translate_aggregation_step(
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
-                    func: AccumulatorFunc::Agg(AggFunc::Max),
-                    collation: arg_collation,
-                }),
-            });
-            target_register
-        }
-        AggFunc::Min => {
-            if num_args != 1 {
-                crate::bail_parse_error!("min bad number of arguments");
-            }
-            let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
-            let expr = &agg_arg_source.arg_at(0);
-            let arg_collation =
-                ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
-            program.emit_insn(Insn::AggStep {
-                data: Box::new(AggStepData {
-                    acc_reg: target_register,
-                    col: expr_reg,
-                    delimiter: 0,
-                    func: AccumulatorFunc::Agg(AggFunc::Min),
+                    func: AccumulatorFunc::Agg(func.clone()),
                     collation: arg_collation,
                 }),
             });

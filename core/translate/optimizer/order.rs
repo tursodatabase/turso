@@ -3,10 +3,11 @@ use crate::translate::expr_context::ExprContext;
 use crate::turso_assert_greater_than_or_equal;
 use crate::Result;
 use crate::{
-    schema::{FromClauseSubquery, Index, Schema},
+    schema::{FromClauseSubquery, Index},
     translate::{
         collate::CollationSeq,
         emitter::Resolver,
+        expr::stored_comparison_type,
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::{
@@ -191,8 +192,17 @@ pub fn compute_order_target(
                     .iter()
                     .any(|group_by_expr| exprs_are_equivalent(expr, group_by_expr))
             });
+            // The GROUP BY sorter sorts a custom type by the values it reads
+            // as, but ORDER BY sorts it by its stored form (see
+            // `stored_comparison_type`), so the groups can't stand in for the
+            // ORDER BY sort.
+            let mut order_by_compares_stored_form = false;
+            for (expr, _, _) in order_by.iter() {
+                order_by_compares_stored_form |=
+                    stored_comparison_type([expr.as_ref()], Some(tables), resolver)?.is_some();
+            }
             // If not, let's try to target an ordering that matches the group by -- we don't care about ASC/DESC
-            if !group_by_contains_all {
+            if !group_by_contains_all || order_by_compares_stored_form {
                 return OrderTarget::maybe_from_iterator(
                     group_by
                         .exprs
@@ -255,7 +265,6 @@ pub fn plan_satisfies_order_target(
     joined_tables: &[JoinedTable],
     table_constraints: &[TableConstraints],
     order_target: &OrderTarget,
-    schema: &Schema,
 ) -> bool {
     // SQLite always sorts after a RIGHT JOIN or FULL JOIN. The unmatched
     // right rows run after the normal loops, so no scan order is sufficient.
@@ -345,7 +354,6 @@ pub fn plan_satisfies_order_target(
                         &constraint_refs,
                         order_target,
                         target_col_idx,
-                        schema,
                     )
                 } else {
                     btree_access_order_consumed(
@@ -355,7 +363,6 @@ pub fn plan_satisfies_order_target(
                         constraint_refs,
                         order_target,
                         target_col_idx,
-                        schema,
                         EqualityPrefixScope::ConstantEquality,
                     )
                 }
@@ -371,7 +378,6 @@ pub fn plan_satisfies_order_target(
                 constraint_refs,
                 order_target,
                 target_col_idx,
-                schema,
                 EqualityPrefixScope::ConstantEquality,
             ),
             AccessMethodParams::Subquery { iter_dir } => {
@@ -386,7 +392,6 @@ pub fn plan_satisfies_order_target(
                         from_clause_subquery,
                         *iter_dir,
                         &order_target.columns[target_col_idx..],
-                        schema,
                     ),
                     includes_rowid: false,
                 }
@@ -476,7 +481,6 @@ pub fn subquery_intrinsic_order_consumed(
     subquery: &FromClauseSubquery,
     iter_dir: IterationDirection,
     target: &[ColumnOrder],
-    schema: &Schema,
 ) -> usize {
     let Plan::Select(select_plan) = subquery.plan.as_ref() else {
         // Don't consider sort elision for compound selects
@@ -520,7 +524,6 @@ pub fn subquery_intrinsic_order_consumed(
         &subquery.columns,
         iter_dir,
         target,
-        schema,
     )
 }
 
@@ -608,7 +611,6 @@ fn finalized_scan_subquery_order_consumed(
     subquery_columns: &[Column],
     iter_dir: IterationDirection,
     target: &[ColumnOrder],
-    schema: &Schema,
 ) -> usize {
     if select_plan.group_by.is_some()
         || !select_plan.aggregates.is_empty()
@@ -691,7 +693,6 @@ fn finalized_scan_subquery_order_consumed(
                     purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
                 },
                 0,
-                schema,
                 EqualityPrefixScope::ConstantEquality,
             )
             .consumed
@@ -705,7 +706,6 @@ fn finalized_scan_subquery_order_consumed(
                 from_clause_subquery,
                 effective_iter_dir,
                 &mapped_target,
-                schema,
             )
         }
         _ => 0,
@@ -854,7 +854,6 @@ pub(super) fn btree_access_order_consumed(
     constraint_refs: &[RangeConstraintRef],
     order_target: &OrderTarget,
     start_col: usize,
-    schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
 ) -> OrderConsumption {
     let target_columns = &order_target.columns[start_col..];
@@ -902,7 +901,6 @@ pub(super) fn btree_access_order_consumed(
             constraint_refs,
             order_target,
             target_columns,
-            schema,
             equality_prefix_scope,
             index.columns.iter().map(|column| IndexOrderColumn {
                 pos_in_table: column.pos_in_table,
@@ -925,7 +923,6 @@ fn temporary_index_order_consumed(
     constraint_refs: &[RangeConstraintRef],
     order_target: &OrderTarget,
     start_col: usize,
-    schema: &Schema,
 ) -> OrderConsumption {
     let target_columns = &order_target.columns[start_col..];
     if target_columns.is_empty() {
@@ -970,7 +967,6 @@ fn temporary_index_order_consumed(
         constraint_refs,
         order_target,
         target_columns,
-        schema,
         EqualityPrefixScope::ConstantEquality,
         index_columns,
         column_count,
@@ -987,7 +983,6 @@ fn index_columns_order_consumed<'a>(
     constraint_refs: &[RangeConstraintRef],
     order_target: &OrderTarget,
     target_columns: &[ColumnOrder],
-    schema: &Schema,
     equality_prefix_scope: EqualityPrefixScope,
     index_columns: impl Iterator<Item = IndexOrderColumn<'a>>,
     column_count: usize,
@@ -1030,14 +1025,6 @@ fn index_columns_order_consumed<'a>(
 
         if !target_matches_order_column(target_col, idx_col, table_ref) {
             break;
-        }
-
-        if let ColumnTarget::Column(col_no) = &target_col.target {
-            if let Some(col) = table_ref.table.columns().get(*col_no) {
-                if col.index_order_differs_from_value_order(schema, table_ref.table.is_strict()) {
-                    break;
-                }
-            }
         }
 
         if target_col.collation != idx_col.collation {

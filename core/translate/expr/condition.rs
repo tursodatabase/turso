@@ -53,7 +53,24 @@ pub(super) fn translate_in_list(
 ) -> Result<()> {
     let lhs_arity = expr_vector_size(lhs)?;
     let lhs_reg = program.alloc_registers(lhs_arity);
-    let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
+    let compared_as = if lhs_arity == 1 {
+        stored_comparison_type(
+            std::iter::once(lhs).chain(rhs.iter().map(|item| item.as_ref())),
+            referenced_tables,
+            resolver,
+        )?
+    } else {
+        None
+    };
+    let compared_as = compared_as.as_ref();
+    let _ = translate_compared_expr(
+        program,
+        referenced_tables,
+        lhs,
+        lhs_reg,
+        resolver,
+        compared_as,
+    )?;
     let mut check_null_reg = 0;
     let mut check_null_in_row_values_reg = 0;
     let label_ok = program.allocate_label();
@@ -96,7 +113,14 @@ pub(super) fn translate_in_list(
     for (i, expr) in rhs.iter().enumerate() {
         let last_condition = i == rhs.len() - 1;
         let rhs_reg = program.alloc_registers(lhs_arity);
-        let _ = translate_expr(program, referenced_tables, expr, rhs_reg, resolver)?;
+        let _ = translate_compared_expr(
+            program,
+            referenced_tables,
+            expr,
+            rhs_reg,
+            resolver,
+            compared_as,
+        )?;
 
         if lhs_arity == 1 {
             // Scalar comparison path

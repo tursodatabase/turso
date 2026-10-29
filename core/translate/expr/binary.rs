@@ -122,12 +122,25 @@ pub(super) fn emit_binary_expr_scalar(
     resolver: &Resolver,
     emit_mode: BinaryEmitMode,
 ) -> Result<usize> {
+    let compared_as = if op.is_comparison() {
+        stored_comparison_type([e1, e2], referenced_tables, resolver)?
+    } else {
+        None
+    };
+    let compared_as = compared_as.as_ref();
     // Equivalent expressions are reusable only when each occurrence is deterministic.
     if exprs_are_equivalent(e1, e2)
         && !expr_contains_nondeterministic_scalar_function(e1, resolver)?
     {
         let shared_reg = program.alloc_register();
-        translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
+        translate_compared_expr(
+            program,
+            referenced_tables,
+            e1,
+            shared_reg,
+            resolver,
+            compared_as,
+        )?;
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -159,8 +172,22 @@ pub(super) fn emit_binary_expr_scalar(
         let e1_reg = program.alloc_registers(2);
         let e2_reg = e1_reg + 1;
 
-        translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-        translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+        translate_compared_expr(
+            program,
+            referenced_tables,
+            e1,
+            e1_reg,
+            resolver,
+            compared_as,
+        )?;
+        translate_compared_expr(
+            program,
+            referenced_tables,
+            e2,
+            e2_reg,
+            resolver,
+            compared_as,
+        )?;
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
