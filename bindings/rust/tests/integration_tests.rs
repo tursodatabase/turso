@@ -2873,3 +2873,36 @@ async fn test_transactional_batch_joins_an_open_transaction() {
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 0);
 }
+
+/// A constraint failure in an UPSERT's DO UPDATE arm, or in a trigger fired
+/// under an explicit OR ABORT, carries its own conflict resolution. It is
+/// still a constraint failure, so it must reach the caller as one.
+#[tokio::test]
+async fn test_constraint_failure_with_its_own_conflict_resolution_is_constraint_error() {
+    let cases = [
+        (
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, c INT UNIQUE); \
+             INSERT INTO t VALUES (1,1,10), (2,2,20);",
+            "INSERT OR FAIL INTO t VALUES (10,5,50), (11,1,60) \
+             ON CONFLICT(u) DO UPDATE SET c = 20",
+        ),
+        (
+            "CREATE TABLE p(a INTEGER PRIMARY KEY, b INT); \
+             CREATE TABLE log(x INT UNIQUE); \
+             INSERT INTO log VALUES (7); \
+             CREATE TRIGGER tp AFTER UPDATE ON p BEGIN INSERT INTO log VALUES (NEW.b); END; \
+             INSERT INTO p VALUES (1,1);",
+            "UPDATE OR ABORT p SET b = 7",
+        ),
+    ];
+    for (setup, failing) in cases {
+        let conn = memory_connection().await;
+        conn.execute_batch(setup).await.unwrap();
+        match conn.execute(failing, ()).await {
+            Err(Error::Constraint(message)) => {
+                assert!(message.contains("UNIQUE constraint failed"), "{message}")
+            }
+            other => panic!("{failing}: expected a constraint error, got {other:?}"),
+        }
+    }
+}

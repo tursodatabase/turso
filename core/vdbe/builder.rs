@@ -940,8 +940,9 @@ impl ProgramBuilder {
     /// clause is applied through the program's resolve_type, except in a
     /// trigger: its program holds every trigger step, each with its own OR
     /// clause, so each Halt carries its step's resolve type, as in SQLite.
-    /// A trigger fired by an UPSERT's DO UPDATE runs with ABORT, which must
-    /// also be carried, or the error takes the outer statement's OR clause.
+    /// A trigger fired with an ABORT override (by an UPSERT's DO UPDATE, or
+    /// by an explicit OR ABORT) carries ABORT too, or under DO UPDATE the
+    /// error would take the outer statement's OR clause.
     pub fn constraint_halt_on_error(&self, effective: ResolveType) -> Option<ResolveType> {
         if self.flags.has_statement_conflict() && self.trigger.is_none() {
             return None;
