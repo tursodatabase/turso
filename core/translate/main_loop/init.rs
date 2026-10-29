@@ -1,6 +1,7 @@
 use super::*;
 use crate::alloc::TursoIteratorExt;
 use crate::function::AggFunc;
+use crate::translate::expr_context::ExprContext;
 
 pub fn init_distinct(
     program: &mut ProgramBuilder,
@@ -10,7 +11,9 @@ pub fn init_distinct(
     let collations = plan
         .result_columns
         .iter()
-        .map(|col| expr_collation(&col.expr, Some(&plan.table_references), resolver))
+        .map(|col| {
+            ExprContext::new(Some(&plan.table_references), resolver).expr_collation(&col.expr)
+        })
         .collect::<Result<Vec<_>>>()?;
     DistinctCtx::new(program, collations)
 }
@@ -84,7 +87,8 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
-            let collations = vec![expr_collation(&agg.args[0], Some(tables), &t_ctx.resolver)?];
+            let collations =
+                vec![ExprContext::new(Some(tables), &t_ctx.resolver).expr_collation(&agg.args[0])?];
             let ctx = DistinctCtx::new(program, collations)?;
             let hash_table_id = ctx.hash_table_id;
             agg.distinctness = Distinctness::Distinct { ctx: Some(ctx) };

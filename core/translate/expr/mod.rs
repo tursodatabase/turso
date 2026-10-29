@@ -4,8 +4,9 @@ use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
-use super::collate::{comparison_collation, expr_collation, first_collation, CollationSeq};
+use super::collate::{comparison_collation, first_collation, CollationSeq};
 use super::emitter::Resolver;
+use super::expr_context::{ExprContext, ExprProperties};
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]

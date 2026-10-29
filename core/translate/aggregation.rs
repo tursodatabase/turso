@@ -1,4 +1,8 @@
 use crate::alloc::TursoVecExt;
+use crate::translate::{
+    catalog::CatalogContext,
+    expr_context::{ExprContext, ExprProperties},
+};
 use turso_parser::ast;
 
 use crate::{
@@ -619,7 +623,8 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = expr_collation(expr, Some(referenced_tables), resolver)?;
+            let arg_collation =
+                ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
@@ -641,7 +646,8 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = expr_collation(expr, Some(referenced_tables), resolver)?;
+            let arg_collation =
+                ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
@@ -781,7 +787,12 @@ pub fn translate_aggregation_step(
             let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             // Activate the value's collation so finalize can sort text correctly.
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = ordered_set_collation(func, expr, referenced_tables, resolver)?;
+            let arg_collation = ordered_set_collation(
+                func,
+                expr,
+                &ExprContext::new(Some(referenced_tables), resolver),
+                &resolver.catalog,
+            )?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -806,7 +817,12 @@ pub fn translate_aggregation_step(
             let fraction_reg =
                 fraction_reg.expect("percentile fraction register must be set by InitLoop::emit");
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = ordered_set_collation(func, expr, referenced_tables, resolver)?;
+            let arg_collation = ordered_set_collation(
+                func,
+                expr,
+                &ExprContext::new(Some(referenced_tables), resolver),
+                &resolver.catalog,
+            )?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -871,10 +887,10 @@ pub fn translate_aggregation_step(
 fn ordered_set_collation(
     func: &AggFunc,
     expr: &ast::Expr,
-    referenced_tables: &TableReferences,
-    resolver: &Resolver,
+    metadata: &impl ExprProperties,
+    catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
-    let collation = expr_collation(expr, Some(referenced_tables), resolver)?;
+    let collation = expr_collation(expr, metadata, catalog)?;
     if collation.is_custom() {
         crate::bail_parse_error!(
             "{}() does not support the custom collation {}",
