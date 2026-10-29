@@ -278,12 +278,12 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
 
     reject_sqlite_catalog_access(sql)?;
 
-    if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
+    let parse_result =
+        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
         return Ok(stmt);
     }
 
-    let parse_result =
-        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
     let rewritten_sql = if let Some((location, schema)) =
         create_table_schema_from_search_path(pg_conn, &parse_result)?
     {
@@ -732,28 +732,23 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
 
 fn try_prepare_special(
     pg_conn: &Arc<PgConnectionInner>,
-    sql: &str,
+    parse_result: &turso_pg_parser::ParseResult,
 ) -> Result<Option<crate::Statement>> {
-    let parse_result = match turso_pg_parser::parse(sql) {
-        Ok(result) => result,
-        Err(_) => return Ok(None),
-    };
-
-    if let Some(set_stmt) = try_extract_set(&parse_result) {
+    if let Some(set_stmt) = try_extract_set(parse_result) {
         let stmt = handle_pg_set(pg_conn, &set_stmt)?;
         return Ok(Some(crate::Statement::new(stmt)));
     }
 
-    if check_set_transaction(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))? {
+    if check_set_transaction(parse_result).map_err(|e| translation_error(&pg_conn.conn, e))? {
         return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
-    if let Some(show_stmt) = try_extract_show(&parse_result) {
+    if let Some(show_stmt) = try_extract_show(parse_result) {
         let stmt = handle_pg_show(pg_conn, &show_stmt)?;
         return Ok(Some(crate::Statement::new(stmt)));
     }
 
-    if is_reset_all(&parse_result) {
+    if is_reset_all(parse_result) {
         let inner = noop_statement(&pg_conn.conn)?;
         let conn = Arc::clone(&pg_conn.conn);
         return Ok(Some(crate::Statement::with_deferred(
@@ -762,7 +757,7 @@ fn try_prepare_special(
         )));
     }
 
-    if is_discard_all(&parse_result) {
+    if is_discard_all(parse_result) {
         let inner = noop_statement(&pg_conn.conn)?;
         let conn = Arc::clone(&pg_conn.conn);
         return Ok(Some(crate::Statement::with_deferred(
@@ -772,7 +767,7 @@ fn try_prepare_special(
     }
 
     if let Some(stmt) =
-        try_extract_create_schema(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
+        try_extract_create_schema(parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     {
         let inner = noop_statement(&pg_conn.conn)?;
         let pg_conn = Arc::clone(pg_conn);
@@ -782,7 +777,7 @@ fn try_prepare_special(
         )));
     }
 
-    if let Some(stmt) = try_extract_drop_schema(&parse_result) {
+    if let Some(stmt) = try_extract_drop_schema(parse_result) {
         let inner = noop_statement(&pg_conn.conn)?;
         let conn = Arc::clone(&pg_conn.conn);
         return Ok(Some(crate::Statement::with_deferred(
@@ -791,16 +786,16 @@ fn try_prepare_special(
         )));
     }
 
-    if is_refresh_matview(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))? {
+    if is_refresh_matview(parse_result).map_err(|e| translation_error(&pg_conn.conn, e))? {
         return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
-    if is_comment_on(&parse_result) {
+    if is_comment_on(parse_result) {
         return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
     }
 
     if let Some(stmt) =
-        try_extract_copy_from(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
+        try_extract_copy_from(parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     {
         let inner = noop_statement(&pg_conn.conn)?;
         let conn = Arc::clone(&pg_conn.conn);
