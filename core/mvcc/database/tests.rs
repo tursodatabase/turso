@@ -309,7 +309,7 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
         1,
         Some(TxTimestampOrID::TxID(tx_id)),
         None,
-        row.clone(),
+        row.data.clone(),
         true,
     );
     assert!(!rollback_restores_rowid(tx_id, &replacement));
@@ -318,7 +318,7 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
         2,
         Some(TxTimestampOrID::Timestamp(1)),
         Some(TxTimestampOrID::TxID(tx_id)),
-        row.clone(),
+        row.data.clone(),
         true,
     );
     assert!(rollback_restores_rowid(tx_id, &deleted_existing_row));
@@ -327,7 +327,7 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
         3,
         None,
         Some(TxTimestampOrID::TxID(tx_id)),
-        row.clone(),
+        row.data.clone(),
         true,
     );
     assert!(rollback_restores_rowid(tx_id, &deleted_btree_row));
@@ -336,7 +336,7 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
         4,
         Some(TxTimestampOrID::TxID(tx_id)),
         Some(TxTimestampOrID::TxID(tx_id)),
-        row.clone(),
+        row.data.clone(),
         true,
     );
     assert!(rollback_restores_rowid(tx_id, &deleted_replacement));
@@ -345,7 +345,7 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
         5,
         Some(TxTimestampOrID::TxID(tx_id)),
         Some(TxTimestampOrID::TxID(tx_id)),
-        row,
+        row.data,
         false,
     );
     assert!(!rollback_restores_rowid(tx_id, &inserted_then_deleted));
@@ -411,7 +411,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
         id: 1,
         begin: PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
         end: PackedTs::pack(None),
-        row: Row::new_table_row(row_id.clone(), &[]).unwrap(),
+        data: Row::new_table_row(row_id.clone(), &[]).unwrap().data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -2454,7 +2454,7 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
         id: 1,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: generate_simple_string_row(table_id, 1, "data"),
+        data: generate_simple_string_row(table_id, 1, "data").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -2473,15 +2473,26 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
         id: 2,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: Row::new_table_row(
+        data: Row::new_table_row(
             RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
             schema_record.as_blob(),
         )
-        .unwrap(),
+        .unwrap()
+        .data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
-    let tx = LogRecord::for_test(commit_ts, &[data_version, schema_version], None);
+    let tx = LogRecord::for_test(
+        commit_ts,
+        &[
+            (RowID::new(table_id, RowKey::Int(1)), data_version),
+            (
+                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
+                schema_version,
+            ),
+        ],
+        None,
+    );
 
     let mut log = LogicalLog::new(file.clone(), io.clone(), None);
     let c = log.log_tx(tx).unwrap();
@@ -8038,7 +8049,7 @@ fn test_snapshot_isolation_tx_visible1() {
             id: 0, // Dummy ID for visibility tests
             begin: crate::mvcc::database::PackedTs::pack(begin),
             end: crate::mvcc::database::PackedTs::pack(end),
-            row: generate_simple_string_row((-2).into(), 1, "testme"),
+            data: generate_simple_string_row((-2).into(), 1, "testme").data,
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
@@ -8139,7 +8150,7 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
         id: 1,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: generate_simple_string_row((-2).into(), 1, "x"),
+        data: generate_simple_string_row((-2).into(), 1, "x").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8152,7 +8163,7 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
         id: 2,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(1))),
         end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
-        row: generate_simple_string_row((-2).into(), 2, "y"),
+        data: generate_simple_string_row((-2).into(), 2, "y").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8260,7 +8271,7 @@ fn test_commit_dependency_speculative_read() {
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: generate_simple_string_row((-2).into(), 1, "test"),
+        data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8293,7 +8304,7 @@ fn test_commit_dependency_cascade_abort() {
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: generate_simple_string_row((-2).into(), 1, "test"),
+        data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8369,7 +8380,7 @@ fn test_commit_dependency_speculative_ignore() {
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(2))),
         end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(3))),
-        row: generate_simple_string_row((-2).into(), 1, "test"),
+        data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8451,7 +8462,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
         id: 20,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(5))),
         end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(writer_id))),
-        row: Row::new_index_row(row_id),
+        data: Row::new_index_row(row_id).data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8506,7 +8517,7 @@ fn test_commit_dependency_multiple_reads_dedup() {
         id: row_id as u64,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: generate_simple_string_row((-2).into(), row_id, "test"),
+        data: generate_simple_string_row((-2).into(), row_id, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -11215,7 +11226,7 @@ fn make_rv(begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>) -> RowV
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(begin),
         end: crate::mvcc::database::PackedTs::pack(end),
-        row: generate_simple_string_row((-2).into(), 1, "gc_test"),
+        data: generate_simple_string_row((-2).into(), 1, "gc_test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     }
@@ -12090,7 +12101,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(begin),
         end: crate::mvcc::database::PackedTs::pack(end),
-        row: generate_simple_string_row((-2).into(), 1, "shrink"),
+        data: generate_simple_string_row((-2).into(), 1, "shrink").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -12198,20 +12209,34 @@ fn test_short_version_chain_has_no_unused_capacity() {
 #[test]
 fn test_row_version_size() {
     assert_eq!(std::mem::size_of::<WalPos>(), 12);
-    assert_eq!(std::mem::size_of::<RowVersion>(), 80);
+    assert_eq!(std::mem::size_of::<RowVersion>(), 56);
 }
 
-/// A row does not store its column count. It reads the count from its record,
-/// and a tombstone with an empty payload has no columns.
+/// A version does not store its column count. It reads the count from its
+/// record, and a tombstone with an empty payload has no columns.
 #[test]
-fn test_row_column_count_comes_from_the_record() {
+fn test_row_version_column_count_comes_from_the_record() {
     let id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
     let record =
         ImmutableRecord::from_values(&[Value::from_i64(7), Value::build_text("seven")], 2).unwrap();
     let row = Row::new_table_row(id.clone(), record.as_blob()).unwrap();
-    assert_eq!(row.column_count(), 2);
-    let tombstone = Row::new_table_row(id, &[]).unwrap();
-    assert_eq!(tombstone.column_count(), 0);
+    let version = RowVersion::new(
+        1,
+        Some(TxTimestampOrID::Timestamp(1)),
+        None,
+        row.data,
+        false,
+    );
+    assert_eq!(version.column_count(&id), 2);
+    let empty = Row::new_table_row(id.clone(), &[]).unwrap();
+    let tombstone = RowVersion::new(
+        2,
+        None,
+        Some(TxTimestampOrID::Timestamp(2)),
+        empty.data,
+        true,
+    );
+    assert_eq!(tombstone.column_count(&id), 0);
 }
 
 /// A tombstone over a B-tree row keeps a copy of the deleted row only for the
@@ -12259,7 +12284,7 @@ fn test_tombstone_keeps_deleted_row_only_for_sqlite_schema() {
         };
         assert!(tombstone.begin().is_none());
         assert!(tombstone.btree_resident);
-        tombstone.row.payload().len()
+        tombstone.payload(row_id).len()
     };
     assert_eq!(tombstone_payload_len(&user_row), 0);
     assert!(tombstone_payload_len(&schema_row) > 0);
@@ -13820,7 +13845,7 @@ fn arbitrary_row_version(g: &mut Gen) -> RowVersion {
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(begin),
         end: crate::mvcc::database::PackedTs::pack(end),
-        row: generate_simple_string_row((-2).into(), 1, "qc"),
+        data: generate_simple_string_row((-2).into(), 1, "qc").data,
         btree_resident: bool::arbitrary(g),
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     }
@@ -21326,11 +21351,12 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         fn serialize_row_version(
             &self,
             log_record: &mut LogRecord,
+            row_id: &RowID,
             row_version: &RowVersion,
             portable_extension: Option<&[u8]>,
         ) -> Result<()> {
             self.inner
-                .serialize_row_version(log_record, row_version, portable_extension)
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
         }
         fn serialize_database_header(
             &self,
@@ -21547,11 +21573,12 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         fn serialize_row_version(
             &self,
             log_record: &mut LogRecord,
+            row_id: &RowID,
             row_version: &RowVersion,
             portable_extension: Option<&[u8]>,
         ) -> Result<()> {
             self.inner
-                .serialize_row_version(log_record, row_version, portable_extension)
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
         }
         fn serialize_database_header(
             &self,
@@ -23825,11 +23852,12 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         fn serialize_row_version(
             &self,
             log_record: &mut LogRecord,
+            row_id: &RowID,
             row_version: &RowVersion,
             portable_extension: Option<&[u8]>,
         ) -> Result<()> {
             self.inner
-                .serialize_row_version(log_record, row_version, portable_extension)
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
         }
         fn serialize_database_header(
             &self,
@@ -24080,7 +24108,7 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
         id: 0,
         begin: PackedTs::pack(None),
         end: PackedTs::pack(Some(TxTimestampOrID::TxID(evicted_writer))),
-        row: generate_simple_string_row((-2).into(), 1, "original"),
+        data: generate_simple_string_row((-2).into(), 1, "original").data,
         btree_resident: true,
         materialized_at: WalPos::ORIGIN,
     });

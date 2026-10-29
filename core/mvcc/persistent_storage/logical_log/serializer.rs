@@ -291,6 +291,7 @@ impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
     #[inline(always)]
     pub(crate) fn serialize_op_entry(
         &mut self,
+        row_id: &RowID,
         row_version: &RowVersion,
         portable_extension: Option<&[u8]>,
     ) -> Result<()> {
@@ -304,7 +305,7 @@ impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
             flags |= OP_FLAG_PORTABLE_EXTENSION;
         }
 
-        let table_id_i64: i64 = row_version.row.id.table_id.into();
+        let table_id_i64: i64 = row_id.table_id.into();
         turso_assert!(
             table_id_i64 < 0,
             "table_id_i64 should be negative, but got {table_id_i64}"
@@ -316,9 +317,9 @@ impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
         let table_id = (table_id_i64 as i32).to_le_bytes();
         let portable_extension = portable_extension.filter(|extension| !extension.is_empty());
 
-        match (&row_version.row.id.row_id, is_delete) {
+        match (&row_id.row_id, is_delete) {
             (&RowKey::Int(rowid), false) => {
-                let record = row_version.row.payload();
+                let record = row_version.payload(row_id);
                 let rowid = rowid as u64;
                 let payload_len = varint_len(rowid)
                     .checked_add(record.len())
@@ -351,7 +352,7 @@ impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
                 )?;
             }
             (RowKey::Record(_), is_delete) => {
-                let key = row_version.row.payload();
+                let key = row_version.payload(row_id);
                 log_write!(
                     self,
                     [
