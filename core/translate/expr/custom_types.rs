@@ -580,20 +580,6 @@ fn emit_expr_with_bindings(
             translate_expr(program, None, bound_expr, reg, resolver)?;
             program.id_register_overrides.insert(name.to_string(), reg);
         }
-        // Any other name would otherwise be read as a string under double-quoted
-        // string rules, so a type stored by an earlier version that uses a
-        // type parameter in ENCODE would silently store and return wrong values.
-        walk_expr(expr, &mut |e| {
-            if let ast::Expr::Id(name) = e {
-                if !program.id_register_overrides.contains_key(name.as_str()) {
-                    crate::bail_parse_error!(
-                        "unknown name \"{}\" in a custom type's expression: ENCODE and DECODE can use only value, and COERCE also the type parameters",
-                        name.as_str()
-                    );
-                }
-            }
-            Ok(WalkControl::Continue)
-        })?;
         Ok(())
     })();
 

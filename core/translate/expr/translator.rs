@@ -2316,7 +2316,9 @@ fn translate_id_expr(
         });
         return Ok(target_register);
     }
-    if !resolver.dqs_dml.is_enabled() {
+    // As in SQLite, only a double-quoted name may be read as a string, so in a
+    // custom type's `ENCODE value * f` an unknown `f` is an error, not 'f'.
+    if !resolver.dqs_dml.is_enabled() || !id.quoted_with('"') {
         crate::bail_parse_error!("no such column: {}", id.as_str());
     }
     // DQS enabled: treat double-quoted identifiers as string literals (SQLite compatibility)
