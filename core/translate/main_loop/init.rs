@@ -12,11 +12,7 @@ pub fn init_distinct(
         .result_columns
         .iter()
         .map(|col| {
-            expr_collation(
-                &col.expr,
-                &ExprContext::new(Some(&plan.table_references), Some(resolver)),
-                &resolver.catalog,
-            )
+            ExprContext::new(Some(&plan.table_references), resolver).expr_collation(&col.expr)
         })
         .collect::<Result<Vec<_>>>()?;
     DistinctCtx::new(program, collations)
@@ -91,11 +87,8 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
-            let collations = vec![expr_collation(
-                &agg.args[0],
-                &ExprContext::new(Some(tables), Some(&t_ctx.resolver)),
-                &t_ctx.resolver.catalog,
-            )?];
+            let collations =
+                vec![ExprContext::new(Some(tables), &t_ctx.resolver).expr_collation(&agg.args[0])?];
             let ctx = DistinctCtx::new(program, collations)?;
             let hash_table_id = ctx.hash_table_id;
             agg.distinctness = Distinctness::Distinct { ctx: Some(ctx) };

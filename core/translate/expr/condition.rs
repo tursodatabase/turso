@@ -62,12 +62,12 @@ pub(super) fn translate_in_list(
 
     // Compute the affinity for the IN comparison based on the LHS expression
     // This follows SQLite's exprINAffinity() approach
-    let metadata = ExprContext::new(referenced_tables, Some(resolver));
+    let metadata = ExprContext::new(referenced_tables, resolver);
     let affinity = in_expr_affinity(lhs, &metadata);
     let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
     // `x IN (y1, ..., yN)` compares with the collation of x alone, as SQLite
     // does; the list items do not take part.
-    let collation = expr_collation(lhs, &metadata, &resolver.catalog)?;
+    let collation = metadata.expr_collation(lhs)?;
 
     if lhs_arity == 1 && false_null_jump_targets_differ {
         check_null_reg = program.alloc_register();

@@ -623,11 +623,8 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = expr_collation(
-                expr,
-                &ExprContext::new(Some(referenced_tables), Some(resolver)),
-                &resolver.catalog,
-            )?;
+            let arg_collation =
+                ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
@@ -649,11 +646,8 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = expr_collation(
-                expr,
-                &ExprContext::new(Some(referenced_tables), Some(resolver)),
-                &resolver.catalog,
-            )?;
+            let arg_collation =
+                ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
             let comparator =
                 super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
@@ -796,7 +790,7 @@ pub fn translate_aggregation_step(
             let arg_collation = ordered_set_collation(
                 func,
                 expr,
-                &ExprContext::new(Some(referenced_tables), Some(resolver)),
+                &ExprContext::new(Some(referenced_tables), resolver),
                 &resolver.catalog,
             )?;
             program.emit_insn(Insn::AggStep {
@@ -826,7 +820,7 @@ pub fn translate_aggregation_step(
             let arg_collation = ordered_set_collation(
                 func,
                 expr,
-                &ExprContext::new(Some(referenced_tables), Some(resolver)),
+                &ExprContext::new(Some(referenced_tables), resolver),
                 &resolver.catalog,
             )?;
             program.emit_insn(Insn::AggStep {

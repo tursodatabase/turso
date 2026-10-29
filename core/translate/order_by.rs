@@ -7,11 +7,7 @@ use turso_parser::ast::{self, SortOrder};
 use crate::{
     emit_explain,
     schema::{Index, IndexColumn, PseudoCursorType, Schema},
-    translate::{
-        collate::{expr_collation, CollationSeq},
-        group_by::is_orderby_agg_or_const,
-        plan::Aggregate,
-    },
+    translate::{collate::CollationSeq, group_by::is_orderby_agg_or_const, plan::Aggregate},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -198,11 +194,8 @@ impl EmitOrderBy {
                         "heap sort cannot express an explicit NULLS ordering".to_string(),
                     ));
                 }
-                let collation = expr_collation(
-                    column,
-                    &ExprContext::new(Some(referenced_tables), Some(&t_ctx.resolver)),
-                    &t_ctx.resolver.catalog,
-                )?;
+                let collation = ExprContext::new(Some(referenced_tables), &t_ctx.resolver)
+                    .expr_collation(column)?;
                 let pos_in_table = index_columns.len();
                 // Have enough space pre-allocatoed to push without realloc
                 index_columns.push(IndexColumn {
@@ -702,11 +695,7 @@ pub(crate) fn sorter_open_data<'a>(
         comparators: Vec::try_with_capacity_ext(capacity)?,
     };
     for (expr, direction, nulls) in terms {
-        let collation = expr_collation(
-            expr,
-            &ExprContext::new(Some(tables), Some(resolver)),
-            &resolver.catalog,
-        )?;
+        let collation = ExprContext::new(Some(tables), resolver).expr_collation(expr)?;
         data.order_collations_nulls
             .try_push((direction, collation, nulls))?;
         data.comparators

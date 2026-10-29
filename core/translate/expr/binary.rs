@@ -187,7 +187,7 @@ pub(super) fn emit_binary_expr_row_valued(
         Greater,
     }
 
-    let metadata = ExprContext::new(referenced_tables, Some(resolver));
+    let metadata = ExprContext::new(referenced_tables, resolver);
     let mut emit_eq = |result_reg: usize, null_eq: bool| -> Result<()> {
         let null_seen_reg = if null_eq {
             None
@@ -425,7 +425,7 @@ pub(super) fn emit_binary_insn(
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Result<()> {
-    let metadata = ExprContext::new(referenced_tables, Some(resolver));
+    let metadata = ExprContext::new(referenced_tables, resolver);
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
         affinity = comparison_affinity(lhs_expr, rhs_expr, &metadata);
@@ -744,7 +744,7 @@ pub(super) fn emit_binary_condition_insn(
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
-    let metadata = ExprContext::new(referenced_tables, Some(resolver));
+    let metadata = ExprContext::new(referenced_tables, resolver);
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
         affinity = comparison_affinity(lhs_expr, rhs_expr, &metadata);

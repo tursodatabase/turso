@@ -831,7 +831,7 @@ fn compound_collations(
                 selects.clone().map(|select| {
                     (
                         &select.result_columns[column].expr,
-                        ExprContext::new(Some(&select.table_references), Some(resolver)),
+                        ExprContext::new(Some(&select.table_references), resolver),
                     )
                 }),
                 &resolver.catalog,

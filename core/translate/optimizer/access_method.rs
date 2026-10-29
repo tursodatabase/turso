@@ -1269,7 +1269,7 @@ pub(super) fn tables_in_hashable_equal_test(
     if !comparison_collation(
         left,
         right,
-        &ExprContext::new(Some(tables), Some(resolver)),
+        &ExprContext::new(Some(tables), resolver),
         &resolver.catalog,
     )?
     .can_hash()

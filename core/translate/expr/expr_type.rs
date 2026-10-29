@@ -482,7 +482,7 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
 fn affinity_type(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
     builtin_type_of_affinity(get_expr_affinity(
         expr,
-        &super::ExprContext::new(env.tables, Some(env.resolver)),
+        &super::ExprContext::new(env.tables, env.resolver),
     ))
 }
 

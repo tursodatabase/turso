@@ -1,9 +1,9 @@
-use turso_parser::ast::TableInternalId;
+use turso_parser::ast::{Expr, TableInternalId};
 
 use crate::{vdbe::affinity::Affinity, LimboError, Result};
 
 use super::{
-    collate::{column_collation, CollationSeq},
+    collate::{column_collation, expr_collation, CollationSeq},
     emitter::Resolver,
     plan::TableReferences,
 };
@@ -18,26 +18,89 @@ pub(crate) trait ExprMetadata<SourceId: Copy = TableInternalId, SubqueryId: Copy
 }
 
 pub(crate) struct ExprContext<'a, 'schema> {
-    tables: Option<&'a TableReferences>,
-    resolver: Option<&'a Resolver<'schema>>,
+    tables: TableMetadata<'a>,
+    resolver: &'a Resolver<'schema>,
 }
 
 impl<'a, 'schema> ExprContext<'a, 'schema> {
     pub(crate) fn new(
         tables: Option<&'a TableReferences>,
-        resolver: Option<&'a Resolver<'schema>>,
+        resolver: &'a Resolver<'schema>,
     ) -> Self {
-        Self { tables, resolver }
+        Self {
+            tables: TableMetadata::new(tables),
+            resolver,
+        }
+    }
+
+    pub(crate) fn expr_collation(&self, expr: &Expr) -> Result<CollationSeq> {
+        expr_collation(expr, self, &self.resolver.catalog)
     }
 }
 
 impl ExprMetadata for ExprContext<'_, '_> {
     fn column_affinity(&self, source: TableInternalId, column: usize) -> Option<Affinity> {
         if source.is_self_table() {
-            if let Some(affinity) = self.resolver.and_then(|r| r.self_table_affinity(column)) {
+            if let Some(affinity) = self.resolver.self_table_affinity(column) {
                 return Some(affinity);
             }
         }
+        self.tables.column_affinity(source, column)
+    }
+
+    fn column_collation(
+        &self,
+        source: TableInternalId,
+        column: usize,
+    ) -> Result<Option<CollationSeq>> {
+        if source.is_self_table() {
+            let table = self.resolver.self_table().ok_or_else(|| {
+                LimboError::InternalError("no table for a self-table column".into())
+            })?;
+            let column = table
+                .columns()
+                .get(column)
+                .ok_or_else(|| LimboError::ParseError("column not found".to_string()))?;
+            return Ok(column_collation(column));
+        }
+        self.tables.column_collation(source, column)
+    }
+
+    fn register_affinity(&self, register: usize) -> Option<Affinity> {
+        self.resolver
+            .register_columns
+            .get(&register)
+            .map(|column| column.affinity)
+    }
+
+    fn register_collation(&self, register: usize) -> Option<CollationSeq> {
+        self.resolver
+            .register_columns
+            .get(&register)
+            .and_then(|column| column.collation)
+    }
+
+    fn subquery_affinity(&self, query: TableInternalId) -> Option<Affinity> {
+        self.resolver
+            .subquery_affinities
+            .borrow()
+            .get(&query)
+            .copied()
+    }
+}
+
+pub(crate) struct TableMetadata<'a> {
+    tables: Option<&'a TableReferences>,
+}
+
+impl<'a> TableMetadata<'a> {
+    pub(crate) fn new(tables: Option<&'a TableReferences>) -> Self {
+        Self { tables }
+    }
+}
+
+impl ExprMetadata for TableMetadata<'_> {
+    fn column_affinity(&self, source: TableInternalId, column: usize) -> Option<Affinity> {
         let (_, table) = self.tables?.find_table_by_internal_id(source)?;
         table.get_column_at(column).map(|column| column.affinity())
     }
@@ -48,14 +111,9 @@ impl ExprMetadata for ExprContext<'_, '_> {
         column: usize,
     ) -> Result<Option<CollationSeq>> {
         if source.is_self_table() {
-            let table = self.resolver.and_then(|r| r.self_table()).ok_or_else(|| {
-                LimboError::InternalError("no table for a self-table column".into())
-            })?;
-            let column = table
-                .columns()
-                .get(column)
-                .ok_or_else(|| LimboError::ParseError("column not found".to_string()))?;
-            return Ok(column_collation(column));
+            return Err(LimboError::InternalError(
+                "no table for a self-table column".into(),
+            ));
         }
         if self
             .tables
@@ -73,25 +131,15 @@ impl ExprMetadata for ExprContext<'_, '_> {
         Ok(column_collation(column))
     }
 
-    fn register_affinity(&self, register: usize) -> Option<Affinity> {
-        self.resolver?
-            .register_columns
-            .get(&register)
-            .map(|column| column.affinity)
+    fn register_affinity(&self, _register: usize) -> Option<Affinity> {
+        None
     }
 
-    fn register_collation(&self, register: usize) -> Option<CollationSeq> {
-        self.resolver?
-            .register_columns
-            .get(&register)
-            .and_then(|column| column.collation)
+    fn register_collation(&self, _register: usize) -> Option<CollationSeq> {
+        None
     }
 
-    fn subquery_affinity(&self, query: TableInternalId) -> Option<Affinity> {
-        self.resolver?
-            .subquery_affinities
-            .borrow()
-            .get(&query)
-            .copied()
+    fn subquery_affinity(&self, _query: TableInternalId) -> Option<Affinity> {
+        None
     }
 }

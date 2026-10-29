@@ -3,7 +3,7 @@ use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
 use crate::translate::expr::{comparison_affinity, maybe_apply_affinity};
-use crate::translate::expr_context::ExprContext;
+use crate::translate::expr_context::{ExprContext, TableMetadata};
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
@@ -101,7 +101,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
             let affinity = comparison_affinity(
                 build_expr,
                 probe_expr,
-                &ExprContext::new(Some(self.table_references), None),
+                &TableMetadata::new(Some(self.table_references)),
             );
             key_affinities.push(affinity.aff_mask());
         }
@@ -124,7 +124,7 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                 comparison_collation(
                     original_lhs,
                     original_rhs,
-                    &ExprContext::new(Some(self.table_references), Some(&self.t_ctx.resolver)),
+                    &ExprContext::new(Some(self.table_references), &self.t_ctx.resolver),
                     &self.t_ctx.resolver.catalog,
                 )
             })

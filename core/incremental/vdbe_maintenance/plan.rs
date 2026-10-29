@@ -7,7 +7,7 @@ use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
 use crate::schema::BTreeTable;
 use crate::sync::Arc;
-use crate::translate::collate::{expr_collation, first_collation, CollationSeq};
+use crate::translate::collate::{first_collation, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, WalkControl};
 use crate::translate::expr_context::ExprContext;
@@ -630,11 +630,8 @@ fn key_column(
     tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<dag::KeyColumn> {
-    let collation = supported_key_collation(expr_collation(
-        expr,
-        &ExprContext::new(Some(tables), Some(resolver)),
-        &resolver.catalog,
-    )?)?;
+    let collation =
+        supported_key_collation(ExprContext::new(Some(tables), resolver).expr_collation(expr)?)?;
     Ok(dag::KeyColumn {
         collation,
         ambiguous: collation != CollationSeq::Binary || stored_affinity(expr, tables).is_none(),
@@ -654,7 +651,7 @@ fn set_op_key_column(
         branches.iter().map(|branch| {
             (
                 &branch.result_columns[index].expr,
-                ExprContext::new(Some(&branch.table_references), Some(resolver)),
+                ExprContext::new(Some(&branch.table_references), resolver),
             )
         }),
         &resolver.catalog,

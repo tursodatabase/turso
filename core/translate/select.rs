@@ -8,7 +8,7 @@ use super::plan::{
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::{expr_collation, CollationSeq};
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
@@ -1861,11 +1861,9 @@ fn is_constant_or_group_by(
         }
         for group_by_expr in group_by_exprs {
             if exprs_are_equivalent(e, group_by_expr)
-                && expr_collation(
-                    group_by_expr,
-                    &ExprContext::new(Some(table_references), Some(resolver)),
-                    &resolver.catalog,
-                )? == CollationSeq::Binary
+                && ExprContext::new(Some(table_references), resolver)
+                    .expr_collation(group_by_expr)?
+                    == CollationSeq::Binary
             {
                 *e = Expr::Literal(ast::Literal::Null);
                 return Ok(WalkControl::SkipChildren);

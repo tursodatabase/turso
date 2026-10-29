@@ -1,5 +1,4 @@
 use super::{
-    collate::expr_collation,
     emitter::Resolver,
     expr_context::ExprContext,
     plan::{
@@ -926,11 +925,8 @@ fn detect_simple_aggregate(
             } else {
                 SortOrder::Desc
             };
-            let collation = expr_collation(
-                &argument,
-                &ExprContext::new(Some(&plan.table_references), Some(resolver)),
-                &resolver.catalog,
-            )?;
+            let collation = ExprContext::new(Some(&plan.table_references), resolver)
+                .expr_collation(&argument)?;
             Some(SimpleAggregate::MinMax(Box::new(MinMaxDef {
                 func: agg.func.clone(),
                 argument,

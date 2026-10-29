@@ -1,11 +1,11 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
-use crate::translate::expr_context::{ExprContext, ExprMetadata};
+use crate::translate::expr_context::{ExprContext, ExprMetadata, TableMetadata};
 use crate::{
     schema::{Column, Index, IndexColumn, Schema},
     translate::{
-        collate::{comparison_collation, expr_collation, CollationSeq},
+        collate::{comparison_collation, CollationSeq},
         expr::{
             as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut,
             WalkControl,
@@ -169,8 +169,12 @@ impl Constraint {
             // known through it. Without it, `text_col < (SELECT int_col ...)`
             // would take the TEXT side's affinity and the seek would compare
             // the integer as text.
-            affinity =
-                comparison_affinity(lhs, rhs, &ExprContext::new(referenced_tables, resolver));
+            affinity = match resolver {
+                Some(resolver) => {
+                    comparison_affinity(lhs, rhs, &ExprContext::new(referenced_tables, resolver))
+                }
+                None => comparison_affinity(lhs, rhs, &TableMetadata::new(referenced_tables)),
+            };
         }
 
         if side == BinaryExprSide::Lhs {
@@ -573,12 +577,12 @@ pub(super) fn add_implied_column_equalities(
             continue;
         }
 
-        let affinity_metadata = ExprContext::new(Some(table_references), None);
-        let collation_metadata = ExprContext::new(Some(table_references), Some(resolver));
+        let affinity_metadata = TableMetadata::new(Some(table_references));
+        let collation_metadata = ExprContext::new(Some(table_references), resolver);
         let left_affinity = get_expr_affinity(left, &affinity_metadata);
         let right_affinity = get_expr_affinity(right, &affinity_metadata);
-        let left_collation = expr_collation(left, &collation_metadata, &resolver.catalog)?;
-        let right_collation = expr_collation(right, &collation_metadata, &resolver.catalog)?;
+        let left_collation = collation_metadata.expr_collation(left)?;
+        let right_collation = collation_metadata.expr_collation(right)?;
         if left_affinity != right_affinity
             || left_collation != right_collation
             || !matches!(
@@ -832,17 +836,13 @@ pub fn constraints_from_where_clause(
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
                     .map(|_| {
-                        comparison_affinity(
-                            lhs,
-                            rhs,
-                            &ExprContext::new(Some(table_references), None),
-                        )
+                        comparison_affinity(lhs, rhs, &TableMetadata::new(Some(table_references)))
                     });
                 let cmp_collation = match operator.as_ast_operator() {
                     Some(op) if op.is_comparison() => Some(comparison_collation(
                         lhs,
                         rhs,
-                        &ExprContext::new(Some(table_references), Some(resolver)),
+                        &ExprContext::new(Some(table_references), resolver),
                         &resolver.catalog,
                     )?),
                     _ => None,
@@ -1098,14 +1098,11 @@ pub fn constraints_from_where_clause(
                 // is the LHS column's affinity; the RHS literals are not folded.
                 let cmp_aff = Some(get_expr_affinity(
                     lhs,
-                    &ExprContext::new(Some(table_references), None),
+                    &TableMetadata::new(Some(table_references)),
                 ));
                 // `x IN (y1, ..., yN)` compares with the collation of x alone.
-                let cmp_collation = Some(expr_collation(
-                    lhs,
-                    &ExprContext::new(Some(table_references), Some(resolver)),
-                    &resolver.catalog,
-                )?);
+                let cmp_collation =
+                    Some(ExprContext::new(Some(table_references), resolver).expr_collation(lhs)?);
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -2227,7 +2224,7 @@ pub(crate) fn summarize_binary_term_for_index(
     let comparison_collation = comparison_collation(
         lhs,
         rhs,
-        &ExprContext::new(Some(table_references), Some(resolver)),
+        &ExprContext::new(Some(table_references), resolver),
         &resolver.catalog,
     )
     .ok()?;
@@ -2237,7 +2234,7 @@ pub(crate) fn summarize_binary_term_for_index(
         rhs,
         operator,
         table_col_pos,
-        &ExprContext::new(Some(table_references), None),
+        &TableMetadata::new(Some(table_references)),
     );
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
@@ -2305,7 +2302,7 @@ pub(crate) fn analyze_binary_term_for_index(
     let comparison_collation = comparison_collation(
         lhs,
         rhs,
-        &ExprContext::new(Some(table_references), Some(resolver)),
+        &ExprContext::new(Some(table_references), resolver),
         &resolver.catalog,
     )
     .ok()?;
@@ -2315,7 +2312,7 @@ pub(crate) fn analyze_binary_term_for_index(
         rhs,
         operator,
         table_col_pos,
-        &ExprContext::new(Some(table_references), None),
+        &TableMetadata::new(Some(table_references)),
     );
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(

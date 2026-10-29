@@ -23,7 +23,7 @@ use crate::translate::{
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{expr_collation, CollationSeq},
+    translate::collate::CollationSeq,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -171,11 +171,8 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation = expr_collation(
-                        expr,
-                        &ExprContext::new(Some(&plan.table_references), Some(&t_ctx.resolver)),
-                        &t_ctx.resolver.catalog,
-                    )?;
+                    let collation = ExprContext::new(Some(&plan.table_references), &t_ctx.resolver)
+                        .expr_collation(expr)?;
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
@@ -705,11 +702,8 @@ pub fn group_by_process_single_group(
         .map(|expr| {
             Ok(KeyInfo {
                 sort_order: SortOrder::Asc,
-                collation: expr_collation(
-                    expr,
-                    &ExprContext::new(Some(&plan.table_references), Some(&t_ctx.resolver)),
-                    &t_ctx.resolver.catalog,
-                )?,
+                collation: ExprContext::new(Some(&plan.table_references), &t_ctx.resolver)
+                    .expr_collation(expr)?,
                 nulls_order: None,
             })
         })

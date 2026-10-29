@@ -287,7 +287,7 @@ fn recursive_cte_result_column_collation(
                 .unwrap_or(&select.result_columns[result_column_index].expr);
             columns.push((
                 expr,
-                ExprContext::new(Some(&select.table_references), Some(resolver)),
+                ExprContext::new(Some(&select.table_references), resolver),
             ));
         }
     }

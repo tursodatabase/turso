@@ -4,7 +4,7 @@ use crate::namespace::NamespaceRef;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
-use crate::translate::collate::{expr_collation, CollationSeq};
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TranslateCtx};
 use crate::translate::expr::{
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
@@ -644,11 +644,7 @@ fn allocate_window_minmax(
         let arg = args
             .first()
             .expect("min/max window calls must have one argument");
-        let collation = expr_collation(
-            arg,
-            &ExprContext::new(Some(table_references), Some(resolver)),
-            &resolver.catalog,
-        )?;
+        let collation = ExprContext::new(Some(table_references), resolver).expr_collation(arg)?;
         let index = Arc::new(Index {
             name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
             table_name: String::new(),
@@ -930,11 +926,8 @@ fn build_order_by_key_info(
         .order_by
         .iter()
         .map(|(expr, _, _)| {
-            let collation = expr_collation(
-                expr,
-                &ExprContext::new(Some(table_references), Some(resolver)),
-                &resolver.catalog,
-            )?;
+            let collation =
+                ExprContext::new(Some(table_references), resolver).expr_collation(expr)?;
             Ok(KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation,
@@ -2010,11 +2003,8 @@ fn emit_flush_buffer_if_new_partition(
                     .expect("every deduplicated partition column has a PARTITION BY entry");
                 Ok(KeyInfo {
                     sort_order: SortOrder::Asc,
-                    collation: expr_collation(
-                        expr,
-                        &ExprContext::new(Some(&plan.table_references), Some(resolver)),
-                        &resolver.catalog,
-                    )?,
+                    collation: ExprContext::new(Some(&plan.table_references), resolver)
+                        .expr_collation(expr)?,
                     nulls_order: None,
                 })
             })
@@ -2562,11 +2552,8 @@ fn emit_window_range_test(
     } else {
         (op, false)
     };
-    let collation = expr_collation(
-        order_expr,
-        &ExprContext::new(Some(&plan.table_references), Some(resolver)),
-        &resolver.catalog,
-    )?;
+    let collation =
+        ExprContext::new(Some(&plan.table_references), resolver).expr_collation(order_expr)?;
     let big_null = matches!(
         (sort_order, nulls_order),
         (SortOrder::Asc, Some(turso_parser::ast::NullsOrder::Last))

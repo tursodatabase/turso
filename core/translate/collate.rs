@@ -635,7 +635,7 @@ mod tests {
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Table, Type},
         translate::plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan},
-        translate::{emitter::Resolver, expr_context::ExprContext, plan::TableReferences},
+        translate::{emitter::Resolver, expr_context::TableMetadata, plan::TableReferences},
     };
 
     use super::*;
@@ -713,7 +713,7 @@ mod tests {
             };
             let collseq = expr_collation_if_any(
                 &expr,
-                &ExprContext::new(Some(&table_references), None),
+                &TableMetadata::new(Some(&table_references)),
                 &Resolver::empty_for_tests().catalog,
             )
             .unwrap();
@@ -740,7 +740,7 @@ mod tests {
             );
             let collseq = expr_collation_if_any(
                 &expr,
-                &ExprContext::new(Some(&table_references), None),
+                &TableMetadata::new(Some(&table_references)),
                 &Resolver::empty_for_tests().catalog,
             )
             .unwrap();
@@ -769,7 +769,7 @@ mod tests {
         );
         let collseq = expr_collation_if_any(
             &expr,
-            &ExprContext::new(Some(&table_references), None),
+            &TableMetadata::new(Some(&table_references)),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -793,7 +793,7 @@ mod tests {
         );
         let collseq_plus = expr_collation_if_any(
             &expr_plus,
-            &ExprContext::new(Some(&table_references), None),
+            &TableMetadata::new(Some(&table_references)),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -816,7 +816,7 @@ mod tests {
         );
         let collseq_cast = expr_collation_if_any(
             &expr_cast,
-            &ExprContext::new(Some(&table_references), None),
+            &TableMetadata::new(Some(&table_references)),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -843,7 +843,7 @@ mod tests {
         let expr = Expr::binary(lhs, Operator::Add, rhs);
         let collseq = expr_collation_if_any(
             &expr,
-            &ExprContext::new(Some(&table_references), None),
+            &TableMetadata::new(Some(&table_references)),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -873,7 +873,7 @@ mod tests {
         let expr = Expr::binary(lhs, Operator::Add, rhs);
         let collseq = expr_collation_if_any(
             &expr,
-            &ExprContext::new(Some(&table_references), None),
+            &TableMetadata::new(Some(&table_references)),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -895,7 +895,7 @@ mod tests {
         let expr = Expr::binary(lhs, Operator::Add, rhs);
         let collseq = expr_collation_if_any(
             &expr,
-            &ExprContext::new(Some(&table_references), None),
+            &TableMetadata::new(Some(&table_references)),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -908,7 +908,7 @@ mod tests {
         let expr = Expr::Literal(Literal::String("abc".to_string()));
         let collseq = expr_collation_if_any(
             &expr,
-            &ExprContext::new(Some(&table_references), None),
+            &TableMetadata::new(Some(&table_references)),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -928,7 +928,7 @@ mod tests {
         // alias declares one.
         let collseq = expr_collation_if_any(
             &expr,
-            &ExprContext::new(Some(&table_references), None),
+            &TableMetadata::new(Some(&table_references)),
             &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
@@ -958,7 +958,7 @@ mod tests {
             comparison_collation(
                 &lhs,
                 &rhs,
-                &ExprContext::new(Some(&table_refs), None),
+                &TableMetadata::new(Some(&table_refs)),
                 &Resolver::empty_for_tests().catalog
             )
             .unwrap(),
@@ -970,7 +970,7 @@ mod tests {
             comparison_collation(
                 &rhs,
                 &lhs,
-                &ExprContext::new(Some(&table_refs), None),
+                &TableMetadata::new(Some(&table_refs)),
                 &Resolver::empty_for_tests().catalog
             )
             .unwrap(),
@@ -1012,7 +1012,7 @@ mod tests {
             comparison_collation(
                 &function_of_binary_column,
                 &nocase_column,
-                &ExprContext::new(Some(&table_refs), None),
+                &TableMetadata::new(Some(&table_refs)),
                 &Resolver::empty_for_tests().catalog
             )
             .unwrap(),
@@ -1047,7 +1047,7 @@ mod tests {
             comparison_collation(
                 &wrapped_binary_column,
                 &nocase_column,
-                &ExprContext::new(Some(&table_refs), None),
+                &TableMetadata::new(Some(&table_refs)),
                 &Resolver::empty_for_tests().catalog
             )
             .unwrap(),
@@ -1081,7 +1081,7 @@ mod tests {
             comparison_collation(
                 &lhs,
                 &rhs,
-                &ExprContext::new(Some(&table_refs), None),
+                &TableMetadata::new(Some(&table_refs)),
                 &Resolver::empty_for_tests().catalog
             )
             .unwrap(),
@@ -1108,7 +1108,7 @@ mod tests {
             comparison_collation(
                 &lhs,
                 &rhs,
-                &ExprContext::new(Some(&table_refs), None),
+                &TableMetadata::new(Some(&table_refs)),
                 &Resolver::empty_for_tests().catalog
             )
             .unwrap(),

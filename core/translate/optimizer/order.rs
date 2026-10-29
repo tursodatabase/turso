@@ -5,7 +5,7 @@ use crate::Result;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
     translate::{
-        collate::{expr_collation, CollationSeq},
+        collate::CollationSeq,
         emitter::Resolver,
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
@@ -99,11 +99,7 @@ impl OrderTarget {
         }
         let mut cols = Vec::new();
         for (expr, order, nulls) in list {
-            let collation = expr_collation(
-                expr,
-                &ExprContext::new(Some(tables), Some(resolver)),
-                &resolver.catalog,
-            )?;
+            let collation = ExprContext::new(Some(tables), resolver).expr_collation(expr)?;
             let Some(col) = expr_to_column_order(expr, order, nulls, collation, tables) else {
                 return Ok(None);
             };
