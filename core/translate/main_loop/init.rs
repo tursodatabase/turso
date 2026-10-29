@@ -513,10 +513,11 @@ impl InitLoop {
                             // Open cursors for each index branch
                             for branch in &multi_idx_op.branches {
                                 if let Some(index) = &branch.index {
-                                    let branch_cursor_id = program.alloc_cursor_index(
-                                        Some(CursorKey::index(table.internal_id, index.clone())),
-                                        index,
-                                    )?;
+                                    let branch_cursor_id = program
+                                        .alloc_cursor_index_if_not_exists(
+                                            CursorKey::index(table.internal_id, index.clone()),
+                                            index,
+                                        )?;
                                     program.emit_insn(Insn::OpenRead {
                                         cursor_id: branch_cursor_id,
                                         root_page: index.root_page,
