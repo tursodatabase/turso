@@ -116,13 +116,15 @@ pub fn translate(
     ));
 
     program.prologue();
-    // Engine-generated helper statements are always SQLite text and
-    // must resolve functions with SQLite semantics regardless of the
-    // database's dialect — the same invariant as unmarked schema rows.
-    // They look names up in every database, like SQLite does, whatever
-    // the connection's search path says.
-    let is_internal_helper = matches!(origin, crate::statement::StatementOrigin::InternalHelper);
-    let search_path = if is_internal_helper {
+    // Engine-generated statements, helpers and reads of the engine's own
+    // metadata, are always SQLite text and must resolve functions with
+    // SQLite semantics regardless of the database's dialect — the same
+    // invariant as unmarked schema rows. They look names up in every
+    // database, like SQLite does, whatever the connection's search path
+    // says.
+    let is_engine_statement = prepare_options.reads_engine_metadata
+        || matches!(origin, crate::statement::StatementOrigin::InternalHelper);
+    let search_path = if is_engine_statement {
         None
     } else {
         connection.search_path()
@@ -137,7 +139,7 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        if is_internal_helper {
+        if is_engine_statement {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
