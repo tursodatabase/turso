@@ -44,6 +44,29 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-compound-with-integer-compares-as-numeric {
+    -- An integer mixed with numeric is a numeric, so 10 and 10.00 are one value.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    CREATE TABLE i(k integer) STRICT;
+    INSERT INTO a VALUES (1.5), (10);
+    INSERT INTO i VALUES (10);
+    SELECT count(*) FROM (SELECT n FROM a UNION SELECT 10);
+    SELECT count(*) FROM (SELECT 10 AS n UNION SELECT n FROM a);
+    SELECT count(*) FROM (SELECT n FROM a UNION SELECT k FROM i);
+    SELECT count(*) FROM (SELECT n FROM a INTERSECT SELECT 10);
+    SELECT count(*) FROM (SELECT n FROM a EXCEPT SELECT 10);
+    SELECT count(*) FROM (SELECT n FROM a UNION ALL SELECT 9) WHERE n > 9.5;
+}
+expect {
+    2
+    2
+    2
+    1
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-operands-evaluated-once {
     -- Every n is 0, so each row's left side is 0, 1 or 2, and every
     -- comparison below is true for every row if the left side runs once.

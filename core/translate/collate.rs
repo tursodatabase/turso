@@ -12,9 +12,7 @@ use crate::{
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
-        expr::expr_type::{
-            compound_column_type, query_column_type, type_of, type_ordering, ExprType,
-        },
+        expr::expr_type::{query_column_type, type_of, type_ordering, ExprType},
         expr_context::{ExprContext, ExprProperties},
         plan::{Plan, SelectPlan, TableReferences},
     },
@@ -611,11 +609,11 @@ pub fn first_collation<'a, 'c, 's: 'c>(
 }
 
 /// The collation that column `column` of a compound SELECT compares with,
-/// where `arms` are its SELECTs: the order of [compound_column_type] when that
-/// type has one, otherwise the text collation of the leftmost SELECT whose
-/// column has one, as in SQLite's `multiSelectCollSeq`. SELECTs whose columns
-/// have different orders, and COLLATE on a column whose type has an order,
-/// are errors, as in a comparison.
+/// where `arms` are its SELECTs, by the rule of [first_collation]: a SELECT
+/// whose column has an order decides, so `SELECT n FROM t UNION SELECT 10`
+/// compares in numeric order and keeps one of `10.00` and `10`. Otherwise the
+/// text collation of the leftmost SELECT whose column has one, as in SQLite's
+/// `multiSelectCollSeq`.
 pub fn compound_column_collation(
     arms: &[&SelectPlan],
     column: usize,
@@ -627,12 +625,7 @@ pub fn compound_column_collation(
             ExprContext::new(Some(&select.table_references), resolver),
         )
     });
-    common_type_ordering(columns.clone())?;
-    let column_type = compound_column_type(arms.iter().copied(), column, resolver);
-    if let Some(ordering) = type_ordering(&column_type, resolver.schema()) {
-        return Ok(CollationSeq::Type(ordering));
-    }
-    first_text_collation(columns).map(CollationSeq::Text)
+    first_collation(columns)
 }
 
 /// The text collation of the first expression that has one, BINARY when none
