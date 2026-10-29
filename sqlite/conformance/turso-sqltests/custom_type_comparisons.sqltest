@@ -24,6 +24,18 @@ expect error {
     DECODE cannot use type parameter "f": only COERCE can
 }
 
+@requires strict "uses STRICT tables"
+test cmp-unknown-name-in-encode-is-an-error-when-used {
+    -- A type stored by an earlier version may use a type parameter in ENCODE.
+    -- Storing a value must fail instead of reading the name as the string 'f'.
+    CREATE TYPE scaled(value integer) BASE integer ENCODE value * f DECODE value;
+    CREATE TABLE t(x scaled) STRICT;
+    INSERT INTO t VALUES (3);
+}
+expect error {
+    unknown name "f" in a custom type's expression: ENCODE and DECODE can use only value, and COERCE also the type parameters
+}
+
 test cmp-coerce-without-type-parameters-is-rejected {
     -- COERCE runs only for a column that gives the type's parameters, so on
     -- a type without parameters it would never run.

@@ -439,7 +439,9 @@ impl TypeDef {
                 operators,
                 default,
             } => {
-                check_type_param_use(params, encode, coerce, decode)?;
+                // CREATE TYPE checks where type parameters are used. A type
+                // already stored by an earlier version is loaded unchecked, so
+                // the database still opens and DROP TYPE can remove it.
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
