@@ -1,0 +1,226 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+test matview-rollback-to-projection {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    INSERT INTO t VALUES (1, 10);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t;
+    BEGIN;
+    SAVEPOINT s;
+    INSERT INTO t VALUES (2, 20);
+    SELECT * FROM v ORDER BY id;
+    ROLLBACK TO s;
+    SELECT * FROM v ORDER BY id;
+    COMMIT;
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+    1|10
+    1|10
+}
+
+test matview-rollback-to-filter {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    INSERT INTO t VALUES (1, 10), (2, 1);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t WHERE a > 5;
+    BEGIN;
+    SAVEPOINT s;
+    INSERT INTO t VALUES (3, 30), (4, 2);
+    SELECT * FROM v ORDER BY id;
+    ROLLBACK TO s;
+    SELECT * FROM v ORDER BY id;
+    COMMIT;
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    1|10
+    3|30
+    1|10
+    1|10
+}
+
+test matview-rollback-to-group-by {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, x INT);
+    INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 5);
+    CREATE MATERIALIZED VIEW v AS SELECT g, COUNT(*) AS c, SUM(x) AS s FROM t GROUP BY g;
+    BEGIN;
+    SAVEPOINT s;
+    INSERT INTO t VALUES (3, 'a', 1), (4, 'c', 7);
+    SELECT * FROM v ORDER BY g;
+    ROLLBACK TO s;
+    SELECT * FROM v ORDER BY g;
+    COMMIT;
+    SELECT * FROM v ORDER BY g;
+}
+expect {
+    a|2|11
+    b|1|5
+    c|1|7
+    a|1|10
+    b|1|5
+    a|1|10
+    b|1|5
+}
+
+test matview-rollback-to-join {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, n TEXT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT, v INT);
+    INSERT INTO p VALUES (1, 'x'), (2, 'y');
+    INSERT INTO c VALUES (1, 1, 100);
+    CREATE MATERIALIZED VIEW v AS SELECT p.n, c.v FROM p JOIN c ON p.id = c.pid;
+    BEGIN;
+    SAVEPOINT s;
+    INSERT INTO c VALUES (2, 2, 200);
+    INSERT INTO p VALUES (3, 'z');
+    INSERT INTO c VALUES (3, 3, 300);
+    SELECT * FROM v ORDER BY v;
+    ROLLBACK TO s;
+    SELECT * FROM v ORDER BY v;
+    COMMIT;
+    SELECT * FROM v ORDER BY v;
+}
+expect {
+    x|100
+    y|200
+    z|300
+    x|100
+    x|100
+}
+
+test matview-rollback-to-nested-outer {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t;
+    BEGIN;
+    INSERT INTO t VALUES (1, 1);
+    SAVEPOINT o;
+    INSERT INTO t VALUES (2, 2);
+    SAVEPOINT i;
+    INSERT INTO t VALUES (3, 3);
+    ROLLBACK TO o;
+    SELECT * FROM v ORDER BY id;
+    COMMIT;
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    1|1
+    1|1
+}
+
+test matview-rollback-to-nested-inner {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t;
+    BEGIN;
+    INSERT INTO t VALUES (1, 1);
+    SAVEPOINT o;
+    INSERT INTO t VALUES (2, 2);
+    SAVEPOINT i;
+    INSERT INTO t VALUES (3, 3);
+    ROLLBACK TO i;
+    SELECT * FROM v ORDER BY id;
+    COMMIT;
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    1|1
+    2|2
+    1|1
+    2|2
+}
+
+test matview-release-after-rollback-to {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t;
+    BEGIN;
+    SAVEPOINT s;
+    INSERT INTO t VALUES (1, 1);
+    ROLLBACK TO s;
+    INSERT INTO t VALUES (2, 2);
+    RELEASE s;
+    SELECT * FROM v ORDER BY id;
+    COMMIT;
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    2|2
+    2|2
+}
+
+test matview-rollback-to-update-delete {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, x INT);
+    INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5);
+    CREATE MATERIALIZED VIEW v AS SELECT g, COUNT(*) AS c, SUM(x) AS s FROM t GROUP BY g;
+    BEGIN;
+    SAVEPOINT s;
+    UPDATE t SET x = 100 WHERE id = 1;
+    DELETE FROM t WHERE id = 3;
+    SELECT * FROM v ORDER BY g;
+    ROLLBACK TO s;
+    SELECT * FROM v ORDER BY g;
+    COMMIT;
+    SELECT * FROM v ORDER BY g;
+}
+expect {
+    a|2|120
+    a|2|30
+    b|1|5
+    a|2|30
+    b|1|5
+}
+
+test matview-rollback-to-then-more-dml {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, x INT);
+    INSERT INTO t VALUES (1, 'a', 10);
+    CREATE MATERIALIZED VIEW v AS SELECT g, COUNT(*) AS c, SUM(x) AS s FROM t GROUP BY g;
+    BEGIN;
+    SAVEPOINT s;
+    INSERT INTO t VALUES (2, 'a', 1);
+    ROLLBACK TO s;
+    INSERT INTO t VALUES (3, 'a', 5);
+    UPDATE t SET x = 11 WHERE id = 1;
+    SELECT * FROM v ORDER BY g;
+    COMMIT;
+    SELECT * FROM v ORDER BY g;
+}
+expect {
+    a|2|16
+    a|2|16
+}
+
+test matview-savepoint-as-outermost-transaction {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    INSERT INTO t VALUES (1, 1);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t;
+    SAVEPOINT s;
+    INSERT INTO t VALUES (2, 2);
+    ROLLBACK TO s;
+    SELECT * FROM v ORDER BY id;
+    INSERT INTO t VALUES (3, 3);
+    RELEASE s;
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    1|1
+    1|1
+    3|3
+}
+
+test matview-rollback-to-twice-on-same-savepoint {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t;
+    BEGIN;
+    SAVEPOINT s;
+    INSERT INTO t VALUES (1, 1);
+    ROLLBACK TO s;
+    INSERT INTO t VALUES (2, 2);
+    ROLLBACK TO s;
+    INSERT INTO t VALUES (3, 3);
+    COMMIT;
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    3|3
+}
