@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use turso_core::{Completion, IOResult, LimboError, Statement as CoreStatement};
 use turso_parser::ast;
+use turso_pg_parser::copy::CopyToStdout;
 use turso_pg_parser::translator::{PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt};
 
-use crate::copy::parse_copy_text_format;
+use crate::copy::{parse_copy_text_format, CopyTo};
 use crate::session::{self, PgConnectionInner};
 use crate::settings::SettingScope;
 use crate::{Result, Statement};
@@ -20,6 +21,13 @@ pub(crate) enum Plan {
     CreateSchema(PgCreateSchemaStmt),
     DropSchema(PgDropSchemaStmt),
     Copy(PgCopyFromStmt),
+    CopyTo(CopyToStdout),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ExecutionResult {
+    Complete,
+    Statement,
 }
 
 pub(crate) struct Execution {
@@ -41,7 +49,7 @@ impl Execution {
         }
     }
 
-    pub(crate) fn step(&mut self, inner: &mut CoreStatement) -> Result<IOResult<()>> {
+    pub(crate) fn step(&mut self, inner: &mut CoreStatement) -> Result<IOResult<ExecutionResult>> {
         if self.operation.is_none() {
             if self.interrupted {
                 return Err(LimboError::Interrupt.into());
@@ -81,11 +89,20 @@ impl Execution {
                         columns: 0,
                     },
                 }),
+                Plan::CopyTo(spec) => Operation::CopyTo(CopyTo::new(&self.conn.conn, spec.clone())),
             });
         }
         match self.operation.as_mut().unwrap() {
-            Operation::Batch(batch) => batch.step(inner, self.timeout, self.interrupted),
-            Operation::Copy(copy) => copy.step(&self.conn, inner, self.timeout, self.interrupted),
+            Operation::Batch(batch) => batch
+                .step(inner, self.timeout, self.interrupted)
+                .map(|result| result.map(|()| ExecutionResult::Complete)),
+            Operation::Copy(copy) => copy
+                .step(&self.conn, inner, self.timeout, self.interrupted)
+                .map(|result| result.map(|()| ExecutionResult::Complete)),
+            Operation::CopyTo(copy) => copy
+                .step(&self.conn.conn, inner, self.timeout, self.interrupted)
+                .map(|result| result.map(|()| ExecutionResult::Statement))
+                .map_err(Into::into),
         }
     }
 
@@ -112,6 +129,7 @@ impl Execution {
 enum Operation {
     Batch(Batch),
     Copy(Copy),
+    CopyTo(CopyTo),
 }
 
 pub(crate) enum Sql {

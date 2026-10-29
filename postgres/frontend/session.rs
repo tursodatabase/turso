@@ -180,20 +180,23 @@ impl PgConnection {
         if self.inner.tx.is_aborted() {
             return Err(in_failed_sql_transaction_error().into());
         }
-        let result = crate::copy::prepare_copy_to_stdout(&self.inner.conn, spec);
+        let result = noop_statement(&self.inner.conn);
         if result.is_err() && !self.inner.conn.get_auto_commit() {
             self.inner.tx.abort();
             self.inner.tx.mark_query_started();
         }
         result
             .map(|stmt| {
-                crate::Statement::new(stmt)
-                    .with_tx_tracking(
-                        Arc::clone(&self.inner.conn),
-                        Arc::clone(&self.inner.tx),
-                        TxRole::Other,
-                    )
-                    .with_query_start_marking(true)
+                crate::Statement::with_execution(
+                    stmt,
+                    Execution::new(self.inner.clone(), Plan::CopyTo(spec.clone())),
+                )
+                .with_tx_tracking(
+                    Arc::clone(&self.inner.conn),
+                    Arc::clone(&self.inner.tx),
+                    TxRole::Other,
+                )
+                .with_query_start_marking(true)
             })
             .map_err(Into::into)
     }

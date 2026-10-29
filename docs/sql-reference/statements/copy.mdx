@@ -29,6 +29,10 @@ returns, backspaces, form feeds, and vertical tabs are escaped. Empty strings
 remain empty fields. The server sends rows individually and reports `COPY n`
 when the export succeeds.
 
+Preparing an export does not look up the table or read its rows.
+During execution, metadata queries and row reads return pending I/O to the caller.
+The server waits for each completion and each socket send before it reads more rows.
+
 COPY reads changes visible to the current transaction and does not commit that
 transaction. Views, query sources such as `COPY (SELECT ...)`, file or program
 destinations, CSV, binary format, and custom output options are not supported.

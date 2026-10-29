@@ -4568,6 +4568,76 @@ mod nonblocking {
     use turso_core::{Clock, File, IOResult, MemoryYieldIO, OpenFlags, IO};
 
     #[test]
+    fn copy_to_stdout_defers_lookup_and_yields_between_rows() {
+        let (io, conn) = open();
+        let spec =
+            turso_pg_parser::copy::parse_copy_to_stdout("COPY exported (name, id) TO STDOUT")
+                .unwrap()
+                .unwrap();
+        io.allow_step.store(false, Ordering::SeqCst);
+        let prepared = conn.prepare_copy_to_stdout(&spec);
+        io.allow_step.store(true, Ordering::SeqCst);
+        let mut copy = prepared.unwrap();
+        conn.execute(
+            "CREATE TABLE exported (id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO exported VALUES (7, 'first'), (19, 'second')",
+        )
+        .unwrap();
+        conn.inner().get_pager().clear_page_cache(false);
+        let wake = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut rows = Vec::new();
+        let mut yields = 0;
+        loop {
+            wake.0.store(false, Ordering::SeqCst);
+            io.allow_step.store(false, Ordering::SeqCst);
+            let result = copy.step_with_waker(&waker);
+            io.allow_step.store(true, Ordering::SeqCst);
+            match result.unwrap() {
+                StepResult::Row => {
+                    rows.push(
+                        copy.row()
+                            .unwrap()
+                            .get_values()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield => {
+                    yields += 1;
+                    copy.take_io_completions()
+                        .unwrap()
+                        .wait(io.as_ref())
+                        .unwrap();
+                    assert!(wake.0.load(Ordering::SeqCst));
+                }
+                result => panic!("unexpected COPY result: {result:?}"),
+            }
+        }
+        assert!(yields > 0);
+        assert_eq!(copy.get_column_name(0), "name");
+        assert_eq!(copy.get_column_name(1), "id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::build_text("first"), Value::from_i64(7)],
+                vec![Value::build_text("second"), Value::from_i64(19)],
+            ]
+        );
+        conn.execute("INSERT INTO exported VALUES (31, 'third')")
+            .unwrap();
+        rows.push(vec![Value::build_text("third"), Value::from_i64(31)]);
+        copy.reset().unwrap();
+        assert_eq!(drive(&io, &mut copy).0, rows);
+        copy.reset().unwrap();
+        assert_eq!(copy.run_collect_rows().unwrap(), rows);
+        copy.reset().unwrap();
+        copy.run_ignore_rows().unwrap();
+        assert!(conn.inner().get_auto_commit());
+    }
+
+    #[test]
     fn frontend_commands_return_pending_io() {
         let (io, conn) = open();
         conn.inner().set_foreign_keys_enabled(true);
