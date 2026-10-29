@@ -17773,7 +17773,8 @@ pub fn op_rename_table(
             db,
             namespace,
             from,
-            to
+            to,
+            temp_unqualified_names_table
         },
         insn
     );
@@ -17995,7 +17996,7 @@ pub fn op_rename_table(
                     view,
                     &normalized_from,
                     to,
-                    !temp_shadows_old_name,
+                    *temp_unqualified_names_table,
                     Some(std::slice::from_ref(&renamed_db_name)),
                 )
             })?;

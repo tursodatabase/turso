@@ -1567,10 +1567,9 @@ pub fn translate_alter_table(
                             "unknown database id {database_id} during ALTER TABLE"
                         ))
                     })?;
+                let unqualified_names_table =
+                    temp_unqualified_name_is_table(resolver, &normalized_old_name, namespace)?;
                 resolver.with_schema(crate::TEMP_DB_ID, |s| -> Result<_> {
-                    let temp_has_table = s
-                        .get_table(NamespaceId::ROOT, &normalized_old_name)
-                        .is_some();
                     let mut rewrites = Vec::new();
                     for (view_name, view) in s.views(NamespaceId::ROOT) {
                         let Some(ast::Cmd::Stmt(stmt)) = connection.dialect().parse(&view.sql)?.0
@@ -1581,7 +1580,7 @@ pub fn translate_alter_table(
                             stmt,
                             &normalized_old_name,
                             new_name,
-                            !temp_has_table,
+                            unqualified_names_table,
                             Some(std::slice::from_ref(&renamed_db_name)),
                         ) {
                             rewrites.push((view_name.to_string(), new_sql));
@@ -1785,6 +1784,11 @@ pub fn translate_alter_table(
                 namespace: namespace.id,
                 from: table_name.to_owned(),
                 to: new_name.to_owned(),
+                temp_unqualified_names_table: temp_unqualified_name_is_table(
+                    resolver,
+                    &normalized_old_name,
+                    namespace,
+                )?,
             });
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
@@ -2921,6 +2925,11 @@ fn translate_rename_virtual_table(
         namespace: namespace.id,
         from: old_name.to_owned(),
         to: new_name_norm,
+        temp_unqualified_names_table: temp_unqualified_name_is_table(
+            resolver,
+            &normalize_ident(old_name),
+            namespace,
+        )?,
     });
 
     program.emit_insn(Insn::Close {
@@ -2931,6 +2940,21 @@ fn translate_rename_virtual_table(
     });
 
     Ok(())
+}
+
+/// Whether a name without a qualifier in a TEMP view means the table
+/// `table_name` of `namespace`.
+fn temp_unqualified_name_is_table(
+    resolver: &Resolver,
+    table_name: &str,
+    namespace: NamespaceRef,
+) -> Result<bool> {
+    let found = resolver.resolve_unqualified_existing(table_name, |schema, namespace, name| {
+        schema.get_table(namespace, name).is_some()
+            || schema.get_view(namespace, name).is_some()
+            || schema.get_materialized_view(namespace, name).is_some()
+    })?;
+    Ok(found == namespace)
 }
 
 /* Triggers must be rewritten when a column is renamed, and DROP COLUMN on table T must be forbidden if any trigger on T references the column.
