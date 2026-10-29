@@ -512,7 +512,7 @@ fn resolve_scalar_func_return_type(
             Ok(CheckExprType::Null)
         }
 
-        ScalarFunc::Min | ScalarFunc::Max => {
+        ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Greatest | ScalarFunc::Least => {
             if let Some(first) = args.first() {
                 resolve_check_expr_type(first, columns, resolver)
             } else {

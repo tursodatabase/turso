@@ -7,6 +7,34 @@
 
 @database :memory:
 
+test greatest-and-least-numeric-values {
+    SELECT GREATEST(10, 3, 7), LEAST(10, 3, 7);
+}
+expect {
+    10|3
+}
+
+test greatest-and-least-ignore-null-values {
+    SELECT GREATEST(NULL, 4, NULL), LEAST(NULL, 4, NULL);
+}
+expect {
+    4|4
+}
+
+test greatest-and-least-all-null-values {
+    SELECT GREATEST(NULL, NULL), LEAST(NULL, NULL);
+}
+expect {
+    |
+}
+
+test greatest-and-least-common-numeric-type {
+    SELECT GREATEST(1, 2.5, NULL), LEAST(1, 2.5, NULL);
+}
+expect {
+    2.5|1
+}
+
 test quote-ident-plain-lowercase {
     SELECT quote_ident('abc');
 }

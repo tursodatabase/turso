@@ -943,6 +943,8 @@ pub enum ScalarFunc {
     ConnTxnId,
     IsAutocommit,
     SequenceWatermark,
+    Greatest,
+    Least,
     // Test type functions (for custom type system testing)
     TestUintEncode,
     TestUintDecode,
@@ -1041,6 +1043,8 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Sign => true,
             ScalarFunc::Substr => true,
             ScalarFunc::Substring => true,
+            ScalarFunc::Greatest => true,
+            ScalarFunc::Least => true,
             ScalarFunc::Soundex => true,
             ScalarFunc::Date => false,
             ScalarFunc::Time => false,
@@ -1202,6 +1206,8 @@ impl Display for ScalarFunc {
             Self::Min => "min",
             Self::Max => "max",
             Self::Nullif => "nullif",
+            Self::Greatest => "greatest",
+            Self::Least => "least",
             Self::Sign => "sign",
             Self::Substr => "substr",
             Self::Substring => "substring",
@@ -1403,6 +1409,8 @@ impl ScalarFunc {
             | Self::IsAutocommit => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
+            Self::Greatest | Self::Least => &[-1],
+
             // SQL-standard string and math extensions
             Self::Gcd | Self::Lcm | Self::Repeat => &[2],
             Self::Lpad | Self::Rpad => &[2, 3],
@@ -1690,7 +1698,13 @@ impl Func {
     pub fn needs_collation(&self) -> bool {
         matches!(
             self,
-            Self::Scalar(ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif)
+            Self::Scalar(
+                ScalarFunc::Min
+                    | ScalarFunc::Max
+                    | ScalarFunc::Greatest
+                    | ScalarFunc::Least
+                    | ScalarFunc::Nullif,
+            )
         )
     }
 

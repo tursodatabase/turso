@@ -3073,8 +3073,8 @@ impl PostgreSQLTranslator {
             Some(pg_query::protobuf::node::Node::MinMaxExpr(minmax)) => {
                 use pg_query::protobuf::MinMaxOp;
                 let func_name = match MinMaxOp::try_from(minmax.op) {
-                    Ok(MinMaxOp::IsGreatest) => "MAX",
-                    Ok(MinMaxOp::IsLeast) => "MIN",
+                    Ok(MinMaxOp::IsGreatest) => "GREATEST",
+                    Ok(MinMaxOp::IsLeast) => "LEAST",
                     _ => return Err(ParseError::ParseError("MinMaxExpr: unsupported op".into())),
                 };
                 let args = minmax

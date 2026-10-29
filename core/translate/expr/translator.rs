@@ -1640,7 +1640,7 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Min => {
+                ScalarFunc::Min | ScalarFunc::Least => {
                     if args.is_empty() {
                         crate::bail_parse_error!("min function with no arguments");
                     }
@@ -1657,7 +1657,7 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Max => {
+                ScalarFunc::Max | ScalarFunc::Greatest => {
                     if args.is_empty() {
                         crate::bail_parse_error!("min function with no arguments");
                     }
