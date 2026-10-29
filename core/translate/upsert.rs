@@ -825,6 +825,7 @@ pub fn emit_upsert(
             program,
             &bt.check_constraints,
             resolver,
+            ctx.namespace.id,
             &bt.name,
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
             bt.columns().iter().enumerate().filter_map(|(idx, col)| {
@@ -1280,6 +1281,7 @@ pub fn emit_upsert(
                 let (constraint_info, err_code) = if is_pk {
                     (
                         Some(Box::new(ConstraintInfo::primary_key(
+                            ctx.namespace.id,
                             table.get_name(),
                             pk_constraint_name,
                             pk_col_names,
@@ -1290,6 +1292,7 @@ pub fn emit_upsert(
                 } else {
                     (
                         Some(Box::new(ConstraintInfo::unique_index(
+                            ctx.namespace.id,
                             table.get_name(),
                             &idx_meta,
                             regs,

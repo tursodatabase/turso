@@ -11,7 +11,7 @@ pub fn to_u32(v: usize) -> u32 {
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::function::AccumulatorFunc;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
@@ -463,6 +463,7 @@ pub struct ConstraintInfo {
     pub kind: crate::ConstraintKind,
     pub constraint_name: Option<String>,
     pub index_name: Option<String>,
+    /// The name the table is stored under: mangled with its namespace.
     pub table_name: String,
     pub column_names: Vec<String>,
     pub violation_regs: Vec<usize>,
@@ -472,6 +473,7 @@ pub struct ConstraintInfo {
 
 impl ConstraintInfo {
     pub fn primary_key(
+        namespace: NamespaceId,
         table: &str,
         name: Option<String>,
         cols: Vec<String>,
@@ -481,7 +483,7 @@ impl ConstraintInfo {
             kind: crate::ConstraintKind::PrimaryKey,
             constraint_name: name,
             index_name: None,
-            table_name: table.to_string(),
+            table_name: mangle_name(namespace, table),
             column_names: cols,
             violation_regs: regs,
             row_col_names: vec![],
@@ -489,12 +491,17 @@ impl ConstraintInfo {
         }
     }
 
-    pub fn unique_index(table: &str, index: &Index, regs: Vec<usize>) -> Self {
+    pub fn unique_index(
+        namespace: NamespaceId,
+        table: &str,
+        index: &Index,
+        regs: Vec<usize>,
+    ) -> Self {
         Self {
             kind: crate::ConstraintKind::Unique,
             constraint_name: index.constraint_name.clone(),
             index_name: Some(index.name.clone()),
-            table_name: table.to_string(),
+            table_name: mangle_name(namespace, table),
             column_names: index.columns.iter().map(|col| col.name.clone()).collect(),
             violation_regs: regs,
             row_col_names: vec![],
@@ -502,12 +509,12 @@ impl ConstraintInfo {
         }
     }
 
-    pub fn not_null(table: &str, col: String) -> Self {
+    pub fn not_null(namespace: NamespaceId, table: &str, col: String) -> Self {
         Self {
             kind: crate::ConstraintKind::NotNull,
             constraint_name: None,
             index_name: None,
-            table_name: table.to_string(),
+            table_name: mangle_name(namespace, table),
             column_names: vec![col],
             violation_regs: vec![],
             row_col_names: vec![],
@@ -516,6 +523,7 @@ impl ConstraintInfo {
     }
 
     pub fn check(
+        namespace: NamespaceId,
         table: &str,
         name: Option<String>,
         regs: Vec<usize>,
@@ -525,7 +533,7 @@ impl ConstraintInfo {
             kind: crate::ConstraintKind::Check,
             constraint_name: name,
             index_name: None,
-            table_name: table.to_string(),
+            table_name: mangle_name(namespace, table),
             column_names: vec![],
             violation_regs: regs,
             row_col_names: row_names,
@@ -534,6 +542,7 @@ impl ConstraintInfo {
     }
 
     pub fn fk(
+        child_namespace: NamespaceId,
         child_table: &str,
         name: Option<String>,
         cols: Vec<String>,
@@ -544,7 +553,7 @@ impl ConstraintInfo {
             kind: crate::ConstraintKind::ForeignKey,
             constraint_name: name,
             index_name: None,
-            table_name: child_table.to_string(),
+            table_name: mangle_name(child_namespace, child_table),
             column_names: cols,
             violation_regs: regs,
             row_col_names: vec![],

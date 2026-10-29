@@ -16,6 +16,7 @@ pub enum ConstraintKind {
 pub struct ConstraintViolation {
     pub kind: ConstraintKind,
     pub message: String,
+    /// The name the table is stored under: mangled with its namespace.
     pub table_name: Option<String>,
     pub constraint_name: Option<String>,
     pub index_name: Option<String>,

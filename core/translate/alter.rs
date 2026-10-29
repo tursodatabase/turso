@@ -681,6 +681,7 @@ fn emit_column_constraints_validation(
             program,
             &check_constraints,
             &mut check_resolver,
+            namespace.id,
             resolved_table.name.as_str(),
             rowid_reg,
             resolved_table
