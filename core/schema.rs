@@ -580,12 +580,9 @@ impl TypeDef {
 /// column may store, so only COERCE may read them. ENCODE also converts index
 /// seek keys and operator arguments, which are compared and never limited: on a
 /// numeric(10,2) column `n = 3.504` matches no row instead of matching 3.50.
-/// COERCE runs only for a column that gives the type's parameters, so a type
-/// without parameters can't have one: it checks its values in ENCODE.
 pub(crate) fn check_type_param_use(
     params: &[ast::TypeParam],
     encode: &Option<Box<ast::Expr>>,
-    coerce: &Option<Box<ast::Expr>>,
     decode: &Option<Box<ast::Expr>>,
 ) -> crate::Result<()> {
     let type_params: std::vec::Vec<String> = params
@@ -593,12 +590,6 @@ pub(crate) fn check_type_param_use(
         .map(|p| normalize_ident(&p.name))
         .filter(|name| name != "value")
         .collect();
-    if coerce.is_some() && type_params.is_empty() {
-        return Err(crate::LimboError::ParseError(
-            "COERCE needs type parameters: a type without parameters checks its values in ENCODE"
-                .to_string(),
-        ));
-    }
     for (clause, expr) in [("ENCODE", encode), ("DECODE", decode)] {
         let Some(expr) = expr else {
             continue;
@@ -970,7 +961,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
         "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
         "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
+        "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'",
         "CREATE TYPE bigint(value integer) BASE integer",
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
         "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",

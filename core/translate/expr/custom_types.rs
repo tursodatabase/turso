@@ -523,9 +523,9 @@ pub(crate) fn emit_type_expr(
 }
 
 /// Emits the type's COERCE on the value in `reg`, with the type's parameters
-/// bound to `type_params` by position. Without arguments, as for a column
-/// declared `numeric`, there are no limits and nothing is emitted. NULL is
-/// left as it is.
+/// bound to `type_params` by position. A type with parameters used without
+/// arguments, as a column declared `numeric`, has no limits and nothing is
+/// emitted. NULL is left as it is.
 fn emit_coerce(
     program: &mut ProgramBuilder,
     type_def: &TypeDef,
@@ -536,7 +536,7 @@ fn emit_coerce(
     let Some(coerce) = type_def.coerce() else {
         return Ok(());
     };
-    if type_params.is_empty() {
+    if type_params.is_empty() && type_def.user_params().next().is_some() {
         return Ok(());
     }
     // A parameter without an argument, as scale in numeric(10), is NULL.

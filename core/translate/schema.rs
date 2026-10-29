@@ -3119,7 +3119,7 @@ pub fn translate_create_type(
         if let Some(ref decode) = decode {
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
-        crate::schema::check_type_param_use(params, encode, coerce, decode)?;
+        crate::schema::check_type_param_use(params, encode, decode)?;
     }
 
     // Build canonical SQL (without IF NOT EXISTS) for persistence

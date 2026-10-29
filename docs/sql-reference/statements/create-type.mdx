@@ -101,10 +101,10 @@ The first parameter is always the input `value`. Additional parameters are the a
 
 ### COERCE
 
-The COERCE expression fits an already encoded value to the column's parameters, such as the maximum length of a `varchar(100)` or the scale of a `numeric(10,2)`. `value` is the output of ENCODE, and each parameter is the column's argument for it. COERCE may only round, pad, cut or reject the value (with RAISE), so the result stays the same value in the type's order: a COERCE like `value * f` would make stored values disagree with values that were only encoded, such as index lookup keys. A type without parameters can't have a COERCE clause; it checks its values in ENCODE.
+The COERCE expression fits an already encoded value to what the column may store, such as the maximum length of a `varchar(100)`, the scale of a `numeric(10,2)` or the range of a `smallint`. `value` is the output of ENCODE, and each parameter is the column's argument for it. COERCE may only round, pad, cut or reject the value (with RAISE), so the result stays the same value in the type's order: a COERCE like `value * f` would make stored values disagree with values that were only encoded, such as index lookup keys. Put limit checks in COERCE, not ENCODE: ENCODE also runs on values that are only compared, so a range check there would make `smallint_col < 100000` fail.
 
-- **When it runs**: on INSERT, UPDATE, and column defaults, after ENCODE, and on `CAST(x AS t(args))`. `CAST(x AS t)` without arguments is SQLite's CAST, so `CAST(x AS NUMERIC)` keeps its SQLite meaning.
-- **When it does not run**: on a column declared without arguments (`name varchar`), and on NULL values.
+- **When it runs**: on INSERT, UPDATE, and column defaults, after ENCODE, and on `CAST(x AS t(args))`. For a type without parameters it also runs on `CAST(x AS t)`. `CAST(x AS t)` on a type with parameters is SQLite's CAST, so `CAST(x AS NUMERIC)` keeps its SQLite meaning.
+- **When it does not run**: on a column of a type with parameters declared without arguments (`name varchar`), and on NULL values.
 - Index lookups also run ENCODE and COERCE on the key, as do constants passed to a type's operator. For a `numeric(10,2)` column holding `3.50`, `n = 3.504` is true, because `3.504` is rounded to `3.50` first.
 - **DECODE** never sees the parameters.
 

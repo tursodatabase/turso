@@ -48,13 +48,14 @@ expect {
     a-x
 }
 
-test cmp-coerce-without-type-parameters-is-rejected {
-    -- COERCE runs only for a column that gives the type's parameters, so on
-    -- a type without parameters it would never run.
+@requires strict "uses STRICT tables"
+test cmp-coerce-without-type-parameters-limits-stored-values {
     CREATE TYPE positive(value integer) BASE integer COERCE CASE WHEN value > 0 THEN value ELSE RAISE(ABORT, 'not positive') END;
+    CREATE TABLE t(x positive) STRICT;
+    INSERT INTO t VALUES (-1);
 }
 expect error {
-    COERCE needs type parameters: a type without parameters checks its values in ENCODE
+    not positive
 }
 
 @requires strict "uses STRICT tables"

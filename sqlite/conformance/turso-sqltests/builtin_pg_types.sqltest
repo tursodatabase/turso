@@ -207,6 +207,38 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test smallint-compared-with-integer-out-of-its-range {
+    -- The range limits what a column stores, not what it is compared with.
+    CREATE TABLE t1(val smallint) STRICT;
+    INSERT INTO t1 VALUES (5);
+    SELECT val FROM t1 WHERE val < 100000;
+    SELECT val FROM t1 WHERE val IN (5, 100000);
+    SELECT val = 100000 FROM t1;
+}
+expect {
+    5
+    5
+    0
+}
+
+@requires strict "uses STRICT tables"
+test smallint-update-overflow {
+    CREATE TABLE t1(val smallint) STRICT;
+    INSERT INTO t1 VALUES (5);
+    UPDATE t1 SET val = 40000;
+}
+expect error {
+    integer out of range for smallint
+}
+
+test smallint-cast-out-of-range {
+    SELECT CAST(100000 AS smallint);
+}
+expect error {
+    integer out of range for smallint
+}
+
+@requires strict "uses STRICT tables"
 test smallint-alias-int2 {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val int2) STRICT;
     INSERT INTO t1 VALUES (1, 100);
