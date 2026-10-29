@@ -272,10 +272,10 @@ impl FailOnDemandAlloc {
 #[test]
 fn write_set_take_transfers_entries_without_cloning() {
     let mut write_set = WriteSet::<TursoAllocator>::new();
-    let row_versions: RowVersions<TursoAllocator> = Arc::new(RwLock::new(crate::alloc::vec![]));
+    let row_versions: RowVersions<TursoAllocator> = Arc::new(RwLock::new(empty_version_chain()));
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
 
-    assert!(write_set.insert(row_id, Arc::clone(&row_versions)));
+    write_set.push(row_id, Arc::clone(&row_versions));
     let entries_ptr = write_set.entries.as_ptr();
     let entries_capacity = write_set.entries.capacity();
     let strong_count = Arc::strong_count(&row_versions);
@@ -283,10 +283,8 @@ fn write_set_take_transfers_entries_without_cloning() {
     let transferred = write_set.take();
 
     assert!(write_set.entries.is_empty());
-    assert!(write_set.seen.is_empty());
     assert_eq!(transferred.entries.as_ptr(), entries_ptr);
     assert_eq!(transferred.entries.capacity(), entries_capacity);
-    assert_eq!(transferred.seen.len(), 1);
     assert_eq!(Arc::strong_count(&row_versions), strong_count);
     assert!(Arc::ptr_eq(&transferred.entries[0].1, &row_versions));
 }
@@ -295,23 +293,23 @@ fn write_set_take_transfers_entries_without_cloning() {
 #[should_panic(expected = "write set cannot be modified unless transaction is active")]
 fn aborted_transaction_rejects_write_set_insert() {
     let tx = new_tx(1, 1, TransactionState::Aborted);
-    let row_versions: RowVersions<TursoAllocator> = Arc::new(RwLock::new(crate::alloc::vec![]));
+    let row_versions: RowVersions<TursoAllocator> = Arc::new(RwLock::new(empty_version_chain()));
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
 
-    tx.insert_to_write_set(row_id, row_versions);
+    tx.add_to_write_set(row_id, row_versions);
 }
 
 #[test]
 fn rollback_only_reports_rowids_restored_by_a_delete() {
     let tx_id = 1;
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(666));
-    let row = Row::new_table_row(row_id, &[], 0).unwrap();
+    let row = Row::new_table_row(row_id, &[]).unwrap();
 
     let replacement = RowVersion::new(
         1,
         Some(TxTimestampOrID::TxID(tx_id)),
         None,
-        row.clone(),
+        row.data.clone(),
         true,
     );
     assert!(!rollback_restores_rowid(tx_id, &replacement));
@@ -320,7 +318,7 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
         2,
         Some(TxTimestampOrID::Timestamp(1)),
         Some(TxTimestampOrID::TxID(tx_id)),
-        row.clone(),
+        row.data.clone(),
         true,
     );
     assert!(rollback_restores_rowid(tx_id, &deleted_existing_row));
@@ -329,7 +327,7 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
         3,
         None,
         Some(TxTimestampOrID::TxID(tx_id)),
-        row.clone(),
+        row.data.clone(),
         true,
     );
     assert!(rollback_restores_rowid(tx_id, &deleted_btree_row));
@@ -338,7 +336,7 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
         4,
         Some(TxTimestampOrID::TxID(tx_id)),
         Some(TxTimestampOrID::TxID(tx_id)),
-        row.clone(),
+        row.data.clone(),
         true,
     );
     assert!(rollback_restores_rowid(tx_id, &deleted_replacement));
@@ -347,7 +345,7 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
         5,
         Some(TxTimestampOrID::TxID(tx_id)),
         Some(TxTimestampOrID::TxID(tx_id)),
-        row,
+        row.data,
         false,
     );
     assert!(!rollback_restores_rowid(tx_id, &inserted_then_deleted));
@@ -413,7 +411,7 @@ fn mv_store_skiplist_allocations_are_fallible() {
         id: 1,
         begin: PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
         end: PackedTs::pack(None),
-        row: Row::new_table_row(row_id.clone(), &[], 0).unwrap(),
+        data: Row::new_table_row(row_id.clone(), &[]).unwrap().data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -429,11 +427,11 @@ fn row_payload_allocation_uses_passed_allocator() {
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
 
     alloc.fail_allocations(true);
-    let result = Row::new_table_row_in(row_id.clone(), &[1, 2, 3], 1, alloc.clone());
+    let result = Row::new_table_row_in(row_id.clone(), &[1, 2, 3], alloc.clone());
     assert!(matches!(result, Err(crate::alloc::TryReserveError)));
 
     alloc.fail_allocations(false);
-    let row = Row::new_table_row_in(row_id, &[1, 2, 3], 1, alloc).unwrap();
+    let row = Row::new_table_row_in(row_id, &[1, 2, 3], alloc).unwrap();
     assert_eq!(row.payload(), &[1, 2, 3]);
 }
 
@@ -485,7 +483,7 @@ fn seqcompact_tombstone_payload_uses_store_allocator() {
     versions.write().try_reserve(1).unwrap();
 
     alloc.fail_allocations(true);
-    store.seqcompact_commit_delete(row_id, 1, 10);
+    store.seqcompact_commit_delete(row_id, 10);
 }
 
 #[test]
@@ -506,7 +504,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
 
     let table_id = MVTableId::from(-2);
     let row_id = RowID::new(table_id, RowKey::Int(42));
-    let row = Row::new_table_row(row_id.clone(), &[], 0).unwrap();
+    let row = Row::new_table_row(row_id.clone(), &[]).unwrap();
     let allocator = store.get_rowid_allocator(&table_id);
 
     alloc.fail_allocations(true);
@@ -523,7 +521,6 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     let savepoints = tx.savepoint_stack.read();
     let savepoint = savepoints.last().unwrap();
     assert!(savepoint.created_table_versions.is_empty());
-    assert!(savepoint.newly_added_to_write_set.is_empty());
 }
 
 impl MvccTestDb {
@@ -715,16 +712,16 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     };
 
     // Sole current insert (begin=Ts(5), end=None), materialized at WAL frame 100.
-    let stamped_insert = || {
+    let stamped_insert = || -> RowVersionChain {
         let mut rv = make_rv(ts(5), None);
         rv.set_materialized_at(frame(100));
-        crate::alloc::vec![rv]
+        crate::alloc::vec![rv].into()
     };
     // Superseded delete (begin=Ts(3), end=Ts(5)<=lwm), materialized at frame 100.
-    let stamped_delete = || {
+    let stamped_delete = || -> RowVersionChain {
         let mut rv = make_rv(ts(3), ts(5));
         rv.set_materialized_at(frame(100));
-        crate::alloc::vec![rv]
+        crate::alloc::vec![rv].into()
     };
 
     // Reader pinned below the materialization frame: keep both current and delete.
@@ -778,7 +775,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
     // Unmaterialized versions are never reclaimed on the Passive path.
     for drop_current_if_in_btree in [false, true] {
-        let mut v = crate::alloc::vec![make_rv(ts(5), None)];
+        let mut v: RowVersionChain = crate::alloc::vec![make_rv(ts(5), None)].into();
         let dropped = MvStore::<MvccClock>::gc_version_chain(
             &mut v,
             10,
@@ -873,9 +870,9 @@ fn debug_gc_metrics_truncate_vs_passive() {
             snap.logical_log_size,
             snap.active_txs,
             snap.min_reader_mark.checkpoint_seq,
-            snap.min_reader_mark.frame,
+            { snap.min_reader_mark.frame },
             snap.backfill_floor.checkpoint_seq,
-            snap.backfill_floor.frame,
+            { snap.backfill_floor.frame },
         );
     }
 
@@ -951,9 +948,9 @@ fn debug_gc_metrics_truncate_vs_passive() {
                 snap.logical_log_size,
                 snap.active_txs,
                 snap.min_reader_mark.checkpoint_seq,
-                snap.min_reader_mark.frame,
+                { snap.min_reader_mark.frame },
                 snap.backfill_floor.checkpoint_seq,
-                snap.backfill_floor.frame,
+                { snap.backfill_floor.frame },
             );
         }
 
@@ -1036,9 +1033,9 @@ fn debug_gc_metrics_truncate_vs_passive() {
                 snap.logical_log_size,
                 snap.active_txs,
                 snap.min_reader_mark.checkpoint_seq,
-                snap.min_reader_mark.frame,
+                { snap.min_reader_mark.frame },
                 snap.backfill_floor.checkpoint_seq,
-                snap.backfill_floor.frame,
+                { snap.backfill_floor.frame },
             );
         }
     }
@@ -1098,7 +1095,8 @@ fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
         "passive Finalize must drain empty SkipMap slots: {snap:?}"
     );
     assert_eq!(
-        snap.backfill_floor.frame, wal_bf,
+        { snap.backfill_floor.frame },
+        wal_bf,
         "backfill_floor must track published nbackfills: {snap:?}"
     );
 
@@ -1833,7 +1831,7 @@ impl MvccTestDbNoConn {
 pub(crate) fn generate_simple_string_row(table_id: MVTableId, id: i64, data: &str) -> Row {
     let record =
         ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap();
-    Row::new_table_row(RowID::new(table_id, RowKey::Int(id)), record.as_blob(), 1).unwrap()
+    Row::new_table_row(RowID::new(table_id, RowKey::Int(id)), record.as_blob()).unwrap()
 }
 
 pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
@@ -2456,7 +2454,7 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
         id: 1,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: generate_simple_string_row(table_id, 1, "data"),
+        data: generate_simple_string_row(table_id, 1, "data").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -2475,16 +2473,26 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
         id: 2,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(commit_ts))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: Row::new_table_row(
+        data: Row::new_table_row(
             RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
             schema_record.as_blob(),
-            5,
         )
-        .unwrap(),
+        .unwrap()
+        .data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
-    let tx = LogRecord::for_test(commit_ts, &[data_version, schema_version], None);
+    let tx = LogRecord::for_test(
+        commit_ts,
+        &[
+            (RowID::new(table_id, RowKey::Int(1)), data_version),
+            (
+                RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(2)),
+                schema_version,
+            ),
+        ],
+        None,
+    );
 
     let mut log = LogicalLog::new(file.clone(), io.clone(), None);
     let c = log.log_tx(tx).unwrap();
@@ -7257,7 +7265,7 @@ fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
         let id = RowID::new(table_id, RowKey::Int(*row_id));
         let record =
             ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1).unwrap();
-        let row = Row::new_table_row(id, record.as_blob(), 1).unwrap();
+        let row = Row::new_table_row(id, record.as_blob()).unwrap();
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
 
@@ -7293,7 +7301,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
         let id = RowID::new(table_id, RowKey::Int(*i));
         let data = format!("row{i}");
         let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1).unwrap();
-        let row = Row::new_table_row(id, record.as_blob(), 1).unwrap();
+        let row = Row::new_table_row(id, record.as_blob()).unwrap();
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
 
@@ -8014,6 +8022,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        portable_logical_changes: false,
     }
 }
 
@@ -8040,7 +8049,7 @@ fn test_snapshot_isolation_tx_visible1() {
             id: 0, // Dummy ID for visibility tests
             begin: crate::mvcc::database::PackedTs::pack(begin),
             end: crate::mvcc::database::PackedTs::pack(end),
-            row: generate_simple_string_row((-2).into(), 1, "testme"),
+            data: generate_simple_string_row((-2).into(), 1, "testme").data,
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
@@ -8141,7 +8150,7 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
         id: 1,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: generate_simple_string_row((-2).into(), 1, "x"),
+        data: generate_simple_string_row((-2).into(), 1, "x").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8154,7 +8163,7 @@ fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
         id: 2,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(1))),
         end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(42))),
-        row: generate_simple_string_row((-2).into(), 2, "y"),
+        data: generate_simple_string_row((-2).into(), 2, "y").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8262,7 +8271,7 @@ fn test_commit_dependency_speculative_read() {
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: generate_simple_string_row((-2).into(), 1, "test"),
+        data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8295,7 +8304,7 @@ fn test_commit_dependency_cascade_abort() {
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: generate_simple_string_row((-2).into(), 1, "test"),
+        data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8371,7 +8380,7 @@ fn test_commit_dependency_speculative_ignore() {
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(2))),
         end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(3))),
-        row: generate_simple_string_row((-2).into(), 1, "test"),
+        data: generate_simple_string_row((-2).into(), 1, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8453,7 +8462,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
         id: 20,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::Timestamp(5))),
         end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(writer_id))),
-        row: Row::new_index_row(row_id, 1),
+        data: Row::new_index_row(row_id).data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -8508,7 +8517,7 @@ fn test_commit_dependency_multiple_reads_dedup() {
         id: row_id as u64,
         begin: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(1))),
         end: crate::mvcc::database::PackedTs::pack(None),
-        row: generate_simple_string_row((-2).into(), row_id, "test"),
+        data: generate_simple_string_row((-2).into(), row_id, "test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -9373,7 +9382,6 @@ fn write_synthetic_row(db: &MvccTestDbNoConn, value: &str) {
             Row::new_table_row(
                 RowID::new((-1).into(), RowKey::Int(next_schema_rowid)),
                 data.as_blob(),
-                5,
             )
             .unwrap(),
         )
@@ -9781,11 +9789,11 @@ fn transaction_display() {
     let tx_id = 42;
     let begin_ts = 20250914;
 
-    let empty_versions = || Arc::new(RwLock::new(crate::alloc::vec![]));
+    let empty_versions = || Arc::new(RwLock::new(empty_version_chain()));
     let write_set = Mutex::new({
         let mut write_set: WriteSet = WriteSet::new();
-        write_set.insert(RowID::new((-2).into(), RowKey::Int(11)), empty_versions());
-        write_set.insert(RowID::new((-2).into(), RowKey::Int(13)), empty_versions());
+        write_set.push(RowID::new((-2).into(), RowKey::Int(11)), empty_versions());
+        write_set.push(RowID::new((-2).into(), RowKey::Int(13)), empty_versions());
         write_set
     });
 
@@ -9806,6 +9814,7 @@ fn transaction_display() {
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
         created_table_ids: Mutex::new(Vec::new()),
+        portable_logical_changes: false,
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
@@ -10504,10 +10513,10 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
     let row_key =
         SortableIndexKey::new_from_payload_in(&record, index_info, crate::alloc::TursoAllocator)
             .unwrap();
-    let row = Row::new_index_row(
-        RowID::new(MVTableId::new(-42), RowKey::Record(Arc::new(row_key))),
-        index.columns.len(),
-    );
+    let row = Row::new_index_row(RowID::new(
+        MVTableId::new(-42),
+        RowKey::Record(Arc::new(row_key)),
+    ));
     let mut write_row_sm = db
         .mvcc_store
         .write_row_to_pager(&row, cursor.clone(), true)
@@ -11217,7 +11226,7 @@ fn make_rv(begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>) -> RowV
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(begin),
         end: crate::mvcc::database::PackedTs::pack(end),
-        row: generate_simple_string_row((-2).into(), 1, "gc_test"),
+        data: generate_simple_string_row((-2).into(), 1, "gc_test").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     }
@@ -11251,7 +11260,7 @@ fn txid(v: u64) -> Option<TxTimestampOrID> {
 /// Rolled-back transactions leave versions with begin=None, end=None. These are
 /// invisible to every transaction and must be removed unconditionally by Rule 1.
 fn test_gc_rule1_aborted_garbage_removed() {
-    let mut versions = crate::alloc::vec![make_rv(None, None)];
+    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(None, None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
@@ -11268,11 +11277,12 @@ fn test_gc_rule1_aborted_garbage_removed() {
 #[test]
 /// Rule 1 removes only aborted garbage, leaving live and superseded versions intact.
 fn test_gc_rule1_aborted_among_live_versions() {
-    let mut versions = crate::alloc::vec![
+    let mut versions: RowVersionChain = crate::alloc::vec![
         make_rv(ts(5), None),  // current
         make_rv(None, None),   // aborted
         make_rv(ts(3), ts(5)), // superseded
-    ];
+    ]
+    .into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         2,
@@ -11296,10 +11306,11 @@ fn test_gc_rule1_aborted_among_live_versions() {
 /// take over B-tree invalidation, the superseded version is safely removable.
 fn test_gc_rule2_superseded_below_lwm_with_current() {
     // Superseded version (end=Timestamp(3)) below LWM=10, and there's a current version.
-    let mut versions = crate::alloc::vec![
+    let mut versions: RowVersionChain = crate::alloc::vec![
         make_rv(ts(3), ts(5)), // superseded, e=5 <= lwm=10
         make_rv(ts(5), None),  // current
-    ];
+    ]
+    .into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
@@ -11319,7 +11330,8 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
 /// to an active reader. It must be retained regardless of other conditions.
 fn test_gc_rule2_superseded_above_lwm_retained() {
     // Superseded version (end=Timestamp(15)) above LWM=10 — must be retained.
-    let mut versions = crate::alloc::vec![make_rv(ts(3), ts(15)), make_rv(ts(15), None)];
+    let mut versions: RowVersionChain =
+        crate::alloc::vec![make_rv(ts(3), ts(15)), make_rv(ts(15), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
@@ -11340,9 +11352,10 @@ fn test_gc_rule2_superseded_above_lwm_retained() {
 fn test_gc_rule2_tombstone_guard_uncheckpointed() {
     // Tombstone: end is set, no current version, and e > ckpt_max.
     // Must be retained to prevent row resurrection via dual cursor.
-    let mut versions = crate::alloc::vec![
+    let mut versions: RowVersionChain = crate::alloc::vec![
         make_rv(ts(3), ts(5)), // tombstone (sole version, no current)
-    ];
+    ]
+    .into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
@@ -11362,7 +11375,7 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
 /// contains the row, so the tombstone is safe to remove.
 fn test_gc_rule2_tombstone_guard_checkpointed() {
     // Tombstone with e <= ckpt_max — deletion is checkpointed, safe to remove.
-    let mut versions = crate::alloc::vec![make_rv(ts(3), ts(5))];
+    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(ts(3), ts(5))].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
@@ -11384,7 +11397,8 @@ fn test_gc_rule2_tombstone_guard_checkpointed() {
 fn test_gc_rule3_drop_current_when_in_btree() {
     // Single stamped current with b <= ckpt_max, and no transaction open
     // (lwm == u64::MAX).
-    let mut versions = crate::alloc::vec![make_materialized_rv(ts(5), None)];
+    let mut versions: RowVersionChain =
+        crate::alloc::vec![make_materialized_rv(ts(5), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
@@ -11400,7 +11414,8 @@ fn test_gc_rule3_drop_current_when_in_btree() {
 /// Truncate Rule 3 matches Passive: sole stamped currents clear only when idle.
 #[test]
 fn test_gc_rule3_truncate_idle_only() {
-    let mut versions = crate::alloc::vec![make_materialized_rv(ts(5), None)];
+    let mut versions: RowVersionChain =
+        crate::alloc::vec![make_materialized_rv(ts(5), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
@@ -11432,7 +11447,8 @@ fn test_gc_rule3_not_checkpointed_retained() {
     // Single current version with b > ckpt_max — B-tree doesn't have it yet.
     // Nothing is open (lwm == u64::MAX), so ckpt_max is the only thing holding
     // this version back.
-    let mut versions = crate::alloc::vec![make_materialized_rv(ts(5), None)];
+    let mut versions: RowVersionChain =
+        crate::alloc::vec![make_materialized_rv(ts(5), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
@@ -11452,7 +11468,8 @@ fn test_gc_rule3_not_checkpointed_retained() {
 /// under it. Rule 3 only fires when nothing is open, so this is retained.
 fn test_gc_rule3_visible_to_active_tx_retained() {
     // Single stamped current, already inside ckpt_max, but a transaction is open.
-    let mut versions = crate::alloc::vec![make_materialized_rv(ts(5), None)];
+    let mut versions: RowVersionChain =
+        crate::alloc::vec![make_materialized_rv(ts(5), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         5,
@@ -11470,7 +11487,8 @@ fn test_gc_rule3_visible_to_active_tx_retained() {
 #[test]
 /// A current version cannot be removed before checkpoint has persisted it.
 fn test_gc_rule3_current_retained_before_first_checkpoint() {
-    let mut versions = crate::alloc::vec![make_materialized_rv(ts(1), None)];
+    let mut versions: RowVersionChain =
+        crate::alloc::vec![make_materialized_rv(ts(1), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
@@ -11487,7 +11505,8 @@ fn test_gc_rule3_current_retained_before_first_checkpoint() {
 #[test]
 /// Once checkpoint has persisted a sole current version, it becomes GC-eligible.
 fn test_gc_rule3_current_collected_after_checkpoint() {
-    let mut versions = crate::alloc::vec![make_materialized_rv(ts(1), None)];
+    let mut versions: RowVersionChain =
+        crate::alloc::vec![make_materialized_rv(ts(1), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
@@ -11506,7 +11525,8 @@ fn test_gc_rule3_current_collected_after_checkpoint() {
 /// superseded history, Rule 3 can then drop that current.
 fn test_gc_rule3_after_history_reclaimed() {
     // Rule 3 only fires when exactly one version remains after rules 1 & 2.
-    let mut versions = crate::alloc::vec![make_rv(ts(3), ts(5)), make_materialized_rv(ts(5), None)];
+    let mut versions: RowVersionChain =
+        crate::alloc::vec![make_rv(ts(3), ts(5)), make_materialized_rv(ts(5), None)].into();
     // Both versions are inside ckpt_max and nothing is open, but the chain
     // starts with 2 entries. Rule 2 removes the superseded one
     // (has_current=true), then Rule 3 drops the remaining current.
@@ -11526,7 +11546,7 @@ fn test_gc_rule3_after_history_reclaimed() {
 /// `ckpt_max` says a checkpoint ran, not that this row reached a B-tree leaf.
 #[test]
 fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
-    let mut versions = crate::alloc::vec![make_rv(ts(5), None)];
+    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(ts(5), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
@@ -11560,7 +11580,7 @@ fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
 /// inserts. They don't match any removal rule and must always be retained.
 fn test_gc_txid_refs_retained() {
     // Versions with TxID (uncommitted) references are never collected.
-    let mut versions = crate::alloc::vec![make_rv(txid(99), None)];
+    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(txid(99), None)].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
@@ -11579,7 +11599,7 @@ fn test_gc_txid_refs_retained() {
 /// end=Timestamp, so these are never collected until the deleting tx resolves.
 fn test_gc_txid_end_retained() {
     // end=TxID means the deletion is uncommitted; rule 2 only matches Timestamp.
-    let mut versions = crate::alloc::vec![make_rv(ts(3), txid(50))];
+    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(ts(3), txid(50))].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
@@ -11601,10 +11621,11 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
     // A pending insert (begin=TxID, end=None) coexists with a tombstone.
     // has_current must NOT count the pending insert — if it rolls back,
     // the tombstone is the only thing hiding the B-tree row.
-    let mut versions = crate::alloc::vec![
+    let mut versions: RowVersionChain = crate::alloc::vec![
         make_rv(ts(3), ts(5)), // tombstone: deletion at e=5, not checkpointed (ckpt_max=2)
         make_rv(txid(99), None), // pending insert (uncommitted)
-    ];
+    ]
+    .into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
@@ -11627,10 +11648,11 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
 fn test_gc_rule2_committed_current_disables_non_btree_tombstone_guard() {
     // A committed current version (begin=Timestamp, end=None) means the row
     // has a live successor — the tombstone can safely be removed.
-    let mut versions = crate::alloc::vec![
+    let mut versions: RowVersionChain = crate::alloc::vec![
         make_rv(ts(3), ts(5)), // superseded, e=5 <= lwm=10
         make_rv(ts(5), None),  // committed current
-    ];
+    ]
+    .into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
@@ -11654,7 +11676,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
     let mut tombstone = make_rv(None, ts(5));
     tombstone.btree_resident = true;
     let current = make_materialized_rv(ts(5), None);
-    let mut versions = crate::alloc::vec![tombstone, current.clone()];
+    let mut versions: RowVersionChain = crate::alloc::vec![tombstone, current.clone()].into();
 
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
@@ -11681,7 +11703,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
 
     let mut rewritten_btree_row = make_rv(ts(3), ts(5));
     rewritten_btree_row.btree_resident = true;
-    let mut versions = crate::alloc::vec![rewritten_btree_row, current];
+    let mut versions: RowVersionChain = crate::alloc::vec![rewritten_btree_row, current].into();
 
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
@@ -11720,7 +11742,7 @@ fn test_gc_rule2_checkpointed_insert_with_current_retained_until_checkpoint() {
     // begin=2 <= ckpt_max=2 (insert checkpointed), end=5 > ckpt_max (overwrite not).
     let checkpointed_btree_row = make_rv(ts(2), ts(5));
     let current = make_materialized_rv(ts(5), None);
-    let mut versions = crate::alloc::vec![checkpointed_btree_row, current];
+    let mut versions: RowVersionChain = crate::alloc::vec![checkpointed_btree_row, current].into();
 
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
@@ -11757,7 +11779,7 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
     // B-tree tombstone: begin=None, end=Timestamp(e) where e > 0.
     // Represents a row deleted in MVCC that existed in B-tree before MVCC.
     // Before checkpoint (ckpt_max < e): tombstone must be retained.
-    let mut versions = crate::alloc::vec![make_rv(None, ts(5))];
+    let mut versions: RowVersionChain = crate::alloc::vec![make_rv(None, ts(5))].into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
@@ -11791,10 +11813,11 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
     // Two versions: superseded with e > lwm (can't remove), and current.
     // Rule 2 can't remove the superseded one, so 2 versions remain.
     // Rule 3 needs a single remaining current, so it must NOT fire.
-    let mut versions = crate::alloc::vec![
+    let mut versions: RowVersionChain = crate::alloc::vec![
         make_rv(ts(3), ts(15)),             // e=15 > lwm=10 — retained
         make_materialized_rv(ts(15), None), // current
-    ];
+    ]
+    .into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
@@ -11811,7 +11834,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
 #[test]
 /// GC on an empty version chain is a no-op. Verifies no panics or off-by-one errors.
 fn test_gc_noop_on_empty() {
-    let mut versions: RowVersionChain<TursoAllocator> = crate::alloc::vec![];
+    let mut versions = empty_version_chain();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
@@ -11829,13 +11852,14 @@ fn test_gc_noop_on_empty() {
 /// checkpointed superseded versions with a committed current (Rule 2), and the sole
 /// surviving stamped current inside `ckpt_max` (Rule 3). The chain is fully reclaimed.
 fn test_gc_combined_rules() {
-    let mut versions = crate::alloc::vec![
+    let mut versions: RowVersionChain = crate::alloc::vec![
         make_rv(None, None),   // aborted → rule 1
         make_rv(ts(1), ts(3)), // superseded, e=3 <= ckpt_max=5 → rule 2 (has_current=true)
         make_rv(ts(3), ts(5)), // superseded, e=5 <= ckpt_max=5 → rule 2
         // current, stamped, b=5 <= ckpt_max=5, nothing open → rule 3
         make_materialized_rv(ts(5), None),
-    ];
+    ]
+    .into();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
@@ -12092,7 +12116,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(begin),
         end: crate::mvcc::database::PackedTs::pack(end),
-        row: generate_simple_string_row((-2).into(), 1, "shrink"),
+        data: generate_simple_string_row((-2).into(), 1, "shrink").data,
         btree_resident: false,
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     };
@@ -12161,7 +12185,257 @@ fn test_gc_shrinks_version_chain_capacity() {
         true,
     );
     assert!(small.is_empty());
+    // A `Vec` keeps a small allocation. The stable build keeps one version
+    // inline, so its chain frees the buffer when one version or none remains.
+    #[cfg(nightly)]
     assert_eq!(small.capacity(), capacity_before);
+    #[cfg(not(nightly))]
+    {
+        assert_eq!(capacity_before, 16);
+        assert_eq!(small.capacity(), 1);
+    }
+}
+
+/// Most chains hold one or two versions, so a short chain must not keep the
+/// four-slot minimum capacity of amortized `Vec` growth.
+#[test]
+fn test_short_version_chain_has_no_unused_capacity() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row(table_id, 1, "version_0"))
+        .unwrap();
+    let chain_len_and_capacity = || {
+        let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+        let versions = entry.value().read();
+        (versions.len(), versions.capacity())
+    };
+    assert_eq!(chain_len_and_capacity(), (1, 1));
+
+    for version in 1..4 {
+        let row = generate_simple_string_row(table_id, 1, &format!("version_{version}"));
+        assert!(db.mvcc_store.update(tx, row).unwrap());
+        assert_eq!(chain_len_and_capacity(), (version + 1, version + 1));
+    }
+}
+
+/// Most chains hold one version. The stable build stores that version inside
+/// the chain, in the allocation of the `Arc` of the chain, so a new row needs
+/// no second allocation.
+#[cfg(not(nightly))]
+#[test]
+fn test_one_version_is_stored_inside_its_chain() {
+    let db = MvccTestDb::new();
+    let table_id: MVTableId = (-2).into();
+    let row_id = RowID::new(table_id, RowKey::Int(1));
+    let tx = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    db.mvcc_store
+        .insert(tx, generate_simple_string_row(table_id, 1, "version_0"))
+        .unwrap();
+    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    let versions = entry.value().read();
+    let chain_start = std::ptr::addr_of!(*versions) as usize;
+    let chain = chain_start..chain_start + std::mem::size_of_val(&*versions);
+    assert!(chain.contains(&(versions.as_ptr() as usize)));
+}
+
+/// A version chain stores its versions inline, so the size of `RowVersion` is a
+/// large part of the heap that MVCC uses for each row. The nightly build stores
+/// an allocator in each payload, so its sizes are different.
+#[cfg(not(nightly))]
+#[test]
+fn test_row_version_size() {
+    assert_eq!(std::mem::size_of::<WalPos>(), 12);
+    assert_eq!(std::mem::size_of::<RowVersion>(), 56);
+}
+
+/// A version does not store its column count. It reads the count from its
+/// record, and a tombstone with an empty payload has no columns.
+#[test]
+fn test_row_version_column_count_comes_from_the_record() {
+    let id = RowID::new(MVTableId::from(-2), RowKey::Int(1));
+    let record =
+        ImmutableRecord::from_values(&[Value::from_i64(7), Value::build_text("seven")], 2).unwrap();
+    let row = Row::new_table_row(id.clone(), record.as_blob()).unwrap();
+    let version = RowVersion::new(
+        1,
+        Some(TxTimestampOrID::Timestamp(1)),
+        None,
+        row.data,
+        false,
+    );
+    assert_eq!(version.column_count(&id), 2);
+    let empty = Row::new_table_row(id.clone(), &[]).unwrap();
+    let tombstone = RowVersion::new(
+        2,
+        None,
+        Some(TxTimestampOrID::Timestamp(2)),
+        empty.data,
+        true,
+    );
+    assert_eq!(tombstone.column_count(&id), 0);
+}
+
+/// A tombstone over a B-tree row keeps a copy of the deleted row only for the
+/// readers that use it: the checkpoint reads `sqlite_schema` rows, and the
+/// commit reads the primary key for portable logical changes.
+#[test]
+fn test_tombstone_keeps_deleted_row_only_for_sqlite_schema() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn.execute("CREATE TABLE dropped(x)").unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'deleted row')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let schema_rowid = get_rows(
+        &db.conn,
+        "SELECT rowid FROM sqlite_schema WHERE name = 'dropped'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let user_row = RowID::new(
+        db.mvcc_store.get_table_id_from_root_page(root_page),
+        RowKey::Int(1),
+    );
+    let schema_row = RowID::new(SQLITE_SCHEMA_MVCC_TABLE_ID, RowKey::Int(schema_rowid));
+    assert!(db.mvcc_store.rows.get(&user_row).is_none());
+    assert!(db.mvcc_store.rows.get(&schema_row).is_none());
+
+    db.conn.execute("BEGIN").unwrap();
+    db.conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    db.conn.execute("DROP TABLE dropped").unwrap();
+    let tombstone_payload_len = |row_id: &RowID| {
+        let entry = db.mvcc_store.rows.get(row_id).unwrap();
+        let versions = entry.value().read();
+        let [tombstone] = versions.as_slice() else {
+            panic!("expected one tombstone, got {versions:?}");
+        };
+        assert!(tombstone.begin().is_none());
+        assert!(tombstone.btree_resident);
+        tombstone.payload(row_id).len()
+    };
+    assert_eq!(tombstone_payload_len(&user_row), 0);
+    assert!(tombstone_payload_len(&schema_row) > 0);
+    db.conn.execute("COMMIT").unwrap();
+
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&db.conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(0)]]
+    );
+    assert!(get_rows(
+        &db.conn,
+        "SELECT name FROM sqlite_schema WHERE name = 'dropped'"
+    )
+    .is_empty());
+}
+
+/// A transaction adds a version chain to its write set only on its first write
+/// to the chain. Later writes to the same table row or index key find a version
+/// of the transaction in the chain and add nothing.
+#[test]
+fn test_write_set_has_one_entry_for_each_written_chain() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    // The table row 1 and the index keys 'a' and 'b'.
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (3, 3)
+    );
+    conn.execute("COMMIT").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::build_text("a")]]);
+}
+
+/// A rollback to a savepoint removes the chains that the savepoint added to the
+/// write set. A chain that the transaction wrote before the savepoint stays,
+/// also when the savepoint wrote to it again. A second rollback to the same
+/// savepoint removes the chains that were added after the first rollback.
+#[test]
+fn test_savepoint_rollback_removes_only_the_chains_that_the_savepoint_added() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (2, 2)
+    );
+
+    conn.execute("SAVEPOINT sp").unwrap();
+    conn.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'c')").unwrap();
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (5, 5)
+    );
+    conn.execute("ROLLBACK TO sp").unwrap();
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (2, 2)
+    );
+
+    conn.execute("INSERT INTO t VALUES (3, 'd')").unwrap();
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (4, 4)
+    );
+    conn.execute("ROLLBACK TO sp").unwrap();
+    assert_eq!(
+        write_set_len_and_distinct_chains(&mvcc_store, tx_id),
+        (2, 2)
+    );
+
+    conn.execute("RELEASE sp").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(rows, vec![vec![Value::from_i64(1), Value::build_text("a")]]);
+}
+
+fn write_set_len_and_distinct_chains(
+    mvcc_store: &Arc<crate::MvStore>,
+    tx_id: TxID,
+) -> (usize, usize) {
+    let tx = mvcc_store.txs.get(&tx_id).unwrap();
+    let write_set = tx.value().write_set.lock();
+    let distinct_chains: HashSet<usize> = write_set
+        .iter()
+        .map(|(_, row_versions)| Arc::as_ptr(row_versions) as usize)
+        .collect();
+    (write_set.len(), distinct_chains.len())
 }
 
 /// `drop_unused_row_versions_and_slots` removes emptied SkipMap entries.
@@ -13616,7 +13890,7 @@ fn arbitrary_row_version(g: &mut Gen) -> RowVersion {
         id: 0,
         begin: crate::mvcc::database::PackedTs::pack(begin),
         end: crate::mvcc::database::PackedTs::pack(end),
-        row: generate_simple_string_row((-2).into(), 1, "qc"),
+        data: generate_simple_string_row((-2).into(), 1, "qc").data,
         btree_resident: bool::arbitrary(g),
         materialized_at: crate::mvcc::database::WalPos::ORIGIN,
     }
@@ -18536,6 +18810,43 @@ fn test_mvcc_portable_changes_delete_carries_pk_projection_not_old_record() {
 
 #[cfg(feature = "conn_raw_api")]
 #[test]
+fn test_mvcc_portable_changes_delete_of_checkpointed_row_carries_pk_projection() {
+    let db = MvccTestDb::new_with_portable_logical_changes();
+    db.conn
+        .execute("CREATE TABLE items(id TEXT PRIMARY KEY, payload TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO items VALUES ('item-a', 'alpha')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    db.conn
+        .execute("DELETE FROM items WHERE id = 'item-a'")
+        .unwrap();
+
+    let delete_pk_record = collect_mvcc_recovery_ops(&db.conn)
+        .into_iter()
+        .find_map(|op| match op {
+            ParsedOp::DeleteTable {
+                rowid,
+                pk_record_bytes,
+                ..
+            } if rowid.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID => Some(pk_record_bytes),
+            _ => None,
+        })
+        .expect("expected data DELETE op");
+    let pk_values = ImmutableRecord::from_bin_record(
+        crate::types::value_blob_from_slice(&delete_pk_record).expect(crate::alloc::ALLOC_ERR_MSG),
+    )
+    .get_values_owned()
+    .unwrap();
+    assert_eq!(
+        pk_values,
+        vec![Value::Text(Text::new("item-a".to_string()))]
+    );
+}
+
+#[cfg(feature = "conn_raw_api")]
+#[test]
 fn test_mvcc_portable_changes_do_not_infer_origin_from_application_table() {
     let db = MvccTestDb::new_with_portable_logical_changes();
     db.conn
@@ -21085,11 +21396,12 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         fn serialize_row_version(
             &self,
             log_record: &mut LogRecord,
+            row_id: &RowID,
             row_version: &RowVersion,
             portable_extension: Option<&[u8]>,
         ) -> Result<()> {
             self.inner
-                .serialize_row_version(log_record, row_version, portable_extension)
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
         }
         fn serialize_database_header(
             &self,
@@ -21306,11 +21618,12 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         fn serialize_row_version(
             &self,
             log_record: &mut LogRecord,
+            row_id: &RowID,
             row_version: &RowVersion,
             portable_extension: Option<&[u8]>,
         ) -> Result<()> {
             self.inner
-                .serialize_row_version(log_record, row_version, portable_extension)
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
         }
         fn serialize_database_header(
             &self,
@@ -23584,11 +23897,12 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         fn serialize_row_version(
             &self,
             log_record: &mut LogRecord,
+            row_id: &RowID,
             row_version: &RowVersion,
             portable_extension: Option<&[u8]>,
         ) -> Result<()> {
             self.inner
-                .serialize_row_version(log_record, row_version, portable_extension)
+                .serialize_row_version(log_record, row_id, row_version, portable_extension)
         }
         fn serialize_database_header(
             &self,
@@ -23839,7 +24153,7 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
         id: 0,
         begin: PackedTs::pack(None),
         end: PackedTs::pack(Some(TxTimestampOrID::TxID(evicted_writer))),
-        row: generate_simple_string_row((-2).into(), 1, "original"),
+        data: generate_simple_string_row((-2).into(), 1, "original").data,
         btree_resident: true,
         materialized_at: WalPos::ORIGIN,
     });
@@ -24684,4 +24998,10 @@ fn step_until_busy_then_release(
             other => panic!("unexpected step result: {other:?}"),
         }
     }
+}
+
+fn empty_version_chain() -> RowVersionChain<TursoAllocator> {
+    <RowVersionChain<TursoAllocator> as TursoVecInExt<RowVersion, TursoAllocator>>::new_in(
+        TursoAllocator,
+    )
 }

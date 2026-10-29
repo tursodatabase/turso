@@ -1,3 +1,4 @@
+use crate::catalog::PG_DATABASE_OWNER_OID;
 use crate::error::sqlstate_error;
 use crate::settings::SettingScope;
 use chrono::Utc;
@@ -107,9 +108,9 @@ impl ScalarCall for PgScalarFunction {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let value = match self {
             Self::Acldefault => exec_acl_default(args)?,
-            Self::PgGetUserbyid => exec_pg_get_user_by_id(int_arg(args, 0, 0)),
+            Self::PgGetUserbyid => oid_arg(args, 0)?.map_or(Value::Null, exec_pg_get_user_by_id),
             Self::PgTableIsVisible | Self::PgFunctionIsVisible | Self::PgTypeIsVisible => {
-                exec_pg_is_visible(int_arg(args, 0, 0))
+                oid_arg(args, 0)?.map_or(Value::Null, exec_pg_is_visible)
             }
             Self::PgEncodingToChar => exec_pg_encoding_to_char(int_arg(args, 0, 0)),
             Self::PgGetFunctionResult
@@ -124,9 +125,15 @@ impl ScalarCall for PgScalarFunction {
                 _ => Value::build_text(turso_pg_parser::quote_identifier(&text_arg(args, 0))),
             },
             Self::QuoteLiteral => exec_quote_literal(args[0].get_value()),
-            Self::FormatType => exec_pg_format_type(int_arg(args, 0, 0), int_arg(args, 1, -1)),
-            Self::PgGetConstraintdef => exec_pg_get_constraintdef(connection, int_arg(args, 0, 0)),
-            Self::PgGetIndexdef => exec_pg_get_indexdef(connection, int_arg(args, 0, 0)),
+            Self::FormatType => oid_arg(args, 0)?.map_or(Value::Null, |type_oid| {
+                exec_pg_format_type(type_oid, int_arg(args, 1, -1))
+            }),
+            Self::PgGetConstraintdef => oid_arg(args, 0)?.map_or(Value::Null, |oid| {
+                exec_pg_get_constraintdef(connection, oid)
+            }),
+            Self::PgGetIndexdef => {
+                oid_arg(args, 0)?.map_or(Value::Null, |oid| exec_pg_get_indexdef(connection, oid))
+            }
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
@@ -256,6 +263,8 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
     // Replace it with a real role OID-to-name lookup later. Keep the numeric fallback for unknown OIDs.
     let role = if owner == 10 {
         "turso".to_string()
+    } else if owner == PG_DATABASE_OWNER_OID {
+        "pg_database_owner".to_string()
     } else {
         owner.to_string()
     };
@@ -390,6 +399,56 @@ fn int_arg(args: &[Register], i: usize, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
+    let value = args[i].get_value();
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => parse_oid(text.as_str()).map(Some),
+        value => value.as_int().map(Some).ok_or_else(|| {
+            LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
+        }),
+    }
+}
+
+fn parse_oid(text: &str) -> Result<i64> {
+    let invalid =
+        || LimboError::ConversionError(format!("invalid input syntax for type oid: \"{text}\""));
+    let out_of_range =
+        || LimboError::ConversionError(format!("value \"{text}\" is out of range for type oid"));
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
+    let number = text.trim_matches(is_space);
+    let (negative, unsigned) = match number.as_bytes().first() {
+        Some(b'-') => (true, &number[1..]),
+        Some(b'+') => (false, &number[1..]),
+        _ => (false, number),
+    };
+    let (radix, digits) = if let Some(hex) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+        .filter(|hex| hex.starts_with(|c: char| c.is_ascii_hexdigit()))
+    {
+        (16, hex)
+    } else if unsigned.len() > 1 && unsigned.starts_with('0') {
+        (8, &unsigned[1..])
+    } else {
+        (10, unsigned)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(invalid());
+    }
+    let magnitude = u64::from_str_radix(digits, radix).map_err(|_| out_of_range())?;
+    let value = if negative {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    };
+    let oid = value as u32;
+    if value != u64::from(oid) && value != oid as i32 as i64 as u64 {
+        return Err(out_of_range());
+    }
+    Ok(i64::from(oid))
+}
+
 fn text_arg(args: &[Register], i: usize) -> String {
     match args.get(i).map(Register::get_value) {
         Some(Value::Text(t)) => t.as_str().to_string(),
@@ -403,7 +462,7 @@ pub(crate) enum ConfigParameter {
     SearchPath,
 }
 
-enum Parameter<'a> {
+pub(crate) enum Parameter<'a> {
     BuiltIn(ConfigParameter),
     Custom(&'a str),
 }
@@ -508,7 +567,7 @@ fn unrecognized_parameter(name: &str) -> LimboError {
     )
 }
 
-fn find_parameter(name: &str) -> Option<Parameter<'_>> {
+pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
     match name.parse::<ConfigParameter>() {
         Ok(parameter) => Some(Parameter::BuiltIn(parameter)),
         Err(_) if name.contains('.') => Some(Parameter::Custom(name)),
@@ -558,8 +617,12 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
     Ok(Value::from_i64(value))
 }
 
-fn exec_pg_get_user_by_id(_oid: i64) -> Value {
-    Value::build_text("turso")
+fn exec_pg_get_user_by_id(oid: i64) -> Value {
+    Value::build_text(if oid == PG_DATABASE_OWNER_OID {
+        "pg_database_owner"
+    } else {
+        "turso"
+    })
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {

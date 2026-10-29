@@ -1,6 +1,8 @@
 use crate::namespace::{NamespaceId, NamespaceRef};
-use crate::schema::{BTreeTable, Trigger};
+use crate::schema::{BTreeTable, Column, Trigger};
 use crate::sync::Arc;
+use crate::translate::collate::column_collation;
+use crate::translate::emitter::RegisterColumn;
 use crate::translate::expr::WalkControl;
 use crate::translate::subquery::{
     emit_non_from_clause_subquery, plan_subqueries_in_expr_without_from_clause,
@@ -11,8 +13,8 @@ use crate::translate::{
     planner::ROWID_STRS,
     translate_inner, ProgramBuilder, ProgramBuilderOpts,
 };
+use crate::turso_assert;
 use crate::util::normalize_ident;
-use crate::vdbe::affinity::Affinity;
 use crate::vdbe::insn::{Insn, Subprogram};
 use crate::vdbe::BranchOffset;
 use crate::{bail_parse_error, QueryMode, Result};
@@ -196,13 +198,22 @@ struct TriggerSubprogramContext {
     db_name: Option<ast::Name>,
 }
 
-fn variable_from_parameter_index(index: NonZero<usize>, col_type: Option<&str>) -> Expr {
+/// The parameter that stands for NEW.x or OLD.x. It carries the declared type
+/// and the collation of column x; None for the rowid.
+fn variable_from_parameter_index(index: NonZero<usize>, column: Option<&Column>) -> Expr {
     let nz = u32::try_from(index.get())
         .ok()
         .and_then(std::num::NonZeroU32::new)
         .expect("trigger parameter index must fit into NonZeroU32");
-    match col_type {
-        Some(ty) => Expr::Variable(ast::Variable::indexed_typed(nz, ty)),
+    match column {
+        Some(column) => {
+            let collation = column_collation(column).map(|collation| collation.name());
+            Expr::Variable(ast::Variable::for_column(
+                nz,
+                &column.ty_str,
+                collation.as_deref(),
+            ))
+        }
         None => Expr::Variable(ast::Variable::indexed(nz)),
     }
 }
@@ -428,12 +439,11 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if ctx.has_new {
                     let num_cols = ctx.table.columns().len();
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
-                        let ty = Some(col_def.ty_str.as_str());
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
                                 ctx.get_new_rowid_param()
                                     .expect("NEW parameters must be provided"),
-                                ty,
+                                Some(col_def),
                             );
                             return Ok(());
                         }
@@ -441,7 +451,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             *e = variable_from_parameter_index(
                                 ctx.get_new_param(idx)
                                     .expect("NEW parameters must be provided"),
-                                ty,
+                                Some(col_def),
                             );
                             return Ok(());
                         } else {
@@ -470,12 +480,11 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 if ctx.has_old {
                     let num_cols = ctx.table.columns().len();
                     if let Some((idx, col_def)) = ctx.table.get_column(&col) {
-                        let ty = Some(col_def.ty_str.as_str());
                         if col_def.is_rowid_alias() {
                             *e = variable_from_parameter_index(
                                 ctx.get_old_rowid_param()
                                     .expect("OLD parameters must be provided"),
-                                ty,
+                                Some(col_def),
                             );
                             return Ok(());
                         }
@@ -483,7 +492,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             *e = variable_from_parameter_index(
                                 ctx.get_old_param(idx)
                                     .expect("OLD parameters must be provided"),
-                                ty,
+                                Some(col_def),
                             );
                             return Ok(());
                         } else {
@@ -891,9 +900,8 @@ pub fn fire_trigger(
     // So we can use the decoded registers directly, skipping N Copy + 1 Affinity per fire.
     let ctx = &decode_trigger_registers(program, resolver, ctx)?;
 
-    let saved_register_affinities = std::mem::take(&mut resolver.register_affinities);
-    let saved_register_collations = std::mem::take(&mut resolver.register_collations);
-    populate_trigger_register_affinities(resolver, ctx);
+    let saved_register_columns = std::mem::take(&mut resolver.register_columns);
+    populate_trigger_register_columns(resolver, ctx);
     let result = (|| -> Result<()> {
         // A trigger body is inlined and re-executed once per affected row. Any
         // run-once block inside it (an uncorrelated subquery, a hash or
@@ -977,8 +985,7 @@ pub fn fire_trigger(
         program.preassign_label_to_next_insn(firing_end);
         Ok(())
     })();
-    resolver.register_affinities = saved_register_affinities;
-    resolver.register_collations = saved_register_collations;
+    resolver.register_columns = saved_register_columns;
     result
 }
 
@@ -1062,14 +1069,13 @@ fn decode_trigger_registers(
     })
 }
 
-fn populate_trigger_register_affinities(resolver: &mut Resolver, ctx: &TriggerContext) {
-    populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.new_registers.as_deref());
-    populate_trigger_row_register_affinities(resolver, &ctx.table, ctx.old_registers.as_deref());
+fn populate_trigger_register_columns(resolver: &mut Resolver, ctx: &TriggerContext) {
+    populate_trigger_row_register_columns(resolver, &ctx.table, ctx.new_registers.as_deref());
+    populate_trigger_row_register_columns(resolver, &ctx.table, ctx.old_registers.as_deref());
 }
 
-// NEW/OLD columns don't have affinities, except for rowids and rowid aliases,
-// which have INTEGER affinity. See https://www.sqlite.org/forum/forumpost/819f2d6627
-fn populate_trigger_row_register_affinities(
+/// NEW/OLD registers hold one register per table column followed by the rowid.
+fn populate_trigger_row_register_columns(
     resolver: &mut Resolver,
     table: &BTreeTable,
     row_registers: Option<&[usize]>,
@@ -1077,23 +1083,22 @@ fn populate_trigger_row_register_affinities(
     let Some(registers) = row_registers else {
         return;
     };
-
-    for (idx, column) in table.columns().iter().enumerate() {
-        if !column.is_rowid_alias() {
-            continue;
-        }
-        if let Some(&register) = registers.get(idx) {
-            resolver
-                .register_affinities
-                .insert(register, Affinity::Integer);
-        }
-    }
-
-    if let Some(&rowid_register) = registers.last() {
+    let columns = table.columns();
+    turso_assert!(
+        registers.len() == columns.len() + 1,
+        "a trigger row has one register per column and one for the rowid"
+    );
+    for (column, &register) in columns.iter().zip(registers) {
         resolver
-            .register_affinities
-            .insert(rowid_register, Affinity::Integer);
+            .register_columns
+            .insert(register, RegisterColumn::trigger_row_column(column));
     }
+    let rowid_register = *registers
+        .last()
+        .expect("a trigger row has a rowid register");
+    resolver
+        .register_columns
+        .insert(rowid_register, RegisterColumn::rowid());
 }
 
 /// Rewrite NEW/OLD references in WHEN clause expressions (uses Register expressions, not Variable)

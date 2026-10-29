@@ -603,3 +603,14 @@ test update-float-into-int-column-rounds {
 expect {
     4
 }
+
+test add-column-fills-existing-rows-with-a-function-default {
+    CREATE TABLE add_column_fill (id int);
+    INSERT INTO add_column_fill VALUES (1), (2);
+    ALTER TABLE add_column_fill ADD COLUMN schema_name text DEFAULT current_schema;
+    SELECT id, schema_name FROM add_column_fill ORDER BY id;
+}
+expect {
+    1|public
+    2|public
+}

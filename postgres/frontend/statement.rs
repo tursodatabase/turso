@@ -78,7 +78,20 @@ impl Statement {
     }
 
     pub fn get_column_type_info(&self, index: usize) -> Result<Option<ColumnTypeInfo>> {
-        self.inner.get_column_type_info(index).map_err(Into::into)
+        let mut info = self.inner.get_column_type_info(index)?;
+        if self.inner.get_query_mode() == turso_core::QueryMode::Normal {
+            let program = self.inner.get_program();
+            if let (Some(info), Some(column)) = (&mut info, program.result_columns.get(index)) {
+                if matches!(
+                    boolean_result_type(&column.expr, program),
+                    BooleanResultType::Boolean
+                ) {
+                    info.declared_name = "BOOLEAN".to_string();
+                    info.base_type = None;
+                }
+            }
+        }
+        Ok(info)
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
@@ -193,6 +206,70 @@ impl Statement {
         }
         self.inner.reset_best_effort();
     }
+}
+
+enum BooleanResultType {
+    Boolean,
+    Null,
+    Other,
+}
+
+// TODO: With better binding and resolved expression support, read the result type
+// from the resolved expression instead. Inferring it from expression shapes here
+// is fragile: new expressions and rewrites can lose the boolean type.
+fn boolean_result_type(
+    expr: &turso_parser::ast::Expr,
+    program: &turso_core::Program,
+) -> BooleanResultType {
+    use turso_parser::ast::{Expr, Literal};
+
+    match expr {
+        Expr::Literal(Literal::Null) => BooleanResultType::Null,
+        Expr::Cast {
+            type_name: Some(ty),
+            ..
+        } if ty.array_dimensions == 0 && is_boolean_type(&ty.name) => BooleanResultType::Boolean,
+        Expr::Column { table, column, .. } => {
+            let column = program
+                .table_references
+                .find_table_by_internal_id(*table)
+                .and_then(|(_, table)| table.get_column_at(*column));
+            match column {
+                Some(column)
+                    if column.array_dimensions() == 0 && is_boolean_type(&column.ty_str) =>
+                {
+                    BooleanResultType::Boolean
+                }
+                _ => BooleanResultType::Other,
+            }
+        }
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => boolean_result_type(&exprs[0], program),
+        Expr::Collate(expr, _) => boolean_result_type(expr, program),
+        Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => {
+            let mut result = BooleanResultType::Null;
+            for expr in when_then_pairs
+                .iter()
+                .map(|(_, then)| then.as_ref())
+                .chain(else_expr.as_deref())
+            {
+                match boolean_result_type(expr, program) {
+                    BooleanResultType::Boolean => result = BooleanResultType::Boolean,
+                    BooleanResultType::Null => {}
+                    BooleanResultType::Other => return BooleanResultType::Other,
+                }
+            }
+            result
+        }
+        _ => BooleanResultType::Other,
+    }
+}
+
+fn is_boolean_type(name: &str) -> bool {
+    name.eq_ignore_ascii_case("boolean") || name.eq_ignore_ascii_case("bool")
 }
 
 impl std::ops::Deref for Statement {

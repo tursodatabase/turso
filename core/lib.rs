@@ -31,7 +31,7 @@ pub mod json;
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
-mod namespace;
+pub mod namespace;
 pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
@@ -108,7 +108,6 @@ use crate::{
     translate::emitter::TransactionMode,
     vdbe::metrics::ConnectionMetrics,
 };
-use core::str;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
 use std::time::Duration;
@@ -161,7 +160,7 @@ pub use io::{
     CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO, SharedBufferData,
     SyscallIO, WriteCompletion, IO,
 };
-pub use namespace::{Namespace, NamespaceId, NamespaceRef, Namespaces};
+pub use namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
@@ -252,54 +251,3 @@ pub enum TempStore {
 pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock, alloc::DynAllocator>;
 
 pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::MvccClock, alloc::DynAllocator>;
-
-pub struct QueryRunner<'a> {
-    conn: &'a Arc<Connection>,
-    statements: &'a str,
-    pending_error: Option<LimboError>,
-    last_offset: usize,
-}
-
-impl<'a> QueryRunner<'a> {
-    pub(crate) fn new(conn: &'a Arc<Connection>, statements: &'a [u8]) -> Self {
-        let (statements, pending_error) = match str::from_utf8(statements) {
-            Ok(statements) => (statements, None),
-            Err(err) => (
-                "",
-                Some(LimboError::ParseError(format!(
-                    "invalid UTF-8 in SQL input: {err}"
-                ))),
-            ),
-        };
-        Self {
-            conn,
-            statements,
-            pending_error,
-            last_offset: 0,
-        }
-    }
-}
-
-impl Iterator for QueryRunner<'_> {
-    type Item = Result<Option<Statement>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(err) = self.pending_error.take() {
-            return Some(Err(err));
-        }
-
-        let remaining = &self.statements[self.last_offset..];
-        match self.conn.parse_sql(remaining) {
-            Ok((Some(cmd), byte_offset_end)) => {
-                let input = remaining[..byte_offset_end].trim();
-                self.last_offset += byte_offset_end;
-                Some(self.conn.run_cmd(cmd, input))
-            }
-            Ok((None, _)) => None,
-            Err(err) => {
-                self.last_offset = self.statements.len();
-                Some(Err(err))
-            }
-        }
-    }
-}

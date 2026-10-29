@@ -1,5 +1,6 @@
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 
 use crate::{
     bail_parse_error,
@@ -7,6 +8,7 @@ use crate::{
     schema::{BTreeTable, Index, RESERVED_TABLE_PREFIXES},
     storage::pager::CreateBTreeFlags,
     translate::{
+        catalog::CatalogContext,
         emitter::Resolver,
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
@@ -33,7 +35,7 @@ type AnalyzeTarget = (Arc<BTreeTable>, Option<Arc<Index>>);
 /// - An index name: analyze just that index
 fn resolve_analyze_targets(
     target_opt: &Option<ast::QualifiedName>,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Result<(NamespaceRef, Vec<AnalyzeTarget>)> {
     match target_opt {
         Some(target) => {
@@ -97,7 +99,10 @@ fn resolve_analyze_targets(
 }
 
 /// Collect all user tables in the given database.
-fn collect_all_tables_in_db(namespace: NamespaceRef, resolver: &Resolver) -> Vec<AnalyzeTarget> {
+fn collect_all_tables_in_db(
+    namespace: NamespaceRef,
+    resolver: &CatalogContext,
+) -> Vec<AnalyzeTarget> {
     resolver.with_schema(namespace.database_id, |schema| {
         schema
             .tables(namespace.id)
@@ -119,7 +124,7 @@ fn collect_all_tables_in_db(namespace: NamespaceRef, resolver: &Resolver) -> Vec
 fn resolve_targets_in_db(
     name: &str,
     namespace: NamespaceRef,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Result<Vec<AnalyzeTarget>> {
     // Try as a table first
     let table_opt: Option<Arc<BTreeTable>> = resolver.with_schema(namespace.database_id, |s| {
@@ -139,7 +144,7 @@ fn resolve_targets_in_db(
 fn find_index_target(
     name: &str,
     namespace: NamespaceRef,
-    resolver: &Resolver,
+    resolver: &CatalogContext,
 ) -> Option<AnalyzeTarget> {
     resolver.with_schema(namespace.database_id, |schema| {
         schema.indexes(namespace.id).find_map(|index| {
@@ -158,7 +163,7 @@ pub fn translate_analyze(
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     // Resolve the target database and collect analyze targets.
-    let (namespace, analyze_targets) = resolve_analyze_targets(&target_opt, resolver)?;
+    let (namespace, analyze_targets) = resolve_analyze_targets(&target_opt, &resolver.catalog)?;
     let database_id = namespace.database_id;
 
     // Register a write transaction for the target database so that the
@@ -287,9 +292,10 @@ pub fn translate_analyze(
             dest: tbl_col_reg,
             default: None,
         });
+        let mangled_table_name = resolver.mangle_name(namespace, &target_table.name);
         let target_tbl_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
-            value: target_table.name.to_string(),
+            value: mangled_table_name.clone(),
             dest: target_tbl_reg,
         });
         program.mark_last_insn_constant();
@@ -300,7 +306,7 @@ pub fn translate_analyze(
             rhs: target_tbl_reg,
             target_pc: skip_label,
             flags: Default::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
 
         if let Some(idx) = target_index.clone() {
@@ -322,7 +328,7 @@ pub fn translate_analyze(
                 rhs: target_idx_reg,
                 target_pc: skip_label,
                 flags: Default::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             let rowid_reg = program.alloc_register();
             program.emit_insn(Insn::RowId {
@@ -376,7 +382,7 @@ pub fn translate_analyze(
         });
         let tablename_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
-            value: target_table.name.to_string(),
+            value: mangled_table_name.clone(),
             dest: tablename_reg,
         });
         program.mark_last_insn_constant();
@@ -450,7 +456,13 @@ pub fn translate_analyze(
             program.preassign_label_to_next_insn(after_insert);
         }
         for index in indexes {
-            emit_index_stats(program, stat_cursor, &target_table, &index, database_id);
+            emit_index_stats(
+                program,
+                stat_cursor,
+                &mangled_table_name,
+                &index,
+                database_id,
+            );
         }
     }
 
@@ -470,7 +482,7 @@ pub fn translate_analyze(
 fn emit_index_stats(
     program: &mut ProgramBuilder,
     stat_cursor: usize,
-    table: &Arc<BTreeTable>,
+    mangled_table_name: &str,
     index: &Arc<Index>,
     database_id: usize,
 ) {
@@ -508,6 +520,7 @@ fn emit_index_stats(
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatInit),
             arg_count: 1,
+            collation: CollationSeq::Binary,
         },
     });
 
@@ -596,6 +609,7 @@ fn emit_index_stats(
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatPush),
             arg_count: 2,
+            collation: CollationSeq::Binary,
         },
     });
 
@@ -616,6 +630,7 @@ fn emit_index_stats(
         func: FuncCtx {
             func: Func::Scalar(ScalarFunc::StatGet),
             arg_count: 1,
+            collation: CollationSeq::Binary,
         },
     });
 
@@ -629,7 +644,7 @@ fn emit_index_stats(
     // Allocate contiguous registers for MakeRecord: tablename, indexname, stat
     let record_start = program.alloc_registers(3);
     program.emit_insn(Insn::String8 {
-        value: table.name.to_string(),
+        value: mangled_table_name.to_string(),
         dest: record_start,
     });
     program.mark_last_insn_constant();

@@ -1,6 +1,7 @@
 use super::consolidate::ConsolidatedDelta;
 use super::stream::{synthesized_view_table, DeltaIdentity};
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
@@ -105,7 +106,7 @@ pub(super) fn emit_terminal_delta(
         rhs: zero_reg,
         target_pc: insertion_row_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::If {
         reg: insertion_pass_reg,
@@ -171,7 +172,7 @@ pub(super) fn emit_terminal_delta(
         rhs: expected_record_reg,
         target_pc: other_values_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Goto {
         target_pc: merge_label,
@@ -190,14 +191,14 @@ pub(super) fn emit_terminal_delta(
         rhs: zero_reg,
         target_pc: write_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Lt {
         lhs: new_weight_reg,
         rhs: zero_reg,
         target_pc: negative_weight_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     // The weight dropped to zero. A consolidated delta has no zero weights,
     // so the row was found in the view.

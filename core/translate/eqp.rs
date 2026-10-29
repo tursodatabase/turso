@@ -5,6 +5,8 @@
 
 use std::fmt::{self, Display, Formatter, Write as _};
 
+use turso_parser::ast::SortOrder;
+
 use crate::{
     schema::Index,
     translate::plan::{
@@ -416,7 +418,12 @@ pub(crate) fn seek_constraint_parts(index: &Index, seek_def: &SeekDef) -> Vec<St
     let range_col_idx = seek_def.prefix.len();
     if let SeekKeyComponent::Expr(_) = &seek_def.start.last_component {
         if let Some(col) = index.columns.get(range_col_idx) {
-            let op_str = match seek_def.start.op {
+            let op = if col.order == SortOrder::Desc {
+                seek_def.start.op.reverse()
+            } else {
+                seek_def.start.op
+            };
+            let op_str = match op {
                 SeekOp::GE { .. } => ">=",
                 SeekOp::GT => ">",
                 SeekOp::LE { .. } => "<=",
@@ -430,13 +437,26 @@ pub(crate) fn seek_constraint_parts(index: &Index, seek_def: &SeekDef) -> Vec<St
     // user-facing SQL operator), so we reverse it for display.
     if let SeekKeyComponent::Expr(_) = &seek_def.end.last_component {
         if let Some(col) = index.columns.get(range_col_idx) {
-            let op_str = match seek_def.end.op {
+            let op = if col.order == SortOrder::Desc {
+                seek_def.end.op.reverse()
+            } else {
+                seek_def.end.op
+            };
+            let op_str = match op {
                 SeekOp::GE { .. } => "<",
                 SeekOp::GT => "<=",
                 SeekOp::LE { .. } => ">",
                 SeekOp::LT => ">=",
             };
             parts.push(format!("{}{op_str}?", col.name));
+        }
+    }
+    if let Some(col) = index.columns.get(range_col_idx) {
+        if parts.len() == range_col_idx + 2
+            && ((col.order == SortOrder::Desc)
+                != (seek_def.iter_dir == IterationDirection::Backwards))
+        {
+            parts.swap(range_col_idx, range_col_idx + 1);
         }
     }
     parts

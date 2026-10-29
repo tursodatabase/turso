@@ -6,16 +6,13 @@ use crate::vdbe::insn::ArrayEncodeData;
 const MAX_ARRAY_LOOP_ELEMENTS: usize = 1024;
 
 /// Emit a per-element transform loop on an array blob in `reg`.
-/// Extracts each element, applies `transform_expr` via emit_type_expr,
-/// stores results into contiguous registers, then rebuilds the blob with
+/// Extracts each element, applies `transform_element` to the register holding
+/// it, stores results into contiguous registers, then rebuilds the blob with
 /// MakeArrayDynamic. O(N) instead of O(N²) ArraySetElement per iteration.
 pub(super) fn emit_array_element_loop(
     program: &mut ProgramBuilder,
     reg: usize,
-    transform_expr: &ast::Expr,
-    col: &Column,
-    type_def: &TypeDef,
-    resolver: &Resolver,
+    transform_element: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
 ) -> Result<()> {
     let reg_len = program.alloc_register();
     let reg_idx = program.alloc_register();
@@ -38,7 +35,7 @@ pub(super) fn emit_array_element_loop(
         rhs: max_reg,
         target_pc: ok_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Halt {
         constraint_info: None,
@@ -71,7 +68,7 @@ pub(super) fn emit_array_element_loop(
         rhs: reg_len,
         target_pc: loop_end_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
 
     // Extract element from record blob (1-based index)
@@ -81,16 +78,7 @@ pub(super) fn emit_array_element_loop(
         dest: reg_elem,
     });
 
-    // Apply per-element transform expression
-    emit_type_expr(
-        program,
-        transform_expr,
-        reg_elem,
-        reg_elem,
-        &col.ty_params,
-        type_def,
-        resolver,
-    )?;
+    transform_element(program, reg_elem)?;
 
     // Store transformed element into contiguous register block at 0-based offset
     program.emit_insn(Insn::RegCopyOffset {
@@ -125,8 +113,9 @@ pub(super) fn emit_array_element_loop(
 
 /// Emit bytecode to encode an array value: parse JSON text input, validate/coerce
 /// elements, and serialize to a native record-format BLOB.
-/// For custom element types with encode expressions, a per-element bytecode loop
-/// normalizes input to blob, applies encode per element, then rebuilds the blob.
+/// For custom element types with ENCODE or COERCE, a per-element bytecode loop
+/// normalizes input to blob, stores each element as a value of the type, then
+/// rebuilds the blob.
 pub(super) fn emit_array_encode(
     program: &mut ProgramBuilder,
     reg: usize,
@@ -135,7 +124,7 @@ pub(super) fn emit_array_encode(
     table_name: &str,
 ) -> Result<()> {
     if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if let Some(encode_expr) = type_def.encode() {
+        if type_def.has_encode_or_coerce() {
             // Normalize input (text or blob) to blob with ANY affinity first
             program.emit_insn(Insn::ArrayEncode {
                 data: Box::new(ArrayEncodeData {
@@ -147,7 +136,15 @@ pub(super) fn emit_array_encode(
                 }),
             });
 
-            emit_array_element_loop(program, reg, encode_expr, col, type_def, resolver)?;
+            emit_array_element_loop(program, reg, |program, element_reg| {
+                emit_store_value(
+                    program,
+                    std::slice::from_ref(type_def),
+                    element_reg,
+                    &col.ty_params,
+                    resolver,
+                )
+            })?;
         }
     }
 
@@ -192,7 +189,10 @@ pub(crate) fn emit_array_decode(
 ) -> Result<()> {
     if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
         if let Some(decode_expr) = type_def.decode() {
-            emit_array_element_loop(program, reg, decode_expr, col, type_def, resolver)?;
+            emit_array_element_loop(program, reg, |program, element_reg| {
+                emit_type_expr(program, decode_expr, element_reg, element_reg, resolver)?;
+                Ok(())
+            })?;
         }
     }
 
@@ -203,7 +203,7 @@ pub(crate) fn emit_array_decode(
     Ok(())
 }
 
-/// Emit encode expressions for columns with custom types in a contiguous register range.
+/// Emit ENCODE and COERCE for columns with custom types in a contiguous register range.
 /// Used by INSERT, UPDATE, and UPSERT paths to encode values before TypeCheck.
 ///
 /// If `only_columns` is `Some`, only encode columns whose index is in the set.
@@ -262,12 +262,7 @@ pub(crate) fn emit_custom_type_encode_columns(
             None
         };
 
-        // Apply encode for each type in the chain (child first, then parent)
-        for td in &resolved.chain {
-            if let Some(encode_expr) = td.encode() {
-                emit_type_expr(program, encode_expr, reg, reg, &col.ty_params, td, resolver)?;
-            }
-        }
+        emit_store_value(program, &resolved.chain, reg, &col.ty_params, resolver)?;
 
         if let Some(label) = skip_label {
             program.preassign_label_to_next_insn(label);
@@ -328,7 +323,7 @@ pub(crate) fn emit_custom_type_decode_columns(
         // Apply decode in reverse order (parent/ancestor first, then child)
         for td in resolved.chain.iter().rev() {
             if let Some(decode_expr) = td.decode() {
-                emit_type_expr(program, decode_expr, reg, reg, &col.ty_params, td, resolver)?;
+                emit_type_expr(program, decode_expr, reg, reg, resolver)?;
             }
         }
 

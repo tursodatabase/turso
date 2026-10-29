@@ -16,6 +16,7 @@ use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     translate_condition_expr, translate_expr_no_constant_opt, ConditionMetadata,
@@ -168,12 +169,13 @@ fn emit_group_aggregate_rows(
         })?;
 
     let syms = connection.syms.read();
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -332,13 +334,7 @@ fn emit_group_aggregate_rows(
         dest: weight_reg,
         default: None,
     });
-    seed_ephemeral_stream_cache(
-        program,
-        channel,
-        &binding_remap,
-        &table_references,
-        &mut resolver,
-    )?;
+    seed_ephemeral_stream_cache(program, channel, &binding_remap, &mut resolver)?;
 
     for (i, group_expr) in group_exprs.iter().enumerate() {
         let bound = remap_bound_expr(group_expr, &binding_remap)?;
@@ -373,7 +369,7 @@ fn emit_group_aggregate_rows(
         rhs: zero_reg,
         target_pc: corrupt_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_int(0, found_reg);
     program.emit_insn(Insn::Null {
@@ -637,7 +633,7 @@ fn emit_group_aggregate_rows(
                 rhs: shown_after_start + shown_exact_offset,
                 target_pc: aggregate_done_label,
                 flags: CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             program.preassign_label_to_next_insn(retract_label);
             emit_weighted_apply(
@@ -669,7 +665,7 @@ fn emit_group_aggregate_rows(
                 rhs: zero_reg,
                 target_pc: not_entering_label,
                 flags: CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             emit_weighted_apply(
                 program,
@@ -684,7 +680,7 @@ fn emit_group_aggregate_rows(
                 rhs: zero_reg,
                 target_pc: aggregate_done_label,
                 flags: CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             emit_weighted_apply(
                 program,
@@ -744,7 +740,7 @@ fn emit_group_aggregate_rows(
                 rhs: stored_group_exact_reg,
                 target_pc: unchanged_label,
                 flags: CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             program.emit_insn(Insn::Copy {
                 src_reg: group_start,
@@ -1002,14 +998,14 @@ fn emit_group_aggregate_rows(
             rhs: zero_reg,
             target_pc: corrupt_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Ne {
             lhs: cnt_reg,
             rhs: zero_reg,
             target_pc: live_group_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Copy {
             src_reg: group_start,

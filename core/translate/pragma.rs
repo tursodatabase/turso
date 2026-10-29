@@ -13,7 +13,7 @@ use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
 };
 use crate::function::Func;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::pragma::pragma_for;
 use crate::schema::{BTreeTable, Index, IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
@@ -164,7 +164,10 @@ fn emit_table_list_rows_for_schema(
                           wr: bool,
                           strict: bool| {
         program.emit_string8(database_name.to_string(), base_reg);
-        program.emit_string8(display_table_list_name(database_id, name), base_reg + 1);
+        program.emit_string8(
+            display_table_list_name(database_id, &mangle_name(namespace, name)),
+            base_reg + 1,
+        );
         program.emit_string8(obj_type.to_string(), base_reg + 2);
         program.emit_int(ncol as i64, base_reg + 3);
         program.emit_int(wr as i64, base_reg + 4);
@@ -1175,10 +1178,7 @@ fn query_pragma(
                     )? {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             let desc = matches!(col.order, ast::SortOrder::Desc);
-                            let coll = col
-                                .collation
-                                .map(|c| c.to_string().to_uppercase())
-                                .unwrap_or_else(|| "BINARY".to_string());
+                            let coll = col.collation.to_string().to_uppercase();
 
                             program.emit_int(seqno as i64, base_reg);
                             emit_index_column_cid_and_name(program, col, base_reg + 1);
@@ -1392,15 +1392,17 @@ fn query_pragma(
                     .namespace_name(current_database_id)
                     .unwrap_or_else(|| "main".to_string());
                 resolver.with_schema(current_database_id, |schema| {
-                    emit_table_list_rows_for_schema(
-                        program,
-                        schema,
-                        NamespaceId::ROOT,
-                        current_database_id,
-                        &database_name,
-                        base_reg,
-                        name.as_deref(),
-                    )
+                    for namespace in schema.namespace_ids() {
+                        emit_table_list_rows_for_schema(
+                            program,
+                            schema,
+                            namespace,
+                            current_database_id,
+                            &database_name,
+                            base_reg,
+                            name.as_deref(),
+                        )
+                    }
                 });
             }
 
@@ -1819,17 +1821,13 @@ fn query_pragma(
         }
         PragmaName::ListTypes => {
             let base_reg = register;
-            program.alloc_registers(5); // 6 total (1 already allocated)
+            program.alloc_registers(6); // 7 total (1 already allocated)
 
-            // Built-in types: NULL parent, encode, decode, default, operators
+            // Built-in types: NULL parent, encode, coerce, decode, default, operators
             for builtin in &["INTEGER", "REAL", "TEXT", "BLOB", "ANY"] {
                 program.emit_string8(builtin.to_string(), base_reg);
-                program.emit_null(base_reg + 1, None);
-                program.emit_null(base_reg + 2, None);
-                program.emit_null(base_reg + 3, None);
-                program.emit_null(base_reg + 4, None);
-                program.emit_null(base_reg + 5, None);
-                program.emit_result_row(base_reg, 6);
+                program.emit_null(base_reg + 1, Some(base_reg + 6));
+                program.emit_result_row(base_reg, 7);
             }
 
             // Custom types from the type registry are only shown when strict mode is enabled
@@ -1860,23 +1858,20 @@ fn query_pragma(
                     };
                     program.emit_string8(display_name, base_reg);
                     program.emit_string8(type_def.base().to_string(), base_reg + 1);
-                    if let Some(expr) = type_def.encode() {
-                        program.emit_string8(expr.to_string(), base_reg + 2);
-                    } else {
-                        program.emit_null(base_reg + 2, None);
-                    }
-                    if let Some(expr) = type_def.decode() {
-                        program.emit_string8(expr.to_string(), base_reg + 3);
-                    } else {
-                        program.emit_null(base_reg + 3, None);
-                    }
-                    if let Some(expr) = type_def.default_expr() {
-                        program.emit_string8(expr.to_string(), base_reg + 4);
-                    } else {
-                        program.emit_null(base_reg + 4, None);
+                    let clauses = [
+                        type_def.encode(),
+                        type_def.coerce(),
+                        type_def.decode(),
+                        type_def.default_expr(),
+                    ];
+                    for (i, clause) in clauses.into_iter().enumerate() {
+                        match clause {
+                            Some(expr) => program.emit_string8(expr.to_string(), base_reg + 2 + i),
+                            None => program.emit_null(base_reg + 2 + i, None),
+                        }
                     }
                     if type_def.operators().is_empty() {
-                        program.emit_null(base_reg + 5, None);
+                        program.emit_null(base_reg + 6, None);
                     } else {
                         let ops: Vec<String> = type_def
                             .operators()
@@ -1886,9 +1881,9 @@ fn query_pragma(
                                 None => format!("'{}'", op.op),
                             })
                             .collect();
-                        program.emit_string8(ops.join(", "), base_reg + 5);
+                        program.emit_string8(ops.join(", "), base_reg + 6);
                     }
-                    program.emit_result_row(base_reg, 6);
+                    program.emit_result_row(base_reg, 7);
                 }
             }
 
@@ -2026,7 +2021,10 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.ty_str.clone(), base_reg + 2);
 
         // notnull
-        program.emit_bool(column.notnull(), base_reg + 3);
+        program.emit_bool(
+            column.notnull() && (!column.is_rowid_alias() || column.explicit_notnull()),
+            base_reg + 3,
+        );
 
         // dflt_value
         match &column.default {

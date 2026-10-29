@@ -5028,11 +5028,12 @@ impl<'a> Parser<'a> {
         }
 
         let mut encode = None;
+        let mut coerce = None;
         let mut decode = None;
         let mut default = None;
         let mut operators = Vec::new();
 
-        // Parse optional clauses: ENCODE, DECODE, OPERATOR
+        // Parse optional clauses: ENCODE, COERCE, DECODE, DEFAULT, OPERATOR
         loop {
             match self.peek()? {
                 Some(tok) if tok.token_type == TK_ID => {
@@ -5042,6 +5043,11 @@ impl<'a> Parser<'a> {
                             eat_assert!(self, TK_ID);
                             let expr = self.parse_expr(0)?;
                             encode = Some(expr);
+                        }
+                        "COERCE" => {
+                            eat_assert!(self, TK_ID);
+                            let expr = self.parse_expr(0)?;
+                            coerce = Some(expr);
                         }
                         "DECODE" => {
                             eat_assert!(self, TK_ID);
@@ -5086,7 +5092,7 @@ impl<'a> Parser<'a> {
                                 let next_kw = from_bytes_as_str(self.peek()?.unwrap().as_bytes())
                                     .to_ascii_uppercase();
                                 match next_kw.as_str() {
-                                    "ENCODE" | "DECODE" | "OPERATOR" | "DEFAULT" => {
+                                    "ENCODE" | "COERCE" | "DECODE" | "OPERATOR" | "DEFAULT" => {
                                         // Naked operator: no function name
                                         None
                                     }
@@ -5131,6 +5137,7 @@ impl<'a> Parser<'a> {
                 params,
                 base,
                 encode,
+                coerce,
                 decode,
                 operators,
                 default,

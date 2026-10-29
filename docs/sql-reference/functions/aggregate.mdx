@@ -392,6 +392,8 @@ percentile_disc(fraction) WITHIN GROUP (ORDER BY sort_expr)
 
 The `ORDER BY` expression is the value being aggregated. For the percentile functions, the argument before `WITHIN GROUP` is the percentile *fraction*. NULL values of the `ORDER BY` expression are ignored; if there are no non-NULL values, the result is NULL.
 
+Text values are compared with the collation of the `ORDER BY` expression. A custom collation registered by the application is not supported there and is an error.
+
 ### mode()
 
 ```sql

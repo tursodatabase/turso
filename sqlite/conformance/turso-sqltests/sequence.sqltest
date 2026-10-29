@@ -320,6 +320,17 @@ expect error {
     sequence name "__turso_internal_autoincrement_pwned" is reserved for internal AUTOINCREMENT use
 }
 
+test create-sequence-may-be-named-like-a-table-of-the-engine {
+    CREATE SEQUENCE sqlite_s;
+    CREATE SEQUENCE __turso_internal_seq_x;
+    SELECT nextval('sqlite_s');
+    SELECT nextval('__turso_internal_seq_x');
+}
+expect {
+    1
+    1
+}
+
 test qualified-sequence-name-may-contain-a-dot {
     CREATE SEQUENCE "a.b" START WITH 5;
     SELECT nextval('main.a.b');
