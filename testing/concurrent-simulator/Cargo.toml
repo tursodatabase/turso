@@ -29,6 +29,10 @@ path = "regression_tests.rs"
 name = "regression_tests_cross_platform"
 path = "regression_tests_cross_platform.rs"
 
+[[test]]
+name = "regression_issue_9005"
+path = "regression_issue_9005.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
