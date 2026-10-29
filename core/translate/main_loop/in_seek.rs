@@ -98,15 +98,9 @@ pub(super) fn emit_in_seek_key(
         target_pc: next_value,
     });
     if let Some(index) = index {
-        encode_seek_keys_for_custom_types(
-            program,
-            table_references,
-            index,
-            seek_reg,
-            1,
-            0,
-            resolver,
-        )?;
+        if let Some(stored_form) = index_key_stored_form(table_references, index, 0, resolver)? {
+            crate::translate::expr::emit_stored_form(program, seek_reg, &stored_form, resolver)?;
+        }
     }
     Ok(seek_reg)
 }

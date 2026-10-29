@@ -2775,7 +2775,6 @@ fn find_table_access_plan(
             table_references.joined_tables(),
             &constraints_per_table,
             order_target,
-            schema,
         )
     });
     let subquery_calls = count_subquery_calls_for_plan(
