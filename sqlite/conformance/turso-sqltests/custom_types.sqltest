@@ -318,7 +318,7 @@ expect {
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END||value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
-    uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END||uuid_str (value)||'<'
+    uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END||uuid_str (value)||'<' uuid_lt, '=' uuid_eq
     varchar(value text, maxlen integer)|text||CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
@@ -353,7 +353,7 @@ expect {
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END||value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
-    uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END||uuid_str (value)||'<'
+    uuid(value any)|blob|CASE WHEN value IS NULL THEN NULL WHEN typeof (value) = 'blob' AND length (value) = 16 THEN value ELSE coalesce (uuid_blob (value), RAISE (ABORT, 'invalid UUID value')) END||uuid_str (value)||'<' uuid_lt, '=' uuid_eq
     varchar(value text, maxlen integer)|text||CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
@@ -505,6 +505,54 @@ expect {
     1|'01945ca0-3189-76c0-9a8f-caf310fc8b8e'
     2|'01945ca0-3189-76c0-9a8f-caf310fc8b8e'
     3|NULL
+}
+
+@setup nullable-uuid
+test strict-uuid-comparison-accepts-any-uuid-spelling {
+    INSERT INTO t1 VALUES (1, '01945ca0-3189-76c0-9a8f-caf310fc8b8e'),
+        (2, '0194bd6e-8f87-7e3a-bd5b-b4d3a4f51f19'), (3, NULL);
+    SELECT a FROM t1 WHERE b = '01945CA0-3189-76C0-9A8F-CAF310FC8B8E';
+    SELECT a FROM t1 WHERE b = '{01945ca0-3189-76c0-9a8f-caf310fc8b8e}';
+    SELECT a FROM t1 WHERE b = '01945ca0318976c09a8fcaf310fc8b8e';
+    SELECT a FROM t1 WHERE b = X'01945ca0318976c09a8fcaf310fc8b8e';
+    SELECT a FROM t1 WHERE b = upper('01945ca0-3189-76c0-9a8f-caf310fc8b8e');
+    SELECT a FROM t1 WHERE b != '01945CA0-3189-76C0-9A8F-CAF310FC8B8E';
+    SELECT a FROM t1 WHERE b > '01945CA0-3189-76C0-9A8F-CAF310FC8B8E';
+    SELECT a FROM t1 WHERE b BETWEEN '{01945CA0-3189-76C0-9A8F-CAF310FC8B8E}'
+        AND '01945ca0318976c09a8fcaf310fc8b8e';
+    CREATE INDEX t1_b ON t1(b);
+    SELECT a FROM t1 WHERE b = '01945CA0-3189-76C0-9A8F-CAF310FC8B8E';
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    2
+    2
+    1
+    1
+}
+
+test strict-custom-type-join-gives-same-rows-with-every-plan {
+    CREATE TABLE t(id uuid, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES ('01945ca0-3189-76c0-9a8f-caf310fc8b8e', 1.50);
+    CREATE TABLE s(x text, y text) STRICT;
+    INSERT INTO s VALUES ('01945CA0-3189-76C0-9A8F-CAF310FC8B8E', '1.5');
+    SELECT count(*) FROM t, s WHERE t.id = s.x;
+    SELECT count(*) FROM t, s WHERE t.id = s.x OR false;
+    SELECT count(*) FROM t, s WHERE t.n = s.y;
+    SELECT count(*) FROM t, s WHERE t.n = s.y OR false;
+    CREATE INDEX s_x ON s(x);
+    SELECT count(*) FROM t, s WHERE s.x = t.id;
+}
+expect {
+    1
+    1
+    1
+    1
+    1
 }
 
 test strict-uuid-cast-null {

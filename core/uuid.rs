@@ -12,6 +12,8 @@ pub fn register_extension(ext_api: &mut ExtensionApi) {
         register_scalar_function(ext_api.ctx, c"uuid7_timestamp_ms".as_ptr(), uuid7_ts);
         register_scalar_function(ext_api.ctx, c"uuid_str".as_ptr(), uuid_str);
         register_scalar_function(ext_api.ctx, c"uuid_blob".as_ptr(), uuid_blob);
+        register_scalar_function(ext_api.ctx, c"uuid_eq".as_ptr(), uuid_eq);
+        register_scalar_function(ext_api.ctx, c"uuid_lt".as_ptr(), uuid_lt);
     }
 }
 
@@ -179,6 +181,45 @@ fn uuid_blob(&self, args: &[Value]) -> Value {
                 "wrong number of arguments to function uuid_blob()".into(),
             );
         }
+    }
+}
+
+/// The uuid type's `=` operator.
+#[scalar(name = "uuid_eq")]
+fn uuid_eq(args: &[Value]) -> Value {
+    compare_uuids("uuid_eq", args, |lhs, rhs| lhs == rhs)
+}
+
+/// The uuid type's `<` operator.
+#[scalar(name = "uuid_lt")]
+fn uuid_lt(args: &[Value]) -> Value {
+    compare_uuids("uuid_lt", args, |lhs, rhs| lhs < rhs)
+}
+
+/// Reads each side from a 16-byte blob or from any text spelling `uuid_blob`
+/// accepts (uppercase, braces, no hyphens), so a literal compares as the uuid
+/// it names rather than as text.
+fn compare_uuids(
+    func_name: &str,
+    args: &[Value],
+    cmp: impl Fn(uuid::Uuid, uuid::Uuid) -> bool,
+) -> Value {
+    if args.len() != 2 {
+        return Value::error_with_message(format!(
+            "wrong number of arguments to function {func_name}()"
+        ));
+    }
+    if args.iter().any(|arg| arg.value_type() == ValueType::Null) {
+        return Value::null();
+    }
+    let parse = |arg: &Value| match arg.value_type() {
+        ValueType::Blob => arg.blob_ref().and_then(|b| uuid::Uuid::from_slice(b).ok()),
+        ValueType::Text => arg.to_text().and_then(|t| uuid::Uuid::parse_str(t).ok()),
+        _ => None,
+    };
+    match (parse(&args[0]), parse(&args[1])) {
+        (Some(lhs), Some(rhs)) => Value::from_integer(cmp(lhs, rhs) as i64),
+        _ => Value::error_with_message("invalid UUID value".into()),
     }
 }
 

@@ -16,8 +16,8 @@ use crate::translate::expr::{
 };
 use crate::translate::expr_context::ExprContext;
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, ordered_ephemeral_key_columns, partial_index,
-    partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
+    compares_with_custom_type_function, convert_to_vtab_constraint, ordered_ephemeral_key_columns,
+    partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
     RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
@@ -1260,6 +1260,13 @@ pub(super) fn tables_in_hashable_equal_test(
         return Ok(None);
     };
     if !matches!(operator.as_ast_operator(), Some(ast::Operator::Equals)) {
+        return Ok(None);
+    }
+    // A hash join compares the values themselves, so it would not match what a
+    // custom type's `=` function (such as `numeric_eq`) decides.
+    if compares_with_custom_type_function(left, tables, resolver)
+        || compares_with_custom_type_function(right, tables, resolver)
+    {
         return Ok(None);
     }
     let (Some(left_table), Some(right_table)) = (one_table_in_expr(left), one_table_in_expr(right))
