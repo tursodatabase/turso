@@ -42,12 +42,12 @@ expect {
 test alter-column-keeps-primary-key-with-automatic-index {
     CREATE TABLE t (a TEXT PRIMARY KEY DESC, b);
     INSERT INTO t VALUES ('x', 1);
-    ALTER TABLE t ALTER COLUMN a TO aa BLOB;
+    ALTER TABLE t ALTER COLUMN a TO aa TEXT;
     SELECT sql FROM sqlite_schema WHERE name = 't';
     SELECT name FROM sqlite_schema WHERE tbl_name = 't' AND type = 'index';
 }
 expect {
-    CREATE TABLE t (aa BLOB PRIMARY KEY DESC, b)
+    CREATE TABLE t (aa TEXT PRIMARY KEY DESC, b)
     sqlite_autoindex_t_1
 }
 
