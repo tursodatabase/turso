@@ -56,6 +56,7 @@ pub(crate) fn emit_recursive_cte(
                     nulls_order: None,
                     pos_in_table: queue_index_columns.len(),
                     collation: CollationSeq::BINARY,
+                    explicit_collation: None,
                     default: None,
                     expr: None,
                 })?;
@@ -74,6 +75,7 @@ pub(crate) fn emit_recursive_cte(
                 nulls_order: None,
                 pos_in_table: queue_index_columns.len(),
                 collation,
+                explicit_collation: None,
                 default: None,
                 expr: None,
             })?;
@@ -130,6 +132,7 @@ pub(crate) fn emit_recursive_cte(
                     result_column_index,
                     resolver,
                 )?,
+                explicit_collation: None,
                 default: None,
                 expr: None,
             })?;

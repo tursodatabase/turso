@@ -2114,6 +2114,7 @@ fn materialized_subquery_ephemeral_index(
                 nulls_order: None,
                 pos_in_table: col_pos,
                 collation: column.collation(),
+                explicit_collation: None,
                 default: column.default.clone(),
                 expr: None,
             })
@@ -2131,6 +2132,7 @@ fn materialized_subquery_ephemeral_index(
                 nulls_order: None,
                 pos_in_table: col_pos,
                 collation: column.collation(),
+                explicit_collation: None,
                 default: column.default.clone(),
                 expr: None,
             })

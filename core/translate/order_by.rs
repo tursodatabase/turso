@@ -121,6 +121,7 @@ impl EmitOrderBy {
                     nulls_order: None,
                     pos_in_table,
                     collation,
+                    explicit_collation: None,
                     default: None,
                     expr: None,
                 });
@@ -133,6 +134,7 @@ impl EmitOrderBy {
                 nulls_order: None,
                 pos_in_table,
                 collation: CollationSeq::BINARY,
+                explicit_collation: None,
                 default: None,
                 expr: None,
             })?;

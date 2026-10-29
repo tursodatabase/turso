@@ -433,6 +433,18 @@ expect error {
     cannot ALTER COLUMN "x": it changes how the column sorts, and index ix is sorted by it
 }
 
+# A type with its own order doesn't accept a COLLATE, so an index that names
+# one couldn't be read back after the column takes such a type.
+@requires strict "uses STRICT tables"
+test alter-column-refuses-a-type-with-an-order-under-an-index-with-its-own-collation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x text) STRICT;
+    CREATE INDEX ix ON t(x COLLATE NOCASE);
+    ALTER TABLE t ALTER COLUMN x TO y numeric(10,2);
+}
+expect error {
+    cannot ALTER COLUMN "x": index ix names a COLLATE for it, and the new type has its own order
+}
+
 @requires strict "uses STRICT tables"
 test alter-column-refuses-to-change-the-order-of-an-indexed-expression {
     CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10,2)) STRICT;

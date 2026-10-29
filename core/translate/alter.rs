@@ -2432,9 +2432,18 @@ fn reject_change_of_indexed_column_order(
         for index_column in &index.columns {
             let order_changes = if index_column.pos_in_table == column_index {
                 // After a reopen the index column takes the new column's
-                // order, unless the index names its own collation, which is
-                // then the index column's current one.
-                index_column.collation != new_column.collation()
+                // order, unless the index names its own COLLATE, which a
+                // type with its own order does not accept.
+                match index_column.explicit_collation {
+                    Some(_) if new_column.type_ordering().is_some() => {
+                        return Err(LimboError::ParseError(format!(
+                            "cannot ALTER COLUMN \"{column_name}\": index {} names a COLLATE for it, and the new type has its own order",
+                            index.name
+                        )));
+                    }
+                    Some(_) => false,
+                    None => index_column.collation != new_column.collation(),
+                }
             } else if index_column.pos_in_table == EXPR_INDEX_SENTINEL {
                 // An index expression sorts in the order of its type, which
                 // the column's new type can change, as for `x * 2`.

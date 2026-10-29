@@ -1067,6 +1067,7 @@ fn resolve_sorted_columns_with_catalog(
                 nulls_order: nulls,
                 pos_in_table: pos,
                 collation,
+                explicit_collation,
                 default: column.default.clone(),
                 expr,
             }
@@ -1082,6 +1083,7 @@ fn resolve_sorted_columns_with_catalog(
                 nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
                 collation: collation.unwrap_or(CollationSeq::BINARY),
+                explicit_collation,
                 default: None,
                 expr: Some(sc.expr.clone()),
             }

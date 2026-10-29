@@ -933,6 +933,35 @@ expect error {
     cannot ALTER COLUMN "x": it changes how the column sorts, and index ix is sorted by it
 }
 
+# An index that names its own COLLATE keeps it whatever the column's
+# collation is, so ALTER COLUMN doesn't change its order.
+test alter-column-renames-a-column-under-an-index-with-its-own-collation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT);
+    CREATE INDEX ix ON t(x COLLATE NOCASE);
+    INSERT INTO t VALUES (1, 'a'), (2, 'B');
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+    INSERT INTO t VALUES (3, 'C'), (4, 'b');
+    PRAGMA integrity_check;
+    SELECT id FROM t WHERE y = 'b' COLLATE NOCASE ORDER BY id;
+}
+expect {
+    ok
+    2
+    4
+}
+
+test alter-column-changes-the-collation-under-a-unique-constraint-with-its-own-collation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT COLLATE RTRIM, UNIQUE(x COLLATE NOCASE));
+    INSERT INTO t VALUES (1, 'a'), (2, 'B');
+    ALTER TABLE t ALTER COLUMN x TO y TEXT;
+    INSERT INTO t VALUES (3, 'C');
+    PRAGMA integrity_check;
+    INSERT INTO t VALUES (4, 'b');
+}
+expect error {
+    UNIQUE constraint failed: t.y
+}
+
 test alter-column-changes-the-collation-under-an-index-that-does-not-sort-by-it {
     CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE);
     CREATE INDEX ix ON t(length(x));

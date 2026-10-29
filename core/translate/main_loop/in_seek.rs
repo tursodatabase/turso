@@ -149,6 +149,7 @@ pub(super) fn open_in_seek_source_cursor(
                     nulls_order: None,
                     pos_in_table: 0,
                     collation,
+                    explicit_collation: None,
                     default: None,
                     expr: None,
                 }]?,

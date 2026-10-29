@@ -1037,6 +1037,7 @@ fn get_subquery_parser<'a>(
                             nulls_order: None,
                             pos_in_table: i,
                             collation,
+                            explicit_collation: None,
                             default: None,
                             expr: None,
                         })

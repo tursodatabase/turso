@@ -7676,6 +7676,10 @@ pub struct IndexColumn {
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
     pub collation: CollationSeq,
+    /// The COLLATE the index or constraint SQL names for this column, if any.
+    /// Reading the schema again keeps it even when the column's own
+    /// collation has changed since, as after ALTER COLUMN.
+    pub explicit_collation: Option<TextCollation>,
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
     pub expr: Option<Box<Expr>>,
@@ -7719,6 +7723,7 @@ impl IndexColumn {
             nulls_order: None,
             pos_in_table,
             collation,
+            explicit_collation: None,
             default: None,
             expr: None,
         }
@@ -7741,6 +7746,7 @@ impl IndexColumn {
                 nulls_order: None,
                 pos_in_table: i,
                 collation: CollationSeq::BINARY,
+                explicit_collation: None,
                 default: None,
                 expr: None,
             })
@@ -7863,16 +7869,16 @@ impl Index {
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
+            let explicit_collation = constraint_columns.get(i).and_then(|c| c.collation);
             primary_keys
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col_name),
                     order: *order,
                     nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
-                    collation: constraint_columns
-                        .get(i)
-                        .and_then(|c| c.collation)
+                    collation: explicit_collation
                         .map_or_else(|| column.collation(), CollationSeq::Text),
+                    explicit_collation,
                     default: column.default.clone(),
                     expr: None,
                 })
@@ -7919,16 +7925,16 @@ impl Index {
                     table.name
                 )));
             };
+            let explicit_collation = constraint_columns.get(i).and_then(|c| c.collation);
             unique_cols
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
                     nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
-                    collation: constraint_columns
-                        .get(i)
-                        .and_then(|c| c.collation)
+                    collation: explicit_collation
                         .map_or_else(|| col.collation(), CollationSeq::Text),
+                    explicit_collation,
                     default: col.default.clone(),
                     expr: None,
                 })

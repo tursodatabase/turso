@@ -660,6 +660,7 @@ fn allocate_window_minmax(
                     nulls_order: None,
                     pos_in_table: 0,
                     collation,
+                    explicit_collation: None,
                     default: None,
                     expr: None,
                 },
