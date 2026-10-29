@@ -18,7 +18,7 @@ use crate::{
 };
 use branches::{mark_unlikely, unlikely};
 use rapidhash::fast::RapidHasher;
-use std::{cell::RefCell, cmp::Ordering, hash::Hasher};
+use std::{cell::RefCell, hash::Hasher};
 use turso_macros::{turso_assert_eq, AtomicEnum};
 
 const DEFAULT_SEED: u64 = 1337;
@@ -42,76 +42,13 @@ const FLOAT_HASH: u8 = 2;
 const TEXT_HASH: u8 = 3;
 const BLOB_HASH: u8 = 4;
 
-#[inline]
-/// Hash text case-insensitively without allocation (ASCII-only for SQLite NOCASE).
-/// SQLite's NOCASE collation only considers ASCII case, so to_ascii_lowercase() is correct.
-fn hash_text_nocase(hasher: &mut impl Hasher, text: &str) {
-    hasher.write_usize(text.len());
-    for byte in text.bytes() {
-        hasher.write_u8(byte.to_ascii_lowercase());
-        if byte == 0 {
-            break;
-        }
-    }
-}
-
 /// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
 fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
+    turso_assert_eq!(key_values.len(), collations.len());
     let mut hasher = RapidHasher::new(DEFAULT_SEED);
-
-    for (idx, value) in key_values.iter().enumerate() {
-        match value {
-            ValueRef::Null => {
-                hasher.write_u8(NULL_HASH);
-            }
-            ValueRef::Numeric(Numeric::Integer(i)) => {
-                // Hash integers in the same bucket as numerically equivalent REALs so e.g. 10 and 10.0 have the same hash.
-                let f = *i as f64;
-                if (f as i64) == *i && f.is_finite() {
-                    hasher.write_u8(FLOAT_HASH);
-                    let bits = normalized_f64_bits(f);
-                    hasher.write(&bits.to_le_bytes());
-                } else {
-                    // Fallback to the integer domain when the float representation would lose precision.
-                    hasher.write_u8(INT_HASH);
-                    hasher.write_i64(*i);
-                }
-            }
-            ValueRef::Numeric(Numeric::Float(f)) => {
-                hasher.write_u8(FLOAT_HASH);
-                let bits = normalized_f64_bits(f64::from(*f));
-                hasher.write(&bits.to_le_bytes());
-            }
-            ValueRef::Text(text) => {
-                let collation = collations.get(idx).unwrap_or(&CollationSeq::Binary);
-                hasher.write_u8(TEXT_HASH);
-                match *collation {
-                    CollationSeq::NoCase => {
-                        hash_text_nocase(&mut hasher, text.as_str());
-                    }
-                    CollationSeq::Rtrim => {
-                        let trimmed = text.as_str().trim_end_matches(' ');
-                        hasher.write(trimmed.as_bytes());
-                    }
-                    CollationSeq::Binary | CollationSeq::Unset => {
-                        hasher.write(text.as_bytes());
-                    }
-                    CollationSeq::Locale(_) => {
-                        hasher.write(&collation.hash_key(text.as_str()));
-                    }
-                    CollationSeq::Custom(_) => {
-                        unreachable!(
-                            "custom collations are rejected before hash table construction"
-                        )
-                    }
-                }
-            }
-            ValueRef::Blob(blob) => {
-                hasher.write_u8(BLOB_HASH);
-                hasher.write(blob);
-            }
-        }
+    for (value, collation) in key_values.iter().zip(collations) {
+        collation.hash_value(*value, &mut hasher);
     }
     hasher.finish()
 }
@@ -142,9 +79,9 @@ fn keys_equal(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) ->
     if key1.len() != key2.len() {
         return false;
     }
-    for (idx, (v1, v2)) in key1.iter().zip(key2.iter()).enumerate() {
-        let collation = collations.get(idx).copied().unwrap_or(CollationSeq::Binary);
-        if !values_equal(v1.as_ref(), *v2, collation) {
+    turso_assert_eq!(key1.len(), collations.len());
+    for ((v1, v2), collation) in key1.iter().zip(key2.iter()).zip(collations) {
+        if !values_equal(v1.as_ref(), *v2, *collation) {
             return false;
         }
     }
@@ -157,38 +94,20 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
     match (v1, v2) {
         // NULL = NULL is false in SQL (actually NULL, which is falsy)
         (ValueRef::Null, _) | (_, ValueRef::Null) => false,
-        (ValueRef::Numeric(n1), ValueRef::Numeric(n2)) => {
-            ValueRef::Numeric(n1) == ValueRef::Numeric(n2)
-        }
-        (ValueRef::Blob(b1), ValueRef::Blob(b2)) => b1 == b2,
-        (ValueRef::Text(t1), ValueRef::Text(t2)) => {
-            // Use collation for text comparison
-            collation.compare_strings(t1.as_str(), t2.as_str()) == Ordering::Equal
-        }
-        _ => false,
+        _ => collation.compare(v1, v2).is_eq(),
     }
 }
 
 /// DISTINCT equality: NULLs compare equal to NULL.
-fn values_equal_distinct(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
-    match (v1, v2) {
-        (ValueRef::Null, ValueRef::Null) => true,
-        (ValueRef::Null, _) | (_, ValueRef::Null) => false,
-        _ => values_equal(v1, v2, collation),
-    }
-}
-
 fn keys_equal_distinct(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) -> bool {
     if key1.len() != key2.len() {
         return false;
     }
-    for (idx, (v1, v2)) in key1.iter().zip(key2.iter()).enumerate() {
-        let collation = collations.get(idx).copied().unwrap_or(CollationSeq::Binary);
-        if !values_equal_distinct(v1.as_ref(), *v2, collation) {
-            return false;
-        }
-    }
-    true
+    turso_assert_eq!(key1.len(), collations.len());
+    key1.iter()
+        .zip(key2.iter())
+        .zip(collations)
+        .all(|((v1, v2), collation)| collation.compare(v1.as_ref(), *v2).is_eq())
 }
 
 /// State machine states for hash table operations.
@@ -1125,13 +1044,12 @@ enum ParseChunkResult {
 impl HashTable {
     /// Create a new hash table.
     pub fn new(config: HashTableConfig, io: Arc<dyn IO>) -> Result<Self> {
-        if config
+        if !config
             .collations
             .iter()
-            .any(|collation| collation.is_custom())
+            .all(|collation| collation.can_hash())
         {
-            // Custom collation equality is a connection-owned callback. Hash tables do
-            // not carry connection context, so hash/equality cannot be made consistent here.
+            // The planner does not hash values of such a collation.
             return Err(LimboError::InternalError(
                 "custom collations are not supported by hash tables".to_string(),
             ));
@@ -3521,9 +3439,20 @@ mod hashtests {
 
     #[test]
     fn test_hash_table_rejects_custom_collations() {
+        unsafe extern "C" fn equal(
+            _: usize,
+            _: *const u8,
+            _: usize,
+            _: *const u8,
+            _: usize,
+        ) -> i32 {
+            0
+        }
         let io = Arc::new(MemoryIO::new());
+        let custom =
+            crate::function::ExternalCollation::new("hash_table_custom".into(), 0, equal, None);
         let config = HashTableConfig {
-            collations: vec![CollationSeq::custom("hash_table_custom")],
+            collations: vec![custom.collation],
             ..Default::default()
         };
         let err = match HashTable::new(config, io) {

@@ -596,10 +596,15 @@ fn structured_foreign_key_errors_preserve_sqlite_transaction_behavior() {
         for (dialect, conn) in [("sqlite", &sqlite), ("postgres", pg.inner())] {
             conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
                 .unwrap();
-            conn.execute(
-                "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))",
-            )
-            .unwrap();
+            // The frontend binds the foreign key's table to its schema; a
+            // table created through core alone references the root namespace.
+            let create_child =
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id))";
+            if dialect == "postgres" {
+                pg.execute(create_child).unwrap();
+            } else {
+                conn.execute(create_child).unwrap();
+            }
             conn.execute("INSERT INTO parent VALUES (1)").unwrap();
             conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
             conn.execute("BEGIN").unwrap();

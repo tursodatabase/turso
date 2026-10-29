@@ -1,3 +1,5 @@
+use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::RegisterColumn;
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -132,17 +134,8 @@ fn extract_target_expr(e: &ast::Expr) -> (&ast::Expr, Option<String>) {
     }
 }
 
-// Return the index key’s effective collation.
-// If `idx_col.collation` is None, fall back to the column default or "BINARY".
-fn effective_collation_for_index_col(idx_col: &IndexColumn, table: &Table) -> String {
-    if let Some(c) = idx_col.collation.as_ref() {
-        return c.to_string().to_ascii_lowercase();
-    }
-    // Otherwise use the table default, or default to BINARY
-    table
-        .get_column_by_name(&idx_col.name)
-        .map(|s| s.1.collation().to_string())
-        .unwrap_or_else(|| "binary".to_string())
+fn index_column_collation_name(idx_col: &IndexColumn) -> String {
+    idx_col.collation.to_string().to_ascii_lowercase()
 }
 
 /// Match ON CONFLICT target to the PRIMARY KEY/rowid alias.
@@ -372,7 +365,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                     continue;
                 }
                 let iname = normalize_ident(&ic.name);
-                let icoll = effective_collation_for_index_col(ic, table);
+                let icoll = index_column_collation_name(ic);
                 if tname.eq_ignore_ascii_case(&iname)
                     && match conflict_target.collate.as_ref() {
                         Some(c) => c.eq_ignore_ascii_case(&icoll),
@@ -395,7 +388,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                     if exprs_are_equivalent(target_expr, idx_expr) {
                         // If target specifies a collation, it must match the index column's.
                         if let Some(ref tc) = target_collate {
-                            let icoll = effective_collation_for_index_col(ic, table);
+                            let icoll = index_column_collation_name(ic);
                             if !tc.eq_ignore_ascii_case(&icoll) {
                                 continue;
                             }
@@ -643,21 +636,19 @@ pub fn emit_upsert(
             continue;
         }
         let reg = layout.to_register(expr_current_start, idx);
-        resolver.register_affinities.insert(reg, col.affinity());
-        resolver.register_collations.insert(reg, col.collation());
+        resolver
+            .register_columns
+            .insert(reg, RegisterColumn::table_column(col));
         if let Some(decoded_start) = excluded_decoded_start {
             let excluded_reg = layout.to_register(decoded_start, idx);
             resolver
-                .register_affinities
-                .insert(excluded_reg, col.affinity());
-            resolver
-                .register_collations
-                .insert(excluded_reg, col.collation());
+                .register_columns
+                .insert(excluded_reg, RegisterColumn::table_column(col));
         }
     }
     resolver
-        .register_affinities
-        .insert(ctx.conflict_rowid_reg, Affinity::Integer);
+        .register_columns
+        .insert(ctx.conflict_rowid_reg, RegisterColumn::rowid());
 
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {
@@ -1109,7 +1100,7 @@ pub fn emit_upsert(
             rhs: ctx.conflict_rowid_reg,
             target_pc: ok,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
 
         // If another row already has rnew -> constraint
@@ -1270,7 +1261,7 @@ pub fn emit_upsert(
                     rhs: hit,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
-                    collation: program.curr_collation(),
+                    collation: CollationSeq::for_internal_values(),
                 });
                 let description = format_unique_violation_desc(table.get_name(), &idx_meta);
                 let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();
@@ -1473,10 +1464,12 @@ pub fn emit_upsert(
         if table.btree().is_some_and(|bt| bt.has_autoincrement)
             && connection.mv_store_for_db(upsert_database_id).is_some()
         {
-            let seq_name = crate::schema::autoincrement_sequence_name(table.get_name());
+            let seq_name = crate::schema::autoincrement_sequence_name(
+                &resolver.mangle_name(upsert_namespace, table.get_name()),
+            );
             let seq = resolver
                 .with_schema(upsert_database_id, |s| {
-                    s.get_sequence(ctx.namespace.id, &seq_name).cloned()
+                    s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
                 })
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(format!(
@@ -1487,7 +1480,7 @@ pub fn emit_upsert(
             crate::translate::sequence::emit_disk_advance_past(
                 program,
                 resolver,
-                upsert_namespace,
+                NamespaceRef::root_of(upsert_database_id),
                 &seq_name,
                 &seq,
                 rnew,

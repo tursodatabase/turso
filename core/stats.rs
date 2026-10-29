@@ -240,9 +240,7 @@ fn load_sqlite_stat1_row(
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> Result<()> {
-    // Only tables of the root namespace are analyzed so far.
-    let namespace = NamespaceId::ROOT;
-    let table_name = row.get::<&str>(0)?;
+    let (namespace, table_name) = schema.demangle_name(row.get::<&str>(0)?);
     let idx_value = row.get::<&Value>(1)?;
     let stat_value = row.get::<&Value>(2)?;
 

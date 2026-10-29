@@ -2,7 +2,7 @@
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
     catalog::{CatalogContext, DatabaseScopeContext},
-    collate::{get_expr_collation_ctx_with_symbols, CollationSeq},
+    collate::CollationSeq,
     compound_select::emit_program_for_compound_select,
     emitter::{
         delete::emit_program_for_delete, select::emit_program_for_select,
@@ -101,11 +101,9 @@ pub struct CachedExprReg<'a> {
     pub expr: Cow<'a, ast::Expr>,
     pub reg: usize,
     pub needs_decode: bool,
-    pub collation: CachedExprCollation,
 }
 
-pub type CachedExprCollation = Option<(CollationSeq, bool)>;
-pub type CachedExprRegHit = (usize, bool, CachedExprCollation);
+pub type CachedExprRegHit = (usize, bool);
 
 /// Whether SQLite's DQS (double-quoted strings) misfeature is enabled for DML.
 /// When `Enabled`, unresolved double-quoted identifiers fall back to string literals;
@@ -139,18 +137,14 @@ pub struct Resolver<'a> {
     /// The `needs_custom_type_decode` flag is true for hash-join payload registers
     /// that contain raw encoded values and need DECODE applied when read.
     pub expr_to_reg_cache: Vec<CachedExprReg<'a>>,
-    /// Maps register indices to column affinities for expression index evaluation.
-    /// Populated temporarily during UPDATE new-image expression index key computation,
-    /// where column references have been rewritten to Expr::Register and comparison
-    /// operators need the original column affinity. Analogous to SQLite's iSelfTab
-    /// mechanism, but operates as a side-channel since limbo rewrites the AST rather
-    /// than redirecting column reads at codegen time.
-    pub register_affinities: HashMap<usize, Affinity>,
-    /// Maps register indices to declared column collations, the collation
-    /// counterpart of `register_affinities`: when column references are
-    /// rewritten to Expr::Register (UPSERT DO UPDATE WHERE/SET), comparisons
-    /// must still use the column's implicit collation per SQLite's rule 2.
-    pub register_collations: HashMap<usize, CollationSeq>,
+    /// The column each register stands for, where column references were
+    /// rewritten to Expr::Register: index expressions and partial index WHERE
+    /// clauses during INSERT and UPDATE, UPSERT DO UPDATE, and NEW./OLD. in
+    /// triggers. Comparisons of such a register still use the column's
+    /// affinity and collation. Analogous to SQLite's iSelfTab mechanism, but
+    /// operates as a side-channel since limbo rewrites the AST rather than
+    /// redirecting column reads at codegen time.
+    pub register_columns: HashMap<usize, RegisterColumn>,
     /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
     /// This lets comparison affinity follow SQLite rules for expressions like
     /// `(SELECT text_col FROM ...) > some_numeric_expr`.
@@ -180,6 +174,45 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
+}
+
+/// The column a register stands for in [Resolver::register_columns].
+#[derive(Debug, Clone, Copy)]
+pub struct RegisterColumn {
+    pub affinity: Affinity,
+    /// None for the rowid, which has no collation.
+    pub collation: Option<CollationSeq>,
+}
+
+impl RegisterColumn {
+    /// A column of the table being written, with its affinity and collation.
+    pub fn table_column(column: &Column) -> Self {
+        Self {
+            affinity: column.affinity(),
+            collation: crate::translate::collate::column_collation(column),
+        }
+    }
+
+    /// NEW.x or OLD.x in a trigger. It has the collation of column x but, as
+    /// in SQLite, no affinity unless x is the rowid alias.
+    /// See https://www.sqlite.org/forum/forumpost/819f2d6627
+    pub fn trigger_row_column(column: &Column) -> Self {
+        Self {
+            affinity: if column.is_rowid_alias() {
+                Affinity::Integer
+            } else {
+                Affinity::None
+            },
+            collation: crate::translate::collate::column_collation(column),
+        }
+    }
+
+    pub fn rowid() -> Self {
+        Self {
+            affinity: Affinity::Integer,
+            collation: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -231,6 +264,26 @@ impl SelfTableScope {
     }
 }
 
+#[cfg(test)]
+impl Resolver<'static> {
+    /// A resolver over an empty main schema with the SQLite dialect. Its state is leaked so
+    /// that unit tests can create one in a single call.
+    pub(crate) fn empty_for_tests() -> Self {
+        Self::new(
+            Box::leak(Box::new(Schema::default())),
+            Box::leak(Box::new(RwLock::new(HashMap::default()))),
+            Box::leak(Box::new(RwLock::new(None))),
+            Box::leak(Box::new(RwLock::new(DatabaseCatalog::new()))),
+            Box::leak(Box::new(crate::Qualifiers::default())),
+            Box::leak(Box::new(SymbolTable::new())),
+            true,
+            DoubleQuotedDml::Enabled,
+            Arc::new(crate::dialect::SqliteDialect),
+            None,
+        )
+    }
+}
+
 impl<'a> Resolver<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -238,7 +291,7 @@ impl<'a> Resolver<'a> {
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
         attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a crate::Namespaces,
+        qualifiers: &'a crate::Qualifiers,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
@@ -251,7 +304,7 @@ impl<'a> Resolver<'a> {
                 database_schemas,
                 temp_database,
                 attached_databases,
-                namespaces,
+                qualifiers,
                 symbol_table,
                 enable_custom_types,
                 dialect,
@@ -259,8 +312,7 @@ impl<'a> Resolver<'a> {
             ),
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
-            register_affinities: HashMap::default(),
-            register_collations: HashMap::default(),
+            register_columns: HashMap::default(),
             subquery_affinities: RefCell::new(HashMap::default()),
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
@@ -294,8 +346,7 @@ impl<'a> Resolver<'a> {
             catalog: self.catalog.fork(),
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
-            register_affinities: HashMap::default(),
-            register_collations: HashMap::default(),
+            register_columns: HashMap::default(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
@@ -311,8 +362,7 @@ impl<'a> Resolver<'a> {
             catalog: self.catalog.fork(),
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
-            register_affinities: self.register_affinities.clone(),
-            register_collations: self.register_collations.clone(),
+            register_columns: self.register_columns.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
@@ -362,14 +412,6 @@ impl<'a> Resolver<'a> {
             .borrow()
             .as_ref()
             .and_then(|scope| scope.affinity(column))
-    }
-
-    pub(crate) fn self_table_collation(&self, column: Option<usize>) -> Option<CollationSeq> {
-        let table = self.self_table()?;
-        match column {
-            Some(column) => table.columns().get(column)?.collation_opt(),
-            None => table.get_rowid_alias_column()?.1.collation_opt(),
-        }
     }
 
     /// The table that `SELF_TABLE` column references refer to.
@@ -516,55 +558,30 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    pub fn cache_expr_reg(
-        &mut self,
-        expr: Cow<'a, ast::Expr>,
-        reg: usize,
-        needs_decode: bool,
-        collation: CachedExprCollation,
-    ) {
+    pub fn cache_expr_reg(&mut self, expr: Cow<'a, ast::Expr>, reg: usize, needs_decode: bool) {
         self.expr_to_reg_cache.push(CachedExprReg {
             expr,
             reg,
             needs_decode,
-            collation,
         });
-    }
-
-    /// Cache a scalar expression result together with the collation metadata that
-    /// standalone expression translation would have propagated to a parent comparison.
-    pub fn cache_scalar_expr_reg(
-        &mut self,
-        expr: Cow<'a, ast::Expr>,
-        reg: usize,
-        needs_decode: bool,
-        referenced_tables: &TableReferences,
-    ) -> Result<()> {
-        let collation = get_expr_collation_ctx_with_symbols(
-            expr.as_ref(),
-            referenced_tables,
-            Some(self.catalog.symbol_table),
-        )?;
-        self.cache_expr_reg(expr, reg, needs_decode, collation);
-        Ok(())
     }
 
     pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
         self.catalog.resolve_collation(name)
     }
 
-    /// Returns the register, decode flag, and collation metadata for a previously translated expression.
+    /// Returns the register and decode flag for a previously translated expression.
     ///
     /// We scan from newest to oldest so later translations win when equivalent
     /// expressions are seen multiple times in the same translation pass.
-    /// Returns `(register, needs_custom_type_decode, collation_ctx)`.
+    /// Returns `(register, needs_custom_type_decode)`.
     pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<CachedExprRegHit> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()
                 .rev()
                 .find(|entry| exprs_are_equivalent(expr, &entry.expr))
-                .map(|entry| (entry.reg, entry.needs_decode, entry.collation))
+                .map(|entry| (entry.reg, entry.needs_decode))
         } else {
             None
         }
@@ -649,6 +666,12 @@ impl<'a> Resolver<'a> {
         self.catalog.resolve_existing_sequence(seq_name)
     }
 
+    /// The namespace and bare name of the sequence whose mangled name is
+    /// `mangled`.
+    pub(crate) fn sequence_of_mangled_name(&self, mangled: &str) -> Option<(NamespaceRef, String)> {
+        self.catalog.sequence_of_mangled_name(mangled)
+    }
+
     pub(crate) fn find_existing_sequence(&self, seq_name: &str) -> Option<NamespaceRef> {
         self.catalog.find_existing_sequence(seq_name)
     }
@@ -658,6 +681,22 @@ impl<'a> Resolver<'a> {
     /// runs.
     pub(crate) fn runtime_sequence_name(&self, namespace: NamespaceRef, seq_name: &str) -> String {
         self.catalog.runtime_sequence_name(namespace, seq_name)
+    }
+
+    /// The name that object `name` of `namespace` is stored under in the
+    /// schema rows and the SQL text of its database.
+    pub(crate) fn mangle_name(&self, namespace: NamespaceRef, name: &str) -> String {
+        crate::namespace::mangle_name(namespace.id, name)
+    }
+
+    /// The name to write into SQL text for the object `written` of
+    /// `namespace`: the name as written for a root namespace, else the
+    /// mangled name.
+    pub(crate) fn name_in_sql(&self, namespace: NamespaceRef, written: &ast::Name) -> ast::Name {
+        if namespace.id.is_root() {
+            return written.clone();
+        }
+        ast::Name::exact(self.mangle_name(namespace, written.as_str()))
     }
 
     /// The namespace that the qualifier of `qualified_name` refers to, or
@@ -692,7 +731,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// The name of `namespace`: the database's name for a root namespace,
-    /// else the name the namespace was added under.
+    /// else the namespace's name.
     pub(crate) fn name_of_namespace(&self, namespace: NamespaceRef) -> Option<String> {
         self.catalog.name_of_namespace(namespace)
     }
@@ -1289,6 +1328,7 @@ fn emit_cdc_insns_v1(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: CollationSeq::Binary,
     };
 
     program.emit_insn(Insn::Function {
@@ -1400,6 +1440,7 @@ fn emit_cdc_insns_v2(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: CollationSeq::Binary,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1417,6 +1458,7 @@ fn emit_cdc_insns_v2(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
+        collation: CollationSeq::Binary,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1522,6 +1564,7 @@ pub fn emit_cdc_commit_insns(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
+        collation: CollationSeq::Binary,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1537,6 +1580,7 @@ pub fn emit_cdc_commit_insns(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
+        collation: CollationSeq::Binary,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1607,6 +1651,7 @@ pub fn emit_cdc_autocommit_commit(
     let is_autocommit_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
         arg_count: 0,
+        collation: CollationSeq::Binary,
     };
     let autocommit_reg = program.alloc_register();
     program.emit_insn(Insn::Function {
@@ -1639,6 +1684,7 @@ pub fn emit_cdc_autocommit_commit(
                 func: crate::function::FuncCtx {
                     func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
                     arg_count: 1,
+                    collation: CollationSeq::Binary,
                 },
             });
             program.emit_insn(Insn::Eq {
@@ -1646,7 +1692,7 @@ pub fn emit_cdc_autocommit_commit(
                 rhs: minus_one_reg,
                 target_pc: skip_label,
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::Binary,
             });
             let (cursor_id, _) =
                 prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
@@ -1693,6 +1739,7 @@ pub fn emit_cdc_explicit_commit_insns(
         func: crate::function::FuncCtx {
             func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
             arg_count: 1,
+            collation: CollationSeq::Binary,
         },
     });
 
@@ -1705,7 +1752,7 @@ pub fn emit_cdc_explicit_commit_insns(
         rhs: minus_one_reg,
         target_pc: skip_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::Binary,
     });
 
     // The CDC record write needs a transaction; joins the open one (keeping its mode) if any.
@@ -2275,32 +2322,23 @@ pub(crate) fn emit_check_constraints<'a>(
     // so that CHECK expressions like `CHECK(rowid > 0)` and `CHECK(t.rowid > 0)` both resolve.
     for rowid_name in ROWID_STRS {
         let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
-        resolver.cache_expr_reg(Cow::Owned(rowid_expr), rowid_reg, false, None);
+        resolver.cache_expr_reg(Cow::Owned(rowid_expr), rowid_reg, false);
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(rowid_name.to_string()),
         );
-        resolver.cache_expr_reg(Cow::Owned(qualified_expr), rowid_reg, false, None);
+        resolver.cache_expr_reg(Cow::Owned(qualified_expr), rowid_reg, false);
     }
 
     // Map each column to its register (both unqualified and qualified forms).
     for (col_name, register) in column_mappings.iter().copied() {
-        let collation = joined_table
-            .and_then(|table| {
-                table.columns().iter().find(|col| {
-                    col.name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(col_name))
-                })
-            })
-            .map(|col| (col.collation(), false));
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
-        resolver.cache_expr_reg(Cow::Owned(column_expr), register, false, collation);
+        resolver.cache_expr_reg(Cow::Owned(column_expr), register, false);
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(col_name.to_string()),
         );
-        resolver.cache_expr_reg(Cow::Owned(qualified_expr), register, false, collation);
+        resolver.cache_expr_reg(Cow::Owned(qualified_expr), register, false);
     }
 
     if let Some(joined_table) = joined_table {
@@ -2311,7 +2349,6 @@ pub(crate) fn emit_check_constraints<'a>(
             }),
             rowid_reg,
             false,
-            None,
         );
 
         for (col_name, register) in column_mappings.iter().copied() {
@@ -2329,7 +2366,6 @@ pub(crate) fn emit_check_constraints<'a>(
                     }),
                     register,
                     false,
-                    Some((col.collation(), false)),
                 );
             }
         }

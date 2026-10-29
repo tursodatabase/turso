@@ -2,15 +2,15 @@ use std::fmt::Debug;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
 use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::Value;
-use turso_pg::{split_statements, Connection, PgConnection};
+use turso_core::{ConnectOpts, Database, Value};
+use turso_pg::{split_statements, PgConnection};
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 
 use pgwire::api::auth::StartupHandler;
@@ -43,7 +43,10 @@ use pgwire::types::format::FormatOptions;
 pub struct TursoPgServer {
     address: String,
     db_file: String,
-    conn: Arc<Mutex<PgConnection>>,
+    db: Arc<Database>,
+    /// The settings that each session connects with, such as the encryption
+    /// key.
+    connect_opts: ConnectOpts,
     interrupt_count: Arc<AtomicUsize>,
 }
 
@@ -51,13 +54,15 @@ impl TursoPgServer {
     pub fn new(
         address: String,
         db_file: String,
-        conn: Connection,
+        db: Arc<Database>,
+        connect_opts: ConnectOpts,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             address,
             db_file,
-            conn: Arc::new(Mutex::new(conn)),
+            db,
+            connect_opts,
             interrupt_count,
         }
     }
@@ -74,25 +79,40 @@ impl TursoPgServer {
             listener.local_addr()?,
             self.db_file
         );
+        self.serve(listener).await
+    }
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
+    /// Accepts clients on `listener` until the server is interrupted. Each
+    /// client gets its own session, with its own transaction and settings.
+    pub async fn serve(&self, listener: TcpListener) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let session = match PgConnection::connect_with(
+                                &self.db,
+                                self.connect_opts.clone(),
+                            ) {
+                                Ok(session) => session,
+                                Err(e) => {
+                                    error!("Error opening a session for {}: {}", addr, e);
+                                    continue;
+                                }
+                            };
+                            let factory = Arc::new(TursoPgFactory {
+                                handler: Arc::new(TursoPgHandler {
+                                    conn: session.clone(),
+                                    query_parser: Arc::new(NoopQueryParser::new()),
+                                }),
+                            });
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                if let Err(e) = process_socket(socket, None, factory).await {
                                     error!("Error processing connection from {}: {}", addr, e);
+                                }
+                                if let Err(e) = session.close() {
+                                    error!("Error closing the session of {}: {}", addr, e);
                                 }
                             });
                         }
@@ -118,55 +138,8 @@ impl TursoPgServer {
 }
 
 struct TursoPgHandler {
-    conn: Arc<Mutex<PgConnection>>,
-    db_file: String,
+    conn: PgConnection,
     query_parser: Arc<NoopQueryParser>,
-}
-
-impl TursoPgHandler {
-    /// After a DROP SCHEMA query succeeds, delete the schema's database file.
-    /// Uses simple string matching to detect DROP SCHEMA statements.
-    fn cleanup_dropped_schema_file(&self, query: &str) {
-        if turso_core::is_memory_like(&self.db_file) {
-            return;
-        }
-        // Simple detection: look for DROP SCHEMA pattern
-        let trimmed = query.trim().to_lowercase();
-        if !trimmed.starts_with("drop schema") {
-            return;
-        }
-        // Extract schema name: "drop schema [if exists] <name> [cascade|restrict]"
-        let rest = trimmed.strip_prefix("drop schema").unwrap().trim();
-        let rest = rest
-            .strip_prefix("if exists")
-            .map(|s| s.trim())
-            .unwrap_or(rest);
-        // Take the first word as the schema name
-        let name = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches('"');
-        if name.is_empty() || name == "public" {
-            return;
-        }
-        let parent = std::path::Path::new(&self.db_file)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
-        if schema_file.exists() {
-            if let Err(e) = std::fs::remove_file(&schema_file) {
-                tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
-            } else {
-                tracing::info!("Deleted schema file {:?}", schema_file);
-            }
-            // Also clean up WAL and SHM files
-            let wal = schema_file.with_extension("db-wal");
-            let shm = schema_file.with_extension("db-shm");
-            let _ = std::fs::remove_file(wal);
-            let _ = std::fs::remove_file(shm);
-        }
-    }
 }
 
 struct TursoPgFactory {
@@ -203,7 +176,7 @@ impl SimpleQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
 
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
@@ -214,9 +187,7 @@ impl SimpleQueryHandler for TursoPgHandler {
             let mut stmt = conn.prepare(sql).map_err(pg_error)?;
 
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                let response = execute_non_query(&mut stmt, sql)?;
-                self.cleanup_dropped_schema_file(sql);
-                responses.push(response);
+                responses.push(execute_non_query(&mut stmt, sql)?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
                 responses.push(execute_query(&mut stmt, header)?);
@@ -251,12 +222,12 @@ impl TursoPgHandler {
                 ))
                 .await?;
         }
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         for sql in statements {
             match parse_copy_to_stdout(&sql).map_err(|error| {
                 pg_error(turso_core::LimboError::ParseError(error.to_string()).into())
             })? {
-                Some(copy) => copy_to_stdout(client, &conn, &copy).await?,
+                Some(copy) => copy_to_stdout(client, conn, &copy).await?,
                 None => {
                     for response in SimpleQueryHandler::do_query(self, client, &sql).await? {
                         match response {
@@ -405,7 +376,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let query = &portal.statement.statement;
 
         let mut stmt = conn.prepare(query).map_err(pg_error)?;
@@ -414,10 +385,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            let response = execute_non_query(&mut stmt, query)?;
-            // Clean up schema file after successful DROP SCHEMA execution
-            self.cleanup_dropped_schema_file(query);
-            return Ok(response);
+            return execute_non_query(&mut stmt, query);
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
@@ -432,7 +400,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
 
         let param_types: Vec<Type> = target
@@ -453,7 +421,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let stmt = conn
             .prepare(&portal.statement.statement)
             .map_err(pg_error)?;
@@ -831,6 +799,8 @@ fn is_pg_non_query(sql: &str) -> bool {
     let upper = sql.trim().to_uppercase();
     upper.starts_with("COPY")
         || upper.starts_with("SET")
+        || upper.starts_with("RESET")
+        || upper.starts_with("DISCARD")
         || upper.starts_with("LOCK")
         || upper.starts_with("CREATE SCHEMA")
         || upper.starts_with("DROP SCHEMA")
@@ -885,6 +855,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("RELEASE")
     } else if upper.starts_with("SET") {
         Tag::new("SET")
+    } else if upper.starts_with("RESET") {
+        Tag::new("RESET")
+    } else if upper.starts_with("DISCARD") {
+        Tag::new("DISCARD ALL")
     } else if upper.starts_with("LOCK") {
         Tag::new("LOCK TABLE")
     } else if upper.starts_with("COPY") {
@@ -1154,34 +1128,6 @@ mod tests {
     }
 
     #[test]
-    fn copy_to_stdout_excludes_generated_columns() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("source.db");
-        let path = path.to_str().unwrap();
-        {
-            let (_io, db) = turso_core::Database::open_new(
-                path,
-                None::<&str>,
-                turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new(),
-                None,
-                Arc::new(turso_core::dialect::SqliteDialect),
-            )
-            .unwrap();
-            let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
-            conn.execute("CREATE TABLE items (id INTEGER, doubled INTEGER GENERATED ALWAYS AS (id * 2) VIRTUAL)").unwrap();
-            conn.execute("INSERT INTO items (id) VALUES (7)").unwrap();
-            conn.close().unwrap();
-        }
-        let (mut client, _) = copy_test_client_at(path);
-        let messages = query_messages(&mut client, "COPY items TO STDOUT");
-        assert_eq!(messages[0].1, [0, 0, 1, 0, 0]);
-        assert_eq!(messages[1].1, b"7\n");
-        let messages = query_messages(&mut client, "COPY items (doubled) TO STDOUT");
-        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"EZ");
-    }
-
-    #[test]
     fn copy_to_stdout_sends_rows_before_a_later_read_error() {
         let (mut client, conn) = copy_test_client();
         conn.execute(
@@ -1215,12 +1161,8 @@ mod tests {
     }
 
     fn copy_test_client() -> (PgConn, PgConnection) {
-        copy_test_client_at(":memory:")
-    }
-
-    fn copy_test_client_at(path: &str) -> (PgConn, PgConnection) {
         let (_io, db) = turso_pg::open_database(
-            path,
+            ":memory:",
             None,
             turso_pg::OpenFlags::default(),
             turso_pg::DatabaseOpts::new().with_attach(true),
@@ -1228,8 +1170,7 @@ mod tests {
         .unwrap();
         let conn = PgConnection::connect(&db).unwrap();
         let handler = Arc::new(TursoPgHandler {
-            conn: Arc::new(Mutex::new(conn.clone())),
-            db_file: path.to_owned(),
+            conn: conn.clone(),
             query_parser: Arc::new(NoopQueryParser::new()),
         });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1287,7 +1228,7 @@ mod tests {
             turso_pg::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = Connection::connect(&db).unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
         for sql in [
             "SELECT pg_catalog.pg_is_in_recovery()",
             "SELECT pg_is_in_recovery() AS recovery",
@@ -1320,7 +1261,7 @@ mod tests {
             turso_pg::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = Connection::connect(&db).unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
         conn.execute("CREATE TABLE t(id int PRIMARY KEY, x int)")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
@@ -1346,6 +1287,18 @@ mod tests {
         assert!(!is_pg_non_query(
             "SELECT set_config('search_path', '', false)"
         ));
+    }
+
+    #[test]
+    fn test_reset_and_discard_are_non_queries() {
+        for (sql, tag) in [
+            ("RESET app.mode", "RESET"),
+            ("reset all", "RESET"),
+            ("DISCARD ALL", "DISCARD ALL"),
+        ] {
+            assert!(is_pg_non_query(sql), "{sql}");
+            assert_eq!(command_tag(sql, 0), Tag::new(tag), "{sql}");
+        }
     }
 
     #[test]

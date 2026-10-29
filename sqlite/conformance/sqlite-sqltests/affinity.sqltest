@@ -905,3 +905,13 @@ test affinity-strict-add-column-quoted-type-name {
 expect {
     integer|text
 }
+
+# CASE x WHEN y compares x and y with the same affinity as x = y.
+test case-when-compares-with-comparison-affinity {
+    CREATE TABLE x(a TEXT, n INTEGER);
+    INSERT INTO x VALUES ('1', 1);
+    SELECT CASE a WHEN 1 THEN 'y' ELSE 'n' END, CASE n WHEN '1' THEN 'y' ELSE 'n' END, CASE a WHEN n THEN 'y' ELSE 'n' END, a = n FROM x;
+}
+expect {
+    y|y|y|1
+}

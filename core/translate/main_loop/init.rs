@@ -10,23 +10,9 @@ pub fn init_distinct(
     let collations = plan
         .result_columns
         .iter()
-        .map(|col| {
-            get_collseq_from_expr_with_symbols(
-                &col.expr,
-                &plan.table_references,
-                Some(resolver.catalog.symbol_table),
-            )
-            .map(|c| c.unwrap_or(CollationSeq::Binary))
-        })
+        .map(|col| expr_collation(&col.expr, Some(&plan.table_references), resolver))
         .collect::<Result<Vec<_>>>()?;
-    let hash_table_id = program.alloc_hash_table_id();
-    let ctx = DistinctCtx {
-        hash_table_id,
-        collations,
-        label_on_conflict: program.allocate_label(),
-    };
-
-    Ok(ctx)
+    DistinctCtx::new(program, collations)
 }
 
 /// First step of Loop emission, opens cursors for all tables and initializes distinct aggregate
@@ -98,20 +84,10 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
-            let collations = vec![get_collseq_from_expr_with_symbols(
-                &agg.args[0],
-                tables,
-                Some(t_ctx.resolver.catalog.symbol_table),
-            )?
-            .unwrap_or(CollationSeq::Binary)];
-            let hash_table_id = program.alloc_hash_table_id();
-            agg.distinctness = Distinctness::Distinct {
-                ctx: Some(DistinctCtx {
-                    hash_table_id,
-                    collations,
-                    label_on_conflict: program.allocate_label(),
-                }),
-            };
+            let collations = vec![expr_collation(&agg.args[0], Some(tables), &t_ctx.resolver)?];
+            let ctx = DistinctCtx::new(program, collations)?;
+            let hash_table_id = ctx.hash_table_id;
+            agg.distinctness = Distinctness::Distinct { ctx: Some(ctx) };
             // DISTINCT aggregate hash tables live in ProgramState, so a correlated
             // subquery can re-enter with rows from the previous invocation still
             // recorded unless we clear the seen-set here.
@@ -621,10 +597,10 @@ fn right_join_metadata(
                     .name
                     .clone()
                     .unwrap_or_default();
-                IndexColumn::new(&name, key_position)
+                IndexColumn::new(&name, key_position, CollationSeq::Binary)
             })
             .try_collect::<crate::alloc::Vec<_>>()?,
-        None => crate::alloc::vec![IndexColumn::new("rowid", 0)],
+        None => crate::alloc::vec![IndexColumn::new("rowid", 0, CollationSeq::Binary)],
     };
     let key_len = key_columns.len();
     let matched_rows_index = Arc::new(Index {
@@ -707,7 +683,7 @@ fn emit_percentile_fraction_check(
         rhs: bound_reg,
         target_pc: bad,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Real {
         value: 1.0,
@@ -718,7 +694,7 @@ fn emit_percentile_fraction_check(
         rhs: bound_reg,
         target_pc: done,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.preassign_label_to_next_insn(bad);
     program.emit_insn(Insn::Halt {

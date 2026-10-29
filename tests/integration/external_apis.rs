@@ -26,10 +26,11 @@ static CTX_DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 fn connection_context_is_typed_and_isolated(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let db = tmp_db.limbo_database();
     let context = Arc::new(std::sync::Mutex::new(7i64));
-    let first = db.connect_with_context(context.clone())?;
+    let first = db.connect_with_context(ConnectOpts::new(), context.clone())?;
     let first_clone = first.clone();
-    let second = db.connect_with_context(Arc::new(std::sync::Mutex::new(19i64)))?;
-    let shared = db.connect_with_context(context.clone())?;
+    let second =
+        db.connect_with_context(ConnectOpts::new(), Arc::new(std::sync::Mutex::new(19i64)))?;
+    let shared = db.connect_with_context(ConnectOpts::new(), context.clone())?;
     let plain = db.connect(ConnectOpts::new())?;
 
     assert!(std::ptr::eq(
@@ -65,7 +66,9 @@ fn connection_hooks_see_statement_ends_rollbacks_and_savepoints(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let hooks = Arc::new(RecordingHooks::default());
-    let conn = tmp_db.limbo_database().connect_with_hooks(hooks.clone())?;
+    let conn = tmp_db
+        .limbo_database()
+        .connect_with_hooks(ConnectOpts::new(), hooks.clone())?;
     assert!(std::ptr::eq(
         hooks.as_ref(),
         conn.context::<RecordingHooks>().unwrap()
@@ -135,6 +138,27 @@ impl RecordingHooks {
 }
 
 #[turso_macros::test(mvcc)]
+fn connection_made_with_settings_and_a_context_has_that_context(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = tmp_db.limbo_database();
+    let context = Arc::new(std::sync::Mutex::new(7i64));
+    let opts = ConnectOpts::new().with_encryption_key(None);
+
+    let conn = db.connect_with_context(opts.clone(), context.clone())?;
+
+    assert!(std::ptr::eq(
+        context.as_ref(),
+        conn.context::<std::sync::Mutex<i64>>().unwrap()
+    ));
+    assert!(db
+        .connect(opts)?
+        .context::<std::sync::Mutex<i64>>()
+        .is_none());
+    Ok(())
+}
+
+#[turso_macros::test(mvcc)]
 fn connection_context_lives_until_the_last_connection_owner_drops(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
@@ -143,7 +167,7 @@ fn connection_context_lives_until_the_last_connection_owner_drops(
     let weak = Arc::downgrade(&context);
     let conn = tmp_db
         .limbo_database()
-        .connect_with_context(context.clone())?;
+        .connect_with_context(ConnectOpts::new(), context.clone())?;
     let cloned_conn = conn.clone();
     let mut statement = conn.prepare("SELECT 7")?;
 
@@ -1110,6 +1134,155 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     assert_eq!(rows, vec![("ok".to_string(),)]);
     other_conn.unregister_external_collation("dotnet_nocase");
 
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn ordered_set_aggregates_reject_custom_collations(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation(
+        "dotnet_nocase".to_string(),
+        0,
+        dotnet_nocase_collation,
+        None,
+    );
+    conn.execute("CREATE TABLE names(value TEXT)")?;
+    conn.execute("INSERT INTO names VALUES ('b'), ('A'), ('a')")?;
+    for sql in [
+        "SELECT mode() WITHIN GROUP (ORDER BY value COLLATE dotnet_nocase) FROM names",
+        "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY value COLLATE dotnet_nocase) FROM names",
+    ] {
+        let err = conn.execute(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not support the custom collation dotnet_nocase"),
+            "{sql}: {err}"
+        );
+    }
+    conn.unregister_external_collation("dotnet_nocase");
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn derived_columns_keep_a_custom_collation(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation(
+        "dotnet_nocase".to_string(),
+        0,
+        dotnet_nocase_collation,
+        None,
+    );
+    conn.execute("CREATE TABLE names(value TEXT)")?;
+    conn.execute("INSERT INTO names VALUES ('beta'), ('ALPHA'), ('alpha'), ('Gamma')")?;
+    conn.execute("CREATE VIEW v AS SELECT value COLLATE dotnet_nocase AS x FROM names")?;
+
+    let both_alphas = vec![
+        vec![SqliteValue::Text("ALPHA".into())],
+        vec![SqliteValue::Text("alpha".into())],
+    ];
+    for sql in [
+        "SELECT x FROM (SELECT value COLLATE dotnet_nocase AS x FROM names) WHERE x = 'alpha' ORDER BY 1",
+        "SELECT x FROM (SELECT value COLLATE dotnet_nocase AS x FROM names LIMIT 10) WHERE x = 'alpha' ORDER BY 1",
+        "WITH c AS (SELECT value COLLATE dotnet_nocase AS x FROM names) SELECT x FROM c WHERE x = 'alpha' ORDER BY 1",
+        "WITH c AS MATERIALIZED (SELECT value COLLATE dotnet_nocase AS x FROM names) SELECT x FROM c WHERE x = 'alpha' ORDER BY 1",
+        "SELECT x FROM (SELECT value COLLATE dotnet_nocase AS x FROM names UNION ALL SELECT 'zz') WHERE x = 'alpha' ORDER BY 1",
+        "SELECT x FROM v WHERE x = 'alpha' ORDER BY 1",
+    ] {
+        assert_eq!(limbo_exec_rows(&conn, sql), both_alphas, "{sql}");
+    }
+
+    let ordered = limbo_exec_rows(
+        &conn,
+        "SELECT x FROM (SELECT value COLLATE dotnet_nocase AS x FROM names) ORDER BY x, x COLLATE BINARY",
+    );
+    let names: Vec<_> = ordered.into_iter().map(|row| row[0].clone()).collect();
+    assert_eq!(
+        names,
+        ["ALPHA", "alpha", "beta", "Gamma"].map(|n| SqliteValue::Text(n.into()))
+    );
+
+    // A table made by CREATE TABLE AS does not take collations from the
+    // SELECT, and a custom collation is never written into a schema.
+    conn.execute("CREATE TABLE copied AS SELECT value COLLATE dotnet_nocase AS x FROM names")?;
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT sql FROM sqlite_schema WHERE name = 'copied'"),
+        vec![vec![SqliteValue::Text(
+            "CREATE TABLE copied(x TEXT)".into()
+        )]]
+    );
+    conn.unregister_external_collation("dotnet_nocase");
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn grouping_in_union_and_joins_compare_with_a_custom_collation(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation(
+        "dotnet_nocase".to_string(),
+        0,
+        dotnet_nocase_collation,
+        None,
+    );
+    conn.execute("CREATE TABLE names(value TEXT)")?;
+    conn.execute("INSERT INTO names VALUES ('beta'), ('ALPHA'), ('alpha'), ('Gamma')")?;
+
+    let int_rows = |values: &[i64]| -> Vec<Vec<SqliteValue>> {
+        values
+            .iter()
+            .map(|v| vec![SqliteValue::Integer(*v)])
+            .collect()
+    };
+    let text_rows = |values: &[&str]| -> Vec<Vec<SqliteValue>> {
+        values
+            .iter()
+            .map(|v| vec![SqliteValue::Text((*v).into())])
+            .collect()
+    };
+    for (sql, expected) in [
+        (
+            "SELECT count(*) FROM (SELECT value COLLATE dotnet_nocase AS x FROM names) GROUP BY x ORDER BY 1",
+            int_rows(&[1, 1, 2]),
+        ),
+        (
+            "SELECT count(*) FROM (SELECT value COLLATE dotnet_nocase FROM names UNION SELECT 'BETA')",
+            int_rows(&[3]),
+        ),
+        (
+            "SELECT count(*) FROM (SELECT value COLLATE dotnet_nocase AS x FROM names) AS a \
+             JOIN names AS b ON a.x = b.value",
+            int_rows(&[6]),
+        ),
+        (
+            "SELECT value FROM names WHERE value COLLATE dotnet_nocase IN (SELECT 'Alpha') ORDER BY 1",
+            text_rows(&["ALPHA", "alpha"]),
+        ),
+        (
+            "SELECT value FROM names WHERE value IN (SELECT 'Alpha' COLLATE dotnet_nocase) ORDER BY 1",
+            text_rows(&["ALPHA", "alpha"]),
+        ),
+    ] {
+        assert_eq!(limbo_exec_rows(&conn, sql), expected, "{sql}");
+    }
+
+    // DISTINCT finds duplicates with a hash table, which cannot hash values
+    // so that the callback's equal values get equal hashes.
+    for sql in [
+        "SELECT DISTINCT value COLLATE dotnet_nocase FROM names",
+        "SELECT count(DISTINCT value COLLATE dotnet_nocase) FROM names",
+    ] {
+        let err = conn.execute(sql).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DISTINCT does not support the custom collation dotnet_nocase"),
+            "{sql}: {err}"
+        );
+    }
+    conn.unregister_external_collation("dotnet_nocase");
     Ok(())
 }
 

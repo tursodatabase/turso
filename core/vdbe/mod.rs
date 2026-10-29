@@ -18,7 +18,6 @@
 //! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
-use crate::namespace::NamespaceId;
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
@@ -163,13 +162,11 @@ pub(crate) fn step_view_delta_batch(
 
                 let schema = connection.schema.read();
                 let views = schema.materialized_view_maintenance_order(
-                    NamespaceId::ROOT,
                     connection.transaction_changes.get_view_names()?,
                 )?;
                 for view_name in &views {
-                    if let Some(view_mutex) =
-                        schema.get_materialized_view(NamespaceId::ROOT, view_name)
-                    {
+                    let (namespace, name) = schema.demangle_name(view_name);
+                    if let Some(view_mutex) = schema.get_materialized_view(namespace, name) {
                         let view = view_mutex.lock();
                         turso_assert_ne!(
                             view.get_root_page(),
@@ -212,9 +209,8 @@ pub(crate) fn step_view_delta_batch(
                     }
 
                     let schema = connection.schema.read();
-                    let Some(view_mutex) =
-                        schema.get_materialized_view(NamespaceId::ROOT, view_name)
-                    else {
+                    let (namespace, name) = schema.demangle_name(view_name);
+                    let Some(view_mutex) = schema.get_materialized_view(namespace, name) else {
                         *current_index += 1;
                         continue;
                     };
@@ -2104,6 +2100,10 @@ pub struct PreparedProgram {
     pub has_materialized_views: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
+    /// The custom collations of the connection that prepared the program. The
+    /// program keeps them alive because its `CollationSeq::Custom` values
+    /// call their callbacks.
+    pub custom_collations: Vec<Arc<crate::function::ExternalCollation>>,
     /// Set of attached database indices that need write transactions.
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.

@@ -2,7 +2,7 @@ use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{is_reserved_object_name, NamespaceId, NamespaceRef};
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
 use crate::sync::Arc;
@@ -40,9 +40,16 @@ use turso_parser::ast::{self, Expr, QualifiedName, SortOrder, SortedColumn};
 
 use super::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 
-fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
+fn canonical_create_index_sql(
+    stmt: &ast::Stmt,
+    idx_name_in_sql: ast::Name,
+    tbl_name_in_sql: ast::Name,
+) -> String {
     let mut canonical_stmt = stmt.clone();
-    let ast::Stmt::CreateIndex { idx_name, .. } = &mut canonical_stmt else {
+    let ast::Stmt::CreateIndex {
+        idx_name, tbl_name, ..
+    } = &mut canonical_stmt
+    else {
         unreachable!("canonical_create_index_sql requires a CREATE INDEX statement");
     };
     // Attached db's index names may have a connection-local schema alias like `aux.idx1`.
@@ -50,6 +57,8 @@ fn canonical_create_index_sql(stmt: &ast::Stmt) -> String {
     // when the same database is reopened or attached under a different alias.
     // e.g. CREATE INDEX aux.idx1 ON t1 (name) -> CREATE INDEX idx1 ON t1 (name)
     idx_name.namespace = None;
+    idx_name.name = idx_name_in_sql;
+    *tbl_name = tbl_name_in_sql;
     canonical_stmt.to_string()
 }
 
@@ -71,9 +80,10 @@ fn validate(
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
+    if (is_reserved_object_name(connection.dialect().supports_namespaces(), idx_name)
+        || RESERVED_TABLE_PREFIXES
+            .iter()
+            .any(|prefix| tbl_name.starts_with(prefix)))
         && !connection.is_nested_stmt()
     {
         bail_parse_error!(
@@ -90,7 +100,7 @@ pub fn translate_create_index(
     resolver: &Resolver,
     stmt: ast::Stmt,
 ) -> crate::Result<()> {
-    let sql = canonical_create_index_sql(&stmt);
+    let written_stmt = stmt.clone();
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,
@@ -105,14 +115,30 @@ pub fn translate_create_index(
         panic!("translate_create_index must be called with CreateIndex AST node");
     };
 
-    let original_idx_name = idx_name;
-    let original_tbl_name = tbl_name;
-    let namespace = if original_idx_name.namespace.is_some() {
-        resolver.resolve_namespace(&original_idx_name)?
-    } else {
-        resolver.resolve_existing_table_named(original_tbl_name.as_str())?
+    let mut original_idx_name = idx_name;
+    let mut original_tbl_name = tbl_name;
+    let namespace = match stored_index_of_namespace(
+        connection,
+        resolver,
+        &original_idx_name,
+        &original_tbl_name,
+    ) {
+        Some((namespace, bare_idx_name, bare_tbl_name)) => {
+            original_idx_name.name = bare_idx_name;
+            original_tbl_name = bare_tbl_name;
+            namespace
+        }
+        None if original_idx_name.namespace.is_some() => {
+            resolver.resolve_namespace(&original_idx_name)?
+        }
+        None => resolver.resolve_existing_table_named(original_tbl_name.as_str())?,
     };
     let database_id = namespace.database_id;
+    let sql = canonical_create_index_sql(
+        &written_stmt,
+        resolver.name_in_sql(namespace, &original_idx_name.name),
+        resolver.name_in_sql(namespace, &original_tbl_name),
+    );
     let idx_name = normalize_ident(original_idx_name.name.as_str());
     let tbl_name = normalize_ident(original_tbl_name.as_str());
 
@@ -295,8 +321,8 @@ pub fn translate_create_index(
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
-        &idx_name,
-        &tbl_name,
+        &resolver.mangle_name(namespace, &idx_name),
+        &resolver.mangle_name(namespace, &tbl_name),
         root_page_reg,
         Some(sql),
     )?;
@@ -320,7 +346,7 @@ pub fn translate_create_index(
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
-    let escaped_idx_name = escape_sql_string_literal(&idx_name);
+    let escaped_idx_name = escape_sql_string_literal(&resolver.mangle_name(namespace, &idx_name));
     let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
@@ -333,6 +359,36 @@ pub fn translate_create_index(
     });
 
     Ok(())
+}
+
+/// The namespace of the index that `idx_name` and `tbl_name` name by their
+/// mangled names, with their bare names. The stored text of an index of a
+/// table of a namespace names both so, and the engine runs that text again,
+/// as VACUUM does when it copies a database.
+fn stored_index_of_namespace(
+    connection: &Arc<crate::Connection>,
+    resolver: &Resolver,
+    idx_name: &QualifiedName,
+    tbl_name: &ast::Name,
+) -> Option<(NamespaceRef, ast::Name, ast::Name)> {
+    if !connection.is_nested_stmt() || idx_name.namespace.is_some() {
+        return None;
+    }
+    resolver.with_schema(crate::MAIN_DB_ID, |schema| {
+        let (id, bare_tbl_name) = schema.demangle_name(tbl_name.as_str());
+        if id.is_root() {
+            return None;
+        }
+        let (_, bare_idx_name) = schema.demangle_name(idx_name.name.as_str());
+        Some((
+            NamespaceRef {
+                database_id: crate::MAIN_DB_ID,
+                id,
+            },
+            ast::Name::exact(bare_idx_name.to_string()),
+            ast::Name::exact(bare_tbl_name.to_string()),
+        ))
+    })
 }
 
 /// Emits the bytecode that rebuilds `idx` from a full scan of `tbl`.
@@ -935,7 +991,7 @@ fn index_matches_collation(index: &Index, collation: CollationSeq) -> bool {
     index
         .columns
         .iter()
-        .any(|column| column.collation.unwrap_or_default() == collation)
+        .any(|column| column.collation == collation)
 }
 
 pub fn resolve_sorted_columns(
@@ -970,7 +1026,7 @@ fn resolve_sorted_columns_with_catalog(
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
-            let collation = explicit_collation.or_else(|| column.collation_opt());
+            let collation = explicit_collation.unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::NotGenerated => None,
@@ -997,7 +1053,7 @@ fn resolve_sorted_columns_with_catalog(
                 order,
                 nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
-                collation: explicit_collation,
+                collation: explicit_collation.unwrap_or(CollationSeq::Binary),
                 default: None,
                 expr: Some(sc.expr.clone()),
             })
@@ -1318,7 +1374,7 @@ pub fn translate_drop_index(
     program.emit_null(null_reg, None);
 
     // String8; r[3] = 'some idx name'
-    let index_name_reg = program.emit_string8_new_reg(idx_name);
+    let index_name_reg = program.emit_string8_new_reg(resolver.mangle_name(namespace, &idx_name));
     // String8; r[4] = 'index'
     let index_str_reg = program.emit_string8_new_reg("index".to_string());
 
@@ -1360,7 +1416,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: Some(CollationSeq::NoCase),
+        collation: CollationSeq::NoCase,
     });
 
     // read type of table
@@ -1372,7 +1428,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
 
     program.emit_insn(Insn::RowId {
@@ -1573,7 +1629,20 @@ mod tests {
             Some("aux")
         );
 
-        let canonical_sql = canonical_create_index_sql(&stmt);
+        let ast::Stmt::CreateIndex { tbl_name, .. } = &stmt else {
+            panic!("expected CREATE INDEX statement");
+        };
+        let canonical_sql =
+            canonical_create_index_sql(&stmt, idx_name.name.clone(), tbl_name.clone());
         assert_eq!(canonical_sql, "CREATE INDEX idx1 ON t1 (name)");
+        let stored_sql = canonical_create_index_sql(
+            &stmt,
+            ast::Name::exact("__turso_ns3_idx1".to_string()),
+            ast::Name::exact("__turso_ns3_t1".to_string()),
+        );
+        assert_eq!(
+            stored_sql,
+            "CREATE INDEX __turso_ns3_idx1 ON __turso_ns3_t1 (name)"
+        );
     }
 }
