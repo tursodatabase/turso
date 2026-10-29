@@ -2071,6 +2071,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             _ => false,
         };
 
+        let keeps_scan = self.write_at_current_row_keeps_scan(&row.id);
         self.save_position_before_write();
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
@@ -2112,6 +2113,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
         }
+        if keeps_scan {
+            self.keep_scan_after_write();
+        }
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }
@@ -2130,6 +2134,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 { "row_id": &rowid }
             );
         }
+        let keeps_scan = self.write_at_current_row_keeps_scan(&rowid);
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
@@ -2155,6 +2160,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             maybe_index_id,
             btree_record.as_ref(),
         )?;
+        if keeps_scan {
+            self.keep_scan_after_write();
+        }
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }
@@ -2979,6 +2987,20 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             IterationDirection::Forwards => self.next(),
             IterationDirection::Backwards => self.prev(),
         }
+    }
+
+    fn write_at_current_row_keeps_scan(&self, row_id: &RowID) -> bool {
+        matches!(self.mv_cursor_type, MvccCursorType::Table)
+            && matches!(&self.current_pos, CursorPosition::Loaded { row_id: current, .. } if current == row_id)
+            && !self.dual_peek.both_uninitialized()
+            && self.table_scan.resume.is_none()
+            && self.table_scan.position_before_write.is_none()
+            && self.transaction.table_write_generation(self.table_id) <= self.table_scan.generation
+    }
+
+    fn keep_scan_after_write(&mut self) {
+        self.table_scan.position_before_write = None;
+        self.table_scan.generation = self.transaction.write_generation();
     }
 
     fn save_position_before_write(&mut self) {

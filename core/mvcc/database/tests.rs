@@ -11659,6 +11659,64 @@ fn test_lazy_cursor_exact_chain_hit_rereads_after_changes() {
 }
 
 #[test]
+fn test_lazy_cursor_write_at_current_key_still_sees_an_earlier_insert_ahead() {
+    let (db, conn) = setup_lazy_walk_table(&[1, 2, 3], &[]);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    conn.execute("INSERT INTO t VALUES (100, 'ahead')").unwrap();
+    drive_lazy_payload_io(&conn, || cursor.delete());
+    let mut rowids = Vec::new();
+    loop {
+        drive_lazy_payload_io(&conn, || cursor.next());
+        let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) else {
+            break;
+        };
+        rowids.push(rowid);
+    }
+    assert_eq!(rowids, vec![2, 3, 100]);
+    drop(cursor);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_write_at_current_key_with_injected_yields() {
+    let expected: Vec<(i64, String)> = (1..=12).map(|id| (id, format!("p{id}!"))).collect();
+    for point in [
+        CursorYieldPoint::NextStart,
+        CursorYieldPoint::NextBtreeAdvance,
+        CursorYieldPoint::AdvanceBtreeForwardProgress,
+    ] {
+        let mut fired = false;
+        for occurrence in 0..14 {
+            let (_db, conn) = setup_lazy_walk_table(&(1..=12).collect::<Vec<_>>(), &[]);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let injector = NthYieldInjector::new(point.point(), occurrence);
+            conn.set_yield_injector(Some(injector.clone()));
+            let mut update = conn.prepare("UPDATE t SET v = v || '!'").unwrap();
+            loop {
+                match update.step().unwrap() {
+                    StepResult::Done => break,
+                    StepResult::IO | StepResult::Yield => update._io().step().unwrap(),
+                    other => panic!("unexpected result {other:?}"),
+                }
+            }
+            drop(update);
+            conn.set_yield_injector(None);
+            fired |= injector.fired();
+            assert_eq!(
+                lazy_text_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+                expected,
+                "{point:?} occurrence={occurrence}"
+            );
+            conn.execute("ROLLBACK").unwrap();
+        }
+        assert!(fired, "{point:?} never fired");
+    }
+}
+
+#[test]
 fn reader_fails_at_a_row_updated_after_its_transaction_ends() {
     for foreign_commit in [true, false] {
         let (db, conn) = setup_rows_for_ended_reader();
@@ -12318,6 +12376,18 @@ fn drive_lazy_payload_io<T>(
             IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
         }
     }
+}
+
+fn lazy_text_rows(conn: &Arc<Connection>, sql: &str) -> Vec<(i64, String)> {
+    get_rows(conn, sql)
+        .into_iter()
+        .map(|row| {
+            let Value::Text(text) = &row[1] else {
+                panic!("expected text, got {:?}", row[1]);
+            };
+            (row[0].as_int().unwrap(), text.as_str().to_string())
+        })
+        .collect()
 }
 
 fn setup_rows_for_ended_reader() -> (MvccTestDbNoConn, Arc<Connection>) {
