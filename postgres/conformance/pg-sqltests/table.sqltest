@@ -768,6 +768,34 @@ expect {
     3
 }
 
+# RESTRICT, unlike NO ACTION, fails even when another row takes the old key.
+test fk-restrict-update-key-taken-by-another-row-rejected {
+    CREATE TABLE fkrk_p (id int PRIMARY KEY);
+    CREATE TABLE fkrk_c (pid int REFERENCES fkrk_p (id) ON UPDATE RESTRICT);
+    INSERT INTO fkrk_p VALUES (1), (2);
+    INSERT INTO fkrk_c VALUES (1);
+    UPDATE fkrk_p SET id = id - 1;
+}
+expect error {
+}
+
+test fk-self-referencing-update-key-and-reference-with-action {
+    CREATE TABLE fksn_t (k int PRIMARY KEY, f int REFERENCES fksn_t (k) ON UPDATE SET NULL);
+    INSERT INTO fksn_t VALUES (5, NULL), (1, 5);
+    UPDATE fksn_t SET k = k + 10, f = f + 10;
+    SELECT k, coalesce(f, 0) FROM fksn_t ORDER BY k;
+    CREATE TABLE fkuc_t (k int PRIMARY KEY, f int REFERENCES fkuc_t (k) ON UPDATE CASCADE);
+    INSERT INTO fkuc_t VALUES (5, NULL), (1, 5);
+    UPDATE fkuc_t SET k = k + 10, f = f + 10;
+    SELECT k, coalesce(f, 0) FROM fkuc_t ORDER BY k;
+}
+expect {
+    11|15
+    15|0
+    11|15
+    15|0
+}
+
 test fk-restrict-delete-referenced-parent-rejected {
     CREATE TABLE fkrp_p (id int PRIMARY KEY);
     CREATE TABLE fkrp_c (pid int REFERENCES fkrp_p (id) ON DELETE RESTRICT);

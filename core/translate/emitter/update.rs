@@ -1324,9 +1324,6 @@ fn emit_update_insns<'a>(
         )?,
         _ => crate::alloc::vec![],
     };
-    let has_parent_fk_checks = affected_parent_fks
-        .iter()
-        .any(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict));
     let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
         matches!(
             fk.fk.on_update,
@@ -2226,10 +2223,10 @@ fn emit_update_insns<'a>(
         if let Some(table_btree) = target_table.table.btree() {
             // Parent-side checks scan child rows that point at the OLD parent
             // key. Each match means this update may create a new violation:
-            // RESTRICT halts immediately, while NO ACTION increments the FK
+            // RESTRICT halts immediately, while other actions increment the FK
             // counter so the statement/transaction can fail later if nothing
-            // fixes it.
-            if has_parent_fk_checks {
+            // fixes it, such as the ON UPDATE action.
+            if !affected_parent_fks.is_empty() {
                 let new_key_probe_mode = if any_effective_replace(
                     program.flags.has_statement_conflict(),
                     or_conflict,

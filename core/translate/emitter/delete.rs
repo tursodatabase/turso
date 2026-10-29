@@ -376,15 +376,6 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, child_table_name, None)
     })? {
-        // The parent change that ran this FK's action counted no violation,
-        // so the action program has none to cancel.
-        if program
-            .fk_action_of
-            .as_ref()
-            .is_some_and(|fk| Arc::ptr_eq(fk, &fk_ref.fk))
-        {
-            continue;
-        }
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
         // With no violation counted there is nothing to cancel, so the parent
