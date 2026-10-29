@@ -19,9 +19,7 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
-use crate::translate::expr::expr_type::{
-    common_type_of, stored_type, type_of, BuiltinType, ExprType, TypeEnv,
-};
+use crate::translate::expr::expr_type::{common_type_of, type_of, ExprType, TypeEnv};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination, SelectPlan};
@@ -1048,7 +1046,7 @@ fn ctas_column_type(arms: &[&SelectPlan], column_index: usize, resolver: &Resolv
         }),
         resolver.schema(),
     );
-    strict_column_type(common, resolver)
+    strict_column_type(common)
 }
 
 /// A column of a STRICT table keeps the type it was declared with, including
@@ -1074,30 +1072,34 @@ fn result_column_strict_type(
         }
     }
     let env = TypeEnv::new(Some(&select.table_references), resolver);
-    strict_column_type(type_of(expr, &env), resolver)
+    strict_column_type(type_of(expr, &env))
 }
 
-/// The STRICT column type for values of type `ty`. A custom type that needs
-/// arguments it does not have, such as `numeric` from a UNION of numeric(10,2)
-/// and numeric(5,1), becomes the type its values are stored as. A value that
-/// may be anything becomes ANY, and text without a type becomes TEXT.
-fn strict_column_type(ty: ExprType, resolver: &Resolver) -> ast::Type {
+/// The STRICT column type for values of type `ty`. A custom type keeps its
+/// arguments, and text without a type becomes TEXT.
+///
+/// Any other type becomes ANY, so writes are not checked: a builtin type here
+/// is only how the values are stored, not their PostgreSQL type. A comparison
+/// or a boolean read through a view is an INTEGER, for example, and an INTEGER
+/// column would reject 't'. The same goes for a custom type that needs
+/// arguments it does not have, such as `numeric` from a UNION of numeric(5,2)
+/// and numeric(4,1).
+fn strict_column_type(ty: ExprType) -> ast::Type {
     let array_dimensions = ty.array_dimensions();
     let scalar = match ty {
         ExprType::Array { element, .. } => *element,
         scalar => scalar,
     };
-    let (name, size) = match scalar {
+    let (name, size, array_dimensions) = match scalar {
         ExprType::Custom { type_def, params }
             if type_def.is_domain || type_def.user_params().count() == params.len() =>
         {
-            (type_def.name.clone(), type_size(params))
+            (type_def.name.clone(), type_size(params), array_dimensions)
         }
-        ExprType::Custom { type_def, .. } => (
-            builtin_strict_type_name(stored_type(&type_def, resolver.schema())).to_string(),
-            None,
-        ),
-        scalar => (builtin_strict_type_name(scalar).to_string(), None),
+        ExprType::Untyped | ExprType::Null if array_dimensions == 0 => {
+            ("TEXT".to_string(), None, 0)
+        }
+        _ => ("ANY".to_string(), None, 0),
     };
     ast::Type {
         name,
@@ -1111,16 +1113,6 @@ fn type_size(params: Vec<Box<ast::Expr>>) -> Option<ast::TypeSize> {
     match <[_; 2]>::try_from(params) {
         Ok([precision, scale]) => Some(ast::TypeSize::TypeSize(precision, scale)),
         Err(mut params) => params.pop().map(ast::TypeSize::MaxSize),
-    }
-}
-
-fn builtin_strict_type_name(ty: ExprType) -> &'static str {
-    match ty {
-        ExprType::Builtin(BuiltinType::Integer) => "INTEGER",
-        ExprType::Builtin(BuiltinType::Real) => "REAL",
-        ExprType::Builtin(BuiltinType::Text) | ExprType::Untyped | ExprType::Null => "TEXT",
-        ExprType::Builtin(BuiltinType::Blob) => "BLOB",
-        _ => "ANY",
     }
 }
 

@@ -221,6 +221,37 @@ test table-select-into-rejects-invalid-boolean {
 }
 expect error {}
 
+@setup typed_src
+test table-create-table-as-boolean-expression-accepts-boolean-text {
+    CREATE TABLE dst AS SELECT NOT b AS x, 1 > 0 AS y FROM src;
+    INSERT INTO dst VALUES ('t', 'f');
+    SELECT count(*) FROM dst;
+}
+expect {
+    2
+}
+
+@setup typed_src
+test table-create-table-as-boolean-from-view-accepts-boolean-text {
+    CREATE VIEW v AS SELECT b FROM src;
+    CREATE TABLE dst AS SELECT * FROM v;
+    INSERT INTO dst VALUES ('true');
+    SELECT count(*) FROM dst;
+}
+expect {
+    2
+}
+
+test table-create-table-as-union-of-numeric-with-different-scales {
+    CREATE TABLE s (n numeric(5,2), m numeric(4,1));
+    INSERT INTO s VALUES (1.5, 2.5);
+    CREATE TABLE dst AS SELECT n FROM s UNION ALL SELECT m FROM s;
+    SELECT count(*) FROM dst;
+}
+expect {
+    2
+}
+
 test table-select-into-nested-rejected {
     SELECT * FROM (SELECT 1 INTO dst) sub;
 }
