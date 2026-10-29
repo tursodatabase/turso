@@ -479,6 +479,19 @@ impl Connection {
         Ok(())
     }
 
+    /// For each column of materialized view `view_name`, the collation under
+    /// which the view chose the value it shows among several values that
+    /// compare equal, or `None` when the value is exact. For test oracles that
+    /// compare a view with a fresh run of its definition.
+    #[cfg(feature = "test_helper")]
+    pub fn materialized_view_chosen_value_collations(
+        &self,
+        view_name: &str,
+    ) -> Result<Vec<Option<String>>> {
+        let conn = self.get_inner_connection()?;
+        Ok(conn.materialized_view_chosen_value_collations(view_name)?)
+    }
+
     pub fn is_autocommit(&self) -> Result<bool> {
         let conn = self.get_inner_connection()?;
         Ok(conn.get_auto_commit())
@@ -501,6 +514,30 @@ impl Connection {
     pub fn busy_timeout(&self, duration: std::time::Duration) -> Result<()> {
         let conn = self.get_inner_connection()?;
         conn.set_busy_timeout(duration);
+        Ok(())
+    }
+
+    /// Sets a wall-clock limit for each statement run on this connection.
+    ///
+    /// The VM checks the deadline before every instruction, so a statement that
+    /// runs past it fails with [`Error::Interrupt`] even when it never yields
+    /// (for example a long aggregate over an in-memory or cached table).
+    /// `Duration::ZERO` disables the limit, which is the default.
+    pub fn set_query_timeout(&self, duration: std::time::Duration) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.set_query_timeout(duration);
+        Ok(())
+    }
+
+    /// Interrupts the statement currently running on this connection, like
+    /// [`sqlite3_interrupt`](https://www.sqlite.org/c3ref/interrupt.html).
+    ///
+    /// The running statement fails with [`Error::Interrupt`]. This is safe to
+    /// call from another thread through a clone of the connection, and it is a
+    /// no-op when no statement is running.
+    pub fn interrupt(&self) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.interrupt();
         Ok(())
     }
 }

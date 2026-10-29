@@ -2178,6 +2178,69 @@ expect {
     2|NULL|NULL
 }
 
+# The unmatched-right loop must copy the correlated WHERE subquery after it is
+# planned. The unplanned copy read the FROM subquery as a coroutine, but its
+# nested subquery read the ephemeral index of the planned copy, which never
+# opened because no row matched: "cursor id 4 is None".
+@cross-check-integrity
+test right-join-copies-planned-where-subquery-with-from-subquery {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t3 VALUES (1);
+
+    SELECT * FROM t2 RIGHT JOIN t1 ON 0
+    WHERE EXISTS (
+        SELECT 1 FROM (SELECT * FROM t3) AS b
+         WHERE b.a > 0 AND t2.a IS NULL AND 1 IN (SELECT b.a FROM t1)
+    );
+}
+expect {
+    |1
+}
+
+@cross-check-integrity
+test right-join-copies-planned-where-subquery-with-empty-left-table {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE t3(a);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t3 VALUES (1);
+
+    SELECT * FROM t2 RIGHT JOIN t1 ON t2.a = t1.a
+    WHERE EXISTS (
+        SELECT 1 FROM (SELECT * FROM t3) AS b
+         WHERE b.a > 0 AND t2.a IS NULL AND 1 IN (SELECT b.a FROM t1)
+    );
+}
+expect {
+    |1
+}
+
+@cross-check-integrity
+test right-join-copied-subquery-opens-multi-index-cursors {
+    CREATE TABLE l(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE r(y INTEGER);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, x INTEGER UNIQUE, value INTEGER);
+    INSERT INTO r VALUES (2), (3);
+    INSERT INTO s VALUES (1, 10, 2), (2, -2, 3);
+
+    SELECT l.id, r.y FROM l RIGHT JOIN r ON l.x < r.y
+     WHERE r.y IN (SELECT value FROM s WHERE -1 <= s.x OR l.id = s.id)
+     ORDER BY r.y LIMIT 4;
+
+    INSERT INTO l VALUES (2, 1);
+    SELECT l.id, r.y FROM l RIGHT JOIN r ON l.x < r.y
+     WHERE r.y IN (SELECT value FROM s WHERE -1 <= s.x OR l.id = s.id)
+     ORDER BY r.y LIMIT 4;
+}
+expect {
+    |2
+    2|2
+    2|3
+}
+
 # From SQLite join8-24000. The unmatched
 # pass must not reuse the CTE cursor that the left join group uses.
 @cross-check-integrity
@@ -2669,4 +2732,106 @@ expect {
     1||x|||
     1||x|1||x
     0|
+}
+
+@cross-check-integrity
+test right-join-with-13-tables-keeps-later-inner-joins-after-it {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, b);
+    CREATE TABLE t3(b, c, a);
+    CREATE TABLE t4(a);
+    CREATE TABLE t5(a);
+    CREATE TABLE t6(a);
+    CREATE TABLE t7(a);
+    CREATE TABLE t8(a);
+    CREATE TABLE t9(a);
+    CREATE TABLE t10(a);
+    CREATE TABLE t11(a);
+    CREATE TABLE t12(a);
+    CREATE TABLE t13(a);
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t2 VALUES (1, 100), (2, 200);
+    INSERT INTO t3 VALUES (100, 1, 1), (200, 1, 2);
+    INSERT INTO t4 VALUES (1), (2);
+    INSERT INTO t5 VALUES (1), (2);
+    INSERT INTO t6 VALUES (1), (2);
+    INSERT INTO t7 VALUES (1), (2);
+    INSERT INTO t8 VALUES (1), (2);
+    INSERT INTO t9 VALUES (1), (2);
+    INSERT INTO t10 VALUES (1), (2);
+    INSERT INTO t11 VALUES (1), (2);
+    INSERT INTO t12 VALUES (1), (2);
+    INSERT INTO t13 VALUES (1), (2);
+
+    SELECT t1.a, t2.a, t3.b, t4.rowid, t12.rowid
+      FROM t1
+      RIGHT JOIN t2 ON t1.a = t2.a
+      JOIN t3 ON t3.b = t2.b
+      JOIN t4 ON t4.a = t3.a
+      JOIN t5 ON t5.a = t3.a
+      JOIN t6 ON t6.a = t3.a
+      JOIN t7 ON t7.a = t3.a
+      JOIN t8 ON t8.a = t3.a
+      JOIN t9 ON t9.a = t3.a
+      JOIN t10 ON t10.a = t3.a
+      JOIN t11 ON t11.a = t3.a
+      JOIN t12 ON t12.a = t3.a
+      JOIN t13 ON t13.a = t3.a
+     WHERE t3.c = 1
+     ORDER BY t2.a;
+}
+expect {
+    1|1|100|1|1
+    |2|200|2|2
+}
+
+@cross-check-integrity
+test full-join-with-13-tables-keeps-later-inner-joins-after-it {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, b);
+    CREATE TABLE t3(b, c, a);
+    CREATE TABLE t4(a);
+    CREATE TABLE t5(a);
+    CREATE TABLE t6(a);
+    CREATE TABLE t7(a);
+    CREATE TABLE t8(a);
+    CREATE TABLE t9(a);
+    CREATE TABLE t10(a);
+    CREATE TABLE t11(a);
+    CREATE TABLE t12(a);
+    CREATE TABLE t13(a);
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t2 VALUES (1, 100), (2, 200);
+    INSERT INTO t3 VALUES (100, 1, 1), (200, 1, 2);
+    INSERT INTO t4 VALUES (1), (2);
+    INSERT INTO t5 VALUES (1), (2);
+    INSERT INTO t6 VALUES (1), (2);
+    INSERT INTO t7 VALUES (1), (2);
+    INSERT INTO t8 VALUES (1), (2);
+    INSERT INTO t9 VALUES (1), (2);
+    INSERT INTO t10 VALUES (1), (2);
+    INSERT INTO t11 VALUES (1), (2);
+    INSERT INTO t12 VALUES (1), (2);
+    INSERT INTO t13 VALUES (1), (2);
+
+    SELECT t1.a, t2.a, t3.b, t4.rowid, t12.rowid
+      FROM t1
+      FULL JOIN t2 ON t1.a = t2.a
+      JOIN t3 ON t3.b = t2.b
+      JOIN t4 ON t4.a = t3.a
+      JOIN t5 ON t5.a = t3.a
+      JOIN t6 ON t6.a = t3.a
+      JOIN t7 ON t7.a = t3.a
+      JOIN t8 ON t8.a = t3.a
+      JOIN t9 ON t9.a = t3.a
+      JOIN t10 ON t10.a = t3.a
+      JOIN t11 ON t11.a = t3.a
+      JOIN t12 ON t12.a = t3.a
+      JOIN t13 ON t13.a = t3.a
+     WHERE t3.c = 1
+     ORDER BY t2.a;
+}
+expect {
+    1|1|100|1|1
+    |2|200|2|2
 }

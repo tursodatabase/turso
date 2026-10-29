@@ -32,6 +32,7 @@ DEFAULT expression
 CHECK (expression)
 REFERENCES foreign-table [(column-name)] [foreign-key-actions]
 COLLATE collation-name
+[GENERATED ALWAYS] AS (expression) [VIRTUAL]
 ```
 
 ### Table Constraints
@@ -86,6 +87,8 @@ CREATE TABLE users (
 
 When a column is declared as `INTEGER PRIMARY KEY`, it becomes an alias for the internal `rowid`, and inserted integer values are used as the row identifier directly. This is the most efficient primary key form.
 
+The PostgreSQL frontend exposes primary keys through its system catalogs, including an index entry for `INTEGER PRIMARY KEY`. This lets `pg_dump` include the primary key constraint without creating a separate physical index for the rowid. These catalog-only indexes use `__turso_internal_pk_index_<table>` names, adding leading underscores when a name is taken. Primary-key constraint names are independent of these internal index names. The PostgreSQL frontend rejects databases containing `WITHOUT ROWID` tables with an error when loading their schema.
+
 #### AUTOINCREMENT
 
 The `AUTOINCREMENT` keyword can only be used with `INTEGER PRIMARY KEY`. It prevents the reuse of rowid values from previously deleted rows by maintaining a counter in the `sqlite_sequence` system table.
@@ -116,6 +119,8 @@ Note also that MVCC autoincrement does **not** un-burn rolled-back rowids — a 
 </Warning>
 
 ### NOT NULL
+
+The PostgreSQL catalogs report `INTEGER PRIMARY KEY` columns as non-nullable, along with explicitly declared `NOT NULL` columns, so `pg_dump` preserves those constraints.
 
 Prevents the column from containing NULL values. Any INSERT or UPDATE that would set the column to NULL raises a constraint error.
 
@@ -205,6 +210,22 @@ CREATE TABLE contacts (
     code TEXT COLLATE RTRIM
 );
 ```
+
+### GENERATED ALWAYS AS
+
+A generated column gets its value from an expression over the other columns of the same row. Turso calculates the value each time a query reads the column, so the value is not stored in the row.
+
+```sql
+CREATE TABLE order_lines (
+    price REAL,
+    qty INTEGER,
+    total REAL GENERATED ALWAYS AS (price * qty) VIRTUAL
+);
+```
+
+The `GENERATED ALWAYS` and `VIRTUAL` keywords are optional, so `total REAL AS (price * qty)` defines the same column. `INSERT` and `UPDATE` cannot write a generated column. You can create an index on a generated column. `PRAGMA table_info` does not show generated columns, but `PRAGMA table_xinfo` does.
+
+Turso supports only virtual generated columns. A `STORED` generated column gives an error.
 
 ## Table Constraints
 
@@ -392,6 +413,7 @@ The following CREATE TABLE features are not yet supported:
 | `CREATE TEMPORARY TABLE` | Temporary tables are not supported |
 | `CREATE TABLE ... AS SELECT` | Creating a table from a query result is not supported |
 | `ON CONFLICT` clause on column constraints | The column-level ON CONFLICT clause (e.g., `NOT NULL ON CONFLICT REPLACE`) is not supported. Use the [INSERT ... ON CONFLICT](/docs/sql-reference/statements/upsert) syntax instead |
+| `GENERATED ALWAYS AS (...) STORED` | Stored generated columns are not supported. Use [virtual generated columns](#generated-always-as) instead |
 
 ### Experimental Features
 
@@ -400,7 +422,6 @@ The following are available behind [experimental feature flags](/docs/sql-refere
 | Feature | Flag | Notes |
 |---------|------|-------|
 | `WITHOUT ROWID` | `--experimental-without-rowid` | WITHOUT ROWID tables have limitations; see the experimental features page |
-| `GENERATED ALWAYS AS` | `--experimental-generated-columns` | Virtual generated (computed) columns only; stored columns are not yet supported |
 
 ## Examples
 

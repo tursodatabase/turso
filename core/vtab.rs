@@ -142,7 +142,17 @@ impl VirtualTable {
                 )
             })?
         {
-            columns_from_create_table_body(&body)
+            let mut columns = columns_from_create_table_body(&body)?;
+            // Like SQLite, HIDDEN marks the column and is not part of its declared type.
+            for column in columns.iter_mut().filter(|column| column.hidden()) {
+                column.ty_str = column
+                    .ty_str
+                    .split(' ')
+                    .filter(|word| !word.eq_ignore_ascii_case("HIDDEN"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+            Ok(columns)
         } else {
             Err(LimboError::ParseError(
                 "Failed to parse schema from virtual table module".to_string(),
@@ -302,12 +312,15 @@ impl VirtualTableCursor {
         result.map(IOResult::Done).map_err(Into::into)
     }
 
-    pub(crate) fn rowid(&self) -> i64 {
-        match &self.inner {
+    pub(crate) fn rowid(&self) -> Option<i64> {
+        if self.null_flag {
+            return None;
+        }
+        Some(match &self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.rowid(),
             VirtualTableCursorInner::External(cursor) => cursor.rowid(),
             VirtualTableCursorInner::Internal(cursor) => cursor.read().rowid(),
-        }
+        })
     }
 
     pub(crate) fn column(&mut self, column: usize) -> IOResultOr<Value> {

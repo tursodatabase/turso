@@ -333,7 +333,7 @@ impl Expr {
                 .unordered_limit_reason()
                 .or_else(|| b.right.unordered_limit_reason()),
             Expr::UnaryOp(u) => u.operand.unordered_limit_reason(),
-            Expr::FunctionCall(fc) => fc.args.iter().find_map(|a| a.unordered_limit_reason()),
+            Expr::FunctionCall(fc) => fc.inputs().find_map(|a| a.unordered_limit_reason()),
             Expr::Case(c) => c
                 .operand
                 .as_ref()
@@ -388,8 +388,7 @@ impl Expr {
                 .or_else(|| b.right.non_unique_order_by_reason(schema)),
             Expr::UnaryOp(u) => u.operand.non_unique_order_by_reason(schema),
             Expr::FunctionCall(fc) => fc
-                .args
-                .iter()
+                .inputs()
                 .find_map(|a| a.non_unique_order_by_reason(schema)),
             Expr::Case(c) => c
                 .operand
@@ -447,7 +446,7 @@ impl Expr {
                 {
                     return true;
                 }
-                fc.args.iter().any(|a| a.contains_aggregate())
+                fc.inputs().any(|a| a.contains_aggregate())
             }
             Expr::BinaryOp(b) => b.left.contains_aggregate() || b.right.contains_aggregate(),
             Expr::UnaryOp(u) => u.operand.contains_aggregate(),
@@ -487,7 +486,7 @@ impl Expr {
     pub fn contains_column_ref(&self) -> bool {
         match self {
             Expr::ColumnRef(_) => true,
-            Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.contains_column_ref()),
+            Expr::FunctionCall(fc) => fc.inputs().any(|a| a.contains_column_ref()),
             Expr::BinaryOp(b) => b.left.contains_column_ref() || b.right.contains_column_ref(),
             Expr::UnaryOp(u) => u.operand.contains_column_ref(),
             Expr::Cast(c) => c.expr.contains_column_ref(),
@@ -527,7 +526,7 @@ impl Expr {
     pub fn contains_scalar_subquery(&self) -> bool {
         match self {
             Expr::Subquery(_) => true,
-            Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.contains_scalar_subquery()),
+            Expr::FunctionCall(fc) => fc.inputs().any(|a| a.contains_scalar_subquery()),
             Expr::BinaryOp(b) => {
                 b.left.contains_scalar_subquery() || b.right.contains_scalar_subquery()
             }
@@ -1613,6 +1612,8 @@ impl Expr {
         Expr::FunctionCall(FunctionCallExpr {
             name,
             args,
+            distinct: false,
+            order_by: Vec::new(),
             filter: None,
         })
     }
@@ -1628,6 +1629,8 @@ impl Expr {
         Expr::FunctionCall(FunctionCallExpr {
             name,
             args,
+            distinct: false,
+            order_by: Vec::new(),
             filter: Some(Box::new(filter)),
         })
     }
@@ -1994,23 +1997,46 @@ pub enum UnaryOp {
 pub struct FunctionCallExpr {
     pub name: String,
     pub args: Vec<Expr>,
+    pub distinct: bool,
+    pub order_by: Vec<OrderByItem>,
     pub filter: Option<Box<Expr>>,
 }
 
 impl fmt::Display for FunctionCallExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}(", self.name)?;
+        if self.distinct {
+            write!(f, "DISTINCT ")?;
+        }
         for (i, arg) in self.args.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
             write!(f, "{arg}")?;
         }
+        if !self.order_by.is_empty() {
+            write!(f, " ORDER BY ")?;
+            for (i, item) in self.order_by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{item}")?;
+            }
+        }
         write!(f, ")")?;
         if let Some(filter_expr) = &self.filter {
             write!(f, " FILTER (WHERE {filter_expr})")?;
         }
         Ok(())
+    }
+}
+
+impl FunctionCallExpr {
+    fn inputs(&self) -> impl Iterator<Item = &Expr> {
+        self.args
+            .iter()
+            .chain(self.order_by.iter().map(|item| &item.expr))
+            .chain(self.filter.as_deref())
     }
 }
 

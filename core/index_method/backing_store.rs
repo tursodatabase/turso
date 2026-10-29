@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
@@ -63,7 +64,7 @@ impl IndexMethodContext {
 
 fn database_prefix(connection: &Connection, database_id: usize) -> String {
     connection
-        .get_database_name_by_index(database_id)
+        .namespace_name(database_id)
         .filter(|name| name != "main")
         .map(|name| format!("{}.", quote_identifier(&name)))
         .unwrap_or_default()
@@ -107,7 +108,7 @@ impl BackingTable {
     fn exists(&self, connection: &Connection, database_id: usize) -> bool {
         let table = self.table_name();
         connection.with_schema(database_id, |schema| {
-            schema.get_btree_table(&table).is_some()
+            schema.get_btree_table(NamespaceId::ROOT, &table).is_some()
         })
     }
 
@@ -183,7 +184,9 @@ impl BackingIndex {
 
     fn exists(&self, connection: &Connection, database_id: usize) -> bool {
         connection.with_schema(database_id, |schema| {
-            schema.get_index(&self.table, &self.name).is_some()
+            schema
+                .get_index(NamespaceId::ROOT, &self.table, &self.name)
+                .is_some()
         })
     }
 
@@ -270,7 +273,9 @@ impl BackingStore {
         let index_name = index.name.clone();
         let keys = &index.keys;
         let Some(index) = connection.with_schema(database_id, |schema| {
-            schema.get_index(&table_name, &index_name).cloned()
+            schema
+                .get_index(NamespaceId::ROOT, &table_name, &index_name)
+                .cloned()
         }) else {
             return Ok(None);
         };

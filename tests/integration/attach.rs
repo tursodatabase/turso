@@ -281,6 +281,40 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
     Ok(())
 }
 
+/// VACUUM INTO an empty file that is attached on the same connection must
+/// leave the attached schema usable, with or without tables in the copy.
+#[turso_macros::test]
+fn test_vacuum_into_attached_empty_file(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+
+    let empty_main_path = db.path.with_extension("vacuum_empty_main.db");
+    conn.execute(format!(
+        "ATTACH '{}' AS empty_copy",
+        empty_main_path.display()
+    ))?;
+    conn.execute("PRAGMA user_version = 3")?;
+    conn.execute(format!("VACUUM INTO '{}'", empty_main_path.display()))?;
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA empty_copy.user_version"))
+        .is_equal_to(vec![row![3]]);
+    conn.execute("CREATE TABLE empty_copy.u(y)")?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT count(*) FROM empty_copy.u"))
+        .is_equal_to(vec![row![0]]);
+
+    let aux_path = db.path.with_extension("vacuum_aux.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (5)")?;
+    conn.execute(format!("VACUUM INTO '{}'", aux_path.display()))?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT x FROM aux.t")).is_equal_to(vec![row![5]]);
+    conn.execute("INSERT INTO aux.t VALUES (6)")?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT x FROM aux.t ORDER BY x"))
+        .is_equal_to(vec![row![5], row![6]]);
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA aux.integrity_check"))
+        .is_equal_to(vec![row!["ok"]]);
+    Ok(())
+}
+
 #[turso_macros::test]
 fn test_fresh_attach_inherits_main_page_size(_tmp_db: TempDatabase) -> anyhow::Result<()> {
     let db = attach_enabled_db(DatabaseOpts::new());
@@ -521,10 +555,8 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
 }
 
 #[turso_macros::test]
-fn test_attach_inherits_generated_columns_flag_on_reattach(
-    _tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
-    let db = attach_enabled_db(DatabaseOpts::new().with_generated_columns(true));
+fn test_attach_supports_generated_columns_on_reattach(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
     let conn = db.connect_limbo();
 
     let aux_path = db.path.with_extension("attach_generated_columns.db");

@@ -133,7 +133,7 @@ set test_files {
   collate5             fail
   collate6             fail
   collate7             fail
-  collate8             fail
+  collate8             pass
   collate9             fail
   collateA             pass
   collateB             pass
@@ -212,7 +212,7 @@ set test_files {
   e_fkey               fail
   e_insert             fail
   e_reindex            fail
-  e_resolve            fail
+  e_resolve            pass
   e_select             fail
   e_select2            pass
   e_totalchanges       fail
@@ -310,14 +310,14 @@ set test_files {
   init                 fail
   insert               fail
   insert2              pass
-  insert3              fail
+  insert3              pass
   insert4              fail
   insert5              pass
   instr                pass
   intarray             fail
   interrupt            fail
   interrupt2           fail
-  intpkey              fail
+  intpkey              pass
   intreal              fail
   io                   fail
   istrue               fail
@@ -410,7 +410,7 @@ set test_files {
   notify3              fail
   notnull              fail
   notnull2             fail
-  null                 fail
+  null                 pass
   nulls1               fail
   numcast              fail
   numindex1            pass
@@ -570,7 +570,7 @@ set test_files {
   temptable2           fail
   temptable3           fail
   temptrigger          fail
-  timediff1            fail
+  timediff1            pass
   tkt-02a8e81d44       pass
   tkt-18458b1a         pass
   tkt-26ff0c2d1e       pass
@@ -688,7 +688,7 @@ set test_files {
   tkt3541              pass
   tkt3554              pass
   tkt3581              pass
-  tkt35xx              fail
+  tkt35xx              pass
   tkt3630              pass
   tkt3718              fail
   tkt3731              pass
@@ -898,6 +898,45 @@ set __runner_logdir [file join $testdir logs]
 file mkdir $__runner_logdir
 set __runner_hang_completed [list]
 
+# A run can cover only part K of N of the files, so CI can spread the suite
+# over several machines: set TCL_TEST_PART="K/N". Every file runs in exactly
+# one part. The slowest files are listed below with their usual run time in
+# seconds; each goes to the part with the least time so far, so the parts
+# finish at about the same time. Every other file goes to a part by its
+# position in the list above. The slow-file list only affects how even the
+# parts are: a file missing from it, or an outdated time, still runs exactly
+# once.
+set __runner_slow_files {
+  view3 140  tkt2686 45  selectG 45  notify2 31  trans2 31
+  walsetlk_recover 31  walsetlk3 31  lock4 31  zeroblob 16  avtrans 14
+  trans 12  sort3 11
+}
+set __runner_part 1
+set __runner_parts 1
+if {[info exists env(TCL_TEST_PART)]} {
+  if {[scan $env(TCL_TEST_PART) "%d/%d%s" __runner_part __runner_parts __runner_rest] != 2
+      || $__runner_parts < 1 || $__runner_part < 1
+      || $__runner_part > $__runner_parts} {
+    puts stderr "TCL_TEST_PART must be K/N with 1 <= K <= N, got \"$env(TCL_TEST_PART)\""
+    exit 2
+  }
+}
+array set __runner_slow_part {}
+set __runner_part_load [lrepeat $__runner_parts 0]
+foreach {__runner_name __runner_secs} \
+    [lsort -stride 2 -index 1 -integer -decreasing $__runner_slow_files] {
+  set __runner_best 0
+  for {set __runner_k 1} {$__runner_k < $__runner_parts} {incr __runner_k} {
+    if {[lindex $__runner_part_load $__runner_k] < [lindex $__runner_part_load $__runner_best]} {
+      set __runner_best $__runner_k
+    }
+  }
+  set __runner_slow_part($__runner_name) [expr {$__runner_best + 1}]
+  lset __runner_part_load $__runner_best \
+      [expr {[lindex $__runner_part_load $__runner_best] + $__runner_secs}]
+}
+set __runner_position 0
+
 # The list above mixes 2-field (pass/fail) and 3-field (skip + reason)
 # entries, so walk it manually instead of with foreach.
 set __runner_i 0
@@ -912,7 +951,20 @@ while {$__runner_i < [llength $test_files]} {
   }
 
   if {$__runner_status eq "skip"} {
-    lappend __runner_results [list $__runner_name SKIP 0 0 $__runner_reason]
+    # Skipped files are only listed in part 1, so each appears once.
+    if {$__runner_part == 1} {
+      lappend __runner_results [list $__runner_name SKIP 0 0 $__runner_reason]
+    }
+    continue
+  }
+
+  if {[info exists __runner_slow_part($__runner_name)]} {
+    set __runner_file_part $__runner_slow_part($__runner_name)
+  } else {
+    set __runner_file_part [expr {$__runner_position % $__runner_parts + 1}]
+    incr __runner_position
+  }
+  if {$__runner_file_part != $__runner_part} {
     continue
   }
 

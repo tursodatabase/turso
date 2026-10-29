@@ -359,6 +359,18 @@ pub enum Stmt {
         /// sequence name
         seq_name: QualifiedName,
     },
+    /// `CREATE SCHEMA`: a namespace stored in the main database. Only a
+    /// frontend that supports namespaces builds this statement; the SQLite
+    /// parser has no such syntax.
+    CreateSchema {
+        /// schema name
+        name: Name,
+    },
+    /// `DROP SCHEMA`, built only by a frontend that supports namespaces.
+    DropSchema {
+        /// schema name
+        name: Name,
+    },
 }
 
 #[repr(transparent)]
@@ -645,6 +657,11 @@ pub struct Variable {
     pub name: Option<Box<str>>,
     /// Type of the source column, if known (e.g. from trigger NEW/OLD rewrite).
     pub col_type: Option<Box<str>>,
+    /// Collation of the source column, if the variable stands for a column
+    /// (trigger NEW/OLD rewrite). Comparisons of the variable use it like
+    /// they use a column's collation.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub col_collation: Option<Box<str>>,
     /// True for an explicit `?N` marker. Numbered markers carry no allocated
     /// name; their "?N" spelling is derived from the index on demand.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -657,6 +674,7 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            col_collation: None,
             numbered: false,
         }
     }
@@ -667,11 +685,14 @@ impl Variable {
             index,
             name: None,
             col_type: None,
+            col_collation: None,
             numbered: true,
         }
     }
 
-    pub fn indexed_typed(index: NonZeroU32, col_type: &str) -> Self {
+    /// A variable that stands for a column with the given declared type and
+    /// collation.
+    pub fn for_column(index: NonZeroU32, col_type: &str, col_collation: Option<&str>) -> Self {
         Self {
             index,
             name: None,
@@ -680,6 +701,7 @@ impl Variable {
             } else {
                 Some(col_type.into())
             },
+            col_collation: col_collation.map(Into::into),
             numbered: false,
         }
     }
@@ -689,6 +711,7 @@ impl Variable {
             index,
             name: Some(name.into()),
             col_type: None,
+            col_collation: None,
             numbered: false,
         }
     }
@@ -1127,7 +1150,11 @@ pub enum SelectTable {
     /// table function call
     TableCall(QualifiedName, Vec<Box<Expr>>, Option<As>),
     /// `SELECT` subquery
-    Select(Select, Option<As>),
+    Select {
+        select: Select,
+        alias: Option<As>,
+        lateral: bool,
+    },
     /// subquery
     Sub(FromClause, Option<As>),
 }
@@ -1360,8 +1387,9 @@ impl Name {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QualifiedName {
-    /// schema
-    pub db_name: Option<Name>,
+    /// namespace of the object: in SQLite, the name of a database (`main`,
+    /// `temp` or an attached database)
+    pub namespace: Option<Name>,
     /// object name
     pub name: Name,
     /// alias
@@ -1372,23 +1400,23 @@ impl QualifiedName {
     /// Constructor
     pub const fn single(name: Name) -> Self {
         Self {
-            db_name: None,
+            namespace: None,
             name,
             alias: None,
         }
     }
     /// Constructor
-    pub const fn fullname(db_name: Name, name: Name) -> Self {
+    pub const fn fullname(namespace: Name, name: Name) -> Self {
         Self {
-            db_name: Some(db_name),
+            namespace: Some(namespace),
             name,
             alias: None,
         }
     }
     /// Constructor
-    pub const fn xfullname(db_name: Name, name: Name, alias: Name) -> Self {
+    pub const fn xfullname(namespace: Name, name: Name, alias: Name) -> Self {
         Self {
-            db_name: Some(db_name),
+            namespace: Some(namespace),
             name,
             alias: Some(alias),
         }
@@ -1396,7 +1424,7 @@ impl QualifiedName {
     /// Constructor
     pub const fn alias(name: Name, alias: Name) -> Self {
         Self {
-            db_name: None,
+            namespace: None,
             name,
             alias: Some(alias),
         }
@@ -1475,6 +1503,10 @@ pub enum CreateTypeBody {
         base: String,
         /// encode expression (called on write), uses `value` placeholder for input
         encode: Option<Box<Expr>>,
+        /// coerce expression (called on write after encode, and by a CAST with
+        /// type parameters). Rounds or rejects the encoded `value` to fit the
+        /// type parameters, which only this expression can reference.
+        coerce: Option<Box<Expr>>,
         /// decode expression (called on read), uses `value` placeholder for input
         decode: Option<Box<Expr>>,
         /// operator-to-function mappings
@@ -2167,6 +2199,10 @@ pub struct TypeField {
     /// field/variant type (recursive — allows nested STRUCT/UNION)
     pub field_type: Type,
 }
+
+/// The most dimensions an array type can have. A column stores its number of
+/// dimensions in three bits.
+pub const MAX_ARRAY_DIMENSIONS: u32 = 7;
 
 /// Column type
 // https://sqlite.org/syntax/type-name.html

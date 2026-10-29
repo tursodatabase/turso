@@ -1,0 +1,45 @@
+@database :memory:
+@skip-file-if mvcc "attach is not supported for mvcc"
+
+# INSERT OR REPLACE into a child table of an attached database looked the
+# table's foreign keys up in main's schema, where the table does not exist.
+# The replaced row, whose parent was missing, was then never taken off the
+# deferred foreign key count, so COMMIT failed with a foreign key error
+# although the row that replaced it has a parent.
+
+@cross-check-integrity
+test replace-into-attached-db-child-table-with-deferred-fk-commits {
+    PRAGMA foreign_keys=ON;
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.p(id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO aux.p VALUES (1);
+    BEGIN;
+    INSERT INTO aux.c VALUES (1, 99);
+    INSERT OR REPLACE INTO aux.c VALUES (1, 1);
+    COMMIT;
+    SELECT * FROM aux.c;
+}
+expect {
+    1|1
+}
+
+# UPDATE of a child table of an attached database had the same lookup: the
+# row's old parent was missing and its new parent exists, but the old
+# violation was never taken off the deferred count.
+@cross-check-integrity
+test update-attached-db-child-row-to-a-valid-parent-with-deferred-fk-commits {
+    PRAGMA foreign_keys=ON;
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.p(id INTEGER PRIMARY KEY);
+    CREATE TABLE aux.c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO aux.p VALUES (1);
+    BEGIN;
+    INSERT INTO aux.c VALUES (1, 99);
+    UPDATE aux.c SET pid = 1 WHERE id = 1;
+    COMMIT;
+    SELECT * FROM aux.c;
+}
+expect {
+    1|1
+}

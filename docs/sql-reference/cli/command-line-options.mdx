@@ -173,13 +173,16 @@ Experimental features may have incomplete implementations or known limitations. 
 | `--experimental-autovacuum` | Enable automatic database vacuuming |
 | `--experimental-vacuum` | Enable in-place `VACUUM` |
 | `--experimental-attach` | Enable `ATTACH DATABASE` / `DETACH DATABASE` |
-| `--experimental-generated-columns` | Enable virtual `GENERATED ALWAYS AS` columns |
 | `--experimental-without-rowid` | Enable `WITHOUT ROWID` tables |
 | `--experimental-multiprocess-wal` | Enable sharing a database between processes via a shared WAL coordinator |
 | `--experimental-mvcc-passive-checkpoint` | Enable passive checkpointing under MVCC (`journal_mode=mvcc`) |
 
 <Info>
 Triggers (`CREATE TRIGGER` / `DROP TRIGGER`) are stable as of Turso 0.7 and no longer require a flag.
+</Info>
+
+<Info>
+Generated columns (`GENERATED ALWAYS AS`) are no longer experimental and do not require a flag. The `--experimental-generated-columns` flag was removed.
 </Info>
 
 ```bash

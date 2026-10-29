@@ -163,7 +163,7 @@ INSERT INTO events VALUES (
 );
 ```
 
-For the full custom types reference including ENCODE/DECODE, operators, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
+For the full custom types reference including ENCODE/DECODE/COERCE, operators, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
 
 ### Composite Types: STRUCT and UNION
 
@@ -259,6 +259,14 @@ SELECT 1 < '2';        -- 1 (true, numeric < text)
 SELECT NULL < 1;        -- NULL (any comparison with NULL yields NULL)
 SELECT NULL IS NULL;    -- 1 (use IS to test for NULL)
 ```
+
+## PostgreSQL storage metadata
+
+The PostgreSQL catalogs report each column's default storage setting for its type.
+Variable-length types such as `text` and `bytea`, and array columns, report extended
+storage; `numeric(precision, scale)` reports main storage. Domains inherit their base type's setting.
+This metadata prevents `pg_dump` from adding unnecessary `SET STORAGE PLAIN`
+statements. It does not change how Turso stores values on disk.
 
 ## See Also
 

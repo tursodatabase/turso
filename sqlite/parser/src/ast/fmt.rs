@@ -716,6 +716,7 @@ impl ToTokens for Stmt {
                         params,
                         base,
                         encode,
+                        coerce,
                         decode,
                         operators,
                         default,
@@ -741,6 +742,11 @@ impl ToTokens for Stmt {
                         if let Some(ref encode) = encode {
                             s.append(TK_ID, Some("ENCODE"))?;
                             encode.to_tokens(s, context)?;
+                        }
+                        // COERCE
+                        if let Some(ref coerce) = coerce {
+                            s.append(TK_ID, Some("COERCE"))?;
+                            coerce.to_tokens(s, context)?;
                         }
                         // DECODE
                         if let Some(ref decode) = decode {
@@ -866,6 +872,18 @@ impl ToTokens for Stmt {
                     s.append(TK_EXISTS, None)?;
                 }
                 seq_name.to_tokens(s, context)?;
+                Ok(())
+            }
+            Self::CreateSchema { name } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                name.to_tokens(s, context)?;
+                Ok(())
+            }
+            Self::DropSchema { name } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("SCHEMA"))?;
+                name.to_tokens(s, context)?;
                 Ok(())
             }
             Self::DropDomain {
@@ -1501,7 +1519,14 @@ impl ToTokens for SelectTable {
                 }
                 Ok(())
             }
-            Self::Select(select, alias) => {
+            Self::Select {
+                select,
+                alias,
+                lateral,
+            } => {
+                if *lateral {
+                    s.append(TK_LATERAL, None)?;
+                }
                 s.append(TK_LP, None)?;
                 select.to_tokens(s, context)?;
                 s.append(TK_RP, None)?;
@@ -1635,7 +1660,7 @@ impl ToTokens for QualifiedName {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        if let Some(ref db_name) = self.db_name {
+        if let Some(ref db_name) = self.namespace {
             db_name.to_tokens(s, context)?;
             s.append(TK_DOT, None)?;
         }
@@ -1837,7 +1862,19 @@ impl ToTokens for ColumnConstraint {
             }
             Self::Default(expr) => {
                 s.append(TK_DEFAULT, None)?;
-                expr.to_tokens(s, context)
+                let parses_without_parentheses = match expr.as_ref() {
+                    Expr::Literal(_) | Expr::Id(_) | Expr::Parenthesized(_) => true,
+                    Expr::Unary(UnaryOperator::Positive | UnaryOperator::Negative, operand) => {
+                        matches!(operand.as_ref(), Expr::Literal(_))
+                    }
+                    _ => false,
+                };
+                if parses_without_parentheses {
+                    return expr.to_tokens(s, context);
+                }
+                s.append(TK_LP, None)?;
+                expr.to_tokens(s, context)?;
+                s.append(TK_RP, None)
             }
             Self::Collate { collation_name } => {
                 s.append(TK_COLLATE, None)?;
