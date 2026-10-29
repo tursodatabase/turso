@@ -846,6 +846,177 @@ fn query_rowid_readers_follow_cached_searcher_order_and_snapshot() {
     );
 }
 
+#[test]
+fn single_term_prefixes_match_and_keep_bm25_scores() {
+    let attachment = test_attachment();
+    let (segment, _) = build_and_load_segment(
+        &attachment,
+        &[
+            (1, "data"),
+            (2, "database"),
+            (3, "data warehouse"),
+            (4, "unrelated"),
+        ],
+    );
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![segment];
+    cursor.snapshot_loaded = true;
+    for (query, expected) in [
+        ("dat*", vec![1, 2, 3]),
+        ("DAT*", vec![1, 2, 3]),
+        ("data !!*", vec![1, 3]),
+        ("data AND !!*", vec![1, 3]),
+        ("data AND !!*^2", vec![1, 3]),
+        ("warehouse &*", vec![3]),
+        ("!!*", vec![]),
+        ("\"dat\"*", vec![1, 2, 3]),
+        ("title:dat*", vec![1, 2, 3]),
+        ("body:dat*", vec![]),
+        ("title:(dat* AND warehouse)", vec![3]),
+        ("dat* NOT warehouse", vec![1, 2]),
+        ("missing* AND data", vec![]),
+        ("missing* OR unrelated", vec![4]),
+        ("\"data ware\"*", vec![3]),
+        ("\"dat*\"", vec![]),
+        ("dat\\*", vec![]),
+    ] {
+        let hits = query_hits(&mut cursor, FTS_PATTERN_COMBINED_ORDERED, query, -1);
+        let mut ids = hits.iter().map(|hit| hit.0).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "{query}");
+        assert!(hits.iter().all(|hit| hit.1.as_float() > 0.0));
+    }
+}
+
+#[test]
+fn prefix_scores_equal_explicit_term_queries() {
+    let attachment = test_attachment();
+    let (segment, _) = build_and_load_segment(
+        &attachment,
+        &[
+            (1, "data data"),
+            (2, "database"),
+            (3, "data warehouse"),
+            (4, "unrelated"),
+        ],
+    );
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![segment];
+    cursor.snapshot_loaded = true;
+    for (prefix, explicit) in [
+        ("dat*", "data OR database"),
+        ("\"dat\"*", "data OR database"),
+        ("title:dat*^2", "(title:data OR title:database)^2"),
+        ("dat* NOT warehouse", "(data OR database) NOT warehouse"),
+        ("dat* OR unrelated", "data OR database OR unrelated"),
+    ] {
+        assert_eq!(
+            query_hits(&mut cursor, FTS_PATTERN_COMBINED_ORDERED, prefix, -1),
+            query_hits(&mut cursor, FTS_PATTERN_COMBINED_ORDERED, explicit, -1),
+            "{prefix}"
+        );
+    }
+}
+
+#[test]
+fn prefixes_use_index_tokenizers_and_field_weights() {
+    for (tokenizer, docs, prefix, explicit) in [
+        (
+            "default",
+            [(1, "DATA"), (2, "DATABASE")],
+            "DAT*",
+            "data OR database",
+        ),
+        (
+            "en_stem",
+            [(1, "agreed"), (2, "agreement")],
+            "ag*",
+            "agreed OR agreement",
+        ),
+        (
+            "raw",
+            [(1, "Data Space"), (2, "Data Span")],
+            "\"Data Sp\"*",
+            "\"Data Space\" OR \"Data Span\"",
+        ),
+    ] {
+        let mut cfg = test_attachment().cfg.clone();
+        cfg.parameters.insert(
+            "tokenizer".to_owned(),
+            Value::from_text(tokenizer.to_owned()),
+        );
+        cfg.parameters.insert(
+            "weights".to_owned(),
+            Value::from_text("title=3,body=1".to_owned()),
+        );
+        let attachment = FtsIndexAttachment::new(cfg).unwrap();
+        let (segment, _) = build_and_load_segment(&attachment, &docs);
+        let mut cursor = FtsCursor::new(&attachment);
+        cursor.segments = vec![segment];
+        cursor.snapshot_loaded = true;
+        let hits = query_hits(&mut cursor, FTS_PATTERN_COMBINED_ORDERED, prefix, -1);
+        assert_eq!(hits.len(), 2, "{tokenizer}");
+        assert_eq!(
+            hits,
+            query_hits(&mut cursor, FTS_PATTERN_COMBINED_ORDERED, explicit, -1),
+            "{tokenizer}"
+        );
+    }
+}
+
+#[test]
+fn prefix_queries_reject_invalid_fields_syntax_and_all_negative_queries() {
+    let attachment = test_attachment();
+    let (segment, _) = build_and_load_segment(&attachment, &[(1, "database")]);
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![segment];
+    cursor.snapshot_loaded = true;
+    cursor.ensure_searcher().unwrap();
+    for text in ["missing:dat*", "NOT dat*", "(dat*"] {
+        let result = query::parse_query(
+            text,
+            cursor.cached_parser.as_ref().unwrap(),
+            cursor.index.as_ref().unwrap(),
+            cursor.searcher.as_ref().unwrap(),
+            &cursor.default_fields,
+            &cursor.field_boosts,
+        );
+        assert!(result.is_err(), "{text}");
+    }
+}
+
+#[test]
+fn prefix_expansion_limit_counts_distinct_terms_across_segments() {
+    let attachment = test_attachment();
+    let docs = (0..50)
+        .map(|i| (i, format!("prefix{i:03}")))
+        .collect::<Vec<_>>();
+    let refs = docs
+        .iter()
+        .map(|(id, text)| (*id, text.as_str()))
+        .collect::<Vec<_>>();
+    let (first, _) = build_and_load_segment(&attachment, &refs);
+    let (duplicate, _) = build_and_load_segment(&attachment, &[(100, "prefix000")]);
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![first, duplicate];
+    cursor.snapshot_loaded = true;
+    assert_eq!(
+        query_hits(&mut cursor, FTS_PATTERN_MATCH, "prefix*", -1).len(),
+        51
+    );
+    let (extra, _) = build_and_load_segment(&attachment, &[(101, "prefix050")]);
+    cursor.segments.push(extra);
+    cursor.invalidate_snapshot_view();
+    let values = [
+        Register::Value(Value::from_i64(FTS_PATTERN_MATCH)),
+        Register::Value(Value::from_text("prefix*".to_owned())),
+        Register::Value(Value::from_i64(-1)),
+        Register::Value(Value::from_text("0,1".to_owned())),
+    ];
+    let error = cursor.query_start(&values).unwrap_err();
+    assert!(error.to_string().contains("more than 50 terms"), "{error}");
+}
+
 fn query_hits(cursor: &mut FtsCursor, pattern: i64, query: &str, limit: i64) -> Vec<(i64, Value)> {
     let values = [
         Register::Value(Value::from_i64(pattern)),

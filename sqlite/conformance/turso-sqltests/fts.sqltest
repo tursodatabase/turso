@@ -1087,3 +1087,72 @@ expect {
     4|3
     5|1
 }
+
+@backend cli
+test fts-single-term-prefix {
+    CREATE TABLE prefix_docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+    CREATE INDEX prefix_docs_fts ON prefix_docs USING fts(title, body);
+    INSERT INTO prefix_docs VALUES
+        (1, 'data', 'alpha'),
+        (2, 'database', 'beta'),
+        (3, 'data warehouse', 'gamma'),
+        (4, 'unrelated', 'database');
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'dat*') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, '"dat"*') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'title:dat* NOT warehouse') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'title:(dat* AND warehouse)') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'missing* OR beta') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, '"data ware"*') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, '"dat*"') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'dat*') AND fts_score(title, body, 'dat*') > 0 ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, 'dat*') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(body, 'dat*') ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    1
+    2
+    3
+    4
+    1
+    2
+    3
+    2
+    3
+    1
+    2
+    3
+    4
+    1
+    2
+    3
+    4
+}
+
+@backend cli
+test fts-prefix-with-no-tokens {
+    CREATE TABLE prefix_docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+    CREATE INDEX prefix_docs_fts ON prefix_docs USING fts(title, body);
+    INSERT INTO prefix_docs VALUES
+        (1, 'data', 'alpha'),
+        (2, 'database', 'beta'),
+        (3, 'data warehouse', 'gamma'),
+        (4, 'unrelated', 'database');
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'data !!*') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'data AND !!*') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'data AND !!*^2') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, 'warehouse &*') ORDER BY id;
+    SELECT id FROM prefix_docs WHERE fts_match(title, body, '!!*') ORDER BY id;
+}
+expect {
+    1
+    3
+    1
+    3
+    1
+    3
+    3
+}

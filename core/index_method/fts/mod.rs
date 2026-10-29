@@ -67,6 +67,7 @@ use uncased::UncasedStr;
 
 mod directory;
 mod format;
+mod query;
 mod rows;
 
 use directory::{BuildDirectory, FileBytes, SnapshotDirectory};
@@ -3275,7 +3276,7 @@ impl IndexMethodCursor for FtsCursor {
         } else {
             let mut parser = tantivy::query::QueryParser::for_index(
                 self.index.as_ref().expect("index built with the searcher"),
-                selected_fields,
+                selected_fields.clone(),
             );
             for &(field, boost) in &self.field_boosts {
                 parser.set_field_boost(field, boost);
@@ -3311,10 +3312,14 @@ impl IndexMethodCursor for FtsCursor {
                 _ => {}
             }
         }
-        let (query, parse_errors) = parser.parse_query_lenient(&query_str);
-        if let Some(error) = parse_errors.first() {
-            return Err(LimboError::InternalError(format!("FTS parse error: {error:?}")).into());
-        }
+        let query = query::parse_query(
+            &query_str,
+            &parser,
+            self.index.as_ref().expect("index built with the searcher"),
+            searcher,
+            &selected_fields,
+            &self.field_boosts,
+        )?;
 
         // TopDocs keeps a heap proportional to its limit. Cap that heap at the
         // number of live documents: this preserves unlimited-query semantics
