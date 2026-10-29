@@ -304,6 +304,9 @@ pub fn translate_create_role(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    if !resolver.catalog.dialect.supports_roles() {
+        bail_parse_error!("CREATE ROLE is not supported");
+    }
     if resolver.schema().roles.get_by_name(role_name).is_some() {
         bail_parse_error!("role \"{role_name}\" already exists");
     }
@@ -439,14 +442,15 @@ mod tests {
     use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 
     use crate::connection::PrepareOptions;
+    use crate::dialect::{SqliteDialect, SqliteWithRolesDialect};
     use crate::native_ext::{TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
     use crate::security::permission::{Action, Object, PermissionDenied};
     use crate::security::roles::RoleId;
     use crate::statement::StatementOrigin;
     use crate::types::IOResultOr;
     use crate::{
-        Connection, Database, DatabaseOpts, IOResult, LimboError, MemoryIO, OpenFlags,
-        SqliteDialect, StepResult, Value, IO,
+        Connection, Database, DatabaseOpts, IOResult, LimboError, MemoryIO, OpenFlags, StepResult,
+        Value, IO,
     };
 
     #[test]
@@ -482,6 +486,26 @@ mod tests {
 
         assert!(
             error.to_string().contains("role \"alice\" already exists"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn create_role_fails_under_a_dialect_without_roles() {
+        let db = Database::open_file(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
+
+        let error = create_role(&conn, "alice").unwrap_err();
+
+        assert!(
+            error.to_string().contains("CREATE ROLE is not supported"),
             "{error}"
         );
     }
@@ -724,7 +748,7 @@ mod tests {
 
     #[test]
     fn role_without_privileges_may_read_native_virtual_tables_that_allow_it() {
-        let options = crate::OpenOptions::new(Arc::new(SqliteDialect))
+        let options = crate::OpenOptions::new(Arc::new(SqliteWithRolesDialect))
             .native_module(
                 "open_rows",
                 VTabKind::VirtualTable,
@@ -756,7 +780,7 @@ mod tests {
 
     #[test]
     fn role_without_privileges_may_use_only_native_table_valued_functions_that_allow_it() {
-        let options = crate::OpenOptions::new(Arc::new(SqliteDialect))
+        let options = crate::OpenOptions::new(Arc::new(SqliteWithRolesDialect))
             .native_module(
                 "open_rows",
                 VTabKind::TableValuedFunction,
@@ -787,7 +811,7 @@ mod tests {
 
     #[test]
     fn role_without_privileges_cannot_change_virtual_tables_it_may_read() {
-        let options = crate::OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        let options = crate::OpenOptions::new(Arc::new(SqliteWithRolesDialect)).native_module(
             "open_rows",
             VTabKind::VirtualTable,
             EmptyModule { readable: true },
@@ -1144,7 +1168,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(SqliteWithRolesDialect),
         )
         .unwrap();
         db.connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))

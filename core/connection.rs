@@ -1823,11 +1823,14 @@ impl Connection {
     }
 
     /// Returns the phase that loads the roles table into `fresh`, or the
-    /// stats refresh phase if the database has no roles table. The fresh
+    /// stats refresh phase if the dialect has no roles or the database has no
+    /// roles table. The fresh
     /// schema is installed first, because the current schema may not contain
     /// the roles table yet.
     fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
-        if !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME) {
+        if !self.db.dialect().supports_roles()
+            || !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
+        {
             return Ok(ReparsePhase::RefreshStats {
                 stats: Default::default(),
             });

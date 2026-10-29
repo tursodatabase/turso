@@ -1376,7 +1376,7 @@ fn multiprocess_shm_create_role_child_process() {
     };
 
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let db = open_multiprocess_db_with_roles(io, db_path.to_str().unwrap()).unwrap();
     let conn = db
         .connect(ConnectOpts::new(crate::SessionRole::Superuser))
         .unwrap();
@@ -1395,7 +1395,7 @@ fn subprocess_database_open_connects_as_role_created_by_another_process() {
     let db_path = dir.path().join("coordination-peer-role.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let db = open_multiprocess_db_with_roles(io, db_path_str).unwrap();
     let conn = db
         .connect(ConnectOpts::new(crate::SessionRole::Superuser))
         .unwrap();
@@ -1439,7 +1439,7 @@ fn subprocess_connect_async_hands_back_io_while_reading_a_role_created_by_anothe
     let db_path = dir.path().join("coordination-peer-role-async.db");
     let db_path_str = db_path.to_str().unwrap();
     let io: Arc<dyn IO> = multiprocess_test_io();
-    let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+    let db = open_multiprocess_db_with_roles(io.clone(), db_path_str).unwrap();
     let conn = db
         .connect(ConnectOpts::new(crate::SessionRole::Superuser))
         .unwrap();
@@ -1480,6 +1480,17 @@ fn subprocess_connect_async_hands_back_io_while_reading_a_role_created_by_anothe
 
     assert!(handed_back_io);
     assert!(!alice.current_role_is_superuser());
+}
+
+fn open_multiprocess_db_with_roles(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
+    Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        multiprocess_wal_db_opts(),
+        None,
+        Arc::new(crate::dialect::SqliteWithRolesDialect),
+    )
 }
 
 #[test]

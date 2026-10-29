@@ -110,6 +110,10 @@ Creating a role is DDL: it runs in the caller's transaction, is undone by a
 rollback, and bumps the schema cookie so that other connections and other
 processes reload the roles.
 
+Only a dialect that supports roles, such as PostgreSQL, stores them. The
+SQLite dialect refuses `CREATE ROLE`, and a table named
+`__turso_internal_roles` is an ordinary table there, as it is to sqlite3.
+
 Each schema holds a role catalog, an in-memory copy of all roles. It is loaded
 when the database is opened, after MVCC bootstrap, and again whenever the
 schema is reloaded, for example after `VACUUM` or after another process changed

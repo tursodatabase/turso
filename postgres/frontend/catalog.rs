@@ -210,6 +210,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn supports_roles(&self) -> bool {
+        true
+    }
+
     fn default_namespaces(&self) -> &'static [&'static str] {
         &["public"]
     }
