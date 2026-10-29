@@ -54,7 +54,7 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, DmlColumnContext},
+        builder::{CursorKey, CursorType, DmlColumnContext, DmlRowForm},
         insn::{
             to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn,
             RegisterOrLiteral,
@@ -518,6 +518,9 @@ struct UpdateColumnCtx<'a> {
     cdc_updates_register: Option<usize>,
     layout: &'a ColumnLayout,
     affected_columns: &'a ColumnMask,
+    /// The SET columns. Until ENCODE runs, their registers hold the user's
+    /// values and the other columns hold stored values.
+    updated_columns: &'a ColumnMask,
 }
 
 impl UpdateColumnCtx<'_> {
@@ -890,6 +893,7 @@ fn emit_update_column_values<'a>(
                                 column_ctx.start,
                                 column_ctx.rowid_reg,
                                 column_ctx.layout.clone(),
+                                DmlRowForm::StoredExceptUpdated(column_ctx.updated_columns.clone()),
                             ),
                             table: column_ctx.target_table.table.require_btree()?,
                         }),
@@ -1345,6 +1349,7 @@ fn emit_update_insns<'a>(
         cdc_updates_register,
         layout: &layout,
         affected_columns: &affected_columns,
+        updated_columns: &updated_column_indices,
     };
     let skip_set_clauses = false;
 
@@ -1453,8 +1458,13 @@ fn emit_update_insns<'a>(
                 // Compute virtual columns for NEW values
                 //TODO only emit required virtual columns
                 if let Table::BTree(ref btree) = target_table.table {
-                    let new_ctx =
-                        DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
+                    let new_ctx = DmlColumnContext::layout(
+                        columns,
+                        start,
+                        new_rowid_reg,
+                        layout.clone(),
+                        DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+                    );
                     compute_virtual_columns(
                         program,
                         &btree.columns_topo_sort()?,
@@ -1659,8 +1669,13 @@ fn emit_update_insns<'a>(
             || has_check_constraints
             || index_references_virtual_column
         {
-            let dml_ctx =
-                DmlColumnContext::layout(cols, start, effective_rowid_reg, layout.clone());
+            let dml_ctx = DmlColumnContext::layout(
+                cols,
+                start,
+                effective_rowid_reg,
+                layout.clone(),
+                DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+            );
             compute_virtual_columns(
                 program,
                 &btree.columns_topo_sort()?,
@@ -1895,7 +1910,7 @@ fn emit_update_insns<'a>(
                 .as_ref()
                 .clone();
             let columns = target_table.table.columns();
-            let mut column_regs: Vec<usize> = columns
+            let column_regs: Vec<usize> = columns
                 .iter()
                 .enumerate()
                 .map(|(i, col)| {
@@ -1913,7 +1928,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 new_where_expr,
                 columns,
-                &mut column_regs,
+                &column_regs,
                 &bt,
                 new_satisfied_reg,
             )?;
@@ -2659,7 +2674,13 @@ fn emit_update_insns<'a>(
                             "UPDATE on virtual table has no btree".into(),
                         )
                     })?;
-                    let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
+                    let new_ctx = DmlColumnContext::layout(
+                        columns,
+                        start,
+                        beg,
+                        layout.clone(),
+                        DmlRowForm::Stored,
+                    );
                     compute_virtual_columns(
                         program,
                         &btree_table.columns_topo_sort()?,
@@ -2672,7 +2693,8 @@ fn emit_update_insns<'a>(
                     if let Some(ref old_regs) = preserved_old_registers {
                         let pairs = columns.iter().zip(old_regs.iter().copied());
                         //TODO only emit required virtual columns
-                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+                        let old_ctx =
+                            DmlColumnContext::from_column_reg_mapping(pairs, DmlRowForm::Stored);
                         compute_virtual_columns(
                             program,
                             &btree_table.columns_topo_sort()?,

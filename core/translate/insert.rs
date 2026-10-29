@@ -53,7 +53,9 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
+        builder::{
+            CursorKey, CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder, ProgramBuilderOpts,
+        },
         insn::{
             to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn,
             RegisterOrLiteral,
@@ -563,8 +565,9 @@ pub fn translate_insert(
         &btree_table,
     );
 
-    let dml_ctx =
-        DmlColumnContext::from_column_reg_mapping(insertion.col_mappings.iter().map(|cm| {
+    // The inserted values are the user's values until ENCODE runs below.
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(
+        insertion.col_mappings.iter().map(|cm| {
             (
                 cm.column,
                 if cm.column.is_rowid_alias() {
@@ -573,7 +576,9 @@ pub fn translate_insert(
                     cm.register
                 },
             )
-        }));
+        }),
+        DmlRowForm::UserFacing,
+    );
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
@@ -803,7 +808,7 @@ pub fn translate_insert(
         compute_virtual_columns(
             program,
             &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
+            &dml_ctx.with_form(DmlRowForm::Stored),
             resolver,
             &btree_table,
         )?;
@@ -1407,7 +1412,7 @@ fn emit_partial_index_check(
         .iter()
         .map(|cm| cm.column.clone())
         .collect();
-    let mut column_regs: Vec<usize> = insertion
+    let column_regs: Vec<usize> = insertion
         .col_mappings
         .iter()
         .map(|cm| {
@@ -1424,7 +1429,7 @@ fn emit_partial_index_check(
         resolver,
         expr,
         &columns,
-        &mut column_regs,
+        &column_regs,
         table,
         reg,
     )?;
@@ -3584,7 +3589,7 @@ fn emit_index_column_value_for_insert(
             .iter()
             .map(|cm| cm.column.clone())
             .collect();
-        let mut column_regs: Vec<usize> = insertion
+        let column_regs: Vec<usize> = insertion
             .col_mappings
             .iter()
             .map(|cm| {
@@ -3600,7 +3605,7 @@ fn emit_index_column_value_for_insert(
             resolver,
             expr,
             &columns,
-            &mut column_regs,
+            &column_regs,
             table,
             dest_reg,
         )?;

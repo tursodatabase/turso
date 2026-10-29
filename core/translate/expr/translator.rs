@@ -2337,11 +2337,23 @@ fn translate_self_table_column_expr(
                     crate::bail_parse_error!("column index out of bounds");
                 }
                 let src_reg = dml_ctx.to_column_reg(*column);
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: target_register,
-                    extra_amount: 0,
-                });
+                let table_column = &table.columns()[*column];
+                if dml_ctx.holds_stored_value(*column, table_column) {
+                    emit_user_facing_column_value(
+                        program,
+                        src_reg,
+                        target_register,
+                        table_column,
+                        table.is_strict,
+                        resolver,
+                    )?;
+                } else {
+                    program.emit_insn(Insn::Copy {
+                        src_reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                }
                 Ok(target_register)
             }
             None => {

@@ -40,7 +40,7 @@ use crate::{
     },
     vdbe::{
         affinity::Affinity,
-        builder::{CursorType, DmlColumnContext, ProgramBuilder},
+        builder::{CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder},
         insn::{to_u32, AddColumnData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
@@ -652,8 +652,13 @@ fn emit_column_constraints_validation(
         program.emit_column_or_rowid(cursor_id, idx, layout.to_register(base_dest_reg, idx));
     }
 
-    let dml_ctx =
-        DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
+    let dml_ctx = DmlColumnContext::layout(
+        resolved_table.columns(),
+        base_dest_reg,
+        rowid_reg,
+        layout,
+        DmlRowForm::Stored,
+    );
     compute_virtual_columns(
         program,
         &resolved_table.columns_topo_sort()?,

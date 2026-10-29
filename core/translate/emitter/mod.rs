@@ -36,7 +36,9 @@ use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
-    builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
+    builder::{
+        CursorKey, CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder, SelfTableContext,
+    },
     insn::{to_u32, ConstraintInfo, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
@@ -2023,7 +2025,7 @@ pub(crate) fn emit_columns_and_dependencies(
         };
         pairs.push((col, reg));
     }
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs.into_iter());
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs.into_iter(), DmlRowForm::Stored);
     if targets
         .iter()
         .all(|&idx| !table.columns()[idx].is_rowid_alias())
@@ -2179,7 +2181,7 @@ fn emit_index_column_value_new_image(
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let expr = expr.as_ref().clone();
-        let mut column_regs: Vec<usize> = columns
+        let column_regs: Vec<usize> = columns
             .iter()
             .enumerate()
             .map(|(i, col)| {
@@ -2195,7 +2197,7 @@ fn emit_index_column_value_new_image(
             resolver,
             expr,
             columns,
-            &mut column_regs,
+            &column_regs,
             table,
             dest_reg,
         )?;
