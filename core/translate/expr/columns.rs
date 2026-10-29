@@ -130,7 +130,7 @@ pub fn emit_stored_column(
         resolved
             .chain
             .iter()
-            .any(|td| td.encode().is_some())
+            .any(|td| td.has_encode_or_coerce())
             .then_some((table, column, default_expr))
     });
     let Some((table, column, default_expr)) = encoded_default else {

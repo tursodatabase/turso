@@ -166,15 +166,13 @@ pub(crate) fn column_custom_type(expr: &ast::Expr, env: &TypeEnv) -> Option<Colu
         return None;
     };
     match column_reference_type(*table, *column, env)? {
-        ExprType::Custom { type_def, params } => Some(ColumnCustomType { type_def, params }),
+        ExprType::Custom { type_def, .. } => Some(ColumnCustomType { type_def }),
         _ => None,
     }
 }
 
-#[allow(clippy::vec_box)]
 pub(crate) struct ColumnCustomType {
     pub(crate) type_def: Arc<TypeDef>,
-    pub(crate) params: Vec<Box<ast::Expr>>,
 }
 
 fn literal_type(literal: &ast::Literal) -> ExprType {
