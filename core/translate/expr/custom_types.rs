@@ -1,4 +1,5 @@
 use super::*;
+use crate::alloc::TursoSliceExt;
 use crate::schema::{ResolvedType, Schema};
 use crate::translate::expr_context::ExprContext;
 use std::borrow::Borrow;
@@ -592,17 +593,13 @@ pub(crate) fn column_stored_form(
     let Some(resolved) = schema.resolve_type(ty_str, is_strict)? else {
         return Ok(None);
     };
-    let Some(base) = resolved.chain.iter().position(|td| !td.is_domain) else {
+    let Some(stored) = without_domains(resolved)? else {
         return Ok(None);
     };
-    let chain = resolved.chain[base..].to_vec();
-    if chain.iter().all(|td| td.encode().is_none()) {
+    if stored.chain.iter().all(|td| td.encode().is_none()) {
         return Ok(None);
     }
-    Ok(Some(ResolvedType {
-        primitive: resolved.primitive,
-        chain,
-    }))
+    Ok(Some(stored))
 }
 
 /// The type whose stored form a value of type `ty` compares in. A domain
@@ -619,19 +616,28 @@ fn stored_form_type(ty: &ExprType, schema: &Schema) -> Result<Option<ResolvedTyp
     let Some(resolved) = schema.resolve_type_unchecked(&type_def.name)? else {
         return Ok(None);
     };
-    let Some(base) = resolved.chain.iter().position(|td| !td.is_domain) else {
+    let Some(stored) = without_domains(resolved)? else {
         return Ok(None);
     };
-    let chain = resolved.chain[base..].to_vec();
-    if chain
+    if stored
+        .chain
         .iter()
         .all(|td| td.encode().is_none() && td.decode().is_none())
     {
         return Ok(None);
     }
+    Ok(Some(stored))
+}
+
+/// `resolved` without its domains: a domain stores its values as its base type
+/// does. None when the chain has only domains.
+fn without_domains(resolved: ResolvedType) -> Result<Option<ResolvedType>> {
+    let Some(base) = resolved.chain.iter().position(|td| !td.is_domain) else {
+        return Ok(None);
+    };
     Ok(Some(ResolvedType {
         primitive: resolved.primitive,
-        chain,
+        chain: resolved.chain[base..].try_to_vec()?,
     }))
 }
 
