@@ -1283,6 +1283,26 @@ expect {
     index constant|1
 }
 
+# varchar has no ENCODE, so it stores text as it is and compares with any
+# text expression, as in PostgreSQL.
+@requires strict "uses STRICT tables"
+test cmp-varchar-with-text-expressions {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(10), s text) STRICT;
+    INSERT INTO t VALUES (1, 'a', 'a'), (2, 'b', 'c');
+    SELECT 'eq', id FROM t WHERE v = s;
+    SELECT 'lt', id FROM t WHERE v < s;
+    SELECT 'upper', id FROM t WHERE upper(v) = upper(s);
+    SELECT 'in', id FROM t WHERE v IN (SELECT s FROM t);
+    SELECT 'join', a.id FROM t a JOIN t b ON a.v = b.s ORDER BY a.id;
+}
+expect {
+    eq|1
+    lt|2
+    upper|1
+    in|1
+    join|1
+}
+
 # As in PostgreSQL, a text column is not compared with a date column as is:
 # the date would need to ENCODE every text value, and a hash join or an IN
 # subquery would compare them without it.
