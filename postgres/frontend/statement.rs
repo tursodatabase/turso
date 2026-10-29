@@ -44,7 +44,8 @@ impl Statement {
             return Ok(());
         };
         if !deferred.completed {
-            (deferred.exec)(&mut self.inner)?;
+            (deferred.exec)(&mut self.inner)
+                .map_err(|error| statement_error(&self.inner, error))?;
             deferred.completed = true;
         }
         Ok(())
@@ -55,7 +56,9 @@ impl Statement {
             self.execute_deferred()?;
             return Ok(StepResult::Done);
         }
-        self.inner.step().map_err(Into::into)
+        self.inner
+            .step()
+            .map_err(|error| statement_error(&self.inner, error))
     }
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
@@ -63,14 +66,18 @@ impl Statement {
             self.execute_deferred()?;
             return Ok(StepResult::Done);
         }
-        self.inner.step_with_waker(waker).map_err(Into::into)
+        self.inner
+            .step_with_waker(waker)
+            .map_err(|error| statement_error(&self.inner, error))
     }
 
     pub fn reset(&mut self) -> Result<()> {
         if let Some(deferred) = self.deferred.as_mut() {
             deferred.completed = false;
         }
-        self.inner.reset().map_err(Into::into)
+        self.inner
+            .reset()
+            .map_err(|error| statement_error(&self.inner, error))
     }
 
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
@@ -98,7 +105,9 @@ impl Statement {
         if self.deferred.is_some() {
             return self.execute_deferred();
         }
-        self.inner.run_ignore_rows().map_err(Into::into)
+        self.inner
+            .run_ignore_rows()
+            .map_err(|error| statement_error(&self.inner, error))
     }
 
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
@@ -106,7 +115,9 @@ impl Statement {
             self.execute_deferred()?;
             return Ok(Vec::new());
         }
-        self.inner.run_collect_rows().map_err(Into::into)
+        self.inner
+            .run_collect_rows()
+            .map_err(|error| statement_error(&self.inner, error))
     }
 
     pub fn run_with_row_callback(
@@ -133,7 +144,7 @@ impl Statement {
         }
         self.inner
             .run_ignore_rows_nonblock()
-            .map_err(|error| (*error).into())
+            .map_err(|error| statement_error(&self.inner, *error))
     }
 
     pub fn run_with_row_callback_nonblock(
@@ -206,6 +217,10 @@ impl Statement {
         }
         self.inner.reset_best_effort();
     }
+}
+
+fn statement_error(stmt: &turso_core::Statement, error: LimboError) -> crate::Error {
+    crate::Error::from_statement(&stmt.get_program().connection, error)
 }
 
 enum BooleanResultType {

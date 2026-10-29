@@ -637,6 +637,46 @@ fn structured_foreign_key_errors_preserve_sqlite_transaction_behavior() {
     }
 }
 
+#[test]
+fn constraint_violations_report_the_schema_of_the_table() {
+    let (_io, conn) = pg_connection_with_fk();
+    conn.execute("CREATE SCHEMA s").unwrap();
+    for schema in ["public", "s"] {
+        conn.execute(format!(
+            "CREATE TABLE {schema}.t (id INT PRIMARY KEY, n INT NOT NULL, v INT CHECK (v > 0), u TEXT UNIQUE)"
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "CREATE TABLE {schema}.c (id INT PRIMARY KEY, tid INT REFERENCES {schema}.t (id))"
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "INSERT INTO {schema}.t VALUES (1, 1, 1, 'a'), (2, 1, 1, 'b')"
+        ))
+        .unwrap();
+    }
+    for schema in ["public", "s"] {
+        for sql in [
+            "INSERT INTO {s}.t VALUES (1, 1, 1, 'c')",
+            "INSERT INTO {s}.t VALUES (3, NULL, 1, 'c')",
+            "INSERT INTO {s}.t VALUES (3, 1, -1, 'c')",
+            "INSERT INTO {s}.t VALUES (3, 1, 1, 'a')",
+            "INSERT INTO {s}.t VALUES (1, 1, 1, 'c') ON CONFLICT (id) DO UPDATE SET u = 'b'",
+            "UPDATE {s}.t SET id = 1 WHERE id = 2",
+            "UPDATE {s}.t SET n = NULL",
+            "UPDATE {s}.t SET v = -1",
+            "UPDATE {s}.t SET u = 'a' WHERE id = 2",
+            "INSERT INTO {s}.c VALUES (1, 99)",
+        ] {
+            let sql = sql.replace("{s}", schema);
+            let e = exec_err(&conn, &sql);
+            let cv = constraint_violation(&e);
+            assert_eq!(cv.schema_name.as_deref(), Some(schema), "{sql}");
+            assert!(matches!(cv.table_name.as_deref(), Some("t" | "c")), "{sql}");
+        }
+    }
+}
+
 fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>) {
     let io = Arc::new(turso_core::MemoryIO::new());
     let db = turso_core::Database::open_file_with_flags(
