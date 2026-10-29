@@ -6,6 +6,7 @@ use std::sync::{atomic::Ordering, Arc};
 use crate::error::LimboError;
 use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch};
 use crate::schema::{BTreeTable, Schema, TypeDef};
+use crate::statement::StatementOrigin;
 use crate::storage::pager::{AutoVacuumMode, Page, PageRef, Pager};
 use crate::storage::sqlite3_ondisk::{
     CacheSize, DatabaseHeader, PageSize, RawVersion, TextEncoding, WAL_FRAME_HEADER_SIZE,
@@ -857,8 +858,12 @@ pub(crate) fn vacuum_target_build_step(
                 if entry.is_sqlite_sequence() || entry.is_autoinc_sequence_backing_table() {
                     let escaped_table_name = table_name.replace('"', "\"\"");
                     let delete_sql = format!("DELETE FROM \"{escaped_table_name}\"");
-                    let delete_stmt =
-                        prepare_on_target(&state.target_conn, table_name, &delete_sql)?;
+                    let delete_stmt = prepare_on_target(
+                        &state.target_conn,
+                        table_name,
+                        &delete_sql,
+                        StatementOrigin::Root,
+                    )?;
                     state.phase = VacuumTargetBuildPhase::ClearCounterTable {
                         delete_stmt: Box::new(delete_stmt),
                         table_idx,
@@ -945,10 +950,16 @@ pub(crate) fn vacuum_target_build_step(
                 )?;
 
                 // SELECT from source, INSERT into the target.
-                let select_stmt = config.source_conn.prepare_internal(&select_sql)?;
+                let select_stmt = config
+                    .source_conn
+                    .prepare_with_origin(&select_sql, StatementOrigin::StorageCopyRead)?;
 
-                let target_insert_stmt =
-                    prepare_on_target(&state.target_conn, table_name, &insert_sql)?;
+                let target_insert_stmt = prepare_on_target(
+                    &state.target_conn,
+                    table_name,
+                    &insert_sql,
+                    StatementOrigin::StorageCopyWrite,
+                )?;
 
                 state.phase = VacuumTargetBuildPhase::CopyRows {
                     select_stmt: Box::new(select_stmt),
@@ -1173,12 +1184,13 @@ fn prepare_on_target(
     target_conn: &Arc<Connection>,
     table_name: &str,
     sql: &str,
+    origin: StatementOrigin,
 ) -> Result<crate::Statement> {
     let is_system = replay_bypasses_reserved_names(table_name);
     if is_system {
         target_conn.start_nested();
     }
-    let stmt = target_conn.prepare(sql);
+    let stmt = target_conn.prepare_with_origin(sql, origin);
     if is_system {
         target_conn.end_nested();
     }

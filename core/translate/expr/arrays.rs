@@ -190,9 +190,11 @@ pub(crate) fn emit_array_decode(
     col: &Column,
     resolver: &Resolver,
 ) -> Result<()> {
-    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if let Some(decode_expr) = type_def.decode() {
-            emit_array_element_loop(program, reg, decode_expr, col, type_def, resolver)?;
+    if !program.flags.suppress_custom_type_decode() {
+        if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
+            if let Some(decode_expr) = type_def.decode() {
+                emit_array_element_loop(program, reg, decode_expr, col, type_def, resolver)?;
+            }
         }
     }
 

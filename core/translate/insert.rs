@@ -4383,6 +4383,9 @@ fn emit_custom_type_encode(
     insertion: &Insertion,
     table_name: &str,
 ) -> Result<()> {
+    if program.flags.copy_stored_values() {
+        return Ok(());
+    }
     let columns: Vec<_> = insertion
         .col_mappings
         .iter()

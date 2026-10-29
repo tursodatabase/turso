@@ -8,6 +8,10 @@ sidebarTitle: VACUUM
 
 The VACUUM statement rebuilds the database file to reclaim unused space, defragment tables and indexes, and reduce the file size. Two forms are supported: `VACUUM` rebuilds the current database in place, while `VACUUM INTO` writes a compacted copy to a new file without modifying the source.
 
+Both forms preserve the stored representation of custom-type values, including
+custom array elements. The copy does not apply their `ENCODE` or `DECODE`
+expressions again.
+
 ## Syntax
 
 ```sql
