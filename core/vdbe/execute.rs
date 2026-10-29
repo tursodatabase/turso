@@ -12368,7 +12368,13 @@ pub fn op_function(
                                     };
 
                                     match alter_func {
-                                        AlterTableFunc::AlterColumn => *column = column_def.clone(),
+                                        AlterTableFunc::AlterColumn => {
+                                            *column = alter_column_definition(
+                                                column,
+                                                &column_def,
+                                                !options.contains_without_rowid(),
+                                            )
+                                        }
                                         AlterTableFunc::RenameColumn => {
                                             column.col_name = column_def.col_name.clone()
                                         }
@@ -12644,6 +12650,40 @@ impl Clock for StatementClock<'_> {
 }
 
 pub(crate) type OpAttachState = crate::dialect::sqlite::attach::AttachDatabaseState;
+
+/// The definition ALTER TABLE ALTER COLUMN writes for column `old`: `new`, plus
+/// the UNIQUE and PRIMARY KEY constraints of `old` that own an automatic index or
+/// the table's key, since ALTER COLUMN cannot change those. The PRIMARY KEY of a
+/// rowid alias owns neither, so it is dropped with the rest of the definition.
+fn alter_column_definition(
+    old: &ast::ColumnDefinition,
+    new: &ast::ColumnDefinition,
+    table_has_rowid: bool,
+) -> ast::ColumnDefinition {
+    let old_is_rowid_alias = table_has_rowid
+        && old
+            .col_type
+            .as_ref()
+            .is_some_and(|ty| crate::util::is_rowid_alias_type(&ty.name))
+        && old.constraints.iter().any(|c| {
+            matches!(
+                c.constraint,
+                ast::ColumnConstraint::PrimaryKey { order, .. } if order != Some(ast::SortOrder::Desc)
+            )
+        });
+    let mut definition = new.clone();
+    definition.constraints.extend(
+        old.constraints
+            .iter()
+            .filter(|c| match c.constraint {
+                ast::ColumnConstraint::Unique(_) => true,
+                ast::ColumnConstraint::PrimaryKey { .. } => !old_is_rowid_alias,
+                _ => false,
+            })
+            .cloned(),
+    );
+    definition
+}
 
 /// LIKE with an operand that is not TEXT: both are converted to TEXT first.
 #[inline(never)]

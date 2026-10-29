@@ -26,6 +26,39 @@ test fail-alter-column-unique {
 expect error {
 }
 
+test alter-column-keeps-unique {
+    CREATE TABLE t (a TEXT CONSTRAINT k UNIQUE ON CONFLICT IGNORE, b TEXT);
+    INSERT INTO t VALUES ('x', 'y');
+    ALTER TABLE t ALTER COLUMN a TO aa TEXT NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    INSERT INTO t VALUES ('x', 'z');
+    SELECT aa, b FROM t;
+}
+expect {
+    CREATE TABLE t (aa TEXT NOT NULL CONSTRAINT k UNIQUE ON CONFLICT IGNORE, b TEXT)
+    x|y
+}
+
+test alter-column-keeps-primary-key-with-automatic-index {
+    CREATE TABLE t (a TEXT PRIMARY KEY DESC, b);
+    INSERT INTO t VALUES ('x', 1);
+    ALTER TABLE t ALTER COLUMN a TO aa BLOB;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT name FROM sqlite_schema WHERE tbl_name = 't' AND type = 'index';
+}
+expect {
+    CREATE TABLE t (aa BLOB PRIMARY KEY DESC, b)
+    sqlite_autoindex_t_1
+}
+
+test fail-alter-column-primary-key-to-integer {
+    CREATE TABLE t (a TEXT PRIMARY KEY, b);
+    ALTER TABLE t ALTER COLUMN a TO aa INTEGER;
+}
+expect error {
+    cannot change the type of PRIMARY KEY column "a" to INTEGER
+}
+
 test alter-table-rename-pk-column {
     CREATE TABLE customers (cust_id INTEGER PRIMARY KEY, cust_name TEXT);
     INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob');

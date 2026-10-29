@@ -1814,6 +1814,24 @@ pub fn translate_alter_table(
                 ));
             }
 
+            // The column keeps its PRIMARY KEY unless it is a rowid alias. Changing such a key
+            // to INTEGER would make the column a rowid alias and leave its automatic index
+            // without a constraint.
+            let old_column = &btree.columns()[column_index];
+            if old_column.primary_key()
+                && !old_column.is_rowid_alias()
+                && btree.has_rowid
+                && btree.primary_key_columns.len() == 1
+                && definition
+                    .col_type
+                    .as_ref()
+                    .is_some_and(|ty| crate::util::is_rowid_alias_type(&ty.name))
+            {
+                return Err(LimboError::ParseError(format!(
+                    "cannot change the type of PRIMARY KEY column \"{from}\" to INTEGER"
+                )));
+            }
+
             let (rewrites_physical_layout, virtual_generated_values_may_change, replacement_column) =
                 match rename {
                     true => (false, false, None),
