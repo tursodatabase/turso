@@ -4519,8 +4519,10 @@ fn test_postgres_unnamed_index_keeps_its_name_after_reprepare(db: TempDatabase) 
 fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE SCHEMA app").unwrap();
-    conn.execute("CREATE TABLE app.t1 (x int)").unwrap();
-    conn.execute("CREATE TABLE public.t2 (x int)").unwrap();
+    conn.execute("CREATE TABLE app.t1 (x int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE public.t2 (x int PRIMARY KEY)")
+        .unwrap();
     // main names a database of the engine, not a schema.
     let error = conn
         .execute("CREATE TABLE main.t3 (x int)")
@@ -4546,11 +4548,11 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
         [
             (
                 "__turso_ns1_t2".to_string(),
-                "/* turso_frontend:postgres */ CREATE TABLE __turso_ns1_t2 (x int)".to_string()
+                "/* turso_frontend:postgres */ CREATE TABLE __turso_ns1_t2 (x int PRIMARY KEY)".to_string()
             ),
             (
                 "__turso_ns2_t1".to_string(),
-                "/* turso_frontend:postgres */ CREATE TABLE __turso_ns2_t1 (x int)".to_string()
+                "/* turso_frontend:postgres */ CREATE TABLE __turso_ns2_t1 (x int PRIMARY KEY)".to_string()
             ),
             (
                 "__turso_ns2_t4".to_string(),

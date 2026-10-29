@@ -2314,9 +2314,12 @@ impl Schema {
         Ok(())
     }
 
+    /// The table `name` of namespace `namespace`. A namespace that does not
+    /// exist has no tables: a foreign key stored before its parent's
+    /// namespace was dropped still names that namespace.
     pub fn get_table(&self, namespace: NamespaceId, name: &str) -> Option<Arc<Table>> {
         let name = self.normalize_table_lookup_name(name);
-        self.namespace(namespace).tables.get(&name).cloned()
+        self.namespaces.get(&namespace)?.tables.get(&name).cloned()
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -2361,13 +2364,10 @@ impl Schema {
         }
     }
 
+    /// The B-tree table `name` of namespace `namespace`. Like
+    /// [Schema::get_table], a namespace that does not exist has no tables.
     pub fn get_btree_table(&self, namespace: NamespaceId, name: &str) -> Option<Arc<BTreeTable>> {
-        let name = self.normalize_table_lookup_name(name);
-        if let Some(table) = self.namespace(namespace).tables.get(&name) {
-            table.btree()
-        } else {
-            None
-        }
+        self.get_table(namespace, name)?.btree()
     }
 
     pub fn add_index(&mut self, namespace: NamespaceId, index: Arc<Index>) -> Result<()> {
@@ -3734,7 +3734,7 @@ impl Schema {
     /// Resolve a single FK declared on `child` referencing `parent_tbl`.
     /// When `require_unique` is set, a non-rowid parent key must be backed by
     /// a non-partial UNIQUE index on exactly those columns.
-    fn resolve_fk(
+    pub fn resolve_fk(
         &self,
         child_namespace: NamespaceId,
         fk: &Arc<ForeignKey>,

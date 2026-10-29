@@ -591,3 +591,269 @@ expect {
     1|public
     2|public
 }
+
+test fk-orphan-insert-rejected {
+    CREATE TABLE fko_p (id int PRIMARY KEY);
+    CREATE TABLE fko_c (pid int REFERENCES fko_p (id));
+    INSERT INTO fko_p VALUES (1);
+    INSERT INTO fko_c VALUES (2);
+}
+expect error {
+    violates foreign key constraint
+}
+
+test fk-on-delete-cascade {
+    CREATE TABLE fkc_p (id int PRIMARY KEY);
+    CREATE TABLE fkc_c (pid int REFERENCES fkc_p (id) ON DELETE CASCADE);
+    INSERT INTO fkc_p VALUES (1), (2);
+    INSERT INTO fkc_c VALUES (1), (2);
+    DELETE FROM fkc_p WHERE id = 1;
+    SELECT pid FROM fkc_c;
+}
+expect {
+    2
+}
+
+test fk-drop-referenced-table-rejected {
+    CREATE TABLE fkd_p (id int PRIMARY KEY);
+    CREATE TABLE fkd_c (pid int REFERENCES fkd_p (id) ON DELETE CASCADE);
+    DROP TABLE fkd_p;
+}
+expect error {
+    cannot drop table fkd_p because other objects depend on it
+}
+
+test fk-drop-referenced-table-in-schema-rejected {
+    CREATE SCHEMA fkd_s;
+    CREATE TABLE fkd_s.p (id int PRIMARY KEY);
+    CREATE TABLE fkd_s.c (pid int REFERENCES fkd_s.p (id));
+    DROP TABLE fkd_s.p;
+}
+expect error {
+    cannot drop table fkd_s.p because other objects depend on it
+}
+
+test fk-drop-referenced-unique-index-rejected {
+    CREATE TABLE fki_p (id int, u int);
+    CREATE UNIQUE INDEX fki_pu ON fki_p (u);
+    CREATE TABLE fki_c (pid int REFERENCES fki_p (u));
+    DROP INDEX fki_pu;
+}
+expect error {
+    cannot drop index fki_pu because other objects depend on it
+}
+
+test fk-drop-referenced-unique-index-in-schema-rejected {
+    CREATE SCHEMA fki_s;
+    CREATE TABLE fki_s.p (id int, u int);
+    CREATE UNIQUE INDEX pu ON fki_s.p (u);
+    CREATE TABLE fki_s.c (pid int REFERENCES fki_s.p (u));
+    DROP INDEX fki_s.pu;
+}
+expect error {
+    cannot drop index fki_s.pu because other objects depend on it
+}
+
+test fk-drop-index-not-used-by-foreign-key {
+    CREATE TABLE fkin_p (id int PRIMARY KEY, u int);
+    CREATE UNIQUE INDEX fkin_pu ON fkin_p (u);
+    CREATE TABLE fkin_c (pid int REFERENCES fkin_p (id));
+    DROP INDEX fkin_pu;
+    INSERT INTO fkin_p VALUES (1, 1);
+    INSERT INTO fkin_c VALUES (1);
+    SELECT pid FROM fkin_c;
+}
+expect {
+    1
+}
+
+test fk-truncate-referenced-table-rejected {
+    CREATE TABLE fkt_p (id int PRIMARY KEY);
+    CREATE TABLE fkt_c (pid int REFERENCES fkt_p (id) ON DELETE CASCADE);
+    INSERT INTO fkt_p VALUES (1);
+    INSERT INTO fkt_c VALUES (1);
+    TRUNCATE fkt_p;
+}
+expect error {
+    cannot truncate a table referenced in a foreign key constraint
+}
+
+test fk-drop-child-then-parent {
+    CREATE TABLE fkdc_p (id int PRIMARY KEY);
+    CREATE TABLE fkdc_c (pid int REFERENCES fkdc_p (id));
+    INSERT INTO fkdc_p VALUES (1);
+    INSERT INTO fkdc_c VALUES (1);
+    TRUNCATE fkdc_c;
+    DROP TABLE fkdc_c;
+    DROP TABLE fkdc_p;
+    SELECT count(*) FROM pg_tables WHERE tablename LIKE 'fkdc%';
+}
+expect {
+    0
+}
+
+test fk-self-referencing-update-delete-truncate-drop {
+    CREATE TABLE fks_t (id int PRIMARY KEY, parent int REFERENCES fks_t (id));
+    INSERT INTO fks_t VALUES (1, NULL), (2, 1), (3, 2);
+    UPDATE fks_t SET id = id + 10, parent = parent + 10;
+    SELECT id, coalesce(parent, 0) FROM fks_t ORDER BY id;
+    DELETE FROM fks_t;
+    SELECT count(*) FROM fks_t;
+    INSERT INTO fks_t VALUES (1, NULL), (2, 1);
+    TRUNCATE fks_t;
+    SELECT count(*) FROM fks_t;
+    INSERT INTO fks_t VALUES (1, NULL), (2, 1);
+    DROP TABLE fks_t;
+    SELECT count(*) FROM pg_tables WHERE tablename = 'fks_t';
+}
+expect {
+    11|0
+    12|11
+    13|12
+    0
+    0
+    0
+}
+
+test fk-self-referencing-update-child-before-parent {
+    CREATE TABLE fkcb_t (id int PRIMARY KEY, parent int REFERENCES fkcb_t (id));
+    INSERT INTO fkcb_t VALUES (5, NULL), (1, 5);
+    UPDATE fkcb_t SET id = id + 10, parent = parent + 10;
+    SELECT id, coalesce(parent, 0) FROM fkcb_t ORDER BY id;
+}
+expect {
+    11|15
+    15|0
+}
+
+# Row 2 moves to id 107 and takes parent 2, a key that no row has once the
+# statement ends.
+test fk-self-referencing-update-new-parent-is-own-old-key {
+    CREATE TABLE fkok_t (id int PRIMARY KEY, parent int REFERENCES fkok_t (id));
+    INSERT INTO fkok_t VALUES (1, NULL), (2, 1), (3, 2);
+    UPDATE fkok_t SET id = CASE WHEN id = 2 THEN 107 ELSE id END, parent = parent + 1;
+}
+expect error {
+}
+
+# PostgreSQL checks RESTRICT against the rows the statement leaves.
+test fk-restrict-self-referencing-delete-and-update {
+    CREATE TABLE fkrd_t (id int PRIMARY KEY, parent int REFERENCES fkrd_t (id) ON DELETE RESTRICT);
+    INSERT INTO fkrd_t VALUES (1, NULL), (2, 1);
+    DELETE FROM fkrd_t;
+    SELECT count(*) FROM fkrd_t;
+    CREATE TABLE fkru_t (id int PRIMARY KEY, parent int REFERENCES fkru_t (id) ON UPDATE RESTRICT);
+    INSERT INTO fkru_t VALUES (1, NULL), (2, 1);
+    UPDATE fkru_t SET id = id + 10, parent = parent + 10;
+    SELECT id, coalesce(parent, 0) FROM fkru_t ORDER BY id;
+}
+expect {
+    0
+    11|0
+    12|11
+}
+
+# One row frees a referenced key and a later row takes it, so no child is
+# left without a parent when the statement ends.
+test fk-update-moves-referenced-key-to-another-row {
+    CREATE TABLE fkm_p (id int PRIMARY KEY);
+    CREATE TABLE fkm_c (pid int REFERENCES fkm_p (id));
+    INSERT INTO fkm_p VALUES (1), (2);
+    INSERT INTO fkm_c VALUES (1);
+    UPDATE fkm_p SET id = CASE id WHEN 1 THEN 3 WHEN 2 THEN 1 END;
+    SELECT id FROM fkm_p ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test fk-restrict-delete-referenced-parent-rejected {
+    CREATE TABLE fkrp_p (id int PRIMARY KEY);
+    CREATE TABLE fkrp_c (pid int REFERENCES fkrp_p (id) ON DELETE RESTRICT);
+    INSERT INTO fkrp_p VALUES (1);
+    INSERT INTO fkrp_c VALUES (1);
+    DELETE FROM fkrp_p;
+}
+expect error {
+}
+
+test fk-unqualified-reference-found-in-other-schema {
+    CREATE SCHEMA fkss;
+    CREATE TABLE fkss_p (id int PRIMARY KEY);
+    SET search_path = fkss, public;
+    CREATE TABLE fkss_c (pid int REFERENCES fkss_p (id));
+    INSERT INTO fkss_p VALUES (1);
+    INSERT INTO fkss_c VALUES (1);
+    INSERT INTO fkss_c VALUES (2);
+}
+expect error {
+    violates foreign key constraint
+}
+
+test fk-drop-table-referenced-from-other-schema-rejected {
+    CREATE SCHEMA fksp;
+    CREATE TABLE fksp.p (id int PRIMARY KEY);
+    CREATE TABLE fksp_c (pid int REFERENCES fksp.p (id));
+    DROP TABLE fksp.p;
+}
+expect error {
+    cannot drop table fksp.p because other objects depend on it
+}
+
+test fk-drop-table-referenced-by-same-named-table-in-other-schema-rejected {
+    CREATE SCHEMA fkn_a;
+    CREATE SCHEMA fkn_b;
+    CREATE TABLE fkn_b.t (id int PRIMARY KEY);
+    CREATE TABLE fkn_a.t (pid int REFERENCES fkn_b.t (id));
+    DROP TABLE fkn_b.t;
+}
+expect error {
+    cannot drop table fkn_b.t because other objects depend on it
+}
+
+test fk-unqualified-reference-in-same-schema {
+    CREATE SCHEMA fksq;
+    SET search_path = fksq, public;
+    CREATE TABLE fksq_p (id int PRIMARY KEY);
+    CREATE TABLE fksq_c (pid int REFERENCES fksq_p (id));
+    INSERT INTO fksq_p VALUES (1);
+    INSERT INTO fksq_c VALUES (1);
+    SELECT count(*) FROM fksq_c;
+}
+expect {
+    1
+}
+
+test fk-create-table-referencing-missing-table-rejected {
+    CREATE TABLE fkmt_c (pid int REFERENCES fkmt_nosuch (id));
+}
+expect error {
+    relation "fkmt_nosuch" does not exist
+}
+
+test fk-create-table-referencing-missing-column-rejected {
+    CREATE TABLE fkmc_p (id int PRIMARY KEY);
+    CREATE TABLE fkmc_c (pid int REFERENCES fkmc_p (nosuch));
+}
+expect error {
+    column "nosuch" referenced in foreign key constraint does not exist
+}
+
+test fk-create-table-referencing-non-unique-column-rejected {
+    CREATE TABLE fknu_p (id int PRIMARY KEY, v int);
+    CREATE TABLE fknu_c (pv int REFERENCES fknu_p (v));
+}
+expect error {
+    there is no unique constraint matching given keys for referenced table "fknu_p"
+}
+
+# PostgreSQL finds a unique key with the same columns in any order.
+@skip-if postgres "PostgreSQL accepts a foreign key listing the key columns in another order"
+test fk-create-table-composite-key-in-other-order-rejected {
+    CREATE TABLE fkro_p (a int, b int, PRIMARY KEY (a, b));
+    CREATE TABLE fkro_c (x int, y int, FOREIGN KEY (x, y) REFERENCES fkro_p (b, a));
+}
+expect error {
+    there is no unique constraint matching given keys for referenced table "fkro_p"
+}

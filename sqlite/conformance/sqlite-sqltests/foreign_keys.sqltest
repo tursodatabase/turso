@@ -4835,3 +4835,415 @@ snapshot fk-upsert-column-no-child-points-at {
 snapshot fk-upsert-parent-key-with-cascade-child {
     INSERT INTO parent(id, k, v) VALUES (1, 10, 2) ON CONFLICT(id) DO UPDATE SET k = excluded.k;
 }
+
+# Deleting a child whose parent was deleted earlier in the same statement
+# cancels the violation that the parent delete counted.
+@cross-check-integrity
+test fk-self-ref-delete-parent-and-child-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-unique-key-delete-parent-and-child-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (k TEXT UNIQUE, parent TEXT REFERENCES t(k));
+    INSERT INTO t VALUES ('a', NULL), ('b', 'a'), ('c', 'b');
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-self-ref-delete-parent-only-still-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DELETE FROM t WHERE id = 1;
+}
+expect error {
+}
+
+# A child deleted by ON DELETE CASCADE was never counted, so deleting it
+# must not cancel the violation of a grandchild left without its parent.
+@cross-check-integrity
+test fk-cascade-delete-keeps-grandchild-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE d (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE);
+    CREATE TABLE g (did REFERENCES d(id));
+    INSERT INTO p VALUES (1);
+    INSERT INTO d VALUES (10, 1);
+    INSERT INTO g VALUES (10);
+    DELETE FROM p;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-self-ref-update-key-and-reference-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    UPDATE t SET id = id + 10, parent = parent + 10;
+    SELECT id, parent FROM t ORDER BY id;
+}
+expect {
+    11|
+    12|11
+}
+
+@cross-check-integrity
+test fk-self-ref-unique-key-update-key-and-reference-in-one-statement {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (k TEXT UNIQUE, parent TEXT REFERENCES t(k));
+    INSERT INTO t VALUES ('a', NULL), ('b', 'a');
+    UPDATE t SET k = k || 'x', parent = parent || 'x';
+    SELECT k, parent FROM t ORDER BY k;
+}
+expect {
+    ax|
+    bx|ax
+}
+
+@cross-check-integrity
+test fk-drop-self-ref-table-with-parent-and-child-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DROP TABLE t;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+# RESTRICT fails at the first parent row deleted, before its child row is gone.
+@cross-check-integrity
+test fk-drop-self-ref-restrict-table-with-parent-and-child-rows-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE RESTRICT);
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DROP TABLE t;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-drop-self-ref-restrict-table-with-row-referencing-itself {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE RESTRICT);
+    INSERT INTO t VALUES (1, 1);
+    DROP TABLE t;
+    SELECT count(*) FROM sqlite_schema;
+}
+expect {
+    0
+}
+
+# The child row comes before its parent in rowid order: the parent's later
+# key change gives the child's new value its parent again.
+@cross-check-integrity
+test fk-self-ref-update-child-before-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (5, NULL), (1, 5);
+    UPDATE t SET id = id + 10, parent = parent + 10;
+    SELECT id, parent FROM t ORDER BY id;
+}
+expect {
+    11|15
+    15|
+}
+
+@cross-check-integrity
+test fk-self-ref-unique-key-update-child-before-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (k TEXT UNIQUE, parent TEXT REFERENCES t(k));
+    INSERT INTO t VALUES ('b', NULL), ('a', 'b');
+    UPDATE t SET k = k || 'x', parent = parent || 'x';
+    SELECT k, parent FROM t ORDER BY k;
+}
+expect {
+    ax|bx
+    bx|
+}
+
+@cross-check-integrity
+test fk-self-ref-update-child-before-missing-parent-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id));
+    INSERT INTO t VALUES (5, NULL), (1, 5);
+    UPDATE t SET id = id + 10, parent = parent + 20;
+}
+expect error {
+}
+
+# A later row of a multi-row INSERT replaces an orphan that an earlier row
+# wrote, whatever the FK's actions are.
+@cross-check-integrity
+test fk-insert-or-replace-later-row-replaces-orphan-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES (1);
+    INSERT OR REPLACE INTO c VALUES (1, 99), (1, 1);
+    SELECT id, pid FROM c;
+}
+expect {
+    1|1
+}
+
+@cross-check-integrity
+test fk-upsert-later-row-repairs-orphan-on-update-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON UPDATE CASCADE);
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (1, 99), (1, 1) ON CONFLICT(id) DO UPDATE SET pid = 1;
+    SELECT id, pid FROM c;
+}
+expect {
+    1|1
+}
+
+# A deferred ON DELETE SET NULL does not cancel another deferred violation.
+@cross-check-integrity
+test fk-deferred-set-null-keeps-other-deferred-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE d (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE g (did REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO d VALUES (10, 1);
+    BEGIN;
+    INSERT INTO g VALUES (77);
+    DELETE FROM p WHERE id = 1;
+    COMMIT;
+}
+expect error {
+}
+
+# A deferred ON DELETE CASCADE does not cancel another deferred violation.
+@cross-check-integrity
+test fk-deferred-cascade-keeps-other-deferred-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE d (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE g (did REFERENCES d(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES (1);
+    INSERT INTO d VALUES (10, 1);
+    BEGIN;
+    INSERT INTO g VALUES (77);
+    DELETE FROM p;
+    COMMIT;
+}
+expect error {
+}
+
+# A row without a parent, written while foreign keys were off, is deleted
+# while another row references it. Removing the row's own orphan key must not
+# cancel the violation its removal causes as a parent.
+test fk-delete-orphan-row-that-has-children-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, x REFERENCES q(id));
+    CREATE TABLE q (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (pid REFERENCES p(id));
+    INSERT INTO p VALUES (1, 99);
+    INSERT INTO c VALUES (1);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-update-orphan-row-that-has-children-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, x REFERENCES q(id));
+    CREATE TABLE q (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (pid REFERENCES p(id));
+    INSERT INTO p VALUES (1, 99);
+    INSERT INTO c VALUES (1);
+    PRAGMA foreign_keys=ON;
+    UPDATE p SET id = 2, x = NULL WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-self-ref-delete-orphan-row-that-has-children-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE t (id INTEGER PRIMARY KEY, parent REFERENCES t(id));
+    INSERT INTO t VALUES (1, 6), (4, 1);
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-replace-orphan-row-that-has-children-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p (id INTEGER PRIMARY KEY, x REFERENCES q(id));
+    CREATE TABLE q (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (pid REFERENCES p(id));
+    INSERT INTO p VALUES (1, 99);
+    INSERT INTO c VALUES (1);
+    PRAGMA foreign_keys=ON;
+    INSERT OR REPLACE INTO p VALUES (1, NULL);
+    SELECT id, x IS NULL FROM p;
+}
+expect {
+    1|1
+}
+
+# A trigger fired inside a foreign key action program writes a row of the
+# action's child table that the action did not touch. Its write still repairs
+# a deferred violation of that foreign key.
+test fk-trigger-in-cascade-delete-repairs-deferred-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER tr AFTER DELETE ON c WHEN old.id = 10 BEGIN DELETE FROM c WHERE id = 20; END;
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (10, 1);
+    BEGIN;
+    INSERT INTO c VALUES (20, 99);
+    DELETE FROM p WHERE id = 1;
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+test fk-trigger-in-set-null-repairs-deferred-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER tr AFTER UPDATE ON c WHEN old.id = 10 BEGIN UPDATE c SET pid = NULL WHERE id = 20; END;
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (10, 1);
+    BEGIN;
+    INSERT INTO c VALUES (20, 99);
+    DELETE FROM p WHERE id = 1;
+    COMMIT;
+    SELECT id, pid IS NULL FROM c ORDER BY id;
+}
+expect {
+    10|1
+    20|1
+}
+
+# One row frees a referenced parent key and a later row of the same UPDATE
+# takes it, so no child is left without a parent.
+test fk-update-moves-referenced-key-to-another-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (pid REFERENCES p(id));
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO c VALUES (1);
+    UPDATE p SET id = CASE id WHEN 1 THEN 3 WHEN 2 THEN 1 END;
+    SELECT id FROM p ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test fk-update-moves-referenced-non-rowid-key-to-another-row {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INT PRIMARY KEY);
+    CREATE TABLE c (pid REFERENCES p(id));
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO c VALUES (1);
+    UPDATE p SET id = CASE id WHEN 1 THEN 3 WHEN 2 THEN 1 END;
+    SELECT id FROM p ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+# The CASCADE of one foreign key deletes the child row, which cancels the
+# violation that another immediate foreign key of that row counted when the
+# parent was deleted. The action program shares the statement's count.
+test fk-cascade-cancels-violation-of-other-immediate-fk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (f REFERENCES p(id) ON DELETE CASCADE, g REFERENCES p(id));
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO c VALUES (1, 1), (2, 2);
+    DELETE FROM p WHERE id = 1;
+    SELECT f, g FROM c;
+}
+expect {
+    2|2
+}
+
+test fk-cascade-keeps-violation-of-row-it-does-not-delete {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE c (f REFERENCES p(id) ON DELETE CASCADE, g REFERENCES p(id));
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO c VALUES (2, 1);
+    DELETE FROM p WHERE id = 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# Row 2 moves to id 107 and takes parent 2. Its old image is the only row
+# with id 2, and the update removes it, so row 107 is left without a parent.
+test fk-self-ref-update-new-parent-is-own-old-key-rowid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s (id INTEGER PRIMARY KEY, parent INT REFERENCES s(id));
+    INSERT INTO s VALUES (1, NULL), (2, 1), (3, 2);
+    UPDATE s SET id = CASE WHEN id = 2 THEN 107 ELSE id END, parent = parent + 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-self-ref-update-new-parent-is-own-old-key-unique-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s (id INT PRIMARY KEY, parent INT REFERENCES s(id));
+    INSERT INTO s VALUES (1, NULL), (2, 1), (3, 2);
+    UPDATE s SET id = CASE WHEN id = 2 THEN 107 ELSE id END, parent = parent + 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-self-ref-update-new-parent-is-own-old-key-deferred {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s (id INT PRIMARY KEY, parent INT REFERENCES s(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO s VALUES (1, NULL), (2, 1), (3, 2);
+    UPDATE s SET id = CASE WHEN id = 2 THEN 107 ELSE id END, parent = parent + 1;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# With ON UPDATE CASCADE the action rewrites the row's reference to its old
+# key into its new key, so the row ends up referencing itself.
+test fk-self-ref-update-new-parent-is-own-old-key-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE s (id INTEGER PRIMARY KEY, parent INT REFERENCES s(id) ON UPDATE CASCADE);
+    INSERT INTO s VALUES (1, NULL);
+    UPDATE s SET id = 91, parent = 1;
+    SELECT id, parent FROM s;
+}
+expect {
+    91|91
+}

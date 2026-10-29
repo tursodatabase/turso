@@ -310,6 +310,8 @@ Foreign key constraints enforce referential integrity between tables. They ensur
 
 <Info>
 Foreign key enforcement is off by default. Enable it with `PRAGMA foreign_keys = ON;` before performing operations that should be checked.
+Through the PostgreSQL frontend, foreign keys are always enforced, as in PostgreSQL. Rows written before enforcement was turned on are not checked again.
+Through the PostgreSQL frontend, `CREATE TABLE` also fails when a foreign key's parent table or columns do not exist, or no primary key or unique constraint has the parent columns in the order the foreign key lists them.
 </Info>
 
 #### Syntax

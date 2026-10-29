@@ -6694,6 +6694,17 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
+/// Returns true if the parse result is a TRUNCATE statement.
+pub fn is_truncate(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return false;
+    }
+    matches!(&nodes[0].0, NodeRef::TruncateStmt(_))
+}
+
 /// Returns true if the parse result is a COMMENT ON statement.
 /// Comments are accepted for PostgreSQL compatibility but are not persisted.
 pub fn is_comment_on(parse_result: &ParseResult) -> bool {

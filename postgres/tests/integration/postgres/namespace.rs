@@ -548,3 +548,38 @@ fn a_namespace_is_created_and_dropped_after_another_connection_changes_the_schem
     conn.drop_namespace("shop").unwrap();
     assert_eq!(other.qualifier("shop"), None);
 }
+
+/// Earlier versions did not enforce foreign keys through PostgreSQL, so DROP
+/// SCHEMA ... CASCADE could leave a foreign key into a namespace that no
+/// longer exists. Writing to the table that has it is an error, as for a
+/// foreign key whose parent table is missing, and does not crash.
+#[turso_macros::test]
+fn a_foreign_key_into_a_dropped_namespace_fails_writes_after_reopening(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE app.p (id int PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE c (pid int REFERENCES app.p (id))")
+        .unwrap();
+    conn.execute("INSERT INTO app.p VALUES (1)").unwrap();
+    conn.execute("INSERT INTO c VALUES (1)").unwrap();
+    drop(conn);
+    let engine = db.connect_limbo();
+    engine.execute("DROP TABLE app.p").unwrap();
+    engine.drop_namespace("app").unwrap();
+    drop(engine);
+
+    let path = db.path.clone();
+    drop(db);
+    let db = reopen(&path);
+    let conn = db.connect_postgres();
+    for sql in [
+        "INSERT INTO c VALUES (5)",
+        "UPDATE c SET pid = 2",
+        "DELETE FROM c",
+    ] {
+        let err = conn.execute(sql).unwrap_err().to_string();
+        assert!(err.contains("foreign key mismatch"), "{sql}: {err}");
+    }
+    assert_eq!(pg_query_i64(&conn, "SELECT count(*) FROM c"), 1);
+}

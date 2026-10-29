@@ -210,6 +210,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn checks_fk_restrict_after_statement(&self) -> bool {
+        true
+    }
+
     fn errors_on_zero_divisor(&self) -> bool {
         true
     }

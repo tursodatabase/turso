@@ -224,6 +224,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether an `ON DELETE` / `ON UPDATE RESTRICT` foreign key is checked
+    /// after the statement, like `NO ACTION`.
+    ///
+    /// PostgreSQL checks it against the rows the statement leaves, so deleting
+    /// a parent and its children in one statement works. SQLite raises the
+    /// error as soon as a row that has children is deleted or its key changes.
+    fn checks_fk_restrict_after_statement(&self) -> bool {
+        false
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
