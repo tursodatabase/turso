@@ -1466,6 +1466,36 @@ impl Value {
         result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
+    pub fn exec_greatest<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
+        let mut result: Option<&Value> = None;
+        for v in regs {
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            result = Some(match result {
+                None => v,
+                Some(cur) if v > cur => v,
+                Some(cur) => cur,
+            });
+        }
+        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
+    }
+
+    pub fn exec_least<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
+        let mut result: Option<&Value> = None;
+        for v in regs {
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            result = Some(match result {
+                None => v,
+                Some(cur) if v <= cur => v,
+                Some(cur) => cur,
+            });
+        }
+        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
+    }
+
     /// Fallibly concatenate another value onto this Text value, converting it to a string.
     /// Panics if self is not a Text value.
     pub fn exec_group_concat(

@@ -10899,6 +10899,17 @@ pub fn op_function(
                 state.registers[*dest]
                     .set_value(Value::exec_max(reg_values.iter().map(|v| v.get_value())));
             }
+            ScalarFunc::Greatest => {
+                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                state.registers[*dest].set_value(Value::exec_greatest(
+                    reg_values.iter().map(|v| v.get_value()),
+                ));
+            }
+            ScalarFunc::Least => {
+                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                state.registers[*dest]
+                    .set_value(Value::exec_least(reg_values.iter().map(|v| v.get_value())));
+            }
             ScalarFunc::Nullif => {
                 let first_value = &state.registers[*start_reg];
                 let second_value = &state.registers[*start_reg + 1];

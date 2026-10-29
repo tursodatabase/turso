@@ -972,6 +972,8 @@ pub enum ScalarFunc {
     NextVal,
     CurrVal,
     SetVal,
+    Greatest,
+    Least,
 }
 
 impl Deterministic for ScalarFunc {
@@ -991,7 +993,9 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Abs => true,
             ScalarFunc::Upper => true,
             ScalarFunc::Lower => true,
-            ScalarFunc::Random => false,     // duh
+            ScalarFunc::Random => false, // duh
+            ScalarFunc::Greatest => true,
+            ScalarFunc::Least => true,
             ScalarFunc::RandomBlob => false, // duh
             ScalarFunc::Trim => true,
             ScalarFunc::LTrim => true,
@@ -1262,6 +1266,8 @@ impl Display for ScalarFunc {
             Self::NextVal => "nextval",
             Self::CurrVal => "currval",
             Self::SetVal => "setval",
+            Self::Greatest => "greatest",
+            Self::Least => "least",
         };
         write!(f, "{str}")
     }
@@ -1365,6 +1371,8 @@ impl ScalarFunc {
             | Self::IsAutocommit => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
+            Self::Greatest | Self::Least => &[-1],
+
             // SQL-standard string and math extensions
             Self::Gcd | Self::Lcm | Self::Repeat => &[2],
             Self::Lpad | Self::Rpad => &[2, 3],

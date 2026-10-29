@@ -810,7 +810,7 @@ pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferen
             }
             // Wrapper functions that pass through an array value
             match name.as_str().to_lowercase().as_str() {
-                "coalesce" | "ifnull" | "min" | "max" => {
+                "coalesce" | "ifnull" | "min" | "max" | "greatest" | "least" => {
                     args.iter().any(|a| expr_is_array(a, referenced_tables))
                 }
                 "iif" => {
