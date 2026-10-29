@@ -283,8 +283,13 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
         Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
         Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
             .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
-        Value::Text(t) => BigDecimal::from_str(&t.value)
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
+        Value::Text(t) => {
+            let trimmed = t
+                .value
+                .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\x0b');
+            BigDecimal::from_str(trimmed)
+                .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value)))
+        }
         Value::Blob(b) => crate::numeric::decimal::blob_to_bigdecimal(b),
         _ => Err(LimboError::Constraint(format!(
             "cannot convert to numeric: \"{val}\""
@@ -11557,7 +11562,9 @@ pub fn op_function(
                                 .into());
                             }
                         };
-                        let bd = BigDecimal::from_str(&text).map_err(|_| {
+                        let trimmed = text
+                            .trim_matches(|ch: char| ch.is_ascii_whitespace() || ch == '\x0b');
+                        let bd = BigDecimal::from_str(trimmed).map_err(|_| {
                             LimboError::Constraint(format!(
                                 "invalid input for type numeric: \"{text}\""
                             ))
