@@ -1343,6 +1343,24 @@ fn wire_load_extension_is_disabled() {
 }
 
 #[test]
+fn wire_set_role_changes_only_the_role_of_its_own_client() {
+    let (mut server, port) = start_tursopg_server();
+    let mut alice = PgTestClient::connect(port);
+    let mut other = PgTestClient::connect(port);
+
+    alice.query_command_tags("CREATE ROLE alice");
+    alice.query_command_tags("SET ROLE alice");
+    assert_eq!(alice.query_single_text("SELECT current_user"), "alice");
+    assert_eq!(other.query_single_text("SELECT current_user"), "postgres");
+
+    other.query_command_tags("RESET ROLE");
+    assert_eq!(alice.query_single_text("SELECT current_user"), "alice");
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+#[test]
 fn wire_comment_on_returns_comment_tag() {
     with_pg_client(|client| {
         let tags = client.query_command_tags("CREATE TABLE docs(id INT)");

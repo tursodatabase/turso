@@ -53,6 +53,8 @@ pub struct TursoPgServer {
 }
 
 impl TursoPgServer {
+    /// Every client gets its own connection from `connect`, so session
+    /// state such as the current role is not shared between clients.
     pub fn new(
         address: String,
         db_file: String,

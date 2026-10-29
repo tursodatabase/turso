@@ -1,3 +1,4 @@
+use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
 use turso_pg_parser::sqlstate::*;
 
@@ -104,6 +105,9 @@ impl From<&LimboError> for ErrorReport {
                 report.message = constraint_message(violation, &report);
                 report.detail = constraint_detail(violation);
             }
+        }
+        if let LimboError::PermissionDenied(denial) = error {
+            report.message = permission_denied_message(denial);
         }
         report
     }
@@ -261,6 +265,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
         LimboError::Dialect(error) => error.code,
+        LimboError::PermissionDenied(_) => SQLSTATE_INSUFFICIENT_PRIVILEGE,
         _ => SQLSTATE_INTERNAL_ERROR,
     }
 }
@@ -373,6 +378,14 @@ fn tx_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_SAVEPOINT_SPECIFICATION
     } else {
         SQLSTATE_INVALID_TRANSACTION_STATE
+    }
+}
+
+fn permission_denied_message(denial: &PermissionDenied) -> String {
+    match (denial.action, &denial.object) {
+        (Action::SetRole, Object::Role(name)) => {
+            format!("permission denied to set role \"{name}\"")
+        }
     }
 }
 
