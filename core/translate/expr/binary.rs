@@ -66,10 +66,25 @@ fn emit_row_valued_binary_expr(
         crate::bail_parse_error!("row value misused");
     }
 
+    let compared_as = row_value_stored_types(e1, &[e2], lhs_arity, referenced_tables, resolver)?;
     let lhs_reg = program.alloc_registers(lhs_arity);
     let rhs_reg = program.alloc_registers(lhs_arity);
-    translate_expr(program, referenced_tables, e1, lhs_reg, resolver)?;
-    translate_expr(program, referenced_tables, e2, rhs_reg, resolver)?;
+    translate_compared_row_value(
+        program,
+        referenced_tables,
+        e1,
+        lhs_reg,
+        resolver,
+        &compared_as,
+    )?;
+    translate_compared_row_value(
+        program,
+        referenced_tables,
+        e2,
+        rhs_reg,
+        resolver,
+        &compared_as,
+    )?;
 
     emit_binary_expr_row_valued(
         program,
@@ -443,7 +458,7 @@ pub(super) fn row_component_affinity_collation(
 /// row subquery's result, so each component compares with its own type. A
 /// subquery column does not bring its text collation. Any other expression
 /// stands for itself.
-fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
+pub(super) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
     match unwrap_parens(expr)? {
         Expr::Parenthesized(exprs) if exprs.len() > 1 => {
             Ok(exprs.get(idx).map_or(Cow::Borrowed(expr), |component| {

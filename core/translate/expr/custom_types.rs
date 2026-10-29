@@ -356,6 +356,79 @@ pub(crate) fn emit_trigger_decode_registers(
         .collect::<Result<Vec<usize>>>()
 }
 
+/// [stored_comparison_type] for each component of a row-value comparison, as
+/// in `(c, d) > (1, 0)` or `(c, d) IN ((1, 0), (2, 0))`. A comparison of
+/// single values has one component.
+pub(crate) fn row_value_stored_types(
+    lhs: &ast::Expr,
+    rhs_operands: &[&ast::Expr],
+    arity: usize,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Vec<Option<ResolvedType>>> {
+    (0..arity)
+        .map(|idx| {
+            let components = std::iter::once(lhs)
+                .chain(rhs_operands.iter().copied())
+                .map(|operand| row_value_component_expr(operand, idx))
+                .collect::<Result<Vec<_>>>()?;
+            stored_comparison_type(
+                components.iter().map(|component| component.as_ref()),
+                referenced_tables,
+                resolver,
+            )
+        })
+        .collect()
+}
+
+/// Translates `expr`, one side of a comparison with `compared_as.len()`
+/// components, into consecutive registers from `target_register`, each
+/// component in the form [translate_compared_expr] gives it.
+pub(crate) fn translate_compared_row_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+    compared_as: &[Option<ResolvedType>],
+) -> Result<usize> {
+    if let [compared_as] = compared_as {
+        return translate_compared_expr(
+            program,
+            referenced_tables,
+            expr,
+            target_register,
+            resolver,
+            compared_as.as_ref(),
+        );
+    }
+    if compared_as.iter().all(Option::is_none) {
+        return translate_expr(program, referenced_tables, expr, target_register, resolver);
+    }
+    if let ast::Expr::Parenthesized(components) = unwrap_parens(expr)? {
+        for (idx, (component, compared_as)) in components.iter().zip(compared_as).enumerate() {
+            translate_compared_expr(
+                program,
+                referenced_tables,
+                component,
+                target_register + idx,
+                resolver,
+                compared_as.as_ref(),
+            )?;
+        }
+        return Ok(target_register);
+    }
+    // A row subquery outputs its columns decoded, so each component of a
+    // custom type is encoded again.
+    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+    for (idx, compared_as) in compared_as.iter().enumerate() {
+        if let Some(compared_as) = compared_as {
+            emit_stored_form(program, target_register + idx, compared_as, resolver)?;
+        }
+    }
+    Ok(target_register)
+}
+
 /// The custom type whose stored form `operands` compare in, or None when they
 /// compare as SQLite values.
 ///
