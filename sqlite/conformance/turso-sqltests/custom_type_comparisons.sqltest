@@ -71,3 +71,18 @@ test cmp-coerce-does-not-run-on-cast-without-type-arguments {
 expect {
     11|
 }
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-constant-finds-same-rows-with-and-without-index {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (3.5), (3.51), (4);
+    CREATE INDEX t_n ON t(n);
+    SELECT (SELECT count(*) FROM t WHERE n = 3.504)
+         = (SELECT count(*) FROM t NOT INDEXED WHERE n = 3.504);
+    SELECT (SELECT group_concat(n) FROM t WHERE n > 3.504)
+         = (SELECT group_concat(n) FROM t NOT INDEXED WHERE n > 3.504);
+}
+expect {
+    1
+    1
+}

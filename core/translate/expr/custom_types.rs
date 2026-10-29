@@ -44,7 +44,7 @@ pub(super) fn emit_custom_type_operator(
     // registers (constant optimization), and encoding in-place would clobber
     // that register — breaking subsequent loop iterations.
     let func_start = if let Some(ref encode_info) = resolved.encode_info {
-        if let Some(encode_expr) = encode_info.type_def.encode() {
+        if encode_info.type_def.has_encode_or_coerce() {
             // Translate operands into temporary registers first.
             let tmp1 = program.alloc_register();
             let tmp2 = program.alloc_register();
@@ -75,8 +75,20 @@ pub(super) fn emit_custom_type_operator(
                 dst_reg: col_dst,
                 extra_amount: 0,
             });
-            // Encode the literal into the fresh function arg slot.
-            emit_type_expr(program, encode_expr, lit_tmp, lit_dst, resolver)?;
+            // Convert the literal in the fresh function arg slot as if it were
+            // stored in the column, so it compares like an index search key.
+            program.emit_insn(Insn::Copy {
+                src_reg: lit_tmp,
+                dst_reg: lit_dst,
+                extra_amount: 0,
+            });
+            emit_store_value(
+                program,
+                std::slice::from_ref(&encode_info.type_def),
+                lit_dst,
+                &encode_info.type_params,
+                resolver,
+            )?;
             func_args
         } else {
             // Type has no encode expression; translate directly into arg slots.
@@ -152,8 +164,10 @@ pub(super) enum EncodeArg {
 }
 
 /// Info needed to encode a literal argument for an operator call.
+#[allow(clippy::vec_box)]
 pub(super) struct OperatorEncodeInfo {
     type_def: Arc<TypeDef>,
+    type_params: Vec<Box<ast::Expr>>,
     which: EncodeArg,
 }
 
@@ -267,6 +281,7 @@ pub(super) fn find_custom_type_operator(
                 negate,
                 encode_info: encode_other.then(|| OperatorEncodeInfo {
                     type_def: info.type_def.clone(),
+                    type_params: info.params.clone(),
                     which,
                 }),
             })

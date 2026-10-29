@@ -287,13 +287,12 @@ test op-numeric-mul-literal-multi-row {
     INSERT INTO t1 VALUES (1, 10);
     INSERT INTO t1 VALUES (2, 3);
     INSERT INTO t1 VALUES (3, -5);
-    -- The literal is not rounded to the column's scale first, so the scale stays 2.
     SELECT id, val * 3 FROM t1 ORDER BY id;
 }
 expect {
-    1|30.00
-    2|9.00
-    3|-15.00
+    1|30.0000
+    2|9.0000
+    3|-15.0000
 }
 
 @requires strict "uses STRICT tables"
@@ -304,8 +303,8 @@ test op-numeric-div-literal-multi-row {
     SELECT id, val / 10 FROM t1 ORDER BY id;
 }
 expect {
-    1|10.00
-    2|3.00
+    1|10
+    2|3
 }
 
 @requires strict "uses STRICT tables"
