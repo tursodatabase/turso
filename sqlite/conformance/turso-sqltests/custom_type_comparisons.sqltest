@@ -1232,6 +1232,56 @@ expect {
     subquery|2
 }
 
+# Comparing a neg column with an integer column ENCODEs the integer, so
+# d.x < t.s is -x < -s, which holds where x > s. An index or rowid on t holds
+# s itself, not -s, so it can't find these rows and the query scans t instead.
+@requires strict "uses STRICT tables"
+test cmp-plain-column-index-unused-when-column-is-encoded {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE d(x neg) STRICT;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, s integer) STRICT;
+    INSERT INTO d VALUES (1), (2), (3);
+    INSERT INTO t VALUES (1, 1), (2, 2), (5, 5);
+    SELECT 'scan', count(*) FROM d NOT INDEXED CROSS JOIN t NOT INDEXED WHERE d.x < t.s;
+    SELECT 'automatic index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < t.s;
+    SELECT 'rowid', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < t.id;
+    CREATE INDEX t_s ON t(s);
+    SELECT 'index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < t.s;
+    SELECT 'index or', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < t.s OR d.x > t.s;
+}
+expect {
+    scan|3
+    automatic index|3
+    rowid|3
+    index|3
+    index or|7
+}
+
+# The date ENCODE drops the time, so t.s = d.x matches '2024-01-01 10:00'.
+# An index on t.s holds the text with the time and would miss it.
+@requires strict "uses STRICT tables"
+test cmp-date-with-text-column-same-rows-with-and-without-index {
+    CREATE TABLE d(x date) STRICT;
+    INSERT INTO d VALUES ('2024-01-01');
+    CREATE TABLE t(s text) STRICT;
+    INSERT INTO t VALUES ('2024-01-01 10:00'), ('2024-01-02');
+    SELECT 'scan', count(*) FROM d NOT INDEXED CROSS JOIN t NOT INDEXED WHERE d.x = t.s;
+    SELECT 'automatic index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x = t.s;
+    SELECT 'in list', count(*) FROM t WHERE t.s IN (CAST('2024-01-01' AS date), CAST('2024-01-03' AS date));
+    CREATE INDEX t_s ON t(s);
+    SELECT 'index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x = t.s;
+    SELECT 'index in list', count(*) FROM t WHERE t.s IN (CAST('2024-01-01' AS date), CAST('2024-01-03' AS date));
+    SELECT 'index constant', count(*) FROM t WHERE t.s = CAST('2024-01-01' AS date);
+}
+expect {
+    scan|1
+    automatic index|1
+    in list|1
+    index|1
+    index in list|1
+    index constant|1
+}
+
 # A value compared with a date column goes through the date's ENCODE, so a
 # malformed date fails the same way in a table scan and in an index search.
 @requires strict "uses STRICT tables"
