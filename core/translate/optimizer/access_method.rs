@@ -594,6 +594,7 @@ pub(super) fn choose_best_in_seek_candidate(
             };
             if not
                 || !constraint.outer_join_compatible
+                || constraint.encodes_column
                 || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
             {
                 continue;
