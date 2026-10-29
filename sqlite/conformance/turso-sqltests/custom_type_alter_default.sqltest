@@ -333,3 +333,29 @@ expect {
     2|
     1|5
 }
+
+@requires strict "uses STRICT tables"
+test alter-add-check-sees-default-on-existing-rows {
+    -- Existing rows have no field for the new column. Its CHECK must see
+    -- the DEFAULT 5, not DECODE(5) = 0, and reject it like an INSERT would.
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN f cents CHECK (CAST(f AS integer) < 3) DEFAULT 5;
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-check-passes-default-on-existing-rows {
+    -- The CHECK must not see the stored form 200 either.
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN f cents CHECK (CAST(f AS integer) < 3) DEFAULT 2;
+    SELECT id, f FROM t;
+}
+expect {
+    1|2
+}
