@@ -10,7 +10,7 @@ use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, Value};
-use turso_pg::{split_statements, PgConnection};
+use turso_pg::{split_statements, PgConnection, TransactionState};
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
 use turso_pg_parser::{returns_rows, ParseResult};
@@ -171,7 +171,8 @@ impl SimpleQueryHandler for TursoPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let result = self.run_simple_query(client, query).await;
-        finish_query(client, result, false).await
+        let status = wire_transaction_status(&self.conn);
+        finish_query(client, result, false, status).await
     }
 
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -212,12 +213,16 @@ impl TursoPgHandler {
             return Err(PgWireError::NotReadyForQuery);
         }
         client.set_state(PgWireConnectionState::QueryInProgress);
-        turso_pg_parser::parse(&query.query).map_err(|error| {
+        let conn = &self.conn;
+        // Errors raised here never reach PgConnection::prepare, so report
+        // them to the session: any error inside a transaction block aborts
+        // the block.
+        let parse_error = |error: turso_pg_parser::ParseError| {
+            conn.abort_transaction_block_on_error();
             pg_error(turso_core::LimboError::ParseError(error.to_string()).into())
-        })?;
-        let statements = turso_pg_parser::split_statements(&query.query).map_err(|error| {
-            pg_error(turso_core::LimboError::ParseError(error.to_string()).into())
-        })?;
+        };
+        turso_pg_parser::parse(&query.query).map_err(parse_error)?;
+        let statements = turso_pg_parser::split_statements(&query.query).map_err(parse_error)?;
         if statements.is_empty() {
             client
                 .feed(PgWireBackendMessage::EmptyQueryResponse(
@@ -225,11 +230,8 @@ impl TursoPgHandler {
                 ))
                 .await?;
         }
-        let conn = &self.conn;
         for sql in statements {
-            match parse_copy_to_stdout(&sql).map_err(|error| {
-                pg_error(turso_core::LimboError::ParseError(error.to_string()).into())
-            })? {
+            match parse_copy_to_stdout(&sql).map_err(parse_error)? {
                 Some(copy) => copy_to_stdout(client, conn, &copy).await?,
                 None => {
                     for response in SimpleQueryHandler::do_query(self, client, &sql).await? {
@@ -245,11 +247,7 @@ impl TursoPgHandler {
                     }
                 }
             }
-            client.set_transaction_status(if conn.inner().get_auto_commit() {
-                TransactionStatus::Idle
-            } else {
-                client.transaction_status().to_in_transaction_state()
-            });
+            client.set_transaction_status(wire_transaction_status(conn));
         }
         client.set_state(PgWireConnectionState::ReadyForQuery);
         send_ready_for_query(client, client.transaction_status()).await
@@ -352,7 +350,8 @@ impl ExtendedQueryHandler for TursoPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let result = self._on_execute(client, message).await;
-        finish_query(client, result, true).await
+        let status = wire_transaction_status(&self.conn);
+        finish_query(client, result, true, status).await
     }
 
     async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
@@ -363,7 +362,8 @@ impl ExtendedQueryHandler for TursoPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let result = self._on_describe(client, message).await;
-        finish_query(client, result, true).await
+        let status = wire_transaction_status(&self.conn);
+        finish_query(client, result, true, status).await
     }
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
@@ -389,7 +389,8 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
         let parsed = parse_statement(query)?;
         if stmt.num_columns() == 0 || !returns_rows(&parsed) {
-            return execute_non_query(&mut stmt, &parsed);
+            return execute_non_query(&mut stmt, &parsed)
+                .map(|response| with_transaction_state(conn, response));
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
@@ -587,10 +588,13 @@ fn execute_non_query(
     stmt.run_ignore_rows().map_err(pg_error)?;
 
     let affected = stmt.n_change() as usize;
-    Ok(Response::Execution(wire_tag(
-        CommandTag::of(parsed),
-        affected,
-    )))
+    // A COMMIT that ended an aborted block performed a rollback; its tag
+    // cannot come from the statement text.
+    let tag = match stmt.command_tag_override() {
+        Some(tag) => Tag::new(tag),
+        None => wire_tag(CommandTag::of(parsed), affected),
+    };
+    Ok(Response::Execution(tag))
 }
 
 fn wire_tag(tag: CommandTag, affected_rows: usize) -> Tag {
@@ -600,6 +604,30 @@ fn wire_tag(tag: CommandTag, affected_rows: usize) -> Tag {
         CommandTag::Insert => Tag::new(tag.name()).with_oid(0).with_rows(affected_rows),
         _ if tag.has_row_count() => Tag::new(tag.name()).with_rows(affected_rows),
         _ => Tag::new(tag.name()),
+    }
+}
+
+/// Reflect the session's transaction state onto the wire protocol: pgwire
+/// derives the ReadyForQuery status byte from TransactionStart and
+/// TransactionEnd responses, so report which side of a transaction block the
+/// statement left the session on.
+fn with_transaction_state(conn: &PgConnection, response: Response) -> Response {
+    let Response::Execution(tag) = response else {
+        return response;
+    };
+    match conn.transaction_state() {
+        TransactionState::Idle => Response::TransactionEnd(tag),
+        TransactionState::Active | TransactionState::Aborted => Response::TransactionStart(tag),
+    }
+}
+
+/// The ReadyForQuery status byte for the session's current transaction
+/// state: 'I' idle, 'T' in a transaction block, 'E' in a failed one.
+fn wire_transaction_status(conn: &PgConnection) -> TransactionStatus {
+    match conn.transaction_state() {
+        TransactionState::Idle => TransactionStatus::Idle,
+        TransactionState::Active => TransactionStatus::Transaction,
+        TransactionState::Aborted => TransactionStatus::Error,
     }
 }
 
@@ -857,6 +885,7 @@ async fn finish_query<C>(
     client: &mut C,
     result: PgWireResult<()>,
     wait_for_sync: bool,
+    status: TransactionStatus,
 ) -> PgWireResult<()>
 where
     C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -890,7 +919,6 @@ where
             fields,
         )))
         .await?;
-    let status = client.transaction_status().to_error_state();
     client.set_transaction_status(status);
     if wait_for_sync {
         client.set_state(PgWireConnectionState::AwaitingSync);
@@ -1150,6 +1178,32 @@ mod tests {
         (client, conn)
     }
 
+    #[test]
+    fn server_side_parse_errors_abort_the_block_on_the_wire() {
+        // A syntax error fails the server's own parse of the query string and
+        // never reaches PgConnection::prepare, but it is still an error
+        // inside the transaction block: later statements must get 25P02 and
+        // COMMIT must roll the block back.
+        let (mut client, _) = copy_test_client();
+        query_messages(&mut client, "CREATE TABLE d1 (x INT)");
+        query_messages(&mut client, "BEGIN");
+        query_messages(&mut client, "INSERT INTO d1 VALUES (1)");
+        let messages = query_messages(&mut client, "SELCT 1");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"EZ");
+        assert_eq!(messages.last().unwrap().1, b"E");
+        let messages = query_messages(&mut client, "SELECT 'after'");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"EZ");
+        assert!(
+            String::from_utf8_lossy(&messages[0].1).contains("25P02"),
+            "{messages:?}"
+        );
+        let messages = query_messages(&mut client, "COMMIT");
+        assert_eq!(messages[0].1, b"ROLLBACK\0");
+        assert_eq!(messages.last().unwrap().1, b"I");
+        let messages = query_messages(&mut client, "SELECT count(*) FROM d1");
+        assert_eq!(messages[1].1, b"\0\x01\0\0\0\x010");
+    }
+
     fn query_messages(client: &mut PgConn, sql: &str) -> Vec<(u8, Vec<u8>)> {
         client.send_query(sql).unwrap();
         let mut messages = Vec::new();
@@ -1194,6 +1248,46 @@ mod tests {
         let stmt = conn.prepare("SELECT 7 AS pg_is_in_recovery").unwrap();
         let fields = build_field_info(&stmt, &Format::UnifiedText);
         assert_eq!(*fields[0].datatype(), Type::INT4);
+    }
+
+    #[test]
+    fn test_aborted_transaction_wire_status_and_commit_tag() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+
+        let mut begin = conn.prepare("BEGIN").unwrap();
+        let response =
+            execute_non_query(&mut begin, &turso_pg_parser::parse("BEGIN").unwrap()).unwrap();
+        assert!(matches!(
+            with_transaction_state(&conn, response),
+            Response::TransactionStart(_)
+        ));
+        assert_eq!(
+            wire_transaction_status(&conn),
+            TransactionStatus::Transaction
+        );
+
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert!(conn.execute("SELECT 1/0").is_err());
+        assert_eq!(wire_transaction_status(&conn), TransactionStatus::Error);
+
+        // COMMIT ends the aborted block as a rollback and reports it so.
+        let mut commit = conn.prepare("COMMIT").unwrap();
+        let response =
+            execute_non_query(&mut commit, &turso_pg_parser::parse("COMMIT").unwrap()).unwrap();
+        let wrapped = with_transaction_state(&conn, response);
+        let Response::TransactionEnd(tag) = wrapped else {
+            panic!("COMMIT must report the end of the transaction block");
+        };
+        assert_eq!(tag, Tag::new("ROLLBACK"));
+        assert_eq!(wire_transaction_status(&conn), TransactionStatus::Idle);
     }
 
     #[test]

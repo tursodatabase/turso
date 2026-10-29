@@ -2492,6 +2492,7 @@ impl ProgramBuilder {
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,
             )),
+            is_multi_write: self.flags.is_multi_write(),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
             has_materialized_views: self.has_materialized_views,

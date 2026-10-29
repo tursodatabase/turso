@@ -70,6 +70,29 @@ fn table_has_fks(
         }))
 }
 
+/// Check whether a table has dependent incremental materialized views.
+/// Maintaining them evaluates the view's expressions after the base-table
+/// write, so an expression error strikes mid-statement and the statement
+/// needs a savepoint, like a trigger body does.
+fn table_has_materialized_views(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    table_name: &str,
+) -> bool {
+    resolver.with_schema(namespace.database_id, |s| {
+        !s.get_dependent_materialized_views(namespace.id, table_name)
+            .is_empty()
+    })
+}
+
+/// Check whether any of the given indexes uses an index method (vector, FTS).
+/// A method can reject a value after the statement already removed or wrote
+/// other entries for the row, so the statement needs a savepoint to keep the
+/// row and its index entries consistent.
+fn any_index_method<'a>(mut indexes: impl Iterator<Item = &'a Arc<crate::schema::Index>>) -> bool {
+    indexes.any(|index| index.index_method.is_some())
+}
+
 /// Determine whether any constraint's effective resolution can trigger an
 /// ABORT. Each constraint has an effective resolution mode — either the
 /// statement-level override (when present) or its DDL-level mode (defaulting
@@ -134,6 +157,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
     statement_conflict: ResolveType,
     inserting_multiple_rows: bool,
     has_triggers: bool,
+    has_returning: bool,
     has_fks: bool,
     has_upsert: bool,
     has_upsert_do_update: bool,
@@ -141,11 +165,15 @@ pub(crate) fn set_insert_stmt_journal_flags(
     notnull_col_exists: bool,
     has_unique: bool,
 ) {
-    let index_modes: Vec<(Option<ResolveType>, bool)> =
-        resolver.with_schema(namespace.database_id, |s| {
-            s.get_indices(namespace.id, &table.name)
-                .map(|idx| (idx.on_conflict, idx.unique))
-                .collect()
+    let (index_modes, has_index_method): (Vec<(Option<ResolveType>, bool)>, bool) = resolver
+        .with_schema(namespace.database_id, |s| {
+            (
+                s.get_indices(namespace.id, &table.name)
+                    .map(|idx| (idx.on_conflict, idx.unique))
+                    .collect(),
+                s.get_indices(namespace.id, &table.name)
+                    .any(|idx| idx.index_method.is_some()),
+            )
         });
     let any_replace = any_effective_replace(
         has_statement_conflict,
@@ -153,6 +181,7 @@ pub(crate) fn set_insert_stmt_journal_flags(
         table.rowid_alias_conflict_clause,
         index_modes.iter().map(|(oc, _)| *oc),
     );
+    let has_materialized_views = table_has_materialized_views(resolver, namespace, &table.name);
     let has_check = !table.check_constraints.is_empty();
     // Multi-row AUTOINCREMENT inserts taint `may_abort` even when no
     // constraint clause is declared on the table: `op_sequence_compute_next`
@@ -169,7 +198,14 @@ pub(crate) fn set_insert_stmt_journal_flags(
     // UNIQUE constraint (and any other constraints touched by SET), so it
     // can always fail mid-statement and must be undoable via a statement
     // journal — even when e.g. INSERT OR REPLACE alone would never abort.
+    // RETURNING evaluates its expressions after the row is written, so an
+    // expression error strikes mid-statement; the statement needs a savepoint
+    // to undo the row. SQLite gets the same effect because it implements
+    // RETURNING as an internal trigger.
     let may_abort = has_triggers
+        || has_returning
+        || has_materialized_views
+        || has_index_method
         || has_fks
         || autoinc_may_abort_multi_row
         || has_upsert_do_update
@@ -187,6 +223,9 @@ pub(crate) fn set_insert_stmt_journal_flags(
     // AUTOINCREMENT is multi-write because sqlite_sequence is updated before constraint checks.
     if !inserting_multiple_rows
         && !has_triggers
+        && !has_returning
+        && !has_materialized_views
+        && !has_index_method
         && !any_replace
         && !has_upsert
         && !has_autoincrement
@@ -241,8 +280,19 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
+    let has_returning = plan.returning.as_ref().is_some_and(|r| !r.is_empty());
+    let has_materialized_views =
+        table_has_materialized_views(resolver, namespace, btree_table.name.as_str());
+    let has_index_method = any_index_method(plan.indexes_to_update.iter());
     let is_single_row = target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !any_replace && !has_fks {
+    if is_single_row
+        && !has_triggers
+        && !has_returning
+        && !has_materialized_views
+        && !has_index_method
+        && !any_replace
+        && !has_fks
+    {
         program.set_multi_write(false);
     }
 
@@ -265,7 +315,11 @@ pub(crate) fn set_update_stmt_journal_flags(
         || !btree_table.unique_sets.is_empty()
         || plan.indexes_to_update.iter().any(|idx| idx.unique);
 
+    // RETURNING evaluates after the row write; see set_insert_stmt_journal_flags.
     let may_abort = has_triggers
+        || has_returning
+        || has_materialized_views
+        || has_index_method
         || has_fks
         || constraint_may_abort(
             has_statement_conflict,
@@ -305,14 +359,26 @@ pub(crate) fn set_delete_stmt_journal_flags(
 
     // After rowset rewriting (for triggers/safety), the target table op is reset to a
     // Scan, so affects_max_1_row correctly returns false — no false optimization.
+    let has_returning = !plan.result_columns.is_empty();
+    let has_materialized_views =
+        table_has_materialized_views(resolver, target_table.namespace, btree_table.name.as_str());
+    let has_index_method = any_index_method(plan.indexes.iter());
     let is_single_row = target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !has_fks {
+    if is_single_row
+        && !has_triggers
+        && !has_returning
+        && !has_materialized_views
+        && !has_index_method
+        && !has_fks
+    {
         program.set_multi_write(false);
     }
 
     // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
-    // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    // only triggers (RAISE(ABORT)), FK violations, a RETURNING expression, or
+    // materialized-view maintenance (both evaluated after the row is deleted)
+    // can abort.
+    if !has_triggers && !has_returning && !has_materialized_views && !has_index_method && !has_fks {
         program.set_may_abort(false);
     }
     Ok(())

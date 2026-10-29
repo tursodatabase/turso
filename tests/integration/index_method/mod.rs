@@ -7279,3 +7279,38 @@ fn run_in_concurrent_transaction(
     }
     result
 }
+
+#[turso_macros::test]
+fn rejected_index_method_value_keeps_row_and_index_consistent(tmp_db: TempDatabase) {
+    // The index method rejects the new value after the UPDATE already
+    // removed the row's old index entries, so the statement needs a
+    // statement savepoint: on error the entries come back, the transaction
+    // survives, and the index still finds the row.
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding)")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute("INSERT INTO vectors VALUES (1, vector32_sparse('[1,0,0]'))")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert!(conn
+        .execute("UPDATE vectors SET embedding = 'zz' WHERE id = 1")
+        .is_err());
+    assert!(!conn.get_auto_commit(), "the transaction must survive");
+    conn.execute("COMMIT").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows(
+        "SELECT id FROM vectors \
+         ORDER BY vector_distance_jaccard(embedding, vector32_sparse('[1,0,0]')) LIMIT 5",
+    );
+    assert_eq!(
+        rows,
+        vec![(1,)],
+        "the query must still find the row through the index"
+    );
+    // integrity_check still reports the row missing from the backing
+    // B-trees: index-method writes survive transaction rollback, a
+    // pre-existing bug (main corrupts the same way through plain ROLLBACK
+    // and autocommit error rollback). Once that is fixed, assert
+    // integrity_check here too.
+}
