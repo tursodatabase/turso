@@ -143,6 +143,7 @@ pub fn translate(
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
+    program.set_any_error_undoes_statement(resolver.catalog.dialect.any_error_undoes_statement());
 
     walk_stmt_expressions(&stmt, &mut |expr| {
         if let ast::Expr::Variable(variable) = expr {

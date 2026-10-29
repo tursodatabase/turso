@@ -435,6 +435,7 @@ Upgrade is not supported.
 |---------|--------|-------|
 | Cursors | ❌ Not supported | DECLARE/FETCH/MOVE not translated |
 | Savepoints | ✅ Supported | SAVEPOINT, RELEASE, ROLLBACK TO |
+| Failed transaction state | ❌ Not supported | A statement that fails inside a transaction is undone and the transaction stays open, as in SQLite. Later statements still run, ROLLBACK TO a savepoint works, and COMMIT keeps the other changes. PostgreSQL rejects every statement after the error until ROLLBACK or ROLLBACK TO, and COMMIT rolls the transaction back |
 | Serializable Snapshot Isolation | ❌ Not supported | BEGIN ISOLATION LEVEL SERIALIZABLE is rejected |
 | Two-phase commit | ❌ Not supported | PREPARE TRANSACTION rejected |
 | Updatable cursors | ❌ Not supported | |

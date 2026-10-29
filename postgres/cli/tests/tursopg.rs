@@ -2102,6 +2102,118 @@ fn wire_error_division_by_zero() {
     });
 }
 
+/// A statement fails inside a transaction. As in PostgreSQL, ROLLBACK TO
+/// SAVEPOINT undoes the failure and the transaction goes on: the rows written
+/// before the savepoint and after the rollback are committed. This holds
+/// whether or not the failed statement has a statement journal.
+#[test]
+fn rollback_to_savepoint_recovers_after_statement_error() {
+    for failing in [
+        "SELECT 1 / 0",
+        "INSERT INTO t VALUES (1 / 0)",
+        "INSERT INTO t SELECT abs(10 / y) FROM s",
+        "INSERT INTO t SELECT 10 / y FROM s",
+        "INSERT INTO t SELECT 10 % y FROM s",
+        "INSERT INTO t VALUES (0) RETURNING abs(10 / x)",
+        "UPDATE t SET x = 0 RETURNING abs(10 / x)",
+        "DELETE FROM t RETURNING abs(10 / (x - 5))",
+    ] {
+        with_pg_client(|c| {
+            c.query_command_tags("CREATE TABLE t (x int)");
+            c.query_command_tags("CREATE TABLE s (y int)");
+            c.query_command_tags("INSERT INTO s VALUES (1), (0)");
+            c.query_command_tags("BEGIN");
+            c.query_command_tags("INSERT INTO t VALUES (5)");
+            c.query_command_tags("SAVEPOINT a");
+            let fields = c.query_error_fields(failing);
+            assert_eq!(
+                fields.get(&b'C').map(String::as_str),
+                Some("22012"),
+                "{failing}: {fields:?}"
+            );
+            assert_eq!(
+                c.query_command_tags("ROLLBACK TO SAVEPOINT a"),
+                vec!["ROLLBACK"],
+                "{failing}"
+            );
+            c.query_command_tags("INSERT INTO t VALUES (7)");
+            assert_eq!(c.query_command_tags("COMMIT"), vec!["COMMIT"], "{failing}");
+            assert_eq!(
+                c.query_single_text("SELECT string_agg(x::text, ',' ORDER BY x) FROM t"),
+                "5,7",
+                "{failing}"
+            );
+        });
+    }
+}
+
+/// A multi-row write fails on a zero divisor after writing its first row.
+/// Division can fail in PostgreSQL, so the write gets a statement journal and
+/// the failed statement leaves no rows, even with no function call in it.
+#[test]
+fn failed_multi_row_write_in_transaction_leaves_no_rows() {
+    for failing in [
+        "INSERT INTO t SELECT 10 / y FROM s",
+        "INSERT INTO t SELECT 10 % y FROM s",
+        "UPDATE t SET x = 10 / (x - 6)",
+        "DELETE FROM t WHERE 10 / (x - 6) > 0",
+    ] {
+        with_pg_client(|c| {
+            c.query_command_tags("CREATE TABLE t (x int)");
+            c.query_command_tags("CREATE TABLE s (y int)");
+            c.query_command_tags("INSERT INTO s VALUES (1), (0)");
+            c.query_command_tags("INSERT INTO t VALUES (5), (6)");
+            c.query_command_tags("BEGIN");
+            c.query_command_tags("INSERT INTO t VALUES (7)");
+            let fields = c.query_error_fields(failing);
+            assert_eq!(
+                fields.get(&b'C').map(String::as_str),
+                Some("22012"),
+                "{failing}: {fields:?}"
+            );
+            c.query_command_tags("COMMIT");
+            assert_eq!(
+                c.query_single_text("SELECT string_agg(x::text, ',' ORDER BY x) FROM t"),
+                "5,6,7",
+                "{failing}"
+            );
+        });
+    }
+}
+
+/// A multi-row write fails after writing its first row, on an error that does
+/// not come from a function call or a division. PostgreSQL statements are
+/// atomic, so the failed statement leaves no rows whatever the error.
+#[test]
+fn failed_multi_row_write_leaves_no_rows_whatever_the_error() {
+    for failing in [
+        "INSERT INTO t SELECT sum(y) FROM s GROUP BY g ORDER BY g",
+        "INSERT INTO t SELECT sum(y) OVER (ORDER BY g, y) FROM s",
+        "UPDATE t SET x = (SELECT sum(y) FROM s WHERE g <= t.x)",
+    ] {
+        with_pg_client(|c| {
+            c.query_command_tags("CREATE TABLE s (g int, y bigint)");
+            c.query_command_tags("INSERT INTO s VALUES (1, 1), (2, 9223372036854775807), (2, 1)");
+            c.query_command_tags("CREATE TABLE t (x bigint)");
+            c.query_command_tags("INSERT INTO t VALUES (-5), (6)");
+            c.query_command_tags("BEGIN");
+            c.query_command_tags("INSERT INTO t VALUES (7)");
+            let fields = c.query_error_fields(failing);
+            assert_eq!(
+                fields.get(&b'C').map(String::as_str),
+                Some("22003"),
+                "{failing}: {fields:?}"
+            );
+            c.query_command_tags("COMMIT");
+            assert_eq!(
+                c.query_single_text("SELECT string_agg(x::text, ',' ORDER BY x) FROM t"),
+                "-5,6,7",
+                "{failing}"
+            );
+        });
+    }
+}
+
 /// `SELECT NULL / 0` returns NULL (not an error) in both PostgreSQL and Turso.
 #[test]
 fn null_divided_by_zero_is_null() {

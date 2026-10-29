@@ -243,6 +243,75 @@ impl LimboError {
             _ => 1,
         }
     }
+
+    /// Whether this error, raised by a statement inside an explicit
+    /// transaction, rolls back the whole transaction instead of only the
+    /// statement. Follows `isSpecialError` in SQLite's `sqlite3VdbeHalt`: an
+    /// I/O error always does. Disk full and out of memory do unless a
+    /// statement journal can undo the statement. Corruption and internal
+    /// errors do too when nothing can undo the statement, because its partial
+    /// writes cannot be trusted. The match lists every variant, so a new one
+    /// must be classified here.
+    pub fn rolls_back_transaction(&self, has_statement_journal: bool) -> bool {
+        match self {
+            Self::CompletionError(_) | Self::CacheError(_) => true,
+            Self::DatabaseFull | Self::OutOfMemory | Self::Corrupt(_) | Self::InternalError(_) => {
+                !has_statement_journal
+            }
+            // `abort` handles these itself before it gets to the statement
+            // cleanup, or they come from constraint resolution.
+            Self::TxError(_)
+            | Self::TableLocked
+            | Self::Busy
+            | Self::StatementsInProgress(_)
+            | Self::BusySnapshot
+            | Self::SchemaUpdated
+            | Self::SchemaConflict
+            | Self::WriteWriteConflict
+            | Self::Constraint(_)
+            | Self::ConstraintViolation(_)
+            | Self::ForeignKeyConstraint(_)
+            | Self::Raise(..)
+            | Self::RaiseIgnore => false,
+            // An interrupt reaches `abort` without an error. A checkpoint
+            // fails after the commit.
+            Self::Interrupt | Self::CheckpointFailed(_) => false,
+            Self::NotADB
+            | Self::IoBackendUnavailable(_)
+            | Self::SqlError(_)
+            | Self::SequenceExhausted { .. }
+            | Self::ParseError(_)
+            | Self::LexerError(_)
+            | Self::ConversionError(_)
+            | Self::EnvVarError(_)
+            | Self::LockingError(_)
+            | Self::ParseIntError(_)
+            | Self::ParseFloatError(_)
+            | Self::InvalidDate(_)
+            | Self::InvalidTime(_)
+            | Self::InvalidModifier(_)
+            | Self::InvalidArgument(_)
+            | Self::InvalidFormatter(_)
+            | Self::ExtensionError(_)
+            | Self::IntegerOverflow
+            | Self::DivisionByZero
+            | Self::InvalidTextRepresentation(_)
+            | Self::TooBig
+            | Self::ReadOnly
+            | Self::Conflict(_)
+            | Self::Page1NotAlloc
+            | Self::TxTerminated
+            | Self::CommitDependencyAborted
+            | Self::NoSuchTransactionID(_)
+            | Self::NullValue
+            | Self::InvalidColumnType
+            | Self::InvalidBlobSize(_)
+            | Self::BlobHandleExpired
+            | Self::PlanningError(_)
+            | Self::UnsupportedEncoding(_)
+            | Self::Dialect(_) => false,
+        }
+    }
 }
 
 fn sequence_bound(ascending: &bool) -> &'static str {

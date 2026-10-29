@@ -214,6 +214,17 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether every run-time error in a statement undoes the rows the
+    /// statement wrote.
+    ///
+    /// PostgreSQL statements are atomic. SQLite undoes a failed statement only
+    /// when it may abort, for example on a constraint or a function call, and
+    /// keeps the rows a multi-row write wrote before other errors, such as a
+    /// `sum()` overflow.
+    fn any_error_undoes_statement(&self) -> bool {
+        false
+    }
+
     /// Whether integer division by zero raises an error.
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
