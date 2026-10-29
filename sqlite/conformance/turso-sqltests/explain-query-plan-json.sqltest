@@ -301,8 +301,10 @@ test table-name-casing-is-not-an-alias {
     CREATE TABLE MixedCase(value INTEGER);
     EXPLAIN QUERY PLAN SELECT * FROM mixedcase;
     EXPLAIN QUERY PLAN SELECT * FROM MixedCase AS m;
+    EXPLAIN QUERY PLAN UPDATE mixedcase SET value = 1;
 }
 expect {
-    1|0|0|SCAN MixedCase
-    1|0|0|SCAN MixedCase AS m
+    1|0|0|SCAN mixedcase
+    1|0|0|SCAN mixedcase AS m
+    2|0|0|SCAN mixedcase
 }

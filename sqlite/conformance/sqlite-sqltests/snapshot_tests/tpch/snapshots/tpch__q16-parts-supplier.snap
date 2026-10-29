@@ -42,9 +42,9 @@ info:
 ---
 QUERY PLAN
 |--LIST SUBQUERY 1
-|  `--SCAN SUPPLIER
-|--SCAN PART
-|--SEARCH PARTSUPP USING COVERING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
+|  `--SCAN supplier
+|--SCAN part
+|--SEARCH partsupp USING COVERING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
 |--USE SORTER FOR GROUP BY
 |--USE HASH TABLE FOR count(DISTINCT)
 `--USE SORTER FOR ORDER BY

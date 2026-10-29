@@ -125,11 +125,7 @@ impl Display for SelectPlan {
 
             match &reference.op {
                 Operation::Scan(scan) => {
-                    let table_name = if reference
-                        .table
-                        .get_name()
-                        .eq_ignore_ascii_case(&reference.identifier)
-                    {
+                    let table_name = if reference.table.get_name() == reference.identifier {
                         reference.identifier.clone()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
@@ -246,11 +242,7 @@ impl Display for DeletePlan {
 
             match &reference.op {
                 Operation::Scan(scan) => {
-                    let table_name = if reference
-                        .table
-                        .get_name()
-                        .eq_ignore_ascii_case(&reference.identifier)
-                    {
+                    let table_name = if reference.table.get_name() == reference.identifier {
                         reference.identifier.clone()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)
@@ -359,11 +351,7 @@ impl fmt::Display for UpdatePlan {
 
             match &reference.op {
                 Operation::Scan(scan) => {
-                    let table_name = if reference
-                        .table
-                        .get_name()
-                        .eq_ignore_ascii_case(&reference.identifier)
-                    {
+                    let table_name = if reference.table.get_name() == reference.identifier {
                         reference.identifier.clone()
                     } else {
                         format!("{} AS {}", reference.table.get_name(), reference.identifier)

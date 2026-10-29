@@ -1396,3 +1396,24 @@ expect {
     public."Parent" USING btree ("Mixed Key")
     Parent
 }
+
+test pg-mixed-case-names-in-separate-schemas {
+    CREATE SCHEMA other;
+    CREATE TABLE public."Mixed Table" ("Mixed Id" INTEGER CONSTRAINT "Inline PK" PRIMARY KEY);
+    CREATE TABLE other."Mixed Table" ("Mixed Key" TEXT, CONSTRAINT "Table PK" PRIMARY KEY ("Mixed Key"));
+    CREATE TABLE child (key TEXT REFERENCES other."Mixed Table" ("Mixed Key"));
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename = 'Mixed Table' ORDER BY schemaname;
+    SELECT n.nspname, r.relname, c.conname, pg_get_constraintdef(c.oid)
+    FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = r.relnamespace
+    WHERE c.contype = 'p' AND r.relname = 'Mixed Table' ORDER BY n.nspname;
+    SELECT n.nspname, r.relname FROM pg_class r JOIN pg_constraint c ON c.confrelid = r.oid
+    JOIN pg_namespace n ON n.oid = r.relnamespace WHERE c.contype = 'f';
+}
+expect {
+    other|Mixed Table
+    public|Mixed Table
+    other|Mixed Table|Table PK|PRIMARY KEY ("Mixed Key")
+    public|Mixed Table|Inline PK|PRIMARY KEY ("Mixed Id")
+    other|Mixed Table
+}

@@ -1385,15 +1385,15 @@ impl Schema {
     }
 
     /// The indexes stored for `table_name`, backing B-tree indexes included.
+    /// `table_name` is the stored name; it is not normalized.
     pub fn indices_including_backing(
         &self,
         namespace: NamespaceId,
         table_name: &str,
     ) -> impl Iterator<Item = &Arc<Index>> {
-        let name = normalize_ident(table_name);
         self.namespace(namespace)
             .indexes
-            .get(&name)
+            .get(table_name)
             .map(|v| v.iter())
             .unwrap_or_default()
     }
@@ -3112,6 +3112,7 @@ impl Schema {
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
+                declared_name: view_name.clone(),
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
@@ -3402,6 +3403,8 @@ impl Schema {
                     let (namespace, table_name) = self.demangle_name(&table.name);
                     if !namespace.is_root() {
                         table.name = table_name.to_string();
+                        table.declared_name =
+                            self.demangle_name(&table.declared_name).1.to_string();
                         self.add_namespace_of_object(namespace);
                     }
                     // Detect sequence-backing tables by name prefix.
@@ -3868,10 +3871,9 @@ impl Schema {
                 let Some(bt) = t.btree() else {
                     return false;
                 };
-                bt.foreign_keys.iter().any(|fk| {
-                    fk.parent_namespace == namespace
-                        && fk.parent_table.eq_ignore_ascii_case(table_name)
-                })
+                bt.foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent_namespace == namespace && fk.parent_table == table_name)
             })
         })
     }
@@ -4064,6 +4066,7 @@ impl TryClone for BTreeTable {
         Ok(Self {
             root_page: self.root_page,
             name: self.name.clone(),
+            declared_name: self.declared_name.clone(),
             primary_key_columns: self.primary_key_columns.try_clone()?,
             primary_key_is_inline: self.primary_key_is_inline,
             columns: self.columns.try_clone()?,
@@ -4699,6 +4702,7 @@ impl GeneratedColGraph {
 pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
+    pub declared_name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     pub primary_key_is_inline: bool,
     columns: Vec<Column>,
@@ -4777,6 +4781,7 @@ impl BTreeTable {
             );
         Self {
             root_page,
+            declared_name: name.clone(),
             name,
             primary_key_columns,
             primary_key_is_inline,
@@ -6044,7 +6049,7 @@ pub fn create_table(
     root_page: i64,
     supports_namespaces: bool,
 ) -> Result<BTreeTable> {
-    let table_name = tbl_name.to_owned();
+    let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let has_rowid;
     let mut has_autoincrement = false;
@@ -6607,6 +6612,7 @@ pub fn create_table(
     let mut table = BTreeTable {
         root_page,
         name: table_name,
+        declared_name: tbl_name.to_owned(),
         has_rowid,
         primary_key_columns,
         primary_key_is_inline,
@@ -7378,6 +7384,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
     Ok(BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
+        declared_name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
         has_autoincrement: false,
@@ -8839,6 +8846,7 @@ mod tests {
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
+            declared_name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,

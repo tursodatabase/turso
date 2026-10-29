@@ -2162,12 +2162,12 @@ impl TableReferences {
     pub fn find_table_by_table_name(&self, name: &str) -> Option<&Table> {
         self.joined_tables
             .iter()
-            .find(|t| t.table.get_name().eq_ignore_ascii_case(name))
+            .find(|t| t.table.get_name() == name)
             .map(|t| &t.table)
             .or_else(|| {
                 self.outer_query_refs
                     .iter()
-                    .find(|t| t.table.get_name().eq_ignore_ascii_case(name))
+                    .find(|t| t.table.get_name() == name)
                     .map(|t| &t.table)
             })
     }

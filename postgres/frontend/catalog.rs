@@ -68,19 +68,33 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-        use turso_parser::ast::Stmt;
-
-        let Stmt::CreateTable { tbl_name, body, .. } = self.parse_table_sql_ast(sql)? else {
-            unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
+        // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
+        // carry no frontend marker and are plain SQLite SQL.
+        let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
+            let table = BTreeTable::from_stored_sql(sql, root_page, true)?;
+            if !table.has_rowid {
+                return Err(LimboError::ParseError(format!(
+                    "PostgreSQL does not support WITHOUT ROWID table '{}'",
+                    table.name
+                )));
+            }
+            return Ok(table);
         };
-        let table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)?;
-        if !table.has_rowid {
-            return Err(LimboError::ParseError(format!(
-                "PostgreSQL does not support WITHOUT ROWID table '{}'",
-                table.name
-            )));
+
+        let parse_result =
+            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
+        let stmt = translator
+            .translate(&parse_result)
+            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        match stmt {
+            turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
+                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
+            }
+            _ => Err(LimboError::ParseError(
+                "expected CREATE TABLE statement".to_string(),
+            )),
         }
-        Ok(table)
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
@@ -400,7 +414,7 @@ impl SnapshotRows for PgClassTable {
         let indexes = catalog_indexes(&schema);
         let relkind: &'static str = RelationKind::Table.into();
 
-        for (i, (namespace, table_name, table)) in tables.iter().enumerate() {
+        for (i, (namespace, _, table)) in tables.iter().enumerate() {
             let btree = match table.as_ref() {
                 Table::BTree(bt) => bt,
                 _ => continue,
@@ -412,7 +426,7 @@ impl SnapshotRows for PgClassTable {
 
             rows.push(vec![
                 Value::from_i64(table_oid),                          // oid
-                Value::Text((*table_name).to_string().into()),       // relname
+                Value::Text(btree.declared_name.clone().into()),     // relname
                 Value::from_i64(namespace_oid(&schema, *namespace)), // relnamespace
                 Value::from_i64(0),                                  // reltype
                 Value::from_i64(0),                                  // reloftype
@@ -1153,10 +1167,11 @@ impl SnapshotRows for PgTablesTable {
         let mut rows = Vec::new();
         let tables = user_tables_sorted(&schema);
 
-        for (namespace, table_name, _) in tables {
+        for (namespace, _, table) in tables {
+            let btree = table.btree().expect("user tables are B-trees");
             rows.push(vec![
                 Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
-                Value::Text(table_name.to_string().into()),                        // tablename
+                Value::Text(btree.declared_name.clone().into()),                   // tablename
                 Value::Text("turso".into()),                                       // tableowner
                 Value::Null,                                                       // tablespace
                 Value::from_i64(0),                                                // hasindexes
@@ -1795,6 +1810,7 @@ impl SnapshotRows for PgConstraintTable {
                 .copied()
                 .unwrap_or(0);
 
+            let table_name = &btree.declared_name;
             if btree.get_rowid_alias_column().is_some() {
                 let index = indexes
                     .iter()
@@ -1952,13 +1968,9 @@ impl SnapshotRows for PgConstraintTable {
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                let confrelid = schema
-                    .get_btree_table(fk.parent_namespace, &fk.parent_table)
-                    .and_then(|parent| {
-                        tbl_oid_map
-                            .get(&(fk.parent_namespace, parent.name.clone()))
-                            .copied()
-                    })
+                let confrelid = tbl_oid_map
+                    .get(&(fk.parent_namespace, fk.parent_table.clone()))
+                    .copied()
                     .unwrap_or(0);
 
                 let confkey: String = fk
@@ -3428,14 +3440,18 @@ impl PgGetTableDefCursor {
 
             let postgres_ddl = match self.sql_map.get(&mangle_name(namespace, table_name)) {
                 Some(schema_sql) => decode_stored_pg_schema_sql(schema_sql)
-                    .map(|sql| ddl_with_user_names(&schema, namespace, table_name, sql))
+                    .map(|sql| {
+                        ddl_with_user_names(&schema, namespace, &btree_table.declared_name, sql)
+                    })
                     .unwrap_or_else(|| self.convert_to_postgres_ddl(schema_sql)),
-                None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
+                None => {
+                    self.convert_to_postgres_ddl(&btree_table.to_sql_as(&btree_table.declared_name))
+                }
             };
 
             self.rows.push(vec![
                 Value::Text(schema_name_of(&schema, namespace).to_string().into()),
-                Value::Text(table_name.to_string().into()),
+                Value::Text(btree_table.declared_name.clone().into()),
                 Value::Text(postgres_ddl.into()),
             ]);
         }
@@ -3632,7 +3648,16 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
                 let cols: Vec<String> = btree
                     .primary_key_columns
                     .iter()
-                    .map(|(name, _)| quote_identifier(name))
+                    .map(|(name, _)| {
+                        let (_, column) =
+                            btree.get_column(name).expect("primary key columns exist");
+                        quote_identifier(
+                            column
+                                .name
+                                .as_deref()
+                                .expect("primary key columns have names"),
+                        )
+                    })
                     .collect();
                 return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
             }
@@ -3645,7 +3670,17 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
                 let col_names: Vec<String> = us
                     .columns
                     .iter()
-                    .map(|column| quote_identifier(&column.name))
+                    .map(|column| {
+                        let (_, column) = btree
+                            .get_column(&column.name)
+                            .expect("constraint columns exist");
+                        quote_identifier(
+                            column
+                                .name
+                                .as_deref()
+                                .expect("constraint columns have names"),
+                        )
+                    })
                     .collect();
                 let kw = if unique_set_is_primary_key(btree, us) {
                     "PRIMARY KEY"
@@ -3770,7 +3805,7 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                 oid,
                 table_oid,
                 namespace,
-                table_name: table_name.to_string(),
+                table_name: btree.declared_name.clone(),
                 name,
                 columns: vec![CatalogIndexColumn {
                     name: column.name.clone().expect("primary key columns have names"),
@@ -3802,7 +3837,7 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                 oid,
                 table_oid,
                 namespace,
-                table_name: table_name.to_string(),
+                table_name: btree.declared_name.clone(),
                 name: index.name.clone(),
                 columns: index
                     .columns
@@ -3877,7 +3912,8 @@ mod tests {
             };
             let table = BTreeTable::from_create_table_ast(&tbl_name, &body, 2, true).unwrap();
             let sqlite_table = BTreeTable::from_sql(sql, 2).unwrap();
-            assert_eq!(sqlite_table.name, "Mixed Table");
+            assert_eq!(sqlite_table.name, "mixed table");
+            assert_eq!(sqlite_table.declared_name, "Mixed Table");
             assert_eq!(
                 sqlite_table.primary_key_constraint_name.as_deref(),
                 Some("Mixed PK")
@@ -3891,9 +3927,10 @@ mod tests {
                     .get_btree_table(NamespaceId::ROOT, "mixed table")
                     .unwrap()
                     .name,
-                "Mixed Table"
+                "mixed table"
             );
-            assert_eq!(table.name, "Mixed Table");
+            assert_eq!(table.name, "mixed table");
+            assert_eq!(table.declared_name, "Mixed Table");
             assert_eq!(
                 table.primary_key_constraint_name.as_deref(),
                 Some("Mixed PK")

@@ -17809,6 +17809,7 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
+                normalized_to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
@@ -17884,7 +17885,9 @@ pub fn op_rename_table(
             if let Some(mut backing_arc) = schema.take_table(NamespaceId::ROOT, &old_backing_table)
             {
                 if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
-                    Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
+                    let btree = Arc::make_mut(btree_arc);
+                    btree.name.clone_from(&new_backing_table);
+                    btree.declared_name.clone_from(&new_backing_table);
                 }
                 schema.insert_table(NamespaceId::ROOT, new_backing_table, backing_arc);
             }
