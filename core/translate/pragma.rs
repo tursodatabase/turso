@@ -381,7 +381,17 @@ fn update_pragma(
             };
             let busy_timeout_ms = busy_timeout_ms.max(0);
             connection.set_busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64));
-            Ok(TransactionMode::None)
+            // Like SQLite, the setter also returns the new busy timeout.
+            query_pragma(
+                PragmaName::BusyTimeout,
+                resolver,
+                None,
+                pager,
+                connection,
+                namespace,
+                schema_was_explicit,
+                program,
+            )
         }
         PragmaName::CacheSize => {
             let data = parse_signed_number(&value)?;

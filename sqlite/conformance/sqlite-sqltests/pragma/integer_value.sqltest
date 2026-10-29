@@ -65,6 +65,7 @@ test pragma-busy-timeout-float-reads-leading-digits {
 }
 expect {
     1
+    1
 }
 
 test pragma-busy-timeout-out-of-range-is-zero {
@@ -72,6 +73,7 @@ test pragma-busy-timeout-out-of-range-is-zero {
     PRAGMA busy_timeout;
 }
 expect {
+    0
     0
 }
 
