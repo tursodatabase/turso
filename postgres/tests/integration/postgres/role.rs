@@ -213,6 +213,20 @@ fn schema_is_read_again_after_creating_a_role() {
 }
 
 #[test]
+fn role_without_privileges_can_read_the_schema_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    conn.inner().force_reparse_schema_without_publish().unwrap();
+
+    let error = conn.execute("SELECT x FROM t").unwrap_err();
+    assert_eq!(error.to_string(), "permission denied for table t");
+}
+
+#[test]
 fn set_role_inside_transaction_block_fails() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();

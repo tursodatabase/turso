@@ -280,6 +280,7 @@ fn is_catalog_table(object: &Object) -> bool {
         Object::Table(name)
             if [
                 crate::schema::SCHEMA_TABLE_NAME,
+                crate::schema::TURSO_NAMESPACES_TABLE_NAME,
                 crate::schema::TURSO_TYPES_TABLE_NAME,
                 ROLES_TABLE_NAME,
             ]

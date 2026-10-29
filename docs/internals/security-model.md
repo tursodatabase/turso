@@ -270,9 +270,10 @@ separately:
   their argument may be a parameter that is not known when the statement is
   prepared.
 
-Every role may read the catalogs: the schema table, the types table, and the
-roles table. They hold the schema and the role names, which PostgreSQL also
-lets every role see, and a connection reads them to reload its own schema.
+Every role may read the catalogs: the schema table, the namespaces table, the
+types table, and the roles table. They hold the schema and the role names,
+which PostgreSQL also lets every role see, and a connection reads them to
+reload its own schema.
 
 ## Frontends
 
