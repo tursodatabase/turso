@@ -238,6 +238,16 @@ expect error {
     integer out of range for smallint
 }
 
+# A CAST to a domain stores the value as the domain's base type does, so
+# smallint's range check runs.
+test smallint-cast-to-domain-out-of-range {
+    CREATE DOMAIN small_pos AS smallint CHECK (value > 0);
+    SELECT CAST(100000 AS small_pos);
+}
+expect error {
+    integer out of range for smallint
+}
+
 @requires strict "uses STRICT tables"
 test smallint-alias-int2 {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val int2) STRICT;

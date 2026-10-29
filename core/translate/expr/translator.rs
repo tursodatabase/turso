@@ -796,21 +796,17 @@ fn translate_cast_expr(
                 None => Vec::new(),
             };
 
-            // Domains: apply parent encode chain, then validate constraints
-            // on the encoded value (domain CHECK sees the stored representation).
+            // Domains: store the value as a column of the domain does, which
+            // runs the ENCODE and COERCE of the types under it, then check
+            // the domain's constraints on the stored value.
             if resolved.is_domain() {
-                // Apply encode from parent custom types (domain itself has encode: None)
-                for td in &resolved.chain {
-                    if let Some(encode_expr) = td.encode() {
-                        emit_type_expr(
-                            program,
-                            encode_expr,
-                            target_register,
-                            target_register,
-                            resolver,
-                        )?;
-                    }
-                }
+                emit_store_value(
+                    program,
+                    &resolved.chain,
+                    target_register,
+                    &ty_params,
+                    resolver,
+                )?;
 
                 // Validate domain constraints on the encoded value
                 emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
