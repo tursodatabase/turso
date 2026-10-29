@@ -2251,6 +2251,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             _ => false,
         };
 
+        let keeps_scan = self.write_keeps_scan(&row.id);
         self.save_table_write_frontier();
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
@@ -2292,6 +2293,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
         }
+        if keeps_scan {
+            self.keep_scan_after_write();
+        }
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }
@@ -2310,6 +2314,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 { "row_id": &rowid }
             );
         }
+        let keeps_scan = self.write_keeps_scan(&rowid);
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
@@ -2335,6 +2340,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             maybe_index_id,
             btree_record.as_ref(),
         )?;
+        if keeps_scan {
+            self.keep_scan_after_write();
+        }
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }
@@ -3018,6 +3026,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 IterationDirection::Backwards => self.prev(),
             };
         }
+        #[cfg(test)]
+        self.db
+            .cursor_scan_refreshes
+            .fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
         self.transaction.table_walk = None;
         let cached = self.transaction.table_scan.generation;
         let movement_pending = self.btree_advance_state.is_some()
@@ -3127,6 +3139,21 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             return Err(LimboError::CommitDependencyAborted);
         }
         Ok(generation)
+    }
+
+    fn write_keeps_scan(&self, row_id: &RowID) -> bool {
+        matches!(self.mv_cursor_type, MvccCursorType::Table)
+            && matches!(&self.current_pos, CursorPosition::Loaded { row_id: current, .. } if current == row_id)
+            && !self.dual_peek.both_uninitialized()
+            && self.transaction.table_scan.resume.is_none()
+            && self.transaction.table_scan.write_frontier.is_none()
+            && self.transaction.table_write_generation(self.table_id)
+                <= self.transaction.table_scan.generation
+    }
+
+    fn keep_scan_after_write(&mut self) {
+        self.transaction.table_scan.write_frontier = None;
+        self.transaction.table_scan.generation = self.transaction.write_generation();
     }
 
     fn save_table_write_frontier(&mut self) {

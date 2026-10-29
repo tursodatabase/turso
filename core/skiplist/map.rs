@@ -281,6 +281,7 @@ where
     /// let gates_age = ages.try_get_or_insert_with("Bill Gates", || 64).unwrap();
     /// assert_eq!(*gates_age.value(), 64);
     /// ```
+    #[inline(always)]
     pub fn try_get_or_insert_with<F>(
         &self,
         key: K,

@@ -7906,6 +7906,191 @@ fn position_lazy_write_scan(
 }
 
 #[test]
+fn test_lazy_cursor_write_at_current_key_keeps_the_scan() {
+    for steps_disabled in [false, true] {
+        for chain_only in [false, true] {
+            let ids: Vec<i64> = (1..=20).collect();
+            let (db, conn) = if chain_only {
+                setup_lazy_walk_table(&[], &ids)
+            } else {
+                setup_lazy_walk_table(&ids, &[])
+            };
+            let store = db.get_mvcc_store();
+            store
+                .cursor_table_steps_disabled
+                .store(steps_disabled, Ordering::Relaxed);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let case = format!("steps_disabled={steps_disabled} chain_only={chain_only}");
+            let prefix = if chain_only { "c" } else { "p" };
+            for (sql, expected) in [
+                (
+                    "UPDATE t SET v = v || '!'",
+                    ids.iter()
+                        .map(|id| (*id, format!("{prefix}{id}!")))
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "UPDATE t SET v = v || '?'",
+                    ids.iter()
+                        .map(|id| (*id, format!("{prefix}{id}!?")))
+                        .collect(),
+                ),
+                (
+                    "DELETE FROM t WHERE id % 2 = 0",
+                    ids.iter()
+                        .filter(|id| *id % 2 == 1)
+                        .map(|id| (*id, format!("{prefix}{id}!?")))
+                        .collect(),
+                ),
+            ] {
+                store.cursor_scan_refreshes.store(0, Ordering::Relaxed);
+                conn.execute(sql).unwrap();
+                assert_eq!(
+                    store.cursor_scan_refreshes.load(Ordering::Relaxed),
+                    0,
+                    "{case}: {sql}"
+                );
+                assert_eq!(
+                    lazy_text_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+                    expected,
+                    "{case}: {sql}"
+                );
+            }
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_write_at_current_key_keeps_the_scan() {
+    let (db, conn) = setup_lazy_walk_table(&(1..=10).collect::<Vec<_>>(), &[]);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    store.cursor_scan_refreshes.store(0, Ordering::Relaxed);
+    store.cursor_table_walk_starts.store(0, Ordering::Relaxed);
+    drive_lazy_payload_io(&conn, || cursor.last());
+    let mut deleted = Vec::new();
+    while let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) {
+        if rowid % 2 == 0 {
+            drive_lazy_payload_io(&conn, || cursor.delete());
+            deleted.push(rowid);
+        }
+        drive_lazy_payload_io(&conn, || cursor.prev());
+    }
+    assert_eq!(deleted, vec![10, 8, 6, 4, 2]);
+    assert_eq!(store.cursor_scan_refreshes.load(Ordering::Relaxed), 0);
+    assert_eq!(store.cursor_table_walk_starts.load(Ordering::Relaxed), 1);
+    drop(cursor);
+    assert_eq!(
+        lazy_text_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+        [1, 3, 5, 7, 9]
+            .into_iter()
+            .map(|id| (id, format!("p{id}")))
+            .collect::<Vec<_>>()
+    );
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_write_at_current_key_still_sees_an_earlier_insert_ahead() {
+    let (db, conn) = setup_lazy_walk_table(&[1, 2, 3], &[]);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    conn.execute("INSERT INTO t VALUES (100, 'ahead')").unwrap();
+    store.cursor_scan_refreshes.store(0, Ordering::Relaxed);
+    drive_lazy_payload_io(&conn, || cursor.delete());
+    let mut rowids = Vec::new();
+    loop {
+        drive_lazy_payload_io(&conn, || cursor.next());
+        let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) else {
+            break;
+        };
+        rowids.push(rowid);
+    }
+    assert_eq!(rowids, vec![2, 3, 100]);
+    assert_eq!(store.cursor_scan_refreshes.load(Ordering::Relaxed), 1);
+    drop(cursor);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_update_that_fails_a_check_keeps_every_row() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE checked(id INTEGER PRIMARY KEY, v TEXT CHECK (v <> 'p7!'))")
+        .unwrap();
+    for id in 1..=10 {
+        conn.execute(format!("INSERT INTO checked VALUES ({id}, 'p{id}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let store = db.get_mvcc_store();
+    store.cursor_scan_refreshes.store(0, Ordering::Relaxed);
+    assert!(conn.execute("UPDATE checked SET v = v || '!'").is_err());
+    assert_eq!(store.cursor_scan_refreshes.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        lazy_text_rows(&conn, "SELECT id, v FROM checked ORDER BY id"),
+        (1..=10)
+            .map(|id| (id, format!("p{id}")))
+            .collect::<Vec<_>>()
+    );
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_write_at_current_key_with_injected_yields() {
+    let expected: Vec<(i64, String)> = (1..=12).map(|id| (id, format!("p{id}!"))).collect();
+    for point in [
+        CursorYieldPoint::NextStart,
+        CursorYieldPoint::NextBtreeAdvance,
+        CursorYieldPoint::AdvanceBtreeForwardProgress,
+    ] {
+        let mut fired = false;
+        for occurrence in 0..14 {
+            let (_db, conn) = setup_lazy_walk_table(&(1..=12).collect::<Vec<_>>(), &[]);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let injector = NthYieldInjector::new(point.point(), occurrence);
+            conn.set_yield_injector(Some(injector.clone()));
+            let mut update = conn.prepare("UPDATE t SET v = v || '!'").unwrap();
+            loop {
+                match update.step().unwrap() {
+                    StepResult::Done => break,
+                    StepResult::IO | StepResult::Yield => update._io().step().unwrap(),
+                    other => panic!("unexpected result {other:?}"),
+                }
+            }
+            drop(update);
+            conn.set_yield_injector(None);
+            fired |= injector.fired();
+            assert_eq!(
+                lazy_text_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+                expected,
+                "{point:?} occurrence={occurrence}"
+            );
+            conn.execute("ROLLBACK").unwrap();
+        }
+        assert!(fired, "{point:?} never fired");
+    }
+}
+
+fn lazy_text_rows(conn: &Arc<Connection>, sql: &str) -> Vec<(i64, String)> {
+    get_rows(conn, sql)
+        .into_iter()
+        .map(|row| {
+            let Value::Text(text) = &row[1] else {
+                panic!("expected text, got {:?}", row[1]);
+            };
+            (row[0].as_int().unwrap(), text.as_str().to_string())
+        })
+        .collect()
+}
+
+#[test]
 fn test_lazy_cursor_write_scan_bounds_hidden_physical_visits() {
     let mut measurements = Vec::new();
     for n in [16, 32] {
