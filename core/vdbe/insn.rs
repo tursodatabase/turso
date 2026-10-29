@@ -13,7 +13,7 @@ use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::function::AccumulatorFunc;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::{
-    schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
+    schema::{BTreeTable, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::TransactionMode, plan::BitSet},
@@ -298,17 +298,6 @@ impl From<BitSet> for NullMatchingMask {
     }
 }
 
-/// Data for AddColumn instruction (boxed to keep Insn small).
-#[derive(Debug, Clone)]
-pub struct AddColumnData {
-    pub db: usize,
-    pub namespace: NamespaceId,
-    pub table: String,
-    pub column: Column,
-    pub check_constraints: Vec<CheckConstraint>,
-    pub foreign_keys: Vec<Arc<ForeignKey>>,
-}
-
 /// Data for AlterColumn instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct AlterColumnData {
@@ -319,7 +308,6 @@ pub struct AlterColumnData {
     pub definition: turso_parser::ast::ColumnDefinition,
     pub rename: bool,
     pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
-    pub renamed_index_methods: Vec<(String, Arc<dyn crate::index_method::IndexMethodAttachment>)>,
 }
 
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
@@ -1959,6 +1947,11 @@ pub enum Insn {
         /// it on the in-memory trigger. Every other ParseSchema use leaves this
         /// as `None`.
         trigger_target_database_id: Option<usize>,
+        /// A table already in the schema whose rows `where_clause` selects.
+        /// The table and its indexes are removed from the schema before the
+        /// rows are read, so ALTER TABLE ends with the same table and indexes
+        /// as reopening the database would give.
+        reloaded_table: Option<(NamespaceId, String)>,
     },
 
     /// Populate all materialized views after schema parsing
@@ -2154,15 +2147,16 @@ pub enum Insn {
         from: String,
         to: String,
     },
-    DropColumn {
+    /// Prepare a SELECT from every view of `namespace` in database `db`, and
+    /// fail with "`error_prefix`: referenced in VIEW ..." if one of them no
+    /// longer compiles.
+    CheckViews {
         db: usize,
         namespace: NamespaceId,
-        table: String,
-        column_index: usize,
+        error_prefix: String,
     },
-    AddColumn {
-        data: Box<AddColumnData>,
-    },
+    /// Update the triggers, views and other tables' foreign keys that name a
+    /// column changed by ALTER TABLE ALTER COLUMN or RENAME COLUMN.
     AlterColumn {
         data: Box<AlterColumnData>,
     },
@@ -2613,8 +2607,7 @@ impl InsnVariants {
             InsnVariants::Count => execute::op_count,
             InsnVariants::IntegrityCk => execute::op_integrity_check,
             InsnVariants::RenameTable => execute::op_rename_table,
-            InsnVariants::DropColumn => execute::op_drop_column,
-            InsnVariants::AddColumn => execute::op_add_column,
+            InsnVariants::CheckViews => execute::op_check_views,
             InsnVariants::AlterColumn => execute::op_alter_column,
             InsnVariants::MaxPgcnt => execute::op_max_pgcnt,
             InsnVariants::JournalMode => execute::op_journal_mode,
@@ -2712,8 +2705,7 @@ impl Insn {
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }
             | Self::RenameTable { .. }
-            | Self::DropColumn { .. }
-            | Self::AddColumn { .. }
+            | Self::CheckViews { .. }
             | Self::AlterColumn { .. }
             | Self::JournalMode { .. }
             | Self::Vacuum { .. } => false,

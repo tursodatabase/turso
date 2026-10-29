@@ -2346,6 +2346,25 @@ impl Schema {
         self.analyze_stats.remove_table(namespace, &name);
     }
 
+    /// Remove a B-tree table and its indexes so that they can be loaded again
+    /// from sqlite_schema. Unlike DROP TABLE, this keeps the table's triggers
+    /// and its ANALYZE statistics.
+    pub fn remove_table_for_reload(&mut self, namespace: NamespaceId, table_name: &str) {
+        let name = normalize_ident(table_name);
+        let objects = self.namespace_mut(namespace);
+        let removed = objects.tables.remove(&name);
+        turso_assert!(
+            removed.as_ref().is_some_and(|table| table.btree().is_some()),
+            "table to reload must be a B-tree table in the schema",
+            { "table": name }
+        );
+        objects.indexes.remove(&name);
+        #[cfg(feature = "conn_raw_api")]
+        if let Some(table) = removed {
+            self.unregister_table_root_page(&table);
+        }
+    }
+
     #[cfg(feature = "conn_raw_api")]
     pub fn register_table_root_page(&mut self, name: &str, table: &Table) {
         if let Table::BTree(table) = table {
@@ -5369,43 +5388,6 @@ impl BTreeTable {
         Ok(())
     }
 
-    pub fn shift_generated_column_indices_after_drop(
-        &mut self,
-        dropped_index: usize,
-    ) -> Result<()> {
-        if !self.has_virtual_columns {
-            return Ok(());
-        }
-
-        for column in &mut self.columns {
-            let Some(expr) = column.generated_expr_mut() else {
-                continue;
-            };
-
-            walk_expr_mut(expr, &mut |e| match e {
-                Expr::Column {
-                    table,
-                    column,
-                    is_rowid_alias: _,
-                    ..
-                } if table.is_self_table() => {
-                    if *column == dropped_index {
-                        return Err(LimboError::InternalError(
-                            "dropped column remained referenced by generated column".to_string(),
-                        ));
-                    }
-                    if *column > dropped_index {
-                        *column -= 1;
-                    }
-                    Ok(WalkControl::Continue)
-                }
-                _ => Ok(WalkControl::Continue),
-            })?;
-        }
-
-        Ok(())
-    }
-
     fn column_graph(&self) -> Result<&GeneratedColGraph> {
         if let Some(graph) = self.column_dependencies.0.get() {
             return Ok(graph);
@@ -5798,28 +5780,6 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
         _ => Ok(WalkControl::Continue),
     })?;
     Ok(())
-}
-
-/// Re-render the SQL text of a generated-column expression using current column names. The input
-/// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
-/// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
-/// stringifying so the result round-trips through the parser, even if a referenced column was
-/// renamed since the original `original_sql` was captured.
-pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
-    let mut clone = expr.clone();
-    walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
-        if let Expr::Column { table, column, .. } = e {
-            if table.is_self_table() {
-                if let Some(col) = columns.get(*column) {
-                    if let Some(name) = col.name.as_ref() {
-                        *e = Expr::Id(Name::exact(name.clone()));
-                    }
-                }
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(clone.to_string())
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
@@ -7242,17 +7202,6 @@ impl Column {
         match &mut self.generated_type {
             GeneratedType::Virtual { expr, .. } => Some(expr.as_mut()),
             GeneratedType::NotGenerated => None,
-        }
-    }
-
-    #[inline]
-    pub fn set_generated_original_sql(&mut self, new_sql: String) {
-        if let GeneratedType::Virtual {
-            ref mut original_sql,
-            ..
-        } = self.generated_type
-        {
-            *original_sql = new_sql;
         }
     }
 

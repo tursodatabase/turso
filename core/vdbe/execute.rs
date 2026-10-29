@@ -14,10 +14,7 @@ use crate::mvcc::MvccClock;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::numeric::decimal::numeric_from_value;
 use crate::numeric::Numeric;
-use crate::schema::{
-    render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
-    SCHEMA_TABLE_NAME,
-};
+use crate::schema::{Schema, Table, SCHEMA_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
@@ -15981,7 +15978,8 @@ pub fn op_parse_schema(
         ParseSchema {
             db,
             where_clause,
-            trigger_target_database_id
+            trigger_target_database_id,
+            reloaded_table
         },
         insn
     );
@@ -16027,7 +16025,7 @@ pub fn op_parse_schema(
     // which also acquires the schema / database_schemas write lock, so holding
     // it here would deadlock on the same thread (parking_lot RwLock is not
     // re-entrant).
-    let schema_arc = if *db == crate::TEMP_DB_ID {
+    let mut schema_arc = if *db == crate::TEMP_DB_ID {
         // TEMP: single source of truth is `temp_db.db.schema`. Skip
         // `database_schemas` staging entirely — it would only go stale.
         conn.temp
@@ -16055,6 +16053,16 @@ pub fn op_parse_schema(
     } else {
         conn.schema.read().clone()
     };
+    if let Some((namespace, table_name)) = reloaded_table {
+        match Schema::try_make_mut(&mut schema_arc) {
+            Ok(schema) => schema.remove_table_for_reload(*namespace, table_name),
+            Err(e) => {
+                conn.auto_commit
+                    .store(previous_auto_commit, Ordering::SeqCst);
+                return Err(e.into());
+            }
+        }
+    }
 
     // Set up MVCC transaction for the nested statement
     let mv_tx = program.connection.get_mv_tx();
@@ -18052,116 +18060,29 @@ fn table_qualifiers(schema: &Schema, namespace: NamespaceId) -> Option<Vec<Strin
     Some(name.into_iter().map(str::to_string).collect())
 }
 
-pub fn op_drop_column(
+pub fn op_check_views(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
-        DropColumn {
+        CheckViews {
             db,
             namespace,
-            table,
-            column_index
+            error_prefix
         },
         insn
     );
 
     let conn = program.connection.clone();
-
-    let normalized_table_name = normalize_ident(table.as_str());
-
-    let column_name = conn.with_schema(*db, |schema| {
-        let table = schema
-            .get_table(*namespace, &normalized_table_name)
-            .expect("table being ALTERed should be in schema");
-        table
-            .get_column_at(*column_index)
-            .expect("column being ALTERed should be in schema")
-            .name
-            .as_ref()
-            .expect("column being ALTERed should be named")
-            .clone()
-    });
-
-    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
-        let table = schema
-            .table_mut(*namespace, &normalized_table_name)
-            .expect("table being renamed should be in schema");
-
-        let table = Arc::get_mut(table).expect("this should be the only strong reference");
-
-        let Table::BTree(btree) = table else {
-            panic!("only btree tables can be renamed");
-        };
-
-        let btree = Arc::make_mut(btree);
-        btree.columns_mut().remove(*column_index);
-        // Remove column-level CHECK constraints for the dropped column
-        let col_name = column_name.clone();
-        btree.check_constraints.retain(|c| {
-            c.column
-                .as_ref()
-                .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
-        });
-
-        btree.shift_generated_column_indices_after_drop(*column_index)?;
-        Ok(())
-    })??;
-
-    conn.with_schema(*db, |schema| -> crate::Result<()> {
-        for index in schema.indices_including_backing(*namespace, &normalized_table_name) {
-            if index
-                .columns
-                .iter()
-                .any(|column| column.pos_in_table == *column_index)
-            {
-                return Err(LimboError::ParseError(format!(
-                    "cannot drop column \"{column_name}\": indexed"
-                )));
-            }
-        }
-        Ok(())
-    })?;
-
-    // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
-    // expressions, to account for the dropped column. For example, if the dropped column had index
-    // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
-    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
-        for index in schema.indices_of_table_mut(*namespace, &normalized_table_name) {
-            let index = Arc::make_mut(index);
-            for index_column in index.columns.iter_mut() {
-                if index_column.pos_in_table != EXPR_INDEX_SENTINEL
-                    && index_column.pos_in_table > *column_index
-                {
-                    index_column.pos_in_table -= 1;
-                }
-                if let Some(ref mut expr) = index_column.expr {
-                    crate::translate::expr::walk_expr_mut(expr, &mut |e| {
-                        if let ast::Expr::Column {
-                            table, column: c, ..
-                        } = e
-                        {
-                            if table.is_self_table() && *c > *column_index {
-                                *c -= 1;
-                            }
-                        }
-                        Ok(crate::translate::expr::WalkControl::Continue)
-                    })?;
-                }
-            }
-        }
-        Ok(())
-    })??;
-
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views(*namespace) {
             let view_select_sql = select_from_view_sql(&conn, *db, schema, *namespace, view_name);
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
-                    "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
-                    column_name, view.sql,
+                    "{error_prefix}: referenced in VIEW {view_name}: {}. {e}",
+                    view.sql,
                 ))
             })?;
         }
@@ -18197,46 +18118,6 @@ fn select_from_view_sql(
     )
 }
 
-pub fn op_add_column(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(AddColumn { data }, insn);
-
-    let conn = program.connection.clone();
-    let normalized_table_name = normalize_ident(data.table.as_str());
-    let new_check_constraints = data.check_constraints.try_to_vec()?;
-    let new_foreign_keys = data.foreign_keys.try_to_vec()?;
-
-    conn.with_database_schema_mut(data.db, |schema| -> Result<()> {
-        let table_ref = schema
-            .table_mut(data.namespace, &normalized_table_name)
-            .expect("table being altered should be in schema");
-
-        let table_ref = Arc::make_mut(table_ref);
-
-        let crate::schema::Table::BTree(btree) = table_ref else {
-            panic!("only btree tables can have columns added");
-        };
-
-        let btree = Arc::make_mut(btree);
-        btree.columns_mut().try_push(data.column.clone())?;
-        // Update CHECK constraints to include any constraints from the new column
-        btree.check_constraints = new_check_constraints;
-        // Update foreign keys to include any FK constraints from the new column
-        btree.foreign_keys = new_foreign_keys;
-
-        // Resolve generated column expressions and update virtual column metadata
-        btree.prepare_generated_columns()?;
-        Ok(())
-    })??;
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
 pub fn op_alter_column(
     program: &Program,
     state: &mut ProgramState,
@@ -18252,35 +18133,24 @@ pub fn op_alter_column(
         definition,
         rename,
         rewritten_triggers,
-        renamed_index_methods,
     } = data.as_ref();
 
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
-    let (old_column_name, is_strict) = conn.with_schema(*db, |schema| {
+    let old_column_name = conn.with_schema(*db, |schema| {
         let table = schema
             .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
-        let old_column_name = table
+        table
             .get_column_at(*column_index)
             .expect("column being ALTERed should be in schema")
             .name
             .as_ref()
             .expect("column being ALTERed should be named")
-            .clone();
-        (old_column_name, table.is_strict())
+            .clone()
     });
-    let new_column = crate::schema::Column::from_definition(
-        definition,
-        FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
-    )?;
     let new_name = definition.col_name.as_str().to_owned();
-    let (domain_not_null, domain_checks) = if is_strict && !*rename {
-        conn.with_schema(*db, |schema| schema.column_domain_constraints(&new_column))?
-    } else {
-        (false, crate::alloc::vec![])
-    };
 
     let view_rewrites: Vec<(NamespaceRef, String, RewrittenView)> = if *rename {
         let target_db_name = conn.namespace_name(*db).ok_or_else(|| {
@@ -18346,162 +18216,10 @@ pub fn op_alter_column(
         Vec::new()
     };
 
+    // The altered table and its indexes are loaded again from sqlite_schema
+    // by the ParseSchema that follows. Here, update the other objects that
+    // name the column.
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
-        let (table_arc, indexes) = schema
-            .table_with_indices_mut(*namespace, &normalized_table_name)
-            .expect("table being ALTERed should be in schema");
-        let table = Arc::make_mut(table_arc);
-
-        let Table::BTree(ref mut btree_arc) = table else {
-            panic!("only btree tables can be altered");
-        };
-        let btree = Arc::make_mut(btree_arc);
-        let clears_autoincrement_sequence = !*rename
-            && btree.has_autoincrement
-            && btree
-                .columns()
-                .get(*column_index)
-                .is_some_and(|column| column.is_rowid_alias())
-            && !new_column.is_rowid_alias();
-
-        // Rename the key column before columns_mut(), whose drop rebuilds the
-        // WITHOUT ROWID key order from primary_key_columns by name.
-        for (pk_name, _ord) in &mut btree.primary_key_columns {
-            if pk_name.eq_ignore_ascii_case(&old_column_name) {
-                pk_name.clone_from(&new_name);
-            }
-        }
-
-        if *rename {
-            btree.columns_mut()[*column_index].name = Some(new_name.clone());
-
-            // Refresh the cached sql in generated columns
-            let column_count = btree.columns().len();
-            for i in 0..column_count {
-                let cols_view = btree.columns();
-                if let Some(new_sql) = cols_view[i]
-                    .generated_expr()
-                    .map(|expr| render_gencol_expr_sql_with_new_names(expr, cols_view))
-                    .transpose()?
-                {
-                    btree.columns_mut()[i].set_generated_original_sql(new_sql)
-                }
-            }
-        } else {
-            btree.columns_mut()[*column_index] = new_column.clone();
-        }
-
-        btree.prepare_generated_columns()?;
-
-        // Update this table's indexes that reference the old column.
-        for idx in indexes {
-            let idx = Arc::make_mut(idx);
-            for ic in &mut idx.columns {
-                if let Some(expr) = &mut ic.expr {
-                    rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
-                    if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
-                        ic.name = expr.to_string();
-                    }
-                }
-                if ic.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL {
-                    let table_column = btree
-                        .columns()
-                        .get(ic.pos_in_table)
-                        .expect("indexed column position should exist");
-                    if let Some(name) = &table_column.name {
-                        ic.name.clone_from(name);
-                    }
-                    ic.default.clone_from(&table_column.default);
-                    ic.expr = table_column
-                        .generated_expr()
-                        .map(|expr| Box::new(expr.clone()));
-                }
-            }
-            // Update partial index WHERE clause column references
-            if let Some(ref mut wc) = idx.where_clause {
-                rename_identifiers(wc, &old_column_name, &new_name);
-            }
-            if let Some((_, attachment)) = renamed_index_methods
-                .iter()
-                .find(|(name, _)| *name == idx.name)
-            {
-                idx.index_method = Some(attachment.clone());
-            }
-        }
-
-        // Update unique_sets to reflect the renamed column
-        for unique_set in &mut btree.unique_sets {
-            for unique_column in &mut unique_set.columns {
-                if unique_column.name.eq_ignore_ascii_case(&old_column_name) {
-                    unique_column.name.clone_from(&new_name);
-                }
-            }
-        }
-
-        // Update CHECK constraint expressions to reference the new column name
-        let old_col_normalized = normalize_ident(&old_column_name);
-        for check in &mut btree.check_constraints {
-            rename_identifiers(&mut check.expr, &old_col_normalized, &new_name);
-            // The captured source text no longer matches the rewritten
-            // expression.
-            check.source = None;
-            if let Some(ref mut col) = check.column {
-                if col.eq_ignore_ascii_case(&old_column_name) {
-                    col.clone_from(&new_name);
-                }
-            }
-        }
-
-        // Maintain rowid-alias bit after change/rename (INTEGER PRIMARY KEY)
-        if !*rename {
-            // recompute alias from `new_column`
-            btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
-            if clears_autoincrement_sequence {
-                btree.has_autoincrement = false;
-            }
-
-            btree
-                .check_constraints
-                .retain(|check| check.column.as_deref() != Some(new_name.as_str()));
-            for constraint in &definition.constraints {
-                if let ast::ColumnConstraint::Check { expr, source } = &constraint.constraint {
-                    btree
-                        .check_constraints
-                        .push(crate::schema::CheckConstraint::new(
-                            constraint.name.as_ref(),
-                            expr,
-                            source.as_deref(),
-                            Some(&new_name),
-                        ));
-                }
-            }
-            btree.check_constraints.extend(domain_checks);
-            if domain_not_null {
-                btree.columns_mut()[*column_index].set_notnull(true);
-            }
-        }
-
-        // Update this table's OWN foreign keys
-        for fk_arc in &mut btree.foreign_keys {
-            let fk = Arc::make_mut(fk_arc);
-            // child side: rename child column if it matches
-            for cc in &mut fk.child_columns {
-                if cc.eq_ignore_ascii_case(&old_column_name) {
-                    cc.clone_from(&new_name);
-                }
-            }
-            // parent side: if self-referencing, rename parent column too
-            if fk.parent_namespace == *namespace
-                && normalize_ident(&fk.parent_table) == normalized_table_name
-            {
-                for pc in &mut fk.parent_columns {
-                    if pc.eq_ignore_ascii_case(&old_column_name) {
-                        pc.clone_from(&new_name);
-                    }
-                }
-            }
-        }
-
         // fix OTHER tables, of any namespace, that reference this table as parent
         for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
             if child_namespace == *namespace && normalize_ident(tname) == normalized_table_name {
@@ -18547,28 +18265,6 @@ pub fn op_alter_column(
                     Ok(())
                 },
             )??;
-        }
-
-        if *db != crate::MAIN_DB_ID {
-            conn.with_schema(*db, |schema| -> crate::Result<()> {
-                let table = schema
-                    .get_table(*namespace, &normalized_table_name)
-                    .expect("table being ALTERed should be in schema");
-                let _column = table
-                    .get_column_at(*column_index)
-                    .expect("column being ALTERed should be in schema");
-                for (view_name, view) in schema.views(NamespaceId::ROOT) {
-                    let view_select_sql =
-                        select_from_view_sql(&conn, *db, schema, NamespaceId::ROOT, view_name);
-                    let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
-                        LimboError::ParseError(format!(
-                            "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
-                            old_column_name, view.sql,
-                        ))
-                    })?;
-                }
-                Ok(())
-            })?;
         }
     }
 

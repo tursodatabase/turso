@@ -40,7 +40,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorType, DmlColumnContext, ProgramBuilder},
-        insn::{to_u32, AddColumnData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
     LimboError, Numeric, Result, Value, ValueRef,
@@ -993,7 +993,8 @@ pub fn translate_alter_table(
                 }
             }
 
-            // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
+            // References in VIEWs are checked by the CheckViews instruction, after the
+            // table is loaded again without the column.
 
             // Like SQLite, re-validate ALL triggers after the drop. Any trigger whose
             // body references a nonexistent column (in the altered table or any other
@@ -1121,12 +1122,12 @@ pub fn translate_alter_table(
                         p5: 0,
                     });
 
-                    program.emit_insn(Insn::DropColumn {
+                    emit_reload_table(program, namespace, &btree.name, &mangled_table_name);
+                    program.emit_insn(Insn::CheckViews {
                         db: database_id,
                         namespace: namespace.id,
-                        table: btree.name.clone(),
-                        column_index: dropped_index,
-                    })
+                        error_prefix: format!("cannot drop column \"{column_name}\""),
+                    });
                 },
             )?;
             rewrite_rows_result?
@@ -1484,16 +1485,7 @@ pub fn translate_alter_table(
                         value: schema_version as i32 + 1,
                         p5: 0,
                     });
-                    program.emit_insn(Insn::AddColumn {
-                        data: Box::new(AddColumnData {
-                            db: database_id,
-                            namespace: namespace.id,
-                            table: table_name.to_owned(),
-                            column,
-                            check_constraints: btree.check_constraints.to_vec(),
-                            foreign_keys: btree.foreign_keys.to_vec(),
-                        }),
-                    });
+                    emit_reload_table(program, namespace, &btree.name, &mangled_table_name);
                 },
             )?
         }
@@ -1790,18 +1782,15 @@ pub fn translate_alter_table(
                 )));
             };
 
-            // Built here so a name an index method cannot use fails before anything is written
             let old_column_name = btree.columns()[column_index]
                 .name
                 .as_deref()
                 .expect("column being ALTERed should be named");
-            let mut renamed_index_methods = Vec::new();
+            // Fail before anything is written if an index method cannot use the
+            // new name. The renamed index itself is loaded from its rewritten SQL.
             for index in &table_indexes {
-                let Some(index_method) = &index.index_method else {
-                    continue;
-                };
-                if let Some(attachment) = index_method.rename_column(old_column_name, col_name)? {
-                    renamed_index_methods.push((index.name.clone(), attachment));
+                if let Some(index_method) = &index.index_method {
+                    index_method.check_rename_column(old_column_name, col_name)?;
                 }
             }
 
@@ -2343,13 +2332,45 @@ pub fn translate_alter_table(
                     definition,
                     rename,
                     rewritten_triggers: triggers_to_rewrite,
-                    renamed_index_methods,
                 }),
             });
+            emit_reload_table(
+                program,
+                namespace,
+                &original_btree.name,
+                &mangled_table_name,
+            );
+            if rename && database_id != crate::MAIN_DB_ID {
+                program.emit_insn(Insn::CheckViews {
+                    db: database_id,
+                    namespace: NamespaceId::ROOT,
+                    error_prefix: format!("cannot rename column \"{old_column_name}\""),
+                });
+            }
         }
     };
 
     Ok(())
+}
+
+/// Replace `table_name` and its indexes in the connection's schema with the
+/// ones described by their sqlite_schema rows, which the ALTER TABLE statement
+/// has rewritten by this point.
+fn emit_reload_table(
+    program: &mut ProgramBuilder,
+    namespace: NamespaceRef,
+    table_name: &str,
+    mangled_table_name: &str,
+) {
+    let escaped_table_name = escape_sql_string_literal(mangled_table_name);
+    program.emit_insn(Insn::ParseSchema {
+        db: namespace.database_id,
+        where_clause: Some(format!(
+            "tbl_name = '{escaped_table_name}' COLLATE NOCASE AND type != 'trigger'"
+        )),
+        trigger_target_database_id: None,
+        reloaded_table: Some((namespace.id, table_name.to_string())),
+    });
 }
 
 /// Reject ALTER TABLE on a plain or materialized view with SQLite's messages
