@@ -4,6 +4,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
@@ -85,8 +86,11 @@ impl TursoPgServer {
     /// Accepts clients on `listener` until the server is interrupted. Each
     /// client gets its own session, with its own transaction and settings.
     pub async fn serve(&self, listener: TcpListener) -> anyhow::Result<()> {
+        let mut io_tasks = tokio::task::JoinSet::new();
+        io_tasks.spawn(poll_io(self.db.io.clone()));
         loop {
             tokio::select! {
+                Some(result) = io_tasks.join_next() => return Ok(result??),
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
@@ -133,7 +137,17 @@ impl TursoPgServer {
             }
         }
 
+        io_tasks.shutdown().await;
         Ok(())
+    }
+}
+
+async fn poll_io(io: Arc<dyn turso_core::IO>) -> turso_core::Result<()> {
+    let mut timer = tokio::time::interval(Duration::from_millis(1));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        io.step()?;
     }
 }
 
@@ -187,10 +201,10 @@ impl SimpleQueryHandler for TursoPgHandler {
             let mut stmt = conn.prepare(sql).map_err(pg_error)?;
 
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                responses.push(execute_non_query(&mut stmt, sql)?);
+                responses.push(execute_non_query(&mut stmt, sql).await?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                responses.push(execute_query(&mut stmt, header)?);
+                responses.push(execute_query(&mut stmt, header).await?);
             }
         }
 
@@ -264,10 +278,7 @@ where
     PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
 {
     let mut stmt = conn.prepare_copy_to_stdout(copy).map_err(pg_error)?;
-    let mut has_row = stmt
-        .run_one_step_blocking(|| Ok(()), || Ok(()))
-        .map_err(pg_error)?
-        .is_some();
+    let mut has_row = next_copy_row(&mut stmt).await?;
     let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
     let column_count = i16::try_from(fields.len())
         .map_err(|error| PgWireError::UserError(Box::new(error_info(&error.to_string()))))?;
@@ -285,15 +296,35 @@ where
             .send(PgWireBackendMessage::CopyData(CopyData::new(data.into())))
             .await?;
         row_count += 1;
-        has_row = stmt
-            .run_one_step_blocking(|| Ok(()), || Ok(()))
-            .map_err(pg_error)?
-            .is_some();
+        has_row = next_copy_row(&mut stmt).await?;
     }
     client
         .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
         .await?;
     send_execution_response(client, Tag::new("COPY").with_rows(row_count)).await
+}
+
+async fn next_copy_row(stmt: &mut turso_pg::Statement) -> PgWireResult<bool> {
+    loop {
+        match stmt.step().map_err(pg_error)? {
+            turso_core::StepResult::Done => return Ok(false),
+            turso_core::StepResult::Row => return Ok(true),
+            turso_core::StepResult::IO
+            | turso_core::StepResult::Yield
+            | turso_core::StepResult::Sleep { .. } => {
+                let completion = stmt.take_io_completions().unwrap_or_else(|| {
+                    turso_core::types::IOCompletions(turso_core::Completion::new_yield())
+                });
+                wait_for_io(completion).await?;
+            }
+            turso_core::StepResult::Interrupt => {
+                return Err(pg_error(turso_core::LimboError::Interrupt.into()));
+            }
+            turso_core::StepResult::Busy => {
+                return Err(pg_error(turso_core::LimboError::Busy.into()));
+            }
+        }
+    }
 }
 
 fn encode_copy_row(row: &turso_core::Row, fields: Arc<Vec<FieldInfo>>) -> PgWireResult<Vec<u8>> {
@@ -385,11 +416,11 @@ impl ExtendedQueryHandler for TursoPgHandler {
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
+            return execute_non_query(&mut stmt, query).await;
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-        execute_query(&mut stmt, header)
+        execute_query(&mut stmt, header).await
     }
 
     async fn do_describe_statement<C>(
@@ -532,38 +563,57 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 }
 
 /// Execute a query that returns rows and build a Query response.
-fn execute_query(
+async fn execute_query(
     stmt: &mut turso_pg::Statement,
     header: Arc<Vec<FieldInfo>>,
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
 
-    stmt.run_with_row_callback(|row| {
-        let mut encoder = DataRowEncoder::new(header_clone.clone());
-        for (i, val) in row.get_values().enumerate() {
-            let pg_type = header_clone
-                .get(i)
-                .map(|fi| fi.datatype().clone())
-                .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
+    loop {
+        match stmt
+            .run_with_row_callback_nonblock(|row| {
+                let mut encoder = DataRowEncoder::new(header_clone.clone());
+                for (i, val) in row.get_values().enumerate() {
+                    let pg_type = header_clone
+                        .get(i)
+                        .map(|fi| fi.datatype().clone())
+                        .unwrap_or(Type::TEXT);
+                    encode_value(&mut encoder, val, &pg_type)?;
+                }
+                rows.push(encoder.finish());
+                Ok(())
+            })
+            .map_err(pg_error)?
+        {
+            turso_core::IOResult::Done(()) => break,
+            turso_core::IOResult::IO(io) => wait_for_io(io).await?,
         }
-        rows.push(encoder.finish());
-        Ok(())
-    })
-    .map_err(pg_error)?;
+    }
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
-fn execute_non_query(stmt: &mut turso_pg::Statement, query: &str) -> PgWireResult<Response> {
-    stmt.run_ignore_rows().map_err(pg_error)?;
+async fn execute_non_query(stmt: &mut turso_pg::Statement, query: &str) -> PgWireResult<Response> {
+    loop {
+        match stmt.run_ignore_rows_nonblock().map_err(pg_error)? {
+            turso_core::IOResult::Done(()) => break,
+            turso_core::IOResult::IO(io) => wait_for_io(io).await?,
+        }
+    }
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
     Ok(Response::Execution(tag))
+}
+
+async fn wait_for_io(completion: turso_core::types::IOCompletions) -> PgWireResult<()> {
+    if completion.is_explicit_yield() {
+        tokio::task::yield_now().await;
+    }
+    completion.0.await.map_err(|error| pg_error(error.into()))
 }
 
 /// Extract parameters from a Portal and bind them to a prepared statement.

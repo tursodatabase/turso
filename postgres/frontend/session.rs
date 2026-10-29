@@ -1,11 +1,13 @@
 use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::num::NonZero;
 use std::str;
 use std::sync::Arc;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::sqlstate_error;
+use crate::execution::{Batch, Execution, Plan, Sql};
 use crate::functions::{find_parameter, ConfigParameter, Parameter};
 use crate::settings::{ConnectionSettings, PgSessionState, SettingScope};
 use turso_core::schema::{Table, SEQ_BACKING_TABLE_PREFIX};
@@ -22,20 +24,18 @@ use turso_pg_parser::translator::{
     check_set_transaction, is_comment_on, is_discard_all, is_drop_matview, is_refresh_matview,
     is_reset_all, try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema,
     try_extract_set, try_extract_show, unnamed_index_name, unqualified_create_table_name_location,
-    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo, PgSetValue,
-    PgShowStmt, PostgreSQLTranslator,
+    PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo, PgSetValue, PgShowStmt,
+    PostgreSQLTranslator,
 };
 use turso_pg_parser::ParseError;
-
-use crate::copy::parse_copy_text_format;
 
 #[derive(Clone)]
 pub struct PgConnection {
     inner: Arc<PgConnectionInner>,
 }
 
-struct PgConnectionInner {
-    conn: Arc<Connection>,
+pub(crate) struct PgConnectionInner {
+    pub(crate) conn: Arc<Connection>,
 }
 
 const SEARCH_PATH_SETTING: &str = "search_path";
@@ -268,7 +268,10 @@ fn refuse_tables_in_no_schema(conn: &Arc<Connection>) -> Result<()> {
     Ok(())
 }
 
-fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crate::Statement> {
+pub(crate) fn prepare_statement(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+) -> Result<crate::Statement> {
     let sql = sql.trim();
     if sql.is_empty() {
         return Err(LimboError::InvalidArgument(
@@ -337,68 +340,20 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         .conn
         .prepare_translated_cmd(cmd.clone(), &sql)
         .map_err(schema_error)?;
-    let pg_conn = Arc::clone(pg_conn);
-    let prereqs = translated.prereqs;
-    let sql_owned = sql.into_owned();
-    Ok(crate::Statement::with_deferred(
+    Ok(crate::Statement::with_execution(
         inner,
-        Box::new(move |inner| {
-            execute_cmd_with_prereqs(&pg_conn, &prereqs, &cmd, &sql_owned, inner)
-        }),
+        Execution::new(
+            pg_conn.clone(),
+            Plan::Prerequisites {
+                statements: translated.prereqs,
+                main: Box::new(cmd),
+                input: sql.into_owned(),
+            },
+        ),
     ))
 }
 
-const PG_STMT_SAVEPOINT: &str = "__turso_pg_stmt";
-
-fn execute_cmd_with_prereqs(
-    pg_conn: &Arc<PgConnectionInner>,
-    prereqs: &[ast::Stmt],
-    cmd: &ast::Cmd,
-    sql: &str,
-    inner: &mut Statement,
-) -> Result<()> {
-    let conn = &pg_conn.conn;
-    if create_table_if_not_exists_target_present(conn, cmd)? {
-        *inner = conn
-            .prepare_translated_cmd(cmd.clone(), sql)
-            .map_err(schema_error)?;
-        return inner.run_ignore_rows();
-    }
-
-    let started_in_autocommit = conn.get_auto_commit();
-    let begin_sp = format!("SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-    let release_sp = format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-    execute_sqlite(conn, begin_sp)?;
-    let result = (|| {
-        for prereq in prereqs {
-            let input = prereq.to_string();
-            let mut stmt = conn
-                .prepare_translated_stmt(prereq.clone(), &input)
-                .map_err(schema_error)?;
-            stmt.run_ignore_rows()?;
-        }
-        *inner = conn
-            .prepare_translated_cmd(cmd.clone(), sql)
-            .map_err(schema_error)?;
-        inner.run_ignore_rows()
-    })();
-
-    match result {
-        Ok(()) => execute_sqlite(conn, release_sp),
-        Err(err) => {
-            if started_in_autocommit {
-                let _ = execute_sqlite(conn, "ROLLBACK");
-            } else {
-                let rollback_sp = format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-                let _ = execute_sqlite(conn, rollback_sp);
-                let _ = execute_sqlite(conn, release_sp);
-            }
-            Err(err)
-        }
-    }
-}
-
-fn create_table_if_not_exists_target_present(
+pub(crate) fn create_table_if_not_exists_target_present(
     conn: &Arc<Connection>,
     cmd: &ast::Cmd,
 ) -> Result<bool> {
@@ -421,20 +376,12 @@ fn create_table_if_not_exists_target_present(
     let Some(namespace) = relation_lookup_namespaces(conn, schema).into_iter().next() else {
         return Ok(false);
     };
-    let database = database_of(conn, &namespace);
-    let mut stmt = conn.prepare_sqlite(format!(
-        "SELECT EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
-         WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1)"
-    ))?;
-    stmt.bind_at(
-        NonZero::new(1).unwrap(),
-        Value::build_text(namespace.mangle_name(tbl_name.name.as_str())),
-    )?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(rows
-        .first()
-        .and_then(|row| row.first())
-        .is_some_and(|val| *val == Value::from_i64(1)))
+    let schema = conn.current_schema();
+    let name = tbl_name.name.as_str().to_lowercase();
+    Ok(schema.has_table(namespace.target.id, &name)
+        || schema
+            .views(namespace.target.id)
+            .any(|(view, _)| view == name))
 }
 
 /// `sql` with each table that a foreign key names replaced by the name the
@@ -775,19 +722,17 @@ fn try_prepare_special(
         try_extract_create_schema(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     {
         let inner = noop_statement(&pg_conn.conn)?;
-        let pg_conn = Arc::clone(pg_conn);
-        return Ok(Some(crate::Statement::with_deferred(
+        return Ok(Some(crate::Statement::with_execution(
             inner,
-            Box::new(move |_inner| handle_pg_create_schema(&pg_conn, &stmt)),
+            Execution::new(pg_conn.clone(), Plan::CreateSchema(stmt)),
         )));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
         let inner = noop_statement(&pg_conn.conn)?;
-        let conn = Arc::clone(&pg_conn.conn);
-        return Ok(Some(crate::Statement::with_deferred(
+        return Ok(Some(crate::Statement::with_execution(
             inner,
-            Box::new(move |_inner| handle_pg_drop_schema(&conn, &stmt)),
+            Execution::new(pg_conn.clone(), Plan::DropSchema(stmt)),
         )));
     }
 
@@ -803,14 +748,9 @@ fn try_prepare_special(
         try_extract_copy_from(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     {
         let inner = noop_statement(&pg_conn.conn)?;
-        let conn = Arc::clone(&pg_conn.conn);
-        return Ok(Some(crate::Statement::with_deferred(
+        return Ok(Some(crate::Statement::with_execution(
             inner,
-            Box::new(move |inner| {
-                let rows_inserted = handle_pg_copy_from(&conn, &stmt)?;
-                inner.set_n_change(rows_inserted as i64);
-                Ok(())
-            }),
+            Execution::new(pg_conn.clone(), Plan::Copy(stmt)),
         )));
     }
 
@@ -838,11 +778,6 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
     conn.prepare("SELECT 0 WHERE 0")
-}
-
-fn execute_sqlite(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-    let mut stmt = conn.prepare_sqlite(sql)?;
-    stmt.run_ignore_rows()
 }
 
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
@@ -1102,15 +1037,15 @@ fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra
         .padded_by(whitespace)
 }
 
-fn handle_pg_create_schema(
+pub(crate) fn create_schema_steps(
     pg_conn: &Arc<PgConnectionInner>,
     stmt: &PgCreateSchemaStmt,
-) -> Result<()> {
+) -> Result<Batch> {
     let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
     if conn.qualifier(&name).is_some() {
         if stmt.if_not_exists {
-            return Ok(());
+            return Ok(Batch::new(pg_conn.clone(), VecDeque::new(), false));
         }
         return Err(LimboError::ParseError(format!(
             "schema \"{name}\" already exists"
@@ -1131,42 +1066,35 @@ fn handle_pg_create_schema(
         ));
     }
 
-    conn.create_namespace(&name)?;
-    if stmt.elements.is_empty() {
-        return Ok(());
+    let mut steps = VecDeque::from([Sql::Namespace(ast::Stmt::CreateSchema {
+        name: ast::Name::exact(name.clone()),
+    })]);
+    if !stmt.elements.is_empty() {
+        let setting = search_path_setting(conn);
+        let mut search_path = turso_pg_parser::quote_identifier(&name);
+        let rest = setting.as_deref().unwrap_or(DEFAULT_SEARCH_PATH).trim();
+        if !rest.is_empty() {
+            search_path = format!("{search_path}, {rest}");
+        }
+        steps.push_back(Sql::SearchPath(search_path));
+        steps.extend(stmt.elements.iter().cloned().map(Sql::Frontend));
     }
-    let setting = search_path_setting(conn);
-    let mut search_path = turso_pg_parser::quote_identifier(&name);
-    let rest = setting.as_deref().unwrap_or(DEFAULT_SEARCH_PATH).trim();
-    if !rest.is_empty() {
-        search_path = format!("{search_path}, {rest}");
-    }
-    set_search_path(conn, Some(&search_path), SettingScope::Session)?;
-    let result = stmt.elements.iter().try_for_each(|sql| {
-        prepare_statement(pg_conn, sql)?
-            .run_ignore_rows()
-            .map_err(crate::Error::into_core_error)
-    });
-    set_search_path(conn, setting.as_deref(), SettingScope::Session)?;
-    if let Err(err) = result {
-        handle_pg_drop_schema(
-            conn,
-            &PgDropSchemaStmt {
-                name,
-                if_exists: false,
-                cascade: true,
-            },
-        )?;
-        return Err(err);
-    }
-    Ok(())
+    Ok(Batch::new(
+        pg_conn.clone(),
+        steps,
+        !stmt.elements.is_empty(),
+    ))
 }
 
-fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
+pub(crate) fn drop_schema_steps(
+    pg_conn: &Arc<PgConnectionInner>,
+    stmt: &PgDropSchemaStmt,
+) -> Result<Batch> {
+    let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
     if !schema_exists(conn, &name) {
         if stmt.if_exists {
-            return Ok(());
+            return Ok(Batch::new(pg_conn.clone(), VecDeque::new(), false));
         }
         return Err(LimboError::ParseError(format!(
             "schema \"{name}\" does not exist"
@@ -1181,24 +1109,14 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
         ));
     }
 
-    without_foreign_keys(conn, || {
-        for object in &objects {
-            execute_sqlite(conn, object.drop_sql(&name))?;
-        }
-        Ok(())
-    })?;
-    conn.drop_namespace(&name)
-}
-
-/// Runs `f` with foreign keys not enforced. DROP SCHEMA ... CASCADE drops
-/// the foreign keys of the tables that it drops along with the tables, so
-/// they must not stop the drops or delete rows.
-fn without_foreign_keys(conn: &Arc<Connection>, f: impl FnOnce() -> Result<()>) -> Result<()> {
-    let enabled = conn.foreign_keys_enabled();
-    conn.set_foreign_keys_enabled(false);
-    let result = f();
-    conn.set_foreign_keys_enabled(enabled);
-    result
+    let mut steps: VecDeque<_> = objects
+        .iter()
+        .map(|object| Sql::DropObject(object.drop_sql(&name)))
+        .collect();
+    steps.push_back(Sql::Namespace(ast::Stmt::DropSchema {
+        name: ast::Name::exact(name),
+    }));
+    Ok(Batch::new(pg_conn.clone(), steps, false))
 }
 
 /// An object of a schema, which DROP SCHEMA ... CASCADE drops.
@@ -1284,85 +1202,11 @@ fn schema_exists(conn: &Connection, schema_name: &str) -> bool {
         .is_some_and(|namespace| !namespace.is_database())
 }
 
-fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
-    let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
-        LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
-    })?;
-
-    let table_name = match &stmt.schema_name {
-        Some(schema) => format!("\"{schema}\".\"{}\"", stmt.table_name),
-        None => format!("\"{}\"", stmt.table_name),
-    };
-    let column_names = get_table_columns(conn, &stmt.table_name, stmt.schema_name.as_deref())?;
-    if column_names.is_empty() {
-        return Err(LimboError::ParseError(format!(
-            "COPY FROM: table '{}' not found or has no columns",
-            stmt.table_name
-        )));
-    }
-
-    let (insert_cols, num_columns) = match &stmt.columns {
-        Some(cols) => {
-            let col_list = cols
-                .iter()
-                .map(|c| format!("\"{c}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            (format!(" ({col_list})"), cols.len())
-        }
-        None => (String::new(), column_names.len()),
-    };
-
-    let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
-    let insert_sql = format!("INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})");
-
-    let delimiter = stmt
-        .delimiter
-        .as_ref()
-        .and_then(|d| d.chars().next())
-        .unwrap_or('\t');
-    let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
-
-    let rows = parse_copy_text_format(&data, delimiter, null_string, num_columns, stmt.header)?;
-
-    let rows_inserted = rows.len();
-    let mut begin = conn.prepare_sqlite("BEGIN CONCURRENT")?;
-    begin.run_ignore_rows()?;
-
-    let result = (|| {
-        let mut insert_stmt = conn.prepare_sqlite(&insert_sql)?;
-        for row in &rows {
-            for (i, val) in row.iter().enumerate() {
-                let index = NonZero::new(i + 1).unwrap();
-                match val {
-                    Some(s) => insert_stmt.bind_at(index, Value::build_text(s.clone()))?,
-                    None => insert_stmt.bind_at(index, Value::Null)?,
-                }
-            }
-            insert_stmt.run_ignore_rows()?;
-            insert_stmt.reset()?;
-            insert_stmt.clear_bindings();
-        }
-
-        let mut commit = conn.prepare_sqlite("COMMIT")?;
-        commit.run_ignore_rows()?;
-        Ok(rows_inserted)
-    })();
-
-    if result.is_err() {
-        if let Ok(mut rollback) = conn.prepare_sqlite("ROLLBACK") {
-            let _ = rollback.run_ignore_rows();
-        }
-    }
-
-    result
-}
-
-fn get_table_columns(
+pub(crate) fn prepare_table_columns(
     conn: &Arc<Connection>,
     table_name: &str,
     schema_name: Option<&str>,
-) -> Result<Vec<String>> {
+) -> Result<Statement> {
     // The pragma runs as an engine statement, without the search path, so
     // a table named without a schema is looked up here, as a query would.
     let schema = match schema_name {
@@ -1377,19 +1221,15 @@ fn get_table_columns(
             })
             .map(|namespace| namespace.name),
     };
+    let table_name = table_name.replace('\'', "''");
     let sql = match schema {
-        Some(schema) => format!("PRAGMA \"{schema}\".table_info('{table_name}')"),
+        Some(schema) => format!(
+            "PRAGMA {}.table_info('{table_name}')",
+            turso_pg_parser::quote_identifier(&schema)
+        ),
         None => format!("PRAGMA table_info('{table_name}')"),
     };
-    let mut stmt = conn.prepare_internal(&sql)?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| match row.get(1) {
-            Some(Value::Text(t)) => Some(t.as_str().to_string()),
-            _ => None,
-        })
-        .collect())
+    conn.prepare_sqlite(&sql)
 }
 
 #[cfg(test)]
