@@ -1282,6 +1282,21 @@ expect {
     index constant|1
 }
 
+# coalesce(c, c) > 4 compares stored values: -c > -4, which holds for c = 1.
+# An index on coalesce(c, c) holds the decoded values 1, 5, 10 and would find
+# 5 and 10 instead, so the query scans t.
+@requires strict "uses STRICT tables"
+test cmp-expression-index-unused-when-expression-is-encoded {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 5), (3, 10);
+    CREATE INDEX i ON t(coalesce(c, c));
+    SELECT id FROM t WHERE coalesce(c, c) > 4;
+}
+expect {
+    1
+}
+
 # A value compared with a date column goes through the date's ENCODE, so a
 # malformed date fails the same way in a table scan and in an index search.
 @requires strict "uses STRICT tables"
