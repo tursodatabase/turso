@@ -1,7 +1,9 @@
 use super::*;
 use crate::alloc::TursoSliceExt;
 use crate::schema::{ResolvedType, Schema};
+use crate::translate::expr::expr_type::compound_column_type;
 use crate::translate::expr_context::ExprContext;
+use crate::translate::plan::SelectPlan;
 use std::borrow::Borrow;
 
 /// Get the effective type name of a literal expression.
@@ -679,6 +681,19 @@ pub(crate) fn column_stored_form(
         return Ok(None);
     }
     Ok(Some(stored))
+}
+
+/// The type whose stored form column `column` of a compound SELECT sorts in,
+/// where `arms` are its SELECTs. It is the column's type as a query over the
+/// compound sees it, so ORDER BY on the compound sorts as ORDER BY on the
+/// compound used as a subquery.
+pub(crate) fn compound_column_stored_form(
+    arms: &[&SelectPlan],
+    column: usize,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    let ty = compound_column_type(arms.iter().copied(), column, resolver);
+    stored_form_type(&ty, resolver.schema())
 }
 
 /// The type whose stored form a value of type `ty` compares in. A domain
