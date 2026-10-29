@@ -5222,7 +5222,7 @@ fn test_plain_vacuum_rejects_active_statement(tmp_db: TempDatabase) -> anyhow::R
     let err = conn.execute("VACUUM").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Transaction error: cannot VACUUM - SQL statements in progress",
+        "cannot VACUUM - SQL statements in progress",
         "unexpected error: {err}"
     );
 
@@ -6281,7 +6281,7 @@ fn test_mvcc_plain_vacuum_requires_checkpointed_image() -> anyhow::Result<()> {
     let err = conn.execute("VACUUM").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Transaction error: cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first",
+        "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first",
         "MVCC VACUUM must reject uncheckpointed logical changes"
     );
 

@@ -82,7 +82,7 @@ pub enum LimboError {
     ConversionError(String),
     #[error("Env variable error: {0}")]
     EnvVarError(#[from] std::env::VarError),
-    #[error("Transaction error: {0}")]
+    #[error("{0}")]
     TxError(String),
     #[error(transparent)]
     CompletionError(#[from] CompletionError),
