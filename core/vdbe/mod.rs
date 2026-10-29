@@ -2010,6 +2010,16 @@ impl ProgramState {
         self.fk_immediate_violations_during_stmt
             .fetch_add(v, Ordering::AcqRel);
     }
+
+    /// Gives this state the immediate foreign key violations counted by
+    /// `other`. A trigger or foreign key action shares the count of the
+    /// statement that runs it, as SQLite's frames share `nFkConstraint`.
+    pub(crate) fn copy_fk_immediate_violations_from(&mut self, other: &ProgramState) {
+        *self.fk_immediate_violations_during_stmt.get_mut() =
+            other.get_fk_immediate_violations_during_stmt();
+        self.fk_immediate_violation
+            .clone_from(&other.fk_immediate_violation);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

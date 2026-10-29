@@ -8,7 +8,10 @@ use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 use crate::{
     index_method::IndexMethodAttachment,
     parameters::Parameters,
-    schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
+    schema::{
+        BTreeTable, Column, ColumnLayout, ForeignKey, Index, PseudoCursorType, Schema, Table,
+        Trigger,
+    },
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
@@ -268,6 +271,9 @@ pub struct ProgramBuilder {
     views_being_expanded: Vec<(usize, String)>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
+    /// If this ProgramBuilder is building the action program of a foreign
+    /// key, such as its ON DELETE CASCADE, that foreign key.
+    pub fk_action_of: Option<Arc<ForeignKey>>,
     pub table_reference_counter: TableRefIdCounter,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
@@ -803,6 +809,7 @@ impl ProgramBuilder {
             flags: ProgramBuilderFlags::new(is_subprogram),
             emitted_function_call: false,
             trigger,
+            fk_action_of: None,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
             cursor_overrides: Vec::new(),

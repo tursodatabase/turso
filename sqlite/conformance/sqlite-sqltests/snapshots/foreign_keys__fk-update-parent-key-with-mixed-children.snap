@@ -14,7 +14,7 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode             p1  p2  p3  p4                 p5  comment
-   0  Init                0  65   0                      0  Start at 65
+   0  Init                0  68   0                      0  Start at 68
    1  OpenEphemeral       0   1   0                      0  cursor=0 is_table=true
    2  OpenRead            1   2   0  k(2,B,B)            0  table=parent, root=2, iDb=0
    3    SeekRowid         1   2   7                      0  if (r[2]!=cursor 1 for table parent.rowid) goto 7
@@ -23,9 +23,9 @@ addr  opcode             p1  p2  p3  p4                 p5  comment
    6    Insert            0   3   1  ephemeral_scratch   6  intkey=r[1] data=r[3]
    7    OpenWrite         1   2   0                      0  root=2; iDb=0
    8    OpenWrite         2   3   0                      0  root=3; iDb=0
-   9    Rewind            0  64   0                      0  Rewind table ephemeral(ephemeral_scratch)
+   9    Rewind            0  67   0                      0  Rewind table ephemeral(ephemeral_scratch)
   10      RowId           0   5   0                      0  r[5]=ephemeral(ephemeral_scratch).rowid
-  11      NotExists       1  63   5                      0
+  11      NotExists       1  66   5                      0
   12      Null            0   6   0                      0  r[6]=NULL
   13      Column          1   1   8                      0  r[8]=parent.k
   14      Add             8   9   7                      0  r[7]=r[8]+r[9]
@@ -43,7 +43,7 @@ addr  opcode             p1  p2  p3  p4                 p5  comment
   26      Halt         2067   0   0  parent.k            0
   27      Column          1   1  15                      0  r[15]=parent.k
   28      Copy            7  16   0                      0  r[16]=r[7]
-  29      Eq             15  16  50  Binary              0  if r[15]==r[16] goto 50
+  29      Eq             15  16  53  Binary              0  if r[15]==r[16] goto 53
   30      Goto            0  31   0                      0
   31      IsNull         15  41   0                      0  if (r[15]==NULL) goto 41
   32      OpenRead        3   4   0  k(2,B,B)            0  =child_no_action, root=4, iDb=0
@@ -55,34 +55,37 @@ addr  opcode             p1  p2  p3  p4                 p5  comment
   38        FkCounter     1   0   0                      0
   39      Next            3  34   0                      0
   40      Close           3   0   0                      0
-  41      IsNull         16  50   0                      0  if (r[16]==NULL) goto 50
-  42      OpenRead        4   4   0  k(2,B,B)            0  =child_no_action, root=4, iDb=0
-  43      Rewind          4  49   0                      0  Rewind  child_no_action
-  44        Column        4   1  18                      0  r[18]=child_no_action.pk
-  45        IsNull       18  48   0                      0  if (r[18]==NULL) goto 48
-  46        Eq           18  16  48  Binary              0  if r[18]==r[16] goto 48
-  47        Goto          0  48   0                      0
-  48      Next            4  44   0                      0
-  49      Close           4   0   0                      0
-  50      Column          1   1  19                      0  r[19]=parent.k
-  51      RowId           1  20   0                      0  r[20]=parent.rowid
-  52      IdxDelete       2  19   2                      1
-  53      IdxInsert       2   4  12                      2  key=r[4]
-  54      MakeRecord      6   2  21                      0  r[21]=mkrec(r[6..7])
-  55      NotExists       1  63   5                      0
-  56      Delete          1   0   0  parent              0
-  57      Insert          1  21   5  parent             11  intkey=r[5] data=r[21]
-  58      Copy           11  22   0                      0  r[22]=r[11]
-  59      Copy            7  23   0                      0  r[23]=r[7]
-  60      Eq             22  23  63  Binary              0  if r[22]==r[23] goto 63
-  61      Goto            0  62   0                      0
-  62      Program        22  63   2  fk cascade update   0  subprogram=fk cascade update
-  63    Next              0  10   0                      1
-  64    Halt              0   0   0                      0
-  65    Transaction       0   2   3                      0  iDb=0 tx_mode=Write
-  66    Integer           1   2   0                      0  r[2]=1
-  67    Integer           1   9   0                      0  r[9]=1
-  68    Goto              0   1   0                      0
+  41      IsNull         16  53   0                      0  if (r[16]==NULL) goto 53
+  42      FkIfZero       53   0   0                      0
+  43      OpenRead        4   4   0  k(2,B,B)            0  =child_no_action, root=4, iDb=0
+  44      Rewind          4  52   0                      0  Rewind  child_no_action
+  45        Column        4   1  18                      0  r[18]=child_no_action.pk
+  46        IsNull       18  51   0                      0  if (r[18]==NULL) goto 51
+  47        Eq           18  16  49  Binary              0  if r[18]==r[16] goto 49
+  48        Goto          0  51   0                      0
+  49        FkIfZero     51   0   0                      0
+  50        FkCounter    -1   0   0                      0
+  51      Next            4  45   0                      0
+  52      Close           4   0   0                      0
+  53      Column          1   1  19                      0  r[19]=parent.k
+  54      RowId           1  20   0                      0  r[20]=parent.rowid
+  55      IdxDelete       2  19   2                      1
+  56      IdxInsert       2   4  12                      2  key=r[4]
+  57      MakeRecord      6   2  21                      0  r[21]=mkrec(r[6..7])
+  58      NotExists       1  66   5                      0
+  59      Delete          1   0   0  parent              0
+  60      Insert          1  21   5  parent             11  intkey=r[5] data=r[21]
+  61      Copy           11  22   0                      0  r[22]=r[11]
+  62      Copy            7  23   0                      0  r[23]=r[7]
+  63      Eq             22  23  66  Binary              0  if r[22]==r[23] goto 66
+  64      Goto            0  65   0                      0
+  65      Program        22  66   2  fk cascade update   0  subprogram=fk cascade update
+  66    Next              0  10   0                      1
+  67    Halt              0   0   0                      0
+  68    Transaction       0   2   3                      0  iDb=0 tx_mode=Write
+  69    Integer           1   2   0                      0  r[2]=1
+  70    Integer           1   9   0                      0  r[9]=1
+  71    Goto              0   1   0                      0
    0    Init              0   1   0                      0  Start at 1
    1    OpenWrite         0   5   0                      0  root=5; iDb=0
    2    Rewind            0  24   0                      0  Rewind table child_cascade

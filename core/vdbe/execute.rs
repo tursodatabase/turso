@@ -3892,7 +3892,10 @@ pub fn halt(
 
     // Check for immediate foreign key violations.
     // Any immediate violation causes the statement subtransaction to roll back.
-    if program.connection.foreign_keys_enabled()
+    // A subprogram hands its count to the statement that runs it, which
+    // checks it when it ends, so a later row can still repair the violation.
+    if !program.is_trigger_subprogram()
+        && program.connection.foreign_keys_enabled()
         && state.get_fk_immediate_violations_during_stmt() > 0
     {
         return Err(state.immediate_foreign_key_error().into());
@@ -6120,6 +6123,7 @@ pub fn op_program(
                         .expect("param_idx + 1 should be non-zero");
                     statement.bind_at(param_index, value)?;
                 }
+                statement.copy_fk_immediate_violations_from_parent(state);
 
                 *state.active_op_state.program() = OpProgramState::Step {
                     is_trigger,
@@ -6209,6 +6213,7 @@ pub fn op_program(
                         }
                     }
                 }
+                statement.copy_fk_immediate_violations_to_parent(state);
                 finish_subprogram(
                     program,
                     &statement,
