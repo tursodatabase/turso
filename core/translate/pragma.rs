@@ -869,7 +869,7 @@ fn update_pragma(
             Some(value),
             pager,
             connection,
-            database_id,
+            namespace,
             schema_was_explicit,
             program,
         ),
