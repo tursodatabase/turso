@@ -904,13 +904,33 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
                 params: Vec::new(),
             }
         }
-        // Mixed with anything else, including another custom type, a custom value
-        // is a value of the type it is stored as: coalesce(smallint_column, 0) and
-        // coalesce(smallint_column, bigint_column) are integers.
+        // Mixed with anything else, a custom type that does not compare in
+        // numeric order is a value of the type it is stored as:
+        // coalesce(smallint_column, 0) is an integer, and
+        // coalesce(numeric_column, bigint_column) is a numeric.
+        (a, b) if lacks_numeric_order(&a) || lacks_numeric_order(&b) => common_scalar_type(
+            stored_type_unless_numeric_order(a, schema),
+            stored_type_unless_numeric_order(b, schema),
+            schema,
+        ),
+        // Two different types in numeric order.
         (ExprType::Custom { type_def, .. }, other) | (other, ExprType::Custom { type_def, .. }) => {
             common_scalar_type(stored_type(&type_def, schema), other, schema)
         }
         _ => ExprType::Builtin(BuiltinType::Any),
+    }
+}
+
+fn lacks_numeric_order(ty: &ExprType) -> bool {
+    matches!(ty, ExprType::Custom { type_def, .. } if type_def.ordering() != Some(TypeOrdering::Numeric))
+}
+
+fn stored_type_unless_numeric_order(ty: ExprType, schema: &Schema) -> ExprType {
+    match &ty {
+        ExprType::Custom { type_def, .. } if lacks_numeric_order(&ty) => {
+            stored_type(type_def, schema)
+        }
+        _ => ty,
     }
 }
 

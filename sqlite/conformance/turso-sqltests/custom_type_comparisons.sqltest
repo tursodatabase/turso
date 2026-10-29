@@ -67,6 +67,25 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-compound-with-bigint-compares-as-numeric {
+    -- bigint is stored as an integer, so mixed with numeric it is a numeric too.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    CREATE TABLE b(k bigint) STRICT;
+    INSERT INTO a VALUES (9.5), (10);
+    INSERT INTO b VALUES (10), (100);
+    SELECT x FROM (SELECT n x FROM a UNION ALL SELECT k FROM b) WHERE x > 9.6 ORDER BY x;
+    SELECT max(x) FROM (SELECT n x FROM a UNION ALL SELECT k FROM b);
+    SELECT count(*) FROM (SELECT n FROM a UNION SELECT k FROM b);
+}
+expect {
+    10.00
+    10
+    100
+    100
+    3
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-compound-with-real-compares-as-numeric {
     -- A real mixed with numeric is a numeric, so 1.50 and 2.5 are both below 9.5.
     CREATE TABLE a(n numeric(10,2)) STRICT;
