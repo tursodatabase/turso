@@ -1075,35 +1075,35 @@ fn result_column_strict_type(
     strict_column_type(type_of(expr, &env))
 }
 
-/// The STRICT column type for values of type `ty`. A custom type keeps its
-/// arguments, and text without a type becomes TEXT.
+/// The STRICT column type for values of type `ty`, the type of an expression
+/// that is not a column of a STRICT table. A custom type without arguments
+/// keeps its name, and text without a type becomes TEXT.
 ///
-/// Any other type becomes ANY, so writes are not checked: a builtin type here
-/// is only how the values are stored, not their PostgreSQL type. A comparison
-/// or a boolean read through a view is an INTEGER, for example, and an INTEGER
-/// column would reject 't'. The same goes for a custom type that needs
-/// arguments it does not have, such as `numeric` from a UNION of numeric(5,2)
-/// and numeric(4,1).
+/// Any other type becomes ANY, so writes are not checked:
+/// - A builtin type here is only how the values are stored, not their
+///   PostgreSQL type. A comparison or a boolean read through a view is an
+///   INTEGER, for example, and an INTEGER column would reject 't'.
+/// - The arguments of a custom type come from a column the expression reads,
+///   not from the expression: `a || 'toolong'` on a varchar(3)[] column, or
+///   `n * 1000` on numeric(5,2), would not fit them.
 fn strict_column_type(ty: ExprType) -> ast::Type {
     let array_dimensions = ty.array_dimensions();
     let scalar = match ty {
         ExprType::Array { element, .. } => *element,
         scalar => scalar,
     };
-    let (name, size, array_dimensions) = match scalar {
+    let (name, array_dimensions) = match scalar {
         ExprType::Custom { type_def, params }
-            if type_def.is_domain || type_def.user_params().count() == params.len() =>
+            if type_def.is_domain || (params.is_empty() && type_def.user_params().count() == 0) =>
         {
-            (type_def.name.clone(), type_size(params), array_dimensions)
+            (type_def.name.clone(), array_dimensions)
         }
-        ExprType::Untyped | ExprType::Null if array_dimensions == 0 => {
-            ("TEXT".to_string(), None, 0)
-        }
-        _ => ("ANY".to_string(), None, 0),
+        ExprType::Untyped | ExprType::Null if array_dimensions == 0 => ("TEXT".to_string(), 0),
+        _ => ("ANY".to_string(), 0),
     };
     ast::Type {
         name,
-        size,
+        size: None,
         array_dimensions,
     }
 }

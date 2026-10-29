@@ -252,6 +252,16 @@ expect {
     2
 }
 
+test table-create-table-as-array-concatenation-drops-the-length-limit {
+    CREATE TABLE s (a varchar(3)[]);
+    INSERT INTO s VALUES ('{abc}');
+    CREATE TABLE dst AS SELECT a || 'toolong'::varchar AS x FROM s;
+    SELECT * FROM dst;
+}
+expect {
+    {abc,toolong}
+}
+
 test table-select-into-nested-rejected {
     SELECT * FROM (SELECT 1 INTO dst) sub;
 }
