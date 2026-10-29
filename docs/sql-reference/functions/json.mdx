@@ -572,8 +572,8 @@ SELECT * FROM json_each(json_text, path);
 | `value` | any | The value of the element, as JSON text for objects/arrays or as a SQL value for primitives |
 | `type` | TEXT | JSON type: `null`, `true`, `false`, `integer`, `real`, `text`, `array`, or `object` |
 | `atom` | any | The SQL value for primitives (NULL for arrays and objects) |
-| `id` | INTEGER | A sequential identifier for the element |
-| `parent` | INTEGER | The id of the parent element (NULL for top-level) |
+| `id` | INTEGER | The byte offset of the element in the JSONB form of the input (for an object member, the offset of its key), as in SQLite |
+| `parent` | INTEGER | The id of the containing element in `json_tree` (NULL for the top-level element, and always NULL in `json_each`) |
 | `fullkey` | TEXT | The full JSON path to this element |
 | `path` | TEXT | The JSON path to the parent of this element |
 

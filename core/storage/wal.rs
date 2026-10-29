@@ -528,6 +528,20 @@ trait WalCoordination: Debug + Send + Sync {
     /// Enumerate the latest visible frame per page in the requested frame range.
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)>;
 
+    fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
+        Ok(self.find_frame(page_id, min_frame, max_frame, frame_watermark))
+    }
+
+    fn try_iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Result<Vec<(u64, u64)>> {
+        Ok(self.iter_latest_frames(min_frame, max_frame))
+    }
+
     /// Read the current checkpoint epoch used to tag cached WAL pages.
     fn checkpoint_epoch(&self) -> u32;
 
@@ -699,6 +713,7 @@ pub trait Wal: Debug + Send + Sync {
     ///
     /// TursoDB uses `page_no` and `size_after` from the supplied header, applies
     /// any configured page transform to the body, and overwrites the checksum.
+    /// Returns an error if this connection does not hold the WAL write lock.
     fn write_frame_raw(
         &self,
         buffer_pool: Arc<BufferPool>,
@@ -2050,6 +2065,29 @@ impl WalCoordination for ShmWalCoordination {
             return self.fallback.iter_latest_frames(min_frame, max_frame);
         }
         self.authority.iter_latest_frames(min_frame, max_frame)
+    }
+
+    fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
+        if self.authority.frame_index_overflowed() {
+            return self
+                .fallback
+                .try_find_frame(page_id, min_frame, max_frame, frame_watermark);
+        }
+        self.authority
+            .try_find_frame(page_id, min_frame, max_frame, frame_watermark)
+    }
+
+    fn try_iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Result<Vec<(u64, u64)>> {
+        if self.authority.frame_index_overflowed() {
+            return self.fallback.try_iter_latest_frames(min_frame, max_frame);
+        }
+        self.authority.try_iter_latest_frames(min_frame, max_frame)
     }
 
     fn checkpoint_epoch(&self) -> u32 {
@@ -3694,9 +3732,9 @@ impl Wal for WalFile {
             min_frame,
             max_frame
         );
-        let frame = self
-            .coordination
-            .find_frame(page_id, min_frame, max_frame, frame_watermark);
+        let frame =
+            self.coordination
+                .try_find_frame(page_id, min_frame, max_frame, frame_watermark)?;
         if let Some(frame) = frame {
             tracing::debug!(
                 "find_frame(page_id={}, frame_watermark={:?}): found frame={}",
@@ -4012,6 +4050,11 @@ impl Wal for WalFile {
         page: &[u8],
         sync_type: FileSyncType,
     ) -> Result<()> {
+        if !self.holds_write_lock() {
+            return Err(LimboError::TxError(
+                "cannot write raw WAL frame without holding the WAL write lock".to_string(),
+            ));
+        }
         let Some(page_size) = PageSize::new(page.len() as u32) else {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
@@ -5023,7 +5066,7 @@ impl WalFile {
                         Vec::new()
                     } else {
                         self.coordination
-                            .iter_latest_frames(oc_min_frame, oc_max_frame)
+                            .try_iter_latest_frames(oc_min_frame, oc_max_frame)?
                     };
                     // sort by frame_id for read locality
                     to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
@@ -5830,9 +5873,7 @@ impl WalFileShared {
             return sqlite3_ondisk::build_shared_wal(&file, io);
         }
         if snapshot.max_frame > snapshot.nbackfills
-            && authority
-                .iter_latest_frames(0, snapshot.max_frame)
-                .is_empty()
+            && !authority.has_visible_frame(snapshot.max_frame)?
         {
             tracing::debug!(
                 max_frame = snapshot.max_frame,
@@ -6550,6 +6591,8 @@ pub mod test {
         }
         let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
         io.wait_for_completion(c).unwrap();
+        wal.begin_read_tx().unwrap();
+        wal.begin_write_tx(WalAutoActions::empty()).unwrap();
 
         (io, buffer_pool, wal)
     }

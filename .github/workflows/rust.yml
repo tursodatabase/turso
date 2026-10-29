@@ -365,6 +365,12 @@ jobs:
           - name: Faultless
             iterations: 10
             args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
+          - name: SavepointStress
+            iterations: 5
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile savepoint_stress --io-backend=memory"
+          - name: WriteStress
+            iterations: 4
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_stress --io-backend=memory"
           - name: IOUring InsertHeavySpill
             iterations: 5
             args: "--io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill"
@@ -465,7 +471,7 @@ jobs:
       matrix:
         # Each profile focuses a different workload so CI covers more than the
         # default statement distribution.
-        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins]
+        profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins, ordered-aggregates]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

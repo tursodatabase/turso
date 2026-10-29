@@ -662,8 +662,49 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test VACUUM INTO error cases: plain VACUUM, existing file, within
-/// transaction, and query_only mode.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER, path TEXT);")]
+fn test_vacuum_into_path_expression(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let dest_dir = TempDir::new()?;
+    let subquery_path = dest_dir.path().join("subquery.db");
+    let subquery_path_str = subquery_path.to_str().unwrap().to_string();
+    let concat_prefix = dest_dir.path().join("concat");
+    let concat_prefix_str = concat_prefix.to_str().unwrap();
+
+    conn.execute(format!(
+        "INSERT INTO t VALUES (42, '{}')",
+        escape_sqlite_string_literal(&subquery_path_str)
+    ))?;
+    conn.execute("VACUUM INTO (SELECT path FROM t)")?;
+    conn.execute(format!(
+        "VACUUM INTO '{}' || '.db'",
+        escape_sqlite_string_literal(concat_prefix_str)
+    ))?;
+    let parameter_path = dest_dir.path().join("parameter.db");
+    let mut stmt = conn.prepare("VACUUM INTO ?")?;
+    stmt.bind_at(
+        1.try_into()?,
+        Value::build_text(parameter_path.to_str().unwrap().to_string()),
+    )?;
+    stmt.run_ignore_rows()?;
+
+    for dest_path in [
+        subquery_path,
+        dest_dir.path().join("concat.db"),
+        parameter_path,
+    ] {
+        let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, tmp_db.db_opts);
+        let dest_conn = dest_db.connect_limbo();
+        assert_eq!(run_integrity_check(&dest_conn), "ok");
+        let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, path FROM t");
+        assert_eq!(rows, vec![(42, subquery_path_str.clone())]);
+    }
+
+    Ok(())
+}
+
+/// Test VACUUM INTO error cases: plain VACUUM, existing non-empty and empty
+/// files, within transaction, and query_only mode.
 #[turso_macros::test(mvcc)]
 fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -688,6 +729,14 @@ fn test_vacuum_into_error_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
         err_msg.contains("already exists") || err_msg.contains("output file"),
         "Error should mention file exists, got: {err_msg}"
     );
+
+    // 2b. VACUUM INTO an existing empty file should succeed
+    let empty_path = dest_dir.path().join("empty.db");
+    std::fs::write(&empty_path, b"")?;
+    conn.execute(format!("VACUUM INTO '{}'", empty_path.to_str().unwrap()))?;
+    let (_dest_db, dest_conn) = connect_existing_with_opts(&empty_path, tmp_db.db_opts);
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![(1,)]);
 
     // 3. VACUUM INTO within transaction should fail
     conn.execute("BEGIN")?;
@@ -1281,6 +1330,94 @@ fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result
         rows,
         vec![(1, "hello".to_string()), (2, "world".to_string())]
     );
+    Ok(())
+}
+
+/// PRAGMA page_size on an existing database leaves the source unchanged, but
+/// VACUUM INTO writes the output with the requested page size, like SQLite.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_uses_pending_page_size(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+    let dest_dir = TempDir::new()?;
+
+    for page_size in [1024, 8192, 65536] {
+        conn.execute(format!("PRAGMA page_size = {page_size}"))?;
+        let dest_path = dest_dir.path().join(format!("vacuumed_{page_size}.db"));
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+        let source_page_size: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
+        assert_eq!(source_page_size, vec![(4096,)]);
+
+        let dest_db = TempDatabase::new_with_existent(&dest_path);
+        let dest_conn = dest_db.connect_limbo();
+        let dest_page_size: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_size");
+        assert_eq!(dest_page_size, vec![(page_size,)]);
+        assert_eq!(run_integrity_check(&dest_conn), "ok");
+        let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t ORDER BY a");
+        assert_eq!(rows, vec![(1,), (2,), (3,)]);
+    }
+
+    // An invalid size replaces the earlier request, so the output keeps the source page size.
+    // 4294968320 is 2^32 + 1024: SQLite reads it as 0, not as 1024. SQLite reads 8.192e3
+    // from its leading digits, as 8.
+    for invalid_page_size in ["1000", "4294968320", "8.192e3"] {
+        conn.execute("PRAGMA page_size = 1024")?;
+        conn.execute(format!("PRAGMA page_size = {invalid_page_size}"))?;
+        let dest_path = dest_dir
+            .path()
+            .join(format!("vacuumed_{invalid_page_size}.db"));
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+        let dest_db = TempDatabase::new_with_existent(&dest_path);
+        let dest_page_size: Vec<(i64,)> = dest_db.connect_limbo().exec_rows("PRAGMA page_size");
+        assert_eq!(dest_page_size, vec![(4096,)]);
+    }
+    Ok(())
+}
+
+/// Like SQLite, VACUUM INTO uses 1024 instead of a requested 512 when the source has
+/// more than 32 reserved bytes, so the output keeps enough usable space per page.
+#[turso_macros::test]
+fn test_vacuum_into_pending_page_size_512_with_large_reserved_space(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let source_db = TempDatabase::new_empty();
+    let conn = source_db.connect_limbo();
+    conn.set_reserved_bytes(33)?;
+    conn.execute("CREATE TABLE t (a INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    conn.execute("PRAGMA page_size = 512")?;
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    let dest_page_size: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_size");
+    assert_eq!(dest_page_size, vec![(1024,)]);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    Ok(())
+}
+
+/// Like SQLite, an in-place VACUUM of a WAL database drops the pending page size,
+/// so a later VACUUM INTO keeps the source page size.
+#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_clears_pending_page_size(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("PRAGMA page_size = 1024")?;
+    conn.execute("VACUUM")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_page_size: Vec<(i64,)> = dest_db.connect_limbo().exec_rows("PRAGMA page_size");
+    assert_eq!(dest_page_size, vec![(4096,)]);
     Ok(())
 }
 
@@ -3668,7 +3805,7 @@ fn test_vacuum_into_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Resu
 #[test]
 fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let opts = turso_core::DatabaseOpts::new();
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 
@@ -3715,7 +3852,7 @@ fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
 #[test]
 fn test_vacuum_into_generated_column_with_rowid_and_deletes() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let opts = turso_core::DatabaseOpts::new();
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 
@@ -4121,8 +4258,7 @@ fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Resu
 /// Plain VACUUM must preserve generated column values.
 #[test]
 fn test_plain_vacuum_preserves_generated_columns() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new().with_generated_columns(true);
-    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
 
     conn.execute(
@@ -4180,6 +4316,53 @@ fn test_plain_vacuum_preserves_custom_types() -> anyhow::Result<()> {
     let reopened_rows: Vec<(i64, i64)> =
         reopened_conn.exec_rows("SELECT id, amount FROM t ORDER BY id");
     assert_eq!(reopened_rows, before_rows);
+
+    Ok(())
+}
+
+/// Plain VACUUM must copy array values as stored. Converting them to display
+/// text and back turned BLOB[] elements into TEXT and changed ANY[] element
+/// types.
+#[test]
+fn test_plain_vacuum_preserves_array_values() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB[], a ANY[], c cents[]) STRICT")?;
+    conn.execute(
+        "INSERT INTO t VALUES \
+         (1, ARRAY[], ARRAY[1, '1', x'01'], ARRAY[1, 2]), \
+         (2, ARRAY[x'cafe'], NULL, ARRAY[])",
+    )?;
+
+    let query = "SELECT id, hex(b), hex(a), hex(c), c FROM t ORDER BY id";
+    let before_rows: Vec<(i64, String, String, String, String)> = conn.exec_rows(query);
+    assert_eq!(
+        before_rows,
+        vec![
+            (
+                1,
+                "01".to_string(),
+                "04090F0E3101".to_string(),
+                "0301026400C8".to_string(),
+                "{1,2}".to_string()
+            ),
+            (
+                2,
+                "0210CAFE".to_string(),
+                String::new(),
+                "01".to_string(),
+                "{}".to_string()
+            ),
+        ]
+    );
+
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    let after_rows: Vec<(i64, String, String, String, String)> = conn.exec_rows(query);
+    assert_eq!(after_rows, before_rows);
 
     Ok(())
 }
@@ -5039,7 +5222,7 @@ fn test_plain_vacuum_rejects_active_statement(tmp_db: TempDatabase) -> anyhow::R
     let err = conn.execute("VACUUM").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Transaction error: cannot VACUUM - SQL statements in progress",
+        "cannot VACUUM - SQL statements in progress",
         "unexpected error: {err}"
     );
 
@@ -6098,7 +6281,7 @@ fn test_mvcc_plain_vacuum_requires_checkpointed_image() -> anyhow::Result<()> {
     let err = conn.execute("VACUUM").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Transaction error: cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first",
+        "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first",
         "MVCC VACUUM must reject uncheckpointed logical changes"
     );
 

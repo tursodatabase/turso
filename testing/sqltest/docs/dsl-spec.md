@@ -157,6 +157,18 @@ setup products {
 }
 ```
 
+### Setups for One Backend
+
+Put `@backend <name>` before a setup block to run the setup only on that backend.
+
+```sql
+@backend postgres
+setup auth_functions {
+    CREATE SCHEMA auth;
+    CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT NULL::uuid $$;
+}
+```
+
 ## File-Level Directives
 
 These directives apply to all tests and snapshots in the file.
@@ -257,6 +269,30 @@ The `expect` block can have modifiers:
 | `error` | Expect an error (optional pattern match) |
 | `pattern` | Match output against regex pattern |
 | `unordered` | Compare as sets (order doesn't matter) |
+
+### Expected SQLSTATE
+
+Put `@sqlstate <code>` on the line before an `expect error` block. The error must then have this SQLSTATE. The block can also give a pattern for the message. An empty block permits any message.
+
+```sql
+test missing-table {
+    SELECT * FROM missing;
+}
+@sqlstate 42P01
+expect error {
+    relation "missing" does not exist
+}
+@sqlstate 42P01
+expect @tursopg error {
+    no such table: missing
+}
+```
+
+Rules:
+
+- A SQLSTATE has 5 characters. Each character is `0-9` or `A-Z`.
+- `@sqlstate` applies only to the next `expect` block, and that block must be an `expect error` block. Put `@sqlstate` before each backend-specific block that must have the code.
+- Only the errors of the `tursopg` and `postgres` backends have a SQLSTATE. On other backends, a test that requires a SQLSTATE fails with an error.
 
 ### Output Format
 
@@ -541,7 +577,7 @@ database_decl   = "@database" database_spec NEWLINE
 database_spec   = ":memory:" | ":temp:" | ":default:" | ":default-no-rowidalias:" | PATH ["readonly"]
 
 setup_block     = "setup" IDENTIFIER block
-test_case       = { decorator } "test" IDENTIFIER block expect_block
+test_case       = { decorator } "test" IDENTIFIER block expect_item { expect_item }
 snapshot_case   = { decorator } "snapshot" IDENTIFIER block
 
 decorator       = "@setup" IDENTIFIER NEWLINE
@@ -556,7 +592,9 @@ skip_condition  = "mvcc"
 
 capability      = "trigger" | "strict" | "materialized_views"
 
-expect_block    = "expect" [expect_modifier] block
+expect_item     = [ "@sqlstate" SQLSTATE NEWLINE ] expect_block
+
+expect_block    = "expect" [ "@" IDENTIFIER ] [expect_modifier] block
 
 expect_modifier = "error" | "pattern" | "unordered"
 
@@ -564,6 +602,7 @@ block           = "{" { any_content } "}"
 
 IDENTIFIER      = [a-zA-Z_][a-zA-Z0-9_-]*
 STRING          = '"' { any_char } '"'
+SQLSTATE        = [0-9A-Z]{5}
 PATH            = [^\s]+
 NEWLINE         = '\n'
 ```
@@ -659,7 +698,7 @@ The lexer uses the [Logos](https://docs.rs/logos) crate (v0.16) for tokenization
 - **Block content extraction**: When `{` is encountered, a custom callback extracts all content until the matching `}`, handling nested braces. This allows arbitrary SQL and expected output without special escaping.
 
 - **Tokens**: The lexer produces these token types:
-  - Keywords: `@database`, `@setup`, `@skip`, `@skip-if`, `@skip-file`, `@skip-file-if`, `@requires`, `@requires-file`, `@backend`, `setup`, `test`, `expect`, `snapshot`
+  - Keywords: `@database`, `@setup`, `@skip`, `@skip-if`, `@skip-file`, `@skip-file-if`, `@requires`, `@requires-file`, `@backend`, `@sqlstate`, `setup`, `test`, `expect`, `snapshot`
   - Modifiers: `error`, `pattern`, `unordered`, `readonly`, `raw`
   - Skip conditions: `mvcc`, `sqlite`
   - Capabilities: `trigger`, `strict`, `materialized_views`
@@ -739,7 +778,7 @@ pub enum Expectation {
     Exact(Vec<String>),
     Pattern(String),
     Unordered(Vec<String>),
-    Error(Option<String>),
+    Error { sqlstate: Option<String>, pattern: Option<String> },
 }
 ```
 

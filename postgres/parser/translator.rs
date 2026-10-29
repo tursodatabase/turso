@@ -3,6 +3,11 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
+use crate::sqlstate::{
+    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_UNDEFINED_FUNCTION,
+    SQLSTATE_UNDEFINED_TABLE,
+};
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
@@ -48,19 +53,19 @@ impl PostgreSQLTranslator {
         } else {
             self.map_table_name(&range_var.relname)
         };
-        let name = ast::Name::from_string(mapped_name);
+        let name = exact_name(mapped_name);
         let alias = range_var
             .alias
             .as_ref()
             .filter(|a| !a.aliasname.is_empty())
-            .map(|a| ast::Name::from_string(&a.aliasname));
+            .map(|a| exact_name(&a.aliasname));
         let schema = if range_var.schemaname.is_empty() {
             is_catalog_table_name(name.as_str()).then_some("main")
         } else {
-            Some(map_schema_name(&range_var.schemaname))
+            Some(schema_qualifier(&range_var.schemaname)?)
         };
         let mut qn = match schema {
-            Some(schema) => ast::QualifiedName::fullname(ast::Name::from_string(schema), name),
+            Some(schema) => ast::QualifiedName::fullname(exact_name(schema), name),
             None => ast::QualifiedName::single(name),
         };
         qn.alias = alias;
@@ -94,6 +99,7 @@ impl PostgreSQLTranslator {
             | "pg_collation"
             | "pg_attrdef"
             | "pg_description"
+            | "pg_seclabels"
             | "pg_publication"
             | "pg_publication_namespace"
             | "pg_publication_rel"
@@ -243,7 +249,7 @@ impl PostgreSQLTranslator {
             order_by: vec![],
             limit: Some(ast::Limit {
                 expr: Box::new(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string("pg_lock_access_share"),
+                    name: exact_name("pg_lock_access_share"),
                     distinctness: None,
                     args: vec![],
                     order_by: vec![],
@@ -308,6 +314,29 @@ impl PostgreSQLTranslator {
         // Collect implicit sequence names for serial columns
         let mut serial_sequences: Vec<String> = Vec::new();
 
+        // Extract table name for serial sequence naming
+        let tbl_name_str = tbl_name.name.as_str().to_string();
+        let mut check_names = std::collections::HashSet::new();
+        for elt in &create.table_elts {
+            match &elt.node {
+                Some(Node::Constraint(c)) => {
+                    if !c.conname.is_empty() {
+                        check_names.insert(c.conname.clone());
+                    }
+                }
+                Some(Node::ColumnDef(col)) => {
+                    for constraint in &col.constraints {
+                        if let Some(Node::Constraint(c)) = &constraint.node {
+                            if !c.conname.is_empty() {
+                                check_names.insert(c.conname.clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Check for table-level PK (to suppress column-level PK emission)
         let mut has_table_pk = false;
         for elt in &create.table_elts {
@@ -330,27 +359,32 @@ impl PostgreSQLTranslator {
                         col_def,
                         has_table_pk,
                         &tbl_name,
-                        &relation.schemaname,
                         &mut serial_sequences,
+                        &mut check_names,
                     )?;
                     columns.push(col);
                 }
                 Node::Constraint(constraint) => {
-                    reject_constraint_attributes(constraint, &relation.schemaname)?;
+                    reject_constraint_attributes(constraint)?;
                     let contype =
                         ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
                     match contype {
                         ConstrType::ConstrPrimary => {
                             let pk_cols = extract_key_columns(&constraint.keys)?;
                             table_constraints.push(ast::NamedTableConstraint {
-                                name: None,
+                                name: if constraint.conname.is_empty() {
+                                    Some(exact_name(format!(
+                                        "{}_pkey",
+                                        bare_table_name(&tbl_name_str)
+                                    )))
+                                } else {
+                                    Some(exact_name(constraint.conname.clone()))
+                                },
                                 constraint: ast::TableConstraint::PrimaryKey {
                                     columns: pk_cols
                                         .into_iter()
                                         .map(|c| ast::SortedColumn {
-                                            expr: Box::new(ast::Expr::Id(ast::Name::from_string(
-                                                c,
-                                            ))),
+                                            expr: Box::new(ast::Expr::Id(exact_name(c))),
                                             order: None,
                                             nulls: None,
                                         })
@@ -363,14 +397,16 @@ impl PostgreSQLTranslator {
                         ConstrType::ConstrUnique => {
                             let unique_cols = extract_key_columns(&constraint.keys)?;
                             table_constraints.push(ast::NamedTableConstraint {
-                                name: None,
+                                name: if constraint.conname.is_empty() {
+                                    None
+                                } else {
+                                    Some(exact_name(constraint.conname.clone()))
+                                },
                                 constraint: ast::TableConstraint::Unique {
                                     columns: unique_cols
                                         .into_iter()
                                         .map(|c| ast::SortedColumn {
-                                            expr: Box::new(ast::Expr::Id(ast::Name::from_string(
-                                                c,
-                                            ))),
+                                            expr: Box::new(ast::Expr::Id(exact_name(c))),
                                             order: None,
                                             nulls: None,
                                         })
@@ -385,17 +421,20 @@ impl PostgreSQLTranslator {
                                 .push(self.pg_fk_to_table_constraint(&fk, &constraint.fk_attrs)?);
                         }
                         ConstrType::ConstrCheck => {
-                            let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
-                                ParseError::ParseError("CHECK constraint missing expression".into())
-                            })?;
-                            let expr = self.translate_expr(raw_expr)?;
-                            table_constraints.push(ast::NamedTableConstraint {
-                                name: None,
-                                constraint: ast::TableConstraint::Check {
-                                    expr: Box::new(expr),
-                                    source: None,
-                                },
-                            });
+                            if let Some(ref raw_expr) = constraint.raw_expr {
+                                let expr = self.translate_expr(raw_expr)?;
+                                table_constraints.push(ast::NamedTableConstraint {
+                                    name: Some(pg_check_constraint_name(
+                                        &tbl_name_str,
+                                        constraint,
+                                        &mut check_names,
+                                    )),
+                                    constraint: ast::TableConstraint::Check {
+                                        expr: Box::new(expr),
+                                        source: None,
+                                    },
+                                });
+                            }
                         }
                         other => {
                             return Err(not_supported(format!(
@@ -452,8 +491,8 @@ impl PostgreSQLTranslator {
             .map(|seq_name| ast::Stmt::CreateSequence {
                 if_not_exists: true,
                 seq_name: ast::QualifiedName::fullname(
-                    ast::Name::from_string(&namespace),
-                    ast::Name::from_string(seq_name),
+                    exact_name(&namespace),
+                    exact_name(seq_name),
                 ),
                 start: None,
                 increment: None,
@@ -476,8 +515,8 @@ impl PostgreSQLTranslator {
         col_def: &pg_query::protobuf::ColumnDef,
         has_table_pk: bool,
         tbl_name: &ast::QualifiedName,
-        table_schema: &str,
         serial_sequences: &mut Vec<String>,
+        check_names: &mut std::collections::HashSet<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
@@ -493,8 +532,10 @@ impl PostgreSQLTranslator {
 
         // Serial does NOT imply PRIMARY KEY in PostgreSQL
         let mut is_primary_key = false;
+        let mut pk_conname: Option<ast::Name> = None;
         let mut is_not_null = col_def.is_not_null || is_serial;
         let mut is_unique = false;
+        let mut unique_conname: Option<ast::Name> = None;
         let mut default_expr: Option<ast::Expr> = None;
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
@@ -505,12 +546,22 @@ impl PostgreSQLTranslator {
                     "unexpected column constraint node".into(),
                 ));
             };
-            reject_constraint_attributes(constraint, table_schema)?;
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
-                ConstrType::ConstrPrimary => is_primary_key = true,
+                ConstrType::ConstrPrimary => {
+                    is_primary_key = true;
+                    if !constraint.conname.is_empty() {
+                        pk_conname = Some(exact_name(constraint.conname.clone()));
+                    }
+                }
                 ConstrType::ConstrNotnull => is_not_null = true,
-                ConstrType::ConstrUnique => is_unique = true,
+                ConstrType::ConstrUnique => {
+                    is_unique = true;
+                    if !constraint.conname.is_empty() {
+                        unique_conname = Some(exact_name(constraint.conname.clone()));
+                    }
+                }
                 ConstrType::ConstrDefault => {
                     let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
                         ParseError::ParseError("DEFAULT missing expression".into())
@@ -518,20 +569,19 @@ impl PostgreSQLTranslator {
                     default_expr = Some(self.translate_expr(raw_expr)?);
                 }
                 ConstrType::ConstrCheck => {
-                    let raw_expr = constraint.raw_expr.as_ref().ok_or_else(|| {
-                        ParseError::ParseError("CHECK constraint missing expression".into())
-                    })?;
-                    check_constraints.push(ast::NamedColumnConstraint {
-                        name: if constraint.conname.is_empty() {
-                            None
-                        } else {
-                            Some(ast::Name::from_string(constraint.conname.clone()))
-                        },
-                        constraint: ast::ColumnConstraint::Check {
-                            expr: Box::new(self.translate_expr(raw_expr)?),
-                            source: None,
-                        },
-                    });
+                    if let Some(ref raw_expr) = constraint.raw_expr {
+                        check_constraints.push(ast::NamedColumnConstraint {
+                            name: Some(pg_check_constraint_name(
+                                tbl_name.name.as_str(),
+                                constraint,
+                                check_names,
+                            )),
+                            constraint: ast::ColumnConstraint::Check {
+                                expr: Box::new(self.translate_expr(raw_expr)?),
+                                source: None,
+                            },
+                        });
+                    }
                 }
                 ConstrType::ConstrForeign => {
                     if foreign_key.is_some() {
@@ -582,13 +632,20 @@ impl PostgreSQLTranslator {
                 tbl_name.name.as_str().to_lowercase(),
                 name.to_lowercase()
             );
-            serial_sequences.push(seq_name.clone());
-            let namespace = serial_sequence_namespace(tbl_name);
+            // The stored text of a table of a schema names the table by its
+            // mangled name, and the sequence's mangled name is that name with
+            // the same suffix, so the default names the sequence that way.
+            let sequence = if bare_table_name(tbl_name.name.as_str()) != tbl_name.name.as_str() {
+                seq_name.clone()
+            } else {
+                format!("{}.{seq_name}", serial_sequence_namespace(tbl_name))
+            };
+            serial_sequences.push(seq_name);
             default_expr = Some(ast::Expr::FunctionCall {
-                name: ast::Name::from_string("nextval"),
+                name: exact_name("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{namespace}.{seq_name}'"
+                    "'{sequence}'"
                 ))))],
                 order_by: vec![],
                 within_group: vec![],
@@ -602,7 +659,9 @@ impl PostgreSQLTranslator {
         // PRIMARY KEY (only on column level if there's no table-level PK)
         if is_primary_key && !has_table_pk {
             constraints.push(ast::NamedColumnConstraint {
-                name: None,
+                name: Some(pk_conname.unwrap_or_else(|| {
+                    exact_name(format!("{}_pkey", bare_table_name(tbl_name.name.as_str())))
+                })),
                 constraint: ast::ColumnConstraint::PrimaryKey {
                     order: None,
                     conflict_clause: None,
@@ -625,7 +684,7 @@ impl PostgreSQLTranslator {
         // UNIQUE
         if is_unique {
             constraints.push(ast::NamedColumnConstraint {
-                name: None,
+                name: unique_conname,
                 constraint: ast::ColumnConstraint::Unique(None),
             });
         }
@@ -642,7 +701,7 @@ impl PostgreSQLTranslator {
         if let Some(ref fk) = foreign_key {
             let clause = self.pg_fk_to_fk_clause(fk);
             constraints.push(ast::NamedColumnConstraint {
-                name: None,
+                name: fk.name.clone().map(exact_name),
                 constraint: ast::ColumnConstraint::ForeignKey {
                     clause,
                     defer_clause: None,
@@ -653,7 +712,7 @@ impl PostgreSQLTranslator {
         constraints.extend(check_constraints);
 
         Ok(ast::ColumnDefinition {
-            col_name: ast::Name::from_string(name),
+            col_name: exact_name(name),
             col_type,
             constraints,
         })
@@ -673,12 +732,12 @@ impl PostgreSQLTranslator {
             }
         }
         ast::ForeignKeyClause {
-            tbl_name: ast::Name::from_string(fk.ref_table.clone()),
+            tbl_name: exact_name(fk.ref_table.clone()),
             columns: fk
                 .ref_columns
                 .iter()
                 .map(|c| ast::IndexedColumn {
-                    col_name: ast::Name::from_string(c.clone()),
+                    col_name: exact_name(c.clone()),
                     collation_name: None,
                     order: None,
                 })
@@ -696,14 +755,14 @@ impl PostgreSQLTranslator {
         let columns = extract_key_columns(fk_attr_nodes)?
             .into_iter()
             .map(|c| ast::IndexedColumn {
-                col_name: ast::Name::from_string(c),
+                col_name: exact_name(c),
                 collation_name: None,
                 order: None,
             })
             .collect();
 
         Ok(ast::NamedTableConstraint {
-            name: None,
+            name: fk.name.clone().map(exact_name),
             constraint: ast::TableConstraint::ForeignKey {
                 columns,
                 clause: self.pg_fk_to_fk_clause(fk),
@@ -718,6 +777,12 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::TransactionStmtKind;
 
+        // Implementing AND CHAIN requires more than translation: on an
+        // aborted block PostgreSQL still starts the chained transaction, and
+        // the frontend's aborted-state redirect (tx_gate in
+        // postgres/frontend/statement.rs) ends the block without chaining.
+        // The and_chain_is_rejected_in_every_transaction_state test pins the
+        // rejection and says what must change.
         if txn.chain {
             return Err(not_supported("COMMIT/ROLLBACK AND CHAIN"));
         }
@@ -736,14 +801,14 @@ impl PostgreSQLTranslator {
                 savepoint_name: None,
             }),
             Ok(TransactionStmtKind::TransStmtSavepoint) => Ok(ast::Stmt::Savepoint {
-                name: ast::Name::from_string(&txn.savepoint_name),
+                name: exact_name(&txn.savepoint_name),
             }),
             Ok(TransactionStmtKind::TransStmtRelease) => Ok(ast::Stmt::Release {
-                name: ast::Name::from_string(&txn.savepoint_name),
+                name: exact_name(&txn.savepoint_name),
             }),
             Ok(TransactionStmtKind::TransStmtRollbackTo) => Ok(ast::Stmt::Rollback {
                 tx_name: None,
-                savepoint_name: Some(ast::Name::from_string(&txn.savepoint_name)),
+                savepoint_name: Some(exact_name(&txn.savepoint_name)),
             }),
             _ => Err(ParseError::ParseError(format!(
                 "Unsupported transaction statement kind: {}",
@@ -825,12 +890,10 @@ impl PostgreSQLTranslator {
                         ));
                     }
                 };
-                let col = self.translate_column_def(col_def, &relation.schemaname)?;
+                let col = self.translate_column_def(col_def)?;
                 ast::AlterTableBody::AddColumn(col)
             }
-            AlterTableType::AtDropColumn => {
-                ast::AlterTableBody::DropColumn(ast::Name::from_string(&cmd.name))
-            }
+            AlterTableType::AtDropColumn => ast::AlterTableBody::DropColumn(exact_name(&cmd.name)),
             AlterTableType::AtAlterColumnType => {
                 // ALTER TABLE t ALTER COLUMN c TYPE new_type
                 // Map to AlterColumn with the new column definition
@@ -852,7 +915,7 @@ impl PostgreSQLTranslator {
                 if col_def.raw_default.is_some() {
                     return Err(not_supported("ALTER COLUMN TYPE ... USING"));
                 }
-                self.translate_column_def(col_def, &relation.schemaname)?;
+                self.translate_column_def(col_def)?;
                 return Err(not_supported("ALTER TABLE ... ALTER COLUMN ... TYPE"));
             }
             AlterTableType::AtColumnDefault => {
@@ -917,15 +980,15 @@ impl PostgreSQLTranslator {
 
         match rename_type {
             ObjectType::ObjectTable => {
-                let new_name = ast::Name::from_string(&rename.newname);
+                let new_name = exact_name(&rename.newname);
                 Ok(ast::Stmt::AlterTable(ast::AlterTable {
                     name,
                     body: ast::AlterTableBody::RenameTo(new_name),
                 }))
             }
             ObjectType::ObjectColumn => {
-                let old = ast::Name::from_string(&rename.subname);
-                let new = ast::Name::from_string(&rename.newname);
+                let old = exact_name(&rename.subname);
+                let new = exact_name(&rename.newname);
                 Ok(ast::Stmt::AlterTable(ast::AlterTable {
                     name,
                     body: ast::AlterTableBody::RenameColumn { old, new },
@@ -941,12 +1004,11 @@ impl PostgreSQLTranslator {
     fn translate_column_def(
         &self,
         col_def: &pg_query::protobuf::ColumnDef,
-        table_schema: &str,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
-        let col_name = ast::Name::from_string(&col_def.colname);
+        let col_name = exact_name(&col_def.colname);
         reject_column_def_clauses(col_def)?;
 
         let pg_type = extract_type_name(col_def)?;
@@ -978,7 +1040,7 @@ impl PostgreSQLTranslator {
                     "unexpected column constraint node".into(),
                 ));
             };
-            reject_constraint_attributes(constraint, table_schema)?;
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             let constraint_ast = match contype {
                 ConstrType::ConstrNotnull => Some(ast::ColumnConstraint::NotNull {
@@ -1026,7 +1088,7 @@ impl PostgreSQLTranslator {
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE INDEX missing table name".into()))?;
-        let tbl_name = ast::Name::from_string(self.map_table_name(&relation.relname));
+        let tbl_name = exact_name(self.map_table_name(&relation.relname));
 
         if !idx.access_method.is_empty() && !idx.access_method.eq_ignore_ascii_case("btree") {
             return Err(not_supported(format!(
@@ -1047,11 +1109,11 @@ impl PostgreSQLTranslator {
         // SQLite names the database on the index, not on the table, and
         // looks the table up there.
         let idx_name = if relation.schemaname.is_empty() {
-            ast::QualifiedName::single(ast::Name::from_string(&idx.idxname))
+            ast::QualifiedName::single(exact_name(&idx.idxname))
         } else {
             ast::QualifiedName::fullname(
-                ast::Name::from_string(map_schema_name(&relation.schemaname)),
-                ast::Name::from_string(&idx.idxname),
+                exact_name(schema_qualifier(&relation.schemaname)?),
+                exact_name(&idx.idxname),
             )
         };
 
@@ -1087,7 +1149,7 @@ impl PostgreSQLTranslator {
             };
             reject_index_elem_clauses(elem, "CREATE INDEX")?;
             let expr = if !elem.name.is_empty() {
-                Box::new(ast::Expr::Id(ast::Name::from_string(&elem.name)))
+                Box::new(ast::Expr::Id(exact_name(&elem.name)))
             } else if let Some(ref expr_node) = elem.expr {
                 Box::new(self.translate_expr(expr_node)?)
             } else {
@@ -1151,20 +1213,20 @@ impl PostgreSQLTranslator {
                 let names = extract_key_columns(&list.items)?;
                 match names.as_slice() {
                     [] => return Err(ParseError::ParseError("DROP: empty name list".into())),
-                    [name] => ast::QualifiedName::single(ast::Name::from_string(name.clone())),
+                    [name] => ast::QualifiedName::single(exact_name(name.clone())),
                     [schema, name] => ast::QualifiedName::fullname(
-                        ast::Name::from_string(map_schema_name(schema)),
-                        ast::Name::from_string(name.clone()),
+                        exact_name(schema_qualifier(schema)?),
+                        exact_name(name.clone()),
                     ),
                     _ => return Err(not_supported("a cross-database reference")),
                 }
             }
-            Some(Node::String(s)) => {
-                ast::QualifiedName::single(ast::Name::from_string(s.sval.clone()))
-            }
-            Some(Node::TypeName(tn)) => ast::QualifiedName::single(ast::Name::from_string(
-                object_name(&tn.names, is_default_schema, "type")?,
-            )),
+            Some(Node::String(s)) => ast::QualifiedName::single(exact_name(s.sval.clone())),
+            Some(Node::TypeName(tn)) => ast::QualifiedName::single(exact_name(object_name(
+                &tn.names,
+                is_default_schema,
+                "type",
+            )?)),
             _ => {
                 return Err(ParseError::ParseError(
                     "DROP: unexpected object format".into(),
@@ -1269,7 +1331,7 @@ impl PostgreSQLTranslator {
             .iter()
             .filter_map(|alias| match &alias.node {
                 Some(pg_query::protobuf::node::Node::String(s)) => Some(ast::IndexedColumn {
-                    col_name: ast::Name::from_string(&s.sval),
+                    col_name: exact_name(&s.sval),
                     collation_name: None,
                     order: None,
                 }),
@@ -1377,7 +1439,7 @@ impl PostgreSQLTranslator {
             .iter()
             .filter_map(|node| match &node.node {
                 Some(pg_query::protobuf::node::Node::String(s)) => Some(ast::IndexedColumn {
-                    col_name: ast::Name::from_string(&s.sval),
+                    col_name: exact_name(&s.sval),
                     collation_name: None,
                     order: None,
                 }),
@@ -1473,7 +1535,7 @@ impl PostgreSQLTranslator {
             .iter()
             .map(|col_node| match &col_node.node {
                 Some(Node::ResTarget(res_target)) if res_target.indirection.is_empty() => {
-                    Ok(ast::Name::from_string(&res_target.name))
+                    Ok(exact_name(&res_target.name))
                 }
                 Some(Node::ResTarget(_)) => Err(not_supported(
                     "INSERT into an array element or composite field",
@@ -1568,7 +1630,7 @@ impl PostgreSQLTranslator {
             (ast::InsertBody::Select(select, upsert), columns)
         };
 
-        let returning = self.translate_returning(&insert.returning_list, relation)?;
+        let returning = self.translate_returning(&insert.returning_list, relation, true)?;
         let with = self.translate_with_clause(&insert.with_clause)?;
 
         Ok(ast::Stmt::Insert {
@@ -1665,7 +1727,7 @@ impl PostgreSQLTranslator {
                             "UPDATE of an array element or composite field",
                         ));
                     }
-                    let col_name = ast::Name::from_string(&res_target.name);
+                    let col_name = exact_name(&res_target.name);
                     let expr = if let Some(val) = &res_target.val {
                         Box::new(self.translate_expr(val)?)
                     } else {
@@ -1701,6 +1763,9 @@ impl PostgreSQLTranslator {
 
         // Translate FROM clause (PG extension: UPDATE ... FROM ...)
         let from = if !update.from_clause.is_empty() {
+            if let Some(error) = lateral_reference_to_update_target(&update.from_clause, relation) {
+                return Err(error);
+            }
             Some(self.translate_from_items(&update.from_clause)?)
         } else {
             None
@@ -1709,7 +1774,11 @@ impl PostgreSQLTranslator {
         if !update.from_clause.is_empty() && update.returning_list.iter().any(is_bare_star) {
             return Err(not_supported("RETURNING * on UPDATE ... FROM"));
         }
-        let returning = self.translate_returning(&update.returning_list, relation)?;
+        let returning = self.translate_returning(
+            &update.returning_list,
+            relation,
+            update.from_clause.is_empty(),
+        )?;
         let with = self.translate_with_clause(&update.with_clause)?;
 
         Ok(ast::Stmt::Update(ast::Update {
@@ -1746,7 +1815,7 @@ impl PostgreSQLTranslator {
             None
         };
 
-        let returning = self.translate_returning(&delete.returning_list, relation)?;
+        let returning = self.translate_returning(&delete.returning_list, relation, true)?;
         let with = self.translate_with_clause(&delete.with_clause)?;
 
         Ok(ast::Stmt::Delete {
@@ -2147,7 +2216,10 @@ impl PostgreSQLTranslator {
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
         reject_column_aliases(&range_var.alias, "a table")?;
-        let qualified_name = self.qualified_name_from_range_var(range_var)?;
+        let mut qualified_name = self.qualified_name_from_range_var(range_var)?;
+        // The FROM item carries the alias; a name that carried it too would
+        // print it twice in stored SQL.
+        qualified_name.alias = None;
         let alias = match &range_var.alias {
             Some(a) => Some(a.aliasname.clone()),
             None if qualified_name.name.as_str() != range_var.relname => {
@@ -2155,7 +2227,7 @@ impl PostgreSQLTranslator {
             }
             None => None,
         }
-        .map(|name| ast::As::Elided(ast::Name::from_string(name)));
+        .map(|name| ast::As::Elided(exact_name(name)));
 
         Ok(ast::SelectTable::Table(qualified_name, alias, None))
     }
@@ -2183,7 +2255,7 @@ impl PostgreSQLTranslator {
         let alias = range_sub
             .alias
             .as_ref()
-            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+            .map(|a| ast::As::Elided(exact_name(a.aliasname.clone())));
         Ok(ast::SelectTable::Select {
             select,
             alias,
@@ -2236,7 +2308,7 @@ impl PostgreSQLTranslator {
             }
         };
 
-        let func_name = object_name(&func_call.funcname, is_pg_catalog, "function")?;
+        let func_name = function_name(&func_call.funcname)?;
         let func_name = func_name.as_str();
         if func_call.func_variadic
             || func_call.agg_star
@@ -2261,7 +2333,7 @@ impl PostgreSQLTranslator {
         let alias = range_func
             .alias
             .as_ref()
-            .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
+            .map(|a| ast::As::Elided(exact_name(a.aliasname.clone())));
 
         // PostgreSQL exposes scalar functions in FROM position as one-row,
         // one-column tables (clients issue `SELECT * FROM current_schema()`),
@@ -2274,10 +2346,10 @@ impl PostgreSQLTranslator {
             reject_column_aliases(&range_func.alias, "a function")?;
             let column_name = match &alias {
                 Some(ast::As::As(name) | ast::As::Elided(name)) => name.clone(),
-                _ => ast::Name::from_string(func_name),
+                _ => exact_name(func_name),
             };
             let call = ast::Expr::FunctionCall {
-                name: ast::Name::from_string(func_name),
+                name: exact_name(func_name),
                 distinctness: None,
                 args: vec![],
                 order_by: vec![],
@@ -2321,9 +2393,9 @@ impl PostgreSQLTranslator {
             });
         }
 
-        let name = ast::Name::from_string(func_name);
-        let qualified_name = if is_catalog_table_name(func_name) {
-            ast::QualifiedName::fullname(ast::Name::from_string("main"), name)
+        let name = exact_name(func_name);
+        let qualified_name = if function_uses_main_schema(func_name) {
+            ast::QualifiedName::fullname(exact_name("main"), name)
         } else {
             ast::QualifiedName::single(name)
         };
@@ -2350,7 +2422,13 @@ impl PostgreSQLTranslator {
                 None => "unnest".into(),
             };
             return Ok(ast::SelectTable::Select {
-                select: single_column_function_select(qualified_name, args, "unnest", column_name),
+                select: single_column_function_select(
+                    qualified_name,
+                    args,
+                    None,
+                    "unnest",
+                    column_name,
+                ),
                 alias,
                 lateral: true,
             });
@@ -2361,36 +2439,55 @@ impl PostgreSQLTranslator {
         ) {
             return self.translate_json_to_record(func_name, range_func, &args, alias);
         }
-        if func_name == "generate_series" {
-            if let Some(range_alias) = &range_func.alias {
-                let names = alias_column_names(range_alias)?;
-                if names.len() > 1 {
-                    return Err(ParseError::ParseError(format!(
-                        "table \"{}\" has 1 columns available but {} columns specified",
-                        range_alias.aliasname,
-                        names.len()
-                    )));
-                }
-                if let Some(column_name) = names.into_iter().next() {
-                    return Ok(ast::SelectTable::Select {
-                        select: single_column_function_select(
-                            qualified_name,
-                            args,
-                            "value",
-                            column_name,
-                        ),
-                        alias,
-                        lateral: true,
-                    });
-                }
-            }
-        }
         if !range_func.coldeflist.is_empty() {
             return Err(not_supported(format!(
                 "a column definition list on {func_name}()"
             )));
         }
+        if func_name == "generate_series" {
+            let column_name = match &range_func.alias {
+                Some(range_alias) => {
+                    let names = alias_column_names(range_alias)?;
+                    if names.len() > 1 {
+                        return Err(ParseError::Sqlstate {
+                            sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+                            message: format!(
+                                "table \"{}\" has 1 columns available but {} columns specified",
+                                range_alias.aliasname,
+                                names.len()
+                            ),
+                        });
+                    }
+                    names
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| range_alias.aliasname.clone())
+                }
+                None => func_name.to_string(),
+            };
+            let alias = alias.unwrap_or_else(|| ast::As::Elided(exact_name(func_name)));
+            // Evaluate the arguments in their own VALUES row so that names like `value` or
+            // `start` resolve to columns on the left, not to generate_series's own columns.
+            // VALUES, unlike a SELECT, still rejects aggregate and window functions.
+            let (arguments, args) = function_arguments_subquery(args);
+            return Ok(ast::SelectTable::Select {
+                select: single_column_function_select(
+                    qualified_name,
+                    args,
+                    Some(arguments),
+                    "value",
+                    column_name,
+                ),
+                alias: Some(alias),
+                lateral: true,
+            });
+        }
         reject_column_aliases(&range_func.alias, "a function")?;
+
+        fn function_uses_main_schema(name: &str) -> bool {
+            is_catalog_table_name(name) || name == "generate_series"
+        }
+
         Ok(ast::SelectTable::TableCall(qualified_name, args, alias))
     }
 
@@ -2444,7 +2541,7 @@ impl PostgreSQLTranslator {
             ),
         };
         let json_type = |args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
-            name: ast::Name::from_string("json_type"),
+            name: exact_name("json_type"),
             distinctness: None,
             args,
             order_by: vec![],
@@ -2469,7 +2566,7 @@ impl PostgreSQLTranslator {
                         distinctness: None,
                         columns: vec![ast::ResultColumn::Expr(
                             Box::new(checked_arg),
-                            Some(ast::As::Elided(ast::Name::from_string("json"))),
+                            Some(ast::As::Elided(exact_name("json"))),
                         )],
                         from: None,
                         where_clause: None,
@@ -2481,25 +2578,18 @@ impl PostgreSQLTranslator {
                 order_by: vec![],
                 limit: None,
             },
-            alias: Some(ast::As::Elided(ast::Name::from_string("arg"))),
+            alias: Some(ast::As::Elided(exact_name("arg"))),
             lateral: false,
         };
-        let arg_json = ast::Expr::Qualified(
-            ast::Name::from_string("arg"),
-            ast::Name::from_string("json"),
-        );
+        let arg_json = ast::Expr::Qualified(exact_name("arg"), exact_name("json"));
         let (source, joins) = if is_recordset {
             let json_each = ast::SelectTable::TableCall(
-                ast::QualifiedName::single(ast::Name::from_string("json_each")),
+                ast::QualifiedName::single(exact_name("json_each")),
                 vec![Box::new(arg_json)],
-                Some(ast::As::Elided(ast::Name::from_string("element"))),
+                Some(ast::As::Elided(exact_name("element"))),
             );
-            let element = |column: &str| {
-                ast::Expr::Qualified(
-                    ast::Name::from_string("element"),
-                    ast::Name::from_string(column),
-                )
-            };
+            let element =
+                |column: &str| ast::Expr::Qualified(exact_name("element"), exact_name(column));
             (
                 json_type_or_raise(
                     element("type"),
@@ -2576,9 +2666,7 @@ impl PostgreSQLTranslator {
                 };
                 Ok(ast::ResultColumn::Expr(
                     Box::new(cast),
-                    Some(ast::As::Elided(ast::Name::from_string(
-                        col_def.colname.clone(),
-                    ))),
+                    Some(ast::As::Elided(exact_name(col_def.colname.clone()))),
                 ))
             })
             .collect::<Result<Vec<_>, ParseError>>()?;
@@ -2602,9 +2690,7 @@ impl PostgreSQLTranslator {
                 order_by: vec![],
                 limit: None,
             },
-            alias: Some(
-                alias.unwrap_or_else(|| ast::As::Elided(ast::Name::from_string(func_name))),
-            ),
+            alias: Some(alias.unwrap_or_else(|| ast::As::Elided(exact_name(func_name)))),
             lateral: true,
         })
     }
@@ -2719,7 +2805,7 @@ impl PostgreSQLTranslator {
         } else if !join_expr.using_clause.is_empty() {
             let names = extract_key_columns(&join_expr.using_clause)?
                 .into_iter()
-                .map(ast::Name::from_string)
+                .map(exact_name)
                 .collect();
             Some(ast::JoinConstraint::Using(names))
         } else {
@@ -2771,7 +2857,7 @@ impl PostgreSQLTranslator {
                                             ));
                                         };
                                         result_columns.push(ast::ResultColumn::TableStar(
-                                            ast::Name::from_string(&s.sval),
+                                            exact_name(&s.sval),
                                         ));
                                     }
                                     continue;
@@ -2782,20 +2868,18 @@ impl PostgreSQLTranslator {
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
                                 None
                             } else {
-                                Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
+                                Some(ast::As::Elided(exact_name(&res_target.name)))
                             };
                             result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         } else {
                             let expr = self.translate_expr(val)?;
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
                                 Some(match derived_column_name(val) {
-                                    Some(name) => ast::As::Elided(ast::Name::from_string(name)),
-                                    None => ast::As::ImplicitColumnName(ast::Name::from_string(
-                                        "?column?",
-                                    )),
+                                    Some(name) => ast::As::Elided(exact_name(name)),
+                                    None => ast::As::ImplicitColumnName(exact_name("?column?")),
                                 })
                             } else {
-                                Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
+                                Some(ast::As::Elided(exact_name(&res_target.name)))
                             };
                             result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         }
@@ -2821,7 +2905,7 @@ impl PostgreSQLTranslator {
                         Some(pg_query::protobuf::node::Node::String(s)) => {
                             if col_ref.fields.len() == 1 {
                                 // Simple column reference
-                                Ok(ast::Expr::Id(ast::Name::from_string(s.sval.clone())))
+                                Ok(ast::Expr::Id(exact_name(s.sval.clone())))
                             } else {
                                 // Qualified column reference (table.column)
                                 let mut parts = vec![];
@@ -2838,16 +2922,16 @@ impl PostgreSQLTranslator {
                                         // schema.table.column. The table name is not mapped:
                                         // FROM aliases a renamed table with its original name.
                                         Ok(ast::Expr::DoublyQualified(
-                                            ast::Name::from_string(map_schema_name(&parts[0])),
-                                            ast::Name::from_string(parts[1].clone()),
-                                            ast::Name::from_string(parts[2].clone()),
+                                            exact_name(schema_qualifier(&parts[0])?),
+                                            exact_name(parts[1].clone()),
+                                            exact_name(parts[2].clone()),
                                         ))
                                     }
                                     2 => {
                                         // table.column
                                         Ok(ast::Expr::Qualified(
-                                            ast::Name::from_string(parts[0].clone()),
-                                            ast::Name::from_string(parts[1].clone()),
+                                            exact_name(parts[0].clone()),
+                                            exact_name(parts[1].clone()),
                                         ))
                                     }
                                     _ => Err(not_supported("a cross-database reference")),
@@ -2975,7 +3059,7 @@ impl PostgreSQLTranslator {
                     .map(|a| Ok(Box::new(self.translate_expr(a)?)))
                     .collect::<Result<Vec<_>, ParseError>>()?;
                 Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string("COALESCE"),
+                    name: exact_name("COALESCE"),
                     distinctness: None,
                     args,
                     order_by: vec![],
@@ -2999,7 +3083,7 @@ impl PostgreSQLTranslator {
                     .map(|a| Ok(Box::new(self.translate_expr(a)?)))
                     .collect::<Result<Vec<_>, ParseError>>()?;
                 Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string(func_name),
+                    name: exact_name(func_name),
                     distinctness: None,
                     args,
                     order_by: vec![],
@@ -3052,7 +3136,7 @@ impl PostgreSQLTranslator {
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.
                     Ok(SqlValueFunctionOp::SvfopCurrentSchema) => Ok(ast::Expr::FunctionCall {
-                        name: ast::Name::from_string("current_schema"),
+                        name: exact_name("current_schema"),
                         distinctness: None,
                         args: vec![],
                         order_by: vec![],
@@ -3063,7 +3147,7 @@ impl PostgreSQLTranslator {
                         },
                     }),
                     Ok(SqlValueFunctionOp::SvfopCurrentCatalog) => Ok(ast::Expr::FunctionCall {
-                        name: ast::Name::from_string("current_database"),
+                        name: exact_name("current_database"),
                         distinctness: None,
                         args: vec![],
                         order_by: vec![],
@@ -3092,7 +3176,7 @@ impl PostgreSQLTranslator {
                     .map(|e| Ok(Box::new(self.translate_expr(e)?)))
                     .collect::<Result<Vec<_>, ParseError>>()?;
                 Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string("array"),
+                    name: exact_name("array"),
                     distinctness: None,
                     args,
                     order_by: vec![],
@@ -3124,7 +3208,7 @@ impl PostgreSQLTranslator {
                                 let start_expr = self.translate_expr(start)?;
                                 let end_expr = self.translate_expr(end)?;
                                 expr = ast::Expr::FunctionCall {
-                                    name: ast::Name::from_string("array_slice"),
+                                    name: exact_name("array_slice"),
                                     distinctness: None,
                                     args: vec![
                                         Box::new(expr),
@@ -3145,7 +3229,7 @@ impl PostgreSQLTranslator {
                                 })?;
                                 let index_expr = self.translate_expr(index_node)?;
                                 expr = ast::Expr::FunctionCall {
-                                    name: ast::Name::from_string("array_element"),
+                                    name: exact_name("array_element"),
                                     distinctness: None,
                                     args: vec![Box::new(expr), Box::new(index_expr)],
                                     order_by: vec![],
@@ -3168,7 +3252,7 @@ impl PostgreSQLTranslator {
                                         ))
                                     }
                                 },
-                                ast::Name::from_string(s.sval.clone()),
+                                exact_name(s.sval.clone()),
                             );
                         }
                         other => {
@@ -3214,12 +3298,16 @@ impl PostgreSQLTranslator {
                 pg_query::protobuf::a_const::Val::Fval(f) => {
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
                 }
-                pg_query::protobuf::a_const::Val::Boolval(b) => {
-                    // SQLite uses 0/1 for booleans
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(
+                pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ast::Expr::Cast {
+                    expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                         if b.boolval { "1" } else { "0" }.to_string(),
-                    )))
-                }
+                    ))),
+                    type_name: Some(ast::Type {
+                        name: "boolean".to_string(),
+                        size: None,
+                        array_dimensions: 0,
+                    }),
+                }),
                 _ => Err(ParseError::ParseError(
                     "Unsupported constant type".to_string(),
                 )),
@@ -3292,7 +3380,7 @@ impl PostgreSQLTranslator {
                     args.push(Box::new(self.translate_expr(rexpr)?));
                 }
                 Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string("NULLIF"),
+                    name: exact_name("NULLIF"),
                     distinctness: None,
                     args,
                     order_by: vec![],
@@ -3508,7 +3596,7 @@ impl PostgreSQLTranslator {
                     _ => unreachable!(),
                 };
                 return Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string(func_name),
+                    name: exact_name(func_name),
                     distinctness: None,
                     args,
                     order_by: vec![],
@@ -3632,7 +3720,7 @@ impl PostgreSQLTranslator {
 
         let array = self.translate_expr(rhs_node)?;
         let call = ast::Expr::FunctionCall {
-            name: ast::Name::from_string("array_contains"),
+            name: exact_name("array_contains"),
             distinctness: None,
             args: vec![Box::new(array), Box::new(lhs)],
             order_by: vec![],
@@ -3776,7 +3864,7 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
-        let func_name = object_name(&func_call.funcname, is_pg_catalog, "function")?;
+        let func_name = function_name(&func_call.funcname)?;
         if func_name.eq_ignore_ascii_case("substring")
             && func_call.args.get(1).is_some_and(is_text_pattern)
         {
@@ -3810,7 +3898,7 @@ impl PostgreSQLTranslator {
         // COUNT(*) and similar aggregate star calls
         if func_call.agg_star {
             return Ok(ast::Expr::FunctionCallStar {
-                name: ast::Name::from_string(func_name),
+                name: exact_name(func_name),
                 filter_over,
             });
         }
@@ -3888,7 +3976,7 @@ impl PostgreSQLTranslator {
         };
 
         Ok(ast::Expr::FunctionCall {
-            name: ast::Name::from_string(func_name),
+            name: exact_name(func_name),
             distinctness,
             args,
             order_by,
@@ -3917,7 +4005,7 @@ impl PostgreSQLTranslator {
                 };
                 let window = self.translate_window_spec(wd)?;
                 Ok(ast::WindowDef {
-                    name: ast::Name::from_string(&wd.name),
+                    name: exact_name(&wd.name),
                     window,
                 })
             })
@@ -3940,7 +4028,7 @@ impl PostgreSQLTranslator {
             && window_def.partition_clause.is_empty()
             && window_def.order_clause.is_empty()
         {
-            return Ok(ast::Over::Name(ast::Name::from_string(&window_def.name)));
+            return Ok(ast::Over::Name(exact_name(&window_def.name)));
         }
 
         let window = self.translate_window_spec(window_def)?;
@@ -3955,7 +4043,7 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Window, ParseError> {
         // Base window reference (for window inheritance)
         let base = if !window_def.refname.is_empty() {
-            Some(ast::Name::from_string(&window_def.refname))
+            Some(exact_name(&window_def.refname))
         } else {
             None
         };
@@ -4232,10 +4320,10 @@ impl PostgreSQLTranslator {
         while query.contains(&table_name) {
             table_name.push('_');
         }
-        let table = ast::Name::from_string(table_name);
-        let column = ast::Name::from_string("_turso_array_value");
+        let table = exact_name(table_name);
+        let column = exact_name("_turso_array_value");
         let call = |name: &str, args: Vec<Box<ast::Expr>>| ast::Expr::FunctionCall {
-            name: ast::Name::from_string(name),
+            name: exact_name(name),
             distinctness: None,
             args,
             order_by: vec![],
@@ -4314,7 +4402,7 @@ impl PostgreSQLTranslator {
                 }
             };
 
-            let tbl_name = ast::Name::from_string(&cte.ctename);
+            let tbl_name = exact_name(&cte.ctename);
 
             // PostgreSQL evaluates SEARCH/CYCLE by adding computed columns to
             // the recursion; silently dropping them would change results (and
@@ -4336,7 +4424,7 @@ impl PostgreSQLTranslator {
                 .iter()
                 .filter_map(|n| match &n.node {
                     Some(Node::String(s)) => Some(ast::IndexedColumn {
-                        col_name: ast::Name::from_string(&s.sval),
+                        col_name: exact_name(&s.sval),
                         collation_name: None,
                         order: None,
                     }),
@@ -4397,12 +4485,12 @@ impl PostgreSQLTranslator {
         limit_offset: &Option<Box<pg_query::protobuf::Node>>,
     ) -> Result<Option<ast::Limit>, ParseError> {
         let count = match limit_count {
-            Some(node) => Some(Box::new(self.translate_expr(node)?)),
+            Some(node) => self.translate_limit_value(node, "LIMIT", "-1")?,
             None => None,
         };
 
         let offset = match limit_offset {
-            Some(node) => Some(Box::new(self.translate_expr(node)?)),
+            Some(node) => self.translate_limit_value(node, "OFFSET", "0")?,
             None => None,
         };
 
@@ -4421,10 +4509,45 @@ impl PostgreSQLTranslator {
         }
     }
 
+    /// Non-negative integer literals are kept as written because the planner
+    /// optimizes literal limits.
+    fn translate_limit_value(
+        &self,
+        node: &pg_query::protobuf::Node,
+        clause: &str,
+        when_null: &str,
+    ) -> Result<Option<Box<ast::Expr>>, ParseError> {
+        let value = self.translate_expr(node)?;
+        match &value {
+            ast::Expr::Literal(ast::Literal::Null) => return Ok(None),
+            ast::Expr::Literal(ast::Literal::Numeric(n))
+                if n.parse::<i64>().is_ok_and(|n| n >= 0) =>
+            {
+                return Ok(Some(Box::new(value)));
+            }
+            _ => {}
+        }
+        let checked_value = function_call(
+            "pg_limit_value",
+            vec![
+                value,
+                ast::Expr::Literal(ast::Literal::String(format!("'{clause}'"))),
+            ],
+        );
+        let no_limit = ast::Expr::Literal(ast::Literal::Numeric(when_null.into()));
+        Ok(Some(Box::new(function_call(
+            "coalesce",
+            vec![checked_value, no_limit],
+        ))))
+    }
+
+    /// `only_target_in_scope` is false when the FROM clause of an UPDATE adds
+    /// tables that RETURNING can name.
     fn translate_returning(
         &self,
         returning_list: &[pg_query::protobuf::Node],
         target: &pg_query::protobuf::RangeVar,
+        only_target_in_scope: bool,
     ) -> Result<Vec<ast::ResultColumn>, ParseError> {
         if returning_list.is_empty() {
             return Ok(vec![]);
@@ -4438,9 +4561,14 @@ impl PostgreSQLTranslator {
         for node in returning_list {
             if is_star_qualified_by(node, target_qualifiers) {
                 columns.push(ast::ResultColumn::Star);
-            } else {
-                columns.extend(self.translate_target_list(std::slice::from_ref(node))?);
+                continue;
             }
+            if only_target_in_scope {
+                if let Some(error) = star_qualified_by_other_table(node, target) {
+                    return Err(error);
+                }
+            }
+            columns.extend(self.translate_target_list(std::slice::from_ref(node))?);
         }
         Ok(columns)
     }
@@ -4473,7 +4601,7 @@ impl PostgreSQLTranslator {
                                     "ON CONFLICT DO UPDATE of an array element or composite field",
                                 ));
                             }
-                            let col_name = ast::Name::from_string(&res_target.name);
+                            let col_name = exact_name(&res_target.name);
                             let expr = if let Some(val) = &res_target.val {
                                 Box::new(self.translate_expr(val)?)
                             } else {
@@ -4532,9 +4660,7 @@ impl PostgreSQLTranslator {
                                 ));
                             }
                             Ok(ast::SortedColumn {
-                                expr: Box::new(ast::Expr::Id(ast::Name::from_string(
-                                    &idx_elem.name,
-                                ))),
+                                expr: Box::new(ast::Expr::Id(exact_name(&idx_elem.name))),
                                 order: None,
                                 nulls: None,
                             })
@@ -4883,7 +5009,7 @@ impl PostgreSQLTranslator {
                     "CREATE DOMAIN: unexpected constraint node".into(),
                 ));
             };
-            reject_constraint_attributes(constraint, "")?;
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
                 ConstrType::ConstrDefault => {
@@ -4943,22 +5069,35 @@ impl PostgreSQLTranslator {
 fn single_column_function_select(
     function: ast::QualifiedName,
     args: Vec<Box<ast::Expr>>,
+    arguments: Option<ast::SelectTable>,
     source_column: &str,
     column_name: String,
 ) -> ast::Select {
+    let call = ast::SelectTable::TableCall(function, args, None);
+    let from = match arguments {
+        Some(arguments) => ast::FromClause {
+            select: Box::new(arguments),
+            joins: vec![ast::JoinedSelectTable {
+                operator: ast::JoinOperator::Comma,
+                table: Box::new(call),
+                constraint: None,
+            }],
+        },
+        None => ast::FromClause {
+            select: Box::new(call),
+            joins: vec![],
+        },
+    };
     ast::Select {
         with: None,
         body: ast::SelectBody {
             select: ast::OneSelect::Select {
                 distinctness: None,
                 columns: vec![ast::ResultColumn::Expr(
-                    Box::new(ast::Expr::Id(ast::Name::from_string(source_column))),
-                    Some(ast::As::Elided(ast::Name::from_string(column_name))),
+                    Box::new(ast::Expr::Id(exact_name(source_column))),
+                    Some(ast::As::Elided(exact_name(column_name))),
                 )],
-                from: Some(ast::FromClause {
-                    select: Box::new(ast::SelectTable::TableCall(function, args, None)),
-                    joins: vec![],
-                }),
+                from: Some(from),
                 where_clause: None,
                 group_by: None,
                 window_clause: vec![],
@@ -4968,6 +5107,34 @@ fn single_column_function_select(
         order_by: vec![],
         limit: None,
     }
+}
+
+#[allow(clippy::vec_box)]
+fn function_arguments_subquery(
+    args: Vec<Box<ast::Expr>>,
+) -> (ast::SelectTable, Vec<Box<ast::Expr>>) {
+    let arg_refs = (1..=args.len())
+        .map(|i| {
+            Box::new(ast::Expr::Qualified(
+                exact_name("arg"),
+                exact_name(format!("column{i}")),
+            ))
+        })
+        .collect();
+    let subquery = ast::SelectTable::Select {
+        select: ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Values(vec![args]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        },
+        alias: Some(ast::As::Elided(exact_name("arg"))),
+        lateral: false,
+    };
+    (subquery, arg_refs)
 }
 
 fn alias_column_names(alias: &pg_query::protobuf::Alias) -> Result<Vec<String>, ParseError> {
@@ -4991,11 +5158,14 @@ fn rename_result_columns(
     }
     if let Some(columns) = result_column_names(select) {
         if names.len() > columns.len() {
-            return Err(ParseError::ParseError(format!(
-                "table \"{alias}\" has {} columns available but {} columns specified",
-                columns.len(),
-                names.len()
-            )));
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+                message: format!(
+                    "table \"{alias}\" has {} columns available but {} columns specified",
+                    columns.len(),
+                    names.len()
+                ),
+            });
         }
         for column in columns.into_iter().skip(names.len()) {
             names.push(column.ok_or_else(|| {
@@ -5031,11 +5201,11 @@ fn rename_result_columns(
         with: Some(ast::With {
             recursive: false,
             ctes: vec![ast::CommonTableExpr {
-                tbl_name: ast::Name::from_string(&cte_name),
+                tbl_name: exact_name(&cte_name),
                 columns: names
                     .iter()
                     .map(|name| ast::IndexedColumn {
-                        col_name: ast::Name::from_string(name),
+                        col_name: exact_name(name),
                         collation_name: None,
                         order: None,
                     })
@@ -5050,7 +5220,7 @@ fn rename_result_columns(
                 columns: vec![ast::ResultColumn::Star],
                 from: Some(ast::FromClause {
                     select: Box::new(ast::SelectTable::Table(
-                        ast::QualifiedName::single(ast::Name::from_string(&cte_name)),
+                        ast::QualifiedName::single(exact_name(&cte_name)),
                         None,
                         None,
                     )),
@@ -5098,6 +5268,45 @@ fn result_column_names(select: &ast::Select) -> Option<Vec<Option<String>>> {
     }
 }
 
+fn pg_check_constraint_name(
+    table_name: &str,
+    constraint: &pg_query::protobuf::Constraint,
+    used_names: &mut std::collections::HashSet<String>,
+) -> ast::Name {
+    if !constraint.conname.is_empty() {
+        return exact_name(constraint.conname.clone());
+    }
+    let mut columns = Vec::new();
+    if let Some(node) = constraint
+        .raw_expr
+        .as_ref()
+        .and_then(|expr| expr.node.as_ref())
+    {
+        for (node, _, _, _) in node.nodes() {
+            if let NodeRef::ColumnRef(column) = node {
+                if let Some(name) = last_string(&column.fields) {
+                    if !columns.contains(&name) {
+                        columns.push(name);
+                    }
+                }
+            }
+        }
+    }
+    let table_name = bare_table_name(table_name);
+    let base = if let [column] = columns.as_slice() {
+        format!("{table_name}_{column}_check")
+    } else {
+        format!("{table_name}_check")
+    };
+    let mut name = base.clone();
+    let mut suffix = 1;
+    while !used_names.insert(name.clone()) {
+        name = format!("{base}{suffix}");
+        suffix += 1;
+    }
+    exact_name(name)
+}
+
 fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
     matches!(
         join.operator,
@@ -5106,19 +5315,50 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
 }
 
 /// The namespace of the sequences of the serial columns of table `tbl_name`:
-/// the namespace of the table, or main when the table has none.
+/// the namespace of the table, or public when the table has none.
 fn serial_sequence_namespace(tbl_name: &ast::QualifiedName) -> String {
     tbl_name
         .namespace
         .as_ref()
         .map(|namespace| namespace.as_str().to_string())
-        .unwrap_or_else(|| "main".to_string())
+        .unwrap_or_else(|| "public".to_string())
+}
+
+/// The name of a table as the user knows it, for naming its constraints.
+/// Core stores a table of a schema under `__turso_ns<id>_<name>` and the
+/// stored text of a CREATE TABLE names it so; a constraint is named after
+/// the bare name, as PostgreSQL names it. See docs/internals/namespaces.md.
+fn bare_table_name(name: &str) -> &str {
+    let Some(rest) = name.strip_prefix("__turso_ns") else {
+        return name;
+    };
+    let digits = rest
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    match rest[digits..].strip_prefix('_') {
+        Some(bare) if digits > 0 => bare,
+        _ => name,
+    }
 }
 
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
+/// The schema that a qualifier written in a statement names. PostgreSQL has
+/// no schema called main or temp: those name databases of the engine, and
+/// an object stored under them would be in no schema the catalogs show.
+fn schema_qualifier(schema: &str) -> Result<&str, ParseError> {
+    if schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("temp") {
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_SCHEMA_NAME,
+            message: format!("schema \"{schema}\" does not exist"),
+        });
+    }
+    Ok(map_schema_name(schema))
+}
+
 fn map_schema_name(schema: &str) -> &str {
     match schema.to_ascii_lowercase().as_str() {
-        "pg_catalog" | "public" | "information_schema" => "main",
+        "pg_catalog" | "information_schema" => "main",
         _ => schema,
     }
 }
@@ -5137,9 +5377,11 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_collation"
             | "pg_attrdef"
             | "pg_description"
+            | "pg_seclabels"
             | "pg_publication"
             | "pg_publication_namespace"
             | "pg_publication_rel"
+            | "pg_sequence"
             | "pg_sequences"
             | "pg_constraint"
             | "pg_index"
@@ -5180,6 +5422,16 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_amproc"
             | "pg_tables"
             | "pg_indexes"
+    )
+}
+
+/// Whether the catalog relation `name` is a view in PostgreSQL. PostgreSQL
+/// rejects DML on these views because they do not read a single table, and
+/// it does so before it checks privileges.
+pub fn is_catalog_view_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pg_roles" | "pg_seclabels" | "pg_sequences" | "pg_settings" | "pg_tables" | "pg_indexes"
     )
 }
 
@@ -5307,6 +5559,161 @@ fn is_star_qualified_by(node: &pg_query::protobuf::Node, target_qualifiers: &[&s
     qualifier.iter().rev().zip(target_qualifiers).all(
         |(field, expected)| matches!(&field.node, Some(Node::String(s)) if s.sval == *expected),
     )
+}
+
+/// The error of PostgreSQL for `qualifier.*` that cannot name the target,
+/// when the target is the only table in scope. None when the node is not
+/// such a star, or when only the schema that the target resolves to decides
+/// it, which the translator does not know.
+fn star_qualified_by_other_table(
+    node: &pg_query::protobuf::Node,
+    target: &pg_query::protobuf::RangeVar,
+) -> Option<ParseError> {
+    use pg_query::protobuf::node::Node;
+    let Some(Node::ResTarget(res_target)) = &node.node else {
+        return None;
+    };
+    let Some(Node::ColumnRef(col_ref)) = res_target.val.as_ref().and_then(|v| v.node.as_ref())
+    else {
+        return None;
+    };
+    let (last, qualifier) = col_ref.fields.split_last()?;
+    if !matches!(last.node, Some(Node::AStar(_))) {
+        return None;
+    }
+    let names = qualifier
+        .iter()
+        .map(|field| match &field.node {
+            Some(Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (table, schema_qualified) = match names.as_slice() {
+        [table] => (*table, false),
+        [_, table] => (*table, true),
+        _ => return None,
+    };
+    if table != target.relname {
+        return Some(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_UNDEFINED_TABLE,
+            message: format!("missing FROM-clause entry for table \"{table}\""),
+        });
+    }
+    let aliased = target
+        .alias
+        .as_ref()
+        .is_some_and(|alias| !alias.aliasname.is_empty());
+    if schema_qualified && !aliased && target.schemaname.is_empty() {
+        return None;
+    }
+    Some(ParseError::Sqlstate {
+        sqlstate: SQLSTATE_UNDEFINED_TABLE,
+        message: format!("invalid reference to FROM-clause entry for table \"{table}\""),
+    })
+}
+
+/// The error of PostgreSQL for a LATERAL item in the FROM clause of an UPDATE
+/// that reads a column of the target table. The target is in scope in such an
+/// item, also in its subqueries, but PostgreSQL does not let the item read it.
+/// A function item counts as LATERAL, as in PostgreSQL. A FROM item that is
+/// not LATERAL cannot see the target at all, also not in a LATERAL item inside
+/// it, and the engine reports that. None when no LATERAL item names the target
+/// as the table of a column, or when some FROM item has the name of the target
+/// too, because then the name can be a reference to that item.
+fn lateral_reference_to_update_target(
+    from_clause: &[pg_query::protobuf::Node],
+    target: &pg_query::protobuf::RangeVar,
+) -> Option<ParseError> {
+    let refname = target
+        .alias
+        .as_ref()
+        .map(|alias| alias.aliasname.as_str())
+        .filter(|alias| !alias.is_empty())
+        .unwrap_or(&target.relname);
+    let target_names = [refname, target.relname.as_str()];
+    let from_nodes = from_clause
+        .iter()
+        .filter_map(|item| item.node.as_ref())
+        .flat_map(|item| item.nodes())
+        .map(|(node, ..)| node)
+        .collect::<Vec<_>>();
+    if from_nodes
+        .iter()
+        .flat_map(range_names)
+        .any(|name| target_names.contains(&name))
+    {
+        return None;
+    }
+    let mut lateral_items = Vec::new();
+    for item in from_clause {
+        collect_lateral_items(item, &mut lateral_items);
+    }
+    let reads_target = lateral_items
+        .into_iter()
+        .filter_map(|item| item.node.as_ref())
+        .flat_map(|item| item.nodes())
+        .filter_map(|(node, ..)| column_qualifier(&node))
+        .any(|qualifier| target_names.contains(&qualifier));
+    reads_target.then(|| ParseError::Sqlstate {
+        sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+        message: format!("invalid reference to FROM-clause entry for table \"{refname}\""),
+    })
+}
+
+/// The LATERAL items and the function items of FROM item `item`: the item
+/// itself, or the items that its joins combine. Not the items inside a
+/// subquery, which have their own FROM clause.
+fn collect_lateral_items<'a>(
+    item: &'a pg_query::protobuf::Node,
+    out: &mut Vec<&'a pg_query::protobuf::Node>,
+) {
+    use pg_query::protobuf::node::Node;
+    match &item.node {
+        Some(Node::RangeSubselect(subselect)) if subselect.lateral => out.push(item),
+        Some(Node::RangeFunction(_)) => out.push(item),
+        Some(Node::JoinExpr(join)) => {
+            for side in [&join.larg, &join.rarg].into_iter().flatten() {
+                collect_lateral_items(side, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The names that a FROM item, a join or a CTE gives to its rows. For a
+/// table, the name of the table too, also when the table has an alias.
+fn range_names<'a>(node: &pg_query::NodeRef<'a>) -> Vec<&'a str> {
+    use pg_query::NodeRef;
+    let alias = |alias: &'a Option<pg_query::protobuf::Alias>| {
+        alias.iter().map(|alias| alias.aliasname.as_str()).collect()
+    };
+    match node {
+        NodeRef::RangeVar(table) => {
+            let mut names: Vec<_> = alias(&table.alias);
+            names.push(table.relname.as_str());
+            names
+        }
+        NodeRef::RangeSubselect(item) => alias(&item.alias),
+        NodeRef::RangeFunction(item) => alias(&item.alias),
+        NodeRef::JoinExpr(join) => alias(&join.alias),
+        NodeRef::CommonTableExpr(cte) => vec![cte.ctename.as_str()],
+        _ => Vec::new(),
+    }
+}
+
+/// The table name of a column reference `table.column`.
+fn column_qualifier<'a>(node: &pg_query::NodeRef<'a>) -> Option<&'a str> {
+    use pg_query::protobuf::node::Node;
+    let pg_query::NodeRef::ColumnRef(column_ref) = node else {
+        return None;
+    };
+    let [qualifier, _] = column_ref.fields.as_slice() else {
+        return None;
+    };
+    match &qualifier.node {
+        Some(Node::String(name)) => Some(name.sval.as_str()),
+        _ => None,
+    }
 }
 
 fn last_string(names: &[pg_query::protobuf::Node]) -> Option<String> {
@@ -5464,6 +5871,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
 
 /// Internal DDL plan for FK constraints — used during CREATE TABLE translation.
 struct PgForeignKey {
+    name: Option<String>,
     ref_table: String,
     ref_columns: Vec<String>,
     on_delete: Option<String>,
@@ -5508,11 +5916,11 @@ fn translate_create_enum(
         base: None,
         when_then_pairs: vec![(
             Box::new(ast::Expr::InList {
-                lhs: Box::new(ast::Expr::Id(ast::Name::from_string("value"))),
+                lhs: Box::new(ast::Expr::Id(exact_name("value"))),
                 not: false,
                 rhs: in_list,
             }),
-            Box::new(ast::Expr::Id(ast::Name::from_string("value"))),
+            Box::new(ast::Expr::Id(exact_name("value"))),
         )],
         else_expr: Some(Box::new(ast::Expr::Raise(
             ast::ResolveType::Abort,
@@ -5522,7 +5930,7 @@ fn translate_create_enum(
         ))),
     };
 
-    let decode = ast::Expr::Id(ast::Name::from_string("value"));
+    let decode = ast::Expr::Id(exact_name("value"));
 
     Ok(ast::Stmt::CreateType {
         if_not_exists: false,
@@ -5534,6 +5942,7 @@ fn translate_create_enum(
             }],
             base: "text".into(),
             encode: Some(Box::new(encode)),
+            coerce: None,
             decode: Some(Box::new(decode)),
             operators: vec![ast::TypeOperator {
                 op: "<".into(),
@@ -5565,7 +5974,7 @@ fn json_type_or_raise(
     let expected_type = string(expected_type);
     ast::Expr::Case {
         base: Some(Box::new(ast::Expr::FunctionCall {
-            name: ast::Name::from_string("coalesce"),
+            name: exact_name("coalesce"),
             distinctness: None,
             args: vec![Box::new(json_type), expected_type.clone()],
             order_by: vec![],
@@ -5712,17 +6121,22 @@ fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>,
 fn extract_foreign_key(
     constraint: &pg_query::protobuf::Constraint,
 ) -> Result<PgForeignKey, ParseError> {
-    let ref_table = constraint
+    let pktable = constraint
         .pktable
         .as_ref()
-        .ok_or_else(|| ParseError::ParseError("REFERENCES missing table name".into()))?
-        .relname
-        .clone();
+        .ok_or_else(|| ParseError::ParseError("REFERENCES missing table name".into()))?;
+    if !pktable.schemaname.is_empty() && schema_qualifier(&pktable.schemaname)? != "main" {
+        return Err(not_supported(
+            "a foreign key naming a table of a schema that was not replaced by its mangled name",
+        ));
+    }
+    let ref_table = pktable.relname.clone();
     let ref_columns = extract_key_columns(&constraint.pk_attrs)?;
     let on_delete = pg_fk_action_to_string(&constraint.fk_del_action)?;
     let on_update = pg_fk_action_to_string(&constraint.fk_upd_action)?;
 
     Ok(PgForeignKey {
+        name: (!constraint.conname.is_empty()).then(|| constraint.conname.clone()),
         ref_table,
         ref_columns,
         on_delete,
@@ -5750,8 +6164,17 @@ fn pg_fk_action_to_string(action: &str) -> Result<Option<String>, ParseError> {
 /// Represents a parsed SET statement from the PostgreSQL protocol.
 pub struct PgSetStmt {
     pub name: String,
-    pub values: Vec<PgSetValue>,
+    pub to: PgSetTo,
     pub is_local: bool,
+}
+
+/// What a SET statement sets its parameter to.
+pub enum PgSetTo {
+    Values(Vec<PgSetValue>),
+    /// RESET and SET ... TO DEFAULT.
+    Default,
+    /// SET ... FROM CURRENT, which keeps the current value.
+    Current,
 }
 
 #[derive(Clone)]
@@ -5820,10 +6243,35 @@ pub struct PgShowStmt {
     pub name: String,
 }
 
-/// Try to extract a SET statement from a PG parse result.
-/// Returns None if the statement is not a SET.
-pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
+/// Whether a parsed statement is one PostgreSQL still accepts inside an
+/// aborted transaction block: COMMIT/END, ROLLBACK/ABORT, or ROLLBACK TO
+/// SAVEPOINT (`IsTransactionExitStmt` in PostgreSQL's postgres.c).
+/// PostgreSQL's list also has PREPARE TRANSACTION; it is left out here
+/// deliberately while two-phase commit is unsupported.
+pub fn is_tx_exit_stmt(parse_result: &ParseResult) -> bool {
+    use pg_query::protobuf::TransactionStmtKind;
     use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(node) = nodes.first() else {
+        return false;
+    };
+    let NodeRef::TransactionStmt(txn) = &node.0 else {
+        return false;
+    };
+    matches!(
+        TransactionStmtKind::try_from(txn.kind),
+        Ok(TransactionStmtKind::TransStmtCommit
+            | TransactionStmtKind::TransStmtRollback
+            | TransactionStmtKind::TransStmtRollbackTo)
+    )
+}
+
+/// Try to extract a SET, SET ... TO DEFAULT, SET ... FROM CURRENT or RESET
+/// statement of one parameter from a PG parse result.
+/// Returns None if the statement is not one of those.
+pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
 
     if parse_result.protobuf.nodes().is_empty() {
         return None;
@@ -5835,23 +6283,44 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         _ => return None,
     };
 
-    // Only handle VAR_SET_VALUE (kind == 1)
-    if set_stmt.kind != 1 {
-        return None;
-    }
-
-    // Extract the value from args
-    let values = set_stmt
-        .args
-        .iter()
-        .map(PgSetValue::from_node)
-        .collect::<Option<Vec<_>>>()?;
+    let to = match VariableSetKind::try_from(set_stmt.kind).ok()? {
+        VariableSetKind::VarSetValue => PgSetTo::Values(
+            set_stmt
+                .args
+                .iter()
+                .map(PgSetValue::from_node)
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        VariableSetKind::VarSetDefault | VariableSetKind::VarReset => PgSetTo::Default,
+        VariableSetKind::VarSetCurrent => PgSetTo::Current,
+        _ => return None,
+    };
 
     Some(PgSetStmt {
         name: set_stmt.name.clone(),
-        values,
+        to,
         is_local: set_stmt.is_local,
     })
+}
+
+/// Returns true if the parse result is a RESET ALL statement.
+pub fn is_reset_all(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(NodeRef::VariableSetStmt(stmt)) if stmt.kind == VariableSetKind::VarResetAll as i32
+    )
+}
+
+/// Returns true if the parse result is a DISCARD ALL statement.
+pub fn is_discard_all(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::DiscardMode, NodeRef};
+
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(NodeRef::DiscardStmt(stmt)) if stmt.target == DiscardMode::DiscardAll as i32
+    )
 }
 
 fn check_transaction_options(
@@ -6135,10 +6604,13 @@ fn create_schema_elements(
                 if relation.schemaname.is_empty() {
                     relation.schemaname = schema.to_string();
                 } else if relation.schemaname != schema {
-                    return Err(ParseError::ParseError(format!(
-                        "CREATE specifies a schema ({}) different from the one being created ({schema})",
-                        relation.schemaname
-                    )));
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_INVALID_SCHEMA_DEFINITION,
+                        message: format!(
+                            "CREATE specifies a schema ({}) different from the one being created ({schema})",
+                            relation.schemaname
+                        ),
+                    });
                 }
             }
             let sql = element
@@ -6204,6 +6676,22 @@ pub fn is_refresh_matview(parse_result: &ParseResult) -> Result<bool, ParseError
         return Err(not_supported("REFRESH MATERIALIZED VIEW ... WITH NO DATA"));
     }
     Ok(true)
+}
+
+/// Returns true if the parse result is a DROP MATERIALIZED VIEW statement.
+/// It translates to the same DROP VIEW as DROP VIEW does.
+pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
+    use pg_query::protobuf::ObjectType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return false;
+    }
+    matches!(
+        &nodes[0].0,
+        NodeRef::DropStmt(drop) if drop.remove_type == ObjectType::ObjectMatview as i32
+    )
 }
 
 /// Returns true if the parse result is a COMMENT ON statement.
@@ -6485,7 +6973,7 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
 
 fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
     ast::Expr::FunctionCall {
-        name: ast::Name::from_string(name),
+        name: exact_name(name),
         distinctness: None,
         args: args.into_iter().map(Box::new).collect(),
         order_by: vec![],
@@ -6495,6 +6983,10 @@ fn function_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
             over_clause: None,
         },
     }
+}
+
+fn exact_name(name: impl Into<String>) -> ast::Name {
+    ast::Name::exact(name.into())
 }
 
 /// SQLite's default SQLITE_MAX_LIKE_PATTERN_LENGTH, which core enforces on
@@ -6621,12 +7113,14 @@ fn drop_object_type_name(obj_type: pg_query::protobuf::ObjectType) -> String {
 }
 
 fn not_supported(what: impl std::fmt::Display) -> ParseError {
-    ParseError::ParseError(format!("{what} is not supported"))
+    ParseError::Sqlstate {
+        sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
+        message: format!("{what} is not supported"),
+    }
 }
 
 fn reject_constraint_attributes(
     constraint: &pg_query::protobuf::Constraint,
-    table_schema: &str,
 ) -> Result<(), ParseError> {
     use pg_query::protobuf::ConstrType;
 
@@ -6642,17 +7136,14 @@ fn reject_constraint_attributes(
             "a DEFERRABLE / INITIALLY DEFERRED constraint",
         ));
     }
-    if let Some(pktable) = &constraint.pktable {
-        let schema_of =
-            |s: &str| map_schema_name(if s.is_empty() { "public" } else { s }).to_string();
-        if !pktable.catalogname.is_empty()
-            || (!pktable.schemaname.is_empty()
-                && schema_of(&pktable.schemaname) != schema_of(table_schema))
-        {
-            return Err(not_supported(
-                "foreign key referencing a table in another schema",
-            ));
-        }
+    if constraint
+        .pktable
+        .as_ref()
+        .is_some_and(|pktable| !pktable.catalogname.is_empty())
+    {
+        return Err(not_supported(
+            "foreign key referencing a table in another database",
+        ));
     }
     if !constraint.including.is_empty() {
         return Err(not_supported("INCLUDE on a constraint"));
@@ -6875,6 +7366,10 @@ fn is_text_pattern(node: &pg_query::protobuf::Node) -> bool {
     }
 }
 
+fn no_such_function(name: &str) -> ParseError {
+    ParseError::ParseError(format!("no such function: {name}"))
+}
+
 fn object_name(
     names: &[pg_query::protobuf::Node],
     allowed_schema: fn(&str) -> bool,
@@ -6886,7 +7381,42 @@ fn object_name(
     }
     unqualified_name(&names, allowed_schema)
         .cloned()
-        .ok_or_else(|| not_supported(format!("a schema-qualified {kind} name")))
+        .ok_or_else(|| match names.as_slice() {
+            [schema, _] => ParseError::SchemaQualifiedName {
+                kind: kind.to_string(),
+                schema: schema.clone(),
+            },
+            _ => not_supported(format!("a schema-qualified {kind} name")),
+        })
+}
+
+/// The name of a function call, in the FROM clause or in an expression.
+fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseError> {
+    if let [schema, name] = extract_key_columns(names)?.as_slice() {
+        if schema == "auth" {
+            let qualified_name = format!("{schema}.{name}");
+            return match name.as_str() {
+                "uid" | "email" | "jwt" => Ok(qualified_name),
+                _ => Err(no_such_function(&qualified_name)),
+            };
+        }
+    }
+    let name = object_name(names, is_pg_catalog, "function")?;
+    if name.contains('.') {
+        return Err(no_such_function(&name));
+    }
+    // libpg_query lowercases unquoted names, so an uppercase letter means the
+    // name was quoted. PostgreSQL matches function names exactly and every
+    // function tursopg provides has a lowercase name, so a quoted name like
+    // "LOWER" names no function. Reject it here because core, like SQLite,
+    // matches function names without regard to case.
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
+            message: format!("no such function: {name}"),
+        });
+    }
+    Ok(name)
 }
 
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {
@@ -6901,8 +7431,10 @@ fn is_pg_catalog(schema: &str) -> bool {
     schema == "pg_catalog"
 }
 
+/// Whether `schema` names the schema that types and functions are looked
+/// up in anyway: the catalog, or public, where PostgreSQL puts user types.
 fn is_default_schema(schema: &str) -> bool {
-    map_schema_name(schema) == "main"
+    map_schema_name(schema) == "main" || schema.eq_ignore_ascii_case("public")
 }
 
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
@@ -6990,7 +7522,15 @@ mod tests {
             ),
             (
                 "SELECT g.n FROM generate_series(1, 3) AS g(n)",
-                "SELECT g.n FROM LATERAL (SELECT value n FROM generate_series (1, 3)) g",
+                "SELECT g.n FROM LATERAL (SELECT value n FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) g",
+            ),
+            (
+                "SELECT g FROM generate_series(1, 3) g",
+                "SELECT g FROM LATERAL (SELECT value g FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) g",
+            ),
+            (
+                "SELECT * FROM generate_series(1, 3)",
+                "SELECT * FROM LATERAL (SELECT value generate_series FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) generate_series",
             ),
         ] {
             assert_eq!(translate(sql).unwrap(), expected, "{sql}");
@@ -8180,7 +8720,7 @@ mod tests {
             ),
             (
                 "SELECT * FROM t1 LEFT JOIN LATERAL (SELECT t1.a) s ON true",
-                "SELECT * FROM t1 LEFT OUTER JOIN LATERAL (SELECT t1.a) s ON 1",
+                "SELECT * FROM t1 LEFT OUTER JOIN LATERAL (SELECT t1.a) s ON CAST (1 AS boolean)",
             ),
             (
                 "SELECT * FROM t1, (SELECT 1) s",
@@ -9764,22 +10304,28 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_fk_other_schema() {
+    fn fail_closed_fk_other_database() {
+        assert_not_supported(
+            "CREATE TABLE c (a int REFERENCES db.other.p(id))",
+            "another database",
+        );
+        assert_not_supported(
+            "ALTER TABLE c ADD COLUMN a int REFERENCES db.other.p(id)",
+            "another database",
+        );
         assert_not_supported(
             "CREATE TABLE c (a int REFERENCES other.p(id))",
-            "another schema",
+            "replaced by its mangled name",
         );
         assert_not_supported(
             "CREATE TABLE s.c (a int, FOREIGN KEY (a) REFERENCES p2.p(id))",
-            "another schema",
+            "replaced by its mangled name",
         );
         assert_not_supported(
-            "ALTER TABLE c ADD COLUMN a int REFERENCES other.p(id)",
-            "another schema",
+            "CREATE TABLE public.c (a int REFERENCES public.p(id))",
+            "replaced by its mangled name",
         );
-        assert_translates("CREATE TABLE public.c (a int REFERENCES public.p(id))");
-        assert_translates("CREATE TABLE c (a int REFERENCES public.p(id))");
-        assert_translates("CREATE TABLE s.c (a int REFERENCES s.p(id))");
+        assert_translates("CREATE TABLE s.c (a int REFERENCES __turso_ns1_p(id))");
     }
 
     #[test]

@@ -54,11 +54,12 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
     fn serialize_row_version(
         &self,
         log_record: &mut turso_core::mvcc::database::LogRecord,
+        row_id: &turso_core::mvcc::database::RowID,
         row_version: &turso_core::mvcc::database::RowVersion,
         portable_extension: Option<&[u8]>,
     ) -> turso_core::Result<()> {
         self.inner
-            .serialize_row_version(log_record, row_version, portable_extension)
+            .serialize_row_version(log_record, row_id, row_version, portable_extension)
     }
 
     fn serialize_database_header(
@@ -407,6 +408,28 @@ fn test_mvcc_read_to_write_upgrade_does_not_block_checkpoint(
     let conn2 = tmp_db.connect_limbo();
     conn2.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_open_reports_unsupported() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_open_reports_unsupported.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB)")?;
+    conn.execute("INSERT INTO files VALUES (1, zeroblob(8))")?;
+
+    for read_write in [false, true] {
+        let Err(err) = conn.blob_open("files", "data", 1, read_write) else {
+            panic!("blob_open must fail in MVCC mode");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Internal error: incremental blob I/O is not supported in MVCC mode"
+        );
+    }
+
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT hex(data) FROM files WHERE id = 1");
+    assert_eq!(rows, vec![("0000000000000000".to_string(),)]);
     Ok(())
 }
 
@@ -1500,6 +1523,38 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
 
     let rows: Vec<(String, i64)> = conn.exec_rows("SELECT key, length(value) FROM quint_corrupt");
     assert_eq!(rows, vec![("k0".to_string(), 32)]);
+
+    Ok(())
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/8067
+///
+/// Under MVCC, an UPSERT (`ON CONFLICT(v) DO UPDATE SET id = excluded.id`) on a
+/// checkpointed row probes the new `INTEGER PRIMARY KEY` with `NotExists` on the
+/// table cursor before re-seeking to the conflicting rowid and deleting it.
+/// `MvccLazyCursor::exists` moved the underlying B-tree cursor during a miss
+/// without clearing `current_pos`, causing the subsequent `SeekRowid` equality
+/// fast-path to short-circuit and `Delete` to fail with a false corruption error.
+#[turso_macros::test]
+fn test_mvcc_checkpointed_upsert_changing_ipk(db: TempDatabase) -> anyhow::Result<()> {
+    let conn = db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two')")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    conn.execute("INSERT INTO t VALUES (3, 'one') ON CONFLICT(v) DO UPDATE SET id = excluded.id")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+    let by_pk: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(by_pk, vec![(2, "two".to_string()), (3, "one".to_string())]);
+
+    let by_idx: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, v FROM t INDEXED BY sqlite_autoindex_t_1 ORDER BY v");
+    assert_eq!(by_idx, vec![(3, "one".to_string()), (2, "two".to_string())]);
 
     Ok(())
 }

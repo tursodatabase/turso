@@ -13,8 +13,9 @@ use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
 };
 use crate::function::Func;
+use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::pragma::pragma_for;
-use crate::schema::{BTreeTable, Index, Schema, Table};
+use crate::schema::{BTreeTable, Index, IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL};
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -93,43 +94,46 @@ fn normalize_table_pragma_lookup_name(database_id: usize, name: &str) -> String 
     }
 }
 
-fn resolve_table_pragma_database_id(
+fn resolve_table_pragma_namespace(
     resolver: &Resolver,
-    default_database_id: usize,
+    default_namespace: NamespaceRef,
     schema_was_explicit: bool,
     table_name: &str,
-) -> crate::Result<usize> {
+) -> crate::Result<NamespaceRef> {
     if schema_was_explicit {
-        return Ok(default_database_id);
+        return Ok(default_namespace);
     }
 
     if table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME)
         || table_name.eq_ignore_ascii_case(crate::schema::TEMP_SCHEMA_TABLE_NAME_ALT)
     {
-        return Ok(crate::TEMP_DB_ID);
+        return Ok(NamespaceRef::root_of(crate::TEMP_DB_ID));
     }
-    resolver.resolve_existing_table_database_id(table_name)
+    resolver.resolve_existing_table_named(table_name)
 }
 
-fn resolve_index_pragma_database_id(
+fn resolve_index_pragma_namespace(
     resolver: &Resolver,
-    default_database_id: usize,
+    default_namespace: NamespaceRef,
     schema_was_explicit: bool,
     index_name: &str,
-) -> crate::Result<usize> {
+) -> crate::Result<NamespaceRef> {
     if schema_was_explicit {
-        return Ok(default_database_id);
+        return Ok(default_namespace);
     }
 
-    let has_index =
-        |schema: &Schema, name: &str| !matches!(find_index_by_name(schema, name), Ok(None));
-    let database_id = resolver.resolve_unqualified_existing_database_id(index_name, has_index)?;
-    if resolver.with_schema(database_id, |schema| has_index(schema, index_name)) {
-        return Ok(database_id);
+    let has_index = |schema: &Schema, namespace: NamespaceId, name: &str| {
+        !matches!(find_index_by_name(schema, namespace, name), Ok(None))
+    };
+    let namespace = resolver.resolve_unqualified_existing(index_name, has_index)?;
+    if resolver.with_schema(namespace.database_id, |schema| {
+        has_index(schema, namespace.id, index_name)
+    }) {
+        return Ok(namespace);
     }
-    resolver.resolve_unqualified_existing_database_id(index_name, |schema, name| {
+    resolver.resolve_unqualified_existing(index_name, |schema, namespace, name| {
         schema
-            .get_btree_table(name)
+            .get_btree_table(namespace, name)
             .is_some_and(|table| !table.has_rowid)
     })
 }
@@ -147,6 +151,7 @@ fn foreign_key_action_name(action: ast::RefAct) -> &'static str {
 fn emit_table_list_rows_for_schema(
     program: &mut ProgramBuilder,
     schema: &Schema,
+    namespace: NamespaceId,
     database_id: usize,
     database_name: &str,
     base_reg: usize,
@@ -159,7 +164,10 @@ fn emit_table_list_rows_for_schema(
                           wr: bool,
                           strict: bool| {
         program.emit_string8(database_name.to_string(), base_reg);
-        program.emit_string8(display_table_list_name(database_id, name), base_reg + 1);
+        program.emit_string8(
+            display_table_list_name(database_id, &mangle_name(namespace, name)),
+            base_reg + 1,
+        );
         program.emit_string8(obj_type.to_string(), base_reg + 2);
         program.emit_int(ncol as i64, base_reg + 3);
         program.emit_int(wr as i64, base_reg + 4);
@@ -169,7 +177,7 @@ fn emit_table_list_rows_for_schema(
 
     if let Some(filter_name) = filter_name {
         let lookup_name = normalize_table_pragma_lookup_name(database_id, filter_name);
-        if let Some(table) = schema.get_table(&lookup_name) {
+        if let Some(table) = schema.get_table(namespace, &lookup_name) {
             let (wr, strict) = match table.btree() {
                 Some(bt) => (!bt.has_rowid, bt.is_strict),
                 None => (false, false),
@@ -182,7 +190,7 @@ fn emit_table_list_rows_for_schema(
                 wr,
                 strict,
             );
-        } else if let Some(view) = schema.get_view(&lookup_name) {
+        } else if let Some(view) = schema.get_view(namespace, &lookup_name) {
             emit_table_row(
                 program,
                 &view.name,
@@ -195,7 +203,7 @@ fn emit_table_list_rows_for_schema(
         return;
     }
 
-    for table in schema.tables.values() {
+    for table in schema.tables(namespace) {
         let Some(bt) = table.btree() else {
             continue;
         };
@@ -208,7 +216,7 @@ fn emit_table_list_rows_for_schema(
             bt.is_strict,
         );
     }
-    for view in schema.views.values() {
+    for (_, view) in schema.views(namespace) {
         emit_table_row(
             program,
             &view.name,
@@ -247,7 +255,8 @@ pub fn translate_pragma(
         return Ok(());
     }
 
-    let database_id = resolver.resolve_database_id(name)?;
+    let namespace = resolver.resolve_namespace(name)?;
+    let database_id = namespace.database_id;
 
     let Some(pragma) = parse_pragma_name(name.name.as_str()) else {
         // SQLite silently ignores unknown PRAGMA names.
@@ -264,7 +273,7 @@ pub fn translate_pragma(
             None,
             pager,
             connection,
-            database_id,
+            namespace,
             schema_was_explicit,
             program,
         )?,
@@ -285,7 +294,7 @@ pub fn translate_pragma(
                 Some(*value),
                 pager,
                 connection,
-                database_id,
+                namespace,
                 schema_was_explicit,
                 program,
             )?,
@@ -295,7 +304,7 @@ pub fn translate_pragma(
                 *value,
                 pager,
                 connection,
-                database_id,
+                namespace,
                 schema_was_explicit,
                 program,
             )?,
@@ -331,10 +340,11 @@ fn update_pragma(
     value: ast::Expr,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
-    database_id: usize,
+    namespace: NamespaceRef,
     schema_was_explicit: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
+    let database_id = namespace.database_id;
     let parse_pragma_enabled = |expr: &ast::Expr| -> bool {
         if let Expr::Literal(Literal::Numeric(n)) = expr {
             return !matches!(n.as_str(), "0");
@@ -433,7 +443,7 @@ fn update_pragma(
                 None,
                 pager,
                 connection,
-                database_id,
+                namespace,
                 schema_was_explicit,
                 program,
             )
@@ -469,7 +479,7 @@ fn update_pragma(
                 None,
                 pager,
                 connection,
-                database_id,
+                namespace,
                 schema_was_explicit,
                 program,
             )
@@ -480,7 +490,7 @@ fn update_pragma(
             Some(value),
             pager,
             connection,
-            database_id,
+            namespace,
             schema_was_explicit,
             program,
         ),
@@ -491,7 +501,7 @@ fn update_pragma(
             None,
             pager,
             connection,
-            database_id,
+            namespace,
             schema_was_explicit,
             program,
         ),
@@ -550,10 +560,27 @@ fn update_pragma(
         PragmaName::PageSize => {
             let page_size = match parse_signed_number(&value)? {
                 Value::Numeric(Numeric::Integer(size)) => size,
-                Value::Numeric(Numeric::Float(size)) => f64::from(size) as i64,
+                // SQLite's sqlite3Atoi reads only the leading digits of the literal,
+                // so 1024.5 is 1024 but 8.192e3 is 8. Negative sizes are invalid anyway.
+                Value::Numeric(Numeric::Float(size)) if f64::from(size) >= 0.0 => {
+                    let literal = match &value {
+                        Expr::Unary(_, inner) => inner.as_ref(),
+                        literal => literal,
+                    };
+                    let Expr::Literal(Literal::Numeric(digits)) = literal else {
+                        unreachable!("parse_signed_number only reads numeric literals");
+                    };
+                    crate::numeric::str_to_i64(digits).unwrap_or(0)
+                }
+                Value::Numeric(Numeric::Float(_)) => 0,
                 _ => bail_parse_error!("Invalid value for page size pragma"),
             };
-            update_page_size(connection, database_id, page_size as u32)?;
+            // Like SQLite's sqlite3Atoi, a value outside the 32-bit range reads as 0.
+            update_page_size(
+                connection,
+                database_id,
+                u32::try_from(page_size).unwrap_or(0),
+            )?;
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
@@ -616,6 +643,7 @@ fn update_pragma(
                 jump_if_null: false,
             });
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: "Early halt because auto vacuum mode is not enabled".to_string(),
                 on_error: None,
@@ -662,7 +690,7 @@ fn update_pragma(
             Some(value),
             pager,
             connection,
-            database_id,
+            namespace,
             schema_was_explicit,
             program,
         ),
@@ -672,7 +700,7 @@ fn update_pragma(
             Some(value),
             pager,
             connection,
-            database_id,
+            namespace,
             schema_was_explicit,
             program,
         ),
@@ -841,7 +869,7 @@ fn update_pragma(
             Some(value),
             pager,
             connection,
-            database_id,
+            namespace,
             schema_was_explicit,
             program,
         ),
@@ -855,10 +883,11 @@ fn query_pragma(
     value: Option<ast::Expr>,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
-    database_id: usize,
+    namespace: NamespaceRef,
     schema_was_explicit: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
+    let database_id = namespace.database_id;
     let schema = resolver.schema();
     let register = program.alloc_register();
     match pragma {
@@ -1096,20 +1125,21 @@ fn query_pragma(
             program.alloc_registers(2);
 
             if let Some(index_name) = index_name {
-                let index_database_id = resolve_index_pragma_database_id(
+                let index_namespace = resolve_index_pragma_namespace(
                     resolver,
-                    database_id,
+                    namespace,
                     schema_was_explicit,
                     &index_name,
                 )?;
-                resolver.with_schema(index_database_id, |schema| -> Result<()> {
-                    if let Some(index) =
-                        find_index_or_without_rowid_primary_key(schema, &index_name)?
-                    {
+                resolver.with_schema(index_namespace.database_id, |schema| -> Result<()> {
+                    if let Some(index) = find_index_or_without_rowid_primary_key(
+                        schema,
+                        index_namespace.id,
+                        &index_name,
+                    )? {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             program.emit_int(seqno as i64, base_reg);
-                            program.emit_int(col.pos_in_table as i64, base_reg + 1);
-                            program.emit_string8(col.name.clone(), base_reg + 2);
+                            emit_index_column_cid_and_name(program, col, base_reg + 1);
                             program.emit_result_row(base_reg, 3);
                         }
                     }
@@ -1134,26 +1164,24 @@ fn query_pragma(
             program.alloc_registers(5);
 
             if let Some(index_name) = index_name {
-                let index_database_id = resolve_index_pragma_database_id(
+                let index_namespace = resolve_index_pragma_namespace(
                     resolver,
-                    database_id,
+                    namespace,
                     schema_was_explicit,
                     &index_name,
                 )?;
-                resolver.with_schema(index_database_id, |schema| -> Result<()> {
-                    if let Some(index) =
-                        find_index_or_without_rowid_primary_key(schema, &index_name)?
-                    {
+                resolver.with_schema(index_namespace.database_id, |schema| -> Result<()> {
+                    if let Some(index) = find_index_or_without_rowid_primary_key(
+                        schema,
+                        index_namespace.id,
+                        &index_name,
+                    )? {
                         for (seqno, col) in index.columns.iter().enumerate() {
                             let desc = matches!(col.order, ast::SortOrder::Desc);
-                            let coll = col
-                                .collation
-                                .map(|c| c.to_string().to_uppercase())
-                                .unwrap_or_else(|| "BINARY".to_string());
+                            let coll = col.collation.to_string().to_uppercase();
 
                             program.emit_int(seqno as i64, base_reg);
-                            program.emit_int(col.pos_in_table as i64, base_reg + 1);
-                            program.emit_string8(col.name.clone(), base_reg + 2);
+                            emit_index_column_cid_and_name(program, col, base_reg + 1);
                             program.emit_int(desc as i64, base_reg + 3);
                             program.emit_string8(coll, base_reg + 4);
                             program.emit_int(1, base_reg + 5); // key column
@@ -1165,14 +1193,14 @@ fn query_pragma(
                             let seqno = index.columns.len();
                             program.emit_int(seqno as i64, base_reg);
                             program.emit_int(-1, base_reg + 1);
-                            program.emit_string8(String::new(), base_reg + 2);
+                            program.emit_null(base_reg + 2, None);
                             program.emit_int(0, base_reg + 3);
                             program.emit_string8("BINARY".to_string(), base_reg + 4);
                             program.emit_int(0, base_reg + 5); // not a key column
                             program.emit_result_row(base_reg, 6);
                         }
 
-                        let table = schema.get_btree_table(&index.table_name);
+                        let table = schema.get_btree_table(index_namespace.id, &index.table_name);
                         if let Some(table) = table.filter(|t| t.root_page == index.root_page) {
                             let other_columns =
                                 table.columns().iter().enumerate().filter(|(pos, col)| {
@@ -1214,14 +1242,14 @@ fn query_pragma(
             program.alloc_registers(4);
 
             if let Some(table_name) = table_name {
-                let table_database_id = resolve_table_pragma_database_id(
+                let table_namespace = resolve_table_pragma_namespace(
                     resolver,
-                    database_id,
+                    namespace,
                     schema_was_explicit,
                     &table_name,
                 )?;
-                resolver.with_schema(table_database_id, |schema| -> Result<()> {
-                    if let Some(table) = schema.get_table(&table_name) {
+                resolver.with_schema(table_namespace.database_id, |schema| -> Result<()> {
+                    if let Some(table) = schema.get_table(table_namespace.id, &table_name) {
                         let btree = table.btree();
                         let pk_cols: Vec<String> = btree
                             .as_ref()
@@ -1238,7 +1266,7 @@ fn query_pragma(
                         };
 
                         let indices = schema
-                            .get_indices(&table_name)
+                            .get_indices(table_namespace.id, &table_name)
                             .map(|index| index.as_ref())
                             .chain(without_rowid_pk_index.as_ref());
                         for (seq, index) in indices.enumerate() {
@@ -1289,14 +1317,16 @@ fn query_pragma(
 
             if let Some(table_name) = table_name {
                 let table_name = table_name.as_str();
-                let table_database_id = resolve_table_pragma_database_id(
+                let table_namespace = resolve_table_pragma_namespace(
                     resolver,
-                    database_id,
+                    namespace,
                     schema_was_explicit,
                     table_name,
                 )?;
-                resolver.with_schema(table_database_id, |schema| {
-                    let Some(table) = schema.get_table(table_name).and_then(|table| table.btree())
+                resolver.with_schema(table_namespace.database_id, |schema| {
+                    let Some(table) = schema
+                        .get_table(table_namespace.id, table_name)
+                        .and_then(|table| table.btree())
                     else {
                         return;
                     };
@@ -1362,14 +1392,17 @@ fn query_pragma(
                     .namespace_name(current_database_id)
                     .unwrap_or_else(|| "main".to_string());
                 resolver.with_schema(current_database_id, |schema| {
-                    emit_table_list_rows_for_schema(
-                        program,
-                        schema,
-                        current_database_id,
-                        &database_name,
-                        base_reg,
-                        name.as_deref(),
-                    )
+                    for namespace in schema.namespace_ids() {
+                        emit_table_list_rows_for_schema(
+                            program,
+                            schema,
+                            namespace,
+                            current_database_id,
+                            &database_name,
+                            base_reg,
+                            name.as_deref(),
+                        )
+                    }
                 });
             }
 
@@ -1389,15 +1422,16 @@ fn query_pragma(
             // we need 6 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(5);
             if let Some(name) = name {
-                let table_database_id = resolve_table_pragma_database_id(
+                let table_namespace = resolve_table_pragma_namespace(
                     resolver,
-                    database_id,
+                    namespace,
                     schema_was_explicit,
                     &name,
                 )?;
-                let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
-                resolver.with_schema(table_database_id, |db_schema| -> Result<()> {
-                    if let Some(table) = db_schema.get_table(&lookup_name) {
+                let lookup_name =
+                    normalize_table_pragma_lookup_name(table_namespace.database_id, &name);
+                resolver.with_schema(table_namespace.database_id, |db_schema| -> Result<()> {
+                    if let Some(table) = db_schema.get_table(table_namespace.id, &lookup_name) {
                         let primary_key_columns = match table.as_ref() {
                             Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
                             _ => None,
@@ -1409,7 +1443,9 @@ fn query_pragma(
                             base_reg,
                             false,
                         );
-                    } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
+                    } else if let Some(view_mutex) =
+                        db_schema.get_materialized_view(table_namespace.id, &lookup_name)
+                    {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns()?;
                         emit_columns_for_table_info(
@@ -1421,7 +1457,8 @@ fn query_pragma(
                             base_reg,
                             false,
                         );
-                    } else if let Some(view) = db_schema.get_view(&lookup_name) {
+                    } else if let Some(view) = db_schema.get_view(table_namespace.id, &lookup_name)
+                    {
                         emit_columns_for_table_info(
                             program,
                             &view.columns,
@@ -1450,15 +1487,16 @@ fn query_pragma(
             // we need 7 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(6);
             if let Some(name) = name {
-                let table_database_id = resolve_table_pragma_database_id(
+                let table_namespace = resolve_table_pragma_namespace(
                     resolver,
-                    database_id,
+                    namespace,
                     schema_was_explicit,
                     &name,
                 )?;
-                let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
-                resolver.with_schema(table_database_id, |db_schema| -> Result<()> {
-                    if let Some(table) = db_schema.get_table(&lookup_name) {
+                let lookup_name =
+                    normalize_table_pragma_lookup_name(table_namespace.database_id, &name);
+                resolver.with_schema(table_namespace.database_id, |db_schema| -> Result<()> {
+                    if let Some(table) = db_schema.get_table(table_namespace.id, &lookup_name) {
                         let primary_key_columns = match table.as_ref() {
                             Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
                             _ => None,
@@ -1470,7 +1508,9 @@ fn query_pragma(
                             base_reg,
                             true,
                         );
-                    } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
+                    } else if let Some(view_mutex) =
+                        db_schema.get_materialized_view(table_namespace.id, &lookup_name)
+                    {
                         let view = view_mutex.lock();
                         let flat_columns = view.column_schema.flat_columns()?;
                         emit_columns_for_table_info(
@@ -1482,7 +1522,8 @@ fn query_pragma(
                             base_reg,
                             true,
                         );
-                    } else if let Some(view) = db_schema.get_view(&lookup_name) {
+                    } else if let Some(view) = db_schema.get_view(table_namespace.id, &lookup_name)
+                    {
                         emit_columns_for_table_info(
                             program,
                             &view.columns,
@@ -1780,17 +1821,13 @@ fn query_pragma(
         }
         PragmaName::ListTypes => {
             let base_reg = register;
-            program.alloc_registers(5); // 6 total (1 already allocated)
+            program.alloc_registers(6); // 7 total (1 already allocated)
 
-            // Built-in types: NULL parent, encode, decode, default, operators
+            // Built-in types: NULL parent, encode, coerce, decode, default, operators
             for builtin in &["INTEGER", "REAL", "TEXT", "BLOB", "ANY"] {
                 program.emit_string8(builtin.to_string(), base_reg);
-                program.emit_null(base_reg + 1, None);
-                program.emit_null(base_reg + 2, None);
-                program.emit_null(base_reg + 3, None);
-                program.emit_null(base_reg + 4, None);
-                program.emit_null(base_reg + 5, None);
-                program.emit_result_row(base_reg, 6);
+                program.emit_null(base_reg + 1, Some(base_reg + 6));
+                program.emit_result_row(base_reg, 7);
             }
 
             // Custom types from the type registry are only shown when strict mode is enabled
@@ -1821,23 +1858,20 @@ fn query_pragma(
                     };
                     program.emit_string8(display_name, base_reg);
                     program.emit_string8(type_def.base().to_string(), base_reg + 1);
-                    if let Some(expr) = type_def.encode() {
-                        program.emit_string8(expr.to_string(), base_reg + 2);
-                    } else {
-                        program.emit_null(base_reg + 2, None);
-                    }
-                    if let Some(expr) = type_def.decode() {
-                        program.emit_string8(expr.to_string(), base_reg + 3);
-                    } else {
-                        program.emit_null(base_reg + 3, None);
-                    }
-                    if let Some(expr) = type_def.default_expr() {
-                        program.emit_string8(expr.to_string(), base_reg + 4);
-                    } else {
-                        program.emit_null(base_reg + 4, None);
+                    let clauses = [
+                        type_def.encode(),
+                        type_def.coerce(),
+                        type_def.decode(),
+                        type_def.default_expr(),
+                    ];
+                    for (i, clause) in clauses.into_iter().enumerate() {
+                        match clause {
+                            Some(expr) => program.emit_string8(expr.to_string(), base_reg + 2 + i),
+                            None => program.emit_null(base_reg + 2 + i, None),
+                        }
                     }
                     if type_def.operators().is_empty() {
-                        program.emit_null(base_reg + 5, None);
+                        program.emit_null(base_reg + 6, None);
                     } else {
                         let ops: Vec<String> = type_def
                             .operators()
@@ -1847,9 +1881,9 @@ fn query_pragma(
                                 None => format!("'{}'", op.op),
                             })
                             .collect();
-                        program.emit_string8(ops.join(", "), base_reg + 5);
+                        program.emit_string8(ops.join(", "), base_reg + 6);
                     }
-                    program.emit_result_row(base_reg, 6);
+                    program.emit_result_row(base_reg, 7);
                 }
             }
 
@@ -1864,22 +1898,25 @@ fn query_pragma(
 
 fn find_index_or_without_rowid_primary_key(
     schema: &Schema,
+    namespace: NamespaceId,
     name: &str,
 ) -> Result<Option<Arc<Index>>> {
-    if let Some(index) = find_index_by_name(schema, name)? {
+    if let Some(index) = find_index_by_name(schema, namespace, name)? {
         return Ok(Some(index));
     }
-    let Some(table) = schema.get_btree_table(name) else {
+    let Some(table) = schema.get_btree_table(namespace, name) else {
         return Ok(None);
     };
     Ok(without_rowid_primary_key_index(&table)?.map(Arc::new))
 }
 
-fn find_index_by_name(schema: &Schema, index_name: &str) -> Result<Option<Arc<Index>>> {
+fn find_index_by_name(
+    schema: &Schema,
+    namespace: NamespaceId,
+    index_name: &str,
+) -> Result<Option<Arc<Index>>> {
     if let Some(index) = schema
-        .indexes
-        .values()
-        .flatten()
+        .indexes(namespace)
         .find(|idx| idx.name.eq_ignore_ascii_case(index_name))
     {
         return Ok(Some(index.clone()));
@@ -1887,7 +1924,7 @@ fn find_index_by_name(schema: &Schema, index_name: &str) -> Result<Option<Arc<In
     let Some(table) = index_name
         .strip_prefix(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
         .and_then(|rest| rest.strip_suffix("_1"))
-        .and_then(|table_name| schema.get_btree_table(table_name))
+        .and_then(|table_name| schema.get_btree_table(namespace, table_name))
     else {
         return Ok(None);
     };
@@ -1908,8 +1945,21 @@ fn without_rowid_primary_key_index(table: &BTreeTable) -> Result<Option<Index>> 
         table.primary_key_columns.len(),
         primary_key.and_then(|us| us.conflict_clause),
         primary_key.map_or(&[], |us| us.columns.as_slice()),
+        primary_key.and_then(|us| us.constraint_name.clone()),
     )?;
     Ok(Some(index))
+}
+
+/// Emits the `cid` and `name` of PRAGMA index_info / index_xinfo. Like SQLite,
+/// an expression column has cid -2 and a NULL name.
+fn emit_index_column_cid_and_name(program: &mut ProgramBuilder, col: &IndexColumn, dest: usize) {
+    if col.pos_in_table == EXPR_INDEX_SENTINEL {
+        program.emit_int(-2, dest);
+        program.emit_null(dest + 1, None);
+    } else {
+        program.emit_int(col.pos_in_table as i64, dest);
+        program.emit_string8(col.name.clone(), dest + 1);
+    }
 }
 
 /// 0-based index of `column` within `primary_key_columns`, if present.
@@ -1971,7 +2021,10 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.ty_str.clone(), base_reg + 2);
 
         // notnull
-        program.emit_bool(column.notnull(), base_reg + 3);
+        program.emit_bool(
+            column.notnull() && (!column.is_rowid_alias() || column.explicit_notnull()),
+            base_reg + 3,
+        );
 
         // dflt_value
         match &column.default {

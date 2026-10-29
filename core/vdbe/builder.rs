@@ -250,6 +250,9 @@ pub struct ProgramBuilder {
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
+    /// What `Statement::get_column_type_info` reports for each result column. Only
+    /// filled in when custom types are enabled.
+    pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by cte_id.
@@ -266,8 +269,6 @@ pub struct ProgramBuilder {
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub table_reference_counter: TableRefIdCounter,
-    /// Curr collation sequence. Bool indicates whether it was set by a COLLATE expr
-    collation: Option<(CollationSeq, bool)>,
     capture_data_changes_info: Option<CaptureDataChangesInfo>,
     /// Whether the main database uses MVCC journal mode, set once at translation time from the connection.
     mvcc_enabled: bool,
@@ -358,6 +359,7 @@ impl ProgramBuilderFlags {
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
+    const KEEP_ARRAY_RESULTS_AS_BLOBS: u16 = 1 << 9;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -462,6 +464,19 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_suppress_custom_type_decode(&mut self, v: bool) {
         self.set(Self::SUPPRESS_CUSTOM_TYPE_DECODE, v)
+    }
+
+    #[inline]
+    /// When set, array result columns are returned as their stored record
+    /// blobs instead of being converted to display text. Engine-internal
+    /// statements (e.g. VACUUM's table copy) write these values back to
+    /// storage, and the text form does not keep element types.
+    pub const fn keep_array_results_as_blobs(self) -> bool {
+        self.get(Self::KEEP_ARRAY_RESULTS_AS_BLOBS)
+    }
+    #[inline]
+    pub const fn set_keep_array_results_as_blobs(&mut self, v: bool) {
+        self.set(Self::KEEP_ARRAY_RESULTS_AS_BLOBS, v)
     }
 
     #[inline]
@@ -590,10 +605,9 @@ impl CursorType {
                                 SortOrder::Asc => "",
                                 SortOrder::Desc => "-",
                             };
-                            if let Some(coll) = col.collation {
-                                format!("{sign}{coll}")
-                            } else {
-                                format!("{sign}B")
+                            match col.collation {
+                                CollationSeq::Binary => format!("{sign}B"),
+                                coll => format!("{sign}{coll}"),
                             }
                         })
                         .collect::<Vec<_>>()
@@ -771,8 +785,8 @@ impl ProgramBuilder {
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
+            result_column_types: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
-            collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called
             init_label: BranchOffset::Placeholder,
@@ -1446,6 +1460,7 @@ impl ProgramBuilder {
 
     fn emit_halt(&mut self, rollback: bool) {
         self.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: 0,
             description: if rollback {
                 "rollback".to_string()
@@ -1463,6 +1478,7 @@ impl ProgramBuilder {
     #[allow(dead_code)]
     pub fn emit_halt_err(&mut self, err_code: usize, description: String) {
         self.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code,
             description,
             on_error: None,
@@ -2044,22 +2060,6 @@ impl ProgramBuilder {
             .map(|(_, cursor_type)| cursor_type)
     }
 
-    pub const fn set_collation(&mut self, c: Option<(CollationSeq, bool)>) {
-        self.collation = c
-    }
-
-    pub const fn curr_collation_ctx(&self) -> Option<(CollationSeq, bool)> {
-        self.collation
-    }
-
-    pub fn curr_collation(&self) -> Option<CollationSeq> {
-        self.collation.map(|c| c.0)
-    }
-
-    pub const fn reset_collation(&mut self) {
-        self.collation = None;
-    }
-
     #[inline]
     pub fn nested<T>(&mut self, body: impl FnOnce(&mut Self) -> T) -> T {
         self.incr_nesting();
@@ -2164,7 +2164,7 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
-        self.has_materialized_views = !schema.table_to_materialized_views.is_empty();
+        self.has_materialized_views = schema.has_materialized_views();
         if self.flags.is_subprogram() {
             // Subprograms (triggers, FK actions) just emit Halt without Transaction
             let description = if self.trigger.is_some() {
@@ -2173,6 +2173,7 @@ impl ProgramBuilder {
                 "fk action"
             };
             self.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: 0,
                 description: description.to_string(),
                 on_error: None,
@@ -2432,6 +2433,7 @@ impl ProgramBuilder {
     pub fn build_prepared_program(
         mut self,
         prepare_context: PrepareContext,
+        custom_collations: Vec<Arc<crate::function::ExternalCollation>>,
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<PreparedProgram> {
@@ -2459,6 +2461,8 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
+        self.explain.build_ephemeral_cursors(&self.insns);
+
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
         // Statement journals are only needed when a statement writes multiple rows AND could
         // abort midway (e.g. constraint violation). Single-row writes are atomic and don't
@@ -2477,6 +2481,7 @@ impl ProgramBuilder {
             change_cnt_on,
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
+            result_column_types: self.result_column_types,
             table_references: self.table_references,
             sql: sql.to_string(),
             refreshes_analyze_stats: sql
@@ -2487,11 +2492,13 @@ impl ProgramBuilder {
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,
             )),
+            is_multi_write: self.flags.is_multi_write(),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
             has_materialized_views: self.has_materialized_views,
             resolve_type: self.resolve_type,
             prepare_context,
+            custom_collations,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
         };
@@ -2506,7 +2513,12 @@ impl ProgramBuilder {
         sql: &str,
     ) -> crate::Result<Program> {
         let prepare_context = PrepareContext::from_connection(&connection);
-        let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
+        let prepared = self.build_prepared_program(
+            prepare_context,
+            connection.custom_collations(),
+            change_cnt_on,
+            sql,
+        )?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
 }

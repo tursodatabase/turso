@@ -76,3 +76,36 @@ test alter-add-column-default-negate-max-int {
 expect {
     -9223372036854775807
 }
+
+test alter-add-column-default-negative-min-int-decimal {
+    CREATE TABLE t4 (a);
+    INSERT INTO t4 VALUES (1);
+    ALTER TABLE t4 ADD COLUMN b DEFAULT -9223372036854775808;
+    INSERT INTO t4 (a) VALUES (2);
+    SELECT a, b, typeof(b) FROM t4;
+}
+expect {
+    1|-9223372036854775808|integer
+    2|-9223372036854775808|integer
+}
+
+test alter-add-column-default-negative-min-int-decimal-parenthesized {
+    CREATE TABLE t5 (a);
+    INSERT INTO t5 VALUES (1);
+    ALTER TABLE t5 ADD COLUMN b DEFAULT (-9223372036854775808);
+    SELECT a, b, typeof(b) FROM t5;
+}
+expect {
+    1|-9223372036854775808|integer
+}
+
+test alter-add-column-default-negative-min-int-decimal-strict-update {
+    CREATE TABLE s (a INT) STRICT;
+    INSERT INTO s VALUES (1);
+    ALTER TABLE s ADD COLUMN b INT DEFAULT -9223372036854775808;
+    UPDATE s SET a = 2;
+    SELECT a, b, typeof(b) FROM s;
+}
+expect {
+    2|-9223372036854775808|integer
+}

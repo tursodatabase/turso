@@ -1,3 +1,5 @@
+use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::RegisterColumn;
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -6,7 +8,8 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR};
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
 use crate::translate::expr::{walk_expr, WalkControl};
@@ -14,14 +17,16 @@ use crate::translate::fkeys::{
     affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
-use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
+use crate::translate::insert::{
+    emit_remember_written_rowid, format_unique_violation_desc, InsertEmitCtx,
+};
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_triggers_including_temp, has_triggers_including_temp, TriggerContext,
 };
 use crate::translate::update::rowid_name_column_index;
-use crate::vdbe::insn::{to_u32, CmpInsFlags};
+use crate::vdbe::insn::{to_u32, CmpInsFlags, ConstraintInfo};
 use crate::{
     bail_parse_error,
     error::SQLITE_CONSTRAINT_NOTNULL,
@@ -129,17 +134,8 @@ fn extract_target_expr(e: &ast::Expr) -> (&ast::Expr, Option<String>) {
     }
 }
 
-// Return the index key’s effective collation.
-// If `idx_col.collation` is None, fall back to the column default or "BINARY".
-fn effective_collation_for_index_col(idx_col: &IndexColumn, table: &Table) -> String {
-    if let Some(c) = idx_col.collation.as_ref() {
-        return c.to_string().to_ascii_lowercase();
-    }
-    // Otherwise use the table default, or default to BINARY
-    table
-        .get_column_by_name(&idx_col.name)
-        .map(|s| s.1.collation().to_string())
-        .unwrap_or_else(|| "binary".to_string())
+fn index_column_collation_name(idx_col: &IndexColumn) -> String {
+    idx_col.collation.to_string().to_ascii_lowercase()
 }
 
 /// Match ON CONFLICT target to the PRIMARY KEY/rowid alias.
@@ -369,7 +365,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                     continue;
                 }
                 let iname = normalize_ident(&ic.name);
-                let icoll = effective_collation_for_index_col(ic, table);
+                let icoll = index_column_collation_name(ic);
                 if tname.eq_ignore_ascii_case(&iname)
                     && match conflict_target.collate.as_ref() {
                         Some(c) => c.eq_ignore_ascii_case(&icoll),
@@ -392,7 +388,7 @@ pub fn upsert_matches_index(upsert: &Upsert, index: &Index, table: &Table) -> bo
                     if exprs_are_equivalent(target_expr, idx_expr) {
                         // If target specifies a collation, it must match the index column's.
                         if let Some(ref tc) = target_collate {
-                            let icoll = effective_collation_for_index_col(ic, table);
+                            let icoll = index_column_collation_name(ic);
                             if !tc.eq_ignore_ascii_case(&icoll) {
                                 continue;
                             }
@@ -426,6 +422,7 @@ pub enum ResolvedUpsertTarget {
 
 pub fn resolve_upsert_target(
     schema: &Schema,
+    namespace: NamespaceId,
     table: &Table,
     upsert: &Upsert,
 ) -> crate::Result<ResolvedUpsertTarget> {
@@ -443,7 +440,7 @@ pub fn resolve_upsert_target(
     }
 
     // Otherwise match a UNIQUE index, also covering non-rowid PRIMARY KEYs
-    for idx in schema.get_indices(table.get_name()) {
+    for idx in schema.get_indices(namespace, table.get_name()) {
         if idx.unique && upsert_matches_index(upsert, idx, table) {
             return Ok(ResolvedUpsertTarget::Index(Arc::clone(idx)));
         }
@@ -497,6 +494,23 @@ pub fn emit_upsert(
         src_reg: ctx.conflict_rowid_reg,
         target_pc: ctx.loop_labels.row_done,
     });
+    if let Some(written_rowids_cursor_id) = ctx.written_rowids_cursor_id {
+        let row_not_written = program.allocate_label();
+        program.emit_insn(Insn::NotExists {
+            cursor: written_rowids_cursor_id,
+            rowid_reg: ctx.conflict_rowid_reg,
+            target_pc: row_not_written,
+        });
+        program.emit_insn(Insn::Halt {
+            constraint_info: None,
+            err_code: SQLITE_ERROR,
+            description: "ON CONFLICT DO UPDATE command cannot affect row a second time"
+                .to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(row_not_written);
+    }
     let num_cols = ctx.table.columns().len();
     let layout = ctx.table.column_layout()?;
 
@@ -620,21 +634,19 @@ pub fn emit_upsert(
             continue;
         }
         let reg = layout.to_register(expr_current_start, idx);
-        resolver.register_affinities.insert(reg, col.affinity());
-        resolver.register_collations.insert(reg, col.collation());
+        resolver
+            .register_columns
+            .insert(reg, RegisterColumn::table_column(col));
         if let Some(decoded_start) = excluded_decoded_start {
             let excluded_reg = layout.to_register(decoded_start, idx);
             resolver
-                .register_affinities
-                .insert(excluded_reg, col.affinity());
-            resolver
-                .register_collations
-                .insert(excluded_reg, col.collation());
+                .register_columns
+                .insert(excluded_reg, RegisterColumn::table_column(col));
         }
     }
     resolver
-        .register_affinities
-        .insert(ctx.conflict_rowid_reg, Affinity::Integer);
+        .register_columns
+        .insert(ctx.conflict_rowid_reg, RegisterColumn::rowid());
 
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {
@@ -713,6 +725,7 @@ pub fn emit_upsert(
         translate_result?;
         if col.notnull() && !col.is_rowid_alias() {
             program.emit_insn(Insn::HaltIfNull {
+                constraint_info: None,
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
@@ -829,7 +842,8 @@ pub fn emit_upsert(
     let (directly_changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
 
     // Fire BEFORE UPDATE triggers
-    let upsert_database_id = ctx.database_id;
+    let upsert_namespace: NamespaceRef = ctx.namespace;
+    let upsert_database_id = upsert_namespace.database_id;
     let updated_positions: ColumnMask = set_pairs
         .iter()
         .map(|(col_idx, _)| *col_idx)
@@ -837,7 +851,7 @@ pub fn emit_upsert(
     let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
-            affected_parent_fks_for_update(resolver, table, &updated_positions, upsert_database_id)?
+            affected_parent_fks_for_update(resolver, table, &updated_positions, upsert_namespace)?
         }
         _ => crate::alloc::vec![],
     };
@@ -856,7 +870,7 @@ pub fn emit_upsert(
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table_btree {
         let relevant_before_update_triggers = get_triggers_including_temp(
             resolver,
-            upsert_database_id,
+            upsert_namespace,
             TriggerEvent::Update,
             TriggerTime::Before,
             Some(set_column_names),
@@ -894,7 +908,7 @@ pub fn emit_upsert(
                     trigger,
                     &trigger_ctx,
                     connection,
-                    upsert_database_id,
+                    upsert_namespace,
                     ctx.loop_labels.row_done,
                 )?;
             }
@@ -954,7 +968,7 @@ pub fn emit_upsert(
 
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
-                upsert_database_id,
+                upsert_namespace,
                 TriggerEvent::Update,
                 Some(set_column_names),
                 &btree_table,
@@ -981,7 +995,7 @@ pub fn emit_upsert(
             // Check if we need to preserve for AFTER triggers
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
-                upsert_database_id,
+                upsert_namespace,
                 TriggerEvent::Update,
                 Some(set_column_names),
                 &btree_table,
@@ -1015,7 +1029,9 @@ pub fn emit_upsert(
             let rowid_new_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
 
             // Child-side checks
-            if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
+            if resolver.with_schema(upsert_database_id, |s| {
+                s.has_child_fks(ctx.namespace.id, bt.name.as_str())
+            }) {
                 emit_fk_child_update_counters(
                     program,
                     &bt,
@@ -1025,13 +1041,15 @@ pub fn emit_upsert(
                     rowid_new_reg,
                     &directly_changed_cols,
                     !affected_parent_fks.is_empty(),
-                    upsert_database_id,
+                    upsert_namespace,
                     resolver,
                     &layout,
                 )?;
             }
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
-                s.get_indices(table.get_name()).cloned().collect()
+                s.get_indices(ctx.namespace.id, table.get_name())
+                    .cloned()
+                    .collect()
             });
             let affected_upsert_indices: Vec<_> = upsert_indices
                 .iter()
@@ -1079,7 +1097,7 @@ pub fn emit_upsert(
             rhs: ctx.conflict_rowid_reg,
             target_pc: ok,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
 
         // If another row already has rnew -> constraint
@@ -1089,6 +1107,7 @@ pub fn emit_upsert(
             target_pc: ok,
         });
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description: format!(
                 "{}.{}",
@@ -1122,8 +1141,9 @@ pub fn emit_upsert(
         // unique ones for conflicts, without modifying any index yet.
         for (idx_name, _root, idx_cid) in &ctx.idx_cursors {
             let idx_meta = resolver
-                .with_schema(ctx.database_id, |s| {
-                    s.get_index(table.get_name(), idx_name).cloned()
+                .with_schema(ctx.namespace.database_id, |s| {
+                    s.get_index(ctx.namespace.id, table.get_name(), idx_name)
+                        .cloned()
                 })
                 .expect("index exists");
 
@@ -1238,11 +1258,48 @@ pub fn emit_upsert(
                     rhs: hit,
                     target_pc: ok,
                     flags: CmpInsFlags::default(),
-                    collation: program.curr_collation(),
+                    collation: CollationSeq::for_internal_values(),
                 });
                 let description = format_unique_violation_desc(table.get_name(), &idx_meta);
+                let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();
+                let idx_col_names: Vec<&str> =
+                    idx_meta.columns.iter().map(|c| c.name.as_str()).collect();
+                let (pk_col_names, pk_constraint_name) = table
+                    .btree()
+                    .map(|bt| {
+                        let cols: Vec<String> = bt
+                            .primary_key_columns
+                            .iter()
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        (cols, bt.primary_key_constraint_name.clone())
+                    })
+                    .unwrap_or_default();
+                let is_pk = !pk_col_names.is_empty()
+                    && idx_col_names == pk_col_names.iter().map(String::as_str).collect::<Vec<_>>();
+                let (constraint_info, err_code) = if is_pk {
+                    (
+                        Some(Box::new(ConstraintInfo::primary_key(
+                            table.get_name(),
+                            pk_constraint_name,
+                            pk_col_names,
+                            regs,
+                        ))),
+                        SQLITE_CONSTRAINT_PRIMARYKEY,
+                    )
+                } else {
+                    (
+                        Some(Box::new(ConstraintInfo::unique_index(
+                            table.get_name(),
+                            &idx_meta,
+                            regs,
+                        ))),
+                        SQLITE_CONSTRAINT_UNIQUE,
+                    )
+                };
                 program.emit_insn(Insn::Halt {
-                    err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                    constraint_info,
+                    err_code,
                     description,
                     on_error: None,
                     description_reg: None,
@@ -1404,9 +1461,13 @@ pub fn emit_upsert(
         if table.btree().is_some_and(|bt| bt.has_autoincrement)
             && connection.mv_store_for_db(upsert_database_id).is_some()
         {
-            let seq_name = crate::schema::autoincrement_sequence_name(table.get_name());
+            let seq_name = crate::schema::autoincrement_sequence_name(
+                &resolver.mangle_name(upsert_namespace, table.get_name()),
+            );
             let seq = resolver
-                .with_schema(upsert_database_id, |s| s.get_sequence(&seq_name).cloned())
+                .with_schema(upsert_database_id, |s| {
+                    s.get_sequence(NamespaceId::ROOT, &seq_name).cloned()
+                })
                 .ok_or_else(|| {
                     crate::LimboError::InternalError(format!(
                         "missing implicit sequence for AUTOINCREMENT table \"{}\"",
@@ -1416,7 +1477,7 @@ pub fn emit_upsert(
             crate::translate::sequence::emit_disk_advance_past(
                 program,
                 resolver,
-                upsert_database_id,
+                NamespaceRef::root_of(upsert_database_id),
                 &seq_name,
                 &seq,
                 rnew,
@@ -1446,6 +1507,11 @@ pub fn emit_upsert(
         });
         cdc_before_rec
     };
+    emit_remember_written_rowid(
+        program,
+        ctx,
+        new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+    );
 
     // CDC must capture the row right after the write above, before any FK action or AFTER
     // trigger this UPSERT fires can write further CDC rows of their own.
@@ -1524,7 +1590,7 @@ pub fn emit_upsert(
                 new_start,              // new_values_start
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
                 connection,
-                upsert_database_id,
+                upsert_namespace,
                 &affected_parent_fks,
             )?;
         }
@@ -1534,7 +1600,7 @@ pub fn emit_upsert(
     if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
         let relevant_triggers = get_triggers_including_temp(
             resolver,
-            upsert_database_id,
+            upsert_namespace,
             TriggerEvent::Update,
             TriggerTime::After,
             Some(set_column_names),
@@ -1567,7 +1633,7 @@ pub fn emit_upsert(
                     trigger,
                     &trigger_ctx_after,
                     connection,
-                    upsert_database_id,
+                    upsert_namespace,
                     after_trigger_done,
                 )?;
             }

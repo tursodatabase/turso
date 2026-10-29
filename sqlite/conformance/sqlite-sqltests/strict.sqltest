@@ -99,3 +99,38 @@ test strict-primary-key-schema-sql-after-add-column {
 expect {
     CREATE TABLE pk1 (code TEXT PRIMARY KEY, n INT, z INT) STRICT
 }
+
+@cross-check-integrity
+test strict-insert-or-ignore-not-null-checked-before-type {
+    CREATE TABLE t7 (a INT, b REAL NOT NULL) STRICT;
+    INSERT OR IGNORE INTO t7 (a) VALUES ('x');
+    SELECT count(*) FROM t7;
+}
+expect {
+    0
+}
+
+test strict-insert-not-null-error-before-type-error {
+    CREATE TABLE t8 (a INT, b REAL NOT NULL) STRICT;
+    INSERT INTO t8 (a) VALUES ('x');
+}
+expect error {
+    NOT NULL constraint failed: t8.b
+}
+
+test strict-insert-generated-column-type-error-before-not-null {
+    CREATE TABLE t9 (a INT, b TEXT NOT NULL, c INT AS (a + 1)) STRICT;
+    INSERT OR IGNORE INTO t9 (a) VALUES ('x');
+}
+expect error {
+    cannot store TEXT value in INT column t9.a
+}
+
+test strict-insert-before-trigger-type-error-before-not-null {
+    CREATE TABLE t10 (a INT, b TEXT NOT NULL) STRICT;
+    CREATE TRIGGER t10_before BEFORE INSERT ON t10 BEGIN SELECT 1; END;
+    INSERT OR IGNORE INTO t10 (a) VALUES ('x');
+}
+expect error {
+    cannot store TEXT value in INT column t10.a
+}

@@ -1,0 +1,113 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+# Comparisons on custom types. Every test here checks a rule that must hold
+# for every way of comparing values, not one query: the same rows with and
+# without an index, equality agreeing with DISTINCT, GROUP BY and UNION, and each
+# operand evaluated once.
+
+@requires strict "uses STRICT tables"
+test cmp-type-parameter-in-encode-is-rejected {
+    -- ENCODE also converts seek keys and operator arguments, which the
+    -- column's limits do not apply to, so it cannot read the parameters.
+    CREATE TYPE scaled(value integer, f integer) BASE integer ENCODE value * f DECODE value;
+}
+expect error {
+    ENCODE cannot use type parameter "f": only COERCE can
+}
+
+@requires strict "uses STRICT tables"
+test cmp-type-parameter-in-decode-is-rejected {
+    CREATE TYPE scaled(value integer, f integer) BASE integer ENCODE value DECODE value / f;
+}
+expect error {
+    DECODE cannot use type parameter "f": only COERCE can
+}
+
+@requires strict "uses STRICT tables"
+test cmp-unknown-name-in-encode-is-an-error-when-used {
+    -- A type stored by an earlier version may use a type parameter in ENCODE.
+    -- Storing a value must fail instead of reading the name as the string 'f'.
+    CREATE TYPE scaled(value integer) BASE integer ENCODE value * f DECODE value;
+    CREATE TABLE t(x scaled) STRICT;
+    INSERT INTO t VALUES (3);
+}
+expect error {
+    no such column: f
+}
+
+@requires strict "uses STRICT tables"
+test cmp-double-quoted-string-in-encode-is-a-string {
+    -- With double-quoted strings allowed, as in SQLite, "-x" is the string '-x'.
+    CREATE TYPE tag(value text) BASE text ENCODE value || "-x" DECODE value;
+    CREATE TABLE t(x tag) STRICT;
+    INSERT INTO t VALUES ('a');
+    SELECT x FROM t;
+}
+expect {
+    a-x
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-without-type-parameters-limits-stored-values {
+    CREATE TYPE positive(value integer) BASE integer COERCE CASE WHEN value > 0 THEN value ELSE RAISE(ABORT, 'not positive') END;
+    CREATE TABLE t(x positive) STRICT;
+    INSERT INTO t VALUES (-1);
+}
+expect error {
+    not positive
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-rejects-stored-value {
+    CREATE TYPE capped(value integer, maxval integer) BASE integer COERCE CASE WHEN value <= maxval THEN value ELSE RAISE(ABORT, 'value above maximum for capped') END;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x capped(10)) STRICT;
+    INSERT INTO t VALUES (1, 11);
+}
+expect error {
+    value above maximum for capped
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-rejects-updated-value {
+    CREATE TYPE capped(value integer, maxval integer) BASE integer COERCE CASE WHEN value <= maxval THEN value ELSE RAISE(ABORT, 'value above maximum for capped') END;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x capped(10)) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    UPDATE t SET x = 11;
+}
+expect error {
+    value above maximum for capped
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-runs-on-cast-with-type-arguments {
+    CREATE TYPE capped(value integer, maxval integer) BASE integer COERCE CASE WHEN value <= maxval THEN value ELSE RAISE(ABORT, 'value above maximum for capped') END;
+    SELECT CAST(11 AS capped(10));
+}
+expect error {
+    value above maximum for capped
+}
+
+@requires strict "uses STRICT tables"
+test cmp-coerce-does-not-run-on-cast-without-type-arguments {
+    CREATE TYPE capped(value integer, maxval integer) BASE integer COERCE CASE WHEN value <= maxval THEN value ELSE RAISE(ABORT, 'value above maximum for capped') END;
+    SELECT CAST(11 AS capped), CAST(NULL AS capped(10));
+}
+expect {
+    11|
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-constant-finds-same-rows-with-and-without-index {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (3.5), (3.51), (4);
+    CREATE INDEX t_n ON t(n);
+    SELECT (SELECT count(*) FROM t WHERE n = 3.504)
+         = (SELECT count(*) FROM t NOT INDEXED WHERE n = 3.504);
+    SELECT (SELECT group_concat(n) FROM t WHERE n > 3.504)
+         = (SELECT group_concat(n) FROM t NOT INDEXED WHERE n > 3.504);
+}
+expect {
+    1
+    1
+}

@@ -1,10 +1,15 @@
+use crate::alloc::TursoVecExt;
+use crate::translate::{
+    catalog::CatalogContext,
+    expr_context::{ExprContext, ExprProperties},
+};
 use turso_parser::ast;
 
 use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::Table,
     sync::Arc,
-    translate::collate::CollationSeq,
+    translate::collate::{expr_collation, CollationSeq},
     vdbe::{
         builder::ProgramBuilder,
         insn::{AggStepData, HashDistinctData, Insn},
@@ -39,10 +44,13 @@ pub fn emit_ungrouped_aggregation<'a>(
 
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let agg_result_reg = agg_start_reg + i;
-        program.emit_insn(Insn::AggFinal {
-            register: agg_result_reg,
-            func: AccumulatorFunc::Agg(agg.func.clone()),
-        });
+        emit_aggregate_final(
+            program,
+            &plan.table_references,
+            agg,
+            agg_result_reg,
+            &t_ctx.resolver,
+        )?;
     }
     // we now have the agg results in (agg_start_reg..agg_start_reg + aggregates.len() - 1)
     // we need to call translate_expr on each result column, but replace the expr with a register copy in case any part of the
@@ -52,7 +60,6 @@ pub fn emit_ungrouped_aggregation<'a>(
             std::borrow::Cow::Borrowed(&agg.original_expr),
             agg_start_reg + i,
             false,
-            None,
         );
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
@@ -214,45 +221,6 @@ pub fn emit_ungrouped_aggregation<'a>(
     Ok(())
 }
 
-/// Resolves the collation a comparison-based aggregate uses for its argument
-/// (explicit COLLATE clause, then the column's table-defined collation, then
-/// BINARY). The result is stored on the AggStep instruction itself.
-pub(crate) fn agg_arg_collation(
-    referenced_tables: &TableReferences,
-    expr: &ast::Expr,
-    resolver: &Resolver,
-) -> CollationSeq {
-    // Check if this is a column expression with explicit COLLATE clause
-    if let ast::Expr::Collate(_, collation_name) = expr {
-        if let Ok(collation) = resolver.resolve_collation(collation_name.as_str()) {
-            return collation;
-        }
-        return CollationSeq::Binary;
-    }
-
-    // A merged USING column compares with the collation of its first column
-    // (see ast::Expr::MergedColumn).
-    if let ast::Expr::MergedColumn(columns) = expr {
-        let first_column = columns
-            .first()
-            .expect("a merged column must have at least two source columns");
-        return agg_arg_collation(referenced_tables, first_column, resolver);
-    }
-
-    // If no explicit collation, check if this is a column with table-defined collation
-    if let ast::Expr::Column { table, column, .. } = expr {
-        if let Some((_, table_ref)) = referenced_tables.find_table_by_internal_id(*table) {
-            if let Some(table_column) = table_ref.get_column_at(*column) {
-                if let Some(c) = table_column.collation_opt() {
-                    return c;
-                }
-            }
-        }
-    }
-
-    CollationSeq::Binary
-}
-
 /// Emits the bytecode for handling duplicates in a distinct aggregate.
 /// This is used in both GROUP BY and non-GROUP BY aggregations to jump over
 /// the AggStep that would otherwise accumulate the same value multiple times.
@@ -366,6 +334,183 @@ impl<'a> AggArgumentSource<'a> {
     }
 }
 
+pub fn emit_aggregate_step(
+    program: &mut ProgramBuilder,
+    tables: &TableReferences,
+    aggregate: &Aggregate,
+    source: AggArgumentSource,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let Some(cursor_id) = aggregate.order_cursor else {
+        return translate_aggregation_step(
+            program,
+            tables,
+            source,
+            target_register,
+            resolver,
+            aggregate.fraction_reg,
+        );
+    };
+    let span_idx = program.constant_spans_next_idx();
+    let key_count = aggregate.order_by().len();
+    let column_count = key_count + 1 + 2 * aggregate.args.len();
+    let start = program.alloc_registers(column_count);
+    let args_start = start + key_count + 1;
+    for (i, term) in aggregate.order_by().iter().enumerate() {
+        translate_expr(program, Some(tables), &term.expr, start + i, resolver)?;
+    }
+    program.emit_insn(Insn::Sequence {
+        cursor_id,
+        target_reg: start + key_count,
+    });
+    for i in 0..aggregate.args.len() {
+        let src_reg = if aggregate.distinct_uses_order_key() {
+            start
+        } else {
+            source.translate(program, tables, resolver, i)?
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: args_start + i,
+            extra_amount: 0,
+        });
+    }
+    for i in 0..aggregate.args.len() {
+        program.emit_insn(Insn::GetSubtype {
+            src_reg: args_start + i,
+            dest_reg: args_start + aggregate.args.len() + i,
+        });
+    }
+    if !aggregate.distinct_uses_order_key() {
+        handle_distinct(program, &aggregate.distinctness, args_start);
+    }
+    let record_reg = program.alloc_register();
+    super::order_by::sorter_insert(program, start, column_count, cursor_id, record_reg);
+    program.constant_spans_invalidate_after(span_idx);
+    Ok(target_register)
+}
+
+pub fn emit_aggregate_final(
+    program: &mut ProgramBuilder,
+    tables: &TableReferences,
+    aggregate: &Aggregate,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if let Some(cursor_id) = aggregate.order_cursor {
+        let key_count = aggregate.order_by().len();
+        let column_count = key_count + 1 + 2 * aggregate.args.len();
+        let pseudo_cursor = super::group_by::group_by_create_pseudo_table(program, column_count);
+        let record_reg = program.alloc_register();
+        let args_start = program.alloc_registers(aggregate.args.len().max(1));
+        let end = program.allocate_label();
+        let next = program.allocate_label();
+        program.emit_insn(Insn::OpenPseudo {
+            cursor_id: pseudo_cursor,
+            content_reg: record_reg,
+            num_fields: column_count,
+        });
+        program.emit_insn(Insn::SorterSort {
+            cursor_id,
+            pc_if_empty: end,
+        });
+        program.preassign_label_to_next_insn(next);
+        program.emit_insn(Insn::SorterData {
+            cursor_id,
+            dest_reg: record_reg,
+            pseudo_cursor,
+        });
+        for i in 0..aggregate.args.len() {
+            program.emit_column_or_rowid(pseudo_cursor, key_count + 1 + i, args_start + i);
+        }
+        let subtype_reg = program.alloc_register();
+        for i in 0..aggregate.args.len() {
+            program.emit_column_or_rowid(
+                pseudo_cursor,
+                key_count + 1 + aggregate.args.len() + i,
+                subtype_reg,
+            );
+            program.emit_insn(Insn::SetSubtype {
+                subtype_reg,
+                dest_reg: args_start + i,
+            });
+        }
+        let mut sorted_aggregate = aggregate.clone();
+        let duplicate = if aggregate.distinct_uses_order_key() {
+            let label = program.allocate_label();
+            let Distinctness::Distinct { ctx: Some(ctx) } = &mut sorted_aggregate.distinctness
+            else {
+                unreachable!("ordered DISTINCT requires a distinct context");
+            };
+            ctx.label_on_conflict = label;
+            Some(label)
+        } else {
+            sorted_aggregate.distinctness = Distinctness::NonDistinct;
+            None
+        };
+        translate_aggregation_step(
+            program,
+            tables,
+            AggArgumentSource::new_from_registers(args_start, &sorted_aggregate),
+            target_register,
+            resolver,
+            aggregate.fraction_reg,
+        )?;
+        if let Some(label) = duplicate {
+            program.preassign_label_to_next_insn(label);
+        }
+        program.emit_insn(Insn::SorterNext {
+            cursor_id,
+            pc_if_next: next,
+        });
+        program.preassign_label_to_next_insn(end);
+        open_aggregate_sorter(program, tables, resolver, aggregate)?;
+    }
+    program.emit_insn(Insn::AggFinal {
+        register: target_register,
+        func: AccumulatorFunc::Agg(aggregate.func.clone()),
+    });
+    Ok(())
+}
+
+pub(crate) fn open_aggregate_sorter(
+    program: &mut ProgramBuilder,
+    tables: &TableReferences,
+    resolver: &Resolver,
+    aggregate: &Aggregate,
+) -> Result<()> {
+    let mut data = super::order_by::sorter_open_data(
+        aggregate
+            .order_cursor
+            .expect("ordered aggregate cursor must exist"),
+        aggregate.order_by().iter().map(|term| {
+            (
+                term.expr.as_ref(),
+                term.order.unwrap_or(ast::SortOrder::Asc),
+                term.nulls,
+            )
+        }),
+        tables,
+        resolver,
+    )?;
+    data.order_collations_nulls.try_push((
+        if aggregate.distinct_uses_order_key() {
+            ast::SortOrder::Desc
+        } else {
+            ast::SortOrder::Asc
+        },
+        CollationSeq::Binary,
+        None,
+    ))?;
+    data.comparators.try_push(None)?;
+    data.columns = aggregate.order_by().len() + 1 + 2 * aggregate.args.len();
+    program.emit_insn(Insn::SorterOpen {
+        data: Box::new(data),
+    });
+    Ok(())
+}
+
 /// Emits the bytecode for processing an aggregate step.
 ///
 /// This is distinct from the final step, which is called after a single group has been entirely accumulated,
@@ -403,7 +548,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Avg),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
             target_register
@@ -419,7 +564,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count0),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
             target_register
@@ -437,7 +582,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
             target_register
@@ -465,7 +610,7 @@ pub fn translate_aggregation_step(
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
 
@@ -478,9 +623,10 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation =
+                ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
             let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -488,7 +634,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Max),
                     comparator,
-                    collation: Some(arg_collation),
+                    collation: arg_collation,
                 }),
             });
             target_register
@@ -500,9 +646,10 @@ pub fn translate_aggregation_step(
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation =
+                ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
             let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -510,7 +657,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Min),
                     comparator,
-                    collation: Some(arg_collation),
+                    collation: arg_collation,
                 }),
             });
             target_register
@@ -531,7 +678,7 @@ pub fn translate_aggregation_step(
                     delimiter: value_reg,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
             target_register
@@ -550,7 +697,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
             target_register
@@ -571,7 +718,7 @@ pub fn translate_aggregation_step(
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::StringAgg),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
 
@@ -590,7 +737,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Sum),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
             target_register
@@ -608,7 +755,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Total),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
             target_register
@@ -627,7 +774,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
             target_register
@@ -640,7 +787,12 @@ pub fn translate_aggregation_step(
             let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
             // Activate the value's collation so finalize can sort text correctly.
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation = ordered_set_collation(
+                func,
+                expr,
+                &ExprContext::new(Some(referenced_tables), resolver),
+                &resolver.catalog,
+            )?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -648,7 +800,7 @@ pub fn translate_aggregation_step(
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Mode),
                     comparator: None,
-                    collation: Some(arg_collation),
+                    collation: arg_collation,
                 }),
             });
             target_register
@@ -665,7 +817,12 @@ pub fn translate_aggregation_step(
             let fraction_reg =
                 fraction_reg.expect("percentile fraction register must be set by InitLoop::emit");
             let expr = &agg_arg_source.arg_at(0);
-            let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
+            let arg_collation = ordered_set_collation(
+                func,
+                expr,
+                &ExprContext::new(Some(referenced_tables), resolver),
+                &resolver.catalog,
+            )?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -673,7 +830,7 @@ pub fn translate_aggregation_step(
                     delimiter: fraction_reg,
                     func: AccumulatorFunc::Agg(func.clone()),
                     comparator: None,
-                    collation: Some(arg_collation),
+                    collation: arg_collation,
                 }),
             });
             target_register
@@ -715,17 +872,33 @@ pub fn translate_aggregation_step(
                         func.clone()
                     })),
                     comparator: None,
-                    collation: None,
+                    collation: CollationSeq::Binary,
                 }),
             });
             target_register
         }
     };
-    // Aggregate arguments can carry column or explicit COLLATE metadata for the
-    // aggregate's internal comparator, but that state must not leak to the
-    // surrounding expression that consumes the aggregate result.
-    program.reset_collation();
     Ok(dest)
+}
+
+/// The collation an ordered-set aggregate (mode, percentile) sorts its values
+/// with. The aggregate keeps it in its state as [CollationSeq::to_bits] until
+/// it sorts at finalize, and a custom collation has no bits.
+fn ordered_set_collation(
+    func: &AggFunc,
+    expr: &ast::Expr,
+    metadata: &impl ExprProperties,
+    catalog: &CatalogContext<'_>,
+) -> Result<CollationSeq> {
+    let collation = expr_collation(expr, metadata, catalog)?;
+    if collation.is_custom() {
+        crate::bail_parse_error!(
+            "{}() does not support the custom collation {}",
+            func.as_str(),
+            collation.name()
+        );
+    }
+    Ok(collation)
 }
 
 fn translate_const_arg(

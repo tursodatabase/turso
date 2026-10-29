@@ -13,8 +13,10 @@ use super::stream::{
 use super::MaintenanceInput;
 use crate::function::AggFunc;
 use crate::incremental::dag;
+use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     translate_condition_expr, translate_expr_no_constant_opt, ConditionMetadata,
@@ -76,11 +78,13 @@ pub(super) fn emit_group_aggregate(
     )?;
 
     let state_table_name = operator_state.state_table_name()?;
-    let state_table = schema.get_btree_table(state_table_name).ok_or_else(|| {
-        LimboError::InternalError(format!(
-            "aggregate arrangement table {state_table_name} not found"
-        ))
-    })?;
+    let state_table = schema
+        .get_btree_table(NamespaceId::ROOT, state_table_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "aggregate arrangement table {state_table_name} not found"
+            ))
+        })?;
     let value_columns = (0..group_exprs.len() + aggregates.len()).collect();
     EmittedNodeOutput::new(
         node_id,
@@ -147,13 +151,15 @@ fn emit_group_aggregate_rows(
     // The state table and its primary-key index are real schema objects
     // created by CREATE MATERIALIZED VIEW and assigned to this DAG node.
     let state_table_name = operator_state.state_table_name()?.to_string();
-    let state_table = schema.get_btree_table(&state_table_name).ok_or_else(|| {
-        LimboError::InternalError(format!(
-            "state table {state_table_name} of materialized view {view_name} not found"
-        ))
-    })?;
+    let state_table = schema
+        .get_btree_table(NamespaceId::ROOT, &state_table_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "state table {state_table_name} of materialized view {view_name} not found"
+            ))
+        })?;
     let state_index = schema
-        .get_indices(&state_table_name)
+        .get_indices(NamespaceId::ROOT, &state_table_name)
         .next()
         .cloned()
         .ok_or_else(|| {
@@ -163,12 +169,13 @@ fn emit_group_aggregate_rows(
         })?;
 
     let syms = connection.syms.read();
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -327,13 +334,7 @@ fn emit_group_aggregate_rows(
         dest: weight_reg,
         default: None,
     });
-    seed_ephemeral_stream_cache(
-        program,
-        channel,
-        &binding_remap,
-        &table_references,
-        &mut resolver,
-    )?;
+    seed_ephemeral_stream_cache(program, channel, &binding_remap, &mut resolver)?;
 
     for (i, group_expr) in group_exprs.iter().enumerate() {
         let bound = remap_bound_expr(group_expr, &binding_remap)?;
@@ -368,7 +369,7 @@ fn emit_group_aggregate_rows(
         rhs: zero_reg,
         target_pc: corrupt_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_int(0, found_reg);
     program.emit_insn(Insn::Null {
@@ -632,7 +633,7 @@ fn emit_group_aggregate_rows(
                 rhs: shown_after_start + shown_exact_offset,
                 target_pc: aggregate_done_label,
                 flags: CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             program.preassign_label_to_next_insn(retract_label);
             emit_weighted_apply(
@@ -664,7 +665,7 @@ fn emit_group_aggregate_rows(
                 rhs: zero_reg,
                 target_pc: not_entering_label,
                 flags: CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             emit_weighted_apply(
                 program,
@@ -679,7 +680,7 @@ fn emit_group_aggregate_rows(
                 rhs: zero_reg,
                 target_pc: aggregate_done_label,
                 flags: CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             emit_weighted_apply(
                 program,
@@ -739,7 +740,7 @@ fn emit_group_aggregate_rows(
                 rhs: stored_group_exact_reg,
                 target_pc: unchanged_label,
                 flags: CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             program.emit_insn(Insn::Copy {
                 src_reg: group_start,
@@ -997,14 +998,14 @@ fn emit_group_aggregate_rows(
             rhs: zero_reg,
             target_pc: corrupt_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Ne {
             lhs: cnt_reg,
             rhs: zero_reg,
             target_pc: live_group_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Copy {
             src_reg: group_start,
@@ -1042,6 +1043,7 @@ fn emit_group_aggregate_rows(
     });
     program.preassign_label_to_next_insn(corrupt_label);
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_ERROR,
         description: format!("materialized view {view_name} state is corrupted"),
         on_error: None,

@@ -20,7 +20,9 @@
 //! [`dag::KeyColumn::ambiguous`]: crate::incremental::dag::KeyColumn::ambiguous
 
 use crate::function::{Func, FuncCtx, ScalarFunc};
+use crate::namespace::NamespaceId;
 use crate::schema::Schema;
+use crate::translate::collate::CollationSeq;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
@@ -47,13 +49,15 @@ impl MemberTable {
         view_name: &str,
         table_name: &str,
     ) -> Result<Self> {
-        let table = schema.get_btree_table(table_name).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "member table {table_name} of materialized view {view_name} not found"
-            ))
-        })?;
+        let table = schema
+            .get_btree_table(NamespaceId::ROOT, table_name)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "member table {table_name} of materialized view {view_name} not found"
+                ))
+            })?;
         let index = schema
-            .get_indices(table_name)
+            .get_indices(NamespaceId::ROOT, table_name)
             .next()
             .cloned()
             .ok_or_else(|| {
@@ -141,6 +145,7 @@ pub(super) fn emit_member_columns(
             func: FuncCtx {
                 func: Func::Scalar(ScalarFunc::Typeof),
                 arg_count: 1,
+                collation: CollationSeq::Binary,
             },
         });
     }
@@ -243,7 +248,7 @@ pub(super) fn emit_add_to_member(
         rhs: zero_reg,
         target_pc: corrupt_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     let keep_label = program.allocate_label();
     program.emit_insn(Insn::Ne {
@@ -251,7 +256,7 @@ pub(super) fn emit_add_to_member(
         rhs: zero_reg,
         target_pc: keep_label,
         flags: CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     // The count reached zero. A new row never gets here: a consolidated
     // delta has no zero weights.

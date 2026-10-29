@@ -167,183 +167,6 @@ pub enum ColumnTypeKind {
     Union,
 }
 
-/// Recursively infer the result primitive of a non-table-column expression
-/// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
-/// `"NUMERIC"`, `"BLOB"`) or `None` when no determination can be made.
-///
-/// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
-/// a usable type for `SELECT 1+1`-style result columns. Goes beyond SQLite's
-/// `get_expr_affinity` (which deliberately stops at binary operators because
-/// SQLite's affinity model is about *column* coercion, not expression
-/// inference) by walking through arithmetic, bitwise, comparison, logical,
-/// and concat operators — letting `SELECT 42 + 1` report INT4 to a
-/// PostgreSQL client the way PG itself does.
-fn infer_expression_primitive(
-    expr: &turso_parser::ast::Expr,
-    referenced_tables: Option<&translate::plan::TableReferences>,
-) -> Option<&'static str> {
-    use crate::function::ScalarFunc;
-    use turso_parser::ast::{Expr, Operator, UnaryOperator};
-
-    match expr {
-        // Bare literal: read the parsed concrete value type.
-        Expr::Literal(lit) => match translate::alter::literal_default_value(lit)
-            .ok()?
-            .value_type()
-        {
-            crate::types::ValueType::Integer => Some("INTEGER"),
-            crate::types::ValueType::Float => Some("REAL"),
-            crate::types::ValueType::Text => Some("TEXT"),
-            _ => None,
-        },
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
-        }
-        Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
-        Expr::Unary(op, inner) => match op {
-            UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
-            UnaryOperator::Negative => Some(combine_arithmetic_primitive(
-                Some("INTEGER"),
-                infer_expression_primitive(inner, referenced_tables),
-            )),
-            UnaryOperator::Positive => infer_expression_primitive(inner, referenced_tables),
-        },
-        Expr::Binary(left, op, right) => match op {
-            // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
-            // with REAL becomes REAL, fall through to NUMERIC otherwise.
-            Operator::Add
-            | Operator::Subtract
-            | Operator::Multiply
-            | Operator::Divide
-            | Operator::Modulus => {
-                let l = infer_expression_primitive(left, referenced_tables);
-                let r = infer_expression_primitive(right, referenced_tables);
-                Some(combine_arithmetic_primitive(l, r))
-            }
-            // Bitwise: result is always INTEGER in both SQLite and PG.
-            Operator::BitwiseAnd
-            | Operator::BitwiseOr
-            | Operator::BitwiseNot
-            | Operator::LeftShift
-            | Operator::RightShift => Some("INTEGER"),
-            // Comparison and logical: SQLite returns 0/1 INTEGER; tursopg
-            // maps INTEGER to BOOL at the wire layer for boolean columns,
-            // but the type the wire layer reports is still INTEGER here.
-            Operator::Equals
-            | Operator::NotEquals
-            | Operator::Less
-            | Operator::LessEquals
-            | Operator::Greater
-            | Operator::GreaterEquals
-            | Operator::Is
-            | Operator::IsNot
-            | Operator::And
-            | Operator::Or
-            | Operator::ArrayContains
-            | Operator::ArrayOverlap => Some("INTEGER"),
-            // Concat is always TEXT.
-            Operator::Concat => Some("TEXT"),
-            // JSON ops fall through to the affinity machinery — `->` returns
-            // JSON / blob, `->>` returns TEXT; the existing affinity rules
-            // give the correct answer.
-            Operator::ArrowRight | Operator::ArrowRightShift => affinity_to_primitive(
-                translate::expr::get_expr_affinity(expr, referenced_tables, None),
-            ),
-        },
-        Expr::RowId { .. } => Some("INTEGER"),
-        Expr::Case {
-            when_then_pairs,
-            else_expr,
-            ..
-        } => common_primitive(
-            when_then_pairs
-                .iter()
-                .map(|(_, then)| then.as_ref())
-                .chain(else_expr.as_deref()),
-            referenced_tables,
-        ),
-        Expr::FunctionCall { name, args, .. } => {
-            match crate::function::Func::resolve_function(name.as_str(), args.len()) {
-                Ok(Some(crate::function::Func::Scalar(
-                    ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
-                ))) => common_primitive(args.iter().map(|arg| arg.as_ref()), referenced_tables),
-                Ok(Some(crate::function::Func::Scalar(ScalarFunc::Nullif))) => {
-                    infer_expression_primitive(&args[0], referenced_tables)
-                }
-                Ok(Some(crate::function::Func::Scalar(ScalarFunc::Abs))) => {
-                    Some(combine_arithmetic_primitive(
-                        Some("INTEGER"),
-                        infer_expression_primitive(&args[0], referenced_tables),
-                    ))
-                }
-                _ => None,
-            }
-        }
-        // CAST, column references, and anything else: defer to the affinity
-        // machinery, which handles these shapes correctly.
-        _ => affinity_to_primitive(translate::expr::get_expr_affinity(
-            expr,
-            referenced_tables,
-            None,
-        )),
-    }
-}
-
-/// The type that every non-NULL expression can be converted to, following
-/// PostgreSQL's rule for CASE branches and COALESCE arguments: mixed numeric
-/// types widen the way arithmetic does, any other mix has no common type.
-fn common_primitive<'a>(
-    exprs: impl Iterator<Item = &'a turso_parser::ast::Expr>,
-    referenced_tables: Option<&translate::plan::TableReferences>,
-) -> Option<&'static str> {
-    use turso_parser::ast::{Expr, Literal};
-
-    let is_numeric = |primitive| matches!(primitive, "INTEGER" | "REAL" | "NUMERIC");
-    let mut common = None;
-    for expr in exprs.filter(|expr| !matches!(expr, Expr::Literal(Literal::Null))) {
-        let primitive = infer_expression_primitive(expr, referenced_tables)?;
-        common = match common {
-            None => Some(primitive),
-            Some(common) if common == primitive => Some(common),
-            Some(common) if is_numeric(common) && is_numeric(primitive) => {
-                Some(combine_arithmetic_primitive(Some(common), Some(primitive)))
-            }
-            Some(_) => return None,
-        };
-    }
-    common
-}
-
-/// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
-/// `infer_expression_primitive` returns. `Blob` collapses to `None` because
-/// SQLite's "no determined affinity" sentinel isn't a usable wire type.
-fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
-    match affinity {
-        crate::vdbe::affinity::Affinity::Integer => Some("INTEGER"),
-        crate::vdbe::affinity::Affinity::Real => Some("REAL"),
-        crate::vdbe::affinity::Affinity::Text => Some("TEXT"),
-        crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC"),
-        crate::vdbe::affinity::Affinity::Blob | crate::vdbe::affinity::Affinity::None => None,
-    }
-}
-
-/// Pick the widening primitive for an arithmetic binary op given each
-/// operand's inferred primitive. `INTEGER + INTEGER -> INTEGER`,
-/// `INTEGER + REAL -> REAL`, everything else collapses to `NUMERIC` (the
-/// safe wire default for a mixed-affinity numeric result).
-fn combine_arithmetic_primitive(
-    left: Option<&'static str>,
-    right: Option<&'static str>,
-) -> &'static str {
-    match (left, right) {
-        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
-        (Some("INTEGER"), Some("REAL"))
-        | (Some("REAL"), Some("INTEGER"))
-        | (Some("REAL"), Some("REAL")) => "REAL",
-        _ => "NUMERIC",
-    }
-}
-
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -379,6 +202,9 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    /// The command the statement was prepared from, when its SQL text cannot
+    /// be parsed again, so that preparing it again translates the command.
+    reprepare_cmd: Option<Cmd>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -460,6 +286,7 @@ impl Statement {
             is_blob_handle: false,
             nested_guard_active,
             analyze_refresh: None,
+            reprepare_cmd: None,
         }
     }
 
@@ -589,8 +416,12 @@ impl Statement {
         self.state.query_deadline = Some(self.pager.io.current_time_monotonic() + timeout);
     }
 
-    fn release_active_root_if_counted(&mut self) {
+    fn release_active_root_if_counted(&mut self, statement_failed: bool) {
         if self.counted_as_active_root {
+            let conn = &self.program.connection;
+            if let Some(hooks) = conn.hooks() {
+                hooks.root_statement_ended(conn, statement_failed);
+            }
             // Blob count drops before the root count so a concurrent
             // checkpoint-guard read never sees fewer non-blob statements
             // than are really active (a stale-high read only causes a
@@ -713,7 +544,7 @@ impl Statement {
                 .matches_connection(&self.program.connection)
             {
                 if let Err(err) = self.reprepare() {
-                    self.release_active_root_if_counted();
+                    self.release_active_root_if_counted(true);
                     return Err(err);
                 }
             }
@@ -770,7 +601,7 @@ impl Statement {
                 .rollback_autocommit_txn()
                 .and_then(|()| self.reprepare())
             {
-                self.release_active_root_if_counted();
+                self.release_active_root_if_counted(true);
                 return Err(err);
             }
             res = self
@@ -792,7 +623,7 @@ impl Statement {
                 // The stats refresh runs a SELECT on this same connection. At
                 // this point ANALYZE is already Done, so it must not count as a
                 // sibling root statement for that internal SELECT.
-                self.release_active_root_if_counted();
+                self.release_active_root_if_counted(false);
                 // Drive the refresh as a state machine instead of pumping
                 // `io.step()` here: its `sqlite_stat1` scan can have to wait
                 // for another transaction, and only the caller's scheduler can
@@ -838,7 +669,7 @@ impl Statement {
         if self.counted_as_active_root
             && (matches!(res, Ok(StepResult::Done | StepResult::Interrupt)) || res.is_err())
         {
-            self.release_active_root_if_counted();
+            self.release_active_root_if_counted(!matches!(res, Ok(StepResult::Done)));
         }
 
         // If the bytecode aborted between SequenceBeginInnerTx and
@@ -890,17 +721,18 @@ impl Statement {
 
         // The interpreter chain carries a boxed error to keep per-row returns
         // register-sized; unbox once at the public boundary.
-        res.map_err(|err| *err)
+        res.map_err(|err| (*err).into_structured_constraint())
     }
 
     #[inline]
     pub fn step(&mut self) -> Result<StepResult> {
-        self._step(None)
+        self._step(None).map_err(|error| self.format_error(error))
     }
 
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
+            .map_err(|error| self.format_error(error))
     }
 
     /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
@@ -911,6 +743,10 @@ impl Statement {
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)
             .map_err(|err| *err)
+    }
+
+    fn format_error(&self, error: LimboError) -> LimboError {
+        self.program.connection.dialect().format_error(error)
     }
 
     /// Makes a trigger or foreign key action see the same current time as
@@ -1118,6 +954,12 @@ impl Statement {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    /// Makes preparing the statement again translate `cmd`, the command it
+    /// was prepared from, instead of parsing its SQL text.
+    pub(crate) fn reprepare_from(&mut self, cmd: Cmd) {
+        self.reprepare_cmd = Some(cmd);
+    }
+
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
@@ -1131,8 +973,13 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
-            let cmd = cmd.expect("Same SQL string should be able to be parsed");
+            let cmd = match &self.reprepare_cmd {
+                Some(cmd) => cmd.clone(),
+                None => {
+                    let (cmd, _) = conn.parse_sql(&self.program.sql)?;
+                    cmd.expect("Same SQL string should be able to be parsed")
+                }
+            };
 
             let syms = conn.syms.read();
             let mode = self.query_mode;
@@ -1348,9 +1195,9 @@ impl Statement {
     /// This is Turso's single entry point for "what is the type of this
     /// column?" — covering both **direct table-column references** (where the
     /// schema carries declared name, array depth, custom-type kind, and the
-    /// resolved primitive) and **computed expressions** (where the SQLite-
-    /// style affinity machinery infers a primitive type from the expression
-    /// shape). One call, one shape, regardless of which path applies.
+    /// resolved primitive) and **computed expressions** (which report the
+    /// primitive behind the expression's type). The answer is worked out
+    /// when the statement is compiled.
     ///
     /// ### Return value
     ///
@@ -1361,8 +1208,9 @@ impl Statement {
     ///   before they can rely on it.
     /// - `Ok(None)` when the statement is in EXPLAIN mode, when `idx` is out
     ///   of bounds, when the result column has no schema column behind it
-    ///   AND the affinity machinery returns `BLOB` (i.e. "no determined
-    ///   affinity"), or when a join/CTE reference can't be resolved.
+    ///   and its value may be a blob or anything (including arithmetic on a
+    ///   custom type, whose operator decides the result), or when a join/CTE
+    ///   reference can't be resolved.
     /// - `Ok(Some(info))` otherwise. For a table-column reference, `info`
     ///   carries the declared name verbatim; for an expression, `declared_name`
     ///   is the inferred-affinity primitive (`"INTEGER"`, `"TEXT"`, `"REAL"`,
@@ -1380,85 +1228,7 @@ impl Statement {
         if self.query_mode != QueryMode::Normal {
             return Ok(None);
         }
-        let Some(column) = self.program.result_columns.get(idx) else {
-            return Ok(None);
-        };
-        // Direct table-column reference: pull declared name, array depth, and
-        // any registered CREATE TYPE / CREATE DOMAIN resolution out of the
-        // schema. Anything else falls through to the expression-affinity
-        // inference path below.
-        if let turso_parser::ast::Expr::Column {
-            table,
-            column: column_idx,
-            ..
-        } = &column.expr
-        {
-            let Some((_, table_ref)) = self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-            else {
-                return Ok(None);
-            };
-            let Some(table_column) = table_ref.get_column_at(*column_idx) else {
-                return Ok(None);
-            };
-            let declared_name = table_column.ty_str.clone();
-            let array_dimensions = table_column.array_dimensions();
-            let schema = self.program.connection.schema.read();
-            let resolved = schema
-                .resolve_type(&declared_name, table_ref.is_strict())
-                .ok()
-                .flatten();
-            // `kind` is computed from the leaf TypeDef in the resolution chain:
-            // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
-            // separately on `TypeDef.is_domain`, and anything else registered
-            // through CREATE TYPE is a Custom. A column whose declared name
-            // does not appear in the type registry is a Builtin.
-            let (base_type, kind) = match resolved {
-                Some(resolved) => {
-                    let leaf = resolved.leaf();
-                    let kind = if leaf.is_struct() {
-                        ColumnTypeKind::Struct
-                    } else if leaf.is_union() {
-                        ColumnTypeKind::Union
-                    } else if leaf.is_domain {
-                        ColumnTypeKind::Domain
-                    } else {
-                        ColumnTypeKind::Custom
-                    };
-                    (Some(resolved.primitive.to_uppercase()), kind)
-                }
-                None => (None, ColumnTypeKind::Builtin),
-            };
-            drop(schema);
-            return Ok(Some(ColumnTypeInfo {
-                declared_name,
-                array_dimensions,
-                base_type,
-                kind,
-            }));
-        }
-        // Not a table column: infer the result primitive from the
-        // expression's shape (literal value type, operand types of a binary
-        // op, the CAST target, etc.).
-        let Some(name) =
-            infer_expression_primitive(&column.expr, Some(&self.program.table_references))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(ColumnTypeInfo {
-            declared_name: name.to_string(),
-            array_dimensions: match &column.expr {
-                turso_parser::ast::Expr::Cast {
-                    type_name: Some(ty),
-                    ..
-                } => ty.array_dimensions,
-                _ => 0,
-            },
-            base_type: None,
-            kind: ColumnTypeKind::Builtin,
-        }))
+        Ok(self.program.result_column_types.get(idx).cloned().flatten())
     }
 
     /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").
@@ -1517,8 +1287,7 @@ impl Statement {
         let column = &self.program.result_columns.get(idx)?;
         let affinity = translate::expr::get_expr_affinity(
             &column.expr,
-            Some(&self.program.table_references),
-            None,
+            &translate::expr_context::TableMetadata::new(Some(&self.program.table_references)),
         );
         affinity_to_primitive(affinity).map(str::to_string)
     }
@@ -1591,6 +1360,7 @@ impl Statement {
 
     pub fn reset(&mut self) -> Result<()> {
         self.reset_internal(None, None, false)
+            .map_err(|error| self.format_error(error))
     }
 
     /// If `Insn::SequenceBeginInnerTx` swapped the connection's mv_tx to
@@ -1709,6 +1479,7 @@ impl Statement {
             }
         }
 
+        let mut statement_failed = false;
         if self.state.execution_state.is_running() {
             if self.query_mode == QueryMode::Normal
                 && self.program.change_cnt_on
@@ -1726,6 +1497,7 @@ impl Statement {
                         &self.pager,
                         0,
                         "",
+                        None,
                         None,
                     ) {
                         Ok(vdbe::execute::InsnFunctionStepResult::Done) => {
@@ -1768,6 +1540,7 @@ impl Statement {
                     }
                 }
 
+                statement_failed = !halt_completed;
                 if !halt_completed {
                     if let Err(abort_err) = self.program.abort(
                         &self.pager,
@@ -1787,6 +1560,7 @@ impl Statement {
                 // yielded a Row (DML still in progress or hit Busy/error), or a
                 // write statement without RETURNING. Rollback to avoid committing
                 // partial DML or silently retrying after transient errors (Busy).
+                statement_failed = self.state.is_active_write;
                 if let Err(abort_err) = self.program.abort(
                     &self.pager,
                     None,
@@ -1831,7 +1605,7 @@ impl Statement {
             self.state.is_active_write = false;
         }
         if self.counted_as_active_root && !preserve_active_root_count {
-            self.release_active_root_if_counted();
+            self.release_active_root_if_counted(statement_failed);
         }
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
@@ -1916,11 +1690,292 @@ impl Drop for Statement {
     }
 }
 
+/// The uppercase primitive name (`"INTEGER"`, `"REAL"`, `"NUMERIC"`, `"TEXT"`) that
+/// [`Statement::get_column_inferred_type`] reports for an expression with this
+/// affinity. `Blob` gives None because it is SQLite's "no affinity", not a usable
+/// wire type.
+fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
+    use crate::vdbe::affinity::Affinity;
+    match affinity {
+        Affinity::Integer => Some("INTEGER"),
+        Affinity::Real => Some("REAL"),
+        Affinity::Numeric => Some("NUMERIC"),
+        Affinity::Text => Some("TEXT"),
+        Affinity::Blob | Affinity::None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::SqliteDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+
+    #[test]
+    fn cloned_halt_retains_constraint_context() {
+        assert_cloned_constraint_context(
+            "INSERT INTO parent VALUES (1, 'b', 1)",
+            crate::ConstraintKind::PrimaryKey,
+            "parent",
+            "id",
+        );
+    }
+
+    #[test]
+    fn cloned_halt_if_null_retains_constraint_context() {
+        assert_cloned_constraint_context(
+            "INSERT INTO parent VALUES (2, NULL, 1)",
+            crate::ConstraintKind::NotNull,
+            "parent",
+            "code",
+        );
+    }
+
+    #[test]
+    fn cloned_fk_counter_retains_constraint_context() {
+        assert_cloned_constraint_context(
+            "UPDATE child SET pid = 99",
+            crate::ConstraintKind::ForeignKey,
+            "child",
+            "pid",
+        );
+    }
+
+    fn assert_cloned_constraint_context(
+        sql: &str,
+        kind: crate::ConstraintKind,
+        table: &str,
+        column: &str,
+    ) {
+        use crate::vdbe::{execute, insn::Insn};
+
+        let conn = constraint_test_connection();
+        let mut stmt = conn.prepare(sql).unwrap();
+        let insn = stmt
+            .program
+            .insns
+            .iter()
+            .find_map(|(insn, _)| {
+                let matches = match kind {
+                    crate::ConstraintKind::PrimaryKey => matches!(
+                        insn,
+                        Insn::Halt {
+                            err_code: crate::error::SQLITE_CONSTRAINT_PRIMARYKEY,
+                            ..
+                        }
+                    ),
+                    crate::ConstraintKind::NotNull => matches!(insn, Insn::HaltIfNull { .. }),
+                    crate::ConstraintKind::ForeignKey => matches!(
+                        insn,
+                        Insn::FkCounter {
+                            increment_value: 1,
+                            deferred: false,
+                            ..
+                        }
+                    ),
+                    _ => unreachable!(),
+                };
+                matches.then(|| insn.clone())
+            })
+            .expect("constraint instruction");
+        for index in 0..stmt.state.column_count() {
+            stmt.state
+                .set_register(index, vdbe::Register::Value(Value::from_i64(99)));
+        }
+        let error = match &insn {
+            Insn::Halt { .. } => {
+                execute::op_halt(&stmt.program, &mut stmt.state, &insn, &stmt.pager)
+                    .err()
+                    .expect("constraint error")
+            }
+            Insn::HaltIfNull { target_reg, .. } => {
+                stmt.state
+                    .set_register(*target_reg, vdbe::Register::Value(Value::Null));
+                execute::op_halt_if_null(&stmt.program, &mut stmt.state, &insn, &stmt.pager)
+                    .err()
+                    .expect("constraint error")
+            }
+            Insn::FkCounter { .. } => {
+                execute::op_fk_counter(&stmt.program, &mut stmt.state, &insn, &stmt.pager).unwrap();
+                Box::new(stmt.state.immediate_foreign_key_error())
+            }
+            _ => unreachable!(),
+        };
+        let LimboError::ConstraintViolation(violation) = *error else {
+            panic!("expected structured constraint: {error:?}");
+        };
+        assert_eq!(violation.kind, kind);
+        assert_eq!(violation.table_name.as_deref(), Some(table));
+        assert_eq!(violation.column_names, vec![column]);
+        assert!(!violation.values.is_empty());
+    }
+
+    #[test]
+    fn internal_constraint_errors_are_structured() {
+        for (sql, kind, message, foreign_key) in constraint_error_cases() {
+            let conn = constraint_test_connection();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let error = loop {
+                match stmt._step(None) {
+                    Err(error) => break error,
+                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                        stmt.pager.io.step().unwrap();
+                    }
+                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+                }
+            };
+            let LimboError::ConstraintViolation(violation) = &error else {
+                panic!("{sql}: {error:?}");
+            };
+            assert_eq!(violation.kind, kind, "{sql}");
+            assert_eq!(error.to_string(), message, "{sql}");
+            assert_eq!(error.is_foreign_key_constraint(), foreign_key, "{sql}");
+            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+        }
+    }
+
+    #[test]
+    fn public_constraint_errors_preserve_sqlite_variants() {
+        for (sql, _, message, foreign_key) in constraint_error_cases() {
+            for with_waker in [false, true] {
+                let conn = constraint_test_connection();
+                let mut stmt = conn.prepare(sql).unwrap();
+                let error = loop {
+                    let result = if with_waker {
+                        stmt.step_with_waker(Waker::noop())
+                    } else {
+                        stmt.step()
+                    };
+                    match result {
+                        Err(error) => break error,
+                        Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                            stmt.pager.io.step().unwrap();
+                        }
+                        Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+                    }
+                };
+                if foreign_key {
+                    assert!(
+                        matches!(error, LimboError::ForeignKeyConstraint(_)),
+                        "{sql}: {error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(error, LimboError::Constraint(_)),
+                        "{sql}: {error:?}"
+                    );
+                }
+                assert_eq!(error.to_string(), message, "{sql}");
+                assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn public_helper_statement_errors_preserve_sqlite_variants() {
+        let conn = constraint_test_connection();
+        let mut stmt = conn
+            .prepare_internal("INSERT INTO parent VALUES (1, 'b', 1)")
+            .unwrap();
+        let error = stmt.run_ignore_rows().unwrap_err();
+        assert!(matches!(error, LimboError::Constraint(_)), "{error:?}");
+        assert_eq!(error.to_string(), "UNIQUE constraint failed: parent.id");
+        assert_eq!(error.sqlite_result_code(), 19);
+    }
+
+    #[test]
+    fn public_reset_preserves_sqlite_foreign_key_error() {
+        let conn = constraint_test_connection();
+        let mut stmt = conn
+            .prepare("INSERT INTO deferred_child VALUES (99) RETURNING pid")
+            .unwrap();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => break,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    stmt.pager.io.step().unwrap();
+                }
+                result => panic!("expected RETURNING row, got {result:?}"),
+            }
+        }
+        let error = stmt.reset().unwrap_err();
+        assert!(
+            matches!(error, LimboError::ForeignKeyConstraint(_)),
+            "{error:?}"
+        );
+        assert_eq!(error.to_string(), "FOREIGN KEY constraint failed");
+        assert_eq!(error.sqlite_result_code(), 19);
+    }
+
+    fn constraint_error_cases() -> [(&'static str, crate::ConstraintKind, &'static str, bool); 8] {
+        [
+            (
+                "INSERT INTO parent VALUES (1, 'b', 1)",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: parent.id",
+                false,
+            ),
+            (
+                "INSERT INTO parent VALUES (2, 'a', 1)",
+                crate::ConstraintKind::Unique,
+                "UNIQUE constraint failed: parent.code",
+                false,
+            ),
+            (
+                "INSERT INTO parent VALUES (2, NULL, 1)",
+                crate::ConstraintKind::NotNull,
+                "NOT NULL constraint failed: parent.code",
+                false,
+            ),
+            (
+                "INSERT INTO parent VALUES (2, 'b', -1)",
+                crate::ConstraintKind::Check,
+                "CHECK constraint failed: positive",
+                false,
+            ),
+            (
+                "INSERT INTO child VALUES (99)",
+                crate::ConstraintKind::ForeignKey,
+                "FOREIGN KEY constraint failed",
+                true,
+            ),
+            (
+                "DELETE FROM parent",
+                crate::ConstraintKind::ForeignKey,
+                "FOREIGN KEY constraint failed",
+                true,
+            ),
+            (
+                "INSERT INTO deferred_child VALUES (99)",
+                crate::ConstraintKind::ForeignKey,
+                "FOREIGN KEY constraint failed",
+                true,
+            ),
+            (
+                "INSERT INTO trigger_source VALUES (1)",
+                crate::ConstraintKind::PrimaryKey,
+                "UNIQUE constraint failed: parent.id",
+                false,
+            ),
+        ]
+    }
+
+    fn constraint_test_connection() -> Arc<crate::Connection> {
+        let conn = open_test_connection().unwrap();
+        conn.set_foreign_keys_enabled(true);
+        for sql in [
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, score INTEGER CONSTRAINT positive CHECK (score > 0))",
+            "CREATE TABLE child (pid INTEGER REFERENCES parent(id))",
+            "CREATE TABLE deferred_child (pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TABLE trigger_source (id INTEGER)",
+            "CREATE TRIGGER duplicate_parent AFTER INSERT ON trigger_source BEGIN INSERT INTO parent VALUES (NEW.id, 'b', 1); END",
+            "INSERT INTO parent VALUES (1, 'a', 1)",
+            "INSERT INTO child VALUES (1)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        conn
+    }
 
     fn open_test_connection() -> crate::Result<Arc<crate::Connection>> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -1933,6 +1988,52 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect(ConnectOpts::new())
+    }
+
+    /// A hash join inside a correlated subquery is built once and probed once per
+    /// outer row. The budget is forced down so the build spills in every build
+    /// profile; the second and third passes then go through the grace phase and
+    /// must count the same rows as the first (#9774).
+    #[test]
+    fn test_spilled_hash_join_counts_the_same_on_every_probe_pass() {
+        let conn = open_test_connection().unwrap();
+        for sql in [
+            "CREATE TABLE a(x INTEGER PRIMARY KEY, y INT)",
+            "CREATE TABLE c(k INT, v INT)",
+            "CREATE TABLE d(k INT, w INT)",
+            "INSERT INTO a VALUES (1, 0), (2, 1000000), (3, 1000000)",
+            "INSERT INTO c SELECT value % 50, value FROM generate_series(1, 1000)",
+            "INSERT INTO d SELECT value % 70, value FROM generate_series(1, 1000)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.x, (SELECT count(*) FROM c JOIN d ON c.k = d.k AND d.w < a.y) FROM a",
+            )
+            .unwrap();
+        let mut hash_builds = 0;
+        for (insn, _) in &mut Arc::make_mut(&mut stmt.program.prepared).insns {
+            if let vdbe::insn::Insn::HashBuild { data } = insn {
+                data.mem_budget = 32 * 1024;
+                hash_builds += 1;
+            }
+        }
+        assert_eq!(hash_builds, 1, "the join must be built once and reused");
+
+        let rows = stmt.run_collect_rows().unwrap();
+        let expected: Vec<Vec<Value>> = [[1, 0], [2, 14400], [3, 14400]]
+            .iter()
+            .map(|row| row.iter().copied().map(Value::from_i64).collect())
+            .collect();
+        assert_eq!(rows, expected);
+
+        let metrics = stmt.metrics().hash_join;
+        assert!(metrics.spill_chunks > 0, "build did not spill: {metrics:?}");
+        assert!(
+            metrics.grace_partitions_processed > 0,
+            "no pass went through grace: {metrics:?}"
+        );
     }
 
     #[test]

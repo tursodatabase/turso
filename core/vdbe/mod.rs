@@ -165,7 +165,8 @@ pub(crate) fn step_view_delta_batch(
                     connection.transaction_changes.get_view_names()?,
                 )?;
                 for view_name in &views {
-                    if let Some(view_mutex) = schema.get_materialized_view(view_name) {
+                    let (namespace, name) = schema.demangle_name(view_name);
+                    if let Some(view_mutex) = schema.get_materialized_view(namespace, name) {
                         let view = view_mutex.lock();
                         turso_assert_ne!(
                             view.get_root_page(),
@@ -208,7 +209,8 @@ pub(crate) fn step_view_delta_batch(
                     }
 
                     let schema = connection.schema.read();
-                    let Some(view_mutex) = schema.get_materialized_view(view_name) else {
+                    let (namespace, name) = schema.demangle_name(view_name);
+                    let Some(view_mutex) = schema.get_materialized_view(namespace, name) else {
                         *current_index += 1;
                         continue;
                     };
@@ -1025,6 +1027,50 @@ pub struct SequenceInnerTxState {
     )>,
 }
 
+/// What a write statement's activity is measured against to tell whether it
+/// wrote anything before failing. In WAL mode the pager's dirty counter
+/// works: the pager and its counter are per-connection, so nothing else —
+/// not even a parallel passive checkpoint — advances it under a statement.
+/// In MVCC mode statements write to the transaction's own row store and the
+/// pager is only written by checkpoint work, so the baseline is the
+/// transaction's write-set size instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WriteBaseline {
+    None,
+    PagerDirties(u64),
+    MvccWriteSet(usize),
+}
+
+impl WriteBaseline {
+    /// The main database's write activity right now, as seen by the
+    /// statement's connection.
+    pub(crate) fn capture(
+        mv_store: Option<&MvStore>,
+        connection: &Connection,
+        pager: &Pager,
+    ) -> WriteBaseline {
+        match mv_store {
+            Some(mv_store) => connection
+                .get_mv_tx_id()
+                .and_then(|tx_id| mv_store.tx_write_set_len(tx_id))
+                .map_or(WriteBaseline::None, WriteBaseline::MvccWriteSet),
+            None => WriteBaseline::PagerDirties(pager.pages_dirtied_count()),
+        }
+    }
+
+    /// Whether the statement wrote anything since this baseline was captured.
+    fn advanced(self, mv_store: Option<&MvStore>, connection: &Connection, pager: &Pager) -> bool {
+        match self {
+            WriteBaseline::None => false,
+            WriteBaseline::PagerDirties(at_start) => pager.pages_dirtied_count() != at_start,
+            WriteBaseline::MvccWriteSet(at_start) => mv_store
+                .zip(connection.get_mv_tx_id())
+                .and_then(|(mv_store, tx_id)| mv_store.tx_write_set_len(tx_id))
+                .is_some_and(|now| now > at_start),
+        }
+    }
+}
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -1168,9 +1214,14 @@ pub struct ProgramState {
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
+    fk_immediate_violation: Option<LimboError>,
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    /// Write activity on the main database when this statement became an
+    /// active write; abort() compares against it to tell whether the
+    /// statement wrote anything before failing.
+    pub(crate) write_baseline: WriteBaseline,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
@@ -1264,6 +1315,7 @@ impl ProgramState {
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
+            fk_immediate_violation: None,
             rowsets: HashMap::default(),
             spare_agg_payloads: Vec::new(),
             bloom_filters: HashMap::default(),
@@ -1271,6 +1323,7 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
@@ -1427,6 +1480,7 @@ impl ProgramState {
         self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
+        self.fk_immediate_violation = None;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
         if !self.rowsets.is_empty() {
             self.rowsets.clear();
@@ -1442,6 +1496,7 @@ impl ProgramState {
         }
         self.uses_subjournal = false;
         self.is_active_write = false;
+        self.write_baseline = WriteBaseline::None;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
@@ -1744,6 +1799,7 @@ impl ProgramState {
         // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::Release);
+        self.fk_immediate_violation = None;
         Ok(IOResult::Done(()))
     }
 
@@ -1944,6 +2000,12 @@ impl ProgramState {
             .load(Ordering::Acquire)
     }
 
+    pub(crate) fn immediate_foreign_key_error(&self) -> LimboError {
+        self.fk_immediate_violation.clone().unwrap_or_else(|| {
+            LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string())
+        })
+    }
+
     pub fn increment_fk_immediate_violations_during_stmt(&self, v: isize) {
         self.fk_immediate_violations_during_stmt
             .fetch_add(v, Ordering::AcqRel);
@@ -2063,6 +2125,7 @@ pub struct PreparedProgram {
     /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
+    pub result_column_types: Vec<Option<crate::statement::ColumnTypeInfo>>,
     pub table_references: TableReferences,
     pub sql: String,
     /// The statement is ANALYZE, so its completion refreshes the in-memory
@@ -2073,6 +2136,9 @@ pub struct PreparedProgram {
     /// when run as part of an interactive (non-autocommit) transaction.
     /// See `crate::vdbe::builder::ProgramBuilder::is_multi_write` and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
+    /// Whether the statement may write more than one row; see
+    /// `crate::vdbe::builder::ProgramBuilder::is_multi_write`.
+    pub is_multi_write: bool,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
@@ -2087,6 +2153,10 @@ pub struct PreparedProgram {
     pub has_materialized_views: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
+    /// The custom collations of the connection that prepared the program. The
+    /// program keeps them alive because its `CollationSeq::Custom` values
+    /// call their callbacks.
+    pub custom_collations: Vec<Arc<crate::function::ExternalCollation>>,
     /// Set of attached database indices that need write transactions.
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
@@ -2895,7 +2965,7 @@ impl Program {
         pager: &Arc<Pager>,
         err: LimboError,
     ) -> Option<ProgramStep> {
-        match err {
+        match err.into_structured_constraint() {
             LimboError::Busy => Some(ProgramStep::Busy),
             LimboError::BusySnapshot
                 if matches!(
@@ -2905,7 +2975,9 @@ impl Program {
             {
                 Some(ProgramStep::Busy)
             }
-            err if (matches!(err, LimboError::Constraint(_))
+            err if ((matches!(err, LimboError::Constraint(_))
+                || matches!(err, LimboError::ConstraintViolation(_)))
+                && !err.is_foreign_key_constraint()
                 && self.resolve_type == ResolveType::Fail)
                 || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
             {
@@ -3455,6 +3527,33 @@ impl Program {
             }
         }
 
+        /// Whether this failed statement, which has no statement savepoint,
+        /// forces the whole transaction to roll back. Ordinary runtime errors
+        /// (overflow, type errors, constraint checks, ...) are raised before
+        /// such a statement writes anything, so the transaction survives
+        /// them. The listed errors can strike mid-write, leaving partial
+        /// writes only a full rollback can undo; an I/O error rolls back even
+        /// from a read-only statement, because it may have hit a cache spill
+        /// of pages dirtied by earlier statements in the transaction. SQLite
+        /// applies the same rules to its "special errors" (sqlite3VdbeHalt),
+        /// with one deliberate difference: an interrupted statement that has
+        /// a statement savepoint is undone by the savepoint and keeps the
+        /// transaction here, where SQLite's interrupts bypass the statement
+        /// journal and roll back everything. Interrupts normally surface as
+        /// a clean stop rather than as this error, and the dropped-writer
+        /// poison rule applies instead.
+        fn error_forces_txn_rollback(err: &LimboError, unfinished_writer: bool) -> bool {
+            match err {
+                LimboError::CompletionError(_) => true,
+                LimboError::DatabaseFull
+                | LimboError::OutOfMemory
+                | LimboError::CacheError(_)
+                | LimboError::Corrupt(_)
+                | LimboError::Interrupt => unfinished_writer,
+                _ => false,
+            }
+        }
+
         let mut abort_error: Option<LimboError> = None;
         if let Err(err) = execute::abort_active_subprogram(self, state, err) {
             capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
@@ -3533,7 +3632,9 @@ impl Program {
         let keeps_prior_changes = match err {
             Some(LimboError::RaiseIgnore) => true,
             Some(LimboError::Raise(ResolveType::Fail, _)) => true,
-            Some(LimboError::Constraint(_)) => self.resolve_type == ResolveType::Fail,
+            Some(error @ (LimboError::Constraint(_) | LimboError::ConstraintViolation(_))) => {
+                !error.is_foreign_key_constraint() && self.resolve_type == ResolveType::Fail
+            }
             _ => false,
         };
         if (err.is_some() || state.execution_state.is_running()) && !keeps_prior_changes {
@@ -3629,7 +3730,9 @@ impl Program {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
-                let is_fail_constraint = (matches!(err, Some(LimboError::Constraint(_)))
+                let is_fail_constraint = ((matches!(err, Some(LimboError::Constraint(_)))
+                    || matches!(err, Some(LimboError::ConstraintViolation(_))))
+                    && !err.is_some_and(LimboError::is_foreign_key_constraint)
                     && self.resolve_type == ResolveType::Fail)
                     || matches!(err, Some(LimboError::Raise(ResolveType::Fail, _)));
                 if !is_fail_constraint {
@@ -3684,7 +3787,7 @@ impl Program {
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
-                Some(LimboError::ForeignKeyConstraint(_)) => {
+                Some(error) if error.is_foreign_key_constraint() => {
                     if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
                     }
@@ -3696,7 +3799,9 @@ impl Program {
                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
                 // - FAIL: don't rollback anything - changes persist, transaction stays active
                 // - ABORT (default): rollback statement, rollback txn if autocommit
-                Some(LimboError::Constraint(_)) | Some(LimboError::Raise(_, _)) => {
+                Some(LimboError::Constraint(_))
+                | Some(LimboError::ConstraintViolation(_))
+                | Some(LimboError::Raise(_, _)) => {
                     let effective_resolve = match err {
                         Some(LimboError::Raise(rt, _)) => *rt,
                         _ => self.resolve_type,
@@ -3779,8 +3884,11 @@ impl Program {
                                 // delivered it before returning the error;
                                 // only the trigger RAISE(FAIL) shape reaches
                                 // the commit through this arm.
-                                let halt_already_delivered =
-                                    matches!(err, Some(LimboError::Constraint(_)));
+                                let halt_already_delivered = matches!(
+                                    err,
+                                    Some(LimboError::Constraint(_))
+                                        | Some(LimboError::ConstraintViolation(_))
+                                );
                                 if committed && !halt_already_delivered {
                                     execute::index_method_on_transaction_committed_all(
                                         state,
@@ -3817,7 +3925,13 @@ impl Program {
                         }
                     }
                     TxnCleanup::RollbackSavepoint => {
-                        if can_autocommit_now {
+                        // An I/O error invalidates more than the failing
+                        // statement — it may have hit a spill of pages other
+                        // statements dirtied — so the statement savepoint is
+                        // not enough: roll back the whole transaction, like
+                        // SQLite on SQLITE_IOERR.
+                        let io_error = matches!(err, Some(LimboError::CompletionError(_)));
+                        if can_autocommit_now || io_error {
                             self.rollback_current_txn(pager);
                         } else if err.is_none() && !pager.is_checkpointing() {
                             if let Err(end_stmt_err) = state.end_statement(
@@ -3834,9 +3948,50 @@ impl Program {
                         }
                     }
                     TxnCleanup::None => {
-                        if can_autocommit_now
-                            || (!self.connection.get_auto_commit() && err.is_some())
-                        {
+                        // An ordinary error, or a clean drop (err == None),
+                        // keeps the transaction. A single-row writer raises
+                        // ordinary errors before it writes its row; a
+                        // multi-row statement that the analysis in
+                        // translate/stmt_journal.rs left without a statement
+                        // savepoint keeps the rows written before the error,
+                        // like SQLite, which opens no statement journal for
+                        // statements its may-abort analysis clears. A dropped
+                        // unfinished writer was poisoned above and the caller
+                        // must ROLLBACK explicitly.
+                        let forces_rollback = err
+                            .is_some_and(|err| error_forces_txn_rollback(err, unfinished_writer));
+                        // A single-row writer must not have written anything
+                        // when an ordinary error is raised. A violation means
+                        // a statement shape whose expressions run after the
+                        // write is missing from the savepoint analysis — like
+                        // RETURNING or materialized-view maintenance were —
+                        // or an error is missing from
+                        // error_forces_txn_rollback: fail loudly in debug
+                        // builds, and roll the transaction back rather than
+                        // keep the row. SQLite asserts the same invariant
+                        // (sqlite3VdbeAssertAbortable).
+                        let wrote_without_savepoint = !can_autocommit_now
+                            && unfinished_writer
+                            && !self.is_multi_write
+                            && err.is_some()
+                            && !forces_rollback
+                            && {
+                                let baseline = state.write_baseline;
+                                let mv_store = state.mv_store(&self.connection).cloned();
+                                baseline.advanced(mv_store.as_deref(), &self.connection, pager)
+                            };
+                        if wrote_without_savepoint {
+                            tracing::error!(
+                                "statement wrote, then failed without a \
+                                 statement savepoint: {err:?}"
+                            );
+                            debug_assert!(
+                                false,
+                                "statement wrote, then failed without a \
+                                 statement savepoint: {err:?}"
+                            );
+                        }
+                        if can_autocommit_now || forces_rollback || wrote_without_savepoint {
                             self.rollback_current_txn(pager);
                         }
                     }

@@ -16,6 +16,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use turso_core::{ConnectOpts, Database, SqliteDialect};
@@ -82,6 +83,8 @@ impl EnginePair {
     }
 
     fn build_with(state_sql: &str, surface_errors: bool) -> Result<Self> {
+        static NEXT_DATABASE_ID: AtomicU64 = AtomicU64::new(0);
+        let database_id = NEXT_DATABASE_ID.fetch_add(1, Ordering::Relaxed);
         let io = Arc::new(MemorySimIO::new(0));
         // Views are cheap to enable even for a non-IVM run (no materialized
         // view statement appears unless the original run created one), and a
@@ -91,7 +94,7 @@ impl EnginePair {
             .with_views(true);
         let turso_db = Database::open_file_with_flags(
             io,
-            "shrink.db",
+            &format!("shrink-{database_id}.db"),
             turso_core::OpenFlags::default(),
             opts,
             None,
@@ -268,7 +271,17 @@ fn expr_children(e: &mut Expr) -> Vec<&mut Expr> {
         | Expr::NotNull(expr)
         | Expr::Unary(_, expr)
         | Expr::FieldAccess { base: expr, .. } => vec![expr],
-        Expr::FunctionCall { args, .. } => args.iter_mut().map(|a| &mut **a).collect(),
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter_over,
+            ..
+        } => args
+            .iter_mut()
+            .map(|a| &mut **a)
+            .chain(order_by.iter_mut().map(|item| &mut *item.expr))
+            .chain(filter_over.filter_clause.as_deref_mut())
+            .collect(),
         Expr::InList { lhs, rhs, .. } => {
             let mut v: Vec<&mut Expr> = vec![lhs];
             v.extend(rhs.iter_mut().map(|a| &mut **a));
@@ -1103,6 +1116,33 @@ mod tests {
     /// hand-written spacing.
     fn norm(sql: &str) -> String {
         parse_one(sql).expect("test SQL must parse").to_string()
+    }
+
+    #[test]
+    fn engine_pairs_do_not_share_database_state() {
+        let first = EnginePair::build_strict("CREATE TABLE t(x);").unwrap();
+        let second = EnginePair::build_strict("CREATE TABLE t(x);").unwrap();
+        let (turso, sqlite) = first.run_both("INSERT INTO t VALUES (1)");
+        assert!(!turso.is_error() && !sqlite.is_error());
+        assert!(!second.states_differ());
+    }
+
+    #[test]
+    fn aggregate_ordering_and_filter_expressions_shrink() {
+        let results =
+            candidates("SELECT group_concat(x ORDER BY y + 2, z) FILTER (WHERE x > 3) FROM t");
+        assert!(
+            results.contains(&norm(
+                "SELECT group_concat(x ORDER BY 1, z) FILTER (WHERE x > 3) FROM t"
+            )),
+            "{results:?}"
+        );
+        assert!(
+            results.contains(&norm(
+                "SELECT group_concat(x ORDER BY y + 2, z) FILTER (WHERE 1) FROM t"
+            )),
+            "{results:?}"
+        );
     }
 
     #[test]

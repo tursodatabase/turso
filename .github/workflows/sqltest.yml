@@ -155,6 +155,42 @@ jobs:
       - name: Run tests against PostgreSQL
         run: make -C postgres/conformance run-postgres
 
+  pg-dump-fuzzer:
+    name: PostgreSQL dump differential fuzzer
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install PostgreSQL 18 clients
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error --location \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-18
+          echo '/usr/lib/postgresql/18/bin' >> "$GITHUB_PATH"
+      - name: Check fuzzer and comparison logic
+        run: cargo test --locked --profile pg-dump-fuzzer -p turso_pg_dump_fuzzer
+      - name: Compare generated PostgreSQL and Turso dumps
+        env:
+          POSTGRES_VERSION: "18"
+        run: make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast'
+      - name: Upload generation report and failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-dump-fuzzer-results
+          path: postgres/conformance/pgdump/results/
+          if-no-files-found: ignore
+          retention-days: 1
+
   sqltest-sqlite:
     name: Run SQL tests (SQLite)
     runs-on: blacksmith-4vcpu-ubuntu-2404
