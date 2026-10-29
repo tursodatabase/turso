@@ -321,23 +321,12 @@ pub struct TableConstraints {
 pub(super) fn automatic_index_terms(
     table: &JoinedTable,
     constraints: &TableConstraints,
-    schema: &Schema,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
-    let can_use_term = |term: &Constraint| {
-        if !term.can_drive_index_seek(columns) {
-            return false;
-        }
-        let column = &columns[term
-            .table_col_pos
-            .expect("a term that can drive an index seek has a column")];
-        !column.index_order_differs_from_value_order(schema, table.table.is_strict())
-            || term.operator == ast::Operator::Equals.into()
-    };
     let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| can_use_term(term))
+        .filter(|term| term.can_drive_index_seek(columns))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -345,7 +334,7 @@ pub(super) fn automatic_index_terms(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| can_use_term(term))
+        .filter(|(_, term)| term.can_drive_index_seek(columns))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
@@ -1323,13 +1312,6 @@ pub fn constraints_from_where_clause(
                     }
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
-                        if constrained_column.index_order_differs_from_value_order(
-                            schema,
-                            table_reference.table.is_strict(),
-                        ) && constraint.operator != ast::Operator::Equals.into()
-                        {
-                            continue;
-                        }
                         let idx_col_aff = constrained_column.affinity();
                         if !constraint.satisfies_index_affinity(idx_col_aff) {
                             continue;
@@ -1376,7 +1358,7 @@ pub fn constraints_from_where_clause(
             }
             true
         });
-        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs, schema);
+        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs);
         constraints.push(cs);
     }
 

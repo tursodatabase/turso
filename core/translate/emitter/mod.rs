@@ -2434,7 +2434,9 @@ pub(crate) fn emit_check_constraints<'a>(
                         is_rowid_alias: col.is_rowid_alias(),
                     }),
                     register,
-                    false,
+                    // The register holds the value as stored, so reading the
+                    // column DECODEs it like a table read does.
+                    true,
                 );
             }
         }

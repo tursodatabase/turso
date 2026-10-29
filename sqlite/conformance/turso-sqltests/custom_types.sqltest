@@ -1122,8 +1122,8 @@ expect {
     a|109.0
 }
 
-# GROUP BY decodes values for grouping, so ORDER BY in this context
-# sorts on decoded values: apple < banana < cherry.
+# ORDER BY sorts a custom type by its stored value with GROUP BY too:
+# 'ananab' < 'elppa' < 'yrrehc'.
 @requires strict "uses STRICT tables"
 test order-by-group-by-custom-type {
     CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
@@ -1135,8 +1135,8 @@ test order-by-group-by-custom-type {
     SELECT val, SUM(n) FROM t1 GROUP BY val ORDER BY val;
 }
 expect {
-    apple|3
     banana|3
+    apple|3
     cherry|4
 }
 

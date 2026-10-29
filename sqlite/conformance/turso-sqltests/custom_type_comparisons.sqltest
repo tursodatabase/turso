@@ -1093,3 +1093,138 @@ test cmp-numeric-with-non-number-text-index {
 expect error {
     invalid input syntax for type numeric: "abc"
 }
+
+# A custom type without its own order compares by its stored value, the value
+# an index keeps and ORDER BY sorts. With ENCODE -value, 1, 5 and 10 are
+# stored as -1, -5 and -10, so 10 sorts first and 1 is the largest value.
+# Scans, index searches, ORDER BY, GROUP BY, min/max and window functions must
+# all agree on that order.
+@requires strict "uses STRICT tables"
+test cmp-stored-value-order-same-everywhere {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 5), (3, 10), (4, NULL);
+    SELECT 'eq', id FROM t WHERE c = 5 ORDER BY id;
+    SELECT 'gt', id FROM t WHERE c > 4 ORDER BY id;
+    SELECT 'lt', id FROM t WHERE c < 5 ORDER BY id;
+    SELECT 'between', id FROM t WHERE c BETWEEN 10 AND 1 ORDER BY id;
+    SELECT 'in', id FROM t WHERE c IN (5, 7) ORDER BY id;
+    SELECT 'case', id FROM t WHERE CASE c WHEN 5 THEN 1 ELSE 0 END ORDER BY id;
+    SELECT 'order', id FROM t WHERE c IS NOT NULL ORDER BY c;
+    SELECT 'desc1', c FROM t ORDER BY c DESC LIMIT 1;
+    SELECT 'max', max(c), min(c) FROM t;
+    SELECT 'group', c, count(*) FROM t GROUP BY c ORDER BY c;
+    SELECT 'order-by-max', id % 2, max(c) m FROM t GROUP BY id % 2 ORDER BY m;
+    SELECT 'scalar-max', id, max(c, 7) FROM t ORDER BY id;
+    SELECT 'window-max', id, max(c) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.c < b.c ORDER BY 2, 3;
+    CREATE INDEX t_c ON t(c);
+    SELECT 'eq', id FROM t WHERE c = 5 ORDER BY id;
+    SELECT 'gt', id FROM t WHERE c > 4 ORDER BY id;
+    SELECT 'lt', id FROM t WHERE c < 5 ORDER BY id;
+    SELECT 'between', id FROM t WHERE c BETWEEN 10 AND 1 ORDER BY id;
+    SELECT 'in', id FROM t WHERE c IN (5, 7) ORDER BY id;
+    SELECT 'order', id FROM t WHERE c IS NOT NULL ORDER BY c;
+    SELECT 'desc1', c FROM t ORDER BY c DESC LIMIT 1;
+    SELECT 'max', max(c), min(c) FROM t;
+}
+expect {
+    eq|2
+    gt|1
+    lt|3
+    between|1
+    between|2
+    between|3
+    in|2
+    case|2
+    order|3
+    order|2
+    order|1
+    desc1|1
+    max|1|10
+    group||1
+    group|10|1
+    group|5|1
+    group|1|1
+    order-by-max|0|5
+    order-by-max|1|1
+    scalar-max|1|1
+    scalar-max|2|5
+    scalar-max|3|7
+    scalar-max|4|
+    window-max|1|1
+    window-max|2|1
+    window-max|3|5
+    window-max|4|10
+    join|2|1
+    join|3|1
+    join|3|2
+    eq|2
+    gt|1
+    lt|3
+    between|1
+    between|2
+    between|3
+    in|2
+    order|3
+    order|2
+    order|1
+    desc1|1
+    max|1|10
+}
+
+# CAST(x AS type) gives the stored value, so it is compared as it is, with
+# and without an index, and not encoded a second time.
+@requires strict "uses STRICT tables"
+test cmp-cast-to-type-is-stored-value {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 5), (3, 10);
+    SELECT 'eq', id FROM t WHERE c = CAST(5 AS neg) ORDER BY id;
+    SELECT 'lt', id FROM t WHERE c < CAST(5 AS neg) ORDER BY id;
+    CREATE INDEX t_c ON t(c);
+    SELECT 'eq', id FROM t WHERE c = CAST(5 AS neg) ORDER BY id;
+    SELECT 'lt', id FROM t WHERE c < CAST(5 AS neg) ORDER BY id;
+}
+expect {
+    eq|2
+    lt|3
+    eq|2
+    lt|3
+}
+
+# A value compared with a date column goes through the date's ENCODE, so a
+# malformed date fails the same way in a table scan and in an index search.
+@requires strict "uses STRICT tables"
+test cmp-date-malformed-literal-scan {
+    CREATE TABLE d(x date) STRICT;
+    INSERT INTO d VALUES ('2024-01-01');
+    SELECT count(*) FROM d WHERE x = '2024-1-1';
+}
+expect error {
+    invalid date value
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-malformed-literal-index {
+    CREATE TABLE d(x date) STRICT;
+    INSERT INTO d VALUES ('2024-01-01');
+    CREATE INDEX d_x ON d(x);
+    SELECT count(*) FROM d WHERE x = '2024-1-1';
+}
+expect error {
+    invalid date value
+}
+
+# Two custom types have two stored forms, and neither fits both values.
+@requires strict "uses STRICT tables"
+test cmp-two-custom-types-is-an-error {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TYPE neg2 BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(c neg) STRICT;
+    CREATE TABLE u(d neg2) STRICT;
+    SELECT count(*) FROM t, u WHERE t.c = u.d;
+}
+expect error {
+    cannot compare type neg with type neg2
+}

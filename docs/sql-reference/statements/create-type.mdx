@@ -138,6 +138,15 @@ SELECT w FROM t ORDER BY w;
 -- cherry   (stored as 'yrrehc')
 ```
 
+Comparisons use the same order, so a query returns the same rows with and without an index, and `max(w)` is the last row of `ORDER BY w`. This holds for `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `min`/`max` (also the scalar and window forms), ORDER BY with GROUP BY, and joins. The column's stored value is compared with the other value encoded (a `CAST` to the type is already encoded):
+
+```sql
+SELECT w FROM t WHERE w < 'cherry';
+-- apple, banana   ('elppa' and 'ananab' are less than 'yrrehc')
+```
+
+Because the other value goes through ENCODE, a value that ENCODE rejects is an error: `d = '2024-1-1'` on a `date` column fails with `invalid date value` instead of matching no rows. Comparing values of two different custom types, such as `a = b` where `a` and `b` have types `t1` and `t2`, fails with `cannot compare type t1 with type t2`.
+
 The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and comparing two types with different orders fails with `cannot compare type x with type y`.
 
 ### Arithmetic
@@ -217,8 +226,6 @@ SELECT CAST(42.5 AS cents);
 ```
 
 This is useful for converting values to the encoded form outside of INSERT/UPDATE, such as in WHERE clauses and CHECK constraints.
-
-A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the encoded value.
 
 ## CHECK Constraints with Custom Types
 

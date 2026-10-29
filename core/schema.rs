@@ -7667,13 +7667,6 @@ impl Column {
     pub fn type_ordering(&self) -> Option<TypeOrdering> {
         self.type_ordering
     }
-    /// Whether an index on this column is ordered differently from how its
-    /// values compare. A custom type without an ordering is indexed by its
-    /// stored form, which does not sort like the values the column reads as,
-    /// so such an index can serve `=` but not a range or ORDER BY.
-    pub fn index_order_differs_from_value_order(&self, schema: &Schema, is_strict: bool) -> bool {
-        self.type_ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
-    }
     /// Fill in what a column of a STRICT table gets from its custom type: the
     /// type, affinity and key order of the type it is stored as. Every path
     /// that adds a column to a STRICT table calls this, so a column added by

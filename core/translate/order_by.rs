@@ -18,7 +18,9 @@ use crate::{
 
 use super::{
     emitter::{Resolver, TranslateCtx},
-    expr::translate_expr,
+    expr::{
+        emit_presentation_form, stored_comparison_type, translate_compared_expr, translate_expr,
+    },
     plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
@@ -305,7 +307,13 @@ impl EmitOrderBy {
             // (on-disk) value (decode was suppressed during sorter insert). Apply
             // DECODE now so the result set contains human-readable values.
             if remapping.deduplicated {
-                if let Some((_, type_def)) = result_column_custom_type_info(
+                if let Some(stored_form) = stored_comparison_type(
+                    [&rc.expr],
+                    Some(&plan.table_references),
+                    &t_ctx.resolver,
+                )? {
+                    emit_presentation_form(program, reg, &stored_form, &t_ctx.resolver)?;
+                } else if let Some((_, type_def)) = result_column_custom_type_info(
                     &rc.expr,
                     &plan.table_references,
                     t_ctx.resolver.schema(),
@@ -395,22 +403,18 @@ impl EmitOrderBy {
         for (i, (expr, _, _)) in order_by.iter().enumerate() {
             let key_reg = start_reg + i;
 
-            // Check if this ORDER BY expression matches a finalized aggregate
-            if let Some(agg_idx) = plan
-                .aggregates
-                .iter()
-                .position(|agg| exprs_are_equivalent(&agg.original_expr, expr))
+            if let Some(stored_form) =
+                stored_comparison_type([expr.as_ref()], Some(&plan.table_references), resolver)?
             {
-                // This ORDER BY expression is an aggregate, so copy from register
-                let agg_start_reg = t_ctx
-                    .reg_agg_start
-                    .expect("aggregate registers must be initialized");
-                let src_reg = agg_start_reg + agg_idx;
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: key_reg,
-                    extra_amount: 0,
-                });
+                // A custom type sorts by its stored form, as it compares.
+                translate_compared_expr(
+                    program,
+                    Some(&plan.table_references),
+                    expr,
+                    key_reg,
+                    resolver,
+                    Some(&stored_form),
+                )?;
             } else {
                 // Sort keys must be encoded (on-disk) values. Suppress decode so the
                 // sorter compares stored values, with SQLite's comparison or the
