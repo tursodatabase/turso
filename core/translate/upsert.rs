@@ -36,8 +36,8 @@ use crate::{
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, OperationMode, Resolver,
         },
         expr::{
-            emit_returning_results, emit_table_column, translate_expr,
-            translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
+            emit_returning_results, emit_table_column, expr_type::column_custom_type_names,
+            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
         },
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
@@ -629,26 +629,31 @@ pub fn emit_upsert(
     // already recorded by the enclosing INSERT translation, except for the
     // decoded copies made for STRICT custom-type tables. Cleared wholesale
     // at the end of the enclosing INSERT translation.
+    let is_strict = table.btree().is_some_and(|bt| bt.is_strict);
     for (idx, col) in table.columns().iter().enumerate() {
         if col.is_rowid_alias() {
             // The rewrite maps rowid-alias references to conflict_rowid_reg;
             // the image register for the alias column is never referenced.
             continue;
         }
+        let register_column = RegisterColumn::table_column(col, is_strict, resolver.schema());
         let reg = layout.to_register(expr_current_start, idx);
-        resolver
-            .register_columns
-            .insert(reg, RegisterColumn::table_column(col));
         if let Some(decoded_start) = excluded_decoded_start {
             let excluded_reg = layout.to_register(decoded_start, idx);
             resolver
                 .register_columns
-                .insert(excluded_reg, RegisterColumn::table_column(col));
+                .insert(excluded_reg, register_column.clone());
         }
+        resolver.register_columns.insert(reg, register_column);
     }
     resolver
         .register_columns
         .insert(ctx.conflict_rowid_reg, RegisterColumn::rowid());
+
+    // The decoded copies hold the columns' custom-type values, so their
+    // registers say which type they hold.
+    let decoded_column_types: Option<Vec<Option<Box<ast::Type>>>> = decoded_current_start
+        .map(|_| column_custom_type_names(table.columns(), is_strict, resolver.schema()));
 
     // WHERE on target row
     if let Some(pred) = where_clause.as_mut() {
@@ -662,6 +667,7 @@ pub fn emit_upsert(
             Some(insertion),
             true,
             excluded_decoded_start,
+            decoded_column_types.as_deref(),
             &layout,
         )?;
         let pr = program.alloc_register();
@@ -686,6 +692,7 @@ pub fn emit_upsert(
             Some(insertion),
             true,
             excluded_decoded_start,
+            decoded_column_types.as_deref(),
             &layout,
         )?;
         if *col_idx == ROWID_SENTINEL {
@@ -1857,21 +1864,26 @@ fn rewrite_expr_to_registers(
     insertion: Option<&Insertion>,
     allow_excluded: bool,
     excluded_decoded_start: Option<usize>,
+    decoded_column_types: Option<&[Option<Box<ast::Type>>]>,
     layout: &ColumnLayout,
 ) -> crate::Result<WalkControl> {
     use ast::Expr;
     let table_name_norm = table_name.map(normalize_ident);
+    let decoded_column = |register: usize, column: usize| Expr::Register {
+        register,
+        custom_type: decoded_column_types.and_then(|types| types[column].clone()),
+    };
 
-    // Map a column name to a register within the row image at `base_start`.
-    let col_reg_from_row_image = |name: &str| -> Option<usize> {
+    // Map a column name to its register within the row image at `base_start`.
+    let col_reg_from_row_image = |name: &str| -> Option<Expr> {
         if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-            return Some(rowid_reg);
+            return Some(Expr::register(rowid_reg));
         }
         let (idx, c) = table.get_column_by_name(name)?;
         if c.is_rowid_alias() {
-            Some(rowid_reg)
+            Some(Expr::register(rowid_reg))
         } else {
-            Some(base_start + layout.to_reg_offset(idx))
+            Some(decoded_column(base_start + layout.to_reg_offset(idx), idx))
         }
     };
 
@@ -1898,18 +1910,19 @@ fn rewrite_expr_to_registers(
                     {
                         if let Some(ins) = insertion {
                             if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&c)) {
-                                *expr = Expr::Register(ins.key_register());
+                                *expr = Expr::register(ins.key_register());
                             } else if let Some(cm) = ins.get_col_mapping_by_name(&c) {
                                 // Use decoded excluded registers when available
                                 // to prevent double-encoding of custom type values
                                 if let Some(decoded_start) = excluded_decoded_start {
                                     let (col_idx, _) =
                                         table.get_column_by_name(&c).expect("column exists");
-                                    *expr = Expr::Register(
+                                    *expr = decoded_column(
                                         decoded_start + layout.to_reg_offset(col_idx),
+                                        col_idx,
                                     );
                                 } else {
-                                    *expr = Expr::Register(cm.register);
+                                    *expr = Expr::register(cm.register);
                                 }
                             } else {
                                 bail_parse_error!("no such column in EXCLUDED: {}", c);
@@ -1921,8 +1934,8 @@ fn rewrite_expr_to_registers(
 
                     // Match the target table namespace if provided
                     if is_target_namespace {
-                        if let Some(r) = col_reg_from_row_image(&c) {
-                            *expr = Expr::Register(r);
+                        if let Some(register) = col_reg_from_row_image(&c) {
+                            *expr = register;
                         } else {
                             bail_parse_error!("no such column: {}.{}", ns, c);
                         }
@@ -1939,8 +1952,9 @@ fn rewrite_expr_to_registers(
                 }
                 // Unqualified id -> row image (CURRENT/NEW depending on caller)
                 Expr::Id(name) => {
-                    if let Some(r) = col_reg_from_row_image(&normalize_ident(name.as_str())) {
-                        *expr = Expr::Register(r);
+                    if let Some(register) = col_reg_from_row_image(&normalize_ident(name.as_str()))
+                    {
+                        *expr = register;
                     }
                 }
                 _ => {}

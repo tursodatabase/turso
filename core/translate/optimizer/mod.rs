@@ -4102,7 +4102,7 @@ impl Optimizable for ast::Expr {
             Expr::Subquery(..) => false,
             Expr::Unary(_, expr) => expr.is_nonnull(tables),
             Expr::Variable(..) => false,
-            Expr::Register(..) => false, // Register values can be null
+            Expr::Register { .. } => false, // Register values can be null
             Expr::Default => false,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
@@ -4202,7 +4202,7 @@ impl Optimizable for ast::Expr {
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
-            Expr::Register(_) => false,
+            Expr::Register { .. } => false,
             Expr::Default => true,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")

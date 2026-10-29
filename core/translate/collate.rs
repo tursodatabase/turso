@@ -11,8 +11,12 @@ use crate::{
     sync::{Arc, LazyLock, RwLock, Weak},
     translate::{
         catalog::CatalogContext,
-        expr::expr_type::{type_of, type_ordering, ExprType},
+        emitter::Resolver,
+        expr::expr_type::{
+            compound_column_type, query_column_type, type_of, type_ordering, ExprType,
+        },
         expr_context::{ExprContext, ExprProperties},
+        plan::{Plan, SelectPlan, TableReferences},
     },
     type_ordering::TypeOrdering,
     types::ValueRef,
@@ -522,6 +526,33 @@ pub fn comparison_collation_across_queries(
     ))
 }
 
+/// [comparison_collation_across_queries] for `x IN (SELECT ...)`, where the
+/// right operand is column `column` of `query`. The column's type is the one
+/// [query_column_type] gives it, which in a compound SELECT comes from every
+/// SELECT, not only from `rhs`, the column of the rightmost SELECT. `rhs`
+/// gives the text collation, as in SQLite.
+pub fn in_subquery_collation(
+    lhs: &Expr,
+    lhs_tables: Option<&TableReferences>,
+    query: &Plan,
+    column: usize,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let rhs = &query.select_result_columns()[column].expr;
+    let lhs_context = ExprContext::new(lhs_tables, resolver);
+    let rhs_context = ExprContext::new(Some(query.select_table_references()), resolver);
+    let rhs_order = operand_order(
+        &query_column_type(query, column, resolver),
+        resolver.schema(),
+    );
+    let lhs_order = expr_operand_order(lhs, &lhs_context);
+    let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
+    if let Some(ordering) = common_ordering([lhs_order, rhs_order], has_collate)? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    comparison_collation_across_queries(lhs, &lhs_context, rhs, &rhs_context)
+}
+
 /// The collation that `x IN (y1, ..., yN)` compares with. When x or any item
 /// has a type with an order, every comparison uses that order, so
 /// `'10.0' IN (n)` agrees with `'10.0' = n`. Otherwise the text collation is
@@ -577,6 +608,31 @@ pub fn first_collation<'a, 'c, 's: 'c>(
         return Ok(CollationSeq::Type(ordering));
     }
     first_text_collation(exprs).map(CollationSeq::Text)
+}
+
+/// The collation that column `column` of a compound SELECT compares with,
+/// where `arms` are its SELECTs: the order of [compound_column_type] when that
+/// type has one, otherwise the text collation of the leftmost SELECT whose
+/// column has one, as in SQLite's `multiSelectCollSeq`. SELECTs whose columns
+/// have different orders, and COLLATE on a column whose type has an order,
+/// are errors, as in a comparison.
+pub fn compound_column_collation(
+    arms: &[&SelectPlan],
+    column: usize,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let columns = arms.iter().map(|select| {
+        (
+            &select.result_columns[column].expr,
+            ExprContext::new(Some(&select.table_references), resolver),
+        )
+    });
+    common_type_ordering(columns.clone())?;
+    let column_type = compound_column_type(arms.iter().copied(), column, resolver);
+    if let Some(ordering) = type_ordering(&column_type, resolver.schema()) {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    first_text_collation(columns).map(CollationSeq::Text)
 }
 
 /// The text collation of the first expression that has one, BINARY when none
@@ -700,7 +756,7 @@ fn expr_collation_if_any(
     match expr {
         Expr::Column { table, column, .. } => metadata.column_collation(*table, *column),
         Expr::RowId { .. } => Ok(None),
-        Expr::Register(register) => Ok(metadata.register_collation(*register)),
+        Expr::Register { register, .. } => Ok(metadata.register_collation(*register)),
         Expr::Variable(variable) => variable
             .col_collation
             .as_deref()
@@ -828,7 +884,7 @@ fn for_each_operand<'a>(expr: &'a Expr, f: &mut impl FnMut(&'a Expr)) {
         Expr::MergedColumn(_)
         | Expr::Column { .. }
         | Expr::RowId { .. }
-        | Expr::Register(_)
+        | Expr::Register { .. }
         | Expr::DoublyQualified(..)
         | Expr::Exists(_)
         | Expr::FunctionCallStar { .. }
@@ -1509,5 +1565,173 @@ mod tests {
             ))),
         });
         table_references
+    }
+}
+
+/// Every query here compares, sorts or hashes only values of a type with its
+/// own order. No instruction of its program may use a text collation: if one
+/// does, some code path took the collation from the text rules instead of
+/// from the value's type, and would compare '10.00' before '9.50'.
+#[cfg(test)]
+mod typed_value_order_tests {
+    use super::CollationSeq;
+    use crate::sync::Arc;
+    use crate::vdbe::{builder::CursorType, insn::Insn};
+    use crate::{
+        ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO,
+    };
+
+    /// Each query, with the number of its instructions that compare values the
+    /// engine made itself (row counters, sequence numbers) with BINARY.
+    const QUERIES: &[(&str, usize)] = &[
+        // comparisons
+        ("SELECT n FROM t WHERE n > 1.5", 0),
+        ("SELECT n FROM t WHERE n BETWEEN 1.5 AND 2", 0),
+        ("SELECT n FROM t WHERE a = '{1}'", 0),
+        ("SELECT n FROM t WHERE b < '{x}'", 0),
+        ("SELECT n FROM t WHERE n = (SELECT max(m) FROM u)", 0),
+        ("SELECT n > 1.5, nullif(n, 2), n IS 1.5 FROM t", 0),
+        // IN
+        ("SELECT n FROM t WHERE n IN (1.5, 2)", 0),
+        ("SELECT n FROM t WHERE n NOT IN (1.5, 2)", 0),
+        ("SELECT n FROM t WHERE n IN (SELECT m FROM u)", 0),
+        ("SELECT n FROM t WHERE n IN (SELECT m FROM u UNION SELECT n FROM t)", 0),
+        ("SELECT n FROM t WHERE a IN (SELECT a FROM t)", 0),
+        // CASE
+        ("SELECT CASE n WHEN 1.5 THEN 1 WHEN 2 THEN 2 END FROM t", 0),
+        ("SELECT n FROM t ORDER BY CASE WHEN a IS NULL THEN n ELSE n END", 0),
+        // ORDER BY
+        ("SELECT n FROM t ORDER BY n", 0),
+        ("SELECT n FROM t ORDER BY a DESC, b", 0),
+        // GROUP BY
+        ("SELECT n FROM t GROUP BY n", 0),
+        ("SELECT a, b FROM t GROUP BY a, b", 0),
+        ("SELECT n FROM t GROUP BY n HAVING n > 1", 0),
+        // DISTINCT
+        ("SELECT DISTINCT n FROM t", 0),
+        ("SELECT DISTINCT a, b FROM t", 0),
+        ("SELECT count(DISTINCT n) FROM t", 0),
+        // compound
+        ("SELECT n FROM t UNION SELECT m FROM u", 0),
+        ("SELECT n FROM t INTERSECT SELECT m FROM u", 0),
+        ("SELECT n FROM t EXCEPT SELECT m FROM u", 0),
+        // The sorter's last key is the sequence number of the row.
+        ("SELECT n FROM t UNION ALL SELECT m FROM u ORDER BY 1", 1),
+        ("SELECT a FROM t UNION SELECT a FROM t", 0),
+        // window
+        ("SELECT min(n) OVER (PARTITION BY a ORDER BY b) FROM t", 0),
+        ("SELECT max(n) OVER (ORDER BY n RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t", 0),
+        ("SELECT n FROM t ORDER BY lag(n) OVER (ORDER BY a)", 0),
+        // Two comparisons of the frame's row numbers.
+        ("SELECT n FROM t ORDER BY first_value(b) OVER (ORDER BY n)", 2),
+        // min/max
+        ("SELECT min(n), max(a), min(b) FROM t", 0),
+        ("SELECT max(n, 2), min(n, 1.5) FROM t", 0),
+        // join
+        ("SELECT t.n FROM t JOIN u ON t.n = u.m", 0),
+        ("SELECT t.n FROM t LEFT JOIN u ON t.n = u.m", 0),
+        ("SELECT t.n FROM t, u WHERE t.n > u.m", 0),
+        ("SELECT t.n FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.m = t.n)", 0),
+        // A value without a type compared with typed values.
+        ("SELECT n FROM t WHERE 1.5 IN (n, 2)", 0),
+        ("SELECT n FROM t WHERE '{1}' IN (a)", 0),
+        // Registers that stand for columns.
+        (
+            "INSERT INTO w VALUES (1, '{1}', 1.5) ON CONFLICT(k) DO UPDATE \
+             SET a = excluded.a WHERE excluded.a > w.a AND excluded.n > w.n",
+            0,
+        ),
+        ("UPDATE w SET a = '{2}'", 0),
+        ("INSERT INTO w VALUES (2, '{1}', 1.5) RETURNING a > '{0}', n > 1.5", 0),
+        // Array function results.
+        ("SELECT n FROM t WHERE b = ARRAY['9'] OR array_append(a, 1) > a", 0),
+        ("SELECT n FROM t WHERE string_to_array('9', ',') = b", 0),
+        // A compound subquery in FROM.
+        ("SELECT x FROM (SELECT n AS x FROM t UNION ALL SELECT m FROM u) WHERE x > 1.5", 0),
+        // Automatic indexes.
+        ("SELECT t.n FROM t, u WHERE t.n = u.m AND u.m > 1", 0),
+    ];
+
+    #[test]
+    fn no_text_collation_on_typed_values() {
+        let conn = connection_with_typed_tables();
+        let mut failures = Vec::new();
+        for &(sql, internal_comparisons) in QUERIES {
+            let stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let program = &stmt.get_program().prepared;
+            let instructions = program
+                .insns
+                .iter()
+                .filter(|(insn, _)| compares_values(insn))
+                .flat_map(|(insn, _)| {
+                    insn.collations()
+                        .into_iter()
+                        .map(move |collation| (format!("{insn:?}"), collation))
+                });
+            let index_keys = program
+                .cursor_ref
+                .iter()
+                .filter_map(|(_, cursor_type)| match cursor_type {
+                    CursorType::BTreeIndex(index) if index.ephemeral => Some(index),
+                    _ => None,
+                })
+                .flat_map(|index| {
+                    index.columns.iter().map(move |column| {
+                        (
+                            format!("key {} of index {}", column.name, index.name),
+                            column.collation,
+                        )
+                    })
+                });
+            let with_text_collation: Vec<String> = instructions
+                .chain(index_keys)
+                .filter(|(_, collation)| matches!(collation, CollationSeq::Text(_)))
+                .map(|(place, _)| place)
+                .collect();
+            if with_text_collation.len() != internal_comparisons {
+                failures.push(format!("{sql}\n    {}", with_text_collation.join("\n    ")));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "comparisons of typed values that use a text collation:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// Functions and aggregates that never compare values carry an unused
+    /// BINARY collation.
+    fn compares_values(insn: &Insn) -> bool {
+        match insn {
+            Insn::Function { func, .. } => func.func.needs_collation(),
+            Insn::AggStep { data } => data.func.compares_values(),
+            _ => true,
+        }
+    }
+
+    fn connection_with_typed_tables() -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(n numeric(10,2), a integer[], b text[]) STRICT")
+            .unwrap();
+        conn.execute("CREATE TABLE u(m numeric(10,2)) STRICT")
+            .unwrap();
+        conn.execute("CREATE TABLE w(k int PRIMARY KEY, a integer[], n numeric(10,2)) STRICT")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER w_grew AFTER UPDATE ON w WHEN NEW.a > OLD.a AND NEW.n > OLD.n \
+             BEGIN SELECT 1; END",
+        )
+        .unwrap();
+        conn
     }
 }

@@ -8,7 +8,7 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::{expr_text_collation, CollationSeq},
+        collate::{expr_text_collation, first_text_collation, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
@@ -39,7 +39,7 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{type_of, TypeEnv};
+use super::expr::expr_type::{compound_column_type, query_column_type, type_of, type_ordering};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -3134,10 +3134,26 @@ pub(super) fn query_output_columns(
         })
         .try_collect::<alloc::Vec<_>>()?;
 
-    let env = TypeEnv::new(Some(table_references), resolver);
+    let context = ExprContext::new(Some(table_references), resolver);
+    let env = context.type_env();
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        let dimensions = type_of(result_expr, &env).array_dimensions();
+        let (result_type, text_collation) = match &compound_arms {
+            Some(arms) => (
+                compound_column_type(arms.iter().copied(), column_index, resolver),
+                first_text_collation(arms.iter().map(|arm| {
+                    (
+                        &arm.result_columns[column_index].expr,
+                        ExprContext::new(Some(&arm.table_references), resolver),
+                    )
+                }))?,
+            ),
+            None => (
+                type_of(result_expr, &env),
+                expr_text_collation(result_expr, &context, context.catalog())?,
+            ),
+        };
+        let dimensions = result_type.array_dimensions();
         if dimensions > ast::MAX_ARRAY_DIMENSIONS {
             crate::bail_parse_error!(
                 "result column {} is an array with {dimensions} dimensions, but arrays have at most {}",
@@ -3146,12 +3162,8 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        let context = ExprContext::new(Some(table_references), resolver);
-        column.set_collation(Some(expr_text_collation(
-            result_expr,
-            &context,
-            context.catalog(),
-        )?));
+        column.set_collation(Some(text_collation));
+        column.set_type_ordering(type_ordering(&result_type, resolver.schema()));
     }
     Ok(columns)
 }
@@ -3316,9 +3328,13 @@ impl JoinedTable {
         for column in columns.iter_mut() {
             column.override_affinity(Affinity::Blob);
         }
+        let column_types = (0..columns.len())
+            .map(|column| query_column_type(query, column, resolver))
+            .try_collect()?;
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),
             columns,
+            column_types,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),

@@ -2628,6 +2628,30 @@ impl InsnVariants {
 }
 
 impl Insn {
+    /// The collations this instruction compares values with.
+    #[cfg(test)]
+    pub(crate) fn collations(&self) -> Vec<CollationSeq> {
+        match self {
+            Insn::Eq { collation, .. }
+            | Insn::Ne { collation, .. }
+            | Insn::Lt { collation, .. }
+            | Insn::Le { collation, .. }
+            | Insn::Gt { collation, .. }
+            | Insn::Ge { collation, .. } => vec![*collation],
+            Insn::Compare { key_info, .. } => key_info.iter().map(|key| key.collation).collect(),
+            Insn::SorterOpen { data } => data
+                .order_collations_nulls
+                .iter()
+                .map(|(_, collation, _)| *collation)
+                .collect(),
+            Insn::AggStep { data } => vec![data.collation],
+            Insn::HashBuild { data } => data.collations.clone(),
+            Insn::HashDistinct { data } => data.collations.clone(),
+            Insn::Function { func, .. } => vec![func.collation],
+            _ => Vec::new(),
+        }
+    }
+
     // SAFETY: If the enumeration specifies a primitive representation,
     // then the discriminant may be reliably accessed via unsafe pointer casting
     #[inline(always)]

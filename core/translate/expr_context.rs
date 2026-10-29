@@ -19,7 +19,7 @@ pub(crate) trait ExprProperties<
     fn column_collation(&self, source: SourceId, column: usize) -> Result<Option<TextCollation>>;
     fn register_affinity(&self, register: usize) -> Option<Affinity>;
     fn register_collation(&self, register: usize) -> Option<TextCollation>;
-    fn subquery_affinity(&self, query: SubqueryId) -> Option<Affinity>;
+    fn subquery_affinity(&self, query: SubqueryId, result_reg: usize) -> Option<Affinity>;
 }
 
 #[derive(Clone, Copy)]
@@ -100,12 +100,9 @@ impl ExprProperties for ExprContext<'_, '_> {
             .and_then(|column| column.collation)
     }
 
-    fn subquery_affinity(&self, query: TableInternalId) -> Option<Affinity> {
-        self.resolver
-            .subquery_affinities
-            .borrow()
-            .get(&query)
-            .copied()
+    fn subquery_affinity(&self, query: TableInternalId, result_reg: usize) -> Option<Affinity> {
+        let subqueries = self.resolver.row_value_subqueries.borrow();
+        Some(subqueries.get(&query)?.column(result_reg)?.affinity)
     }
 }
 
@@ -160,7 +157,7 @@ impl ExprProperties for TableMetadata<'_> {
         None
     }
 
-    fn subquery_affinity(&self, _query: TableInternalId) -> Option<Affinity> {
+    fn subquery_affinity(&self, _query: TableInternalId, _result_reg: usize) -> Option<Affinity> {
         None
     }
 }

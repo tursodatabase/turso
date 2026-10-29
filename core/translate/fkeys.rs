@@ -2092,7 +2092,7 @@ fn build_fk_match_where_clause(
                 .ok()
                 .and_then(std::num::NonZeroU32::new)
                 .expect("fk parameter index must fit into NonZeroU32"),
-            "",
+            None,
             Some(&collation.name()),
         );
         let cond = Expr::Binary(
