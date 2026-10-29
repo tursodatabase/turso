@@ -339,12 +339,8 @@ pub fn translate_insert(
 
     let is_mvcc = connection.mv_store_for_db(database_id).is_some();
 
-    let cdc_table = prepare_cdc_if_necessary(
-        program,
-        resolver.schema(),
-        database_id,
-        Some(table.get_name()),
-    )?;
+    let cdc_table =
+        prepare_cdc_if_necessary(program, resolver.schema(), database_id, table.get_name())?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

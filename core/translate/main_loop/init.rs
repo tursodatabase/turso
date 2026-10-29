@@ -55,11 +55,12 @@ impl InitLoop {
                 }) => target_table.as_ref(),
                 _ => &tables.joined_tables()[0],
             };
-            let prepared = prepare_cdc_if_necessary(
+            let prepared = 
+                prepare_cdc_if_necessary(
                 program,
                 t_ctx.resolver.schema(),
                 changed_table.namespace.database_id,
-                Some(changed_table.table.get_name()),
+                changed_table.table.get_name(),
             )?;
             if let Some((cdc_cursor_id, _)) = prepared {
                 t_ctx.cdc_cursor_id = Some(cdc_cursor_id);
