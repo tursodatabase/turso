@@ -86,6 +86,25 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-through-subquery-cte-and-view-compares-as-numeric {
+    -- A numeric column read through a subquery, CTE or view is still a
+    -- numeric, so 10 is above 9.5 and 1.50 is below it.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    INSERT INTO a VALUES (1.5), (10);
+    CREATE VIEW v AS SELECT n FROM a;
+    SELECT n FROM (SELECT n FROM a) WHERE n < 9.5;
+    WITH c AS (SELECT n FROM a) SELECT n FROM c WHERE n < 9.5;
+    SELECT n FROM v WHERE n < 9.5;
+    SELECT n FROM v WHERE n > 9.5;
+}
+expect {
+    1.50
+    1.50
+    1.50
+    10.00
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-domain-mixed-with-number-compares-as-numeric {
     -- A domain mixed with another type is its base type, numeric, so 9.5 sorts
     -- before 10 instead of comparing as stored bytes.
