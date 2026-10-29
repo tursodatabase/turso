@@ -130,6 +130,20 @@ expect {
     42
 }
 
+# A CAST to numeric is a number, not the stored blob, so it can be stored in
+# a numeric column, added to one, and looked up in an index on one.
+@requires strict "uses STRICT tables"
+test cast-to-numeric-is-usable-as-a-number {
+    CREATE TABLE s(n numeric(10,2)) STRICT;
+    INSERT INTO s VALUES (CAST(1.5 AS numeric(10,2)));
+    UPDATE s SET n = CAST(2.5 AS numeric(10,2)) + n;
+    CREATE INDEX s_n ON s(n);
+    SELECT n, n + CAST(1 AS numeric(10,2)) FROM s WHERE n IN (CAST(4 AS numeric(10,2)), 9);
+}
+expect {
+    4.00|5.00
+}
+
 @requires strict "uses STRICT tables"
 test cast-to-varchar {
     SELECT CAST('hello' AS varchar(3));
