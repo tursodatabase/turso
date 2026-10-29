@@ -232,11 +232,10 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             let Some(resolver) = env.resolver() else {
                 return ExprType::Unknown;
             };
-            let subqueries = resolver.row_value_subqueries.borrow();
-            match subqueries
-                .get(subquery_id)
-                .and_then(|subquery| subquery.column(*result_reg_start))
-            {
+            let Some(subquery) = resolver.row_value_subqueries.get(*subquery_id) else {
+                return ExprType::Unknown;
+            };
+            match subquery.column(*result_reg_start) {
                 Some(column) => column.expr_type.clone(),
                 None => ExprType::Unknown,
             }

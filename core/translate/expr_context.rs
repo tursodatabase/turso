@@ -101,8 +101,8 @@ impl ExprProperties for ExprContext<'_, '_> {
     }
 
     fn subquery_affinity(&self, query: TableInternalId, result_reg: usize) -> Option<Affinity> {
-        let subqueries = self.resolver.row_value_subqueries.borrow();
-        Some(subqueries.get(&query)?.column(result_reg)?.affinity)
+        let subquery = self.resolver.row_value_subqueries.get(query)?;
+        Some(subquery.column(result_reg)?.affinity)
     }
 }
 

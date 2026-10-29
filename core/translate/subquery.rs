@@ -874,7 +874,7 @@ fn get_subquery_parser<'a>(
                         expr_type: type_of(&result_col.expr, &env),
                     })
                     .collect();
-                resolver.row_value_subqueries.borrow_mut().insert(
+                resolver.row_value_subqueries.insert(
                     subquery_id,
                     RowValueSubquery {
                         result_reg_start: reg_start,

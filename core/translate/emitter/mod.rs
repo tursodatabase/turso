@@ -50,6 +50,7 @@ use crate::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::rc::Rc;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
@@ -147,7 +148,7 @@ pub struct Resolver<'a> {
     /// redirecting column reads at codegen time.
     pub register_columns: HashMap<usize, RegisterColumn>,
     /// Each planned subquery that gives one row, keyed by its internal ID.
-    pub(crate) row_value_subqueries: RefCell<HashMap<TableInternalId, RowValueSubquery>>,
+    pub(crate) row_value_subqueries: Rc<RowValueSubqueries>,
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
@@ -220,9 +221,40 @@ impl RegisterColumn {
     }
 }
 
+/// The subqueries that give one row which a resolver has planned. A forked
+/// resolver starts a new, empty layer on top of its parent's layer instead of
+/// copying it: deeply nested subqueries fork thousands of times, and copying
+/// every entry on each fork made planning them quadratic. What a fork adds
+/// stays out of its parent, because a fork can compile a separate program
+/// (a trigger or a foreign key action) whose internal IDs repeat the parent's.
+#[derive(Default)]
+pub(crate) struct RowValueSubqueries {
+    parent: Option<Rc<RowValueSubqueries>>,
+    own: RefCell<HashMap<TableInternalId, Rc<RowValueSubquery>>>,
+}
+
+impl RowValueSubqueries {
+    pub(crate) fn insert(&self, subquery_id: TableInternalId, subquery: RowValueSubquery) {
+        self.own.borrow_mut().insert(subquery_id, Rc::new(subquery));
+    }
+
+    pub(crate) fn get(&self, subquery_id: TableInternalId) -> Option<Rc<RowValueSubquery>> {
+        if let Some(subquery) = self.own.borrow().get(&subquery_id) {
+            return Some(subquery.clone());
+        }
+        self.parent.as_ref()?.get(subquery_id)
+    }
+
+    fn fork(self: &Rc<Self>) -> Rc<Self> {
+        Rc::new(Self {
+            parent: Some(self.clone()),
+            own: RefCell::default(),
+        })
+    }
+}
+
 /// What the outer query knows about the result columns of a subquery that
 /// gives one row, such as `(SELECT e FROM u)` or `(SELECT x, y FROM v)`.
-#[derive(Clone)]
 pub(crate) struct RowValueSubquery {
     /// The register of the first result column.
     pub(crate) result_reg_start: usize,
@@ -345,7 +377,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_columns: HashMap::default(),
-            row_value_subqueries: RefCell::new(HashMap::default()),
+            row_value_subqueries: Rc::default(),
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml,
@@ -379,7 +411,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_columns: HashMap::default(),
-            row_value_subqueries: RefCell::new(self.row_value_subqueries.borrow().clone()),
+            row_value_subqueries: self.row_value_subqueries.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
@@ -395,7 +427,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_columns: self.register_columns.clone(),
-            row_value_subqueries: RefCell::new(self.row_value_subqueries.borrow().clone()),
+            row_value_subqueries: self.row_value_subqueries.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
