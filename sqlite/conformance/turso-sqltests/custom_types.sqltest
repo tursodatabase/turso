@@ -103,24 +103,31 @@ test cast-to-custom-type {
     SELECT CAST('hello' AS test_reverse);
 }
 expect {
-    olleh
+    hello
 }
 
 @requires strict "uses STRICT tables"
 test cast-to-parametric-type {
-    SELECT typeof(CAST(42 AS numeric(10,2)));
+    SELECT typeof(CAST(42 AS numeric(10,2))), CAST('3.504' AS numeric(10,2));
 }
 expect {
-    blob
+    text|3.50
 }
 
+# A CAST reads back like a column of the type: ENCODE, then DECODE.
 @requires strict "uses STRICT tables"
-test cast-to-custom-type-encode-only {
+test cast-to-custom-type-reads-back-like-a-column {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    SELECT CAST(42 AS cents);
+    CREATE TABLE t(c cents) STRICT;
+    INSERT INTO t VALUES (42);
+    INSERT INTO t SELECT CAST(7 AS cents);
+    SELECT CAST(42 AS cents), CAST(42 AS cents) = c FROM t WHERE c = 42;
+    SELECT c FROM t ORDER BY c;
 }
 expect {
-    4200
+    42|1
+    7
+    42
 }
 
 @requires strict "uses STRICT tables"
