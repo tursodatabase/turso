@@ -1839,9 +1839,10 @@ impl Database {
                         .expect("conn must be initialized in Init phase");
                     if state.roles_stmt.is_none() {
                         let schema = db.schema.lock().clone();
-                        let has_roles_table = schema
-                            .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
-                            .is_some();
+                        let has_roles_table = db.dialect().supports_roles()
+                            && schema
+                                .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
+                                .is_some();
                         *conn.schema.write() = schema;
                         if has_roles_table {
                             state.roles_stmt = Some(Box::new(conn.prepare(SELECT_ROLES_SQL)?));
@@ -3820,6 +3821,7 @@ mod database_tests {
     };
 
     use super::{is_memory_like, Database, DatabaseKey, InitState, DATABASE_MANAGER};
+    use crate::dialect::SqliteWithRolesDialect;
     use crate::security::roles::{RoleId, SessionRole};
     use crate::storage::encryption::EncryptionKey;
     use crate::storage::page_transform::{
@@ -3936,7 +3938,7 @@ mod database_tests {
         Database::open_file(
             Arc::new(crate::MemoryIO::new()),
             ":memory:",
-            Arc::new(SqliteDialect),
+            Arc::new(SqliteWithRolesDialect),
         )
         .unwrap()
     }
@@ -3952,7 +3954,7 @@ mod database_tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(SqliteWithRolesDialect),
         )
         .unwrap();
         let conn = db
@@ -3990,7 +3992,7 @@ mod database_tests {
                 OpenFlags::Create,
                 DatabaseOpts::new(),
                 None,
-                Arc::new(SqliteDialect),
+                Arc::new(SqliteWithRolesDialect),
             )
             .unwrap()
         };
@@ -4036,7 +4038,7 @@ mod database_tests {
                 OpenFlags::Create,
                 DatabaseOpts::new(),
                 None,
-                Arc::new(SqliteDialect),
+                Arc::new(SqliteWithRolesDialect),
             )
             .unwrap();
             let conn = db
@@ -4062,7 +4064,7 @@ mod database_tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(SqliteWithRolesDialect),
         )
         .unwrap();
 
@@ -4083,7 +4085,7 @@ mod database_tests {
         phase: super::OpenDbAsyncPhase,
     ) -> (Arc<Database>, bool) {
         let file = io.open_file(path, OpenFlags::Create, true).unwrap();
-        let options = OpenOptions::new(Arc::new(SqliteDialect))
+        let options = OpenOptions::new(Arc::new(SqliteWithRolesDialect))
             .storage(Arc::new(DatabaseFile::new(file)))
             .flags(OpenFlags::Create);
         let mut state = OpenDbAsyncState::new();

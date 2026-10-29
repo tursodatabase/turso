@@ -13,6 +13,8 @@
 pub mod sqlite;
 
 pub use sqlite::SqliteDialect;
+#[cfg(test)]
+pub(crate) use sqlite::SqliteWithRolesDialect;
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
@@ -207,6 +209,14 @@ pub trait Dialect: Send + Sync + 'static {
     /// PostgreSQL stores its schemas this way. SQLite has no namespaces, so
     /// a name that looks like a mangled name is an ordinary name.
     fn supports_namespaces(&self) -> bool {
+        false
+    }
+
+    /// Whether a database of this dialect stores roles in the roles table.
+    ///
+    /// SQLite has no roles, so a table named like the roles table is an
+    /// ordinary table.
+    fn supports_roles(&self) -> bool {
         false
     }
 

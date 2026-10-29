@@ -203,6 +203,34 @@ fn test_open_refuses_file_with_postgres_table() {
     assert_that!(msg).contains("malformed database schema");
 }
 
+/// The SQLite dialect has no roles, so a table named like the roles table of
+/// the PostgreSQL frontend is an ordinary table, as it is to sqlite3.
+#[test]
+fn test_open_file_with_table_named_like_the_roles_table() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("roles.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE __turso_internal_roles(x);
+             INSERT INTO __turso_internal_roles VALUES (1);
+             CREATE TABLE t(a);
+             INSERT INTO t VALUES (5);",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let db = open_plain_file(&path).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    conn.force_reparse_schema_without_publish().unwrap();
+
+    let mut stmt = conn.prepare("SELECT a FROM t").unwrap();
+    let rows = stmt.run_collect_rows().unwrap();
+    assert_that!(rows).is_equal_to(vec![vec![turso_core::Value::from_i64(5)]]);
+}
+
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///
