@@ -17,6 +17,12 @@ pub(crate) trait ExprProperties<
 {
     fn column_affinity(&self, source: SourceId, column: usize) -> Option<Affinity>;
     fn column_collation(&self, source: SourceId, column: usize) -> Result<Option<TextCollation>>;
+    /// Whether the column is never NULL in this query. An outer join can make
+    /// a NOT NULL column NULL.
+    fn column_is_nonnull(&self, source: SourceId, column: usize) -> bool;
+    /// Whether the rowid is never NULL in this query. An outer join can make
+    /// the rowid NULL.
+    fn rowid_is_nonnull(&self, source: SourceId) -> bool;
     fn register_affinity(&self, register: usize) -> Option<Affinity>;
     fn register_collation(&self, register: usize) -> Option<TextCollation>;
     fn subquery_affinity(&self, query: SubqueryId, result_reg: usize) -> Option<Affinity>;
@@ -86,6 +92,14 @@ impl ExprProperties for ExprContext<'_, '_> {
         self.tables.column_collation(source, column)
     }
 
+    fn column_is_nonnull(&self, source: TableInternalId, column: usize) -> bool {
+        self.tables.column_is_nonnull(source, column)
+    }
+
+    fn rowid_is_nonnull(&self, source: TableInternalId) -> bool {
+        self.tables.rowid_is_nonnull(source)
+    }
+
     fn register_affinity(&self, register: usize) -> Option<Affinity> {
         self.resolver
             .register_columns
@@ -147,6 +161,30 @@ impl ExprProperties for TableMetadata<'_> {
             .get_column_at(column)
             .ok_or_else(|| LimboError::ParseError("column not found".to_string()))?;
         Ok(column_collation(column))
+    }
+
+    fn column_is_nonnull(&self, source: TableInternalId, column: usize) -> bool {
+        // A null-extended row has a NULL rowid and NULL in every column.
+        if !self.rowid_is_nonnull(source) {
+            return false;
+        }
+        let (_, table) = self
+            .tables
+            .and_then(|tables| tables.find_table_by_internal_id(source))
+            .expect("table not found");
+        let column = &table.columns()[column];
+        // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
+        // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
+        column.is_rowid_alias() || column.notnull()
+    }
+
+    fn rowid_is_nonnull(&self, source: TableInternalId) -> bool {
+        // SQLite marks columns from the nullable side of an outer join as
+        // nullable, even when the table schema says NOT NULL. A correlated
+        // outer reference carries the nullability from its own scope.
+        !self
+            .tables
+            .is_some_and(|tables| tables.outer_join_may_null_extend(source))
     }
 
     fn register_affinity(&self, _register: usize) -> Option<Affinity> {
