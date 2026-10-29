@@ -1223,6 +1223,11 @@ fn function_call_for_def(
             (0..n)
                 .map(|i| {
                     let arg_type = func.expected_type_at(i).cloned();
+                    if func.int_args_are_non_surrogate_codepoints
+                        && arg_type == Some(DataType::Integer)
+                    {
+                        return non_surrogate_codepoint();
+                    }
                     // Use bounded integers for functions with int_arg_max
                     if let (Some(max), Some(DataType::Integer)) = (int_arg_max, arg_type.as_ref()) {
                         (0..=max)
@@ -1252,6 +1257,12 @@ fn function_call_for_def(
                 Just(Expression::function_call(name, args)).boxed()
             }
         })
+        .boxed()
+}
+
+fn non_surrogate_codepoint() -> BoxedStrategy<Expression> {
+    any::<char>()
+        .prop_map(|c| Expression::Value(SqlValue::Integer(i64::from(u32::from(c)))))
         .boxed()
 }
 
@@ -1811,6 +1822,37 @@ mod tests {
                 unreachable!("function generation must return a function call");
             };
             assert!(!aggregate_result_depends_on_input_order(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn char_arguments_are_never_surrogate_codepoints() {
+        use crate::schema::Schema;
+        use proptest::strategy::Strategy;
+        use proptest::test_runner::TestRunner;
+
+        let char_func = crate::function::string_functions()
+            .into_iter()
+            .find(|f| f.name == "CHAR")
+            .unwrap();
+        let ctx = ExpressionContext::new(builtin_functions(), Schema::default()).with_max_depth(2);
+        let strategy = function_call_for_def(char_func, ctx, 1);
+        let mut runner = TestRunner::deterministic();
+
+        for _ in 0..1000 {
+            let expr = strategy.new_tree(&mut runner).unwrap().current();
+            let Expression::FunctionCall { args, .. } = expr else {
+                unreachable!("function generation must return a function call");
+            };
+            for arg in args {
+                match arg {
+                    Expression::Value(SqlValue::Integer(codepoint)) => {
+                        assert!((0..=0x10FFFF).contains(&codepoint), "{codepoint}");
+                        assert!(!(0xD800..=0xDFFF).contains(&codepoint), "{codepoint}");
+                    }
+                    other => panic!("expected an integer literal, got {other}"),
+                }
+            }
         }
     }
 
