@@ -1,5 +1,6 @@
 @database :memory:
 
+@requires index_method "uses CREATE INDEX ... USING"
 test vector-index-integrity-check {
     CREATE TABLE v(id INTEGER PRIMARY KEY, e);
     CREATE INDEX vi ON v USING toy_vector_sparse_ivf (e);
@@ -16,6 +17,7 @@ expect {
     ok
 }
 
+@requires index_method "uses CREATE INDEX ... USING"
 test vector-index-savepoint-rollback {
     CREATE TABLE v(id INTEGER PRIMARY KEY, e);
     CREATE INDEX vi ON v USING toy_vector_sparse_ivf (e);
