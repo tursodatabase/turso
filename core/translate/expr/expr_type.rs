@@ -888,11 +888,12 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         // PostgreSQL: coalesce(date_column, '2024-01-01') is a date.
         (custom @ ExprType::Custom { .. }, ExprType::Untyped)
         | (ExprType::Untyped, custom @ ExprType::Custom { .. }) => custom,
-        // An integer mixed with numeric is a numeric without parameters, as
-        // PostgreSQL converts integer to numeric: in `SELECT n FROM t UNION
-        // SELECT 10`, the column compares in numeric order.
-        (ExprType::Custom { type_def, .. }, ExprType::Builtin(Integer))
-        | (ExprType::Builtin(Integer), ExprType::Custom { type_def, .. })
+        // A number mixed with a type in numeric order is that type without
+        // parameters: in `SELECT n FROM t UNION SELECT 10` and `SELECT n FROM t
+        // UNION SELECT 2.5`, the column compares in numeric order. Its stored
+        // form, a blob, would not compare with the other SELECT's numbers.
+        (ExprType::Custom { type_def, .. }, ExprType::Builtin(Integer | Real | Numeric))
+        | (ExprType::Builtin(Integer | Real | Numeric), ExprType::Custom { type_def, .. })
             if type_def.ordering() == Some(TypeOrdering::Numeric) =>
         {
             ExprType::Custom {

@@ -67,6 +67,25 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-compound-with-real-compares-as-numeric {
+    -- A real mixed with numeric is a numeric, so 1.50 and 2.5 are both below 9.5.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    CREATE TABLE r(f real) STRICT;
+    INSERT INTO a VALUES (1.5);
+    INSERT INTO r VALUES (2.5);
+    SELECT x FROM (SELECT n x FROM a UNION ALL SELECT 2.5) WHERE x < 9.5 ORDER BY x;
+    SELECT x FROM (SELECT n x FROM a UNION ALL SELECT f FROM r) WHERE x < 9.5 ORDER BY x;
+    SELECT count(*) FROM (SELECT n FROM a UNION SELECT 1.5);
+}
+expect {
+    1.50
+    2.5
+    1.50
+    2.5
+    1
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-operands-evaluated-once {
     -- Every n is 0, so each row's left side is 0, 1 or 2, and every
     -- comparison below is true for every row if the left side runs once.

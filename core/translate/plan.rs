@@ -8,7 +8,7 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::{expr_text_collation, first_text_collation, CollationSeq},
+        collate::{expr_text_collation, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
@@ -3138,21 +3138,15 @@ pub(super) fn query_output_columns(
     let env = context.type_env();
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        let (result_type, text_collation) = match &compound_arms {
-            Some(arms) => (
-                compound_column_type(arms.iter().copied(), column_index, resolver),
-                first_text_collation(arms.iter().map(|arm| {
-                    (
-                        &arm.result_columns[column_index].expr,
-                        ExprContext::new(Some(&arm.table_references), resolver),
-                    )
-                }))?,
-            ),
-            None => (
-                type_of(result_expr, &env),
-                expr_text_collation(result_expr, &context, context.catalog())?,
-            ),
+        // A compound's column has the common type of every SELECT, but the
+        // text collation of the leftmost SELECT only, as in SQLite. The
+        // compound itself removes duplicates with the collation of
+        // `compound_column_collation`, which looks at every SELECT.
+        let result_type = match &compound_arms {
+            Some(arms) => compound_column_type(arms.iter().copied(), column_index, resolver),
+            None => type_of(result_expr, &env),
         };
+        let text_collation = expr_text_collation(result_expr, &context, context.catalog())?;
         let dimensions = result_type.array_dimensions();
         if dimensions > ast::MAX_ARRAY_DIMENSIONS {
             crate::bail_parse_error!(
