@@ -23,8 +23,8 @@ use crate::{
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{
-            emit_stored_column, emit_type_expr, translate_expr, translate_expr_no_constant_opt,
-            walk_expr, walk_expr_mut, NoConstantOptReason, WalkControl,
+            emit_store_value, emit_stored_column, translate_expr_no_constant_opt, walk_expr,
+            walk_expr_mut, NoConstantOptReason, WalkControl,
         },
         plan::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
@@ -733,9 +733,10 @@ fn emit_column_constraints_validation(
     Ok(())
 }
 
-/// Run the column type's ENCODE on the DEFAULT of a newly added column when the
-/// table has rows, so a DEFAULT that ENCODE rejects (e.g. too long for a
-/// `varchar(n)`) fails the ALTER TABLE instead of every later read of the column.
+/// Store the DEFAULT of a newly added column as a value of the column's types
+/// (each type's ENCODE, then its COERCE) when the table has rows, so a DEFAULT
+/// they reject (e.g. too long for a `varchar(n)`) fails the ALTER TABLE instead
+/// of every later read of the column.
 fn emit_add_column_encode_validation(
     program: &mut ProgramBuilder,
     btree: &BTreeTable,
@@ -748,14 +749,10 @@ fn emit_add_column_encode_validation(
     let Some(default_expr) = default_expr.filter(|e| !crate::util::expr_contains_null(e)) else {
         return Ok(());
     };
-    let Some(type_def) = resolver
+    let Some(resolved) = resolver
         .schema()
-        .get_type_def(&column.ty_str, btree.is_strict)
-        .cloned()
+        .resolve_type(&column.ty_str, btree.is_strict)?
     else {
-        return Ok(());
-    };
-    let Some(encode_expr) = type_def.encode() else {
         return Ok(());
     };
 
@@ -771,12 +768,25 @@ fn emit_add_column_encode_validation(
         pc_if_empty: skip_label,
     });
 
-    // Table has rows: they would read the encoded DEFAULT, so encode it now and
-    // let any error raised by ENCODE abort the statement.
+    // Table has rows: they would read the stored DEFAULT, so store it now and
+    // let any error raised by ENCODE or COERCE abort the statement. Not hoisted,
+    // since the value is stored in place in this register.
     let default_reg = program.alloc_register();
-    translate_expr(program, None, default_expr, default_reg, resolver)?;
-    let encoded_reg = program.alloc_register();
-    emit_type_expr(program, encode_expr, default_reg, encoded_reg, resolver)?;
+    translate_expr_no_constant_opt(
+        program,
+        None,
+        default_expr,
+        default_reg,
+        resolver,
+        NoConstantOptReason::CustomTypeEncode,
+    )?;
+    emit_store_value(
+        program,
+        &resolved.chain,
+        default_reg,
+        &column.ty_params,
+        resolver,
+    )?;
 
     program.preassign_label_to_next_insn(skip_label);
     Ok(())
