@@ -119,7 +119,7 @@ impl LoopLabels {
     }
 }
 
-fn find_non_semi_anti_ancestor(
+fn find_outer_table(
     join_order: &[JoinOrderMember],
     tables: &[JoinedTable],
     join_idx: usize,
@@ -128,10 +128,13 @@ fn find_non_semi_anti_ancestor(
     let mut idx = join_idx - 1;
     while idx > 0 {
         let prev = &tables[join_order[idx].original_idx];
-        if !prev
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| ji.is_semi_or_anti())
+        let is_hash_anti = matches!(prev.op, Operation::HashJoin(ref hj) if
+            hj.join_type == HashJoinType::LeftAnti);
+        if is_hash_anti
+            || !prev
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.is_semi_or_anti())
         {
             break;
         }
