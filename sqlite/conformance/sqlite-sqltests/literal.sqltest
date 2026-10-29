@@ -153,3 +153,48 @@ test invalid-numberic-literal-4 {
 expect error {
 }
 
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/11001
+# Parentheses around a numeric literal must not change how unary minus
+# folds it: SQLite treats -(N) exactly like -N.
+test negated-parenthesized-min-i64 {
+    SELECT -(9223372036854775808), typeof(-(9223372036854775808));
+}
+expect {
+    -9223372036854775808|integer
+}
+
+test negated-nested-parentheses-min-i64 {
+    SELECT -((9223372036854775808)), typeof(-((9223372036854775808)));
+}
+expect {
+    -9223372036854775808|integer
+}
+
+test negated-parenthesized-hex-too-big {
+    SELECT -(0x8000000000000000);
+}
+expect error {
+    hex literal too big
+}
+
+test negated-parenthesized-min-i64-create-table-default {
+    CREATE TABLE t(a, b DEFAULT (-(9223372036854775808)));
+    INSERT INTO t(a) VALUES (1);
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    -9223372036854775808|integer
+}
+
+test negated-parenthesized-min-i64-add-column-default {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b DEFAULT (-(9223372036854775808));
+    INSERT INTO t(a) VALUES (2);
+    SELECT a, b, typeof(b) FROM t ORDER BY a;
+}
+expect {
+    1|-9223372036854775808|integer
+    2|-9223372036854775808|integer
+}

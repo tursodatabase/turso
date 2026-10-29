@@ -134,7 +134,7 @@ fn is_strict_constant_default(expr: &ast::Expr) -> bool {
         ast::Expr::Id(_) => true,
         ast::Expr::Unary(ast::UnaryOperator::Positive | ast::UnaryOperator::Negative, inner) => {
             // Only allow unary +/- on literals
-            matches!(inner.as_ref(), ast::Expr::Literal(_))
+            matches!(inner.without_parentheses(), ast::Expr::Literal(_))
         }
         ast::Expr::Parenthesized(exprs) => {
             // Parenthesized expression with a single inner expression
@@ -438,7 +438,7 @@ pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
         ast::Expr::Id(name) => Ok(Value::from_text(name.as_str().to_string())),
         ast::Expr::Unary(op, inner) => {
             if let (ast::UnaryOperator::Negative, ast::Expr::Literal(ast::Literal::Numeric(text))) =
-                (op, inner.as_ref())
+                (op, inner.without_parentheses())
             {
                 if !text.starts_with("0x") && !text.starts_with("0X") {
                     return parse_numeric_literal(&format!("-{text}"));

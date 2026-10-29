@@ -3184,7 +3184,7 @@ fn translate_unary_expr(
     let ast::Expr::Unary(op, expr) = expr else {
         unreachable!("translate_unary_expr expects Expr::Unary");
     };
-    match (op, expr.as_ref()) {
+    match (op, expr.without_parentheses()) {
         (UnaryOperator::Positive, expr) => {
             translate_expr(program, referenced_tables, expr, target_register, resolver)
         }

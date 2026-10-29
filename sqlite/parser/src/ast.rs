@@ -750,6 +750,20 @@ impl Expr {
         Box::new(self)
     }
 
+    /// Returns the expression inside any number of single-element
+    /// parentheses, so `((x))` gives `x`. SQLite's parser does not keep
+    /// parentheses, so `-(5)` and `-5` must behave the same.
+    pub fn without_parentheses(&self) -> &Expr {
+        let mut expr = self;
+        while let Expr::Parenthesized(exprs) = expr {
+            let [inner] = exprs.as_slice() else {
+                break;
+            };
+            expr = inner;
+        }
+        expr
+    }
+
     pub fn unary(operator: UnaryOperator, expr: Expr) -> Expr {
         Expr::Unary(operator, Box::new(expr))
     }
