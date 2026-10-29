@@ -1,5 +1,5 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
-use crate::schema::{Index, IndexColumn, PseudoCursorType};
+use crate::schema::{Index, IndexColumn, PseudoCursorType, ResolvedType};
 use crate::sync::Arc;
 use crate::translate::collate::{compound_column_collation, CollationSeq};
 use crate::translate::emitter::{
@@ -7,7 +7,7 @@ use crate::translate::emitter::{
     LimitCtx, Resolver, TranslateCtx,
 };
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
-use crate::translate::expr::translate_expr;
+use crate::translate::expr::{compound_column_stored_form, emit_stored_form, translate_expr};
 use crate::translate::order_by::sorter_insert;
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
@@ -229,8 +229,14 @@ pub fn emit_program_for_compound_select(
     if let (Some(order_by), Some(collection_cursor_id), Some(collection_idx)) =
         (order_by_owned, collection_cursor, collection_index)
     {
+        let arms: Vec<&SelectPlan> = left
+            .iter()
+            .map(|(select, _)| select)
+            .chain([&**right_most])
+            .collect();
         let result_reg = emit_compound_order_by(
             program,
+            &arms,
             &order_by,
             collection_cursor_id,
             &collection_idx,
@@ -837,6 +843,7 @@ fn compound_collations(
 #[allow(clippy::too_many_arguments)]
 fn emit_compound_order_by(
     program: &mut ProgramBuilder,
+    arms: &[&SelectPlan],
     order_by: &[CompoundOrderByKey],
     collection_cursor_id: usize,
     collection_index: &Index,
@@ -873,6 +880,15 @@ fn emit_compound_order_by(
         )))
         .try_collect()?;
 
+    // A custom type sorts by its stored form, as it compares. Such a key holds
+    // the stored form, so it can't also be the result column.
+    let key_stored_forms: Vec<Option<ResolvedType>> = order_by
+        .iter()
+        .map(|(col_idx, _, _, _)| {
+            compound_column_stored_form(arms, *col_idx, &right_most_ctx.resolver)
+        })
+        .collect::<crate::Result<_>>()?;
+
     // Compute deduplication remappings: which result columns share a sort key slot.
     // The sorter layout is: [order_by_keys..., sequence, non-dedup data cols...]
     let seq_slot = order_by.len();
@@ -880,10 +896,13 @@ fn emit_compound_order_by(
     let mut non_dedup_count = 0;
     let remappings: crate::alloc::Vec<(usize, bool)> = (0..num_result_cols)
         .map(|col_idx| {
-            if let Some((sort_key_idx, _)) = order_by
-                .iter()
-                .enumerate()
-                .find(|(_, (ob_col, _, _, _))| *ob_col == col_idx)
+            if let Some((sort_key_idx, _)) =
+                order_by
+                    .iter()
+                    .enumerate()
+                    .find(|(sort_key_idx, (ob_col, _, _, _))| {
+                        *ob_col == col_idx && key_stored_forms[*sort_key_idx].is_none()
+                    })
             {
                 // This result column is also a sort key - deduplicate.
                 (sort_key_idx, true)
@@ -944,6 +963,14 @@ fn emit_compound_order_by(
             dst_reg: sorter_regs + sort_key_idx,
             extra_amount: 0,
         });
+        if let Some(stored_form) = &key_stored_forms[sort_key_idx] {
+            emit_stored_form(
+                program,
+                sorter_regs + sort_key_idx,
+                stored_form,
+                &right_most_ctx.resolver,
+            )?;
+        }
     }
     // Then emit sequence number for tie-breaking
     program.emit_insn(Insn::Copy {

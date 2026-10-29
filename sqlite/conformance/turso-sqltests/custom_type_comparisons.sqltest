@@ -1173,6 +1173,32 @@ expect {
     max|1|10
 }
 
+# ORDER BY on a compound SELECT sorts a custom type by its stored value too,
+# as it does when the same compound is a subquery.
+@requires strict "uses STRICT tables"
+test cmp-stored-value-order-compound-order-by {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 5), (3, 10), (4, NULL);
+    SELECT 'union-all', c FROM t WHERE id < 3 UNION ALL SELECT 'union-all', c FROM t WHERE id >= 3 ORDER BY 2;
+    SELECT 'union', id, c FROM t UNION SELECT 'union', id, c FROM t ORDER BY 3 DESC, 2;
+    SELECT 'subquery', x FROM (SELECT c AS x FROM t UNION ALL SELECT c FROM t WHERE 0) ORDER BY x;
+}
+expect {
+    union-all|
+    union-all|10
+    union-all|5
+    union-all|1
+    union|1|1
+    union|2|5
+    union|3|10
+    union|4|
+    subquery|
+    subquery|10
+    subquery|5
+    subquery|1
+}
+
 # CAST(x AS type) gives the stored value, so it is compared as it is, with
 # and without an index, and not encoded a second time.
 @requires strict "uses STRICT tables"
