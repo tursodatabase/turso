@@ -19,7 +19,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -27,9 +27,9 @@ jobs:
           toolchain: "1.88.0"
 
       - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust-codspeed-memory"
           cache-on-failure: true
@@ -37,7 +37,7 @@ jobs:
 
 
       - name: Install cargo-codspeed
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-codspeed
 
@@ -49,7 +49,7 @@ jobs:
           ls -lh codspeed-memory-benchmarks.tar.zst
 
       - name: Upload benchmark binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: codspeed-memory-benchmarks
           path: codspeed-memory-benchmarks.tar.zst
@@ -65,7 +65,7 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -73,9 +73,9 @@ jobs:
           toolchain: "1.88.0"
 
       - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+        uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           prefix-key: "v1-rust-codspeed-memory"
           cache-on-failure: true
@@ -123,7 +123,7 @@ jobs:
             filter: "::([^w:/][^:/]*)?/update-churn/"
           - name: fts-queries
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-rust-toolchain
@@ -131,12 +131,12 @@ jobs:
           toolchain: "1.88.0"
 
       - name: Install cargo-codspeed
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-codspeed
 
       - name: Download benchmark binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: codspeed-memory-benchmarks
 
@@ -148,7 +148,7 @@ jobs:
           rm codspeed-memory-benchmarks.tar.zst
 
       - name: Run memory benchmarks
-        uses: CodSpeedHQ/action@v4.17.0
+        uses: CodSpeedHQ/action@9d332c4d90b43981c3e55ae8e38e68709996240f # v4.17.0
         with:
           mode: memory
           # The CodSpeed runner runs this with `bash -c`; the single quotes
