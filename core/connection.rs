@@ -1836,7 +1836,11 @@ impl Connection {
             *schema = fresh.try_clone()?;
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
-        let stmt = self.prepare(SELECT_ROLES_SQL)?;
+        let stmt = self.prepare_with_origin_and_options(
+            SELECT_ROLES_SQL,
+            StatementOrigin::Root,
+            &PrepareOptions::engine_metadata_read(),
+        )?;
         Ok(ReparsePhase::LoadRoles {
             stmt: Box::new(stmt),
             rows: Vec::new(),

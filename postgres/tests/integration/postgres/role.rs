@@ -198,6 +198,21 @@ fn set_role_changes_only_its_own_connection() {
 }
 
 #[test]
+fn schema_is_read_again_after_creating_a_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+
+    conn.inner().force_reparse_schema_without_publish().unwrap();
+
+    assert_eq!(
+        role_names(&conn),
+        vec!["postgres", "pg_database_owner", "alice"]
+    );
+}
+
+#[test]
 fn set_role_inside_transaction_block_fails() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();
