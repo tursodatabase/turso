@@ -1052,7 +1052,9 @@ fn ctas_column_type(arms: &[&SelectPlan], column_index: usize, resolver: &Resolv
 /// A column of a STRICT table keeps the type it was declared with, including
 /// its parameters and array dimensions. The name of a type made with CREATE
 /// TYPE or CREATE DOMAIN is quoted when it has to be, such as `"select"` or
-/// `"Mood X"`.
+/// `"Mood X"`. A custom type the schema does not know (an enum is not loaded
+/// again when the database is reopened) leaves the column unchecked, as on a
+/// table created without types.
 fn result_column_strict_type(
     select: &SelectPlan,
     column_index: usize,
@@ -1066,7 +1068,11 @@ fn result_column_strict_type(
             .filter(|(_, table)| table.is_strict())
             .and_then(|(_, table)| table.get_column_at(*column));
         if let Some(declared) = declared {
-            let name = match resolver.schema().get_type_def_unchecked(&declared.ty_str) {
+            let type_def = resolver.schema().get_type_def_unchecked(&declared.ty_str);
+            if !is_builtin_strict_type(&declared.ty_str) && type_def.is_none() {
+                return unchecked_column_type();
+            }
+            let name = match type_def {
                 Some(type_def) if !type_def.is_builtin => quote_identifier(&declared.ty_str),
                 _ => declared.ty_str.clone(),
             };
@@ -1105,12 +1111,21 @@ fn strict_column_type(ty: ExprType) -> ast::Type {
             (quote_identifier(&type_def.name), array_dimensions)
         }
         ExprType::Untyped | ExprType::Null if array_dimensions == 0 => ("TEXT".to_string(), 0),
-        _ => ("ANY".to_string(), 0),
+        _ => return unchecked_column_type(),
     };
     ast::Type {
         name,
         size: None,
         array_dimensions,
+    }
+}
+
+/// The type of a CTAS column whose writes are not checked.
+fn unchecked_column_type() -> ast::Type {
+    ast::Type {
+        name: "ANY".to_string(),
+        size: None,
+        array_dimensions: 0,
     }
 }
 
