@@ -361,6 +361,7 @@ fn translate_subquery_result_expr(
         SubqueryType::In {
             cursor_id,
             affinity_str,
+            custom_type_eq_funcs,
         } => {
             // jump here when we can definitely skip the row (result = 0/false)
             let label_skip_row = program.allocate_label();
@@ -381,6 +382,26 @@ fn translate_subquery_result_expr(
                 expr => vec![expr],
             };
             let lhs_column_count = lhs_columns.len();
+            let eq_funcs = custom_type_eq_funcs
+                .iter()
+                .map(|name| {
+                    name.as_ref()
+                        .map(|name| {
+                            resolver.resolve_function(name, 2)?.ok_or_else(|| {
+                                LimboError::InternalError(format!("function not found: {name}"))
+                            })
+                        })
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // The row-by-row search compares each column with the collation
+            // of its ephemeral index column, as the index lookup does.
+            let index_collations: Vec<CollationSeq> = program
+                .resolve_index_for_cursor_id(*cursor_id)
+                .columns
+                .iter()
+                .map(|column| column.collation)
+                .collect();
             let lhs_column_regs_start = program.alloc_registers(lhs_column_count);
             for (i, lhs_column) in lhs_columns.iter().enumerate() {
                 translate_expr(
@@ -428,7 +449,53 @@ fn translate_subquery_result_expr(
                 label_skip_row
             };
 
-            if *not_in {
+            if eq_funcs.iter().any(Option::is_some) {
+                // The ephemeral index orders values by their bytes, so it
+                // cannot find a value that is only equal by the `=` function
+                // of a custom type. Compare with every row instead, which
+                // reads the whole index for each left value.
+                let label_match_next = program.allocate_label();
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: *cursor_id,
+                    pc_if_empty: label_on_no_null,
+                });
+                let label_match_loop_start = program.allocate_label();
+                program.preassign_label_to_next_insn(label_match_loop_start);
+                let column_reg = program.alloc_register();
+                for (i, affinity) in affinity_str.chars().map(Affinity::from_char).enumerate() {
+                    program.emit_insn(Insn::Column {
+                        cursor_id: *cursor_id,
+                        column: i,
+                        dest: column_reg,
+                        default: None,
+                    });
+                    emit_in_column_comparison(
+                        program,
+                        lhs_column_regs_start + i,
+                        column_reg,
+                        CmpInsFlags::default()
+                            .with_affinity(affinity)
+                            .jump_if_null(),
+                        index_collations[i],
+                        eq_funcs[i].as_ref(),
+                        label_match_next,
+                    );
+                }
+                program.emit_insn(Insn::Goto {
+                    target_pc: if *not_in {
+                        label_skip_row
+                    } else {
+                        label_include_row
+                    },
+                });
+                program.preassign_label_to_next_insn(label_match_next);
+                program.emit_insn(Insn::Next {
+                    cursor_id: *cursor_id,
+                    pc_if_next: label_match_loop_start,
+                    fullscan: false,
+                    is_index: false,
+                });
+            } else if *not_in {
                 // NOT IN: skip row if value is found
                 program.emit_insn(Insn::Found {
                     cursor_id: *cursor_id,
@@ -465,18 +532,19 @@ fn translate_subquery_result_expr(
                     dest: column_check_reg,
                     default: None,
                 });
-                // Ne with NULL operand does NOT jump (comparison is NULL/unknown).
+                // A comparison with a NULL operand does NOT jump (it is unknown).
                 // Like SQLite, this compares with the collation of the left side alone.
-                program.emit_insn(Insn::Ne {
-                    lhs: lhs_column_regs_start + i,
-                    rhs: column_check_reg,
-                    target_pc: label_null_checks_next,
-                    flags: CmpInsFlags::default().with_affinity(affinity),
-                    collation: ExprContext::new(referenced_tables, resolver)
-                        .expr_collation(lhs_columns[i])?,
-                });
+                emit_in_column_comparison(
+                    program,
+                    lhs_column_regs_start + i,
+                    column_check_reg,
+                    CmpInsFlags::default().with_affinity(affinity),
+                    ExprContext::new(referenced_tables, resolver).expr_collation(lhs_columns[i])?,
+                    eq_funcs[i].as_ref(),
+                    label_null_checks_next,
+                );
             }
-            // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
+            // All comparisons fell through -> this row has NULLs -> result is NULL
             program.emit_insn(Insn::Goto {
                 target_pc: label_null_result,
             });
@@ -533,6 +601,58 @@ fn translate_subquery_result_expr(
             Ok(target_register)
         }
     }
+}
+
+/// Jump to `target_pc` when one column of an IN test is not equal to the
+/// value read from the ephemeral index. A column of a custom type is compared
+/// with the `=` function of that type. Unless `flags` has the jump-if-null
+/// flag, an unknown result (a NULL operand) does not jump.
+fn emit_in_column_comparison(
+    program: &mut ProgramBuilder,
+    lhs_reg: usize,
+    column_reg: usize,
+    flags: CmpInsFlags,
+    collation: CollationSeq,
+    eq_func: Option<&Func>,
+    target_pc: BranchOffset,
+) {
+    let Some(eq_func) = eq_func else {
+        program.emit_insn(Insn::Ne {
+            lhs: lhs_reg,
+            rhs: column_reg,
+            target_pc,
+            flags,
+            collation,
+        });
+        return;
+    };
+    let args = program.alloc_registers(2);
+    program.emit_insn(Insn::Copy {
+        src_reg: lhs_reg,
+        dst_reg: args,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: column_reg,
+        dst_reg: args + 1,
+        extra_amount: 0,
+    });
+    let is_equal_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: args,
+        dest: is_equal_reg,
+        func: FuncCtx {
+            func: eq_func.clone(),
+            arg_count: 2,
+            collation: CollationSeq::Binary,
+        },
+    });
+    program.emit_insn(Insn::IfNot {
+        reg: is_equal_reg,
+        target_pc,
+        jump_if_null: flags.has_jump_if_null(),
+    });
 }
 
 #[inline(never)]

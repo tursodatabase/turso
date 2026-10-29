@@ -1,6 +1,6 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{comparison_affinity, index_search_matches_custom_type_eq};
 use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
 use crate::{
     schema::{Column, Index, IndexColumn, Schema},
@@ -829,6 +829,11 @@ pub fn constraints_from_where_clause(
                 {
                     continue;
                 }
+                // An index search compares bytes, so it cannot call the `=`
+                // function of a custom type.
+                if !index_search_matches_custom_type_eq(lhs, rhs, table_references, resolver) {
+                    continue;
+                }
                 // Resolve the comparison affinity once per term per SQLite's
                 // `comparisonAffinity` (see `Constraint::comparison_affinity`)
                 // and propagate it to every constraint derived from this term.
@@ -1157,7 +1162,12 @@ pub fn constraints_from_where_clause(
                 subquery_id,
                 lhs: Some(lhs_expr),
                 not_in,
-                query_type: ast::SubqueryType::In { affinity_str, .. },
+                query_type:
+                    ast::SubqueryType::In {
+                        affinity_str,
+                        custom_type_eq_funcs,
+                        ..
+                    },
             } = &term.expr
             {
                 // Find the subquery to check if it's correlated
@@ -1165,8 +1175,10 @@ pub fn constraints_from_where_clause(
                     .iter()
                     .find(|s| s.internal_id == *subquery_id)
                     .expect("subquery not found");
-                // Only use as constraint if NOT correlated
-                if !subquery.correlated {
+                // Only use as constraint if NOT correlated, and not when a
+                // column needs the `=` function of its custom type, which an
+                // index search cannot call.
+                if !subquery.correlated && custom_type_eq_funcs.iter().all(Option::is_none) {
                     let table_stats = schema.analyze_stats.table_stats(
                         table_reference.namespace.id,
                         table_reference.table.get_name(),

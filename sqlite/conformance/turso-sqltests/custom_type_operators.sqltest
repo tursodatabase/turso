@@ -833,3 +833,299 @@ expect {
     1
     3
 }
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-join-different-scale {
+    -- numeric_eq says 1.00 = 1.000, so the join must match these rows.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1);
+    SELECT a.x = b.y FROM a, b ORDER BY a.x;
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT a.x, b.y FROM a LEFT JOIN b ON a.x = b.y ORDER BY a.x;
+}
+expect {
+    1
+    0
+    1
+    1.00|1.000
+    2.00|
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-in-subquery-different-scale {
+    -- IN compares with numeric_eq and still returns NULL when it finds
+    -- no match but the subquery has a NULL.
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1, 1), (2, 2), (3, NULL);
+    INSERT INTO b VALUES (1);
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM b);
+    SELECT id, x IN (SELECT y FROM b), x NOT IN (SELECT y FROM b) FROM a ORDER BY id;
+    INSERT INTO b VALUES (NULL);
+    SELECT id, x IN (SELECT y FROM b), x NOT IN (SELECT y FROM b) FROM a ORDER BY id;
+}
+expect {
+    1
+    1|1|0
+    2|0|1
+    3||
+    1|1|0
+    2||
+    3||
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-in-subquery-on-indexed-column-different-scale {
+    -- An index search on c.z would look up the bytes of a.x.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE c(z numeric(10,3)) STRICT;
+    CREATE INDEX c_z ON c(z);
+    INSERT INTO a VALUES (1), (2.5);
+    INSERT INTO c VALUES (1), (1.25), (2.5);
+    SELECT count(*) FROM c WHERE z IN (SELECT x FROM a);
+    SELECT count(*) FROM c WHERE z NOT IN (SELECT x FROM a);
+}
+expect {
+    2
+    1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-row-value-in-subquery-different-scale {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x numeric(10,2), k INTEGER) STRICT;
+    CREATE TABLE b(y numeric(10,3), k INTEGER) STRICT;
+    INSERT INTO a VALUES (1, 1, 5), (2, 1, 6), (3, 1, 7);
+    INSERT INTO b VALUES (1, 5), (NULL, 6);
+    SELECT id, (x, k) IN (SELECT y, k FROM b), (x, k) NOT IN (SELECT y, k FROM b)
+    FROM a ORDER BY id;
+}
+expect {
+    1|1|0
+    2||
+    3|0|1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-correlated-subquery-different-scale {
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1), (1);
+    SELECT x, (SELECT count(*) FROM b WHERE b.y = a.x) FROM a ORDER BY x;
+}
+expect {
+    1.00|2
+    2.00|0
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-join-search-keeps-other-scale {
+    -- An index search must not encode 1.25 at scale 1, which gives 1.2,
+    -- also when 1.25 comes from a subquery.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,1)) STRICT;
+    INSERT INTO a VALUES (1.20), (1.25);
+    INSERT INTO b VALUES (1.2);
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a JOIN b ON b.y < a.x;
+    SELECT count(*) FROM a JOIN b ON b.y >= a.x;
+    SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y = a.x);
+    SELECT count(*) FROM a JOIN b ON b.y = (SELECT a.x);
+    SELECT count(*) FROM b WHERE b.y = (SELECT max(x) FROM a);
+    CREATE INDEX b_y ON b(y);
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a JOIN b ON b.y < a.x;
+    SELECT count(*) FROM a JOIN b ON b.y >= a.x;
+    SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y = a.x);
+    SELECT count(*) FROM a JOIN b ON b.y = (SELECT a.x);
+    SELECT count(*) FROM b WHERE b.y = (SELECT max(x) FROM a);
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    0
+    1
+    1
+    1
+    1
+    1
+    0
+}
+
+@requires strict "uses STRICT tables"
+test op-user-defined-eq-literal-skips-index-search {
+    -- test_uint_eq finds '1' equal to '01', so an index search, which
+    -- compares bytes, cannot be used.
+    CREATE TYPE test_uint(value any) BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '<' test_uint_lt
+        OPERATOR '=' test_uint_eq;
+    CREATE TABLE t(a test_uint) STRICT;
+    INSERT INTO t VALUES ('1'), ('2');
+    SELECT count(*) FROM t WHERE a = '01';
+    CREATE INDEX t_a ON t(a);
+    SELECT count(*) FROM t WHERE a = '01';
+}
+expect {
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-row-value-in-subquery-keeps-column-collations {
+    -- Each column uses its own collation: m is BINARY, n is NOCASE, and an
+    -- explicit COLLATE on the left side applies to its column only.
+    CREATE TABLE a(x numeric(10,2), n text COLLATE NOCASE, m text) STRICT;
+    CREATE TABLE b(y numeric(10,3), n text, m text) STRICT;
+    INSERT INTO a VALUES (1, 'abc', 'q');
+    INSERT INTO b VALUES (1, 'ABC', 'Q');
+    SELECT (n, x, m) IN (SELECT n, y, m FROM b) FROM a;
+    SELECT (x, n) IN (SELECT y, n FROM b) FROM a;
+    SELECT (m COLLATE NOCASE, x, n) IN (SELECT m, y, n FROM b) FROM a;
+    SELECT (m COLLATE NOCASE, x, m) IN (SELECT m, y, m FROM b) FROM a;
+}
+expect {
+    0
+    1
+    1
+    0
+}
+
+@requires strict "uses STRICT tables"
+test op-user-defined-eq-join-in-and-correlated-subquery {
+    -- test_uint_eq says '1' = '01', but the two values have different bytes.
+    CREATE TYPE myu(value any) BASE text OPERATOR '=' test_uint_eq;
+    CREATE TABLE a(x myu) STRICT;
+    CREATE TABLE b(y myu) STRICT;
+    INSERT INTO a VALUES ('1'), ('2');
+    INSERT INTO b VALUES ('01');
+    SELECT a.x = b.y FROM a, b ORDER BY a.x;
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM b);
+    SELECT count(*) FROM a WHERE x NOT IN (SELECT y FROM b);
+    SELECT x, (SELECT count(*) FROM b WHERE b.y = a.x) FROM a ORDER BY x;
+    CREATE INDEX a_x ON a(x);
+    SELECT count(*) FROM b JOIN a ON a.x = b.y;
+    SELECT count(*) FROM b WHERE y IN (SELECT x FROM a);
+}
+expect {
+    1
+    0
+    1
+    1
+    1
+    1|1
+    2|0
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-join-same-scale-uses-hash-join {
+    -- Equal numeric values with the same scale have equal bytes, so a hash
+    -- join can compare them.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,2)) STRICT;
+    INSERT INTO a VALUES (1), (2.5), (3);
+    INSERT INTO b VALUES (1.000), (2.50), (4);
+    EXPLAIN QUERY PLAN SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+}
+expect {
+    1|0|0|HASH JOIN b
+    2|0|0|SCAN a
+    2
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-with-view-subquery-and-cte-column {
+    -- A column of a view, FROM-clause subquery or CTE has no custom type, but
+    -- comparing it with a numeric column still calls numeric_eq.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    CREATE TABLE c(z INTEGER) STRICT;
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1);
+    INSERT INTO c VALUES (1);
+    CREATE VIEW v AS SELECT y FROM b;
+    SELECT count(*) FROM a JOIN v ON a.x = v.y;
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM v);
+    SELECT x, (SELECT count(*) FROM v WHERE v.y = a.x) FROM a ORDER BY x;
+    SELECT count(*) FROM a JOIN (SELECT y FROM b) s ON a.x = s.y;
+    WITH w AS (SELECT y FROM b) SELECT count(*) FROM a JOIN w ON a.x = w.y;
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM (SELECT y FROM b));
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM b UNION ALL SELECT y FROM b);
+    SELECT count(*) FROM a WHERE x IN (SELECT z FROM c UNION SELECT y FROM b);
+    SELECT count(*) FROM a JOIN c ON a.x = c.z;
+}
+expect {
+    1
+    1
+    1.00|1
+    2.00|0
+    1
+    1
+    1
+    1
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-with-expression-of-another-table {
+    -- `=` calls numeric_eq when the other side is any expression, so the
+    -- join, IN and DELETE must find the same matches. A constant still uses
+    -- the index search.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    CREATE TABLE c(z INTEGER) STRICT;
+    INSERT INTO a VALUES (1), (2), (9);
+    INSERT INTO b VALUES (1);
+    INSERT INTO c VALUES (1), (2);
+    SELECT sum(a.x = c.z + 0) FROM a, c;
+    SELECT count(*) FROM a JOIN c ON a.x = c.z + 0;
+    SELECT count(*) FROM a JOIN b ON b.y + 0 = a.x;
+    SELECT count(*) FROM a WHERE x IN (SELECT y + 0 FROM b);
+    SELECT count(*) FROM a WHERE x IN (SELECT z + 0 FROM c);
+    CREATE INDEX a_x ON a(x);
+    EXPLAIN QUERY PLAN SELECT * FROM a WHERE x = 5;
+    DELETE FROM a WHERE x IN (SELECT y + 8 FROM b);
+    SELECT x FROM a ORDER BY x;
+}
+expect {
+    2
+    2
+    1
+    1
+    2
+    1|0|0|SEARCH a USING COVERING INDEX a_x (x=?)
+    1.00
+    2.00
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-in-subquery-with-constant {
+    -- The IN probe does not encode a constant with the column's parameters,
+    -- so it must call numeric_eq for these too.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1), (2), (9);
+    INSERT INTO b VALUES (1), (NULL);
+    SELECT count(*) FROM a WHERE x IN (SELECT 1.000);
+    SELECT count(*) FROM a WHERE x NOT IN (SELECT 1.000);
+    SELECT count(*) FROM b WHERE 1 IN (SELECT x FROM a);
+    CREATE INDEX a_x ON a(x);
+    SELECT count(*) FROM a WHERE x IN (SELECT 1.000);
+}
+expect {
+    1
+    2
+    2
+    1
+}

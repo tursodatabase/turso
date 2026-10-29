@@ -805,7 +805,11 @@ fn assign_new_subquery_output(
                 },
             )
         }
-        SubqueryType::In { affinity_str, .. } => {
+        SubqueryType::In {
+            affinity_str,
+            custom_type_eq_funcs,
+            ..
+        } => {
             let (index, destination_affinity, is_delete) = match plan
                 .select_query_destination()
                 .expect("a subquery must have a query destination")
@@ -823,6 +827,7 @@ fn assign_new_subquery_output(
                 SubqueryType::In {
                     cursor_id,
                     affinity_str: affinity_str.clone(),
+                    custom_type_eq_funcs: custom_type_eq_funcs.clone(),
                 },
                 QueryDestination::EphemeralIndex {
                     cursor_id,

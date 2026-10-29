@@ -742,6 +742,11 @@ pub enum SubqueryType {
         /// Affinity string used by the IN operator probe and ephemeral materialization.
         /// Mirrors SQLite's exprINAffinity behavior.
         affinity_str: Arc<String>,
+        /// For each column, the `=` function of the custom type when comparing
+        /// the left value with the subquery value calls it and equal values
+        /// can have different bytes. The probe must call these functions
+        /// instead of looking up the bytes in the ephemeral index.
+        custom_type_eq_funcs: Arc<[Option<String>]>,
     },
 }
 
