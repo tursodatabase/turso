@@ -1158,6 +1158,20 @@ expect {
     ^(?:a\%){1,1}?(b){1,1}(?:c)$|^(?:a.*.)$
 }
 
+test similar-to-custom-escape-inside-brackets {
+    SELECT CASE WHEN ']x' SIMILAR TO '[#]]x' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN '5' SIMILAR TO '[#d]' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN '"' SIMILAR TO '[#"]' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN ']x' SIMILAR TO p ESCAPE '#' THEN 1 ELSE 0 END FROM (SELECT '[#]]x' AS p) s;
+}
+expect {
+    1|1|1|1
+}
+
+test similar-to-escape-function-makes-groups-non-capturing {
+    SELECT similar_to_escape('a(b|c)'), similar_to_escape('[(]#(', '#');
+}
+expect {
+    ^(?:a(?:b|c))$|^(?:[(]\()$
+}
+
 @setup like_strings
 test similar-to-escape-in-partial-index {
     CREATE INDEX t_similar_escape ON t (id) WHERE s SIMILAR TO 'a#_c' ESCAPE '#';

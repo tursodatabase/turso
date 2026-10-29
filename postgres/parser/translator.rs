@@ -7009,9 +7009,9 @@ fn similar_to_literal_args(rhs: &pg_query::protobuf::Node) -> Option<(&str, &str
 }
 
 /// Convert a SQL SIMILAR TO pattern to a regex anchored with ^(?:...)$, as
-/// PostgreSQL's similar_to_escape() does. `%` → `.*`, `_` → `.`, and `.`, `^`,
-/// `$` and `\`, which are literals in SIMILAR TO, are escaped; other regex
-/// metacharacters are kept as-is. `escape` is the ESCAPE string: one
+/// PostgreSQL's similar_to_escape() does. `%` → `.*`, `_` → `.`, `(` → `(?:`,
+/// and `.`, `^`, `$` and `\`, which are literals in SIMILAR TO, are escaped;
+/// other regex metacharacters are kept as-is. `escape` is the ESCAPE string: one
 /// character, or empty for none. The escape character followed by `"`
 /// separates the pattern into the parts that substring() would return.
 pub fn similar_to_regex(pattern: &str, escape: &str) -> Result<String, ParseError> {
@@ -7033,6 +7033,15 @@ pub fn similar_to_regex(pattern: &str, escape: &str) -> Result<String, ParseErro
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         if in_bracket {
+            // Like PostgreSQL, a custom escape character escapes the next
+            // character inside brackets too, and there `"` is not a separator.
+            if Some(c) == escape && c != '\\' {
+                if let Some(next) = chars.next() {
+                    regex.push('\\');
+                    regex.push(next);
+                }
+                continue;
+            }
             if c == '\\' && escape != Some('\\') {
                 regex.push('\\');
             }
@@ -7068,6 +7077,7 @@ pub fn similar_to_regex(pattern: &str, escape: &str) -> Result<String, ParseErro
         match c {
             '%' => regex.push_str(".*"),
             '_' => regex.push('.'),
+            '(' => regex.push_str("(?:"),
             '.' | '^' | '$' | '\\' => {
                 regex.push('\\');
                 regex.push(c);
