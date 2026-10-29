@@ -1626,51 +1626,7 @@ pub fn translate_create_schema(
     program.begin_write_on_database(MAIN_DB_ID, schema_version)?;
 
     let cursor_id = open_namespaces_table_for_writing(program, resolver)?;
-    let id_reg = program.alloc_register();
-    program.emit_insn(Insn::Integer {
-        dest: id_reg,
-        value: i64::from(id.as_u32()),
-    });
-    let insert_label = program.allocate_label();
-    program.emit_insn(Insn::NotExists {
-        cursor: cursor_id,
-        rowid_reg: id_reg,
-        target_pc: insert_label,
-    });
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: crate::error::SQLITE_CONSTRAINT_PRIMARYKEY,
-        description: format!("UNIQUE constraint failed: {TURSO_NAMESPACES_TABLE_NAME}.id"),
-        on_error: None,
-        description_reg: None,
-    });
-    program.preassign_label_to_next_insn(insert_label);
-    // The id is the rowid, so the record keeps NULL for it, as SQLite does
-    // for an INTEGER PRIMARY KEY column.
-    let record_start_reg = program.alloc_registers(2);
-    program.emit_insn(Insn::Null {
-        dest: record_start_reg,
-        dest_end: None,
-    });
-    program.emit_insn(Insn::String8 {
-        value: normalized_name.clone(),
-        dest: record_start_reg + 1,
-    });
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u32(record_start_reg),
-        count: to_u32(2),
-        dest_reg: to_u32(record_reg),
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: cursor_id,
-        key_reg: id_reg,
-        record_reg,
-        flag: InsertFlags::new(),
-        table_name: TURSO_NAMESPACES_TABLE_NAME.to_string(),
-    });
+    emit_namespace_row(program, cursor_id, id, &normalized_name);
     program.emit_insn(Insn::AddNamespace {
         db: MAIN_DB_ID,
         namespace: id,
@@ -1703,18 +1659,7 @@ pub fn translate_drop_schema(
     let schema_version = resolver.with_schema(MAIN_DB_ID, |s| s.schema_version);
     program.begin_write_on_database(MAIN_DB_ID, schema_version)?;
 
-    let namespaces_table = resolver
-        .with_schema(MAIN_DB_ID, |s| {
-            s.get_btree_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME)
-        })
-        .expect("a database with a namespace has the namespaces table");
-    let root_page = namespaces_table.root_page;
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(namespaces_table));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id,
-        root_page: root_page.into(),
-        db: MAIN_DB_ID,
-    });
+    let cursor_id = open_namespaces_table_for_writing(program, resolver)?;
     let id_reg = program.alloc_register();
     program.emit_insn(Insn::Integer {
         dest: id_reg,
@@ -1760,8 +1705,10 @@ pub fn translate_drop_schema(
     Ok(())
 }
 
-/// Opens the namespaces table of the main database for writing, creating
-/// it first when this is the database's first namespace.
+/// Opens the namespaces table of the main database for writing. A database
+/// that has never created or dropped a namespace has no namespaces table
+/// yet, so it is created first with a row for each namespace the database
+/// has, which are its default namespaces.
 fn open_namespaces_table_for_writing(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1769,6 +1716,7 @@ fn open_namespaces_table_for_writing(
     let existing = resolver.with_schema(MAIN_DB_ID, |s| {
         s.get_btree_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME)
     });
+    let created = existing.is_none();
     let (table, root_page) = match existing {
         Some(table) => {
             let root_page = RegisterOrLiteral::Literal(table.root_page);
@@ -1822,7 +1770,67 @@ fn open_namespaces_table_for_writing(
         root_page,
         db: MAIN_DB_ID,
     });
+    if created {
+        let namespaces = resolver.with_schema(MAIN_DB_ID, |s| {
+            s.namespaces()
+                .map(|(id, name)| (id, name.to_string()))
+                .collect::<Vec<_>>()
+        });
+        for (id, name) in namespaces {
+            emit_namespace_row(program, cursor_id, id, &name);
+        }
+    }
     Ok(cursor_id)
+}
+
+/// Inserts the row of namespace `id` called `name` into the namespaces
+/// table open at `cursor_id`, failing if the table has a row with that id.
+fn emit_namespace_row(program: &mut ProgramBuilder, cursor_id: usize, id: NamespaceId, name: &str) {
+    let id_reg = program.alloc_register();
+    program.emit_insn(Insn::Integer {
+        dest: id_reg,
+        value: i64::from(id.as_u32()),
+    });
+    let insert_label = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor: cursor_id,
+        rowid_reg: id_reg,
+        target_pc: insert_label,
+    });
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: crate::error::SQLITE_CONSTRAINT_PRIMARYKEY,
+        description: format!("UNIQUE constraint failed: {TURSO_NAMESPACES_TABLE_NAME}.id"),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(insert_label);
+    // The id is the rowid, so the record keeps NULL for it, as SQLite does
+    // for an INTEGER PRIMARY KEY column.
+    let record_start_reg = program.alloc_registers(2);
+    program.emit_insn(Insn::Null {
+        dest: record_start_reg,
+        dest_end: None,
+    });
+    program.emit_insn(Insn::String8 {
+        value: name.to_string(),
+        dest: record_start_reg + 1,
+    });
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(record_start_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: cursor_id,
+        key_reg: id_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: TURSO_NAMESPACES_TABLE_NAME.to_string(),
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
