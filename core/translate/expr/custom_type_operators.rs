@@ -270,15 +270,9 @@ impl<'a> Operand<'a> {
 
     /// The operand's type for an error message: `date`, `integer`, ...
     fn type_name(&self) -> String {
-        match (&self.value_type, self.expr_type) {
-            (Some(ty), _) => ty.type_def.name.clone(),
-            (None, ExprType::Builtin(BuiltinType::Any)) => "value".to_string(),
-            (None, ExprType::Builtin(BuiltinType::Decimal)) => "numeric".to_string(),
-            (None, ExprType::Builtin(builtin)) => format!("{builtin:?}").to_lowercase(),
-            (None, ExprType::Custom { type_def, .. }) => type_def.name.clone(),
-            (None, ExprType::Untyped) => "text".to_string(),
-            (None, ExprType::Null) => "null".to_string(),
-            (None, _) => "value".to_string(),
+        match &self.value_type {
+            Some(ty) => ty.type_def.name.clone(),
+            None => self.expr_type.name(),
         }
     }
 }
