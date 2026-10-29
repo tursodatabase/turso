@@ -921,7 +921,9 @@ fn emit_update_column_values<'a>(
                                 .resolve_type_unchecked(&table_column.ty_str)
                                 .ok()
                                 .flatten()
-                                .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
+                                .is_some_and(|r| {
+                                    r.chain.iter().any(|td| td.has_encode_or_coerce())
+                                });
                             let translate_result = if has_custom_encode {
                                 translate_expr_no_constant_opt(
                                     program,
@@ -2521,7 +2523,9 @@ fn emit_update_insns<'a>(
                 && table.has_autoincrement
                 && connection.mv_store_for_db(update_database_id).is_some()
             {
-                let seq_name = crate::schema::autoincrement_sequence_name(&target_table.identifier);
+                let seq_name = crate::schema::autoincrement_sequence_name(
+                    &t_ctx.resolver.mangle_name(update_namespace, &table.name),
+                );
                 let seq = t_ctx
                     .resolver
                     .with_schema(update_database_id, |s| {
@@ -2536,7 +2540,7 @@ fn emit_update_insns<'a>(
                 crate::translate::sequence::emit_disk_advance_past(
                     program,
                     &t_ctx.resolver,
-                    update_namespace,
+                    NamespaceRef::root_of(update_database_id),
                     &seq_name,
                     &seq,
                     effective_rowid_reg,

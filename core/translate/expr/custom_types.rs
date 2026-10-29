@@ -44,7 +44,7 @@ pub(super) fn emit_custom_type_operator(
     // registers (constant optimization), and encoding in-place would clobber
     // that register — breaking subsequent loop iterations.
     let func_start = if let Some(ref encode_info) = resolved.encode_info {
-        if let Some(encode_expr) = encode_info.type_def.encode() {
+        if encode_info.type_def.has_encode_or_coerce() {
             // Translate operands into temporary registers first.
             let tmp1 = program.alloc_register();
             let tmp2 = program.alloc_register();
@@ -75,14 +75,18 @@ pub(super) fn emit_custom_type_operator(
                 dst_reg: col_dst,
                 extra_amount: 0,
             });
-            // Encode the literal into the fresh function arg slot.
-            emit_type_expr(
+            // Convert the literal in the fresh function arg slot as if it were
+            // stored in the column, so it compares like an index search key.
+            program.emit_insn(Insn::Copy {
+                src_reg: lit_tmp,
+                dst_reg: lit_dst,
+                extra_amount: 0,
+            });
+            emit_store_value(
                 program,
-                encode_expr,
-                lit_tmp,
+                std::slice::from_ref(&encode_info.type_def),
                 lit_dst,
                 &encode_info.type_params,
-                &encode_info.type_def,
                 resolver,
             )?;
             func_args
@@ -432,15 +436,7 @@ pub(crate) fn emit_user_facing_column_value(
         // Apply decode in reverse order (parent/ancestor first, then child)
         for td in resolved.chain.iter().rev() {
             if let Some(decode_expr) = td.decode() {
-                emit_type_expr(
-                    program,
-                    decode_expr,
-                    dest_reg,
-                    dest_reg,
-                    &column.ty_params,
-                    td,
-                    resolver,
-                )?;
+                emit_type_expr(program, decode_expr, dest_reg, dest_reg, resolver)?;
             }
         }
 
@@ -522,46 +518,101 @@ pub(super) fn emit_domain_cast_constraints(
     Ok(())
 }
 
-/// Emit bytecode for a custom type encode/decode expression.
-/// Sets up `value` to reference `value_reg`, and binds the type's parameters to
-/// `type_params`, the arguments written after the type name, by position.
-/// The expression result is written to `dest_reg`.
+/// Emits what storing the value in `reg` as a value of `chain`'s types runs:
+/// each type's ENCODE, then its COERCE with `type_params`, the arguments
+/// written after the type name. A CAST with type arguments runs the same.
+pub(crate) fn emit_store_value(
+    program: &mut ProgramBuilder,
+    chain: &[crate::sync::Arc<TypeDef>],
+    reg: usize,
+    type_params: &[Box<ast::Expr>],
+    resolver: &Resolver,
+) -> Result<()> {
+    for type_def in chain {
+        if let Some(encode) = type_def.encode() {
+            emit_type_expr(program, encode, reg, reg, resolver)?;
+        }
+        emit_coerce(program, type_def, reg, type_params, resolver)?;
+    }
+    Ok(())
+}
+
+/// Emit bytecode for a custom type ENCODE or DECODE expression, with `value`
+/// referencing `value_reg`. The result is written to `dest_reg`.
 pub(crate) fn emit_type_expr(
     program: &mut ProgramBuilder,
     expr: &ast::Expr,
     value_reg: usize,
     dest_reg: usize,
-    type_params: &[Box<ast::Expr>],
-    type_def: &TypeDef,
     resolver: &Resolver,
 ) -> Result<usize> {
-    // Set up value override
+    emit_expr_with_bindings(program, expr, value_reg, dest_reg, &[], resolver)
+}
+
+/// Emits the type's COERCE on the value in `reg`, with the type's parameters
+/// bound to `type_params` by position. A type with parameters used without
+/// arguments, as a column declared `numeric`, has no limits and nothing is
+/// emitted. NULL is left as it is.
+fn emit_coerce(
+    program: &mut ProgramBuilder,
+    type_def: &TypeDef,
+    reg: usize,
+    type_params: &[Box<ast::Expr>],
+    resolver: &Resolver,
+) -> Result<()> {
+    let Some(coerce) = type_def.coerce() else {
+        return Ok(());
+    };
+    if type_params.is_empty() && type_def.user_params().next().is_some() {
+        return Ok(());
+    }
+    // A parameter without an argument, as scale in numeric(10), is NULL.
+    let null = ast::Expr::Literal(ast::Literal::Null);
+    let bindings: Vec<(&str, &ast::Expr)> = type_def
+        .user_params()
+        .enumerate()
+        .map(|(i, param)| {
+            let arg = type_params.get(i).map_or(&null, |arg| arg.as_ref());
+            (param.name.as_str(), arg)
+        })
+        .collect();
+    let skip_null = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_null,
+    });
+    emit_expr_with_bindings(program, coerce, reg, reg, &bindings, resolver)?;
+    program.preassign_label_to_next_insn(skip_null);
+    Ok(())
+}
+
+/// Translates `expr` with `value` referencing `value_reg` and each name in
+/// `bindings` referencing its expression's value.
+fn emit_expr_with_bindings(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    value_reg: usize,
+    dest_reg: usize,
+    bindings: &[(&str, &ast::Expr)],
+    resolver: &Resolver,
+) -> Result<usize> {
     program
         .id_register_overrides
         .insert("value".to_string(), value_reg);
 
-    // Set up type parameter overrides. Capture the result so we can
-    // clean up overrides even if param translation fails.
-    let param_result: Result<()> = (|| {
-        // Skip `value` param (already handled above); match remaining params
-        // against the user-provided ty_params by position.
-        let user_params: Vec<_> = type_def.user_params().collect();
-        for (i, param) in user_params.iter().enumerate() {
-            if let Some(param_expr) = type_params.get(i) {
-                let reg = program.alloc_register();
-                translate_expr(program, None, param_expr, reg, resolver)?;
-                program
-                    .id_register_overrides
-                    .insert(param.name.clone(), reg);
-            }
+    // Capture the result so the overrides are cleared even on error.
+    let bind_result: Result<()> = (|| {
+        for (name, bound_expr) in bindings {
+            let reg = program.alloc_register();
+            translate_expr(program, None, bound_expr, reg, resolver)?;
+            program.id_register_overrides.insert(name.to_string(), reg);
         }
         Ok(())
     })();
 
-    // Translate body expression only if param setup succeeded
-    let result = param_result.and_then(|()| {
-        // Translate the expression, disabling constant optimization since
-        // the `value` placeholder refers to a register that changes per row.
+    let result = bind_result.and_then(|()| {
+        // The `value` placeholder refers to a register that changes per row,
+        // so the expression must not be hoisted as a constant.
         translate_expr_no_constant_opt(
             program,
             None,
@@ -572,7 +623,6 @@ pub(crate) fn emit_type_expr(
         )
     });
 
-    // Always clean up overrides, even on error
     program.id_register_overrides.clear();
 
     result

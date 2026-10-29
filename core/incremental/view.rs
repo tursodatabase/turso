@@ -1,5 +1,6 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::io::{Buffer, Completion, File, TempFile, IO};
+use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
@@ -710,7 +711,7 @@ impl IncrementalView {
         sql: &str,
         schema: &Schema,
         main_data_root: i64,
-        namespace: crate::namespace::NamespaceId,
+        namespace: NamespaceId,
     ) -> Result<Self> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -751,11 +752,15 @@ impl IncrementalView {
     /// Schema reconstruction uses this to order persisted materialized views
     /// before binding them. The executable DAG is still produced by the main
     /// bound planner; this walker is identity metadata only.
-    pub(crate) fn referenced_table_names(select: &ast::Select) -> std::vec::Vec<String> {
+    /// The tables `select` reads, each with the namespace it is written
+    /// with, if any. A name that is a CTE of the select is not a table.
+    pub(crate) fn referenced_tables(
+        select: &ast::Select,
+    ) -> std::vec::Vec<(Option<String>, String)> {
         fn collect_source(
             source: &ast::SelectTable,
             cte_names: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             match source {
                 ast::SelectTable::Table(name, _, _) => {
@@ -765,7 +770,12 @@ impl IncrementalView {
                     {
                         return;
                     }
-                    tables.insert(crate::util::normalize_ident(name.name.as_str()));
+                    tables.insert((
+                        name.namespace
+                            .as_ref()
+                            .map(|namespace| crate::util::normalize_ident(namespace.as_str())),
+                        crate::util::normalize_ident(name.name.as_str()),
+                    ));
                 }
                 ast::SelectTable::Select { select, .. } => {
                     collect_select(select, cte_names, tables)
@@ -783,7 +793,7 @@ impl IncrementalView {
         fn collect_one(
             select: &ast::OneSelect,
             cte_names: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             let ast::OneSelect::Select {
                 columns,
@@ -839,7 +849,7 @@ impl IncrementalView {
         fn collect_select(
             select: &ast::Select,
             inherited_ctes: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             let mut cte_names = inherited_ctes.clone();
             if let Some(with) = &select.with {

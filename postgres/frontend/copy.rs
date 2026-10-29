@@ -9,66 +9,48 @@
 //! - Empty field = empty string (not NULL)
 //! - Lines starting with `\.` = end of data
 
-use turso_core::{LimboError, Result};
+use std::num::NonZero;
+
+use crate::session::{database_of, relation_lookup_namespaces};
+use turso_core::{LimboError, Result, Value};
 use turso_pg_parser::{copy::CopyToStdout, quote_identifier};
 
 pub(crate) fn prepare_copy_to_stdout(
     conn: &std::sync::Arc<turso_core::Connection>,
     spec: &CopyToStdout,
 ) -> Result<turso_core::Statement> {
-    let schema = match &spec.schema {
-        Some(schema) => match schema.as_str() {
-            "public" => "main".to_owned(),
-            schema => schema.to_owned(),
-        },
-        None => {
-            let mut schemas = Vec::new();
-            conn.prepare_sqlite(format!(
-                "PRAGMA table_list({})",
-                quote_identifier(&spec.table)
-            ))?
-            .run_with_row_callback(|row| {
-                schemas.push(row.get::<String>(0)?);
-                Ok(())
-            })?;
-            conn.search_order()
-                .into_iter()
-                .find_map(|namespace| {
-                    let id = namespace.database_id();
-                    let name = if id == turso_core::MAIN_DB_ID {
-                        "main".to_owned()
-                    } else {
-                        conn.namespace_name(id)?
-                    };
-                    schemas.iter().find(|schema| **schema == name).cloned()
-                })
-                .ok_or_else(|| {
-                    LimboError::ParseError(format!("COPY table '{}' does not exist", spec.table))
-                })?
+    let mut found = None;
+    for namespace in relation_lookup_namespaces(conn, spec.schema.as_deref()) {
+        let mut stmt = conn.prepare_sqlite(format!(
+            "SELECT type, rootpage, sql FROM {}.sqlite_schema \
+             WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1",
+            quote_identifier(&database_of(conn, &namespace))
+        ))?;
+        stmt.bind_at(
+            NonZero::new(1).unwrap(),
+            Value::build_text(namespace.mangle_name(&spec.table)),
+        )?;
+        let mut table = None;
+        stmt.run_with_row_callback(|row| {
+            let kind = row.get::<String>(0)?;
+            let root_page = row.get::<i64>(1)?;
+            if kind != "table" || root_page == 0 {
+                return Err(LimboError::ParseError(
+                    "COPY TO STDOUT requires a plain table".to_owned(),
+                ));
+            }
+            table = Some(
+                conn.dialect()
+                    .parse_table_sql(&row.get::<String>(2)?, root_page)?,
+            );
+            Ok(())
+        })?;
+        if let Some(table) = table {
+            found = Some((namespace, table));
+            break;
         }
-    };
-    let mut table = None;
-    conn.prepare_sqlite(format!(
-        "SELECT type, rootpage, sql FROM {}.sqlite_schema \
-         WHERE type IN ('table', 'view') AND name = '{}'",
-        quote_identifier(&schema),
-        spec.table.to_ascii_lowercase().replace('\'', "''")
-    ))?
-    .run_with_row_callback(|row| {
-        let kind = row.get::<String>(0)?;
-        let root_page = row.get::<i64>(1)?;
-        if kind != "table" || root_page == 0 {
-            return Err(LimboError::ParseError(
-                "COPY TO STDOUT requires a plain table".to_owned(),
-            ));
-        }
-        table = Some(
-            conn.dialect()
-                .parse_table_sql(&row.get::<String>(2)?, root_page)?,
-        );
-        Ok(())
-    })?;
-    let table = table.ok_or_else(|| {
+    }
+    let (namespace, table) = found.ok_or_else(|| {
         LimboError::ParseError(format!("COPY table '{}' does not exist", spec.table))
     })?;
     let columns = if spec.columns.is_empty() {
@@ -94,7 +76,7 @@ pub(crate) fn prepare_copy_to_stdout(
         .join(", ");
     conn.prepare_sqlite(format!(
         "SELECT {columns} FROM {}.{}",
-        quote_identifier(&schema),
+        quote_identifier(&namespace.name),
         quote_identifier(&spec.table)
     ))
 }

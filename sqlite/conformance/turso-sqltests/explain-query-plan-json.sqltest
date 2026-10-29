@@ -197,3 +197,102 @@ expect {
     {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    INSERT INTO users(name) VALUES ('x');","result_columns":[],"nodes":[]}
     0
 }
+
+test descending-index-range-operators-use-column-value-order {
+    CREATE TABLE t(a INT);
+    CREATE INDEX i ON t(a DESC);
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a > 5;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a >= 5;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a < 5;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a <= 5;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX i (a>?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a>=?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a<?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a<=?)
+}
+
+test descending-index-both-bounds-use-column-value-order {
+    CREATE TABLE t(a INT);
+    CREATE INDEX i ON t(a DESC);
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a > 2 AND a < 8;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a > 2 AND a < 8 ORDER BY a ASC;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a > 2 AND a < 8 ORDER BY a DESC;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a >= 2 AND a <= 8;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a >= 2 AND a <= 8 ORDER BY a ASC;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX i (a>? AND a<?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a>? AND a<?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a>? AND a<?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a>=? AND a<=?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a>=? AND a<=?)
+}
+
+test descending-index-range-after-an-equality-prefix {
+    CREATE TABLE t(a INT, b INT);
+    CREATE INDEX i ON t(a ASC, b DESC);
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b >= 2;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b < 8;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b >= 2 AND b < 8;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b >= 2 AND b < 8 ORDER BY b ASC;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX i (a=? AND b>=?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a=? AND b<?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a=? AND b>=? AND b<?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a=? AND b>=? AND b<?)
+}
+
+test ascending-index-range-after-a-descending-equality-prefix {
+    CREATE TABLE t(a INT, b INT);
+    CREATE INDEX i ON t(a DESC, b ASC);
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 2 AND b < 8;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a = 1 AND b > 2 AND b < 8 ORDER BY b DESC;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX i (a=? AND b>? AND b<?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a=? AND b>? AND b<?)
+}
+
+test ascending-index-range-operators-use-column-value-order {
+    CREATE TABLE t(a INT);
+    CREATE INDEX i ON t(a ASC);
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a > 5;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a >= 5;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a < 5;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a <= 5;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX i (a>?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a>=?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a<?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a<=?)
+}
+
+
+test ascending-index-both-bounds-always-show-the-lower-bound-first {
+    CREATE TABLE t(a INT);
+    CREATE INDEX i ON t(a ASC);
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a > 2 AND a < 8;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a > 2 AND a < 8 ORDER BY a DESC;
+    EXPLAIN QUERY PLAN SELECT * FROM t WHERE a >= 2 AND a <= 8 ORDER BY a DESC;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX i (a>? AND a<?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a>? AND a<?)
+    1|0|0|SEARCH t USING COVERING INDEX i (a>=? AND a<=?)
+}
+
+
+test descending-index-json-ranges-show-column-value-order {
+    CREATE TABLE t(a INT);
+    CREATE INDEX i ON t(a DESC);
+    EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE a > 5;
+    EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE a > 2 AND a < 8;
+}
+expect {
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE a > 5;","result_columns":["a"],"nodes":[{"id":1,"parent":null,"detail":"SEARCH t USING COVERING INDEX i (a>?)","op":{"type":"search","table":"t","search_kind":"seek","index":{"name":"i","covering":true,"ephemeral":false},"constraints":["a>?"],"estimate":{"input_rows":1,"rows_per_input":400000,"output_rows":400000,"access_cost":9203.51,"total_cost":9203.51}}}]}
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON SELECT * FROM t WHERE a > 2 AND a < 8;","result_columns":["a"],"nodes":[{"id":1,"parent":null,"detail":"SEARCH t USING COVERING INDEX i (a>? AND a<?)","op":{"type":"search","table":"t","search_kind":"seek","index":{"name":"i","covering":true,"ephemeral":false},"constraints":["a>?","a<?"],"estimate":{"input_rows":1,"rows_per_input":160000.00000000003,"output_rows":160000.00000000003,"access_cost":3683.5100000000007,"total_cost":3683.5100000000007}}}]}
+}

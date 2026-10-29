@@ -29,6 +29,15 @@ impl PgSessionState {
         self.settings.lock().unwrap().contains(name)
     }
 
+    pub(crate) fn name_as_defined(&self, name: &str) -> Option<String> {
+        self.settings
+            .lock()
+            .unwrap()
+            .names_as_defined
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+    }
+
     fn update_settings(
         &self,
         conn: &Connection,
@@ -84,6 +93,10 @@ pub(crate) struct ConnectionSettings {
     current: SettingValues,
     memo_before_transaction: Option<SettingValues>,
     memo_before_statement: Option<SettingValues>,
+    /// Each parameter's name as written when it was first set, by
+    /// ascii-lowercase name. SHOW names its column this way. A rollback
+    /// keeps the parameter defined, so it keeps this name too.
+    names_as_defined: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -147,12 +160,19 @@ impl ConnectionSettings {
     }
 
     pub(crate) fn set(&mut self, name: &str, value: Option<String>, scope: SettingScope) {
-        self.current
-            .named
-            .entry(name.to_owned())
-            .or_default()
-            .set(value, scope);
+        let key = name.to_ascii_lowercase();
+        self.names_as_defined
+            .entry(key.clone())
+            .or_insert_with(|| name.to_owned());
+        self.current.named.entry(key).or_default().set(value, scope);
         self.current.has_transaction_values |= scope == SettingScope::Transaction;
+    }
+
+    /// Sets every named parameter to its default value for the session.
+    pub(crate) fn reset_all(&mut self) {
+        for setting in self.current.named.values_mut() {
+            setting.set(None, SettingScope::Session);
+        }
     }
 
     pub(crate) fn end_statement(
