@@ -20,7 +20,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord};
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
 use crate::{turso_assert, turso_debug_assert};
@@ -900,6 +900,10 @@ pub struct Schema {
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
 
+    /// Whether the database was opened with custom types enabled. Without
+    /// them, a schema that uses custom types is refused when it is loaded.
+    custom_types_enabled: bool,
+
     /// Whether the schema rows may hold the objects of namespaces
     /// under their mangled names, as the dialect of the database says.
     supports_namespaces: bool,
@@ -1106,6 +1110,7 @@ impl Schema {
             analyze_stats: AnalyzeStats::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
+            custom_types_enabled: enable_custom_types,
             supports_namespaces: dialect.supports_namespaces(),
             default_namespaces: dialect.default_namespaces(),
             namespace_names_loaded: !dialect.supports_namespaces(),
@@ -3397,6 +3402,9 @@ impl Schema {
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
+        if !self.custom_types_enabled {
+            self.refuse_custom_types()?;
+        }
         if !type_sqls.is_empty() {
             self.load_type_definitions(type_sqls)?;
         }
@@ -3422,6 +3430,36 @@ impl Schema {
             dbsp_state_index_roots,
         )?;
         self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled)
+    }
+
+    /// Refuse a schema that uses custom types when they are not enabled.
+    /// Without them, a custom-type column would be read as its stored bytes,
+    /// and an index on it would be read and written in a different order
+    /// than the one it was built in.
+    fn refuse_custom_types(&self) -> Result<()> {
+        if self.has_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME) {
+            return Err(LimboError::ParseError(
+                "the database has a table of custom types (made by CREATE TYPE), which requires --experimental-custom-types flag"
+                    .to_string(),
+            ));
+        }
+        for table in self.all_tables() {
+            let Some(btree) = table.btree().filter(|btree| btree.is_strict) else {
+                continue;
+            };
+            if let Some(column) = btree
+                .columns
+                .iter()
+                .find(|column| column.is_array() || !is_builtin_strict_type(&column.ty_str))
+            {
+                return Err(LimboError::ParseError(format!(
+                    "column {}.{} has a custom type, which requires --experimental-custom-types flag",
+                    btree.name,
+                    column.name.as_deref().unwrap_or_default()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Yield (backing_table_name, sequence_name) for every backing table
@@ -4338,6 +4376,7 @@ impl TryClone for Schema {
             pending_materialized_views: self.pending_materialized_views.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
+            custom_types_enabled: self.custom_types_enabled,
         })
     }
 }
