@@ -8,19 +8,13 @@ use super::{
     plan::TableReferences,
 };
 
-pub(crate) trait ExprMetadata {
-    type SourceId: Copy;
-    type SubqueryId: Copy;
-
-    fn column_affinity(&self, source: Self::SourceId, column: usize) -> Option<Affinity>;
-    fn column_collation(
-        &self,
-        source: Self::SourceId,
-        column: usize,
-    ) -> Result<Option<CollationSeq>>;
+pub(crate) trait ExprMetadata<SourceId: Copy = TableInternalId, SubqueryId: Copy = TableInternalId>
+{
+    fn column_affinity(&self, source: SourceId, column: usize) -> Option<Affinity>;
+    fn column_collation(&self, source: SourceId, column: usize) -> Result<Option<CollationSeq>>;
     fn register_affinity(&self, register: usize) -> Option<Affinity>;
     fn register_collation(&self, register: usize) -> Option<CollationSeq>;
-    fn subquery_affinity(&self, query: Self::SubqueryId) -> Option<Affinity>;
+    fn subquery_affinity(&self, query: SubqueryId) -> Option<Affinity>;
 }
 
 pub(crate) struct ExprContext<'a, 'schema> {
@@ -38,10 +32,7 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
 }
 
 impl ExprMetadata for ExprContext<'_, '_> {
-    type SourceId = TableInternalId;
-    type SubqueryId = TableInternalId;
-
-    fn column_affinity(&self, source: Self::SourceId, column: usize) -> Option<Affinity> {
+    fn column_affinity(&self, source: TableInternalId, column: usize) -> Option<Affinity> {
         if source.is_self_table() {
             if let Some(affinity) = self.resolver.and_then(|r| r.self_table_affinity(column)) {
                 return Some(affinity);
@@ -53,7 +44,7 @@ impl ExprMetadata for ExprContext<'_, '_> {
 
     fn column_collation(
         &self,
-        source: Self::SourceId,
+        source: TableInternalId,
         column: usize,
     ) -> Result<Option<CollationSeq>> {
         if source.is_self_table() {
@@ -96,7 +87,7 @@ impl ExprMetadata for ExprContext<'_, '_> {
             .and_then(|column| column.collation)
     }
 
-    fn subquery_affinity(&self, query: Self::SubqueryId) -> Option<Affinity> {
+    fn subquery_affinity(&self, query: TableInternalId) -> Option<Affinity> {
         self.resolver?
             .subquery_affinities
             .borrow()

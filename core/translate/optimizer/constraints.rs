@@ -2400,7 +2400,7 @@ fn term_comparison_affinity(
     rhs: &ast::Expr,
     operator: ConstraintOperator,
     table_col_pos: Option<usize>,
-    metadata: &impl ExprMetadata<SourceId = TableInternalId, SubqueryId = TableInternalId>,
+    metadata: &impl ExprMetadata,
 ) -> Affinity {
     match operator.as_ast_operator() {
         Some(op) if op.is_comparison() && table_col_pos.is_some() => {

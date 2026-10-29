@@ -397,7 +397,7 @@ pub(super) fn row_component_affinity_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     idx: usize,
-    metadata: &impl ExprMetadata<SourceId = TableInternalId, SubqueryId = TableInternalId>,
+    metadata: &impl ExprMetadata,
     catalog: &crate::translate::catalog::CatalogContext<'_>,
 ) -> Result<(Affinity, CollationSeq)> {
     // If one side is a decomposable row literal and the other is not, still prefer

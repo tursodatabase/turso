@@ -4,7 +4,7 @@ use crate::{
     vdbe::affinity::Affinity,
 };
 use bitflags::bitflags;
-use turso_parser::ast::{self, TableInternalId};
+use turso_parser::ast;
 
 bitflags! {
     /// Storage class flags that represent the possible storage classes an expression can yield.
@@ -48,10 +48,7 @@ impl StorageClassMask {
     }
 }
 
-pub(crate) fn get_expr_affinity(
-    expr: &ast::Expr,
-    metadata: &impl ExprMetadata<SourceId = TableInternalId, SubqueryId = TableInternalId>,
-) -> Affinity {
+pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprMetadata) -> Affinity {
     match expr {
         ast::Expr::Column { table, column, .. } => metadata
             .column_affinity(*table, *column)
@@ -94,10 +91,7 @@ pub(crate) fn get_expr_affinity(
 /// Mirrors SQLite's `sqlite3ExprDataType()` (expr.c): a bitmask of the storage
 /// classes an expression could yield. Used to combine column affinities across
 /// the arms of a compound (UNION/INTERSECT/EXCEPT) subquery.
-pub(crate) fn expr_data_type(
-    expr: &ast::Expr,
-    metadata: &impl ExprMetadata<SourceId = TableInternalId, SubqueryId = TableInternalId>,
-) -> StorageClassMask {
+pub(crate) fn expr_data_type(expr: &ast::Expr, metadata: &impl ExprMetadata) -> StorageClassMask {
     match expr {
         ast::Expr::Collate(inner, _) | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
             expr_data_type(inner, metadata)
@@ -182,7 +176,7 @@ pub(crate) fn do_comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
 pub fn comparison_affinity(
     lhs: impl HasComparableAffinity,
     rhs: impl HasComparableAffinity,
-    metadata: &impl ExprMetadata<SourceId = TableInternalId, SubqueryId = TableInternalId>,
+    metadata: &impl ExprMetadata,
 ) -> Affinity {
     let lhs = lhs.comparison_affinity(metadata);
     let rhs = rhs.comparison_affinity(metadata);
@@ -190,26 +184,17 @@ pub fn comparison_affinity(
 }
 
 pub(crate) trait HasComparableAffinity {
-    fn comparison_affinity(
-        &self,
-        metadata: &impl ExprMetadata<SourceId = TableInternalId, SubqueryId = TableInternalId>,
-    ) -> Affinity;
+    fn comparison_affinity(&self, metadata: &impl ExprMetadata) -> Affinity;
 }
 
 impl HasComparableAffinity for &ast::Expr {
-    fn comparison_affinity(
-        &self,
-        metadata: &impl ExprMetadata<SourceId = TableInternalId, SubqueryId = TableInternalId>,
-    ) -> Affinity {
+    fn comparison_affinity(&self, metadata: &impl ExprMetadata) -> Affinity {
         get_expr_affinity(self, metadata)
     }
 }
 
 impl HasComparableAffinity for Affinity {
-    fn comparison_affinity(
-        &self,
-        _metadata: &impl ExprMetadata<SourceId = TableInternalId, SubqueryId = TableInternalId>,
-    ) -> Affinity {
+    fn comparison_affinity(&self, _metadata: &impl ExprMetadata) -> Affinity {
         *self
     }
 }

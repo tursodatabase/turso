@@ -893,7 +893,7 @@ pub fn translate_aggregation_step(
 fn ordered_set_collation(
     func: &AggFunc,
     expr: &ast::Expr,
-    metadata: &impl ExprMetadata<SourceId = ast::TableInternalId>,
+    metadata: &impl ExprMetadata,
     catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
     let collation = expr_collation(expr, metadata, catalog)?;
