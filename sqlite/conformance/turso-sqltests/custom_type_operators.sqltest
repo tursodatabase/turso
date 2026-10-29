@@ -862,6 +862,18 @@ expect error {
     operator does not exist: blob \* numeric
 }
 
+# A column of type ANY may hold a blob that is only known when the statement
+# runs. Even a blob holding a stored numeric is not a number.
+@requires strict "uses STRICT tables"
+test op-numeric-plus-blob-in-any-column-error {
+    CREATE TABLE t(n numeric(10,2), x ANY) STRICT;
+    INSERT INTO t VALUES (1, numeric_encode('5.5'));
+    SELECT n + x FROM t;
+}
+expect error {
+    a blob is not a number
+}
+
 @requires strict "uses STRICT tables"
 test op-numeric-plus-cast-to-blob-error {
     CREATE TABLE t(n numeric(10,2)) STRICT;

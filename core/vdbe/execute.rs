@@ -11304,14 +11304,16 @@ pub fn op_function(
                 let val = &state.registers[*start_reg];
                 let precision_reg = &state.registers[*start_reg + 1];
                 let scale_reg = &state.registers[*start_reg + 2];
+                // COERCE runs on the value ENCODE stored, so the value is a
+                // stored numeric.
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
-                    other => {
+                    Value::Blob(stored) => {
                         use crate::numeric::decimal::{
-                            bigdecimal_to_blob, validate_precision_scale,
+                            bigdecimal_to_blob, blob_to_bigdecimal, validate_precision_scale,
                         };
 
-                        let bd = numeric_from_value(other)?;
+                        let bd = blob_to_bigdecimal(stored)?;
                         let (
                             Value::Numeric(Numeric::Integer(precision)),
                             Value::Numeric(Numeric::Integer(scale)),
@@ -11324,6 +11326,13 @@ pub fn op_function(
                         };
                         let fitted = validate_precision_scale(&bd, *precision, *scale)?;
                         Value::from_blob(bigdecimal_to_blob(&fitted))
+                    }
+                    other => {
+                        return Err(LimboError::InternalError(format!(
+                            "numeric_fit expects a stored numeric, got {}",
+                            other.value_type()
+                        ))
+                        .into());
                     }
                 };
                 state.registers[*dest].set_value(result);
