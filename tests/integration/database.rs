@@ -471,6 +471,15 @@ fn test_errors_on_zero_divisor_dialect() {
 
     struct DivisionRaisesErrorDialect;
     impl Dialect for DivisionRaisesErrorDialect {
+        fn validate_check_constraint_types(
+            &self,
+            columns: &[turso_parser::ast::ColumnDefinition],
+            constraints: &[turso_parser::ast::NamedTableConstraint],
+            options: &turso_parser::ast::TableOptions,
+            catalog: &turso_core::CatalogContext,
+        ) -> turso_core::Result<()> {
+            SqliteDialect.validate_check_constraint_types(columns, constraints, options, catalog)
+        }
         fn name(&self) -> &'static str {
             SqliteDialect.name()
         }

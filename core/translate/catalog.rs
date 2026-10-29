@@ -14,18 +14,20 @@ use crate::{DatabaseCatalog, LimboError, Result, RwLock, SymbolTable};
 use super::collate::TextCollation;
 use super::plan::BitSet;
 
-pub(crate) struct CatalogContext<'a> {
+/// What `CREATE TABLE` and other statements can see while they are compiled:
+/// the schemas, functions and settings of the connection.
+pub struct CatalogContext<'a> {
     schema: &'a Schema,
     database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
     temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
     attached_databases: &'a RwLock<DatabaseCatalog>,
     qualifiers: &'a crate::Qualifiers,
     non_main_schema_cache: RefCell<HashMap<usize, Arc<Schema>>>,
-    pub symbol_table: &'a SymbolTable,
-    pub enable_custom_types: bool,
+    pub(crate) symbol_table: &'a SymbolTable,
+    pub(crate) enable_custom_types: bool,
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
-    pub dialect: Arc<dyn crate::dialect::Dialect>,
+    pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
     pub(super) database_scope: RefCell<Option<DatabaseScopeContext>>,
     /// Cached flag: true when this connection has an active temp database.
     ///
@@ -118,15 +120,15 @@ impl<'a> CatalogContext<'a> {
         }
     }
 
-    pub fn schema(&self) -> &Schema {
+    pub(crate) fn schema(&self) -> &Schema {
         self.schema
     }
 
-    pub fn has_temp_database(&self) -> bool {
+    pub(crate) fn has_temp_database(&self) -> bool {
         self.has_temp_schema
     }
 
-    pub fn require_custom_types(&self, feature: &str) -> Result<()> {
+    pub(crate) fn require_custom_types(&self, feature: &str) -> Result<()> {
         if !self.enable_custom_types {
             crate::bail_parse_error!("{} require --experimental-custom-types flag", feature);
         }
@@ -162,7 +164,7 @@ impl<'a> CatalogContext<'a> {
         self.with_database_scope(namespace, "view", view_name, f)
     }
 
-    pub fn resolve_function(
+    pub(crate) fn resolve_function(
         &self,
         func_name: &str,
         arg_count: usize,
@@ -178,7 +180,7 @@ impl<'a> CatalogContext<'a> {
         }
     }
 
-    pub fn resolve_collation(&self, name: &str) -> Result<TextCollation> {
+    pub(crate) fn resolve_collation(&self, name: &str) -> Result<TextCollation> {
         if let Some(collation) = self.symbol_table.resolve_collation(name) {
             return Ok(collation);
         }
