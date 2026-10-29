@@ -1266,14 +1266,7 @@ pub(super) fn tables_in_hashable_equal_test(
     else {
         return Ok(None);
     };
-    if !comparison_collation(
-        left,
-        right,
-        &ExprContext::new(Some(tables), resolver),
-        &resolver.catalog,
-    )?
-    .can_hash()
-    {
+    if !comparison_collation(left, right, &ExprContext::new(Some(tables), resolver))?.can_hash() {
         return Ok(None);
     }
     Ok(Some((left_table, right_table)))

@@ -1845,7 +1845,7 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         rhs: name_col_reg,
         target_pc: found_label,
         flags: Default::default(),
-        collation: super::collate::CollationSeq::NoCase,
+        collation: super::collate::CollationSeq::NOCASE,
     });
     program.emit_insn(Insn::Copy {
         src_reg: name_col_reg,

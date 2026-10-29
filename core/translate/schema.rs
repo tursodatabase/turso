@@ -450,10 +450,6 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::IntToBoolean
         | ScalarFunc::IsAutocommit
         | ScalarFunc::ConnTxnId
-        | ScalarFunc::TestUintLt
-        | ScalarFunc::TestUintEq
-        | ScalarFunc::NumericLt
-        | ScalarFunc::NumericEq
         | ScalarFunc::ValidateIpAddr
         | ScalarFunc::GetByte
         | ScalarFunc::UnixEpoch => Ok(CheckExprType::Integer),
@@ -816,6 +812,9 @@ fn validate(
                         table_name,
                         c.col_name
                     );
+                }
+                if col_type.is_array() {
+                    resolver.schema().check_array_element_type(type_name)?;
                 }
 
                 // Domain types require STRICT tables because domain constraints
@@ -2291,7 +2290,7 @@ pub fn translate_drop_table(
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::NoCase,
+        collation: CollationSeq::NOCASE,
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -2734,7 +2733,7 @@ pub fn translate_drop_table(
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::NoCase,
+            collation: CollationSeq::NOCASE,
         });
 
         program.emit_insn(Insn::Delete {

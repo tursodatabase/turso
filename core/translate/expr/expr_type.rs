@@ -10,10 +10,12 @@ use turso_parser::ast;
 use super::custom_types::operator_to_str;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ScalarFunc};
-use crate::schema::{Column, Schema, TypeDef};
+use crate::schema::{BTreeTable, Column, Schema, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
+use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::TableReferences;
+use crate::type_ordering::TypeOrdering;
 use crate::vdbe::affinity::Affinity;
 
 /// Type parameters are kept as written, in the same form as `Column::ty_params`.
@@ -38,8 +40,8 @@ pub(crate) enum ExprType {
     /// Parameters (`?`) should be untyped too, but are `Builtin(Any)` for now.
     Untyped,
     Null,
-    /// The result of an operator or function applied to a custom type or an array.
-    /// Which function runs, and so the result type, is not decided here.
+    /// A value whose type nothing declares: the result of a custom type's own
+    /// operator function, or of an operator on an array.
     Unknown,
 }
 
@@ -78,6 +80,20 @@ impl ExprType {
         matches!(self, Self::Array { .. })
     }
 
+    /// Whether this is an array whose element type nothing declares, such as
+    /// `ARRAY[x]` over a column without a type, or `ARRAY[]`.
+    pub(crate) fn is_array_of_unknown_elements(&self) -> bool {
+        matches!(self, Self::Array { element, .. } if element.is_unknown_element())
+    }
+
+    /// Whether nothing declares the type of this array element.
+    fn is_unknown_element(&self) -> bool {
+        matches!(
+            self,
+            Self::Builtin(BuiltinType::Any) | Self::Null | Self::Unknown
+        )
+    }
+
     pub(crate) fn array_dimensions(&self) -> u32 {
         match self {
             Self::Array { dimensions, .. } => *dimensions,
@@ -93,21 +109,68 @@ pub(crate) fn same_type_def(a: &TypeDef, b: &TypeDef) -> bool {
 }
 
 /// What an expression's column references and registers refer to.
-///
-/// The resolver holds the table being written (`SELF_TABLE`) and what is known
-/// about registers and subquery results, so every caller sees the same types.
-pub(crate) struct TypeEnv<'a> {
-    tables: Option<&'a TableReferences>,
-    resolver: &'a Resolver<'a>,
+pub(crate) enum TypeEnv<'a> {
+    /// An expression in a statement being translated. The resolver holds the
+    /// table being written (`SELF_TABLE`) and what is known about registers
+    /// and subquery results, so every caller sees the same types.
+    Statement {
+        tables: Option<&'a TableReferences>,
+        resolver: &'a Resolver<'a>,
+    },
+    /// An expression over the columns of one table, such as an index
+    /// expression read from the schema. Its columns are `SELF_TABLE` columns.
+    Table {
+        table: &'a BTreeTable,
+        schema: &'a Schema,
+    },
 }
 
 impl<'a> TypeEnv<'a> {
     pub(crate) fn new(tables: Option<&'a TableReferences>, resolver: &'a Resolver<'a>) -> Self {
-        Self { tables, resolver }
+        Self::Statement { tables, resolver }
     }
 
-    fn schema(&self) -> &Schema {
-        self.resolver.schema()
+    pub(crate) fn over_table(table: &'a BTreeTable, schema: &'a Schema) -> Self {
+        Self::Table { table, schema }
+    }
+
+    pub(crate) fn schema(&self) -> &Schema {
+        match self {
+            Self::Statement { resolver, .. } => resolver.schema(),
+            Self::Table { schema, .. } => schema,
+        }
+    }
+
+    fn tables(&self) -> Option<&TableReferences> {
+        match self {
+            Self::Statement { tables, .. } => *tables,
+            Self::Table { .. } => None,
+        }
+    }
+
+    fn resolver(&self) -> Option<&Resolver<'a>> {
+        match self {
+            Self::Statement { resolver, .. } => Some(resolver),
+            Self::Table { .. } => None,
+        }
+    }
+
+    fn self_table_column_type(&self, column: usize) -> Option<ExprType> {
+        match self {
+            Self::Statement { resolver, .. } => {
+                let table = resolver.self_table()?;
+                Some(column_type(
+                    table.columns().get(column)?,
+                    table.is_strict,
+                    resolver.schema(),
+                ))
+            }
+            Self::Table { table, schema, .. } => Some(column_type(
+                table.columns().get(column)?,
+                table.is_strict,
+                schema,
+            )),
+        }
     }
 }
 
@@ -166,15 +229,13 @@ pub(crate) fn column_custom_type(expr: &ast::Expr, env: &TypeEnv) -> Option<Colu
         return None;
     };
     match column_reference_type(*table, *column, env)? {
-        ExprType::Custom { type_def, params } => Some(ColumnCustomType { type_def, params }),
+        ExprType::Custom { type_def, .. } => Some(ColumnCustomType { type_def }),
         _ => None,
     }
 }
 
-#[allow(clippy::vec_box)]
 pub(crate) struct ColumnCustomType {
     pub(crate) type_def: Arc<TypeDef>,
-    pub(crate) params: Vec<Box<ast::Expr>>,
 }
 
 fn literal_type(literal: &ast::Literal) -> ExprType {
@@ -201,7 +262,7 @@ fn column_reference_type(
     env: &TypeEnv,
 ) -> Option<ExprType> {
     if let Some((_, table)) = env
-        .tables
+        .tables()
         .and_then(|tables| tables.find_table_by_internal_id(table))
     {
         return Some(column_type(
@@ -211,14 +272,30 @@ fn column_reference_type(
         ));
     }
     if table.is_self_table() {
-        let table = env.resolver.self_table()?;
-        return Some(column_type(
-            table.columns().get(column)?,
-            table.is_strict,
-            env.schema(),
-        ));
+        return env.self_table_column_type(column);
     }
     None
+}
+
+/// The order values of this type compare in, if the type has its own: an
+/// array, or numeric. A domain has the
+/// order of the type it is based on.
+pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrdering> {
+    match ty {
+        ExprType::Custom { type_def, .. } => schema.type_ordering(type_def),
+        ExprType::Array { element, .. } => {
+            let element_is_text = matches!(
+                sqlite_operand_type(element.as_ref().clone(), None, schema),
+                ExprType::Builtin(BuiltinType::Text) | ExprType::Untyped
+            );
+            Some(if element_is_text {
+                TypeOrdering::TextArray
+            } else {
+                TypeOrdering::Array
+            })
+        }
+        ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null | ExprType::Unknown => None,
+    }
 }
 
 /// Custom types only apply to columns of STRICT tables.
@@ -228,6 +305,9 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
             type_def: Arc::clone(type_def),
             params: column.ty_params.clone(),
         },
+        // An array column stores blobs, so its affinity says nothing about its
+        // elements; the declared element type does.
+        None if column.is_array() => builtin_type_of_affinity(Affinity::affinity(&column.ty_str)),
         None => builtin_type_of_affinity(column.affinity()),
     };
     ExprType::array(scalar, column.array_dimensions())
@@ -376,9 +456,20 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         return ExprType::Builtin(BuiltinType::Any);
     };
     match func {
-        Func::Scalar(f) if f.returns_array_blob() => {
-            ExprType::array(ExprType::Builtin(BuiltinType::Any), 1)
+        Func::Scalar(ScalarFunc::Array) => {
+            ExprType::array(common_type(args.iter().map(|arg| arg.as_ref()), env), 1)
         }
+        Func::Scalar(ScalarFunc::StringToArray) => {
+            ExprType::array(ExprType::Builtin(BuiltinType::Text), 1)
+        }
+        // The other functions that build an array give an array of the type of
+        // their array argument: array_prepend(element, array) and
+        // array_cat(array1, array2) take it second when the first is not one.
+        Func::Scalar(f) if f.returns_array_blob() => args
+            .iter()
+            .map(|arg| type_of(arg, env))
+            .find(ExprType::is_array)
+            .unwrap_or_else(|| ExprType::array(ExprType::Builtin(BuiltinType::Any), 1)),
         Func::Agg(AggFunc::ArrayAgg) => ExprType::array(
             args.first()
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
@@ -392,12 +483,19 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         }
         Func::Scalar(ScalarFunc::Iif) => common_type(args.iter().skip(1).map(|a| a.as_ref()), env),
         // A call with the wrong number of arguments is reported when it is translated.
-        Func::Scalar(ScalarFunc::Nullif | ScalarFunc::Abs | ScalarFunc::ArrayElement)
-            if args.is_empty() =>
-        {
-            ExprType::Builtin(BuiltinType::Any)
-        }
-        Func::Scalar(ScalarFunc::Nullif) => type_of(&args[0], env),
+        Func::Scalar(
+            ScalarFunc::Nullif
+            | ScalarFunc::Likely
+            | ScalarFunc::Unlikely
+            | ScalarFunc::Likelihood
+            | ScalarFunc::Abs
+            | ScalarFunc::ArrayElement,
+        ) if args.is_empty() => ExprType::Builtin(BuiltinType::Any),
+        // nullif returns its first argument or NULL; likely, unlikely and
+        // likelihood return their first argument unchanged.
+        Func::Scalar(
+            ScalarFunc::Nullif | ScalarFunc::Likely | ScalarFunc::Unlikely | ScalarFunc::Likelihood,
+        ) => type_of(&args[0], env),
         Func::Scalar(ScalarFunc::Abs) => arithmetic_type(
             &ExprType::Builtin(BuiltinType::Integer),
             &sqlite_operand_type(type_of(&args[0], env), None, env.schema()),
@@ -418,22 +516,49 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
 /// PostgreSQL frontend will choose its own common type through the dialect.
 ///
 /// NULLs don't count. An array wins over anything else, as main has always decoded
-/// such a value as an array. Numbers widen as in arithmetic. String literals count
+/// such a value as an array. Two arrays give an array of the common type of
+/// their elements, where elements of unknown type take the other array's
+/// element type. Numbers widen as in arithmetic. String literals count
 /// as text. The same custom type with different parameters, such as numeric(10,2)
 /// and numeric(5,1), is that type without parameters. A custom type mixed with any
 /// other type counts as the type it is stored as. Any other mix is `Any`.
 fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) -> ExprType {
+    common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
+}
+
+fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
     let mut common: Option<ExprType> = None;
-    for ty in exprs.map(|expr| type_of(expr, env)) {
+    for ty in types {
         common = Some(match (common, ty) {
             (None, ty) | (Some(ExprType::Null), ty) => ty,
             (Some(common), ExprType::Null) => common,
+            (
+                Some(ExprType::Array {
+                    element: a,
+                    dimensions: a_dimensions,
+                }),
+                ExprType::Array {
+                    element: b,
+                    dimensions: b_dimensions,
+                },
+            ) => ExprType::array(
+                common_element_type(*a, *b, schema),
+                a_dimensions.max(b_dimensions),
+            ),
             (Some(common @ ExprType::Array { .. }), _) => common,
             (_, ty @ ExprType::Array { .. }) => ty,
-            (Some(common), ty) => common_scalar_type(common, ty, env.schema()),
+            (Some(common), ty) => common_scalar_type(common, ty, schema),
         });
     }
     common.unwrap_or(ExprType::Null)
+}
+
+fn common_element_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
+    match (a, b) {
+        (a, b) if a.is_unknown_element() => b,
+        (a, b) if b.is_unknown_element() => a,
+        (a, b) => common_scalar_type(a, b, schema),
+    }
 }
 
 fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
@@ -480,10 +605,11 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
 /// For expressions whose type is only known through their SQLite affinity: a column
 /// that could not be found, a register, a subquery result.
 fn affinity_type(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
-    builtin_type_of_affinity(get_expr_affinity(
-        expr,
-        &super::ExprContext::new(env.tables, env.resolver),
-    ))
+    let affinity = match env.resolver() {
+        Some(resolver) => get_expr_affinity(expr, &super::ExprContext::new(env.tables(), resolver)),
+        None => get_expr_affinity(expr, &TableMetadata::new(env.tables())),
+    };
+    builtin_type_of_affinity(affinity)
 }
 
 fn builtin_type_of_affinity(affinity: Affinity) -> ExprType {

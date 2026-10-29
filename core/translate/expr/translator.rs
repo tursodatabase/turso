@@ -705,7 +705,6 @@ fn translate_case_expr(
                         .expect("base_reg is set only with a base expression"),
                     when_expr,
                     &ExprContext::new(referenced_tables, resolver),
-                    &resolver.catalog,
                 )?,
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
@@ -772,6 +771,7 @@ fn translate_cast_expr(
 
     if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
         if tn.array_dimensions > 0 {
+            resolver.schema().check_array_element_type(cast_type_name)?;
             let mut column = Column::new(
                 None,
                 cast_type_name.clone(),
@@ -892,10 +892,9 @@ fn translate_function_call_expr(
         first_collation(
             args.iter()
                 .map(|arg| (arg.as_ref(), ExprContext::new(referenced_tables, resolver))),
-            &resolver.catalog,
         )?
     } else {
-        CollationSeq::Binary
+        CollationSeq::BINARY
     };
     let func_ctx = FuncCtx {
         func,
@@ -1912,8 +1911,6 @@ fn translate_function_call_expr(
                 | ScalarFunc::TestUintSub
                 | ScalarFunc::TestUintMul
                 | ScalarFunc::TestUintDiv
-                | ScalarFunc::TestUintLt
-                | ScalarFunc::TestUintEq
                 | ScalarFunc::StringReverse
                 | ScalarFunc::Gcd
                 | ScalarFunc::Lcm
@@ -1930,8 +1927,6 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericSub
                 | ScalarFunc::NumericMul
                 | ScalarFunc::NumericDiv
-                | ScalarFunc::NumericLt
-                | ScalarFunc::NumericEq
                 | ScalarFunc::DatePlus
                 | ScalarFunc::DateMinus => translate_function(
                     program,

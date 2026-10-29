@@ -1199,6 +1199,11 @@ pub fn translate_alter_table(
                 }
                 let written_ty = column.written_ty_str.as_deref().unwrap_or(ty);
                 let is_builtin = ty.is_empty() || is_builtin_strict_type(written_ty);
+                if column.is_array() {
+                    resolver
+                        .schema()
+                        .check_array_element_type(&normalize_ident(ty))?;
+                }
                 // Domain types require STRICT tables because domain constraints
                 // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
                 if !is_builtin && !btree.is_strict {
@@ -1619,7 +1624,7 @@ pub fn translate_alter_table(
                     func: crate::function::FuncCtx {
                         func: Func::AlterTable(AlterTableFunc::RenameTable),
                         arg_count: 7,
-                        collation: CollationSeq::Binary,
+                        collation: CollationSeq::BINARY,
                     },
                 });
 
@@ -1927,7 +1932,7 @@ pub fn translate_alter_table(
             let altered_table = if let Some(replacement_column) = &replacement_column {
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] = replacement_column.clone();
-                table.resolve_custom_type_affinities(resolver.schema());
+                table.resolve_custom_types(resolver.schema());
                 table.prepare_generated_columns()?;
                 let column_names: Vec<&str> = table
                     .columns()
@@ -2144,7 +2149,7 @@ pub fn translate_alter_table(
                             AlterTableFunc::AlterColumn
                         }),
                         arg_count: 8,
-                        collation: CollationSeq::Binary,
+                        collation: CollationSeq::BINARY,
                     },
                 });
 
@@ -2841,7 +2846,7 @@ fn translate_rename_virtual_table(
             func: crate::function::FuncCtx {
                 func: Func::AlterTable(AlterTableFunc::RenameTable),
                 arg_count: 7,
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
             },
         });
 

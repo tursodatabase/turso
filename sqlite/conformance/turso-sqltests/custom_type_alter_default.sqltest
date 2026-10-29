@@ -151,7 +151,7 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test alter-add-default-old-row-index-and-update-use-encoded-default {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
     INSERT INTO t VALUES (1, 10);
     ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
@@ -227,7 +227,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test alter-add-default-old-row-index-delete {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
     INSERT INTO t VALUES (1, 10);
     ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
@@ -243,7 +243,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test alter-add-default-old-row-order-by-uses-encoded-default {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
     INSERT INTO t VALUES (1, 10);
     ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
@@ -288,7 +288,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test alter-add-default-old-row-join-uses-encoded-default {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
     INSERT INTO t VALUES (1, 10);
     ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
@@ -318,7 +318,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test alter-add-default-left-join-unmatched-row-is-null {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
     INSERT INTO t VALUES (1, 10);
     ALTER TABLE t ADD COLUMN c cents DEFAULT 5;

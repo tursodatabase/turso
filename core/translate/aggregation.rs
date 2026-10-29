@@ -1,15 +1,12 @@
 use crate::alloc::TursoVecExt;
-use crate::translate::{
-    catalog::CatalogContext,
-    expr_context::{ExprContext, ExprProperties},
-};
+use crate::translate::expr_context::ExprContext;
 use turso_parser::ast;
 
 use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::Table,
     sync::Arc,
-    translate::collate::{expr_collation, CollationSeq},
+    translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
         insn::{AggStepData, HashDistinctData, Insn},
@@ -500,10 +497,9 @@ pub(crate) fn open_aggregate_sorter(
         } else {
             ast::SortOrder::Asc
         },
-        CollationSeq::Binary,
+        CollationSeq::BINARY,
         None,
     ))?;
-    data.comparators.try_push(None)?;
     data.columns = aggregate.order_by().len() + 1 + 2 * aggregate.args.len();
     program.emit_insn(Insn::SorterOpen {
         data: Box::new(data),
@@ -547,8 +543,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Avg),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -563,8 +558,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count0),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -581,8 +575,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Count),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -609,8 +602,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::GroupConcat),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
 
@@ -625,15 +617,12 @@ pub fn translate_aggregation_step(
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation =
                 ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
-            let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Max),
-                    comparator,
                     collation: arg_collation,
                 }),
             });
@@ -648,15 +637,12 @@ pub fn translate_aggregation_step(
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation =
                 ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
-            let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Min),
-                    comparator,
                     collation: arg_collation,
                 }),
             });
@@ -677,8 +663,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: value_reg,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupObject),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -696,8 +681,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::JsonGroupArray),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -717,8 +701,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: delimiter_reg,
                     func: AccumulatorFunc::Agg(AggFunc::StringAgg),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
 
@@ -736,8 +719,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Sum),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -754,8 +736,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Total),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -773,8 +754,7 @@ pub fn translate_aggregation_step(
                     col: expr_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::ArrayAgg),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -791,7 +771,6 @@ pub fn translate_aggregation_step(
                 func,
                 expr,
                 &ExprContext::new(Some(referenced_tables), resolver),
-                &resolver.catalog,
             )?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
@@ -799,7 +778,6 @@ pub fn translate_aggregation_step(
                     col: value_reg,
                     delimiter: 0,
                     func: AccumulatorFunc::Agg(AggFunc::Mode),
-                    comparator: None,
                     collation: arg_collation,
                 }),
             });
@@ -821,7 +799,6 @@ pub fn translate_aggregation_step(
                 func,
                 expr,
                 &ExprContext::new(Some(referenced_tables), resolver),
-                &resolver.catalog,
             )?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
@@ -829,7 +806,6 @@ pub fn translate_aggregation_step(
                     col: value_reg,
                     delimiter: fraction_reg,
                     func: AccumulatorFunc::Agg(func.clone()),
-                    comparator: None,
                     collation: arg_collation,
                 }),
             });
@@ -871,8 +847,7 @@ pub fn translate_aggregation_step(
                     } else {
                         func.clone()
                     })),
-                    comparator: None,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 }),
             });
             target_register
@@ -887,10 +862,9 @@ pub fn translate_aggregation_step(
 fn ordered_set_collation(
     func: &AggFunc,
     expr: &ast::Expr,
-    metadata: &impl ExprProperties,
-    catalog: &CatalogContext<'_>,
+    context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
-    let collation = expr_collation(expr, metadata, catalog)?;
+    let collation = context.expr_collation(expr)?;
     if collation.is_custom() {
         crate::bail_parse_error!(
             "{}() does not support the custom collation {}",

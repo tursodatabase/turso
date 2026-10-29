@@ -5065,6 +5065,12 @@ impl<'a> Parser<'a> {
                                 .and_then(|s| s.strip_suffix('\''))
                                 .unwrap_or(&op_raw)
                                 .to_owned();
+                            if matches!(op.as_str(), "<" | "<=" | ">" | ">=" | "=" | "!=") {
+                                return Err(Error::ParseError(format!(
+                                    "OPERATOR '{op}' is not supported: values of a custom type \
+                                     sort and compare by their stored value"
+                                )));
+                            }
                             // Three syntaxes:
                             // 1. OPERATOR 'op' func_name          (named)
                             // 2. OPERATOR 'op' (type) -> func_name (old named)

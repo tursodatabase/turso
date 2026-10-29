@@ -663,7 +663,7 @@ fn allocate_window_minmax(
                     default: None,
                     expr: None,
                 },
-                IndexColumn::new("1", 1, CollationSeq::Binary),
+                IndexColumn::new("1", 1, CollationSeq::BINARY),
             ],
             unique: false,
             ephemeral: true,
@@ -3243,8 +3243,7 @@ fn emit_function_step(
                         col: arg_load_start.unwrap_or(0),
                         delimiter: 0,
                         func: AccumulatorFunc::Window(win_func.clone()),
-                        comparator: None,
-                        collation: CollationSeq::Binary,
+                        collation: CollationSeq::BINARY,
                     }),
                 });
             }
@@ -3354,7 +3353,6 @@ fn emit_function_inverse(
                 col: arg_load_start.unwrap_or(0),
                 delimiter: 0,
                 func: func.func.clone(),
-                comparator: None,
             });
 
             if let Some(label) = filter_skip_label {

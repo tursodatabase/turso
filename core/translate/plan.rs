@@ -8,7 +8,7 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::CollationSeq,
+        collate::{expr_text_collation, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
@@ -3146,9 +3146,12 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        column.set_collation(Some(
-            ExprContext::new(Some(table_references), resolver).expr_collation(result_expr)?,
-        ));
+        let context = ExprContext::new(Some(table_references), resolver);
+        column.set_collation(Some(expr_text_collation(
+            result_expr,
+            &context,
+            context.catalog(),
+        )?));
     }
     Ok(columns)
 }

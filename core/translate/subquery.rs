@@ -1030,7 +1030,6 @@ fn get_subquery_parser<'a>(
                             &ExprContext::new(Some(referenced_tables), resolver),
                             &c.expr,
                             &ExprContext::new(Some(table_references), resolver),
-                            &resolver.catalog,
                         )?;
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),

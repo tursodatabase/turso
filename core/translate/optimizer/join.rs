@@ -3039,7 +3039,7 @@ mod tests {
                 table_id: joined_tables[0].internal_id,
                 target: ColumnTarget::Column(0),
                 order: SortOrder::Asc,
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
                 nulls_order: None,
             }],
             purpose: OrderTargetPurpose::EliminatesSort(EliminatesSortBy::Order),
@@ -3185,7 +3185,7 @@ mod tests {
             columns: crate::alloc::vec![IndexColumn::new(
                 "id",
                 0,
-                crate::translate::collate::CollationSeq::Binary
+                crate::translate::collate::CollationSeq::BINARY
             )],
             unique: true,
             ephemeral: false,
@@ -3283,7 +3283,7 @@ mod tests {
             columns: crate::alloc::vec![IndexColumn::new(
                 "id",
                 0,
-                crate::translate::collate::CollationSeq::Binary
+                crate::translate::collate::CollationSeq::BINARY
             )],
             unique: true,
             ephemeral: false,
@@ -3427,7 +3427,7 @@ mod tests {
                     columns: crate::alloc::vec![IndexColumn::new(
                         "id",
                         0,
-                        crate::translate::collate::CollationSeq::Binary
+                        crate::translate::collate::CollationSeq::BINARY
                     )],
                     unique: true,
                     ephemeral: false,
@@ -3450,7 +3450,7 @@ mod tests {
             columns: crate::alloc::vec![IndexColumn::new(
                 "customer_id",
                 1,
-                crate::translate::collate::CollationSeq::Binary
+                crate::translate::collate::CollationSeq::BINARY
             )],
             unique: false,
             ephemeral: false,
@@ -3467,7 +3467,7 @@ mod tests {
             columns: crate::alloc::vec![IndexColumn::new(
                 "order_id",
                 1,
-                crate::translate::collate::CollationSeq::Binary
+                crate::translate::collate::CollationSeq::BINARY
             )],
             unique: false,
             ephemeral: false,
@@ -3980,8 +3980,8 @@ mod tests {
             table_name: "t1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![
-                IndexColumn::new("x", 0, crate::translate::collate::CollationSeq::Binary),
-                IndexColumn::new("y", 1, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("x", 0, crate::translate::collate::CollationSeq::BINARY),
+                IndexColumn::new("y", 1, crate::translate::collate::CollationSeq::BINARY),
             ],
             unique: false,
             root_page: 2,
@@ -4084,9 +4084,9 @@ mod tests {
             table_name: "t1".to_string(),
             where_clause: None,
             columns: crate::alloc::vec![
-                IndexColumn::new("c1", 0, crate::translate::collate::CollationSeq::Binary),
-                IndexColumn::new("c2", 1, crate::translate::collate::CollationSeq::Binary),
-                IndexColumn::new("c3", 2, crate::translate::collate::CollationSeq::Binary),
+                IndexColumn::new("c1", 0, crate::translate::collate::CollationSeq::BINARY),
+                IndexColumn::new("c2", 1, crate::translate::collate::CollationSeq::BINARY),
+                IndexColumn::new("c3", 2, crate::translate::collate::CollationSeq::BINARY),
             ],
             unique: false,
             root_page: 2,
@@ -4397,7 +4397,7 @@ mod tests {
                     IndexColumn::new(
                         (*name).to_string(),
                         *pos_in_table,
-                        crate::translate::collate::CollationSeq::Binary,
+                        crate::translate::collate::CollationSeq::BINARY,
                     )
                 })
                 .try_collect()
@@ -4552,7 +4552,7 @@ mod tests {
             columns: crate::alloc::vec![IndexColumn::new(
                 "a",
                 0,
-                crate::translate::collate::CollationSeq::Binary
+                crate::translate::collate::CollationSeq::BINARY
             )],
             unique: false, // Non-unique index
             ephemeral: false,
