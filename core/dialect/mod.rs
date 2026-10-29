@@ -547,29 +547,12 @@ mod tests {
     }
 
     #[test]
-    fn query_runner_reports_invalid_utf8_once() {
+    fn consume_stmt_reports_parse_error() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "query-runner-invalid-utf8.db", Arc::new(SqliteDialect)).unwrap();
+        let db = open_db(&io, "consume-stmt-parse-error.db", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
-        let mut runner = conn.query_runner(b"SELECT 1;\xff");
 
-        let Some(Err(crate::LimboError::ParseError(message))) = runner.next() else {
-            panic!("invalid UTF-8 must produce a parse error");
-        };
-        assert!(message.contains("invalid UTF-8"));
-        assert!(runner.next().is_none());
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn query_runner_reports_parse_error_once() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "query-runner-parse-error.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        let mut runner = conn.query_runner(b"SELECT * FROM");
-
-        assert!(runner.next().is_some_and(|result| result.is_err()));
-        assert!(runner.next().is_none());
+        assert!(conn.consume_stmt("SELECT * FROM").is_err());
         conn.close().unwrap();
     }
 
