@@ -4306,6 +4306,7 @@ impl TryClone for FromClauseSubquery {
             name: self.name.clone(),
             plan: self.plan.clone(),
             columns: self.columns.try_clone()?,
+            column_types: self.column_types.clone(),
             parenthesized_join_columns: self.parenthesized_join_columns.clone(),
             result_columns_start_reg: self.result_columns_start_reg,
             materialized_cursor_id: self.materialized_cursor_id,
@@ -5752,6 +5753,10 @@ pub struct FromClauseSubquery {
     pub plan: Box<Plan>,
     /// The columns of the derived table.
     pub columns: Vec<Column>,
+    /// The type of each column, computed once when the subquery is planned.
+    /// Computing it on each reference would walk every nested subquery again,
+    /// which takes exponential time in the nesting depth.
+    pub(crate) column_types: Vec<ExprType>,
     /// Source names for a parenthesized join. SQLite stores these in
     /// `ExprList_item.zEName` when `selectExpander` handles `SF_NestedFrom`.
     ///

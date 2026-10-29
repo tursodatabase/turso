@@ -437,12 +437,9 @@ fn column_reference_type(
         .tables()
         .and_then(|tables| tables.find_table_by_internal_id(table))
     {
-        Some((_, Table::FromClauseSubquery(subquery))) => Some(query_column_type(
-            &subquery.plan,
-            column,
-            env.resolver()
-                .expect("only a statement's expressions refer to FROM clause subqueries"),
-        )),
+        Some((_, Table::FromClauseSubquery(subquery))) => {
+            subquery.column_types.get(column).cloned()
+        }
         Some((_, Table::RecursiveCteInput(input))) => input.column_types.get(column).cloned(),
         _ => base_table_column_type(table, column, env),
     }
