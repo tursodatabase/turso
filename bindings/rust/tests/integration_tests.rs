@@ -2873,3 +2873,76 @@ async fn test_transactional_batch_joins_an_open_transaction() {
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 0);
 }
+const RUNAWAY_COUNT: &str =
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c";
+
+async fn first_row_error(conn: &turso::Connection, sql: &str) -> Error {
+    let mut rows = conn.query(sql, ()).await.unwrap();
+    match rows.next().await {
+        Err(err) => err,
+        Ok(row) => panic!(
+            "expected the statement to be interrupted, got {:?}",
+            row.is_some()
+        ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_query_timeout_interrupts_a_runaway_statement() {
+    let conn = memory_connection().await;
+    conn.set_query_timeout(std::time::Duration::from_millis(100))
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let err = first_row_error(&conn, RUNAWAY_COUNT).await;
+    assert!(matches!(err, Error::Interrupt(_)), "got {err:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    // The deadline is per statement: the connection runs the next one normally.
+    let mut rows = conn.query("SELECT 1", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+
+    // Duration::ZERO disables the limit again.
+    conn.set_query_timeout(std::time::Duration::ZERO).unwrap();
+    let mut rows = conn
+        .query(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) SELECT count(*) FROM c",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 100000);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_interrupt_from_another_thread_stops_a_running_statement() {
+    let conn = memory_connection().await;
+
+    // Interrupting an idle connection does nothing to its next statement.
+    conn.interrupt().unwrap();
+    let mut rows = conn.query("SELECT 1", ()).await.unwrap();
+    assert!(rows.next().await.unwrap().is_some());
+    drop(rows);
+
+    // An interrupt that lands before the statement starts is a no-op, so keep
+    // interrupting until the statement has returned.
+    let handle = conn.clone();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = done.clone();
+    let interrupter = std::thread::spawn(move || {
+        while !finished.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            handle.interrupt().unwrap();
+        }
+    });
+    let err = first_row_error(&conn, RUNAWAY_COUNT).await;
+    done.store(true, std::sync::atomic::Ordering::Release);
+    interrupter.join().unwrap();
+    assert!(matches!(err, Error::Interrupt(_)), "got {err:?}");
+
+    let mut rows = conn.query("SELECT 2", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 2);
+}

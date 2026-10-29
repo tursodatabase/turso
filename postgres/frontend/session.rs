@@ -66,24 +66,22 @@ pub fn open_database_with_io(
     flags: turso_core::OpenFlags,
     opts: turso_core::DatabaseOpts,
 ) -> crate::Result<Arc<turso_core::Database>> {
-    let is_new = turso_core::is_memory_like(path) || io.open_file(path, flags, true)?.size()? == 0;
-    if !is_new {
+    let is_empty =
+        turso_core::is_memory_like(path) || io.open_file(path, flags, true)?.size()? == 0;
+    if !is_empty {
         refuse_a_file_with_tables_in_no_schema(&io, path, flags, opts)?;
     }
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    let db = turso_core::Database::open(
+    turso_core::Database::open(
         io,
         path,
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
             .db_opts(opts.with_mvcc(true)),
-    )?;
-    if is_new {
-        set_up_new_database(&db)?;
-    }
-    Ok(db)
+    )
+    .map_err(Into::into)
 }
 
 /// Refuses an existing file whose tables are in no schema before it is
@@ -111,26 +109,18 @@ fn refuse_a_file_with_tables_in_no_schema(
     Ok(())
 }
 
-/// Sets up a database that was just made: creates the schema `public`, as
-/// PostgreSQL does when a database is created. `public` is a stored
-/// namespace like any other schema, so once dropped it stays dropped, and
-/// the root namespace holds only the engine's own tables. A read-only
-/// database is left as it is.
-pub fn set_up_new_database(db: &Arc<turso_core::Database>) -> crate::Result<()> {
-    let conn = db.connect(turso_core::ConnectOpts::new())?;
-    if conn.qualifier("public").is_some() || conn.is_readonly(turso_core::MAIN_DB_ID) {
-        return Ok(());
-    }
-    match conn.create_namespace("public") {
-        Ok(_) => Ok(()),
-        Err(_) if conn.qualifier("public").is_some() => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
-        let conn = db.connect_with_hooks(Arc::new(PgSessionState::default()))?;
+        Self::connect_with(db, turso_core::ConnectOpts::new())
+    }
+
+    /// Opens a session on `db`, connecting with `opts`, such as the
+    /// encryption key. The session has its own transaction and settings.
+    pub fn connect_with(
+        db: &Arc<turso_core::Database>,
+        opts: turso_core::ConnectOpts,
+    ) -> crate::Result<Self> {
+        let conn = db.connect_with_hooks(opts, Arc::new(PgSessionState::default()))?;
         refuse_tables_in_no_schema(&conn)?;
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
@@ -235,16 +225,9 @@ pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
 /// A database whose tables are in the root namespace, in no schema, was
 /// made by an earlier version of tursopg or by SQLite. This version keeps
 /// every table in a schema and would hide those, so it refuses the
-/// database instead. A database that has a schema, or none and no tables,
-/// is opened as it is: a dropped `public` is not recreated.
+/// database instead.
 fn refuse_tables_in_no_schema(conn: &Arc<Connection>) -> Result<()> {
-    if conn.qualifier("public").is_some() {
-        return Ok(());
-    }
     let schema = conn.current_schema();
-    if schema.namespaces().next().is_some() {
-        return Ok(());
-    }
     let has_tables_in_no_schema = schema
         .tables(turso_core::NamespaceId::ROOT)
         .any(|table| table.btree().is_some() && !catalog::is_system_table_name(table.get_name()))
@@ -1386,7 +1369,6 @@ fn get_table_columns(
 #[cfg(test)]
 mod tests {
     use super::{open_database_with_io, search_path_parser, PgConnection};
-    use crate::session::set_up_new_database;
     use crate::PostgresDialect;
     use chumsky::Parser;
     use std::sync::Arc;
@@ -1401,7 +1383,6 @@ mod tests {
                 .db_opts(DatabaseOpts::new().with_views(true)),
         )
         .unwrap();
-        set_up_new_database(&db).unwrap();
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute(
             "CREATE SCHEMA app; \
@@ -1441,7 +1422,6 @@ mod tests {
                 .db_opts(DatabaseOpts::new().with_views(true)),
         )
         .unwrap();
-        set_up_new_database(&db).unwrap();
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute(
             "CREATE VIEW aliased AS SELECT a.nspname FROM pg_namespace a JOIN pg_namespace b ON a.oid = b.oid; \
@@ -1475,7 +1455,6 @@ mod tests {
                 .db_opts(DatabaseOpts::new().with_views(true)),
         )
         .unwrap();
-        set_up_new_database(&db).unwrap();
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute(
             "CREATE TABLE t (a int); \
@@ -1523,7 +1502,6 @@ mod tests {
                     .db_opts(DatabaseOpts::new().with_attach(true)),
             )
             .unwrap();
-            set_up_new_database(&db).unwrap();
             let conn = PgConnection::connect(&db).unwrap();
             conn.execute("CREATE SCHEMA s").unwrap();
             assert!(

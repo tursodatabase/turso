@@ -437,6 +437,13 @@ pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
         ast::Expr::Literal(literal) => literal_default_value(literal),
         ast::Expr::Id(name) => Ok(Value::from_text(name.as_str().to_string())),
         ast::Expr::Unary(op, inner) => {
+            if let (ast::UnaryOperator::Negative, ast::Expr::Literal(ast::Literal::Numeric(text))) =
+                (op, inner.as_ref())
+            {
+                if !text.starts_with("0x") && !text.starts_with("0X") {
+                    return parse_numeric_literal(&format!("-{text}"));
+                }
+            }
             let value = eval_constant_default_value(inner)?;
             match (op, value) {
                 (ast::UnaryOperator::Positive, value) => Ok(value),
@@ -1785,6 +1792,21 @@ pub fn translate_alter_table(
                 )));
             };
 
+            // Built here so a name an index method cannot use fails before anything is written
+            let old_column_name = btree.columns()[column_index]
+                .name
+                .as_deref()
+                .expect("column being ALTERed should be named");
+            let mut renamed_index_methods = Vec::new();
+            for index in &table_indexes {
+                let Some(index_method) = &index.index_method else {
+                    continue;
+                };
+                if let Some(attachment) = index_method.rename_column(old_column_name, col_name)? {
+                    renamed_index_methods.push((index.name.clone(), attachment));
+                }
+            }
+
             if definition
                 .constraints
                 .iter()
@@ -2323,6 +2345,7 @@ pub fn translate_alter_table(
                     definition,
                     rename,
                     rewritten_triggers: triggers_to_rewrite,
+                    renamed_index_methods,
                 }),
             });
         }

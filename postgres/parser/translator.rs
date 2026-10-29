@@ -5936,6 +5936,7 @@ fn translate_create_enum(
             }],
             base: "text".into(),
             encode: Some(Box::new(encode)),
+            coerce: None,
             decode: Some(Box::new(decode)),
             operators: vec![ast::TypeOperator {
                 op: "<".into(),

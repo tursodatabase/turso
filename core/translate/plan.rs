@@ -2235,6 +2235,17 @@ impl TableReferences {
             .find(|t| t.internal_id == internal_id)
     }
 
+    /// Whether `column` of the joined table `internal_id` is a value its index method query
+    /// provides (see [IndexMethodQuery::covered_columns]) instead of a column of the table: it
+    /// stands for an expression the index method computes, such as a score or a distance.
+    pub fn provided_by_index_method(&self, internal_id: TableInternalId, column: usize) -> bool {
+        self.find_joined_table_by_internal_id(internal_id)
+            .is_some_and(|table| match &table.op {
+                Operation::IndexMethodQuery(query) => query.covered_columns.contains_key(&column),
+                _ => false,
+            })
+    }
+
     /// Returns a mutable reference to the [JoinedTable] with the given internal ID.
     pub fn find_joined_table_by_internal_id_mut(
         &mut self,

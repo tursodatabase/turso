@@ -1087,3 +1087,36 @@ expect {
     4|3
     5|1
 }
+
+@backend cli
+test fts-names-that-need-quoting {
+    CREATE TABLE "my docs" (id INTEGER PRIMARY KEY, "my col" TEXT, "order" TEXT);
+    CREATE INDEX docs_fts ON "my docs" USING fts ("my col", "order") WITH (weights = 'my col=2.0');
+    INSERT INTO "my docs" VALUES (1, 'hello world', 'x'), (2, 'x', 'hello');
+    SELECT id FROM "my docs" WHERE fts_match("my col", "order", 'hello') ORDER BY id;
+    SELECT id FROM "my docs" WHERE fts_match("my col", "order", 'hello') ORDER BY fts_score("my col", "order", 'hello') DESC;
+}
+expect {
+    1
+    2
+    1
+    2
+}
+
+@backend cli
+test fts-column-name-starting-with-dash-error {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, "-x" TEXT);
+    CREATE INDEX t_fts ON t USING fts ("-x");
+}
+expect error {
+    FTS cannot index a column named "-x"
+}
+
+@backend cli
+test fts-column-named-like-internal-field-error {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, rowid TEXT);
+    CREATE INDEX t_fts ON t USING fts (rowid);
+}
+expect error {
+    FTS cannot index a column named "rowid"
+}
