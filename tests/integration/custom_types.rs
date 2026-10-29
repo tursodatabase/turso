@@ -316,6 +316,38 @@ mod tests {
         }
     }
 
+    /// An index on a numeric column added by ALTER TABLE must be built in
+    /// numeric order right away, the order the column has after a reopen.
+    #[test]
+    fn test_index_on_added_numeric_column_keeps_its_order_after_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_add_column_index.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT")
+                .unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN n numeric(10,2)")
+                .unwrap();
+            conn.execute("CREATE INDEX t_n ON t(n)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 9), (2, 10), (3, -3), (4, 100)")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+            assert_eq!(rows, vec![("ok".to_string(),)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE n > 9 ORDER BY id");
+            assert_eq!(rows, vec![(2,), (4,)]);
+            conn.close().unwrap();
+        }
+    }
+
     /// A new connection on the same database must see custom types that were
     /// created by another connection, even without reopening the database file.
     #[test]

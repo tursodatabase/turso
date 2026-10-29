@@ -5045,22 +5045,7 @@ impl BTreeTable {
             return;
         }
         for col in &mut self.columns {
-            if col.is_array() {
-                // Arrays are stored as record-format blobs regardless of element type.
-                col.set_ty(Type::Blob);
-                col.override_affinity(Affinity::Blob);
-                col.set_type_ordering(crate::translate::expr::expr_type::type_ordering(
-                    &crate::translate::expr::expr_type::column_type(col, true, schema),
-                    schema,
-                ));
-                continue;
-            }
-            if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) {
-                let (base_ty, _) = type_from_name(&resolved.primitive);
-                col.set_ty(base_ty);
-                col.override_affinity(Affinity::affinity(&resolved.primitive));
-                col.set_type_ordering(resolved.ordering());
-            }
+            col.resolve_custom_type(schema);
         }
     }
 
@@ -7464,9 +7449,27 @@ impl Column {
     pub fn index_order_differs_from_value_order(&self, schema: &Schema, is_strict: bool) -> bool {
         self.type_ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
     }
-    #[inline]
-    pub fn set_type_ordering(&mut self, ordering: Option<TypeOrdering>) {
-        self.type_ordering = ordering;
+    /// Fill in what a column of a STRICT table gets from its custom type: the
+    /// type, affinity and key order of the type it is stored as. Every path
+    /// that adds a column to a STRICT table calls this, so a column added by
+    /// ALTER TABLE matches the same column read back from the schema.
+    pub fn resolve_custom_type(&mut self, schema: &Schema) {
+        if self.is_array() {
+            // Arrays are stored as record-format blobs regardless of element type.
+            self.set_ty(Type::Blob);
+            self.override_affinity(Affinity::Blob);
+            self.type_ordering = crate::translate::expr::expr_type::type_ordering(
+                &crate::translate::expr::expr_type::column_type(self, true, schema),
+                schema,
+            );
+            return;
+        }
+        if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&self.ty_str) {
+            let (base_ty, _) = type_from_name(&resolved.primitive);
+            self.set_ty(base_ty);
+            self.override_affinity(Affinity::affinity(&resolved.primitive));
+            self.type_ordering = resolved.ordering();
+        }
     }
     #[inline]
     pub fn has_explicit_collation(&self) -> bool {
