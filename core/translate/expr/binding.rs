@@ -398,110 +398,67 @@ pub fn bind_and_rewrite_expr<'a>(
                         }
                     }
 
-                    // Try db.table.column interpretation first. If database resolves AND
-                    // the table+column exist, use that. Otherwise fall through to
-                    // table.column.field for struct/union field access.
-                    let mut resolved_as_db_table_col = false;
-                    if let Ok(namespace) = db_resolution {
-                        let table = resolver.with_schema(namespace.database_id, |schema| {
-                            schema.get_table(namespace.id, &tbl_name_str)
+                    // db.table.column did not match a table in the FROM clause —
+                    // try table.column.field for struct/union field access.
+                    let normalized_tbl_name = normalize_ident(&db_name_str);
+                    let normalized_col = normalize_ident(&tbl_name_str);
+                    let field_name = normalize_ident(&col_name_str);
+                    let matching_tbl = referenced_tables
+                        .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                    if let Some((tbl_id, tbl)) = matching_tbl {
+                        let col_idx = tbl.columns().iter().position(|c| {
+                            c.name
+                                .as_ref()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
                         });
-
-                        if let Some(table) = table {
-                            let col_idx = table.columns().iter().position(|c| {
-                                c.name.as_ref().is_some_and(|name| {
-                                    name.eq_ignore_ascii_case(&normalized_col_name)
-                                })
-                            });
-
-                            if let Some(col_idx) = col_idx {
-                                let col = table.columns().get(col_idx).unwrap();
-                                let is_rowid_alias = col.is_rowid_alias();
-                                let normalized_tbl_name = normalize_ident(&tbl_name_str);
-                                let matching_tbl = referenced_tables
-                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
-
-                                if let Some((tbl_id, _)) = matching_tbl {
-                                    *expr = Expr::Column {
-                                        database: None,
-                                        table: tbl_id,
-                                        column: col_idx,
-                                        is_rowid_alias,
-                                    };
-                                    referenced_tables.mark_column_used(tbl_id, col_idx);
-                                    resolved_as_db_table_col = true;
-                                } else {
-                                    // Table exists in database but not in FROM clause
-                                    return Err(LimboError::ParseError(format!(
-                                        "table {normalized_tbl_name} is not in FROM clause — \
-                                         cross-database column references require the table to be explicitly joined"
-                                    )));
-                                }
+                        if let Some(col_idx) = col_idx {
+                            let col = &tbl.columns()[col_idx];
+                            let type_def =
+                                resolver.schema().get_type_def_unchecked(&col.ty_str);
+                            let is_struct_or_union = type_def
+                                .map(|td| td.is_struct() || td.is_union())
+                                .unwrap_or(false);
+                            if is_struct_or_union {
+                                *expr = make_field_access_expr(
+                                    tbl_id,
+                                    col_idx,
+                                    col.is_rowid_alias(),
+                                    &field_name,
+                                    type_def.unwrap(),
+                                );
+                                referenced_tables.mark_column_used(tbl_id, col_idx);
+                                return Ok(WalkControl::Continue);
+                            } else {
+                                // Column exists but is not a struct/union type
+                                return Err(LimboError::ParseError(format!(
+                                    "column '{normalized_col}' is not a STRUCT or UNION type; \
+                                     cannot access field '{field_name}'"
+                                )));
                             }
                         }
                     }
-                    if !resolved_as_db_table_col {
-                        // db.table.column failed — try table.column.field for struct/union
-                        let normalized_tbl_name = normalize_ident(&db_name_str);
-                        let normalized_col = normalize_ident(&tbl_name_str);
-                        let field_name = normalize_ident(&col_name_str);
-                        let matching_tbl = referenced_tables
-                            .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
-                        if let Some((tbl_id, tbl)) = matching_tbl {
-                            let col_idx = tbl.columns().iter().position(|c| {
-                                c.name
-                                    .as_ref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(&normalized_col))
-                            });
-                            if let Some(col_idx) = col_idx {
-                                let col = &tbl.columns()[col_idx];
-                                let type_def =
-                                    resolver.schema().get_type_def_unchecked(&col.ty_str);
-                                let is_struct_or_union = type_def
-                                    .map(|td| td.is_struct() || td.is_union())
-                                    .unwrap_or(false);
-                                if is_struct_or_union {
-                                    *expr = make_field_access_expr(
-                                        tbl_id,
-                                        col_idx,
-                                        col.is_rowid_alias(),
-                                        &field_name,
-                                        type_def.unwrap(),
-                                    );
-                                    referenced_tables.mark_column_used(tbl_id, col_idx);
-                                    return Ok(WalkControl::Continue);
-                                } else {
-                                    // Column exists but is not a struct/union type
-                                    return Err(LimboError::ParseError(format!(
-                                        "column '{normalized_col}' is not a STRUCT or UNION type; \
-                                         cannot access field '{field_name}'"
-                                    )));
-                                }
-                            }
-                        }
-                        // Fallback (3): column.field.subfield for nested struct/union access
-                        // Handles:
-                        //   data.telegram.chat_id — UNION column, variant with struct type
-                        //   data.sub.a            — STRUCT column, struct-typed field, sub-field
-                        let col_name_norm = normalize_ident(&db_name_str);
-                        let mid_name = normalize_ident(&tbl_name_str);
-                        let leaf_field = normalize_ident(&col_name_str);
-                        if let Some((nested_expr, tbl_id, col_idx)) =
-                            try_resolve_nested_field_access(
-                                referenced_tables,
-                                &col_name_norm,
-                                &mid_name,
-                                &leaf_field,
-                                resolver,
-                            )?
-                        {
-                            *expr = nested_expr;
-                            referenced_tables.mark_column_used(tbl_id, col_idx);
-                        } else {
-                            return Err(LimboError::ParseError(format!(
-                                "no such column: {db_name_str}.{tbl_name_str}.{col_name_str}"
-                            )));
-                        }
+                    // Fallback (3): column.field.subfield for nested struct/union access
+                    // Handles:
+                    //   data.telegram.chat_id — UNION column, variant with struct type
+                    //   data.sub.a            — STRUCT column, struct-typed field, sub-field
+                    let col_name_norm = normalize_ident(&db_name_str);
+                    let mid_name = normalize_ident(&tbl_name_str);
+                    let leaf_field = normalize_ident(&col_name_str);
+                    if let Some((nested_expr, tbl_id, col_idx)) =
+                        try_resolve_nested_field_access(
+                            referenced_tables,
+                            &col_name_norm,
+                            &mid_name,
+                            &leaf_field,
+                            resolver,
+                        )?
+                    {
+                        *expr = nested_expr;
+                        referenced_tables.mark_column_used(tbl_id, col_idx);
+                    } else {
+                        return Err(LimboError::ParseError(format!(
+                            "no such column: {db_name_str}.{tbl_name_str}.{col_name_str}"
+                        )));
                     }
                 }
                 Expr::FunctionCallStar { name, filter_over } => {
