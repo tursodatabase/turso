@@ -262,6 +262,125 @@ fn current_user_and_session_user_name_the_superuser() {
     );
 }
 
+#[test]
+fn create_role_keeps_the_last_inserted_rowid() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    assert_eq!(conn.last_insert_rowid(), 3);
+
+    conn.execute("CREATE ROLE alice").unwrap();
+
+    assert_eq!(conn.last_insert_rowid(), 3);
+}
+
+#[test]
+fn failed_set_role_inside_a_transaction_keeps_the_transaction() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    conn.execute("SET ROLE alice").unwrap_err();
+
+    assert!(!conn.get_auto_commit());
+    conn.execute("COMMIT").unwrap();
+    let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![vec![turso_core::Value::from_i64(1)]]
+    );
+}
+
+#[test]
+fn interrupted_set_role_keeps_the_current_role() {
+    for interrupt_at_step in 1.. {
+        let db = TempDatabase::builder().build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE ROLE alice").unwrap();
+        let result = run_interrupted_at(&conn, "SET ROLE alice", interrupt_at_step);
+        if result.is_ok() {
+            assert!(interrupt_at_step > 1, "the statement was never interrupted");
+            return;
+        }
+
+        assert_eq!(
+            conn.current_role(),
+            conn.session_role(),
+            "interrupted at step {interrupt_at_step}, the role changed"
+        );
+    }
+}
+
+#[test]
+fn interrupted_create_role_leaves_no_role_behind() {
+    for interrupt_at_step in 1.. {
+        let db = TempDatabase::builder().build();
+        let conn = db.connect_limbo();
+        let result = run_interrupted_at(&conn, "CREATE ROLE alice", interrupt_at_step);
+        if result.is_ok() {
+            assert!(interrupt_at_step > 1, "the statement was never interrupted");
+            return;
+        }
+
+        assert!(
+            conn.role_catalog().get_by_name("alice").is_none(),
+            "interrupted at step {interrupt_at_step}, the role is still in the catalog"
+        );
+        conn.execute("CREATE ROLE alice").unwrap();
+    }
+}
+
+#[test]
+fn roles_are_loaded_on_open_when_the_schema_cookie_is_zero() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.checkpoint(turso_core::CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })
+    .unwrap();
+    conn.close().unwrap();
+    drop(conn);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&db.path)
+        .unwrap();
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(40)).unwrap();
+    std::io::Write::write_all(&mut file, &0u32.to_be_bytes()).unwrap();
+    drop(file);
+
+    let db = db.reopen();
+
+    assert!(db
+        .connect_limbo()
+        .role_catalog()
+        .get_by_name("alice")
+        .is_some());
+}
+
+/// Runs `sql` with a progress handler that interrupts it at the
+/// `interrupt_at_step`th step.
+fn run_interrupted_at(
+    conn: &std::sync::Arc<turso_core::Connection>,
+    sql: &str,
+    interrupt_at_step: u64,
+) -> turso_core::Result<()> {
+    let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    conn.set_progress_handler(
+        1,
+        Some(Box::new(move || {
+            steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == interrupt_at_step
+        })),
+    );
+    let result = conn.execute(sql);
+    conn.set_progress_handler(0, None);
+    result
+}
+
 fn current_user(conn: &PgConnection) -> String {
     let mut stmt = conn.query("SELECT current_user").unwrap().unwrap();
     stmt.run_collect_rows().unwrap()[0][0].to_string()

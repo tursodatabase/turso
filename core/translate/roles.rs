@@ -170,6 +170,9 @@ pub fn translate_create_role(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    if !resolver.catalog.dialect.supports_roles() {
+        bail_parse_error!("CREATE ROLE is not supported");
+    }
     if resolver.schema().roles.get_by_name(role_name).is_some() {
         bail_parse_error!("role \"{role_name}\" already exists");
     }
@@ -254,240 +257,28 @@ fn emit_roles_table_if_missing(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
     use turso_parser::ast;
 
-    use crate::security::permission::{Action, Object, PermissionDenied};
-    use crate::security::roles::RoleId;
-    use crate::{
-        Connection, Database, DatabaseOpts, LimboError, MemoryIO, OpenFlags, SqliteDialect, IO,
-    };
+    use crate::{Connection, Database, MemoryIO, SqliteDialect};
 
     #[test]
-    fn create_role_adds_the_role_to_the_catalog() {
-        let conn = open_connection();
-
-        create_role(&conn, "alice").unwrap();
-
-        let roles = conn.role_catalog();
-        let alice = roles.get_by_name("alice").unwrap();
-        assert!(!alice.superuser);
-    }
-
-    #[test]
-    fn create_role_keeps_the_last_inserted_rowid() {
-        let conn = open_connection();
-        conn.execute("CREATE TABLE t (x)").unwrap();
-        conn.execute("INSERT INTO t (rowid, x) VALUES (42, 1)")
-            .unwrap();
-
-        create_role(&conn, "alice").unwrap();
-
-        assert_eq!(conn.last_insert_rowid(), 42);
-    }
-
-    #[test]
-    fn create_role_fails_if_the_role_exists() {
-        let conn = open_connection();
-        create_role(&conn, "alice").unwrap();
+    fn create_role_fails_under_a_dialect_without_roles() {
+        let db = Database::open_file(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
 
         let error = create_role(&conn, "alice").unwrap_err();
 
         assert!(
-            error.to_string().contains("role \"alice\" already exists"),
+            error.to_string().contains("CREATE ROLE is not supported"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn set_role_switches_the_current_role_and_reset_role_switches_back() {
-        let conn = open_connection();
-        create_role(&conn, "alice").unwrap();
-        let alice = conn.role_catalog().get_by_name("alice").unwrap().id;
-
-        set_role(&conn, "alice").unwrap();
-        assert_eq!(conn.current_role(), alice);
-        assert_eq!(conn.session_role(), RoleId::SUPERUSER);
-
-        reset_role(&conn).unwrap();
-        assert_eq!(conn.current_role(), RoleId::SUPERUSER);
-    }
-
-    #[test]
-    fn set_role_to_a_missing_role_fails() {
-        let conn = open_connection();
-
-        let error = set_role(&conn, "nobody").unwrap_err();
-
-        assert_eq!(error.to_string(), "role \"nobody\" does not exist");
-        assert_eq!(conn.current_role(), RoleId::SUPERUSER);
-    }
-
-    #[test]
-    fn set_role_inside_a_transaction_keeps_the_transaction() {
-        let conn = open_connection();
-        create_role(&conn, "alice").unwrap();
-        conn.execute("CREATE TABLE t (x)").unwrap();
-        conn.execute("BEGIN").unwrap();
-        conn.execute("INSERT INTO t VALUES (1)").unwrap();
-
-        set_role(&conn, "alice").unwrap_err();
-
-        assert!(!conn.get_auto_commit());
-        conn.execute("COMMIT").unwrap();
-        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
-        assert_eq!(
-            stmt.run_collect_rows().unwrap(),
-            vec![vec![crate::Value::from_i64(1)]]
-        );
-    }
-
-    #[test]
-    fn set_role_inside_a_transaction_fails() {
-        let conn = open_connection();
-        create_role(&conn, "alice").unwrap();
-        conn.execute("BEGIN").unwrap();
-
-        let error = set_role(&conn, "alice").unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "SET ROLE inside a transaction block is not supported"
-        );
-        assert_eq!(conn.current_role(), RoleId::SUPERUSER);
-    }
-
-    #[test]
-    fn role_without_privileges_cannot_create_objects() {
-        let conn = open_connection();
-        create_role(&conn, "alice").unwrap();
-        set_role(&conn, "alice").unwrap();
-
-        let create_table = conn.execute("CREATE TABLE t (x)").unwrap_err();
-        let create_role_error = create_role(&conn, "bob").unwrap_err();
-
-        assert_eq!(
-            denial(create_table),
-            PermissionDenied::privilege(Action::Create, Object::Schema("main".to_string()))
-        );
-        assert_eq!(
-            denial(create_role_error),
-            PermissionDenied::privilege(Action::Create, Object::Role("bob".to_string()))
-        );
-    }
-
-    #[test]
-    fn role_without_privileges_can_run_statements_without_objects() {
-        let conn = open_connection();
-        create_role(&conn, "alice").unwrap();
-        set_role(&conn, "alice").unwrap();
-
-        conn.execute("SELECT 1").unwrap();
-        reset_role(&conn).unwrap();
-        conn.execute("CREATE TABLE t (x)").unwrap();
-    }
-
-    #[test]
-    fn interrupted_set_role_keeps_the_current_role() {
-        for interrupt_at_step in 1.. {
-            let conn = open_connection();
-            create_role(&conn, "alice").unwrap();
-            let steps = Arc::new(AtomicU64::new(0));
-            let steps_in_handler = steps.clone();
-            conn.set_progress_handler(
-                1,
-                Some(Box::new(move || {
-                    steps_in_handler.fetch_add(1, Ordering::SeqCst) + 1 == interrupt_at_step
-                })),
-            );
-            let result = set_role(&conn, "alice");
-            conn.set_progress_handler(0, None);
-            if result.is_ok() {
-                assert!(interrupt_at_step > 1, "the statement was never interrupted");
-                return;
-            }
-
-            assert_eq!(
-                conn.current_role(),
-                RoleId::SUPERUSER,
-                "interrupted at step {interrupt_at_step}, the role changed"
-            );
-        }
-    }
-
-    #[test]
-    fn role_catalog_includes_roles_committed_by_another_connection() {
-        let conn1 = open_connection();
-        let conn2 = conn1.db.connect(crate::ConnectOpts::new()).unwrap();
-        assert!(conn1.role_catalog().get_by_name("alice").is_none());
-
-        create_role(&conn2, "alice").unwrap();
-
-        assert!(conn1.role_catalog().get_by_name("alice").is_some());
-    }
-
-    #[test]
-    fn interrupted_create_role_leaves_no_role_behind() {
-        for interrupt_at_step in 1.. {
-            let conn = open_connection();
-            let steps = Arc::new(AtomicU64::new(0));
-            let steps_in_handler = steps.clone();
-            conn.set_progress_handler(
-                1,
-                Some(Box::new(move || {
-                    steps_in_handler.fetch_add(1, Ordering::SeqCst) + 1 == interrupt_at_step
-                })),
-            );
-            let result = create_role(&conn, "alice");
-            conn.set_progress_handler(0, None);
-            if result.is_ok() {
-                assert!(interrupt_at_step > 1, "the statement was never interrupted");
-                return;
-            }
-
-            assert!(
-                conn.role_catalog().get_by_name("alice").is_none(),
-                "interrupted at step {interrupt_at_step}, the role is still in the catalog"
-            );
-            create_role(&conn, "alice").unwrap();
-        }
-    }
-
-    fn denial(error: LimboError) -> PermissionDenied {
-        match error {
-            LimboError::PermissionDenied(denial) => *denial,
-            other => panic!("expected a permission error, got: {other}"),
-        }
-    }
-
-    fn open_connection() -> Arc<Connection> {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:",
-            OpenFlags::Create,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(SqliteDialect),
-        )
-        .unwrap();
-        db.connect(crate::ConnectOpts::new()).unwrap()
-    }
-
-    fn set_role(conn: &Arc<Connection>, name: &str) -> crate::Result<()> {
-        let set_role = ast::Cmd::Stmt(ast::Stmt::SetRole {
-            role_name: Some(name.to_string()),
-        });
-        conn.prepare_translated_cmd(set_role, &format!("SET ROLE {name}"))?
-            .run_ignore_rows()
-    }
-
-    fn reset_role(conn: &Arc<Connection>) -> crate::Result<()> {
-        let reset_role = ast::Cmd::Stmt(ast::Stmt::SetRole { role_name: None });
-        conn.prepare_translated_cmd(reset_role, "RESET ROLE")?
-            .run_ignore_rows()
     }
 
     fn create_role(conn: &Arc<Connection>, name: &str) -> crate::Result<()> {

@@ -201,6 +201,14 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a database of this dialect stores roles in the roles table.
+    ///
+    /// SQLite has no roles, so a table named like the roles table is an
+    /// ordinary table.
+    fn supports_roles(&self) -> bool {
+        false
+    }
+
     /// The namespaces of a database that has never created or dropped one.
     /// They have ids from 1 in this order and no rows until the first
     /// CREATE SCHEMA or DROP SCHEMA creates the namespaces table, which then
