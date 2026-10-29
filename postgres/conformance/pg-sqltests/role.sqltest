@@ -204,6 +204,70 @@ expect {
     cr_committed
 }
 
+test set-role-changes-current-user {
+    CREATE ROLE sr_current;
+    SET ROLE sr_current;
+    SELECT current_user;
+}
+expect {
+    sr_current
+}
+
+test set-role-keeps-session-user {
+    CREATE ROLE sr_session;
+    SET ROLE sr_session;
+    SELECT CASE WHEN session_user = 'sr_session' THEN 'changed' ELSE 'kept' END;
+}
+expect {
+    kept
+}
+
+test reset-role-returns-to-session-user {
+    CREATE ROLE sr_reset;
+    SET ROLE sr_reset;
+    RESET ROLE;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-role-none-returns-to-session-user {
+    CREATE ROLE sr_none;
+    SET ROLE sr_none;
+    SET ROLE NONE;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-role-with-quoted-uppercase-setting-name-changes-current-user {
+    CREATE ROLE sr_quoted_name;
+    SET "ROLE" TO sr_quoted_name;
+    SELECT current_user;
+}
+expect {
+    sr_quoted_name
+}
+
+test reset-role-with-quoted-uppercase-setting-name-returns-to-session-user {
+    CREATE ROLE sr_quoted_reset;
+    SET ROLE sr_quoted_reset;
+    RESET "ROLE";
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-role-to-missing-role-fails {
+    SET ROLE sr_missing;
+}
+expect error {
+    role "sr_missing" does not exist
+}
+
 test pg-tables-does-not-list-the-roles-table {
     CREATE ROLE pt_role;
     SELECT count(*) FROM pg_tables WHERE tablename LIKE '%roles%';
