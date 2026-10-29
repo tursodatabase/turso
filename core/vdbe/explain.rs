@@ -2565,6 +2565,7 @@ pub fn insn_to_row(
                 namespace: _,
                 from,
                 to,
+                temp_unqualified_names_table: _,
             } => (
                 "RenameTable",
                 0,
