@@ -7,8 +7,8 @@ use crate::{
     translate::{
         collate::{comparison_collation, in_list_collation, CollationSeq},
         expr::{
-            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut,
-            WalkControl,
+            as_binary_components, comparison_encodes_operand, get_expr_affinity, truth_test_rhs,
+            unwrap_parens, walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -115,6 +115,12 @@ pub struct Constraint {
     /// of `x = y`. None for terms that are not collating comparisons (LIKE,
     /// MATCH and other virtual-table operators).
     pub collation: Option<CollationSeq>,
+    /// Whether the comparison runs the constrained column through a custom
+    /// type's ENCODE, as `text_col = date_col` does to `text_col` (see
+    /// [crate::translate::expr::comparison_encodes_operand]). An index or the
+    /// rowid holds the column's own values, not encoded ones, so no seek can
+    /// use the constraint: it stays a filter.
+    pub encodes_column: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -231,7 +237,7 @@ impl Constraint {
     /// Whether the term can drive a seek in a temporary index built over
     /// `columns`, whose key columns have the collation of their table column.
     pub fn can_drive_index_seek(&self, columns: &[Column]) -> bool {
-        if !self.usable || !self.outer_join_compatible {
+        if !self.usable || !self.outer_join_compatible || self.encodes_column {
             return false;
         }
         let Some(pos) = self.table_col_pos else {
@@ -727,6 +733,9 @@ pub fn constraints_from_where_clause(
     // deciding it means working out the types of its operands, so each term's
     // collation is decided at most once, the first time a table needs it.
     let mut term_collations: Vec<Option<CollationSeq>> = vec![None; where_clause.len()];
+    // The same holds for whether the term's comparison ENCODEs its left and
+    // right operands.
+    let mut term_encoded_sides: Vec<Option<(bool, bool)>> = vec![None; where_clause.len()];
 
     // For each table, collect all the Constraints and all potential index candidates that may use them.
     for table_reference in table_references.joined_tables() {
@@ -841,6 +850,28 @@ pub fn constraints_from_where_clause(
                     }
                     _ => None,
                 };
+                // See [Constraint::encodes_column].
+                let (encodes_lhs, encodes_rhs) = match operator.as_ast_operator() {
+                    Some(op) if op.is_comparison() => {
+                        decide_once(&mut term_encoded_sides[i], || {
+                            Ok((
+                                comparison_encodes_operand(
+                                    lhs,
+                                    [rhs],
+                                    Some(table_references),
+                                    resolver,
+                                )?,
+                                comparison_encodes_operand(
+                                    rhs,
+                                    [lhs],
+                                    Some(table_references),
+                                    resolver,
+                                )?,
+                            ))
+                        })?
+                    }
+                    _ => (false, false),
+                };
                 let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
                 let outer_join_compatible = can_use_before_null_extension(is_op);
                 // See [Constraint::null_matching]. The constraining value sits
@@ -876,6 +907,7 @@ pub fn constraints_from_where_clause(
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
                                 collation: cmp_collation,
+                                encodes_column: encodes_lhs,
                             });
                         }
                     }
@@ -909,6 +941,7 @@ pub fn constraints_from_where_clause(
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
                                 collation: cmp_collation,
+                                encodes_column: encodes_lhs,
                             });
                         }
                     }
@@ -951,6 +984,7 @@ pub fn constraints_from_where_clause(
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(rhs),
                             collation: cmp_collation,
+                            encodes_column: encodes_lhs,
                         });
                     }
                     _ => {}
@@ -982,6 +1016,7 @@ pub fn constraints_from_where_clause(
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
                                 collation: cmp_collation,
+                                encodes_column: encodes_rhs,
                             });
                         }
                     }
@@ -1015,6 +1050,7 @@ pub fn constraints_from_where_clause(
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
                                 collation: cmp_collation,
+                                encodes_column: encodes_rhs,
                             });
                         }
                     }
@@ -1057,6 +1093,7 @@ pub fn constraints_from_where_clause(
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(lhs),
                             collation: cmp_collation,
+                            encodes_column: encodes_rhs,
                         });
                     }
                     _ => {}
@@ -1101,6 +1138,17 @@ pub fn constraints_from_where_clause(
                         &ExprContext::new(Some(table_references), resolver),
                     )
                 })?);
+                // See [Constraint::encodes_column].
+                let in_list_encodes_lhs = decide_once(&mut term_encoded_sides[i], || {
+                    let encodes_lhs = comparison_encodes_operand(
+                        lhs,
+                        rhs.iter().map(|item| item.as_ref()),
+                        Some(table_references),
+                        resolver,
+                    )?;
+                    Ok((encodes_lhs, false))
+                })?
+                .0;
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -1124,6 +1172,7 @@ pub fn constraints_from_where_clause(
                             comparison_affinity: cmp_aff,
                             null_matching: false,
                             collation: cmp_collation,
+                            encodes_column: in_list_encodes_lhs,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1144,6 +1193,7 @@ pub fn constraints_from_where_clause(
                             comparison_affinity: cmp_aff,
                             null_matching: false,
                             collation: cmp_collation,
+                            encodes_column: in_list_encodes_lhs,
                         });
                     }
                     _ => {}
@@ -1227,6 +1277,7 @@ pub fn constraints_from_where_clause(
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
                                 collation: cmp_collation,
+                                encodes_column: false,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1247,6 +1298,7 @@ pub fn constraints_from_where_clause(
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
                                 collation: cmp_collation,
+                                encodes_column: false,
                             });
                         }
                         _ => {}
@@ -1264,8 +1316,10 @@ pub fn constraints_from_where_clause(
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {
-            // Skip constraints that don't participate in range-seek matching (IN, collation mismatches)
-            if !constraint.usable || !constraint.outer_join_compatible {
+            // Skip constraints that don't participate in range-seek matching (IN,
+            // collation mismatches, encoded columns)
+            if !constraint.usable || !constraint.outer_join_compatible || constraint.encodes_column
+            {
                 continue;
             }
 
@@ -1365,17 +1419,14 @@ pub fn constraints_from_where_clause(
     Ok(constraints)
 }
 
-/// The collation in `slot`, deciding it with `decide` if it is not decided yet.
-fn decide_once(
-    slot: &mut Option<CollationSeq>,
-    decide: impl FnOnce() -> Result<CollationSeq>,
-) -> Result<CollationSeq> {
-    if let Some(collation) = *slot {
-        return Ok(collation);
+/// The value in `slot`, deciding it with `decide` if it is not decided yet.
+fn decide_once<T: Copy>(slot: &mut Option<T>, decide: impl FnOnce() -> Result<T>) -> Result<T> {
+    if let Some(value) = *slot {
+        return Ok(value);
     }
-    let collation = decide()?;
-    *slot = Some(collation);
-    Ok(collation)
+    let value = decide()?;
+    *slot = Some(value);
+    Ok(value)
 }
 
 /// The collation `x IN (SELECT y ...)` compares with. The subquery's ephemeral
@@ -2132,6 +2183,7 @@ struct BinaryTermIndexInfo<'a> {
     operator: ConstraintOperator,
     table_col_pos: Option<usize>,
     constraining_expr: &'a ast::Expr,
+    constrained_expr: &'a ast::Expr,
     side: BinaryExprSide,
     is_rowid: bool,
 }
@@ -2192,6 +2244,11 @@ fn analyze_binary_term_index_info<'a>(
         operator,
         table_col_pos,
         constraining_expr,
+        constrained_expr: if side == BinaryExprSide::Rhs {
+            lhs
+        } else {
+            rhs
+        },
         side,
         is_rowid,
     })
@@ -2215,6 +2272,7 @@ pub(crate) fn summarize_binary_term_for_index(
         operator,
         table_col_pos,
         constraining_expr,
+        constrained_expr,
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
@@ -2224,6 +2282,17 @@ pub(crate) fn summarize_binary_term_for_index(
         &ExprContext::new(Some(table_references), resolver),
     )
     .ok()?;
+    // See [Constraint::encodes_column].
+    if comparison_encodes_operand(
+        constrained_expr,
+        [constraining_expr],
+        Some(table_references),
+        resolver,
+    )
+    .ok()?
+    {
+        return None;
+    }
 
     let affinity = term_comparison_affinity(
         lhs,
@@ -2294,6 +2363,7 @@ pub(crate) fn analyze_binary_term_for_index(
         constraining_expr,
         side,
         is_rowid,
+        constrained_expr,
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
     let comparison_collation = comparison_collation(
         lhs,
@@ -2301,6 +2371,17 @@ pub(crate) fn analyze_binary_term_for_index(
         &ExprContext::new(Some(table_references), resolver),
     )
     .ok()?;
+    // See [Constraint::encodes_column].
+    if comparison_encodes_operand(
+        constrained_expr,
+        [constraining_expr],
+        Some(table_references),
+        resolver,
+    )
+    .ok()?
+    {
+        return None;
+    }
 
     let affinity = term_comparison_affinity(
         lhs,
@@ -2378,6 +2459,7 @@ pub(crate) fn analyze_binary_term_for_index(
         comparison_affinity: Some(affinity),
         null_matching,
         collation: Some(comparison_collation),
+        encodes_column: false,
     };
 
     Some(AnalyzedTerm {

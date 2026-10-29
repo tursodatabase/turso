@@ -497,20 +497,19 @@ pub(crate) fn translate_compared_expr(
     let Some(compared_as) = compared_as else {
         return translate_expr(program, referenced_tables, expr, target_register, resolver);
     };
-    let env = TypeEnv::new(referenced_tables, resolver);
-    let has_compared_type = stored_form_type(&type_of(expr, &env), resolver.schema())?
-        .is_some_and(|ty| same_type_def(ty.leaf(), compared_as.leaf()));
-    if has_compared_type && reads_stored_column(expr, referenced_tables, resolver) {
-        let suppressed = program.flags.suppress_custom_type_decode();
-        program.flags.set_suppress_custom_type_decode(true);
-        let result = translate_expr(program, referenced_tables, expr, target_register, resolver);
-        program.flags.set_suppress_custom_type_decode(suppressed);
-        return result;
-    }
-    let is_stored_form =
-        has_compared_type && matches!(unwrap_parens(expr)?, ast::Expr::Cast { .. });
-    if is_stored_form {
-        return translate_expr(program, referenced_tables, expr, target_register, resolver);
+    match compared_operand_form(expr, referenced_tables, resolver, compared_as)? {
+        ComparedOperandForm::StoredColumn => {
+            let suppressed = program.flags.suppress_custom_type_decode();
+            program.flags.set_suppress_custom_type_decode(true);
+            let result =
+                translate_expr(program, referenced_tables, expr, target_register, resolver);
+            program.flags.set_suppress_custom_type_decode(suppressed);
+            return result;
+        }
+        ComparedOperandForm::CastToType => {
+            return translate_expr(program, referenced_tables, expr, target_register, resolver);
+        }
+        ComparedOperandForm::Encoded => {}
     }
     if !expr.is_constant(resolver) {
         translate_expr(program, referenced_tables, expr, target_register, resolver)?;
@@ -528,6 +527,63 @@ pub(crate) fn translate_compared_expr(
     });
     emit_stored_form(program, target_register, compared_as, resolver)?;
     Ok(target_register)
+}
+
+/// Whether comparing `operand` with `others` runs `operand` through a custom
+/// type's ENCODE (see [translate_compared_expr]). `text_col = date_col` encodes
+/// `text_col` as a date. An index or rowid holds the column's own values, not
+/// encoded ones, so a seek on it can't find the rows such a comparison matches.
+pub(crate) fn comparison_encodes_operand<'a>(
+    operand: &'a ast::Expr,
+    others: impl IntoIterator<Item = &'a ast::Expr>,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let Some(compared_as) = stored_comparison_type(
+        std::iter::once(operand).chain(others),
+        referenced_tables,
+        resolver,
+    )?
+    else {
+        return Ok(false);
+    };
+    Ok(
+        compared_operand_form(operand, referenced_tables, resolver, &compared_as)?
+            == ComparedOperandForm::Encoded,
+    )
+}
+
+/// The form [translate_compared_expr] gives an operand of a comparison done in
+/// the stored form of a custom type.
+#[derive(Debug, PartialEq, Eq)]
+enum ComparedOperandForm {
+    /// A table column of the type, read without its DECODE.
+    StoredColumn,
+    /// A CAST to the type, which gives the stored form already.
+    CastToType,
+    /// Any other value, put through the type's ENCODE.
+    Encoded,
+}
+
+fn compared_operand_form(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+    compared_as: &ResolvedType,
+) -> Result<ComparedOperandForm> {
+    let env = TypeEnv::new(referenced_tables, resolver);
+    let has_compared_type = stored_form_type(&type_of(expr, &env), resolver.schema())?
+        .is_some_and(|ty| same_type_def(ty.leaf(), compared_as.leaf()));
+    if !has_compared_type {
+        return Ok(ComparedOperandForm::Encoded);
+    }
+    if reads_stored_column(expr, referenced_tables, resolver) {
+        return Ok(ComparedOperandForm::StoredColumn);
+    }
+    if matches!(unwrap_parens(expr)?, ast::Expr::Cast { .. }) {
+        return Ok(ComparedOperandForm::CastToType);
+    }
+    Ok(ComparedOperandForm::Encoded)
 }
 
 /// Turns the value in `reg` into the stored form of `ty` with the type's
