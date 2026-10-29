@@ -18272,6 +18272,7 @@ pub fn op_alter_column(
         definition,
         rename,
         rewritten_triggers,
+        renamed_index_methods,
     } = data.as_ref();
 
     let conn = program.connection.clone();
@@ -18439,6 +18440,12 @@ pub fn op_alter_column(
             // Update partial index WHERE clause column references
             if let Some(ref mut wc) = idx.where_clause {
                 rename_identifiers(wc, &old_column_name, &new_name);
+            }
+            if let Some((_, attachment)) = renamed_index_methods
+                .iter()
+                .find(|(name, _)| *name == idx.name)
+            {
+                idx.index_method = Some(attachment.clone());
             }
         }
 
