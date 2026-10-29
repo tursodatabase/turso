@@ -7,7 +7,7 @@ use turso_parser::ast::{Expr, UnaryOperator};
 use crate::{
     function::ExternalCollation,
     sync::{Arc, LazyLock, RwLock, Weak},
-    translate::{catalog::CatalogContext, expr_context::ExprMetadata},
+    translate::{catalog::CatalogContext, expr_context::ExprProperties},
     types::ValueRef,
     vdbe::hash_table::normalized_f64_bits,
     LimboError, Numeric, Result,
@@ -407,7 +407,7 @@ impl LocaleCollationRegistry {
 pub fn comparison_collation(
     lhs: &Expr,
     rhs: &Expr,
-    metadata: &impl ExprMetadata,
+    metadata: &impl ExprProperties,
     catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
     comparison_collation_across_queries(lhs, metadata, rhs, metadata, catalog)
@@ -418,9 +418,9 @@ pub fn comparison_collation(
 /// looked up in its own tables.
 pub fn comparison_collation_across_queries(
     lhs: &Expr,
-    lhs_metadata: &impl ExprMetadata,
+    lhs_metadata: &impl ExprProperties,
     rhs: &Expr,
-    rhs_metadata: &impl ExprMetadata,
+    rhs_metadata: &impl ExprProperties,
     catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
     let collation = if has_collate_operator(lhs) {
@@ -441,7 +441,7 @@ pub fn comparison_collation_across_queries(
 /// does `x IN (y1, ..., yN)`, which compares with the collation of x alone.
 pub fn expr_collation(
     expr: &Expr,
-    metadata: &impl ExprMetadata,
+    metadata: &impl ExprProperties,
     catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
     Ok(expr_collation_if_any(expr, metadata, catalog)?.unwrap_or(CollationSeq::Binary))
@@ -454,7 +454,7 @@ pub fn expr_collation(
 /// marked `SQLITE_FUNC_NEEDCOLL`), and a compound SELECT compares a result
 /// column with the collation of the leftmost SELECT whose column has one.
 /// Each expression comes with the tables its columns refer to.
-pub fn first_collation<'a, M: ExprMetadata>(
+pub fn first_collation<'a, M: ExprProperties>(
     exprs: impl IntoIterator<Item = (&'a Expr, M)>,
     catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
@@ -476,7 +476,7 @@ pub fn first_collation<'a, M: ExprMetadata>(
 /// COLLATE operator.
 fn expr_collation_if_any(
     expr: &Expr,
-    metadata: &impl ExprMetadata,
+    metadata: &impl ExprProperties,
     catalog: &CatalogContext<'_>,
 ) -> Result<Option<CollationSeq>> {
     match expr {

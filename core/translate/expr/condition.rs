@@ -32,7 +32,7 @@ use super::*;
 /// Compute the affinity for an IN expression.
 /// For `x IN (y1, y2, ..., yN)`, the affinity is determined by the LHS expression `x`.
 /// This follows SQLite's `exprINAffinity()` function.
-pub(super) fn in_expr_affinity(lhs: &ast::Expr, metadata: &impl ExprMetadata) -> Affinity {
+pub(super) fn in_expr_affinity(lhs: &ast::Expr, metadata: &impl ExprProperties) -> Affinity {
     // For parenthesized expressions (vectors), we take the first element's affinity
     // since scalar IN comparisons only use the first element
     match lhs {

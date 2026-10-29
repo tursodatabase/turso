@@ -6,7 +6,7 @@ use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, 
 
 use super::collate::{comparison_collation, first_collation, CollationSeq};
 use super::emitter::Resolver;
-use super::expr_context::{ExprContext, ExprMetadata};
+use super::expr_context::{ExprContext, ExprProperties};
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]

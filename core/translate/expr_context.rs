@@ -8,7 +8,10 @@ use super::{
     plan::TableReferences,
 };
 
-pub(crate) trait ExprMetadata<SourceId: Copy = TableInternalId, SubqueryId: Copy = TableInternalId>
+pub(crate) trait ExprProperties<
+    SourceId: Copy = TableInternalId,
+    SubqueryId: Copy = TableInternalId,
+>
 {
     fn column_affinity(&self, source: SourceId, column: usize) -> Option<Affinity>;
     fn column_collation(&self, source: SourceId, column: usize) -> Result<Option<CollationSeq>>;
@@ -38,7 +41,7 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
     }
 }
 
-impl ExprMetadata for ExprContext<'_, '_> {
+impl ExprProperties for ExprContext<'_, '_> {
     fn column_affinity(&self, source: TableInternalId, column: usize) -> Option<Affinity> {
         if source.is_self_table() {
             if let Some(affinity) = self.resolver.self_table_affinity(column) {
@@ -99,7 +102,7 @@ impl<'a> TableMetadata<'a> {
     }
 }
 
-impl ExprMetadata for TableMetadata<'_> {
+impl ExprProperties for TableMetadata<'_> {
     fn column_affinity(&self, source: TableInternalId, column: usize) -> Option<Affinity> {
         let (_, table) = self.tables?.find_table_by_internal_id(source)?;
         table.get_column_at(column).map(|column| column.affinity())

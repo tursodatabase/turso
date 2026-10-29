@@ -1,5 +1,5 @@
 use crate::{
-    translate::{alter::literal_default_value, expr_context::ExprMetadata},
+    translate::{alter::literal_default_value, expr_context::ExprProperties},
     types::ValueType,
     vdbe::affinity::Affinity,
 };
@@ -48,7 +48,7 @@ impl StorageClassMask {
     }
 }
 
-pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprMetadata) -> Affinity {
+pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprProperties) -> Affinity {
     match expr {
         ast::Expr::Column { table, column, .. } => metadata
             .column_affinity(*table, *column)
@@ -91,7 +91,7 @@ pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprMetadata) 
 /// Mirrors SQLite's `sqlite3ExprDataType()` (expr.c): a bitmask of the storage
 /// classes an expression could yield. Used to combine column affinities across
 /// the arms of a compound (UNION/INTERSECT/EXCEPT) subquery.
-pub(crate) fn expr_data_type(expr: &ast::Expr, metadata: &impl ExprMetadata) -> StorageClassMask {
+pub(crate) fn expr_data_type(expr: &ast::Expr, metadata: &impl ExprProperties) -> StorageClassMask {
     match expr {
         ast::Expr::Collate(inner, _) | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
             expr_data_type(inner, metadata)
@@ -176,7 +176,7 @@ pub(crate) fn do_comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
 pub fn comparison_affinity(
     lhs: impl HasComparableAffinity,
     rhs: impl HasComparableAffinity,
-    metadata: &impl ExprMetadata,
+    metadata: &impl ExprProperties,
 ) -> Affinity {
     let lhs = lhs.comparison_affinity(metadata);
     let rhs = rhs.comparison_affinity(metadata);
@@ -184,17 +184,17 @@ pub fn comparison_affinity(
 }
 
 pub(crate) trait HasComparableAffinity {
-    fn comparison_affinity(&self, metadata: &impl ExprMetadata) -> Affinity;
+    fn comparison_affinity(&self, metadata: &impl ExprProperties) -> Affinity;
 }
 
 impl HasComparableAffinity for &ast::Expr {
-    fn comparison_affinity(&self, metadata: &impl ExprMetadata) -> Affinity {
+    fn comparison_affinity(&self, metadata: &impl ExprProperties) -> Affinity {
         get_expr_affinity(self, metadata)
     }
 }
 
 impl HasComparableAffinity for Affinity {
-    fn comparison_affinity(&self, _metadata: &impl ExprMetadata) -> Affinity {
+    fn comparison_affinity(&self, _metadata: &impl ExprProperties) -> Affinity {
         *self
     }
 }

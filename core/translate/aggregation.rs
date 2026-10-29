@@ -1,7 +1,7 @@
 use crate::alloc::TursoVecExt;
 use crate::translate::{
     catalog::CatalogContext,
-    expr_context::{ExprContext, ExprMetadata},
+    expr_context::{ExprContext, ExprProperties},
 };
 use turso_parser::ast;
 
@@ -887,7 +887,7 @@ pub fn translate_aggregation_step(
 fn ordered_set_collation(
     func: &AggFunc,
     expr: &ast::Expr,
-    metadata: &impl ExprMetadata,
+    metadata: &impl ExprProperties,
     catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
     let collation = expr_collation(expr, metadata, catalog)?;

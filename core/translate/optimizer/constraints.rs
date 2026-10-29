@@ -1,7 +1,7 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
-use crate::translate::expr_context::{ExprContext, ExprMetadata, TableMetadata};
+use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
 use crate::{
     schema::{Column, Index, IndexColumn, Schema},
     translate::{
@@ -2397,7 +2397,7 @@ fn term_comparison_affinity(
     rhs: &ast::Expr,
     operator: ConstraintOperator,
     table_col_pos: Option<usize>,
-    metadata: &impl ExprMetadata,
+    metadata: &impl ExprProperties,
 ) -> Affinity {
     match operator.as_ast_operator() {
         Some(op) if op.is_comparison() && table_col_pos.is_some() => {
