@@ -5085,7 +5085,6 @@ test gencol-virtual-reads-user-value-of-custom-type-column {
 
 # UPDATE that sets one numeric column: the indexed virtual column adds it to a
 # column the UPDATE did not set, which is still in its stored form.
-@cross-check-integrity
 @skip-if sqlite "SQLite doesn't support custom types"
 @requires custom_types "uses custom types"
 test gencol-virtual-index-key-mixes-set-and-unchanged-custom-type-columns {
@@ -5095,9 +5094,11 @@ test gencol-virtual-index-key-mixes-set-and-unchanged-custom-type-columns {
     UPDATE m SET a = 2.00;
     SELECT s FROM m INDEXED BY m_s WHERE s = '4.50';
     SELECT count(*) FROM m INDEXED BY m_s WHERE s = '3.75';
+    PRAGMA integrity_check;
 } expect {
     4.50
     0
+    ok
 }
 
 @skip-if sqlite "SQLite doesn't support custom types"
