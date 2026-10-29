@@ -998,7 +998,7 @@ pub(crate) fn set_search_path(
     conn: &Connection,
     value: Option<&str>,
     scope: SettingScope,
-) -> Result<Value> {
+) -> Result<String> {
     let mut path = parse_search_path(value.unwrap_or(DEFAULT_SEARCH_PATH))?;
     path.retain(|name| name != "$user" && !is_core_database_name(name));
     session_state(conn)?.mutate(conn, |settings| {
@@ -1006,9 +1006,7 @@ pub(crate) fn set_search_path(
         settings.set(SEARCH_PATH_SETTING, value.map(str::to_owned), scope);
     });
     conn.set_search_path(Some(path));
-    Ok(Value::build_text(
-        value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
-    ))
+    Ok(value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned())
 }
 
 /// `main` and `temp` name databases in core, not PostgreSQL schemas, so a
@@ -1027,7 +1025,7 @@ pub(crate) fn set_custom_parameter(
     name: &str,
     value: Option<&str>,
     scope: SettingScope,
-) -> Result<Value> {
+) -> Result<String> {
     if !is_valid_custom_parameter_name(name) {
         return Err(sqlstate_error(
             SQLSTATE_INVALID_NAME,
@@ -1037,7 +1035,7 @@ pub(crate) fn set_custom_parameter(
     session_state(conn)?.mutate(conn, |settings| {
         settings.set(name, value.map(str::to_owned), scope)
     });
-    Ok(Value::build_text(value.unwrap_or_default().to_owned()))
+    Ok(value.unwrap_or_default().to_owned())
 }
 
 pub(crate) fn custom_parameter(conn: &Connection, name: &str) -> Option<String> {

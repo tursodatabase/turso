@@ -20,7 +20,7 @@ fn native_scalar_accepts_only_declared_argument_counts() {
         FunctionArity::OneOf(&[1, usize::MAX]),
     ] {
         assert!(matches!(
-            ExternalFunc::new_native_scalar("invalid".into(), arity, false, None, NullToNine),
+            ExternalFunc::new_native_scalar("invalid".into(), arity, false, NullToNine),
             Err(LimboError::InvalidArgument(_))
         ));
     }
@@ -30,7 +30,6 @@ fn native_scalar_accepts_only_declared_argument_counts() {
                 "null_to_nine".into(),
                 FunctionArity::OneOf(&[1, 3]),
                 false,
-                None,
                 NullToNine,
             )
             .unwrap(),
@@ -68,7 +67,7 @@ fn native_scalar_accepts_only_declared_argument_counts() {
 }
 
 #[test]
-fn native_scalar_with_a_declared_return_type_can_be_called_in_a_strict_check_constraint() {
+fn native_scalar_returning_i64_can_be_called_in_a_strict_check_constraint() {
     let conn = connection(
         OpenOptions::new(Arc::new(SqliteDialect))
             .extension_function(
@@ -76,8 +75,7 @@ fn native_scalar_with_a_declared_return_type_can_be_called_in_a_strict_check_con
                     "typed_nine".into(),
                     FunctionArity::Exact(1),
                     true,
-                    Some(ReturnType::Integer),
-                    NullToNine,
+                    Nine,
                 )
                 .unwrap(),
             )
@@ -86,7 +84,6 @@ fn native_scalar_with_a_declared_return_type_can_be_called_in_a_strict_check_con
                     "untyped_nine".into(),
                     FunctionArity::Exact(1),
                     true,
-                    None,
                     NullToNine,
                 )
                 .unwrap(),
@@ -114,7 +111,6 @@ fn native_scalar_borrows_the_same_registers_across_io() {
         "register_probe".into(),
         FunctionArity::Exact(2),
         false,
-        None,
         RegisterProbe {
             args_address: args.as_ptr() as usize,
             queue: queue.clone(),
@@ -137,7 +133,6 @@ fn native_scalar_receives_each_executing_connection() {
                 "connection_changes".into(),
                 FunctionArity::Exact(1),
                 false,
-                None,
                 ConnectionChanges,
             )
             .unwrap(),
@@ -168,7 +163,6 @@ fn native_scalar_connection_context_survives_io_and_helper_queries() {
                 "connection_context_read".into(),
                 FunctionArity::Exact(1),
                 false,
-                None,
                 ConnectionContextRead {
                     queue: queue.clone(),
                 },
@@ -239,6 +233,8 @@ struct ConnectionContextCall {
 }
 
 impl ScalarCall for ConnectionContextCall {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if integer(args[0].get_value()) == 0 {
             let context = connection.context::<AtomicI64>().ok_or_else(|| {
@@ -275,7 +271,6 @@ fn native_scalar_preserves_unmatched_outer_join_rows() {
                 "null_to_nine".into(),
                 FunctionArity::Exact(1),
                 false,
-                None,
                 NullToNine,
             )
             .unwrap(),
@@ -306,7 +301,6 @@ fn native_scalar_helper_queries_resume_with_independent_call_state() {
                 "nested_sum".into(),
                 FunctionArity::Exact(1),
                 false,
-                None,
                 NestedSum {
                     queue: queue.clone(),
                 },
@@ -342,7 +336,6 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                             "nested_sum".into(),
                             FunctionArity::Exact(1),
                             false,
-                            None,
                             NestedSum {
                                 queue: queue.clone(),
                             },
@@ -487,6 +480,8 @@ struct RegisterProbeCall {
 }
 
 impl ScalarCall for RegisterProbeCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         assert_eq!(args.as_ptr() as usize, self.args_address);
         if let Some(io) = self.gate.wait() {
@@ -510,10 +505,31 @@ impl ScalarFunction for ConnectionChanges {
 }
 
 impl ScalarCall for ConnectionChanges {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         Ok(IOResult::Done(Value::from_i64(
             connection.changes() * 10 + integer(args[0].get_value()),
         )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Nine;
+
+impl ScalarFunction for Nine {
+    type Call = Self;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(*self)
+    }
+}
+
+impl ScalarCall for Nine {
+    type Output = i64;
+
+    fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<i64> {
+        Ok(IOResult::Done(9))
     }
 }
 
@@ -531,6 +547,8 @@ impl ScalarFunction for NullToNine {
 struct NullToNineCall;
 
 impl ScalarCall for NullToNineCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         Ok(IOResult::Done(match args[0].get_value() {
             Value::Null => Value::from_i64(9),
@@ -565,7 +583,6 @@ fn extension_constructors_validate_argument_counts() {
                     count => FunctionArity::Exact(count as usize),
                 },
                 false,
-                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -691,7 +708,6 @@ fn scalar_calls_resume_independently_and_create_once() {
                 "DeLaYeD".into(),
                 FunctionArity::Exact(2),
                 false,
-                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: created.clone(),
@@ -729,7 +745,6 @@ fn resetting_a_pending_scalar_drops_it_and_starts_a_new_call() {
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
-                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: created.clone(),
@@ -758,7 +773,6 @@ fn scalar_error_after_io_drops_the_call_and_preserves_the_error() {
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
-                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -788,7 +802,6 @@ fn failed_completion_releases_the_pending_scalar() {
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
-                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -823,7 +836,6 @@ fn abort_releases_nested_trigger_calls_and_restores_trigger_state() {
                     "delayed".into(),
                     FunctionArity::Exact(2),
                     false,
-                    None,
                     DelayedScalar {
                         queue: queue.clone(),
                         created: Arc::new(AtomicUsize::new(0)),
@@ -1644,7 +1656,6 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
             "delayed".into(),
             FunctionArity::Exact(2),
             false,
-            None,
             DelayedScalar {
                 queue: queue.clone(),
                 created: created.clone(),
@@ -1684,7 +1695,6 @@ fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end(
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
-                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -1979,6 +1989,8 @@ struct DelayedCall {
 }
 
 impl ScalarCall for DelayedCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
@@ -2023,6 +2035,8 @@ struct NestedSumCall {
 }
 
 impl ScalarCall for NestedSumCall {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if self.statement.is_none() {
             self.statement = Some(connection.prepare_internal("SELECT x FROM input_values")?);

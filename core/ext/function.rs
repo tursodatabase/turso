@@ -1,7 +1,7 @@
 use crate::alloc::TryClone;
 use crate::function::{ExtFunc, ExternalFunc};
 use crate::native_ext::{
-    AggregateFunction, ExtensionState, FunctionArity, ReturnType, ScalarFunction,
+    AggregateFunction, ExtensionState, FunctionArity, ScalarCall, ScalarFunction, ScalarReturn,
 };
 use crate::sync::Arc;
 use crate::types::{AggContext, ExternalAggState, IOResultOr};
@@ -21,7 +21,6 @@ impl ExternalFunc {
         name: String,
         arity: FunctionArity,
         deterministic: bool,
-        return_type: Option<ReturnType>,
         function: F,
     ) -> Result<Self> {
         arity.validate()?;
@@ -30,7 +29,7 @@ impl ExternalFunc {
             func: ExtFunc::NativeScalar {
                 arity,
                 deterministic,
-                return_type,
+                return_type: <<F::Call as ScalarCall>::Output as ScalarReturn>::TYPE,
                 function: Arc::new(function),
             },
         })

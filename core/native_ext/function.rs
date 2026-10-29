@@ -1,6 +1,6 @@
 use super::ExtensionState;
 use crate::sync::Arc;
-use crate::types::{AggContext, IOResultOr};
+use crate::types::{AggContext, IOResultOr, ValueBlob};
 use crate::{Connection, IOResult, LimboError, Register, Result, Value};
 use std::fmt::Debug;
 
@@ -11,7 +11,99 @@ pub trait ScalarFunction: Debug + Send + Sync {
 }
 
 pub trait ScalarCall: Send + Sync {
+    /// The planner reads the function's SQL return type from this type, so a
+    /// function cannot declare one type and return another.
+    type Output: ScalarReturn;
+
+    fn step(&mut self, connection: &Arc<Connection>, args: &[Register])
+        -> IOResultOr<Self::Output>;
+}
+
+/// A Rust type a native scalar function can return.
+pub trait ScalarReturn {
+    /// The SQL type of every non-NULL result, or `None` when results can have
+    /// any type.
+    const TYPE: Option<ReturnType>;
+
+    fn into_value(self) -> Value;
+}
+
+impl ScalarReturn for Value {
+    const TYPE: Option<ReturnType> = None;
+
+    fn into_value(self) -> Value {
+        self
+    }
+}
+
+impl ScalarReturn for i64 {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Integer);
+
+    fn into_value(self) -> Value {
+        Value::from_i64(self)
+    }
+}
+
+/// Stored as 0 or 1, like SQLite booleans.
+impl ScalarReturn for bool {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Integer);
+
+    fn into_value(self) -> Value {
+        Value::from_i64(self as i64)
+    }
+}
+
+impl ScalarReturn for f64 {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Real);
+
+    fn into_value(self) -> Value {
+        Value::from_f64(self)
+    }
+}
+
+impl ScalarReturn for String {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Text);
+
+    fn into_value(self) -> Value {
+        Value::build_text(self)
+    }
+}
+
+impl ScalarReturn for &'static str {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Text);
+
+    fn into_value(self) -> Value {
+        Value::build_text(self)
+    }
+}
+
+impl ScalarReturn for ValueBlob {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Blob);
+
+    fn into_value(self) -> Value {
+        Value::from_blob(self)
+    }
+}
+
+/// `None` is SQL NULL, which every function may return whatever its type.
+impl<T: ScalarReturn> ScalarReturn for Option<T> {
+    const TYPE: Option<ReturnType> = T::TYPE;
+
+    fn into_value(self) -> Value {
+        self.map_or(Value::Null, ScalarReturn::into_value)
+    }
+}
+
+/// `ScalarCall` with its output converted to `Value`, so calls of different
+/// output types can be stored behind one trait object.
+pub trait ScalarStep: Send + Sync {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value>;
+}
+
+impl<C: ScalarCall> ScalarStep for C {
+    fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
+        Ok(ScalarCall::step(self, connection, args)?.map(ScalarReturn::into_value))
+    }
 }
 
 pub trait AggregateFunction: Debug + Send + Sync {
@@ -26,11 +118,11 @@ pub trait Aggregate: Debug + Send + Sync {
 }
 
 pub trait ScalarFactory: Debug + Send + Sync {
-    fn create_call(&self) -> Result<Box<dyn ScalarCall>>;
+    fn create_call(&self) -> Result<Box<dyn ScalarStep>>;
 }
 
 impl<F: ScalarFunction> ScalarFactory for F {
-    fn create_call(&self) -> Result<Box<dyn ScalarCall>> {
+    fn create_call(&self) -> Result<Box<dyn ScalarStep>> {
         Ok(Box::new(ScalarFunction::create_call(self)?))
     }
 }
