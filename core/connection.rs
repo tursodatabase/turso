@@ -3657,6 +3657,11 @@ impl Connection {
         self.role_catalog().is_superuser(self.current_role())
     }
 
+    /// Makes the session role the current role again, as RESET ROLE does.
+    pub fn reset_current_role(&self) {
+        self.set_current_role(self.session_role);
+    }
+
     /// Statements prepared under the previous role are prepared again, because
     /// privileges are checked when a statement is prepared.
     pub(crate) fn set_current_role(&self, role: RoleId) {

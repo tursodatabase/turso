@@ -261,6 +261,16 @@ expect {
     session user
 }
 
+test discard-all-returns-to-session-user {
+    CREATE ROLE sr_discard;
+    SET ROLE sr_discard;
+    DISCARD ALL;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
 test set-role-to-missing-role-fails {
     SET ROLE sr_missing;
 }
