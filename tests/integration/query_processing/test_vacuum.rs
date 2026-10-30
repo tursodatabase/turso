@@ -212,8 +212,7 @@ fn create_custom_type_ordering_fixture(conn: &Arc<Connection>) -> anyhow::Result
         "CREATE TYPE rev \
          BASE text \
          ENCODE string_reverse(value) \
-         DECODE string_reverse(value) \
-         OPERATOR '<'",
+         DECODE string_reverse(value)",
     )?;
     conn.execute(
         "CREATE TABLE words(
