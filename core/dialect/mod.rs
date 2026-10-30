@@ -246,6 +246,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         false
     }
+
+    /// Whether `CREATE INDEX` accepts qualified column names such as `t.a`
+    /// in its indexed terms.
+    ///
+    /// PostgreSQL accepts them. SQLite raises an error.
+    fn allows_qualified_columns_in_index_terms(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
