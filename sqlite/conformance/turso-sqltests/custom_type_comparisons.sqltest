@@ -1329,27 +1329,32 @@ expect {
     join|1
 }
 
-# As in PostgreSQL, a text column is not compared with a date column as is:
-# the date would need to ENCODE every text value, and a hash join or an IN
-# subquery would compare them without it.
+# A text value compared with a date is cast to date first, the way SQLite
+# applies a column's affinity, so '2024-01-01 10:00' equals the date
+# 2024-01-01 in every plan: a hash join, a scan, an IN subquery, a scalar
+# subquery and a row value. A date function's text result is cast too.
 @requires strict "uses STRICT tables"
-test cmp-date-with-text-column-is-an-error {
+test cmp-date-with-text-casts-the-text {
     CREATE TABLE d(x date) STRICT;
+    INSERT INTO d VALUES ('2024-01-01'), ('2024-01-02');
     CREATE TABLE t(s text) STRICT;
-    SELECT count(*) FROM d JOIN t ON d.x = t.s;
+    INSERT INTO t VALUES ('2024-01-01 10:00'), ('2024-01-03');
+    SELECT 'join', group_concat(d.x) FROM d JOIN t ON d.x = t.s;
+    SELECT 'scan', group_concat(d.x) FROM d NOT INDEXED CROSS JOIN t NOT INDEXED WHERE d.x = t.s;
+    SELECT 'in', group_concat(d.x) FROM d WHERE d.x IN (SELECT s FROM t);
+    SELECT 'in text', group_concat(s) FROM t WHERE t.s IN (SELECT x FROM d);
+    SELECT 'scalar', group_concat(d.x) FROM d WHERE d.x = (SELECT s FROM t LIMIT 1);
+    SELECT 'row', group_concat(d.x) FROM d, t WHERE (d.x, d.x) = (t.s, t.s);
+    SELECT 'date()', group_concat(d.x) FROM d WHERE d.x > date('2024-01-01', '+0 day');
 }
-expect error {
-    cannot compare type date with text: cast it to date first
-}
-
-@requires strict "uses STRICT tables"
-test cmp-date-with-text-in-subquery-is-an-error {
-    CREATE TABLE d(x date) STRICT;
-    CREATE TABLE t(s text) STRICT;
-    SELECT count(*) FROM t WHERE t.s IN (SELECT x FROM d);
-}
-expect error {
-    cannot compare type date with text: cast it to date first
+expect {
+    join|2024-01-01
+    scan|2024-01-01
+    in|2024-01-01
+    in text|2024-01-01 10:00
+    scalar|2024-01-01
+    row|2024-01-01
+    date()|2024-01-02
 }
 
 # A comparison, NOT, IS, IN or BETWEEN gives a boolean, as in PostgreSQL, so it
@@ -1376,14 +1381,15 @@ expect {
     join|1
 }
 
-# An integer column is not a truth value, so it needs a cast.
+# An integer column compared with a boolean is cast to boolean first.
 @requires strict "uses STRICT tables"
-test cmp-boolean-with-integer-column-is-an-error {
-    CREATE TABLE t(b boolean, u integer) STRICT;
-    SELECT count(*) FROM t WHERE b = u;
+test cmp-boolean-with-integer-column-casts-the-integer {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b boolean, u integer) STRICT;
+    INSERT INTO t VALUES (1, 1, 1), (2, 0, 0), (3, 1, 0);
+    SELECT group_concat(id) FROM t WHERE b = u;
 }
-expect error {
-    cannot compare type boolean with integer: cast it to boolean first
+expect {
+    1,2
 }
 
 # A value cast to a type compares the same in a nested loop, a hash join and

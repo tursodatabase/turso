@@ -14,7 +14,7 @@ use super::{
 };
 use crate::translate::expr::expr_type::{type_of, TypeEnv};
 use crate::translate::expr::{
-    cast_compared_builtin_types, cast_in_subquery_builtin_types, comparison_affinity,
+    cast_compared_operands, cast_in_subquery_operands, comparison_affinity,
 };
 use crate::turso_assert;
 use crate::{
@@ -623,14 +623,14 @@ fn plan_subqueries_with_outer_query_access<'a>(
         walk_expr_mut(expr, &mut subquery_parser)?;
     }
     drop(subquery_parser);
-    // Binding casts compared values of different built-in types to a common
-    // one, but a scalar subquery's type is known only now that it is planned:
+    // Binding casts compared values to the custom type they are compared as,
+    // but a scalar subquery's type is known only now that it is planned:
     // `ts = (SELECT d ...)` becomes `ts = CAST((SELECT d ...) AS timestamp)`.
     if !resolver.schema().type_registry.is_empty() {
         let env = TypeEnv::new(Some(referenced_tables), resolver);
         for expr in exprs {
             walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
-                cast_compared_builtin_types(expr, &env, resolver)?;
+                cast_compared_operands(expr, &env, resolver)?;
                 Ok(WalkControl::Continue)
             })?;
         }
@@ -989,7 +989,7 @@ fn get_subquery_parser<'a>(
                     QueryDestination::Unset,
                     connection,
                 )?;
-                cast_in_subquery_builtin_types(
+                cast_in_subquery_operands(
                     &mut lhs,
                     Some(referenced_tables),
                     &mut plan,
