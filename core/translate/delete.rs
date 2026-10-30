@@ -1,4 +1,5 @@
-use crate::schema::{BTreeTable, Table};
+use crate::namespace::NamespaceRef;
+use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
@@ -7,7 +8,9 @@ use crate::translate::plan::{
     DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
     QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
-use crate::translate::planner::{parse_where, plan_ctes_as_outer_refs};
+use crate::translate::planner::{
+    collect_subquery_table_refs_in_expr, parse_where, plan_ctes_as_outer_refs,
+};
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
@@ -16,7 +19,6 @@ use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
-use smallvec::SmallVec;
 use turso_parser::ast::{Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
@@ -26,7 +28,7 @@ fn validate_delete(
     resolver: &Resolver,
     tbl_name: &str,
     qualified_name: &QualifiedName,
-    database_id: usize,
+    namespace: NamespaceRef,
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<Arc<Table>> {
@@ -37,7 +39,9 @@ fn validate_delete(
     {
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }
-    let table = match resolver.with_schema(database_id, |s| s.get_table(tbl_name)) {
+    let table = match resolver.with_schema(namespace.database_id, |s| {
+        s.get_table(namespace.id, tbl_name)
+    }) {
         Some(table) => table,
         None => crate::bail_parse_error!(
             "no such table: {}",
@@ -51,26 +55,30 @@ fn validate_delete(
         crate::bail_parse_error!("DELETE from WITHOUT ROWID tables is not supported");
     }
 
-    // Check if this is a materialized view
-    if resolver.schema().is_materialized_view(tbl_name) {
+    // Check if this is a materialized view. Must look up the schema of the
+    // table's own database: a table in an attached database can share a name
+    // with a materialized view in a different database.
+    if resolver.with_schema(namespace.database_id, |s| {
+        s.is_materialized_view(namespace.id, tbl_name)
+    }) {
         crate::bail_parse_error!("cannot modify materialized view {}", tbl_name);
     }
 
     // Check if this table has any incompatible dependent views
-    resolver.schema().with_incompatible_dependent_views(tbl_name, |views| {
+    resolver.with_schema(namespace.database_id, |s| s.with_incompatible_dependent_views(namespace.id, tbl_name, |views| {
     if !views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+        use crate::incremental::view::DBSP_CIRCUIT_VERSION;
         crate::bail_parse_error!(
             "Cannot DELETE from table '{tbl_name}' because it has incompatible dependent materialized view(s): {}. \n\
              These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
              Please DROP and recreate the view(s) before modifying this table.",
-            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
+            views.iter().map(|view| view.as_str()).collect::<Vec<_>>().join(", "),
         );
     }
     // Pins the closure's error type: bail_parse_error! is polymorphic over
     // boxed and unboxed LimboError since the InsnResult migration.
     Ok::<(), crate::LimboError>(())
-    })?;
+    }))?;
     Ok(table)
 }
 
@@ -86,13 +94,14 @@ pub fn translate_delete(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    let database_id = resolver.resolve_existing_table_database_id_qualified(tbl_name)?;
+    let namespace = resolver.resolve_queried_table(tbl_name)?;
+    let database_id = namespace.database_id;
     let normalized_table_name = normalize_ident(tbl_name.name.as_str());
     let table = validate_delete(
         resolver,
         &normalized_table_name,
         tbl_name,
-        database_id,
+        namespace,
         program,
         connection,
     )?;
@@ -110,13 +119,12 @@ pub fn translate_delete(
         indexed,
         with,
         connection,
-        database_id,
+        namespace,
     )?;
 
     // Plan subqueries in the WHERE clause
     if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
         if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
-            // When using rowset (triggers or subqueries present), subqueries are in the rowset_plan's WHERE
             plan_subqueries_from_select_plan(program, rowset_plan, resolver, connection)?;
         } else {
             // Normal path: subqueries are in the DELETE plan's WHERE
@@ -168,13 +176,7 @@ pub fn translate_delete(
     let Plan::Delete(ref delete) = delete_plan else {
         panic!("delete_plan is not a DeletePlan");
     };
-    super::stmt_journal::set_delete_stmt_journal_flags(
-        program,
-        delete,
-        resolver,
-        connection,
-        database_id,
-    )?;
+    super::stmt_journal::set_delete_stmt_journal_flags(program, delete, resolver, connection)?;
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
     emit_program(connection, resolver, program, delete_plan, |_| {})?;
@@ -193,8 +195,9 @@ pub fn prepare_delete_plan(
     indexed: Option<turso_parser::ast::Indexed>,
     with: Option<With>,
     connection: &Arc<crate::Connection>,
-    database_id: usize,
+    namespace: NamespaceRef,
 ) -> Result<Plan> {
+    let database_id = namespace.database_id;
     let btree_table_for_triggers = table.btree();
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table)
@@ -204,26 +207,46 @@ pub fn prepare_delete_plan(
         crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
     };
     let indexes = resolver.with_schema(database_id, |schema| {
-        schema.get_indices(table.get_name()).cloned().collect()
+        schema
+            .get_indices(namespace.id, table.get_name())
+            .cloned()
+            .collect()
     });
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         unmatched_right_rows_plan: None,
         table,
         identifier: qualified_name.identifier(),
+        has_alias: qualified_name.alias.is_some(),
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
-        database_id,
+        namespace,
         indexed,
         plan_estimate: None,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
     // Plan CTEs and add them as outer query references for subquery resolution
-    plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
+    let mut subquery_table_refs = Vec::new();
+    if let Some(where_clause) = &where_clause {
+        collect_subquery_table_refs_in_expr(where_clause, &mut subquery_table_refs);
+    }
+    for column in &returning {
+        if let ResultColumn::Expr(expr, _) = column {
+            collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+        }
+    }
+    plan_ctes_as_outer_refs(
+        with,
+        &subquery_table_refs,
+        resolver,
+        program,
+        &mut table_references,
+        connection,
+    )?;
 
     let mut where_predicates = vec![];
 
@@ -256,21 +279,24 @@ pub fn prepare_delete_plan(
     // to skip the rowset materialization.
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
-        .map(|bt| {
-            has_triggers_including_temp(resolver, database_id, TriggerEvent::Delete, None, bt)
-        })
+        .map(|bt| has_triggers_including_temp(resolver, namespace, TriggerEvent::Delete, None, bt))
         .unwrap_or(false);
 
-    let has_fk_cascade_triggers = match btree_table_for_triggers.as_ref() {
-        Some(bt) => table_has_fk_cascade_triggers(resolver, database_id, &bt.name)?,
-        None => false,
+    let has_fk_actions = match btree_table_for_triggers.as_ref() {
+        Some(bt) if connection.foreign_keys_enabled() => resolver
+            .with_schema(database_id, |s| {
+                s.resolved_fks_referencing(namespace.id, &bt.name)
+            })?
+            .iter()
+            .any(|fk_ref| !matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict)),
+        _ => false,
     };
 
     let mut safety = DmlSafety::default();
     if has_delete_triggers {
         safety.require(DmlSafetyReason::Trigger);
     }
-    if has_fk_cascade_triggers {
+    if has_fk_actions {
         safety.require(DmlSafetyReason::FkCascade);
     }
     if where_clause_has_subquery(&where_predicates) {
@@ -294,62 +320,6 @@ pub fn prepare_delete_plan(
     }
 
     Ok(Plan::Delete(Box::new(delete_plan)))
-}
-
-/// Returns true if any FK referencing `table_name` (transitively, following CASCADE chains)
-/// has triggers on the child table side, which could write back to `table_name` and
-/// invalidate a live DELETE scan iterator.
-fn table_has_fk_cascade_triggers(
-    resolver: &crate::translate::emitter::Resolver,
-    database_id: usize,
-    table_name: &str,
-) -> Result<bool> {
-    let check_temp = database_id != crate::TEMP_DB_ID && resolver.has_temp_database();
-
-    let mut visited: SmallVec<[Arc<BTreeTable>; 2]> = SmallVec::new();
-    let mut worklist: SmallVec<[Arc<BTreeTable>; 2]> = SmallVec::new();
-
-    let start = resolver
-        .with_schema(database_id, |s| s.get_btree_table(table_name))
-        .ok_or_else(|| {
-            crate::LimboError::InternalError(format!(
-                "btree table {table_name} missing from schema after delete validation"
-            ))
-        })?;
-    worklist.push(start);
-
-    while let Some(current) = worklist.pop() {
-        if visited.iter().any(|t| Arc::ptr_eq(t, &current)) {
-            continue;
-        }
-        visited.push(current.clone());
-
-        let referencing_fks =
-            resolver.with_schema(database_id, |s| s.resolved_fks_referencing(&current.name))?;
-
-        for fk_ref in referencing_fks {
-            if matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict) {
-                continue;
-            }
-            let child_name = fk_ref.child_table.name.as_str();
-            let has_triggers = resolver.with_schema(database_id, |s| {
-                s.get_triggers_for_table(child_name).next().is_some()
-            });
-            if has_triggers {
-                return Ok(true);
-            }
-            if check_temp {
-                let has_temp = resolver.with_schema(crate::TEMP_DB_ID, |s| {
-                    s.get_triggers_for_table(child_name).next().is_some()
-                });
-                if has_temp {
-                    return Ok(true);
-                }
-            }
-            worklist.push(fk_ref.child_table);
-        }
-    }
-    Ok(false)
 }
 
 /// Check if any WHERE predicate contains a subquery (Subquery, InSelect, or Exists).
@@ -466,7 +436,6 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
-        phantom_params: vec![],
     };
     plan.rowset_plan = Some(rowset_plan);
 }

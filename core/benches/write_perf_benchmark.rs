@@ -20,7 +20,7 @@ use codspeed_criterion_compat::{
 
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Database, PlatformIO, StepResult};
+use turso_core::{ConnectOpts, Database, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -74,7 +74,7 @@ fn setup_limbo_with_sync(temp_dir: &TempDir, schema: &str, sync_on: bool) -> Arc
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, db_path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Set synchronous mode
     let sync_mode = if sync_on { "FULL" } else { "OFF" };
@@ -160,7 +160,7 @@ fn bench_index_impact(criterion: &mut Criterion) {
         // Limbo benchmark
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_limbo(&temp_dir, schema);
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         group.bench_function(BenchmarkId::new("limbo", name), |b| {
             let mut insert_stmt = conn.prepare(&values).unwrap();
@@ -237,7 +237,7 @@ fn bench_transaction_size(criterion: &mut Criterion) {
             &temp_dir,
             "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
         );
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         group.bench_function(BenchmarkId::new("limbo", format!("{tx_size}_rows")), |b| {
             let mut begin = conn.query("BEGIN").unwrap().unwrap();
@@ -342,7 +342,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
         &temp_dir,
         "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
     );
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "sequential_keys"), |b| {
         let mut stmt = conn.prepare(&seq_values).unwrap();
@@ -367,7 +367,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
         &temp_dir,
         "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
     );
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "random_keys"), |b| {
         let mut stmt = conn.prepare(&rand_values).unwrap();
@@ -481,7 +481,7 @@ fn bench_update_performance(criterion: &mut Criterion) {
         &temp_dir,
         "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
     );
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Insert initial data
     let mut stmt = conn.prepare(&initial_insert).unwrap();
@@ -549,7 +549,7 @@ fn bench_delete_performance(criterion: &mut Criterion) {
         &temp_dir,
         "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
     );
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "range_delete"), |b| {
         iter_custom_or_iter!(b, |iters| {
@@ -620,7 +620,7 @@ fn bench_delete_performance(criterion: &mut Criterion) {
         "CREATE TABLE source (id INTEGER PRIMARY KEY, data TEXT, bucket INTEGER)",
         false,
     );
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE clear_target (id INTEGER PRIMARY KEY, data TEXT, bucket INTEGER)")
         .unwrap();
     conn.execute("CREATE INDEX clear_target_data ON clear_target(data)")
@@ -716,7 +716,7 @@ fn bench_large_transaction_commit(criterion: &mut Criterion) {
             &temp_dir,
             "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT, val INTEGER)",
         );
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         group.bench_function(
             BenchmarkId::new("limbo", format!("{row_count}_rows")),
@@ -808,7 +808,7 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
         "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
         true,
     );
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "sync_FULL"), |b| {
         let mut insert_stmt = conn.prepare(&values).unwrap();
@@ -834,7 +834,7 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
         "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
         false,
     );
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "sync_OFF"), |b| {
         let mut insert_stmt = conn.prepare(&values).unwrap();

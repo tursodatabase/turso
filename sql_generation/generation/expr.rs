@@ -240,7 +240,7 @@ impl Arbitrary for QualifiedName {
         let table = &context.tables()[table_idx];
         // TODO: for now forego alias
         Self {
-            db_name: None,
+            namespace: None,
             name: Name::from_string(&table.name),
             alias: None,
         }

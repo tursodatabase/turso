@@ -142,7 +142,17 @@ impl VirtualTable {
                 )
             })?
         {
-            columns_from_create_table_body(&body)
+            let mut columns = columns_from_create_table_body(&body)?;
+            // Like SQLite, HIDDEN marks the column and is not part of its declared type.
+            for column in columns.iter_mut().filter(|column| column.hidden()) {
+                column.ty_str = column
+                    .ty_str
+                    .split(' ')
+                    .filter(|word| !word.eq_ignore_ascii_case("HIDDEN"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+            Ok(columns)
         } else {
             Err(LimboError::ParseError(
                 "Failed to parse schema from virtual table module".to_string(),
@@ -302,12 +312,15 @@ impl VirtualTableCursor {
         result.map(IOResult::Done).map_err(Into::into)
     }
 
-    pub(crate) fn rowid(&self) -> i64 {
-        match &self.inner {
+    pub(crate) fn rowid(&self) -> Option<i64> {
+        if self.null_flag {
+            return None;
+        }
+        Some(match &self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.rowid(),
             VirtualTableCursorInner::External(cursor) => cursor.rowid(),
             VirtualTableCursorInner::Internal(cursor) => cursor.read().rowid(),
-        }
+        })
     }
 
     pub(crate) fn column(&mut self, column: usize) -> IOResultOr<Value> {
@@ -637,7 +650,7 @@ pub trait InternalVirtualTableCursor: Send + Sync {
 mod tests {
     use super::*;
     use crate::SqliteDialect;
-    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags};
+    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags};
 
     /// Minimal `InternalVirtualTable` that exposes a fixed two-row table. Used
     /// to verify that callers can register an arbitrary catalog table at
@@ -738,7 +751,7 @@ mod tests {
             .unwrap();
         assert_eq!(name, "external_metadata");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let mut stmt = conn
             .prepare("SELECT key, value FROM external_metadata")
             .unwrap();
@@ -782,7 +795,7 @@ mod tests {
             .unwrap();
         assert_eq!(name, "External_ΔΥΣ");
 
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let mut stmt = conn.prepare("SELECT key, value FROM external_ΔΥΣ").unwrap();
         let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows.len(), 2);

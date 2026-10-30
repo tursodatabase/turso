@@ -46,7 +46,7 @@ miette = { workspace = true, features = ["fancy"] }
 glob = "0.3"
 
 itertools = { workspace = true }
-chumsky = "0.12.0"
+chumsky = { workspace = true }
 
 # Database generation
 fake = { version = "4.4", features = ["derive", "rand_core"] }
@@ -60,15 +60,17 @@ turso = { workspace = true, features = ["test_helper"] }
 
 # Turso SQL parser (for splitting multi-statement SQL)
 turso_parser = { workspace = true }
+query-result-oracle = { path = "../query-result-oracle" }
 
 # Bundled SQLite: the in-process oracle matrix cases are verified against.
 # The bundled version is pinned by Cargo.lock; upgrading it is a deliberate,
 # reviewable event because expected results follow SQLite's behavior.
 rusqlite = { workspace = true }
 
-# PostgreSQL wire-protocol client (for the pg backend, which drives a
-# spawned tursopg server over TCP)
+# PostgreSQL wire-protocol client (for the tursopg and postgres backends,
+# which drive a tursopg server or a real PostgreSQL server over TCP)
 turso_pg_client = { workspace = true }
+pg_query = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1"

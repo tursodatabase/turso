@@ -1,0 +1,138 @@
+@database :memory:
+
+# A persistent (main-database) view's unqualified table names are fixed to
+# the database the view was created in, never resolved TEMP-first like an
+# ordinary top-level query. Established with sqlite3 (src/fix.c,
+# sqlite3FixSelect/sqlite3FixSrcList - the "view schema fixer" that every
+# persistent view's body runs through): a view over "t" keeps reading main.t
+# even after a same-named TEMP TABLE is created, whether the TEMP table
+# existed before or after the view, and an explicit "FROM temp.t" in a
+# persistent view's body is rejected outright.
+
+test view-sees-main-table-after-temp-shadow-created {
+    CREATE TABLE t(id INTEGER, val TEXT);
+    INSERT INTO main.t VALUES (1, 'main-row');
+    CREATE VIEW v AS SELECT * FROM t;
+    CREATE TEMP TABLE t(id INTEGER, val TEXT);
+    INSERT INTO temp.t VALUES (2, 'temp-row');
+    SELECT * FROM v;
+    SELECT 'direct unqualified t still resolves to temp:';
+    SELECT * FROM t;
+}
+expect {
+    1|main-row
+    direct unqualified t still resolves to temp:
+    2|temp-row
+}
+
+test view-sees-main-table-when-temp-shadow-created-before-view {
+    CREATE TEMP TABLE t(id INTEGER, val TEXT);
+    INSERT INTO temp.t VALUES (2, 'temp-row');
+    CREATE TABLE t(id INTEGER, val TEXT);
+    INSERT INTO main.t VALUES (1, 'main-row');
+    CREATE VIEW v AS SELECT * FROM t;
+    SELECT * FROM v;
+}
+expect {
+    1|main-row
+}
+
+# A view queried from inside a trigger must keep resolving its own body
+# within its own database, even when the trigger itself is a TEMP trigger
+# (whose own unqualified names - unlike a view's - do follow the looser,
+# temp-first search path). The two scopes are independent: entering the
+# trigger's relaxed scope to compile the trigger body must not leak into the
+# view expanded inside it.
+test view-inside-temp-trigger-still-sees-main-table {
+    CREATE TABLE t(id INTEGER, val TEXT);
+    INSERT INTO main.t VALUES (1, 'main-row');
+    CREATE VIEW v AS SELECT * FROM t;
+    CREATE TABLE log(msg TEXT);
+    CREATE TEMP TRIGGER trg AFTER INSERT ON log
+    BEGIN
+        INSERT INTO log(msg) SELECT val FROM v;
+    END;
+    CREATE TEMP TABLE t(id INTEGER, val TEXT);
+    INSERT INTO temp.t VALUES (2, 'temp-row');
+    INSERT INTO log(msg) VALUES ('trigger-fired');
+    SELECT * FROM log;
+}
+expect {
+    trigger-fired
+    main-row
+}
+
+# A view over another view: both views keep resolving within main, so a
+# TEMP table created afterwards shadows neither.
+test view-over-view-still-sees-main-table {
+    CREATE TABLE t(id INTEGER, val TEXT);
+    INSERT INTO main.t VALUES (1, 'main-row');
+    CREATE VIEW v1 AS SELECT * FROM t;
+    CREATE VIEW v2 AS SELECT * FROM v1;
+    CREATE TEMP TABLE t(id INTEGER, val TEXT);
+    INSERT INTO temp.t VALUES (2, 'temp-row');
+    SELECT * FROM v2;
+}
+expect {
+    1|main-row
+}
+
+# A persistent view explicitly qualifying a source table as temp is rejected
+# outright, matching SQLite's rule that a persistent view cannot reference
+# objects in a different database. The two engines' error text differs
+# ("view v cannot reference objects in database temp" vs Turso's "view cannot
+# reference table in attached database: ..."), so the pattern only checks the
+# shared wording both use.
+test view-rejects-explicit-temp-qualified-source {
+    CREATE TEMP TABLE t(id INTEGER);
+    CREATE VIEW v AS SELECT * FROM temp.t;
+}
+expect error {
+    cannot reference
+}
+
+# A TEMP view carries no database restriction at all (SQLite's schema fixer
+# skips TEMP objects outright - src/attach.c, sqlite3FixInit sets bTemp for
+# iDb==1 and fixSelectCb only binds a from-item to the view's own schema when
+# bTemp is 0). So unqualified "sqlite_master"/"sqlite_schema" inside a TEMP
+# view's body must keep naming main's schema table, exactly like an ordinary
+# top-level query - never the TEMP view's own schema just because the body
+# is compiled with a database scope set.
+test temp-view-over-sqlite-master-reads-main-schema {
+    CREATE TABLE m(a);
+    CREATE TEMP VIEW tv AS SELECT name FROM sqlite_master;
+    SELECT * FROM tv;
+}
+expect {
+    m
+}
+
+test temp-view-over-sqlite-schema-reads-main-schema {
+    CREATE TABLE m(a);
+    CREATE TEMP VIEW tv AS SELECT name FROM sqlite_schema;
+    SELECT * FROM tv;
+}
+expect {
+    m
+}
+
+test temp-table-as-select-from-temp-view-over-sqlite-master {
+    CREATE TABLE m(a);
+    CREATE TEMP VIEW tv AS SELECT name FROM sqlite_master;
+    CREATE TEMP TABLE out AS SELECT * FROM tv;
+    SELECT * FROM out;
+}
+expect {
+    m
+}
+
+test temp-view-unions-sqlite-schema-with-main-view {
+    CREATE TABLE m(a);
+    CREATE VIEW mv AS SELECT name FROM sqlite_master;
+    CREATE TEMP VIEW tv AS SELECT name FROM sqlite_schema UNION SELECT name FROM mv;
+    SELECT * FROM tv;
+}
+expect {
+    m
+    mv
+}

@@ -219,6 +219,46 @@ test divide-by-zero {
 expect {
 }
 
+test divide-by-float-zero {
+    SELECT 10 / 0.0
+}
+expect {
+}
+
+test divide-float-by-float-zero {
+    SELECT 10.0 / 0.0
+}
+expect {
+}
+
+test divide-float-by-int-zero {
+    SELECT (1.5 / 0) IS NULL
+}
+expect {
+    1
+}
+
+test divide-by-quoted-zero {
+    SELECT (1 / '0') IS NULL
+}
+expect {
+    1
+}
+
+test divide-null-by-zero {
+    SELECT (NULL / 0) IS NULL
+}
+expect {
+    1
+}
+
+test remainder-null-by-zero {
+    SELECT (NULL % 0) IS NULL
+}
+expect {
+    1
+}
+
 test divide-int-null {
     SELECT 10 / null
 }

@@ -100,6 +100,18 @@ expect {
     {"aaa":123}
 }
 
+test json5-line-comment-ends-at-any-line-terminator {
+    SELECT json('[1,// c' || char(13) || '2]'),
+           json('[1,// c' || char(0x2028) || '2]'),
+           json('[1,// c' || char(0x2029) || '2]'),
+           json('[1,// c' || char(10) || '2]'),
+           json('[1,// c' || char(13, 10) || '2]'),
+           json('{a:// c' || char(0x2028) || '1}');
+}
+expect {
+    [1,2]|[1,2]|[1,2]|[1,2]|[1,2]|{"a":1}
+}
+
 test json5-ecma-script-1-pretty {
     select json_pretty('{a:5,b:6}') ;
 }
@@ -363,6 +375,27 @@ test json_bare_negative_infinity {
 }
 expect {
     -9e999
+}
+
+test json_keeps_infinity_text_from_input {
+    SELECT json('["9.0e+999"]'), json('{"note":"x 9.0e+999 y"}'), json('[9.0e+999]'), json(jsonb_array(9e999)), json(jsonb_object('a', -9e999));
+}
+expect {
+    ["9.0e+999"]|{"note":"x 9.0e+999 y"}|[9.0e+999]|[9.0e+999]|{"a":-9.0e+999}
+}
+
+test json_set_insert_replace_infinity {
+    SELECT json_set('[1]', '$[0]', 9e999), json_insert('[]', '$[#]', -9e999), json_replace('[1]', '$[0]', 9e999), json(jsonb_set('[1]', '$[0]', 9e999)), json(jsonb_replace('[1]', '$[0]', -9e999));
+}
+expect {
+    [9e999]|[-9e999]|[9e999]|[9e999]|[-9e999]
+}
+
+test json_quote_and_arrow_infinity {
+    SELECT json_quote(9e999), json_object('a', 9e999), 9e999 -> '$', json_group_array(x) FROM (SELECT -9e999 AS x);
+}
+expect {
+    9.0e+999|{"a":9.0e+999}|9e999|[-9.0e+999]
 }
 
 test json_extract_malformed_json_1 {
@@ -1204,6 +1237,77 @@ expect {
     9
 }
 
+test json_error_position_missing_value_at_end_of_input {
+    SELECT json_error_position(''),
+           json_error_position(' '),
+           json_error_position(char(0)),
+           json_error_position('/* c */'),
+           json_error_position('// c'),
+           json_error_position('[ '),
+           json_error_position('[[ '),
+           json_error_position('[1, '),
+           json_error_position('[1,' || char(10)),
+           json_error_position('[1, /* c */'),
+           json_error_position('\{"a": '),
+           json_error_position('\{"a":[ ');
+}
+expect {
+    1|1|1|1|1|2|3|4|4|4|6|7
+}
+
+test json_error_position_end_of_input_after_value_or_key {
+    SELECT json_error_position('[1 '),
+           json_error_position('\{ '),
+           json_error_position('\{"a" '),
+           json_error_position('\{"a":1, '),
+           json_error_position('[1, x'),
+           json_error_position('  x');
+}
+expect {
+    4|3|6|9|5|3
+}
+
+test json_error_position_missing_value_before_punctuation {
+    SELECT json_error_position('{"a": }'),
+           json_error_position('[1, ,2]'),
+           json_error_position('[ \}'),
+           json_error_position('{"a": ,"b":1}'),
+           json_error_position('[ /* c */ ,'),
+           json_error_position('[[ ,]]'),
+           json_error_position('{"a": ]}'),
+           json_error_position('{"a": :}'),
+           json_error_position('[1, \}'),
+           json_error_position(' ]');
+}
+expect {
+    6|4|2|6|2|3|6|6|4|2
+}
+
+test json_error_position_missing_or_non_string_object_key {
+    SELECT json_error_position('\{ :'),
+           json_error_position('\{ ,'),
+           json_error_position('{"a":1, :}'),
+           json_error_position('\{"a":1, :'),
+           json_error_position(char(123, 123)),
+           json_error_position('\{['),
+           json_error_position('\{ \{'),
+           json_error_position('\{"a":1, ['),
+           json_error_position('\{"a":1, \{'),
+           json_error_position('{ 1}'),
+           json_error_position('{ [1]:2}'),
+           json_error_position('{"a":1, 1}');
+}
+expect {
+    3|3|9|9|3|3|4|10|10|2|2|8
+}
+
+test json_array_elements_need_a_comma {
+    SELECT json_valid('[1 2]'), json_error_position('[1 2]');
+}
+expect {
+    0|4
+}
+
 test json_object_simple {
     SELECT json_object('key', 'value');
 }
@@ -1588,6 +1692,70 @@ expect {
     8C1761133117621332
 }
 
+test json-patch-keeps-escapes-in-added-keys {
+    select json_patch('{}', '{"\u00e9":1}');
+    select json_patch('{"a":1}', '{"b\u00e9":2}');
+    select json_patch('{"a":1}', '{"a":"\u00e9"}');
+    select json_patch('{"a":{"x":1}}', '{"a":{"b\u00e9":{"c":null,"d\n":[1]}},"f\u0041":{"g":{}}}');
+}
+expect {
+    {"\u00e9":1}
+    {"a":1,"b\u00e9":2}
+    {"a":"\u00e9"}
+    {"a":{"x":1,"b\u00e9":{"d\n":[1]}},"f\u0041":{"g":{}}}
+}
+
+test json-patch-matches-escaped-keys-by-value {
+    select json_patch('{"\u00e9":1}', '{"é":2}');
+    select json_patch('{"é":1}', '{"\u00e9":2}');
+}
+expect {
+    {"\u00e9":2}
+    {"é":2}
+}
+
+test jsonb-patch-copies-added-key-bytes {
+    select hex(jsonb_patch('{}', '{"x\ny":1}'));
+    select json_valid(jsonb_patch('{}', '{"x\ny":1}'), 8);
+    select hex(jsonb_patch('{"a":{"b":1}}', jsonb('{a:{c:2},"x\x41":3}')));
+}
+expect {
+    7C48785C6E791331
+    1
+    CC1317618C176213311763133259785C7834311333
+}
+
+test json-patch-object-over-non-object-starts-empty {
+    select json_patch('{"a":1}', '{"a":{"b":1,"b":null}}');
+    select json_patch('{"a":1}', '{"a":{"b":{"x":1},"b":{"y":2}}}');
+    select json_patch('{"a":[1],"c":2}', '{"a":{"b":{"c":null,"d":{"e":null}}},"c":{"x":null}}');
+}
+expect {
+    {"a":{}}
+    {"a":{"b":{"x":1,"y":2}}}
+    {"a":{"b":{"d":{}}},"c":{}}
+}
+
+test json-patch-applies-duplicate-patch-keys-in-order {
+    select json_patch('{}', '{"a":{"x":1},"a":5,"a":{"y":2}}');
+    select json_patch('{}', '{"a":{"x":1},"a":null,"a":{"y":2}}');
+    select json_patch('{"a":{"b":1}}', '{"a":{"c":2},"a":{"b":null}}');
+    select json_patch('{"a":{"b":{"c":1}},"z":0}', '{"a":{"b":{"d":{"e":{"f":2}}}},"z":{"q":null}}');
+}
+expect {
+    {"a":{"y":2}}
+    {"a":{"y":2}}
+    {"a":{"c":2}}
+    {"a":{"b":{"c":1,"d":{"e":{"f":2}}}},"z":{}}
+}
+
+test json-patch-does-not-decode-textraw-keys {
+    select json_patch('{"a\nb":0}', x'7C4A615C6E621331');
+}
+expect {
+    {"a\nb":0,"a\\\\nb":1}
+}
+
 test json-remove-1 {
     select json_remove('{"a": 5, "a": [5,4,3,2,1]}','$.a', '$.a[4]', '$.a[5]', '$.a');
 }
@@ -1684,6 +1852,207 @@ test json_set_blob_value {
 }
 expect error {
     .*JSON cannot hold BLOB values.*
+}
+
+test json_set_blob_value_null_path {
+    SELECT json_set('[1]', NULL, x'7b7d');
+}
+expect {
+    [1]
+}
+
+test json_set_bad_path_before_blob_value {
+    SELECT json_set('[1]', 'bad', x'7b7d');
+}
+expect error {
+    .*bad JSON path.*
+}
+
+test jsonb_set_blob_value {
+    SELECT jsonb_set('[1]', '$[0]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_insert_blob_value_array_append {
+    SELECT json_insert('[]', '$[#]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_insert_blob_value_object_key {
+    SELECT json_insert('{}', '$.a', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_insert_blob_value_null_path {
+    SELECT json_insert('[1]', NULL, x'7b7d');
+}
+expect {
+    [1]
+}
+
+test json_insert_jsonb_blob_value {
+    SELECT json_insert('{}', '$.a', x'01');
+}
+expect {
+    {"a":true}
+}
+
+test jsonb_insert_blob_value {
+    SELECT jsonb_insert('{}', '$.a', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_replace_blob_value {
+    SELECT json_replace('[1]', '$[0]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_replace_jsonb_blob_value {
+    SELECT json_replace('[1]', '$[0]', x'01');
+}
+expect {
+    [true]
+}
+
+test jsonb_replace_blob_value {
+    SELECT jsonb_replace('[1]', '$[0]', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+# x'245b305d' = '$[0]', x'245b315d' = '$[1]', x'61' = 'a', x'2461' = '$a'
+test json_set_blob_path {
+    SELECT json_set('[1]', x'245b305d', 5);
+}
+expect {
+    [5]
+}
+
+test json_insert_blob_path {
+    SELECT json_insert('[1]', x'245b315d', 5);
+}
+expect {
+    [1,5]
+}
+
+test json_replace_blob_path {
+    SELECT json_replace('[1]', x'245b305d', 5);
+}
+expect {
+    [5]
+}
+
+test json_set_blob_path_blob_value {
+    SELECT json_set('[1]', x'245b305d', x'7b7d');
+}
+expect error {
+    .*JSON cannot hold BLOB values.*
+}
+
+test json_remove_blob_path {
+    SELECT json_remove('[1,2]', x'245b305d');
+}
+expect {
+    [2]
+}
+
+test json_extract_blob_path {
+    SELECT json_extract('[1]', x'245b305d');
+}
+expect {
+    1
+}
+
+test json_extract_bad_blob_path {
+    SELECT json_extract('{"a":1}', x'2461');
+}
+expect error {
+    .*bad JSON path.*
+}
+
+test json_type_blob_path {
+    SELECT json_type('[1]', x'245b305d');
+}
+expect {
+    integer
+}
+
+test json_arrow_blob_path {
+    SELECT '[1]' -> x'245b305d', '{"a":1}' ->> x'61';
+}
+expect {
+    1|1
+}
+
+test json_each_blob_path {
+    SELECT key, value FROM json_each('[1,[2]]', x'245b315d');
+}
+expect {
+    0|2
+}
+
+test json_tree_blob_path {
+    SELECT key, value FROM json_tree('[1,[2]]', x'245b315d');
+}
+expect {
+    1|[2]
+    0|2
+}
+
+test json_extract_path_stops_at_nul {
+    SELECT json_extract('[1]', '$' || char(0) || '[0]'), json_extract('[1]', x'24005b305d');
+}
+expect {
+    [1]|[1]
+}
+
+test json_edit_path_stops_at_nul {
+    SELECT json_set('{"a":1}', '$.b' || char(0) || 'x', 5),
+           json_insert('{"a":1}', '$.c' || char(0) || 'x', 5),
+           json_replace('{"a":1}', '$.a' || char(0) || 'x', 5),
+           json_remove('{"a":1,"b":2}', '$.a' || char(0) || 'x');
+}
+expect {
+    {"a":1,"b":5}|{"a":1,"c":5}|{"a":5}|{"b":2}
+}
+
+test json_type_path_stops_at_nul {
+    SELECT json_type('{"a":[1]}', '$.a' || char(0) || '[0]');
+}
+expect {
+    array
+}
+
+test json_arrow_path_stops_at_nul {
+    SELECT '{"a":{"b":2}}' -> ('$.a' || char(0) || '.b'), '{"a":{"b":2}}' ->> ('a' || char(0) || '.b');
+}
+expect {
+    {"b":2}|{"b":2}
+}
+
+test json_each_path_stops_at_nul {
+    SELECT key, path, fullkey FROM json_each('{"a":{"b":2}}', '$.a' || char(0) || 'x');
+}
+expect {
+    b|$.a|$.a.b
+}
+
+test json_path_starting_with_nul {
+    SELECT json_extract('[1]', char(0) || '$');
+}
+expect error {
+    .*bad JSON path.*
 }
 
 test json_set_field_empty_object {
@@ -3427,23 +3796,20 @@ expect {
 # str::from_utf8_unchecked through an object key, and a child element could
 # declare a payload larger than the containing buffer.
 #
-# SQLite is more lenient here: it renders an invalid UTF-8 key with replacement
-# characters rather than rejecting the document.
+# Like SQLite, a key that is not UTF-8 is accepted; it does not match '$.a'.
 
-@skip-if sqlite "sqlite renders malformed jsonb leniently"
 test jsonb-truncated-utf8-key {
-    SELECT json_extract(x'9C79616161616161F000', '$.a');
+    SELECT quote(json_extract(x'9C79616161616161F000', '$.a'));
 }
-expect error {
-    malformed JSON
+expect {
+    NULL
 }
 
-@skip-if sqlite "sqlite renders malformed jsonb leniently"
 test jsonb-invalid-utf8-key {
-    SELECT json_extract(x'9C79FFFFFFFFFFFFFF00', '$.a');
+    SELECT quote(json_extract(x'9C79FFFFFFFFFFFFFF00', '$.a'));
 }
-expect error {
-    malformed JSON
+expect {
+    NULL
 }
 
 @skip-if sqlite "sqlite renders malformed jsonb leniently"

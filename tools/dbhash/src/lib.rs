@@ -12,7 +12,7 @@ use turso_core::SqliteDialect;
 use sha1::{Digest, Sha1};
 use std::num::NonZero;
 use turso_core::{
-    Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, StepResult, Value, IO,
+    ConnectOpts, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, StepResult, Value, IO,
 };
 
 pub use encoder::encode_value;
@@ -69,7 +69,7 @@ pub fn hash_database_with_database_opts(
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
 
     let mut hasher = Sha1::new();
     let mut tables_hashed = 0;

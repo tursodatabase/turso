@@ -106,7 +106,7 @@ pub(super) fn open_in_seek_source_cursor(
             let collation = index
                 .as_ref()
                 .and_then(|idx| idx.columns.first())
-                .and_then(|c| c.collation);
+                .map_or(CollationSeq::Binary, |c| c.collation);
             let ephemeral_index = Arc::new(Index {
                 name: String::new(),
                 table_name: String::new(),
@@ -126,6 +126,7 @@ pub(super) fn open_in_seek_source_cursor(
                 where_clause: None,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             });
             let eph_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index));
             program.emit_insn(Insn::OpenEphemeral {

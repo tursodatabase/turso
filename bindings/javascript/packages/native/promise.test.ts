@@ -31,6 +31,35 @@ test('in-memory-db-async', async () => {
     expect(rows).toEqual([{ x: 1 }, { x: 3 }]);
 })
 
+test('concurrent calls on one prepared statement use their own parameters', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE items (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    await db.exec("INSERT INTO items VALUES ('first', 'first value'), ('second', 'second value')");
+    const select = await db.prepare("SELECT value FROM items WHERE key = ?");
+
+    const rows = await Promise.all([select.get('first'), select.get('second')]);
+    expect(rows).toEqual([{ value: 'first value' }, { value: 'second value' }]);
+
+    const all = await Promise.all([select.all('first'), select.all('second')]);
+    expect(all).toEqual([[{ value: 'first value' }], [{ value: 'second value' }]]);
+
+    const collect = async (key: string) => {
+        const out = [];
+        for await (const row of select.iterate(key)) {
+            out.push(row);
+        }
+        return out;
+    };
+    const iterated = await Promise.all([collect('first'), collect('second')]);
+    expect(iterated).toEqual([[{ value: 'first value' }], [{ value: 'second value' }]]);
+
+    await db.exec("CREATE TABLE w (k TEXT)");
+    const insert = await db.prepare("INSERT INTO w VALUES (?)");
+    const results = await Promise.all([insert.run('a'), insert.run('b')]);
+    expect(results.map(r => r.changes)).toEqual([1, 1]);
+    expect(await db.all("SELECT k FROM w ORDER BY k")).toEqual([{ k: 'a' }, { k: 'b' }]);
+})
+
 test('busy timeout gives up on time when the write lock is never released', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     try {

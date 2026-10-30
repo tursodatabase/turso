@@ -1,6 +1,93 @@
 @database :default:
 @database :default-no-rowidalias:
 
+test scalar-function-filter-rejected {
+    WITH t(a) AS (VALUES (-1), (2))
+    SELECT abs(a) FILTER (WHERE a > 0) FROM t;
+}
+expect error {
+    FILTER may not be used with non-aggregate abs()
+}
+
+test scalar-function-filter-in-where-rejected {
+    SELECT 1 WHERE abs(-1) FILTER (WHERE 0);
+}
+expect error {
+    FILTER may not be used with non-aggregate abs()
+}
+
+test scalar-function-filter-in-case-rejected {
+    SELECT CASE WHEN 0 THEN abs(-1) FILTER (WHERE 1) ELSE 2 END;
+}
+expect error {
+    FILTER may not be used with non-aggregate abs()
+}
+
+test scalar-function-filter-nested-rejected {
+    SELECT coalesce(abs(-1) FILTER (WHERE 1), 0);
+}
+expect error {
+    FILTER may not be used with non-aggregate abs()
+}
+
+test scalar-function-filter-zero-arguments-rejected {
+    SELECT random() FILTER (WHERE 1);
+}
+expect error {
+    FILTER may not be used with non-aggregate random()
+}
+
+test scalar-function-filter-star-rejected {
+    SELECT random(*) FILTER (WHERE 1);
+}
+expect error {
+    FILTER may not be used with non-aggregate random()
+}
+
+test scalar-function-over-in-where-rejected {
+    SELECT 1 WHERE abs(-1) OVER ();
+}
+expect error {
+    may not be used as a window function
+}
+
+test scalar-function-over-in-case-rejected {
+    SELECT CASE WHEN 0 THEN abs(-1) OVER () ELSE 2 END;
+}
+expect error {
+    may not be used as a window function
+}
+
+test scalar-function-over-nested-rejected {
+    SELECT coalesce(abs(-1) OVER (), 0);
+}
+expect error {
+    may not be used as a window function
+}
+
+test scalar-function-over-star-in-where-rejected {
+    SELECT 1 WHERE random(*) OVER ();
+}
+expect error {
+    may not be used as a window function
+}
+
+test scalar-function-filter-over-in-where-rejected {
+    SELECT 1 WHERE abs(-1) FILTER (WHERE 1) OVER ();
+}
+expect error {
+    may not be used as a window function
+}
+
+test scalar-function-filter-aggregate-controls {
+    WITH t(a) AS (VALUES (-1), (2))
+    SELECT abs(min(a)), max(a) FILTER (WHERE a < 0),
+           min(a) FILTER (WHERE a > 0), count(*) FILTER (WHERE a > 0) FROM t;
+}
+expect {
+    1|-1|2|1
+}
+
 test abs-integer-boundaries {
     SELECT abs(-9223372036854775807), abs(9223372036854775807), abs(0), abs(NULL) IS NULL;
 }
@@ -318,6 +405,29 @@ test replace-null {
 expect {
 }
 
+test replace-empty-pattern-null-replacement {
+    select quote(replace('abc', '', NULL)), quote(replace(-1, '', NULL)), quote(replace('abc', x'', NULL)), quote(replace('abc', 'b', NULL));
+}
+expect {
+    'abc'|'-1'|'abc'|NULL
+}
+
+test replace-empty-pattern-null-replacement-filter {
+    WITH t(c0, c2) AS (VALUES ('', -1))
+    SELECT c2 FROM t WHERE replace(c2, c0, NULL);
+}
+expect {
+    -1
+}
+
+# Result column types are worked out before argument counts are checked.
+test abs-without-arguments-in-subquery-errors {
+    SELECT * FROM (SELECT abs())
+}
+expect error {
+    abs function with no arguments|wrong number of arguments to function abs\(\)
+}
+
 test replace-wrong-arg-count-0 {
     select replace()
 }
@@ -581,6 +691,28 @@ test unhex-space-separated {
 }
 expect {
     X'AABB'
+}
+
+test unhex-separators-from-non-text-value {
+    SELECT quote(unhex('12-34', -1)), quote(unhex('1234', 0)), quote(unhex('12.34', 0.5)), quote(unhex('12 34', x'20'));
+}
+expect {
+    X'1234'|X'1234'|X'1234'|X'1234'
+}
+
+test unhex-separators-from-integer-expression {
+    WITH t(c) AS (VALUES (-17))
+    SELECT quote(unhex(c, c)), quote(unhex('12-34', c)) FROM t;
+}
+expect {
+    X'17'|X'1234'
+}
+
+test unhex-null-separators {
+    SELECT quote(unhex('12', NULL));
+}
+expect {
+    NULL
 }
 
 test trim {
@@ -1619,12 +1751,52 @@ expect {
     2.042747795102219097e+05
 }
 
+test quote-float-scientific-zero-exponent {
+    SELECT quote(pi()), quote(-10 / 3.0)
+}
+expect {
+    3.141592653589793116e+00|-3.333333333333333482e+00
+}
+
 # Regression: QUOTE() should return TEXT type for floats, not REAL
 test quote-float-typeof {
     SELECT typeof(quote(12.34))
 }
 expect {
     text
+}
+
+# Regression: infinite REAL must quote as a reloadable numeric literal, not Inf.
+# SQLite emits 9.0e+999 so both engines can parse the dump back.
+# Keep these SELECT-only: the sqltest harness opens the DB read-only.
+test quote-positive-infinity {
+    SELECT quote(1e400);
+}
+expect {
+    9.0e+999
+}
+
+test quote-negative-infinity {
+    SELECT quote(-1e400);
+}
+expect {
+    -9.0e+999
+}
+
+test quote-infinity-reload {
+    SELECT quote(CAST(quote(1e400) AS REAL));
+    SELECT quote(CAST(quote(-1e400) AS REAL));
+}
+expect {
+    9.0e+999
+    -9.0e+999
+}
+
+test quote-blob {
+    SELECT quote(X'89504E47');
+}
+expect {
+    X'89504E47'
 }
 
 test sign-positive-integer {
@@ -1700,6 +1872,13 @@ test sign-null {
     SELECT sign(NULL);
 }
 expect {
+}
+
+test random-calls-in-comparison-are-independent {
+    SELECT random() = random();
+}
+expect {
+    0
 }
 
 test randomblob-int-2 {
@@ -2272,10 +2451,37 @@ expect error {
 	wrong number of arguments to function uuid7_timestamp_ms()
 }
 
-# TODO: sqlite seems not enable soundex() by default unless build it with SQLITE_SOUNDEX enabled.
-# do_execsql_test soundex-text {
-#  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
-# } {P236|H210|T522|A261|R163|R163|R150|K530|K530|X000|0000}
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test soundex-text {
+    select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
+}
+expect {
+    P236|H210|T522|A226|R163|R163|R150|K530|K530|X000|?000
+}
+
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test soundex-non-letters {
+    select soundex(' Robert'), soundex('O''Brien'), soundex('Ab-bc'), soundex('1abc'), soundex('123'), soundex(NULL), soundex('a' || char(0) || 'bc');
+}
+expect {
+    R163|O165|A112|A120|?000|?000|A000
+}
+
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test soundex-non-text {
+    select soundex(x'41'), soundex(4.5e-10), soundex(12), soundex(x'41E2'), soundex(x'41C2'), soundex(x'41F0'), soundex(x'61626364E2'), soundex(x'4100E2'), soundex(x'E2C2');
+}
+expect {
+    A000|E000|?000|A100|A100|A100|A123|A000|?000
+}
+
+@skip-if sqlite "soundex() requires a SQLite build with SQLITE_SOUNDEX"
+test soundex-non-ascii {
+    select soundex('aé'), soundex('闪电五连鞭');
+}
+expect {
+    A200|?000
+}
 
 @skip-if sqlite "unistr not available in CI SQLite build"
 test unistr-u-escape {

@@ -1,20 +1,33 @@
 use crate::functions::validate_pg_input;
-use rustc_hash::FxHashMap as HashMap;
-use std::fmt::Debug;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
+    dialect::POSTGRES_TABLE_SQL_PREFIX,
+    namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Index, Schema, Table},
-    Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
+    schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
+    Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
+    Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::RefAct;
+use turso_parser::ast::{RefAct, SortOrder};
+use turso_pg_parser::quote_identifier;
+
+pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
+
+/// PostgreSQL uses OID zero when no object is referenced.
+const PG_INVALID_OID: i64 = 0;
+pub(crate) const PG_DATABASE_OWNER_OID: i64 = 6171;
+/// pg_depend uses column zero for a whole object; table columns are numbered from one.
+const WHOLE_OBJECT_COLUMN_NUMBER: i64 = 0;
+/// Catalog BOOLEAN values are stored as integers; one means true.
+const CATALOG_BOOLEAN_TRUE: i64 = 1;
 
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
-const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
 #[derive(Debug)]
 pub struct PostgresDialect;
@@ -22,6 +35,10 @@ pub struct PostgresDialect;
 impl Dialect for PostgresDialect {
     fn name(&self) -> &'static str {
         "postgres"
+    }
+
+    fn format_error(&self, error: LimboError) -> LimboError {
+        error
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -54,7 +71,14 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return BTreeTable::from_sql(sql, root_page);
+            let table = BTreeTable::from_stored_sql(sql, root_page, true)?;
+            if !table.has_rowid {
+                return Err(LimboError::ParseError(format!(
+                    "PostgreSQL does not support WITHOUT ROWID table '{}'",
+                    table.name
+                )));
+            }
+            return Ok(table);
         };
 
         let parse_result =
@@ -65,7 +89,7 @@ impl Dialect for PostgresDialect {
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
         match stmt {
             turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)
+                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page, true)
             }
             _ => Err(LimboError::ParseError(
                 "expected CREATE TABLE statement".to_string(),
@@ -115,7 +139,7 @@ impl Dialect for PostgresDialect {
         // destination does not have, so re-render the translated AST without
         // the qualifier; the canonical text round-trips through the SQLite
         // fallback in `Dialect::parse`.
-        if tbl_name.db_name.take().is_none() {
+        if tbl_name.namespace.take().is_none() {
             return Ok(raw_sql.to_string());
         }
 
@@ -131,10 +155,16 @@ impl Dialect for PostgresDialect {
     fn format_table_sql(
         &self,
         input: &str,
-        _tbl_name: &turso_parser::ast::QualifiedName,
+        tbl_name: &turso_parser::ast::QualifiedName,
         _body: &turso_parser::ast::CreateTableBody,
     ) -> Result<String> {
-        Ok(encode_pg_schema_sql(input))
+        let sql = turso_pg_parser::name_create_table(input, tbl_name.name.as_str())
+            .unwrap_or_else(|_| input.to_string());
+        Ok(encode_pg_schema_sql(&sql))
+    }
+
+    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
+        turso_core::dialect::sqlite::SqliteDialect.format_rewritten_table_sql(stmt)
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
@@ -142,7 +172,9 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
-        register_catalog_modules(crate::functions::register_functions(options))
+        let options = crate::functions::register_functions(options);
+        let options = crate::auth_functions::register_functions(options);
+        register_catalog_modules(options)
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
@@ -156,70 +188,105 @@ impl Dialect for PostgresDialect {
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         true
     }
-}
 
-pub fn is_catalog_table_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "pg_class"
-            | "pg_namespace"
-            | "pg_attribute"
-            | "pg_roles"
-            | "pg_proc"
-            | "pg_database"
-            | "pg_am"
-            | "pg_type"
-            | "pg_collation"
-            | "pg_attrdef"
-            | "pg_description"
-            | "pg_publication"
-            | "pg_publication_namespace"
-            | "pg_publication_rel"
-            | "pg_sequences"
-            | "pg_constraint"
-            | "pg_index"
-            | "pg_inherits"
-            | "pg_rewrite"
-            | "pg_foreign_table"
-            | "pg_partitioned_table"
-            | "pg_trigger"
-            | "pg_policy"
-            | "pg_input_error_info"
-            | "pg_get_tabledef"
-            | "pg_tables"
-            | "pg_indexes"
-    )
+    fn random_value(&self, bits: i64) -> Value {
+        let mantissa = (bits as u64) >> 11;
+        Value::from_f64(mantissa as f64 / (1_u64 << 53) as f64)
+    }
+
+    fn binds_names_at_create(&self) -> bool {
+        true
+    }
+
+    fn supports_namespaces(&self) -> bool {
+        true
+    }
+
+    fn default_namespaces(&self) -> &'static [&'static str] {
+        &["public"]
+    }
+
+    fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        true
+    }
+
+    fn errors_on_zero_divisor(&self) -> bool {
+        true
+    }
+
+    fn mod_of_integers_is_integer(&self) -> bool {
+        true
+    }
+
+    fn add_column_computes_default_for_existing_rows(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
-    format!("{STORED_PG_SCHEMA_PREFIX}{sql}")
+    format!("{POSTGRES_TABLE_SQL_PREFIX}{sql}")
 }
 
 pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
-    sql.strip_prefix(STORED_PG_SCHEMA_PREFIX)
+    sql.strip_prefix(POSTGRES_TABLE_SQL_PREFIX)
 }
 
-/// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
-/// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
-    let mut tables: Vec<_> = schema
-        .tables
-        .iter()
-        .filter(|(name, table)| {
-            // Skip system tables
-            if name.starts_with("sqlite_")
-                || name.starts_with("pg_")
-                || name.starts_with("pragma_")
-                || name.starts_with("json_")
-            {
-                return false;
-            }
-            // Skip virtual tables and subqueries
-            matches!(table.as_ref(), Table::BTree(_))
-        })
-        .collect();
-    tables.sort_by_key(|(name, _)| *name);
+/// Returns the user tables of every namespace as (namespace, name, table)
+/// in deterministic order: the root namespace first, then the stored
+/// namespaces by id, each sorted by name. Every catalog that assigns OIDs
+/// to tables must use this function so the OIDs agree.
+fn user_tables_sorted(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>)> {
+    let mut tables = Vec::new();
+    for namespace in namespaces_sorted(schema) {
+        let mut namespace_tables: Vec<_> = schema
+            .tables(namespace)
+            .map(|table| (namespace, table.get_name(), table))
+            .filter(|(_, name, table)| {
+                !is_system_table_name(name) && matches!(table.as_ref(), Table::BTree(_))
+            })
+            .collect();
+        namespace_tables.sort_by_key(|(_, name, _)| *name);
+        tables.extend(namespace_tables);
+    }
     tables
+}
+
+/// The schemas of `schema`: the namespaces by id. The root
+/// namespace holds the engine's own tables and is not a schema.
+fn namespaces_sorted(schema: &Schema) -> Vec<NamespaceId> {
+    let mut namespaces: Vec<_> = schema
+        .namespace_ids()
+        .filter(|namespace| !namespace.is_root())
+        .collect();
+    namespaces.sort();
+    namespaces
+}
+
+/// The PostgreSQL schema name of `namespace`.
+fn schema_name_of(schema: &Schema, namespace: NamespaceId) -> &str {
+    schema.namespace_name(namespace).unwrap_or("")
+}
+
+/// OID of the public schema, which initdb gives it.
+const PUBLIC_NAMESPACE_OID: i64 = 2200;
+
+/// What is added to the id of a namespace to get the OID of its
+/// schema.
+const FIRST_USER_SCHEMA_OID: i64 = 16384;
+
+fn namespace_oid(schema: &Schema, namespace: NamespaceId) -> i64 {
+    if schema.namespace_name(namespace) == Some("public") {
+        return PUBLIC_NAMESPACE_OID;
+    }
+    FIRST_USER_SCHEMA_OID + i64::from(namespace.as_u32())
+}
+
+/// Whether `name` is a table that the engine or this frontend owns, rather
+/// than the user.
+pub(crate) fn is_system_table_name(name: &str) -> bool {
+    ["sqlite_", "pg_", "pragma_", "json_", "__turso_internal_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// Map a SQLite type string to a PostgreSQL type OID.
@@ -256,12 +323,15 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     }
 }
 
-/// Build a mapping from table name to OID for all user tables.
-fn table_oid_map(schema: &Schema) -> HashMap<String, i64> {
+/// Build a mapping from namespace and table name to OID for all user tables.
+fn table_oid_map(schema: &Schema) -> HashMap<(NamespaceId, String), i64> {
     let tables = user_tables_sorted(schema);
     let mut map = HashMap::default();
-    for (i, (name, _)) in tables.iter().enumerate() {
-        map.insert((*name).clone(), USER_TABLE_OID_START + i as i64);
+    for (i, (namespace, name, _)) in tables.iter().enumerate() {
+        map.insert(
+            (*namespace, (*name).to_string()),
+            USER_TABLE_OID_START + i as i64,
+        );
     }
     map
 }
@@ -275,6 +345,16 @@ fn ref_act_to_char(act: &RefAct) -> &'static str {
         RefAct::SetNull => "n",
         RefAct::SetDefault => "d",
     }
+}
+
+#[derive(strum::EnumString, strum::IntoStaticStr)]
+enum RelationKind {
+    #[strum(serialize = "r")]
+    Table,
+    #[strum(serialize = "i")]
+    Index,
+    #[strum(serialize = "S")]
+    Sequence,
 }
 
 /// Virtual table implementation for pg_catalog.pg_class
@@ -298,27 +378,31 @@ impl SnapshotRows for PgClassTable {
             reltuples REAL,
             relallvisible INTEGER,
             reltoastrelid INTEGER,
-            relhasindex INTEGER,
-            relisshared INTEGER,
+            relhasindex BOOLEAN,
+            relisshared BOOLEAN,
             relpersistence TEXT,
             relkind TEXT,
             relnatts INTEGER,
             relchecks INTEGER,
-            relhasrules INTEGER,
-            relhastriggers INTEGER,
-            relhassubclass INTEGER,
-            relrowsecurity INTEGER,
-            relforcerowsecurity INTEGER,
-            relispopulated INTEGER,
+            relhasrules BOOLEAN,
+            relhastriggers BOOLEAN,
+            relhassubclass BOOLEAN,
+            relrowsecurity BOOLEAN,
+            relforcerowsecurity BOOLEAN,
+            relispopulated BOOLEAN,
             relreplident TEXT,
-            relispartition INTEGER,
+            relispartition BOOLEAN,
             relrewrite INTEGER,
             relfrozenxid INTEGER,
             relminmxid INTEGER,
             relacl TEXT,
             reloptions TEXT,
-            relpartbound TEXT
+            relpartbound TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    /// Fixed PostgreSQL OID of pg_class, which describes tables and indexes.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(1259);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -327,104 +411,133 @@ impl SnapshotRows for PgClassTable {
         let mut rows = Vec::new();
 
         let tables = user_tables_sorted(&schema);
-        let num_tables = tables.len() as i64;
+        let indexes = catalog_indexes(&schema);
+        let relkind: &'static str = RelationKind::Table.into();
 
-        for (i, (table_name, table)) in tables.iter().enumerate() {
+        for (i, (namespace, _, table)) in tables.iter().enumerate() {
             let btree = match table.as_ref() {
                 Table::BTree(bt) => bt,
                 _ => continue,
             };
             let table_oid = USER_TABLE_OID_START + i as i64;
             let relnatts = btree.columns().len() as i64;
-            let relhasindex = if schema.get_indices(table_name).next().is_some() {
-                1i64
-            } else {
-                0
-            };
+            let relhasindex = i64::from(indexes.iter().any(|index| index.table_oid == table_oid));
             let relchecks = btree.check_constraints.len() as i64;
 
             rows.push(vec![
-                Value::from_i64(table_oid),                // oid
-                Value::Text((*table_name).clone().into()), // relname
-                Value::from_i64(2200),                     // relnamespace (public schema)
-                Value::from_i64(0),                        // reltype
-                Value::from_i64(0),                        // reloftype
-                Value::from_i64(10),                       // relowner
-                Value::from_i64(2),                        // relam (heap)
-                Value::from_i64(0),                        // relfilenode
-                Value::from_i64(0),                        // reltablespace
-                Value::from_i64(1),                        // relpages
-                Value::from_f64(0.0),                      // reltuples
-                Value::from_i64(0),                        // relallvisible
-                Value::from_i64(0),                        // reltoastrelid
-                Value::from_i64(relhasindex),              // relhasindex
-                Value::from_i64(0),                        // relisshared
-                Value::Text("p".into()),                   // relpersistence (permanent)
-                Value::Text("r".into()),                   // relkind (regular table)
-                Value::from_i64(relnatts),                 // relnatts
-                Value::from_i64(relchecks),                // relchecks
-                Value::from_i64(0),                        // relhasrules
-                Value::from_i64(0),                        // relhastriggers
-                Value::from_i64(0),                        // relhassubclass
-                Value::from_i64(0),                        // relrowsecurity
-                Value::from_i64(0),                        // relforcerowsecurity
-                Value::from_i64(1),                        // relispopulated
-                Value::Text("d".into()),                   // relreplident
-                Value::from_i64(0),                        // relispartition
-                Value::from_i64(0),                        // relrewrite
-                Value::from_i64(0),                        // relfrozenxid
-                Value::from_i64(0),                        // relminmxid
-                Value::Null,                               // relacl
-                Value::Null,                               // reloptions
-                Value::Null,                               // relpartbound
+                Value::from_i64(table_oid),                          // oid
+                Value::Text(btree.declared_name.clone().into()),     // relname
+                Value::from_i64(namespace_oid(&schema, *namespace)), // relnamespace
+                Value::from_i64(0),                                  // reltype
+                Value::from_i64(0),                                  // reloftype
+                Value::from_i64(10),                                 // relowner
+                Value::from_i64(2),                                  // relam (heap)
+                Value::from_i64(0),                                  // relfilenode
+                Value::from_i64(0),                                  // reltablespace
+                Value::from_i64(1),                                  // relpages
+                Value::from_f64(0.0),                                // reltuples
+                Value::from_i64(0),                                  // relallvisible
+                Value::from_i64(0),                                  // reltoastrelid
+                Value::from_i64(relhasindex),                        // relhasindex
+                Value::from_i64(0),                                  // relisshared
+                Value::Text("p".into()),                             // relpersistence (permanent)
+                Value::build_text(relkind),                          // relkind (regular table)
+                Value::from_i64(relnatts),                           // relnatts
+                Value::from_i64(relchecks),                          // relchecks
+                Value::from_i64(0),                                  // relhasrules
+                Value::from_i64(0),                                  // relhastriggers
+                Value::from_i64(0),                                  // relhassubclass
+                Value::from_i64(0),                                  // relrowsecurity
+                Value::from_i64(0),                                  // relforcerowsecurity
+                Value::from_i64(1),                                  // relispopulated
+                Value::Text("d".into()),                             // relreplident
+                Value::from_i64(0),                                  // relispartition
+                Value::from_i64(0),                                  // relrewrite
+                Value::from_i64(0),                                  // relfrozenxid
+                Value::from_i64(0),                                  // relminmxid
+                Value::Null,                                         // relacl
+                Value::Null,                                         // reloptions
+                Value::Null,                                         // relpartbound
             ]);
         }
 
         // Add index rows (relkind='i')
-        let mut index_oid = USER_TABLE_OID_START + num_tables;
-        for (table_name, _) in &tables {
-            for idx in schema.get_indices(table_name) {
-                if idx.ephemeral {
-                    continue;
-                }
-                let indnatts = idx.columns.len() as i64;
-                rows.push(vec![
-                    Value::from_i64(index_oid),           // oid
-                    Value::Text(idx.name.clone().into()), // relname
-                    Value::from_i64(2200),                // relnamespace (public)
-                    Value::from_i64(0),                   // reltype
-                    Value::from_i64(0),                   // reloftype
-                    Value::from_i64(10),                  // relowner
-                    Value::from_i64(403),                 // relam (btree)
-                    Value::from_i64(0),                   // relfilenode
-                    Value::from_i64(0),                   // reltablespace
-                    Value::from_i64(1),                   // relpages
-                    Value::from_f64(0.0),                 // reltuples
-                    Value::from_i64(0),                   // relallvisible
-                    Value::from_i64(0),                   // reltoastrelid
-                    Value::from_i64(0),                   // relhasindex
-                    Value::from_i64(0),                   // relisshared
-                    Value::Text("p".into()),              // relpersistence
-                    Value::Text("i".into()),              // relkind (index)
-                    Value::from_i64(indnatts),            // relnatts
-                    Value::from_i64(0),                   // relchecks
-                    Value::from_i64(0),                   // relhasrules
-                    Value::from_i64(0),                   // relhastriggers
-                    Value::from_i64(0),                   // relhassubclass
-                    Value::from_i64(0),                   // relrowsecurity
-                    Value::from_i64(0),                   // relforcerowsecurity
-                    Value::from_i64(1),                   // relispopulated
-                    Value::Text("d".into()),              // relreplident
-                    Value::from_i64(0),                   // relispartition
-                    Value::from_i64(0),                   // relrewrite
-                    Value::from_i64(0),                   // relfrozenxid
-                    Value::from_i64(0),                   // relminmxid
-                    Value::Null,                          // relacl
-                    Value::Null,                          // reloptions
-                    Value::Null,                          // relpartbound
-                ]);
-                index_oid += 1;
-            }
+        let relkind: &'static str = RelationKind::Index.into();
+        for index in indexes {
+            let indnatts = index.columns.len() as i64;
+            rows.push(vec![
+                Value::from_i64(index.oid),                               // oid
+                Value::Text(index.name.into()),                           // relname
+                Value::from_i64(namespace_oid(&schema, index.namespace)), // relnamespace
+                Value::from_i64(0),                                       // reltype
+                Value::from_i64(0),                                       // reloftype
+                Value::from_i64(10),                                      // relowner
+                Value::from_i64(403),                                     // relam (btree)
+                Value::from_i64(0),                                       // relfilenode
+                Value::from_i64(0),                                       // reltablespace
+                Value::from_i64(1),                                       // relpages
+                Value::from_f64(0.0),                                     // reltuples
+                Value::from_i64(0),                                       // relallvisible
+                Value::from_i64(0),                                       // reltoastrelid
+                Value::from_i64(0),                                       // relhasindex
+                Value::from_i64(0),                                       // relisshared
+                Value::Text("p".into()),                                  // relpersistence
+                Value::build_text(relkind),                               // relkind (index)
+                Value::from_i64(indnatts),                                // relnatts
+                Value::from_i64(0),                                       // relchecks
+                Value::from_i64(0),                                       // relhasrules
+                Value::from_i64(0),                                       // relhastriggers
+                Value::from_i64(0),                                       // relhassubclass
+                Value::from_i64(0),                                       // relrowsecurity
+                Value::from_i64(0),                                       // relforcerowsecurity
+                Value::from_i64(1),                                       // relispopulated
+                Value::Text("d".into()),                                  // relreplident
+                Value::from_i64(0),                                       // relispartition
+                Value::from_i64(0),                                       // relrewrite
+                Value::from_i64(0),                                       // relfrozenxid
+                Value::from_i64(0),                                       // relminmxid
+                Value::Null,                                              // relacl
+                Value::Null,                                              // reloptions
+                Value::Null,                                              // relpartbound
+            ]);
+        }
+        let relkind: &'static str = RelationKind::Sequence.into();
+        for (oid, namespace, sequence) in sequence_catalog_entries(&schema) {
+            rows.push(vec![
+                Value::from_i64(oid),
+                Value::build_text(sequence.name.clone()),
+                Value::from_i64(namespace_oid(&schema, namespace)),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(10),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_f64(1.0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::build_text("p"),
+                Value::build_text(relkind),
+                Value::from_i64(3),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::build_text("n"),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]);
         }
 
         rows
@@ -441,47 +554,122 @@ impl SnapshotRows for PgNamespaceTable {
             oid INTEGER,
             nspname TEXT,
             nspowner INTEGER,
-            nspacl TEXT
+            nspacl TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    /// Fixed PostgreSQL OID of pg_namespace, which describes schemas.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2615);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 5;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
-        // PostgreSQL standard namespaces
-        let mut rows = vec![
-            vec![
-                Value::from_i64(11),              // oid
-                Value::Text("pg_catalog".into()), // nspname
-                Value::from_i64(10),              // nspowner
-                Value::Null,                      // nspacl
-            ],
-            vec![
-                Value::from_i64(2200),        // oid
-                Value::Text("public".into()), // nspname
-                Value::from_i64(10),          // nspowner
-                Value::Null,                  // nspacl
-            ],
-            vec![
-                Value::from_i64(11394),                   // oid
-                Value::Text("information_schema".into()), // nspname
-                Value::from_i64(10),                      // nspowner
-                Value::Null,                              // nspacl
-            ],
-        ];
+        let mut rows: Vec<_> = BUILTIN_SCHEMAS
+            .iter()
+            .map(|(oid, name)| {
+                vec![
+                    Value::from_i64(*oid),
+                    Value::Text((*name).into()),
+                    Value::from_i64(10), // nspowner (bootstrap superuser)
+                    Value::Null,         // nspacl
+                ]
+            })
+            .collect();
 
-        // Add attached schemas (CREATE SCHEMA creates attached databases)
-        let schema_names = conn.attached_database_names();
-        let mut oid = 16384i64;
-        for name in schema_names {
+        let schema = conn.current_schema();
+        let mut stored: Vec<_> = schema
+            .namespaces()
+            .map(|(id, name)| (name.to_string(), id))
+            .collect();
+        stored.sort();
+        for (name, id) in stored {
+            let (owner, acl) = if name == "public" {
+                (
+                    PG_DATABASE_OWNER_OID,
+                    Value::build_text(
+                        "{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}",
+                    ),
+                )
+            } else {
+                (10, Value::Null)
+            };
             rows.push(vec![
-                Value::from_i64(oid),
+                Value::from_i64(namespace_oid(&schema, id)),
                 Value::build_text(name),
-                Value::from_i64(10), // nspowner (bootstrap superuser)
-                Value::Null,         // nspacl
+                Value::from_i64(owner),
+                acl,
             ]);
-            oid += 1;
         }
         rows
+    }
+}
+
+#[derive(Debug)]
+struct PgDescriptionTable;
+
+impl SnapshotRows for PgDescriptionTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 1;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        vec![vec![
+            Value::from_i64(2200),
+            Value::from_i64(PgNamespaceTable::TABLE_OID.unwrap()),
+            Value::from_i64(0),
+            Value::build_text("standard public schema"),
+        ]]
+    }
+}
+
+/// The schemas that PostgreSQL always has, with their fixed OIDs.
+const BUILTIN_SCHEMAS: [(i64, &str); 2] = [(11, "pg_catalog"), (11394, "information_schema")];
+
+/// Whether pg_namespace lists schema `name`: one of the schemas that
+/// PostgreSQL always has, or a namespace stored in the main database,
+/// which is what CREATE SCHEMA creates and what public is.
+pub(crate) fn namespace_exists(conn: &Connection, name: &str) -> bool {
+    BUILTIN_SCHEMAS.iter().any(|(_, schema)| *schema == name)
+        || conn
+            .qualifier(name)
+            .is_some_and(|namespace| !namespace.is_database())
+}
+
+/// Virtual table implementation for information_schema.schemata
+#[derive(Debug)]
+struct SchemataTable;
+
+impl SnapshotRows for SchemataTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_information_schema_schemata (
+            catalog_name TEXT,
+            schema_name TEXT,
+            schema_owner TEXT,
+            default_character_set_catalog TEXT,
+            default_character_set_schema TEXT,
+            default_character_set_name TEXT,
+            sql_path TEXT
+        )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 10.0;
+    const ESTIMATED_ROWS: u32 = 5;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let db_name = db_name_from_path(conn.db_file_path());
+        PgNamespaceTable::load_rows(conn)
+            .into_iter()
+            .map(|namespace| {
+                vec![
+                    Value::build_text(db_name.clone()),
+                    namespace[1].clone(),
+                    Value::build_text("turso"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ]
+            })
+            .collect()
     }
 }
 
@@ -501,23 +689,26 @@ impl SnapshotRows for PgAttributeTable {
             attndims INTEGER,
             attcacheoff INTEGER,
             atttypmod INTEGER,
-            attbyval INTEGER,
+            attbyval BOOLEAN,
             attstorage TEXT,
             attalign TEXT,
-            attnotnull INTEGER,
-            atthasdef INTEGER,
-            atthasmissing INTEGER,
+            attcompression TEXT,
+            attnotnull BOOLEAN,
+            atthasdef BOOLEAN,
+            atthasmissing BOOLEAN,
             attidentity TEXT,
             attgenerated TEXT,
-            attisdropped INTEGER,
-            attislocal INTEGER,
+            attisdropped BOOLEAN,
+            attislocal BOOLEAN,
             attinhcount INTEGER,
             attcollation INTEGER,
             attacl TEXT,
             attoptions TEXT,
             attfdwoptions TEXT,
-            attmissingval TEXT
+            attmissingval TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1249);
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 1000;
 
@@ -527,16 +718,24 @@ impl SnapshotRows for PgAttributeTable {
 
         let mut oid_counter = USER_TABLE_OID_START;
 
-        for (_, table) in user_tables_sorted(&schema) {
+        for (_, _, table) in user_tables_sorted(&schema) {
             let table_oid = oid_counter;
             oid_counter += 1;
 
             let columns = table.columns();
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
-                let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
+                let type_oid = match schema.get_type_def(&col.ty_str, table.is_strict()) {
+                    Some(td) if !td.is_builtin => user_type_oid(&td.name),
+                    _ => sqlite_type_to_pg_oid(&col.ty_str),
+                };
+                let storage = if col.is_array() {
+                    "x"
+                } else {
+                    type_storage(&schema, &col.ty_str)
+                };
                 let attnum = (i + 1) as i64; // 1-based
-                let notnull = if col.notnull() { 1i64 } else { 0i64 };
+                let notnull = i64::from(col.notnull());
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
 
                 rows.push(vec![
@@ -550,21 +749,22 @@ impl SnapshotRows for PgAttributeTable {
                     Value::from_i64(-1),          // attcacheoff
                     Value::from_i64(-1),          // atttypmod
                     Value::from_i64(1),           // attbyval
-                    Value::Text("p".into()),      // attstorage (plain)
+                    Value::build_text(storage),   // attstorage
                     Value::Text("i".into()),      // attalign (int)
-                    Value::from_i64(notnull),     // attnotnull
-                    Value::from_i64(has_def),     // atthasdef
-                    Value::from_i64(0),           // atthasmissing
-                    Value::Text("".into()),       // attidentity
-                    Value::Text("".into()),       // attgenerated
-                    Value::from_i64(0),           // attisdropped
-                    Value::from_i64(1),           // attislocal
-                    Value::from_i64(0),           // attinhcount
-                    Value::from_i64(0),           // attcollation
-                    Value::Null,                  // attacl
-                    Value::Null,                  // attoptions
-                    Value::Null,                  // attfdwoptions
-                    Value::Null,                  // attmissingval
+                    Value::Text("".into()),
+                    Value::from_i64(notnull), // attnotnull
+                    Value::from_i64(has_def), // atthasdef
+                    Value::from_i64(0),       // atthasmissing
+                    Value::Text("".into()),   // attidentity
+                    Value::Text("".into()),   // attgenerated
+                    Value::from_i64(0),       // attisdropped
+                    Value::from_i64(1),       // attislocal
+                    Value::from_i64(0),       // attinhcount
+                    Value::from_i64(0),       // attcollation
+                    Value::Null,              // attacl
+                    Value::Null,              // attoptions
+                    Value::Null,              // attfdwoptions
+                    Value::Null,              // attmissingval
                 ]);
             }
         }
@@ -574,7 +774,7 @@ impl SnapshotRows for PgAttributeTable {
 }
 
 /// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns a single hardcoded "turso" superuser role.
+/// Stub: returns the "turso" superuser and the built-in database owner role.
 /// TODO: replace with real role data when authentication is implemented.
 #[derive(Debug)]
 struct PgRolesTable;
@@ -595,27 +795,43 @@ impl SnapshotRows for PgRolesTable {
             rolbypassrls INTEGER,
             rolconfig TEXT
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 10.0;
-    const ESTIMATED_ROWS: u32 = 1;
+    const ESTIMATED_ROWS: u32 = 2;
 
-    /// Stub: returns a single default superuser role.
-    /// Replace this method with real role lookup when auth is implemented.
     fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(10),        // oid
-            Value::build_text("turso"), // rolname
-            Value::from_i64(1),         // rolsuper
-            Value::from_i64(1),         // rolinherit
-            Value::from_i64(1),         // rolcreaterole
-            Value::from_i64(1),         // rolcreatedb
-            Value::from_i64(1),         // rolcanlogin
-            Value::from_i64(1),         // rolreplication
-            Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-            Value::Null,                // rolpassword (never exposed)
-            Value::Null,                // rolvaliduntil
-            Value::from_i64(1),         // rolbypassrls
-            Value::Null,                // rolconfig
-        ]]
+        vec![
+            vec![
+                Value::from_i64(10),        // oid
+                Value::build_text("turso"), // rolname
+                Value::from_i64(1),         // rolsuper
+                Value::from_i64(1),         // rolinherit
+                Value::from_i64(1),         // rolcreaterole
+                Value::from_i64(1),         // rolcreatedb
+                Value::from_i64(1),         // rolcanlogin
+                Value::from_i64(1),         // rolreplication
+                Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
+                Value::Null,                // rolpassword (never exposed)
+                Value::Null,                // rolvaliduntil
+                Value::from_i64(1),         // rolbypassrls
+                Value::Null,                // rolconfig
+            ],
+            vec![
+                Value::from_i64(PG_DATABASE_OWNER_OID),
+                Value::build_text("pg_database_owner"),
+                Value::from_i64(0),
+                Value::from_i64(1),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(-1),
+                Value::Null,
+                Value::Null,
+                Value::from_i64(0),
+                Value::Null,
+            ],
+        ]
     }
 }
 
@@ -635,10 +851,10 @@ impl SnapshotRows for PgProcTable {
             prorows REAL,
             provariadic INTEGER,
             prokind TEXT,
-            prosecdef INTEGER,
-            proleakproof INTEGER,
-            proisstrict INTEGER,
-            proretset INTEGER,
+            prosecdef BOOLEAN,
+            proleakproof BOOLEAN,
+            proisstrict BOOLEAN,
+            proretset BOOLEAN,
             provolatile TEXT,
             proparallel TEXT,
             pronargs INTEGER,
@@ -654,8 +870,10 @@ impl SnapshotRows for PgProcTable {
             probin TEXT,
             prosqlbody TEXT,
             proconfig TEXT,
-            proacl TEXT
+            proacl TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1255);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 100;
 
@@ -677,9 +895,9 @@ impl SnapshotRows for PgProcTable {
             rows.push(vec![
                 Value::from_i64(oid),               // oid
                 Value::build_text(entry.name),      // proname
-                Value::from_i64(2200),              // pronamespace (public)
+                Value::from_i64(11),                // pronamespace (pg_catalog)
                 Value::from_i64(10),                // proowner
-                Value::from_i64(14),                // prolang (SQL)
+                Value::from_i64(12),                // prolang (internal)
                 Value::from_f64(1.0),               // procost
                 Value::from_f64(0.0),               // prorows
                 Value::from_i64(0),                 // provariadic
@@ -716,7 +934,7 @@ impl SnapshotRows for PgProcTable {
             rows.push(vec![
                 Value::from_i64(oid),       // oid
                 Value::build_text(name),    // proname
-                Value::from_i64(2200),      // pronamespace (public)
+                Value::from_i64(11),        // pronamespace (pg_catalog)
                 Value::from_i64(10),        // proowner
                 Value::from_i64(13),        // prolang (C)
                 Value::from_f64(1.0),       // procost
@@ -762,8 +980,8 @@ impl SnapshotRows for PgDatabaseTable {
             datdba INTEGER,
             encoding INTEGER,
             datlocprovider TEXT,
-            datistemplate INTEGER,
-            datallowconn INTEGER,
+            datistemplate BOOLEAN,
+            datallowconn BOOLEAN,
             datconnlimit INTEGER,
             datfrozenxid INTEGER,
             datminmxid INTEGER,
@@ -772,8 +990,10 @@ impl SnapshotRows for PgDatabaseTable {
             datctype TEXT,
             daticulocale TEXT,
             daticurules TEXT,
-            datacl TEXT
+            datacl TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    const TABLE_OID: Option<i64> = Some(1262);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
@@ -820,8 +1040,12 @@ impl SnapshotRows for PgAmTable {
             oid INTEGER,
             amname TEXT,
             amhandler TEXT,
-            amtype TEXT
+            amtype TEXT,
+            tableoid INTEGER HIDDEN
         )";
+    /// Fixed PostgreSQL OID of pg_am, which lists table and index access methods.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2601);
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
@@ -934,23 +1158,26 @@ impl SnapshotRows for PgTablesTable {
             hastriggers INTEGER,
             rowsecurity INTEGER
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 1000.0;
     const ESTIMATED_ROWS: u32 = 100;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
+        let tables = user_tables_sorted(&schema);
 
-        for (table_name, _) in user_tables_sorted(&schema) {
+        for (namespace, _, table) in tables {
+            let btree = table.btree().expect("user tables are B-trees");
             rows.push(vec![
-                Value::Text("public".into()),           // schemaname
-                Value::Text(table_name.clone().into()), // tablename
-                Value::Text("turso".into()),            // tableowner
-                Value::Null,                            // tablespace
-                Value::from_i64(0),                     // hasindexes
-                Value::from_i64(0),                     // hasrules
-                Value::from_i64(0),                     // hastriggers
-                Value::from_i64(0),                     // rowsecurity
+                Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
+                Value::Text(btree.declared_name.clone().into()),                   // tablename
+                Value::Text("turso".into()),                                       // tableowner
+                Value::Null,                                                       // tablespace
+                Value::from_i64(0),                                                // hasindexes
+                Value::from_i64(0),                                                // hasrules
+                Value::from_i64(0),                                                // hastriggers
+                Value::from_i64(0),                                                // rowsecurity
             ]);
         }
 
@@ -969,6 +1196,7 @@ impl SnapshotRows for PgIndexesTable {
             tablespace TEXT,
             indexdef TEXT
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -976,19 +1204,14 @@ impl SnapshotRows for PgIndexesTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
-        for (table_name, _) in user_tables_sorted(&schema) {
-            for idx in schema.get_indices(table_name) {
-                if idx.ephemeral {
-                    continue;
-                }
-                rows.push(vec![
-                    Value::Text("public".into()),
-                    Value::Text(table_name.clone().into()),
-                    Value::Text(idx.name.clone().into()),
-                    Value::Null,
-                    Value::build_text(index_definition(table_name, idx)),
-                ]);
-            }
+        for index in catalog_indexes(&schema) {
+            rows.push(vec![
+                Value::build_text(schema_name_of(&schema, index.namespace).to_string()),
+                Value::build_text(index.table_name.clone()),
+                Value::build_text(index.name.clone()),
+                Value::Null,
+                Value::build_text(index_definition(&schema, &index)),
+            ]);
         }
 
         rows
@@ -1293,13 +1516,14 @@ const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
     (3807, "_jsonb", 3802),
 ];
 
-const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval INTEGER, typtype TEXT, typcategory TEXT, typispreferred INTEGER, typisdefined INTEGER, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull INTEGER, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT)";
+const PG_TYPE_SQL: &str = "CREATE TABLE pg_type (oid INTEGER, typname TEXT, typnamespace INTEGER, typowner INTEGER, typlen INTEGER, typbyval BOOLEAN, typtype TEXT, typcategory TEXT, typispreferred BOOLEAN, typisdefined BOOLEAN, typdelim TEXT, typrelid INTEGER, typsubscript TEXT, typelem INTEGER, typarray INTEGER, typinput TEXT, typoutput TEXT, typreceive TEXT, typsend TEXT, typmodin TEXT, typmodout TEXT, typanalyze TEXT, typalign TEXT, typstorage TEXT, typnotnull BOOLEAN, typbasetype INTEGER, typtypmod INTEGER, typndims INTEGER, typcollation INTEGER, typdefaultbin TEXT, typdefault TEXT, typacl TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgTypeTable;
 
 impl SnapshotRows for PgTypeTable {
     const SCHEMA: &'static str = PG_TYPE_SQL;
+    const TABLE_OID: Option<i64> = Some(1247);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1327,28 +1551,35 @@ impl SnapshotRows for PgTypeTable {
             }));
         }
 
-        // Dynamic: user-defined enum types from type_registry
         let schema = conn.current_schema();
         for (name, td) in &schema.type_registry {
             if td.is_builtin {
                 continue;
             }
-            // User-defined enums: typtype='e', typcategory='E'
-            let enum_oid = 50000
-                + (name
-                    .as_bytes()
+            let (typtype, typcategory, typbasetype) = if td.is_domain {
+                let base_oid = match schema.get_type_def_unchecked(td.base()) {
+                    Some(base) if !base.is_builtin => user_type_oid(&base.name),
+                    _ => sqlite_type_to_pg_oid(td.base()),
+                };
+                let base_category = PG_BASE_TYPES
                     .iter()
-                    .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
-                    % 10000) as i64;
+                    .find(|t| t.oid == base_oid)
+                    .map_or("U", |t| t.typcategory);
+                ("d", base_category, base_oid)
+            } else {
+                ("e", "E", 0)
+            };
+            let oid = user_type_oid(&td.name);
+            let storage = type_storage(&schema, &td.name);
             rows.push(vec![
-                Value::from_i64(enum_oid),        // oid
+                Value::from_i64(oid),             // oid
                 Value::Text(name.clone().into()), // typname
-                Value::from_i64(11),              // typnamespace (pg_catalog)
+                Value::from_i64(2200),            // typnamespace (public)
                 Value::from_i64(10),              // typowner
                 Value::from_i64(4),               // typlen
                 Value::from_i64(1),               // typbyval
-                Value::build_text("e"),           // typtype (enum)
-                Value::build_text("E"),           // typcategory (enum)
+                Value::build_text(typtype),       // typtype
+                Value::build_text(typcategory),   // typcategory
                 Value::from_i64(0),               // typispreferred
                 Value::from_i64(1),               // typisdefined
                 Value::build_text(","),           // typdelim
@@ -1364,9 +1595,9 @@ impl SnapshotRows for PgTypeTable {
                 Value::Null,                      // typmodout
                 Value::Null,                      // typanalyze
                 Value::build_text("i"),           // typalign
-                Value::build_text("p"),           // typstorage
+                Value::build_text(storage),       // typstorage
                 Value::from_i64(0),               // typnotnull
-                Value::from_i64(0),               // typbasetype
+                Value::from_i64(typbasetype),     // typbasetype
                 Value::from_i64(-1),              // typtypmod
                 Value::from_i64(0),               // typndims
                 Value::from_i64(0),               // typcollation
@@ -1377,6 +1608,33 @@ impl SnapshotRows for PgTypeTable {
         }
         rows
     }
+}
+
+fn user_type_oid(name: &str) -> i64 {
+    50000
+        + (name
+            .as_bytes()
+            .iter()
+            .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
+            % 10000) as i64
+}
+
+fn type_storage<'a>(schema: &'a Schema, mut name: &'a str) -> &'static str {
+    while let Some(ty) = schema.get_type_def_unchecked(name) {
+        if ty.is_builtin {
+            break;
+        }
+        if !ty.is_domain {
+            return "p";
+        }
+        name = ty.base();
+    }
+    let oid = sqlite_type_to_pg_oid(name);
+    PG_BASE_TYPES
+        .iter()
+        .find(|ty| ty.oid == oid)
+        .expect("column type OIDs refer to PostgreSQL base types")
+        .typstorage
 }
 
 fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
@@ -1420,13 +1678,14 @@ fn make_type_row(t: &PgTypeInfo) -> Vec<Value> {
 // pg_index
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique INTEGER, indisprimary INTEGER, indisexclusion INTEGER, indimmediate INTEGER, indisclustered INTEGER, indisvalid INTEGER, indcheckxmin INTEGER, indisready INTEGER, indislive INTEGER, indisreplident INTEGER, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT)";
+const PG_INDEX_SQL: &str = "CREATE TABLE pg_index (indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique BOOLEAN, indnullsnotdistinct BOOLEAN, indisprimary BOOLEAN, indisexclusion BOOLEAN, indimmediate BOOLEAN, indisclustered BOOLEAN, indisvalid BOOLEAN, indcheckxmin BOOLEAN, indisready BOOLEAN, indislive BOOLEAN, indisreplident BOOLEAN, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgIndexTable;
 
 impl SnapshotRows for PgIndexTable {
     const SCHEMA: &'static str = PG_INDEX_SQL;
+    const TABLE_OID: Option<i64> = Some(2610);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1434,80 +1693,65 @@ impl SnapshotRows for PgIndexTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
-        let tables = user_tables_sorted(&schema);
-        let num_tables = tables.len() as i64;
-        let tbl_oid_map = table_oid_map(&schema);
+        for index in catalog_indexes(&schema) {
+            let indnatts = index.columns.len() as i64;
+            let indkey: String = index
+                .columns
+                .iter()
+                .map(|column| {
+                    if column.expression.is_some() {
+                        "0".to_string()
+                    } else {
+                        (column.position + 1).to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
 
-        let mut index_oid = USER_TABLE_OID_START + num_tables;
-        for (table_name, _) in &tables {
-            let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
-            for idx in schema.get_indices(table_name) {
-                if idx.ephemeral {
-                    continue;
-                }
-                let indnatts = idx.columns.len() as i64;
-                let indisunique = i64::from(idx.unique);
-                let indisprimary = i64::from(
-                    idx.name
-                        .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
-                        && idx.unique,
-                );
+            let indpred = index
+                .where_clause
+                .as_ref()
+                .map(|e| Value::build_text(e.clone()))
+                .unwrap_or(Value::Null);
 
-                // Build indkey: space-separated 1-based column positions (0 for expression cols)
-                let indkey: String = idx
+            let indexprs = if index
+                .columns
+                .iter()
+                .any(|column| column.expression.is_some())
+            {
+                let exprs: Vec<String> = index
                     .columns
                     .iter()
-                    .map(|col| {
-                        if col.expr.is_some() {
-                            "0".to_string()
-                        } else {
-                            (col.pos_in_table + 1).to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                    .filter_map(|column| column.expression.clone())
+                    .collect();
+                Value::build_text(exprs.join(", "))
+            } else {
+                Value::Null
+            };
 
-                let indpred = idx
-                    .where_clause
-                    .as_ref()
-                    .map(|e| Value::build_text(e.to_string()))
-                    .unwrap_or(Value::Null);
-
-                let indexprs = if idx.columns.iter().any(|c| c.expr.is_some()) {
-                    let exprs: Vec<String> = idx
-                        .columns
-                        .iter()
-                        .filter_map(|c| c.expr.as_ref().map(|e| e.to_string()))
-                        .collect();
-                    Value::build_text(exprs.join(", "))
-                } else {
-                    Value::Null
-                };
-
-                rows.push(vec![
-                    Value::from_i64(index_oid),    // indexrelid
-                    Value::from_i64(table_oid),    // indrelid
-                    Value::from_i64(indnatts),     // indnatts
-                    Value::from_i64(indnatts),     // indnkeyatts
-                    Value::from_i64(indisunique),  // indisunique
-                    Value::from_i64(indisprimary), // indisprimary
-                    Value::from_i64(0),            // indisexclusion
-                    Value::from_i64(1),            // indimmediate
-                    Value::from_i64(0),            // indisclustered
-                    Value::from_i64(1),            // indisvalid
-                    Value::from_i64(0),            // indcheckxmin
-                    Value::from_i64(1),            // indisready
-                    Value::from_i64(1),            // indislive
-                    Value::from_i64(0),            // indisreplident
-                    Value::build_text(indkey),     // indkey
-                    Value::Null,                   // indcollation
-                    Value::Null,                   // indclass
-                    Value::Null,                   // indoption
-                    indexprs,                      // indexprs
-                    indpred,                       // indpred
-                ]);
-                index_oid += 1;
-            }
+            rows.push(vec![
+                Value::from_i64(index.oid),               // indexrelid
+                Value::from_i64(index.table_oid),         // indrelid
+                Value::from_i64(indnatts),                // indnatts
+                Value::from_i64(indnatts),                // indnkeyatts
+                Value::from_i64(i64::from(index.unique)), // indisunique
+                Value::from_i64(0),
+                Value::from_i64(i64::from(index.primary)), // indisprimary
+                Value::from_i64(0),                        // indisexclusion
+                Value::from_i64(1),                        // indimmediate
+                Value::from_i64(0),                        // indisclustered
+                Value::from_i64(1),                        // indisvalid
+                Value::from_i64(0),                        // indcheckxmin
+                Value::from_i64(1),                        // indisready
+                Value::from_i64(1),                        // indislive
+                Value::from_i64(0),                        // indisreplident
+                Value::build_text(indkey),                 // indkey
+                Value::Null,                               // indcollation
+                Value::Null,                               // indclass
+                Value::Null,                               // indoption
+                indexprs,                                  // indexprs
+                indpred,                                   // indpred
+            ]);
         }
         rows
     }
@@ -1517,13 +1761,29 @@ impl SnapshotRows for PgIndexTable {
 // pg_constraint
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable INTEGER, condeferred INTEGER, convalidated INTEGER, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal INTEGER, coninhcount INTEGER, connoinherit INTEGER, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT)";
+#[derive(strum::EnumString, strum::IntoStaticStr)]
+enum ConstraintKind {
+    #[strum(serialize = "p")]
+    PrimaryKey,
+    #[strum(serialize = "u")]
+    Unique,
+    #[strum(serialize = "f")]
+    ForeignKey,
+    #[strum(serialize = "c")]
+    Check,
+}
+
+const PG_CONSTRAINT_SQL: &str = "CREATE TABLE pg_constraint (oid INTEGER, conname TEXT, connamespace INTEGER, contype TEXT, condeferrable BOOLEAN, condeferred BOOLEAN, convalidated BOOLEAN, conrelid INTEGER, contypid INTEGER, conindid INTEGER, conparentid INTEGER, confrelid INTEGER, confupdtype TEXT, confdeltype TEXT, confmatchtype TEXT, conislocal BOOLEAN, coninhcount INTEGER, connoinherit BOOLEAN, conkey TEXT, confkey TEXT, conpfeqop TEXT, conppeqop TEXT, conffeqop TEXT, conexclop TEXT, conbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgConstraintTable;
 
 impl SnapshotRows for PgConstraintTable {
     const SCHEMA: &'static str = PG_CONSTRAINT_SQL;
+    /// Fixed PostgreSQL OID of pg_constraint, which describes primary keys,
+    /// unique constraints, foreign keys and checks.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2606);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1532,35 +1792,34 @@ impl SnapshotRows for PgConstraintTable {
         let mut rows = Vec::new();
 
         let tables = user_tables_sorted(&schema);
-        let num_tables = tables.len() as i64;
         let tbl_oid_map = table_oid_map(&schema);
+        let indexes = catalog_indexes(&schema);
+        let mut constraint_oid = indexes
+            .last()
+            .map_or(USER_TABLE_OID_START + tables.len() as i64, |index| {
+                index.oid + 1
+            });
 
-        // Build index_name -> index_oid map (same OID assignment as pg_class/pg_index)
-        let mut index_oid_map: HashMap<String, i64> = HashMap::default();
-        let mut next_index_oid = USER_TABLE_OID_START + num_tables;
-        for (table_name, _) in &tables {
-            for idx in schema.get_indices(table_name) {
-                if idx.ephemeral {
-                    continue;
-                }
-                index_oid_map.insert(idx.name.clone(), next_index_oid);
-                next_index_oid += 1;
-            }
-        }
-
-        let mut constraint_oid = next_index_oid;
-
-        for (table_name, table) in &tables {
+        for (namespace, table_name, table) in &tables {
             let btree = match table.as_ref() {
                 Table::BTree(bt) => bt,
                 _ => continue,
             };
-            let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
+            let table_oid = tbl_oid_map
+                .get(&(*namespace, (*table_name).to_string()))
+                .copied()
+                .unwrap_or(0);
 
-            // Synthesize PK constraint for rowid-alias tables when unique_sets has no PK
-            let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
-            if !has_pk_in_unique_sets && !btree.primary_key_columns.is_empty() {
-                let conname = format!("{table_name}_pkey");
+            let table_name = &btree.declared_name;
+            if btree.get_rowid_alias_column().is_some() {
+                let index = indexes
+                    .iter()
+                    .find(|index| index.table_oid == table_oid && index.primary)
+                    .expect("rowid primary keys have a catalog index");
+                let conname = btree
+                    .primary_key_constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{table_name}_pkey"));
                 let conkey: String = btree
                     .primary_key_columns
                     .iter()
@@ -1572,17 +1831,18 @@ impl SnapshotRows for PgConstraintTable {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                let contype: &'static str = ConstraintKind::PrimaryKey.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid),
                     Value::build_text(conname),
                     Value::from_i64(2200),
-                    Value::build_text("p"),
+                    Value::build_text(contype),
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::from_i64(1),
                     Value::from_i64(table_oid),
                     Value::from_i64(0),
-                    Value::from_i64(0),
+                    Value::from_i64(index.oid),
                     Value::from_i64(0),
                     Value::from_i64(0),
                     Value::Null,
@@ -1604,13 +1864,23 @@ impl SnapshotRows for PgConstraintTable {
 
             // PK / UNIQUE constraints from unique_sets
             for us in &btree.unique_sets {
-                let contype = if us.is_primary_key { "p" } else { "u" };
-                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
-                let conname = if us.is_primary_key {
-                    format!("{table_name}_pkey")
+                let primary = unique_set_is_primary_key(btree, us);
+                let contype = if primary {
+                    ConstraintKind::PrimaryKey
                 } else {
-                    let cols_str = col_names.join("_");
-                    format!("{table_name}_{cols_str}_key")
+                    ConstraintKind::Unique
+                };
+                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
+                let conname = if primary {
+                    btree
+                        .primary_key_constraint_name
+                        .clone()
+                        .unwrap_or_else(|| format!("{table_name}_pkey"))
+                } else {
+                    us.constraint_name.clone().unwrap_or_else(|| {
+                        let cols_str = col_names.join("_");
+                        format!("{table_name}_{cols_str}_key")
+                    })
                 };
 
                 // Build conkey: space-separated 1-based attnums
@@ -1625,26 +1895,34 @@ impl SnapshotRows for PgConstraintTable {
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                // Find matching index OID
-                let conindid = if us.is_primary_key {
-                    // PK auto-index name: sqlite_autoindex_{table}_{N}
-                    index_oid_map
-                        .iter()
-                        .find(|(k, _)| {
-                            k.starts_with(&format!(
-                                "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{table_name}"
-                            ))
-                        })
-                        .map(|(_, &v)| v)
-                        .unwrap_or(0)
-                } else {
-                    index_oid_map
-                        .iter()
-                        .find(|(k, _)| k.contains(&col_names.join("_")))
-                        .map(|(_, &v)| v)
-                        .unwrap_or(0)
-                };
+                let positions: Vec<usize> = col_names
+                    .iter()
+                    .map(|name| btree.get_column(name).expect("constraint columns exist").0)
+                    .collect();
+                let conindid = indexes
+                    .iter()
+                    .find(|index| {
+                        index.table_oid == table_oid
+                            && index.unique
+                            && index
+                                .name
+                                .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+                            && index.where_clause.is_none()
+                            && index
+                                .columns
+                                .iter()
+                                .all(|column| column.expression.is_none())
+                            && index.primary == primary
+                            && index
+                                .columns
+                                .iter()
+                                .map(|column| column.position)
+                                .eq(positions.iter().copied())
+                    })
+                    .expect("unique constraints have a catalog index")
+                    .oid;
 
+                let contype: &'static str = contype.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid), // oid
                     Value::build_text(conname),      // conname
@@ -1678,7 +1956,10 @@ impl SnapshotRows for PgConstraintTable {
             // FK constraints from foreign_keys
             for fk in &btree.foreign_keys {
                 let child_cols = fk.child_columns.join("_");
-                let conname = format!("{table_name}_{child_cols}_fkey");
+                let conname = fk
+                    .constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{table_name}_{child_cols}_fkey"));
 
                 let conkey: String = fk
                     .child_columns
@@ -1692,14 +1973,17 @@ impl SnapshotRows for PgConstraintTable {
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                let confrelid = tbl_oid_map.get(&fk.parent_table).copied().unwrap_or(0);
+                let confrelid = tbl_oid_map
+                    .get(&(fk.parent_namespace, fk.parent_table.clone()))
+                    .copied()
+                    .unwrap_or(0);
 
                 let confkey: String = fk
                     .parent_columns
                     .iter()
                     .map(|name| {
                         schema
-                            .get_btree_table(&fk.parent_table)
+                            .get_btree_table(fk.parent_namespace, &fk.parent_table)
                             .and_then(|parent_bt| {
                                 parent_bt
                                     .get_column(name)
@@ -1710,11 +1994,12 @@ impl SnapshotRows for PgConstraintTable {
                     .collect::<Vec<_>>()
                     .join(" ");
 
+                let contype: &'static str = ConstraintKind::ForeignKey.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid),                   // oid
                     Value::build_text(conname),                        // conname
                     Value::from_i64(2200),                             // connamespace
-                    Value::build_text("f"),                            // contype
+                    Value::build_text(contype),                        // contype
                     Value::from_i64(i64::from(fk.deferred)),           // condeferrable
                     Value::from_i64(i64::from(fk.deferred)),           // condeferred
                     Value::from_i64(1),                                // convalidated
@@ -1757,11 +2042,12 @@ impl SnapshotRows for PgConstraintTable {
                     })
                     .unwrap_or_default();
 
+                let contype: &'static str = ConstraintKind::Check.into();
                 rows.push(vec![
                     Value::from_i64(constraint_oid), // oid
                     Value::build_text(conname),      // conname
                     Value::from_i64(2200),           // connamespace
-                    Value::build_text("c"),          // contype
+                    Value::build_text(contype),      // contype
                     Value::from_i64(0),              // condeferrable
                     Value::from_i64(0),              // condeferred
                     Value::from_i64(1),              // convalidated
@@ -1799,14 +2085,16 @@ impl SnapshotRows for PgConstraintTable {
 // pg_attrdef
 // ──────────────────────────────────────────────────────────────────────
 
-const PG_ATTRDEF_SQL: &str =
-    "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT)";
+const PG_ATTRDEF_SQL: &str = "CREATE TABLE pg_attrdef (oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT, tableoid INTEGER HIDDEN)";
 
 #[derive(Debug)]
 struct PgAttrdefTable;
 
 impl SnapshotRows for PgAttrdefTable {
     const SCHEMA: &'static str = PG_ATTRDEF_SQL;
+    /// Fixed PostgreSQL OID of pg_attrdef, which describes column default expressions.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2604);
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 50;
 
@@ -1821,12 +2109,15 @@ impl SnapshotRows for PgAttrdefTable {
         // Use a high base to avoid collisions
         let mut attrdef_oid: i64 = 50000;
 
-        for (table_name, table) in &tables {
+        for (namespace, table_name, table) in &tables {
             let btree = match table.as_ref() {
                 Table::BTree(bt) => bt,
                 _ => continue,
             };
-            let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
+            let table_oid = tbl_oid_map
+                .get(&(*namespace, (*table_name).to_string()))
+                .copied()
+                .unwrap_or(0);
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
@@ -1842,6 +2133,66 @@ impl SnapshotRows for PgAttrdefTable {
         }
         rows
     }
+}
+
+#[derive(Debug)]
+struct PgSequenceTable;
+
+impl SnapshotRows for PgSequenceTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_sequence (
+        seqrelid INTEGER, seqtypid INTEGER, seqstart BIGINT, seqincrement BIGINT,
+        seqmax BIGINT, seqmin BIGINT, seqcache BIGINT, seqcycle BOOLEAN,
+        tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2224);
+    const ESTIMATED_COST: f64 = 100.0;
+    const ESTIMATED_ROWS: u32 = 10;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        sequence_catalog_entries(&conn.current_schema())
+            .into_iter()
+            .map(|(oid, _, seq)| {
+                vec![
+                    Value::from_i64(oid),
+                    Value::from_i64(20),
+                    Value::from_i64(seq.start_value),
+                    Value::from_i64(seq.increment_by),
+                    Value::from_i64(seq.max_value),
+                    Value::from_i64(seq.min_value),
+                    Value::from_i64(1),
+                    Value::from_i64(i64::from(seq.cycle)),
+                ]
+            })
+            .collect()
+    }
+}
+
+/// The sequences the catalogs list, each with its OID and its namespace.
+/// The OIDs continue after those of the user tables and their indexes,
+/// as pg_class numbers them, so a join on them agrees across catalogs.
+fn sequence_catalog_entries(schema: &Schema) -> Vec<(i64, NamespaceId, &Sequence)> {
+    let tables = user_tables_sorted(schema);
+    let index_count = catalog_indexes(schema).len();
+    let first_oid = USER_TABLE_OID_START + tables.len() as i64 + index_count as i64;
+    let mut sequences = Vec::new();
+    for namespace in namespaces_sorted(schema) {
+        let mut named: Vec<_> = schema
+            .sequences_by_name(namespace)
+            .iter()
+            .filter(|(name, _)| !name.starts_with(AUTOINCREMENT_SEQ_PREFIX))
+            .collect();
+        named.sort_by_key(|(name, _)| *name);
+        sequences.extend(
+            named
+                .into_iter()
+                .map(|(_, sequence)| (namespace, sequence.as_ref())),
+        );
+    }
+    sequences
+        .into_iter()
+        .enumerate()
+        .map(|(i, (namespace, sequence))| (first_oid + i as i64, namespace, sequence))
+        .collect()
 }
 
 /// Virtual table implementation for pg_catalog.pg_sequences
@@ -1863,24 +2214,33 @@ impl SnapshotRows for PgSequencesTable {
             cache_size INTEGER,
             last_value INTEGER
         )";
+    const TABLE_OID: Option<i64> = None;
     const ESTIMATED_COST: f64 = 100.0;
     const ESTIMATED_ROWS: u32 = 10;
 
     fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
         let mut rows = Vec::new();
         let schema = conn.current_schema();
-        let mut names: Vec<_> = schema.sequences.keys().cloned().collect();
-        names.sort();
-        for name in names {
-            if let Some(seq) = schema.sequences.get(&name) {
+        let namespaces = namespaces_sorted(&schema);
+        for namespace in namespaces {
+            let sequences = schema.sequences_by_name(namespace);
+            let mut names: Vec<_> = sequences.keys().cloned().collect();
+            names.sort();
+            for name in names {
+                let Some(seq) = sequences.get(&name) else {
+                    continue;
+                };
                 let seq_name = seq.name.clone();
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
                 let last_val = conn
-                    .get_sequence_currval(&seq_name)
+                    .get_sequence_currval(
+                        turso_core::MAIN_DB_ID,
+                        &mangle_name(namespace, &seq_name),
+                    )
                     .unwrap_or(seq.start_value);
                 rows.push(vec![
-                    Value::build_text("public"),           // schemaname
+                    Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
                     Value::build_text(seq_name),           // sequencename
                     Value::build_text("turso"),            // sequenceowner
                     Value::build_text("bigint"),           // data_type
@@ -1899,6 +2259,16 @@ impl SnapshotRows for PgSequencesTable {
 }
 
 pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions {
+    options = options.native_module(
+        "unnest",
+        VTabKind::TableValuedFunction,
+        crate::unnest::Unnest,
+    );
+    options = options.native_module(
+        "pg_options_to_table",
+        VTabKind::TableValuedFunction,
+        crate::options::PgOptionsToTable,
+    );
     options = options.native_module(
         "pg_class",
         VTabKind::TableValuedFunction,
@@ -1945,6 +2315,11 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         SnapshotCatalog::<PgIndexesTable>(PhantomData),
     );
     options = options.native_module(
+        "pg_information_schema_schemata",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<SchemataTable>(PhantomData),
+    );
+    options = options.native_module(
         "pg_get_tabledef",
         VTabKind::TableValuedFunction,
         CatalogModule {
@@ -1981,24 +2356,46 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
         },
     );
     options = options.native_module(
+        "pg_sequence",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgSequenceTable>(PhantomData),
+    );
+    options = options.native_module(
         "pg_sequences",
         VTabKind::TableValuedFunction,
         SnapshotCatalog::<PgSequencesTable>(PhantomData),
     );
     options = options.native_module(
+        "pg_settings",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgSettingsTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_extension",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_extension (
+                oid INTEGER, extname TEXT, extowner INTEGER, extnamespace INTEGER,
+                extrelocatable BOOLEAN, extversion TEXT, extconfig INTEGER[], extcondition TEXT[],
+                tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
         "pg_policy",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_policy (oid INTEGER, polname TEXT, polpermissive TEXT, polroles TEXT, polcmd TEXT, polqual TEXT, polwithcheck TEXT, polrelid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_trigger",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_trigger (oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs TEXT, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT, tgparentid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_statistic_ext",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_statistic_ext (oid INTEGER, stxrelid INTEGER, stxname TEXT, stxnamespace INTEGER, stxowner INTEGER, stxstattarget INTEGER, stxkeys TEXT, stxkind TEXT, stxexprs TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_statistic_ext (oid INTEGER, stxrelid INTEGER, stxname TEXT, stxnamespace INTEGER, stxowner INTEGER, stxstattarget INTEGER, stxkeys TEXT, stxkind TEXT, stxexprs TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_inherits",
@@ -2008,7 +2405,7 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_rewrite",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_rewrite (oid INTEGER, rulename TEXT, ev_class INTEGER, ev_type TEXT, ev_enabled TEXT, is_instead INTEGER, ev_qual TEXT, ev_action TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_foreign_table",
@@ -2027,33 +2424,683 @@ pub(crate) fn register_catalog_modules(mut options: OpenOptions) -> OpenOptions 
     options = options.native_module(
         "pg_collation",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_collation (oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER, collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER, collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT, collversion TEXT)".to_string() },
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_collation (
+                oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER,
+                collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER,
+                collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT,
+                collversion TEXT, tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
     );
     options = options.native_module(
         "pg_description",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)".to_string() },
+        SnapshotCatalog::<PgDescriptionTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_seclabels",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_seclabels (
+                objoid INTEGER, classoid INTEGER, objsubid INTEGER, objtype TEXT,
+                objnamespace INTEGER, objname TEXT, provider TEXT, label TEXT
+            )"
+            .to_string(),
+        },
     );
     options = options.native_module(
         "pg_publication",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_publication_namespace",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_namespace (oid INTEGER, pnpubid INTEGER, pnnspid INTEGER)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_namespace (oid INTEGER, pnpubid INTEGER, pnnspid INTEGER, tableoid INTEGER HIDDEN)".to_string() },
     );
     options = options.native_module(
         "pg_publication_rel",
         VTabKind::TableValuedFunction,
-        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT)".to_string() },
+        EmptyPgCatalogTable { create_sql: "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT, tableoid INTEGER HIDDEN)".to_string() },
     );
+    options = options.native_module(
+        "pg_depend",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgDependTable>(PhantomData),
+    );
+    options = options.native_module(
+        "pg_tablespace",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_tablespace (
+                oid INTEGER, spcname TEXT, spcowner INTEGER, spcacl TEXT[], spcoptions TEXT[],
+                tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_init_privs",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_init_privs (
+                objoid INTEGER, classoid INTEGER, objsubid INTEGER, privtype TEXT,
+                initprivs TEXT[], tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_cast",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_cast (
+                oid INTEGER, castsource INTEGER, casttarget INTEGER, castfunc INTEGER,
+                castcontext TEXT, castmethod TEXT, tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_transform",
+        VTabKind::TableValuedFunction,
+        EmptyPgCatalogTable {
+            create_sql: "CREATE TABLE pg_transform (
+                oid INTEGER, trftype INTEGER, trflang INTEGER, trffromsql INTEGER,
+                trftosql INTEGER, tableoid INTEGER HIDDEN
+            )"
+            .to_string(),
+        },
+    );
+    options = options.native_module(
+        "pg_language",
+        VTabKind::TableValuedFunction,
+        SnapshotCatalog::<PgLanguageTable>(PhantomData),
+    );
+    for (name, create_sql) in [
+        (
+            "pg_operator",
+            "CREATE TABLE pg_operator (
+            oid INTEGER, oprname TEXT, oprnamespace INTEGER, oprowner INTEGER,
+            oprkind TEXT, oprcanmerge BOOLEAN, oprcanhash BOOLEAN, oprleft INTEGER,
+            oprright INTEGER, oprresult INTEGER, oprcom INTEGER, oprnegate INTEGER,
+            oprcode INTEGER, oprrest INTEGER, oprjoin INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_opclass",
+            "CREATE TABLE pg_opclass (
+            oid INTEGER, opcmethod INTEGER, opcname TEXT, opcnamespace INTEGER,
+            opcowner INTEGER, opcfamily INTEGER, opcintype INTEGER, opcdefault BOOLEAN,
+            opckeytype INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_opfamily",
+            "CREATE TABLE pg_opfamily (
+            oid INTEGER, opfmethod INTEGER, opfname TEXT, opfnamespace INTEGER,
+            opfowner INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_parser",
+            "CREATE TABLE pg_ts_parser (
+            oid INTEGER, prsname TEXT, prsnamespace INTEGER, prsstart INTEGER,
+            prstoken INTEGER, prsend INTEGER, prsheadline INTEGER, prslextype INTEGER,
+            tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_template",
+            "CREATE TABLE pg_ts_template (
+            oid INTEGER, tmplname TEXT, tmplnamespace INTEGER, tmplinit INTEGER,
+            tmpllexize INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_dict",
+            "CREATE TABLE pg_ts_dict (
+            oid INTEGER, dictname TEXT, dictnamespace INTEGER, dictowner INTEGER,
+            dicttemplate INTEGER, dictinitoption TEXT, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_ts_config",
+            "CREATE TABLE pg_ts_config (
+            oid INTEGER, cfgname TEXT, cfgnamespace INTEGER, cfgowner INTEGER,
+            cfgparser INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_foreign_data_wrapper",
+            "CREATE TABLE pg_foreign_data_wrapper (
+            oid INTEGER, fdwname TEXT, fdwowner INTEGER, fdwhandler INTEGER,
+            fdwvalidator INTEGER, fdwacl TEXT[], fdwoptions TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_foreign_server",
+            "CREATE TABLE pg_foreign_server (
+            oid INTEGER, srvname TEXT, srvowner INTEGER, srvfdw INTEGER, srvtype TEXT,
+            srvversion TEXT, srvacl TEXT[], srvoptions TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_default_acl",
+            "CREATE TABLE pg_default_acl (
+            oid INTEGER, defaclrole INTEGER, defaclnamespace INTEGER, defaclobjtype TEXT,
+            defaclacl TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_conversion",
+            "CREATE TABLE pg_conversion (
+            oid INTEGER, conname TEXT, connamespace INTEGER, conowner INTEGER,
+            conforencoding INTEGER, contoencoding INTEGER, conproc INTEGER,
+            condefault BOOLEAN, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_range",
+            "CREATE TABLE pg_range (
+            rngtypid INTEGER, rngsubtype INTEGER, rngmultitypid INTEGER,
+            rngcollation INTEGER, rngsubopc INTEGER, rngcanonical INTEGER,
+            rngsubdiff INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_event_trigger",
+            "CREATE TABLE pg_event_trigger (
+            oid INTEGER, evtname TEXT, evtevent TEXT, evtowner INTEGER, evtfoid INTEGER,
+            evtenabled TEXT, evttags TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_subscription",
+            "CREATE TABLE pg_subscription (
+            oid INTEGER, subdbid INTEGER, subskiplsn TEXT, subname TEXT, subowner INTEGER,
+            subenabled BOOLEAN, subbinary BOOLEAN, substream TEXT, subtwophasestate TEXT,
+            subdisableonerr BOOLEAN, subpasswordrequired BOOLEAN, subrunasowner BOOLEAN,
+            subconninfo TEXT, subslotname TEXT, subsynccommit TEXT, subpublications TEXT[],
+            suborigin TEXT, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_largeobject_metadata",
+            "CREATE TABLE pg_largeobject_metadata (
+            oid INTEGER, lomowner INTEGER, lomacl TEXT[], tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_amop",
+            "CREATE TABLE pg_amop (
+            oid INTEGER, amopfamily INTEGER, amoplefttype INTEGER, amoprighttype INTEGER,
+            amopstrategy INTEGER, amoppurpose TEXT, amopopr INTEGER, amopmethod INTEGER,
+            amopsortfamily INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+        (
+            "pg_amproc",
+            "CREATE TABLE pg_amproc (
+            oid INTEGER, amprocfamily INTEGER, amproclefttype INTEGER, amprocrighttype INTEGER,
+            amprocnum INTEGER, amproc INTEGER, tableoid INTEGER HIDDEN
+        )",
+        ),
+    ] {
+        options = options.native_module(
+            name,
+            VTabKind::TableValuedFunction,
+            EmptyPgCatalogTable {
+                create_sql: create_sql.to_owned(),
+            },
+        );
+    }
     options
+}
+
+#[derive(Debug)]
+struct PgLanguageTable;
+
+impl SnapshotRows for PgLanguageTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_language (
+        oid INTEGER, lanname TEXT, lanowner INTEGER, lanispl BOOLEAN,
+        lanpltrusted BOOLEAN, lanplcallfoid INTEGER, laninline INTEGER,
+        lanvalidator INTEGER, lanacl TEXT[], tableoid INTEGER HIDDEN
+    )";
+    const TABLE_OID: Option<i64> = Some(2612);
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 2;
+
+    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
+        [(12, "internal"), (13, "c")]
+            .into_iter()
+            .map(|(oid, name)| {
+                vec![
+                    Value::from_i64(oid),
+                    Value::build_text(name),
+                    Value::from_i64(10),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::from_i64(0),
+                    Value::Null,
+                ]
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct PgSettingsTable;
+
+impl SnapshotRows for PgSettingsTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_settings (
+        name TEXT,
+        setting TEXT,
+        unit TEXT,
+        category TEXT,
+        short_desc TEXT,
+        extra_desc TEXT,
+        context TEXT,
+        vartype TEXT,
+        source TEXT,
+        min_val TEXT,
+        max_val TEXT,
+        enumvals TEXT[],
+        boot_val TEXT,
+        reset_val TEXT,
+        sourcefile TEXT,
+        sourceline INTEGER,
+        pending_restart BOOLEAN
+    )";
+    const TABLE_OID: Option<i64> = None;
+    const ESTIMATED_COST: f64 = 1.0;
+    const ESTIMATED_ROWS: u32 = 1;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        use crate::session::{search_path_setting, DEFAULT_SEARCH_PATH};
+
+        let setting = search_path_setting(conn);
+        let source = if setting.is_some() {
+            "session"
+        } else {
+            "default"
+        };
+        vec![vec![
+            Value::build_text("search_path"),
+            Value::build_text(setting.unwrap_or_else(|| DEFAULT_SEARCH_PATH.to_owned())),
+            Value::Null,
+            Value::build_text("Client Connection Defaults / Statement Behavior"),
+            Value::build_text(
+                "Sets the schema search order for names that are not schema-qualified.",
+            ),
+            Value::Null,
+            Value::build_text("user"),
+            Value::build_text("string"),
+            Value::build_text(source),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::build_text(DEFAULT_SEARCH_PATH),
+            Value::build_text(DEFAULT_SEARCH_PATH),
+            Value::Null,
+            Value::Null,
+            Value::from_i64(0),
+        ]]
+    }
+}
+
+#[derive(strum::IntoStaticStr)]
+enum DependencyKind {
+    #[strum(serialize = "n")]
+    Normal,
+    #[strum(serialize = "a")]
+    Auto,
+    #[strum(serialize = "i")]
+    Internal,
+}
+
+struct ObjectAddress {
+    catalog_oid: i64,
+    object_oid: i64,
+    column_number: i64,
+}
+
+struct RelationRow {
+    oid: i64,
+    namespace_oid: i64,
+    access_method_oid: i64,
+    kind: RelationKind,
+}
+
+struct ConstraintRow<'a> {
+    oid: i64,
+    kind: ConstraintKind,
+    table_oid: i64,
+    index_oid: i64,
+    referenced_table_oid: i64,
+    column_numbers: Option<&'a str>,
+    referenced_column_numbers: Option<&'a str>,
+}
+
+struct IndexRow<'a> {
+    oid: i64,
+    table_oid: i64,
+    is_unique: bool,
+    column_numbers: Option<&'a str>,
+}
+
+struct ColumnDefaultRow {
+    oid: i64,
+    table_oid: i64,
+    column_number: i64,
+}
+
+#[derive(Debug)]
+struct PgDependTable;
+
+impl SnapshotRows for PgDependTable {
+    const SCHEMA: &'static str = "CREATE TABLE pg_depend (
+        classid INTEGER, objid INTEGER, objsubid INTEGER,
+        refclassid INTEGER, refobjid INTEGER, refobjsubid INTEGER, deptype TEXT,
+        tableoid INTEGER HIDDEN
+    )";
+    /// Fixed PostgreSQL OID of pg_depend, which records dependencies between objects.
+    /// Must match PostgreSQL for tableoid and pg_depend references used by pg_dump.
+    const TABLE_OID: Option<i64> = Some(2608);
+    const ESTIMATED_COST: f64 = 1000.0;
+    const ESTIMATED_ROWS: u32 = 100;
+
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let mut rows = Vec::new();
+        let constraint_rows = PgConstraintTable::load_rows(conn);
+        let constraints = constraint_rows
+            .iter()
+            .map(Vec::as_slice)
+            .map(ConstraintRow::from_row);
+        let index_rows = PgIndexTable::load_rows(conn);
+        let indexes = index_rows.iter().map(Vec::as_slice).map(IndexRow::from_row);
+        let relation_rows = PgClassTable::load_rows(conn);
+        let relations = relation_rows
+            .iter()
+            .map(Vec::as_slice)
+            .map(RelationRow::from_row);
+
+        // Report each table's normal dependencies on its schema and access method.
+        for relation in relations.clone() {
+            if !matches!(relation.kind, RelationKind::Table) {
+                continue;
+            }
+            rows.push(dependency_row(
+                ObjectAddress::whole::<PgClassTable>(relation.oid),
+                ObjectAddress::whole::<PgNamespaceTable>(relation.namespace_oid),
+                DependencyKind::Normal,
+            ));
+            if relation.access_method_oid != PG_INVALID_OID {
+                rows.push(dependency_row(
+                    ObjectAddress::whole::<PgClassTable>(relation.oid),
+                    ObjectAddress::whole::<PgAmTable>(relation.access_method_oid),
+                    DependencyKind::Normal,
+                ));
+            }
+        }
+
+        // Match indexes to their owning PK/UNIQUE constraints for internal dependencies.
+        // Other indexes have automatic dependencies on their indexed columns.
+        for index in indexes.clone() {
+            let columns = catalog_column_numbers(index.column_numbers);
+            let constraint = constraints.clone().find(|constraint| {
+                matches!(
+                    constraint.kind,
+                    ConstraintKind::PrimaryKey | ConstraintKind::Unique
+                ) && constraint.index_oid == index.oid
+            });
+            if let Some(constraint) = constraint {
+                rows.push(dependency_row(
+                    ObjectAddress::whole::<PgClassTable>(index.oid),
+                    ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                    DependencyKind::Internal,
+                ));
+            } else {
+                // Emit one automatic dependency row per indexed column.
+                for column_number in columns {
+                    rows.push(dependency_row(
+                        ObjectAddress::whole::<PgClassTable>(index.oid),
+                        ObjectAddress::column(index.table_oid, column_number),
+                        DependencyKind::Auto,
+                    ));
+                }
+            }
+        }
+
+        // Report constraints' dependencies on local columns and foreign-key references.
+        for constraint in constraints {
+            // Use automatic dependencies for local columns, or the whole table if none are listed.
+            for column_number in catalog_column_numbers(constraint.column_numbers) {
+                rows.push(dependency_row(
+                    ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                    ObjectAddress::column(constraint.table_oid, column_number),
+                    DependencyKind::Auto,
+                ));
+            }
+            if constraint.referenced_table_oid != PG_INVALID_OID {
+                let referenced_columns =
+                    catalog_column_numbers(constraint.referenced_column_numbers);
+                // Foreign keys have normal dependencies on their referenced columns.
+                for &column_number in &referenced_columns {
+                    rows.push(dependency_row(
+                        ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                        ObjectAddress::column(constraint.referenced_table_oid, column_number),
+                        DependencyKind::Normal,
+                    ));
+                }
+                // Also report a normal dependency on a matching unique index for the referenced key.
+                if let Some(index) = indexes.clone().find(|index| {
+                    index.table_oid == constraint.referenced_table_oid
+                        && index.is_unique
+                        && catalog_column_numbers(index.column_numbers) == referenced_columns
+                }) {
+                    rows.push(dependency_row(
+                        ObjectAddress::whole::<PgConstraintTable>(constraint.oid),
+                        ObjectAddress::whole::<PgClassTable>(index.oid),
+                        DependencyKind::Normal,
+                    ));
+                }
+            }
+        }
+
+        let default_rows = PgAttrdefTable::load_rows(conn);
+        let defaults = default_rows
+            .iter()
+            .map(Vec::as_slice)
+            .map(ColumnDefaultRow::from_row);
+        // Default expressions automatically depend on the column that owns them.
+        for default in defaults {
+            rows.push(dependency_row(
+                ObjectAddress::whole::<PgAttrdefTable>(default.oid),
+                ObjectAddress::column(default.table_oid, default.column_number),
+                DependencyKind::Auto,
+            ));
+        }
+        rows
+    }
+}
+
+fn catalog_column_numbers(text: Option<&str>) -> Vec<i64> {
+    match text {
+        None => vec![WHOLE_OBJECT_COLUMN_NUMBER],
+        Some(text) => {
+            let mut columns: Vec<i64> = text
+                .split_ascii_whitespace()
+                .map(|column| column.parse().expect("catalog column numbers are integers"))
+                .collect();
+            if columns.is_empty() {
+                columns.push(WHOLE_OBJECT_COLUMN_NUMBER);
+            }
+            columns.sort_unstable();
+            columns.dedup();
+            columns
+        }
+    }
+}
+
+fn dependency_row(
+    dependent: ObjectAddress,
+    referenced: ObjectAddress,
+    kind: DependencyKind,
+) -> Vec<Value> {
+    let kind: &'static str = kind.into();
+    vec![
+        Value::from_i64(dependent.catalog_oid),
+        Value::from_i64(dependent.object_oid),
+        Value::from_i64(dependent.column_number),
+        Value::from_i64(referenced.catalog_oid),
+        Value::from_i64(referenced.object_oid),
+        Value::from_i64(referenced.column_number),
+        Value::build_text(kind),
+    ]
+}
+
+impl ObjectAddress {
+    const fn whole<T: SnapshotRows>(object_oid: i64) -> Self {
+        Self {
+            catalog_oid: T::TABLE_OID.expect("dependency catalogs have OIDs"),
+            object_oid,
+            column_number: WHOLE_OBJECT_COLUMN_NUMBER,
+        }
+    }
+
+    const fn column(table_oid: i64, column_number: i64) -> Self {
+        Self {
+            column_number,
+            ..Self::whole::<PgClassTable>(table_oid)
+        }
+    }
+}
+
+impl RelationRow {
+    // Zero-based positions in PgClassTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const NAMESPACE_OID_COLUMN: usize = 2;
+    const ACCESS_METHOD_OID_COLUMN: usize = 6;
+    const KIND_COLUMN: usize = 16;
+
+    fn from_row(row: &[Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            namespace_oid: row[Self::NAMESPACE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            access_method_oid: row[Self::ACCESS_METHOD_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            kind: row[Self::KIND_COLUMN]
+                .to_text()
+                .expect("catalog relation kinds are text")
+                .parse()
+                .expect("catalog relation kinds are valid"),
+        }
+    }
+}
+
+impl<'a> ConstraintRow<'a> {
+    // Zero-based positions in PgConstraintTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const KIND_COLUMN: usize = 3;
+    const TABLE_OID_COLUMN: usize = 7;
+    const INDEX_OID_COLUMN: usize = 9;
+    const REFERENCED_TABLE_OID_COLUMN: usize = 11;
+    const COLUMN_NUMBERS_COLUMN: usize = 18;
+    const REFERENCED_COLUMN_NUMBERS_COLUMN: usize = 19;
+
+    fn from_row(row: &'a [Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            kind: row[Self::KIND_COLUMN]
+                .to_text()
+                .expect("catalog constraint kinds are text")
+                .parse()
+                .expect("catalog constraint kinds are valid"),
+            table_oid: row[Self::TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            index_oid: row[Self::INDEX_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            referenced_table_oid: row[Self::REFERENCED_TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
+            referenced_column_numbers: catalog_column_text(
+                &row[Self::REFERENCED_COLUMN_NUMBERS_COLUMN],
+            ),
+        }
+    }
+}
+
+impl<'a> IndexRow<'a> {
+    // Zero-based positions in PgIndexTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const TABLE_OID_COLUMN: usize = 1;
+    const IS_UNIQUE_COLUMN: usize = 4;
+    const COLUMN_NUMBERS_COLUMN: usize = 15;
+
+    fn from_row(row: &'a [Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            table_oid: row[Self::TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            is_unique: row[Self::IS_UNIQUE_COLUMN]
+                .as_int()
+                .expect("catalog index uniqueness is an integer")
+                == CATALOG_BOOLEAN_TRUE,
+            column_numbers: catalog_column_text(&row[Self::COLUMN_NUMBERS_COLUMN]),
+        }
+    }
+}
+
+impl ColumnDefaultRow {
+    // Zero-based positions in PgAttrdefTable's SQL column order.
+    const OID_COLUMN: usize = 0;
+    const TABLE_OID_COLUMN: usize = 1;
+    const COLUMN_NUMBER_COLUMN: usize = 2;
+
+    fn from_row(row: &[Value]) -> Self {
+        Self {
+            oid: row[Self::OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            table_oid: row[Self::TABLE_OID_COLUMN]
+                .as_int()
+                .expect("catalog OIDs are integers"),
+            column_number: row[Self::COLUMN_NUMBER_COLUMN]
+                .as_int()
+                .expect("catalog column numbers are integers"),
+        }
+    }
+}
+
+fn catalog_column_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::Null => None,
+        Value::Text(text) => Some(text.as_str()),
+        _ => unreachable!("catalog column lists are text or null"),
+    }
 }
 
 trait SnapshotRows: Debug + Send + Sync + 'static {
     const SCHEMA: &'static str;
+    const TABLE_OID: Option<i64>;
     const ESTIMATED_COST: f64;
     const ESTIMATED_ROWS: u32;
 
@@ -2086,6 +3133,7 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
         Ok(SnapshotCursor {
             conn,
             load_rows: T::load_rows,
+            table_oid: T::TABLE_OID,
             rows: Vec::new(),
             current_row: 0,
         })
@@ -2118,6 +3166,7 @@ impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
 struct SnapshotCursor {
     conn: Arc<Connection>,
     load_rows: fn(&Connection) -> Vec<Vec<Value>>,
+    table_oid: Option<i64>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
@@ -2133,11 +3182,17 @@ impl VirtualTableCursor for SnapshotCursor {
     }
 
     fn column(&mut self, column: usize) -> turso_core::types::IOResultOr<Value> {
-        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(IOResult::Done(self.rows[self.current_row][column].clone()))
-        } else {
-            Ok(IOResult::Done(Value::Null))
+        if self.current_row < self.rows.len() {
+            if column < self.rows[self.current_row].len() {
+                return Ok(IOResult::Done(self.rows[self.current_row][column].clone()));
+            }
+            if column == self.rows[self.current_row].len() {
+                if let Some(table_oid) = self.table_oid {
+                    return Ok(IOResult::Done(Value::from_i64(table_oid)));
+                }
+            }
         }
+        Ok(IOResult::Done(Value::Null))
     }
 
     fn filter(
@@ -2383,30 +3438,25 @@ impl PgGetTableDefCursor {
         let schema = self.conn.current_schema();
         self.rows.clear();
 
-        for (table_name, table) in &schema.tables {
-            // Skip system tables
-            if table_name.starts_with("sqlite_")
-                || table_name == "sqlite_master"
-                || table_name == "sqlite_schema"
-            {
-                continue;
-            }
-
-            // Skip virtual tables and subqueries
+        for (namespace, table_name, table) in user_tables_sorted(&schema) {
             let Table::BTree(btree_table) = table.as_ref() else {
                 continue;
             };
 
-            let postgres_ddl = match self.sql_map.get(table_name) {
+            let postgres_ddl = match self.sql_map.get(&mangle_name(namespace, table_name)) {
                 Some(schema_sql) => decode_stored_pg_schema_sql(schema_sql)
-                    .map(str::to_string)
+                    .map(|sql| {
+                        ddl_with_user_names(&schema, namespace, &btree_table.declared_name, sql)
+                    })
                     .unwrap_or_else(|| self.convert_to_postgres_ddl(schema_sql)),
-                None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
+                None => {
+                    self.convert_to_postgres_ddl(&btree_table.to_sql_as(&btree_table.declared_name))
+                }
             };
 
             self.rows.push(vec![
-                Value::Text("public".into()),
-                Value::Text(table_name.clone().into()),
+                Value::Text(schema_name_of(&schema, namespace).to_string().into()),
+                Value::Text(btree_table.declared_name.clone().into()),
                 Value::Text(postgres_ddl.into()),
             ]);
         }
@@ -2444,6 +3494,45 @@ impl PgGetTableDefCursor {
 
         postgres_ddl
     }
+}
+
+/// `sql`, the stored text of table `table_name` of `namespace`, with the
+/// names a user writes: the stored text names the table and the tables its
+/// foreign keys refer to by their mangled names. A foreign key target in
+/// another schema is named with its schema.
+fn ddl_with_user_names(
+    schema: &Schema,
+    namespace: NamespaceId,
+    table_name: &str,
+    sql: &str,
+) -> String {
+    let Ok(parse_result) = turso_pg_parser::parse(sql) else {
+        return sql.to_string();
+    };
+    let mut ddl = sql.to_string();
+    // From the last name to the first, so the offsets of the others hold.
+    for table in turso_pg_parser::foreign_key_tables(&parse_result)
+        .iter()
+        .rev()
+    {
+        let (target, bare) = schema.demangle_name(&table.name);
+        if target.is_root() {
+            continue;
+        }
+        let Ok(renamed) = turso_pg_parser::name_at(&ddl, table.location, bare) else {
+            return sql.to_string();
+        };
+        ddl = if target == namespace {
+            renamed
+        } else {
+            turso_pg_parser::qualify_create_table_name(
+                &renamed,
+                table.location,
+                schema_name_of(schema, target),
+            )
+        };
+    }
+    turso_pg_parser::name_create_table(&ddl, table_name).unwrap_or(ddl)
 }
 
 impl VirtualTableCursor for PgGetTableDefCursor {
@@ -2546,34 +3635,34 @@ fn ref_act_to_sql(code: &str) -> &'static str {
 pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
     let tables = user_tables_sorted(&schema);
-    let num_tables = tables.len() as i64;
+    let indexes = catalog_indexes(&schema);
+    let mut constraint_oid = indexes
+        .last()
+        .map_or(USER_TABLE_OID_START + tables.len() as i64, |index| {
+            index.oid + 1
+        });
 
-    // Build index_name -> index_oid map (same as pg_constraint)
-    let mut next_index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(table_name) {
-            if !idx.ephemeral {
-                next_index_oid += 1;
-            }
-        }
-    }
-
-    let mut constraint_oid = next_index_oid;
-
-    for (_, table) in &tables {
+    for (_, _, table) in &tables {
         let btree = match table.as_ref() {
             Table::BTree(bt) => bt,
             _ => continue,
         };
 
-        // Synthesized PK for rowid-alias tables
-        let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
-        if !has_pk_in_unique_sets && !btree.primary_key_columns.is_empty() {
+        if btree.get_rowid_alias_column().is_some() {
             if constraint_oid == target_oid {
                 let cols: Vec<String> = btree
                     .primary_key_columns
                     .iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|(name, _)| {
+                        let (_, column) =
+                            btree.get_column(name).expect("primary key columns exist");
+                        quote_identifier(
+                            column
+                                .name
+                                .as_deref()
+                                .expect("primary key columns have names"),
+                        )
+                    })
                     .collect();
                 return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
             }
@@ -2583,8 +3672,22 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // PK / UNIQUE from unique_sets
         for us in &btree.unique_sets {
             if constraint_oid == target_oid {
-                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
-                let kw = if us.is_primary_key {
+                let col_names: Vec<String> = us
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        let (_, column) = btree
+                            .get_column(&column.name)
+                            .expect("constraint columns exist");
+                        quote_identifier(
+                            column
+                                .name
+                                .as_deref()
+                                .expect("constraint columns have names"),
+                        )
+                    })
+                    .collect();
+                let kw = if unique_set_is_primary_key(btree, us) {
                     "PRIMARY KEY"
                 } else {
                     "UNIQUE"
@@ -2597,12 +3700,60 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // FK constraints
         for fk in &btree.foreign_keys {
             if constraint_oid == target_oid {
-                let child_cols = fk.child_columns.join(", ");
-                let parent_cols = fk.parent_columns.join(", ");
-                let mut def = format!(
-                    "FOREIGN KEY ({child_cols}) REFERENCES {}({parent_cols})",
-                    fk.parent_table
+                let parent = schema.get_btree_table(fk.parent_namespace, &fk.parent_table);
+                let child_cols = constraint_column_list(
+                    Some(btree),
+                    fk.child_columns.iter().map(String::as_str),
                 );
+                let parent_cols = if fk.parent_columns.is_empty() {
+                    parent.as_ref().map_or_else(String::new, |parent| {
+                        constraint_column_list(
+                            Some(parent),
+                            parent
+                                .primary_key_columns
+                                .iter()
+                                .map(|(name, _)| name.as_str()),
+                        )
+                    })
+                } else {
+                    constraint_column_list(
+                        parent.as_deref(),
+                        fk.parent_columns.iter().map(String::as_str),
+                    )
+                };
+                let parent_name = parent.as_ref().map_or(fk.parent_table.as_str(), |parent| {
+                    parent.declared_name.as_str()
+                });
+                let visible = conn
+                    .search_order()
+                    .into_iter()
+                    .find(|namespace| {
+                        schema
+                            .get_table(namespace.target.id, &fk.parent_table)
+                            .is_some()
+                            || schema
+                                .get_view(namespace.target.id, &fk.parent_table)
+                                .is_some()
+                            || schema
+                                .get_sequence(namespace.target.id, &fk.parent_table)
+                                .is_some()
+                            || indexes.iter().any(|index| {
+                                index.namespace == namespace.target.id
+                                    && index.name == fk.parent_table
+                            })
+                    })
+                    .is_some_and(|namespace| namespace.target.id == fk.parent_namespace);
+                let parent_name = if visible {
+                    quote_identifier(parent_name)
+                } else {
+                    format!(
+                        "{}.{}",
+                        quote_identifier(schema_name_of(&schema, fk.parent_namespace)),
+                        quote_identifier(parent_name),
+                    )
+                };
+                let mut def =
+                    format!("FOREIGN KEY ({child_cols}) REFERENCES {parent_name}({parent_cols})");
                 let on_update = ref_act_to_char(&fk.on_update);
                 let on_delete = ref_act_to_char(&fk.on_delete);
                 if on_update != "a" {
@@ -2628,51 +3779,209 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
     None
 }
 
+fn constraint_column_list<'a>(
+    table: Option<&BTreeTable>,
+    names: impl IntoIterator<Item = &'a str>,
+) -> String {
+    names
+        .into_iter()
+        .map(|name| {
+            let declared_name = table
+                .and_then(|table| table.get_column(name))
+                .and_then(|(_, column)| column.name.as_deref())
+                .unwrap_or(name);
+            quote_identifier(declared_name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
 /// Uses the same OID assignment as [PgIndexTable] / [PgClassTable].
 pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
-    let num_tables = tables.len() as i64;
-
-    let mut index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(table_name) {
-            if idx.ephemeral {
-                continue;
-            }
-            if index_oid == target_oid {
-                return Some(index_definition(table_name, idx));
-            }
-            index_oid += 1;
-        }
-    }
-
-    None
+    catalog_indexes(&schema)
+        .iter()
+        .find(|index| index.oid == target_oid)
+        .map(|index| index_definition(&schema, index))
 }
 
-fn index_definition(table_name: &str, idx: &Index) -> String {
-    let unique = if idx.unique { "UNIQUE " } else { "" };
-    let cols: Vec<String> = idx
-        .columns
-        .iter()
-        .map(|col| {
-            if let Some(expr) = &col.expr {
-                expr.to_string()
-            } else {
-                col.name.clone()
+fn index_definition(schema: &Schema, index: &CatalogIndex) -> String {
+    IndexDefinition {
+        name: &index.name,
+        schema_name: schema_name_of(schema, index.namespace),
+        table_name: &index.table_name,
+        unique: index.unique,
+        columns: &index.columns,
+        where_clause: index.where_clause.as_deref(),
+    }
+    .to_string()
+}
+
+struct IndexDefinition<'a> {
+    name: &'a str,
+    schema_name: &'a str,
+    table_name: &'a str,
+    unique: bool,
+    columns: &'a [CatalogIndexColumn],
+    where_clause: Option<&'a str>,
+}
+
+impl Display for IndexDefinition<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE ")?;
+        if self.unique {
+            f.write_str("UNIQUE ")?;
+        }
+        write!(
+            f,
+            "INDEX {} ON {}.{} USING btree (",
+            quote_identifier(self.name),
+            quote_identifier(self.schema_name),
+            quote_identifier(self.table_name),
+        )?;
+        for (position, column) in self.columns.iter().enumerate() {
+            if position != 0 {
+                f.write_str(", ")?;
             }
+            match column.expression.as_deref() {
+                Some(expression) => f.write_str(expression)?,
+                None => f.write_str(&quote_identifier(&column.name))?,
+            }
+            match column.order {
+                SortOrder::Asc => {}
+                SortOrder::Desc => f.write_str(" DESC")?,
+            }
+        }
+        f.write_str(")")?;
+        if let Some(where_clause) = self.where_clause {
+            write!(f, " WHERE {where_clause}")?;
+        }
+        Ok(())
+    }
+}
+
+struct CatalogIndex {
+    oid: i64,
+    table_oid: i64,
+    namespace: NamespaceId,
+    table_name: String,
+    name: String,
+    columns: Vec<CatalogIndexColumn>,
+    unique: bool,
+    primary: bool,
+    where_clause: Option<String>,
+}
+
+fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
+    let tables = user_tables_sorted(schema);
+    let mut oid = USER_TABLE_OID_START + tables.len() as i64;
+    // A relation name is unique within its schema.
+    let mut relation_names: HashSet<(NamespaceId, String)> = schema
+        .namespace_ids()
+        .flat_map(|namespace| {
+            schema
+                .table_names(namespace)
+                .map(str::to_owned)
+                .chain(schema.views(namespace).map(|(name, _)| name.to_owned()))
+                .chain(schema.indexes(namespace).map(|index| index.name.clone()))
+                .chain(schema.sequences_by_name(namespace).keys().cloned())
+                .map(move |name| (namespace, name))
+                .collect::<Vec<_>>()
         })
         .collect();
-    let mut def = format!(
-        "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-        idx.name,
-        cols.join(", ")
-    );
-    if let Some(where_clause) = &idx.where_clause {
-        def.push_str(&format!(" WHERE {where_clause}"));
+    let mut indexes = Vec::new();
+    for (table_position, (namespace, table_name, table)) in tables.into_iter().enumerate() {
+        let Table::BTree(btree) = table.as_ref() else {
+            continue;
+        };
+        let table_oid = USER_TABLE_OID_START + table_position as i64;
+        if let Some((position, column)) = btree.get_rowid_alias_column() {
+            let mut name = format!("__turso_internal_pk_index_{table_name}");
+            while !relation_names.insert((namespace, name.clone())) {
+                name.insert(0, '_');
+            }
+            indexes.push(CatalogIndex {
+                oid,
+                table_oid,
+                namespace,
+                table_name: btree.declared_name.clone(),
+                name,
+                columns: vec![CatalogIndexColumn {
+                    name: column.name.clone().expect("primary key columns have names"),
+                    position,
+                    expression: None,
+                    order: SortOrder::Asc,
+                }],
+                unique: true,
+                primary: true,
+                where_clause: None,
+            });
+            oid += 1;
+        }
+        for index in schema
+            .get_indices(namespace, table_name)
+            .filter(|index| !index.ephemeral)
+        {
+            let primary = btree.get_rowid_alias_column().is_none()
+                && index
+                    .name
+                    .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+                && index
+                    .columns
+                    .iter()
+                    .map(|column| column.pos_in_table)
+                    .eq(btree.primary_key_columns.iter().map(|(name, _)| {
+                        btree.get_column(name).expect("primary key columns exist").0
+                    }));
+            indexes.push(CatalogIndex {
+                oid,
+                table_oid,
+                namespace,
+                table_name: btree.declared_name.clone(),
+                name: index.name.clone(),
+                columns: index
+                    .columns
+                    .iter()
+                    .map(|column| CatalogIndexColumn {
+                        name: if column.expr.is_some() {
+                            column.name.clone()
+                        } else {
+                            btree.columns()[column.pos_in_table]
+                                .name
+                                .clone()
+                                .expect("index columns have names")
+                        },
+                        position: column.pos_in_table,
+                        expression: column.expr.as_ref().map(ToString::to_string),
+                        order: column.order,
+                    })
+                    .collect(),
+                unique: index.unique,
+                primary,
+                where_clause: index.where_clause.as_ref().map(ToString::to_string),
+            });
+            oid += 1;
+        }
     }
-    def
+    indexes
+}
+
+struct CatalogIndexColumn {
+    name: String,
+    position: usize,
+    expression: Option<String>,
+    order: SortOrder,
+}
+
+fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {
+    table.get_rowid_alias_column().is_none()
+        && set.columns.len() == table.primary_key_columns.len()
+        && set
+            .columns
+            .iter()
+            .zip(&table.primary_key_columns)
+            .all(|(column, (name, _))| column.name.eq_ignore_ascii_case(name))
 }
 
 // TODO: Fix tests to use correct API
@@ -2682,6 +3991,59 @@ mod tests {
     use super::*;
     use crate::{Database, Numeric, PlatformIO, StepResult};
     use tempfile::tempdir;
+    use turso_core::ConnectOpts;
+
+    /// Connects like the frontend does: with the `public` schema in place
+    /// and on the search path.
+    fn connect_with_public(db: &Arc<Database>) -> Arc<Connection> {
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.set_search_path(Some(vec!["public".to_string()]));
+        conn
+    }
+
+    #[test]
+    fn primary_key_index_prefixes_colliding_names() {
+        let mut schema = Schema::new();
+        let public = NamespaceId::new(1);
+        schema.add_namespace(public, "public");
+        for name in [
+            "t",
+            "__turso_internal_pk_index_t",
+            "___turso_internal_pk_index_t",
+        ] {
+            let columns = if name == "t" {
+                "id INTEGER PRIMARY KEY"
+            } else {
+                "value TEXT"
+            };
+            schema
+                .add_btree_table(
+                    public,
+                    Arc::new(
+                        BTreeTable::from_sql(&format!("CREATE TABLE {name} ({columns})"), 2)
+                            .unwrap(),
+                    ),
+                )
+                .unwrap();
+        }
+        let indexes = catalog_indexes(&schema);
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].name, "____turso_internal_pk_index_t");
+    }
+
+    #[test]
+    fn postgres_rejects_without_rowid_schema() {
+        let sql = "CREATE TABLE t(a TEXT PRIMARY KEY, b) WITHOUT ROWID";
+        assert!(!BTreeTable::from_sql(sql, 2).unwrap().has_rowid);
+        let error = PostgresDialect.parse_table_sql(sql, 2).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Parse error: PostgreSQL does not support WITHOUT ROWID table 't'"
+        );
+        assert!(PostgresDialect
+            .parse_table_sql("CREATE TABLE t(a TEXT PRIMARY KEY, b)", 2)
+            .is_ok());
+    }
 
     #[test]
     fn catalogs_registered_at_open_survive_schema_refresh() {
@@ -2701,7 +4063,10 @@ mod tests {
             "pg_type",
             "pg_attrdef",
             "pg_input_error_info",
+            "pg_sequence",
             "pg_sequences",
+            "pg_settings",
+            "pg_extension",
             "pg_policy",
             "pg_trigger",
             "pg_statistic_ext",
@@ -2723,19 +4088,28 @@ mod tests {
                 crate::DatabaseOpts::new(),
             )
             .unwrap();
-            let conn = db.connect().unwrap();
+            let conn = connect_with_public(&db);
             if mvcc {
                 conn.pragma_update("journal_mode", "'mvcc'").unwrap();
             }
             for name in catalog_names {
                 assert!(
                     matches!(
-                        conn.current_schema().get_table(name).as_deref(),
+                        conn.current_schema()
+                            .get_table(NamespaceId::ROOT, name)
+                            .as_deref(),
                         Some(Table::Virtual(_))
                     ),
                     "{name}"
                 );
             }
+            assert_eq!(
+                conn.prepare("SELECT setting FROM pg_settings WHERE name = 'search_path'")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![vec![Value::build_text("\"$user\", public")]]
+            );
             let mut namespaces = conn
                 .prepare("SELECT nspname FROM pg_namespace() ORDER BY nspname")
                 .unwrap();
@@ -2751,7 +4125,7 @@ mod tests {
                 .prepare("SELECT relname FROM pg_class WHERE relname = 'second_connection'")
                 .unwrap();
             assert!(tables.run_collect_rows().unwrap().is_empty());
-            let other = db.connect().unwrap();
+            let other = connect_with_public(&db);
             other
                 .execute("CREATE TABLE second_connection (v INT)")
                 .unwrap();
@@ -2764,7 +4138,9 @@ mod tests {
             for name in catalog_names {
                 assert!(
                     matches!(
-                        conn.current_schema().get_table(name).as_deref(),
+                        conn.current_schema()
+                            .get_table(NamespaceId::ROOT, name)
+                            .as_deref(),
                         Some(Table::Virtual(_))
                     ),
                     "{name}"
@@ -2779,7 +4155,7 @@ mod tests {
             );
             conn.execute("CREATE TABLE namespace_counts (n INT)")
                 .unwrap();
-            conn.execute("CREATE TRIGGER catalog_check AFTER INSERT ON second_connection BEGIN INSERT INTO namespace_counts SELECT COUNT(*) FROM pg_namespace LEFT JOIN pg_policy ON 1; END").unwrap();
+            conn.execute("CREATE TRIGGER catalog_check AFTER INSERT ON second_connection BEGIN INSERT INTO namespace_counts SELECT COUNT(*) FROM main.pg_namespace LEFT JOIN main.pg_policy ON 1; END").unwrap();
             conn.execute("INSERT INTO second_connection VALUES (7)")
                 .unwrap();
             let mut counts = conn.prepare("SELECT n FROM namespace_counts").unwrap();
@@ -2791,108 +4167,62 @@ mod tests {
     }
 
     #[test]
-    fn table_definitions_resume_after_io_and_statement_reset() {
-        use turso_core::{MemoryYieldIO, IO};
-
-        let io = Arc::new(MemoryYieldIO::new());
-        let db = crate::session::open_database_with_io(
-            io.clone(),
-            "tabledefs.db",
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new(),
-        )
-        .unwrap();
-        let conn = db.connect().unwrap();
-        let mut expected = Vec::new();
-        for i in 0..12 {
-            let name = format!("catalog_{i:02}");
-            let sql = format!(
-                "CREATE TABLE {name} (item TEXT DEFAULT '{}', n INT DEFAULT {i})",
-                "x".repeat(2048 + i * 31)
-            );
-            conn.execute(&sql).unwrap();
-            expected.push(vec![
-                Value::build_text("public"),
-                Value::build_text(name),
-                Value::build_text(sql),
-            ]);
-        }
-
-        conn.execute("BEGIN").unwrap();
-        conn.get_pager().clear_page_cache(false);
-        let mut cursor = PgGetTableDefTable::new().open(conn.clone()).unwrap();
-        let mut yields = 0;
-        loop {
-            match cursor.filter(&[], None, 0).unwrap() {
-                IOResult::IO(completions) => {
-                    yields += 1;
-                    assert!(!completions.finished());
-                    io.step().unwrap();
-                    assert!(completions.finished());
-                }
-                IOResult::Done(has_rows) => {
-                    assert!(has_rows);
-                    break;
-                }
-            }
-        }
-        assert!(yields > 1, "schema scan should yield on multiple pages");
-        cursor.rows.sort_by_key(|row| row[1].to_string());
-        assert_eq!(cursor.rows, expected);
-        drop(cursor);
-        conn.execute("ROLLBACK").unwrap();
-
-        let mut stmt = conn
-            .prepare("SELECT schema_name, table_name, ddl FROM pg_get_tabledef ORDER BY table_name")
-            .unwrap();
-        conn.get_pager().clear_page_cache(false);
-        conn.execute("SELECT COUNT(*) FROM pg_namespace").unwrap();
-        assert!(matches!(stmt.step().unwrap(), StepResult::IO));
-        assert!(matches!(stmt.step().unwrap(), StepResult::IO));
-        stmt.reset().unwrap();
-        conn.get_pager().clear_page_cache(false);
-        conn.execute("SELECT COUNT(*) FROM pg_namespace").unwrap();
-        let mut rows = Vec::new();
-        let mut statement_yields = 0;
-        loop {
-            match stmt.step().unwrap() {
-                StepResult::IO => {
-                    statement_yields += 1;
-                    let completions = stmt
-                        .take_io_completions()
-                        .expect("catalog I/O must reach its caller");
-                    io.step().unwrap();
-                    assert!(completions.finished());
-                }
-                StepResult::Row => rows.push(
-                    stmt.row()
-                        .unwrap()
-                        .get_values()
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                ),
-                StepResult::Done => break,
-                other => panic!("unexpected catalog step: {other:?}"),
-            }
-        }
-        assert!(statement_yields > 1);
-        assert_eq!(rows, expected);
-        stmt.reset().unwrap();
-        assert_eq!(stmt.run_collect_rows().unwrap(), expected);
-        conn.execute("CREATE TABLE after_catalog (v INT)").unwrap();
-    }
-
-    #[test]
     fn catalog_view_columns_survive_schema_refresh() {
         let expected = ["oid", "nspname", "nspowner", "nspacl"]
             .map(Value::build_text)
             .map(|value| vec![value])
             .to_vec();
-        let columns = |conn: &Arc<Connection>| {
-            conn.prepare("SELECT name FROM pragma_table_info('catalog_names') ORDER BY cid")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap()
+        let hidden_expected = ["nspname", "tableoid"]
+            .map(Value::build_text)
+            .map(|value| vec![value])
+            .to_vec();
+        let views = [
+            ("catalog_names", "SELECT * FROM pg_namespace", false),
+            (
+                "catalog_qualified_names",
+                "SELECT pg_namespace.* FROM pg_namespace",
+                false,
+            ),
+            (
+                "catalog_group_names",
+                "SELECT * FROM (pg_namespace) AS namespaces",
+                false,
+            ),
+            (
+                "catalog_qualified_group_names",
+                "SELECT namespaces.* FROM (pg_namespace) AS namespaces",
+                false,
+            ),
+            (
+                "catalog_hidden",
+                "SELECT nspname, tableoid FROM pg_namespace",
+                true,
+            ),
+            (
+                "catalog_group_hidden",
+                "SELECT namespaces.nspname, namespaces.tableoid FROM (pg_namespace) AS namespaces",
+                true,
+            ),
+        ];
+        let check_columns = |conn: &Arc<Connection>| {
+            for (name, _, selects_hidden) in views {
+                let columns = conn
+                    .prepare(format!(
+                        "SELECT name FROM pragma_table_info('{name}') ORDER BY cid"
+                    ))
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                assert_eq!(
+                    &columns,
+                    if selects_hidden {
+                        &hidden_expected
+                    } else {
+                        &expected
+                    },
+                    "{name}"
+                );
+            }
         };
         let dir = tempdir().unwrap();
         for mvcc in [false, true] {
@@ -2909,16 +4239,20 @@ mod tests {
                     opts,
                 )
                 .unwrap();
-                let conn = db.connect().unwrap();
+                let conn = connect_with_public(&db);
                 if mvcc {
                     conn.pragma_update("journal_mode", "'mvcc'").unwrap();
                 }
-                conn.execute("CREATE VIEW catalog_names AS SELECT * FROM pg_namespace")
-                    .unwrap();
+                let stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
+                assert_eq!(stmt.num_columns(), 4);
+                for (name, select, _) in views {
+                    conn.execute(format!("CREATE VIEW {name} AS {select}"))
+                        .unwrap();
+                }
                 conn.execute("CREATE VIEW catalog_join AS WITH namespaces AS (SELECT * FROM pg_namespace) SELECT namespaces.nspname FROM namespaces JOIN pg_namespace USING (oid)").unwrap();
-                assert_eq!(columns(&conn), expected);
+                check_columns(&conn);
                 conn.force_reparse_schema().unwrap();
-                assert_eq!(columns(&conn), expected);
+                check_columns(&conn);
             }
             let db = crate::session::open_database_with_io(
                 io,
@@ -2927,11 +4261,28 @@ mod tests {
                 opts,
             )
             .unwrap();
-            let conn = db.connect().unwrap();
-            assert_eq!(columns(&conn), expected);
+            let conn = connect_with_public(&db);
+            check_columns(&conn);
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.force_reparse_schema().unwrap();
-            assert_eq!(columns(&conn), expected);
+            check_columns(&conn);
+            for name in ["catalog_hidden", "catalog_group_hidden"] {
+                let mut stmt = conn
+                    .prepare(format!("SELECT * FROM {name} ORDER BY nspname"))
+                    .unwrap();
+                assert_eq!(stmt.num_columns(), 2);
+                assert_eq!(
+                    stmt.run_collect_rows().unwrap(),
+                    vec![
+                        vec![
+                            Value::build_text("information_schema"),
+                            Value::from_i64(2615)
+                        ],
+                        vec![Value::build_text("pg_catalog"), Value::from_i64(2615)],
+                        vec![Value::build_text("public"), Value::from_i64(2615)],
+                    ]
+                );
+            }
             assert_eq!(
                 conn.prepare("SELECT nspname FROM catalog_join ORDER BY nspname")
                     .unwrap()
@@ -2963,7 +4314,7 @@ mod tests {
             opts,
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = connect_with_public(&db);
         conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
             .unwrap();
         conn.execute("CREATE TABLE aux.data (v INT)").unwrap();
@@ -2973,7 +4324,7 @@ mod tests {
                 .unwrap()
                 .run_collect_rows()
                 .unwrap(),
-            vec![vec![Value::from_i64(4)]]
+            vec![vec![Value::from_i64(3)]]
         );
         conn.execute("CREATE TRIGGER aux.catalog_check AFTER INSERT ON data BEGIN INSERT INTO counts SELECT COUNT(*) FROM pg_namespace; END").unwrap();
         conn.execute("INSERT INTO aux.data VALUES (5)").unwrap();
@@ -2982,7 +4333,7 @@ mod tests {
                 .unwrap()
                 .run_collect_rows()
                 .unwrap(),
-            vec![vec![Value::from_i64(4)]]
+            vec![vec![Value::from_i64(3)]]
         );
         let attached = crate::session::open_database_with_io(
             io.clone(),
@@ -2992,9 +4343,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            attached
-                .connect()
-                .unwrap()
+            connect_with_public(&attached)
                 .prepare("SELECT COUNT(*) FROM pg_namespace")
                 .unwrap()
                 .run_collect_rows()
@@ -3002,15 +4351,10 @@ mod tests {
             vec![vec![Value::from_i64(3)]]
         );
         for temp_store in ["MEMORY", "FILE"] {
-            let temp_conn = db.connect().unwrap();
+            let temp_conn = connect_with_public(&db);
             temp_conn
                 .execute(format!("PRAGMA temp_store = {temp_store}"))
                 .unwrap();
-            temp_conn.execute("BEGIN").unwrap();
-            temp_conn
-                .execute("CREATE TEMP TABLE temp_data (v INT)")
-                .unwrap();
-            temp_conn.execute("ROLLBACK").unwrap();
             assert_eq!(
                 temp_conn
                     .prepare("SELECT COUNT(*) FROM temp.pg_namespace")
@@ -3032,9 +4376,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            output
-                .connect()
-                .unwrap()
+            connect_with_public(&output)
                 .prepare("SELECT COUNT(*) FROM catalog_names")
                 .unwrap()
                 .run_collect_rows()
@@ -3056,7 +4398,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = crate::Connection::new(db.connect().unwrap());
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_namespace
         let mut stmt = conn.prepare("SELECT * FROM pg_namespace").unwrap();
@@ -3104,7 +4446,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = connect_with_public(&db);
 
         // Create test tables in SQLite mode (default)
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
@@ -3114,7 +4456,8 @@ mod tests {
         conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, product_id INTEGER)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_class for regular tables
         let mut stmt = conn
@@ -3164,13 +4507,14 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = connect_with_public(&db);
 
         // Create a test table with known columns
         conn.execute("CREATE TABLE test_table (id INTEGER, name TEXT, value REAL)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_class for table details
         let mut stmt = conn
@@ -3229,13 +4573,14 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = connect_with_public(&db);
 
         // Create a test table
         conn.execute("CREATE TABLE test_table (id INTEGER)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Try to query sqlite_master - should fail
         let result = conn.prepare("SELECT * FROM sqlite_master");
@@ -3268,7 +4613,7 @@ mod tests {
             Arc::new(turso_core::SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Try to query pg_class - should fail
         let result = conn.prepare("SELECT * FROM pg_class");
@@ -3311,7 +4656,7 @@ mod tests {
         .unwrap();
 
         // SQLite-mode connection: sqlite_master sees the user table.
-        let sqlite_conn = db.connect().unwrap();
+        let sqlite_conn = connect_with_public(&db);
         sqlite_conn
             .execute("CREATE TABLE users (id INTEGER, name TEXT)")
             .unwrap();
@@ -3323,7 +4668,7 @@ mod tests {
             match stmt.step().unwrap() {
                 StepResult::Row => {
                     if let Value::Text(name) = stmt.row().unwrap().get_value(0) {
-                        if name.value == "users" {
+                        if name.value == "__turso_ns1_users" {
                             found = true;
                         }
                     }
@@ -3332,10 +4677,13 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(found, "users table not found in sqlite_master");
+        assert!(
+            found,
+            "users table not found in sqlite_master under its mangled name"
+        );
 
         // PostgreSQL-mode connection: pg_class sees the user table.
-        let pg_conn = crate::Connection::new(db.connect().unwrap());
+        let pg_conn = crate::Connection::connect(&db).unwrap();
         let mut stmt = pg_conn
             .prepare("SELECT relname FROM pg_class WHERE relkind = 'r'")
             .unwrap();
@@ -3369,7 +4717,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = connect_with_public(&db);
 
         // Create multiple tables
         conn.execute("CREATE TABLE table1 (id INTEGER)").unwrap();
@@ -3378,7 +4726,8 @@ mod tests {
         conn.execute("CREATE TABLE table3 (id INTEGER, name TEXT, value REAL)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Test various WHERE clause combinations
 
@@ -3440,7 +4789,7 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = connect_with_public(&db);
 
         // Create test tables
         conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
@@ -3448,7 +4797,8 @@ mod tests {
         conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         // Query pg_tables
         let mut stmt = conn
@@ -3488,12 +4838,13 @@ mod tests {
             crate::DatabaseOpts::new(),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = connect_with_public(&db);
 
         conn.execute("CREATE TABLE mydata (id INTEGER PRIMARY KEY)")
             .unwrap();
 
-        let conn = crate::Connection::new(conn);
+        drop(conn);
+        let conn = crate::Connection::connect(&db).unwrap();
 
         let mut stmt = conn.prepare("SELECT tablename FROM pg_tables").unwrap();
 

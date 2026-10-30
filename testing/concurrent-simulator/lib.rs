@@ -21,8 +21,8 @@ use turso_core::SqliteDialect;
 use turso_core::WindowsIOCP;
 use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
 use turso_core::{
-    CheckpointMode, CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, LimboError,
-    OpenFlags, Statement, Value,
+    CheckpointMode, CipherMode, ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts,
+    IO, LimboError, OpenFlags, Statement, Value,
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
@@ -778,7 +778,7 @@ impl Whopper {
             }
         };
 
-        let bootstrap_conn = match db.connect() {
+        let bootstrap_conn = match db.connect(ConnectOpts::new()) {
             Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
             Err(e) => {
                 return Err(anyhow::anyhow!("Connection failed: {}", e));
@@ -1725,7 +1725,7 @@ impl Whopper {
 
         for i in 0..self.max_connections {
             let conn = db
-                .connect()
+                .connect(ConnectOpts::new())
                 .map_err(|e| anyhow::anyhow!("Failed to create fiber connection {}: {}", i, e))?;
             let conn = may_be_set_encryption(conn, &self.encryption_opts)?;
             self.context.fibers.push(SimulatorFiber {

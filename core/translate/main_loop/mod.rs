@@ -1,15 +1,15 @@
 use turso_parser::ast::{Expr, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
-    aggregation::{translate_aggregation_step, AggArgumentSource},
+    aggregation::{emit_aggregate_step, AggArgumentSource},
     emitter::{
         InSeekMetadata, MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver,
         TranslateCtx, UpdateRowSource,
     },
     expr::{
-        expr_references_outer_query, expr_references_subquery_id, translate_condition_expr,
-        translate_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
-        ConditionMetadata, NoConstantOptReason, WalkControl,
+        emit_stored_column, expr_references_subquery_id, translate_condition_expr, translate_expr,
+        translate_expr_no_constant_opt, walk_expr, walk_expr_mut, ConditionMetadata,
+        NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::{constraints::BinaryExprSide, Optimizable},
@@ -26,12 +26,9 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, Table},
     translate::{
-        collate::{
-            get_collseq_from_expr_with_symbols, resolve_comparison_collseq_with_symbols,
-            CollationSeq,
-        },
+        collate::{comparison_collation, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
-        planner::{table_mask_from_expr, TableMask},
+        planner::{expr_reads_an_outer_query, table_mask_from_expr, TableMask},
         result_row::emit_select_result,
     },
     turso_assert, turso_assert_eq,

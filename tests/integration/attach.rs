@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use turso_core::SqliteDialect;
-use turso_core::{Database, DatabaseOpts, OpenFlags};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags};
 
 const PAGE_SIZE_OFFSET: u64 = 16;
 const RESERVED_SPACE_OFFSET: u64 = 20;
@@ -201,7 +201,7 @@ fn open_unreliable_attached_database(
         None,
         Arc::new(SqliteDialect),
     )?;
-    Ok(db.connect()?)
+    Ok(db.connect(ConnectOpts::new())?)
 }
 
 #[turso_macros::test]
@@ -278,6 +278,40 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
         "SELECT x FROM aux.t INDEXED BY t_x"
     ))
     .is_equal_to(vec![row![2]]);
+    Ok(())
+}
+
+/// VACUUM INTO an empty file that is attached on the same connection must
+/// leave the attached schema usable, with or without tables in the copy.
+#[turso_macros::test]
+fn test_vacuum_into_attached_empty_file(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+
+    let empty_main_path = db.path.with_extension("vacuum_empty_main.db");
+    conn.execute(format!(
+        "ATTACH '{}' AS empty_copy",
+        empty_main_path.display()
+    ))?;
+    conn.execute("PRAGMA user_version = 3")?;
+    conn.execute(format!("VACUUM INTO '{}'", empty_main_path.display()))?;
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA empty_copy.user_version"))
+        .is_equal_to(vec![row![3]]);
+    conn.execute("CREATE TABLE empty_copy.u(y)")?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT count(*) FROM empty_copy.u"))
+        .is_equal_to(vec![row![0]]);
+
+    let aux_path = db.path.with_extension("vacuum_aux.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (5)")?;
+    conn.execute(format!("VACUUM INTO '{}'", aux_path.display()))?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT x FROM aux.t")).is_equal_to(vec![row![5]]);
+    conn.execute("INSERT INTO aux.t VALUES (6)")?;
+    assert_that!(limbo_exec_rows(&conn, "SELECT x FROM aux.t ORDER BY x"))
+        .is_equal_to(vec![row![5], row![6]]);
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA aux.integrity_check"))
+        .is_equal_to(vec![row!["ok"]]);
     Ok(())
 }
 
@@ -364,7 +398,7 @@ fn test_fresh_attach_inherits_mvcc_before_first_write(_tmp_db: TempDatabase) -> 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let aux_conn = aux_db.connect()?;
+    let aux_conn = aux_db.connect(ConnectOpts::new())?;
     assert!(aux_conn.mvcc_enabled());
 
     Ok(())
@@ -386,7 +420,7 @@ fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let aux_conn = aux_db.connect()?;
+    let aux_conn = aux_db.connect(ConnectOpts::new())?;
     aux_conn.execute("CREATE TABLE t(x INTEGER)")?;
 
     let err = conn
@@ -505,7 +539,7 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
                 durable_storage as Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
             ),
     )?;
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     conn.pragma_update("journal_mode", "'mvcc'")?;
 
     let err = conn
@@ -521,10 +555,8 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
 }
 
 #[turso_macros::test]
-fn test_attach_inherits_generated_columns_flag_on_reattach(
-    _tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
-    let db = attach_enabled_db(DatabaseOpts::new().with_generated_columns(true));
+fn test_attach_supports_generated_columns_on_reattach(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
     let conn = db.connect_limbo();
 
     let aux_path = db.path.with_extension("attach_generated_columns.db");
@@ -878,7 +910,7 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
         Arc::new(SqliteDialect),
     )?;
 
-    let conn = db.connect()?;
+    let conn = db.connect(ConnectOpts::new())?;
     conn.execute("ATTACH 'queued-attach-lock-aux.db' AS aux1")?;
     conn.execute("CREATE TABLE main_t (x INTEGER)")?;
     conn.execute("INSERT INTO main_t VALUES (1)")?;
@@ -892,7 +924,7 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
     // next attached read transaction sees the database as changed, drops its
     // cached pages and cached schema cookie, and must re-read the header page
     // from disk inside its attached Transaction opcode.
-    let conn2 = db.connect()?;
+    let conn2 = db.connect(ConnectOpts::new())?;
     conn2.execute("ATTACH 'queued-attach-lock-aux.db' AS aux1")?;
     conn2.execute("INSERT INTO aux1.t VALUES (2)")?;
 

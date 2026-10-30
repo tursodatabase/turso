@@ -12,6 +12,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # With CI set, the Makefiles build tursodb, tursopg and the test runner
+  # with --release, which uses thin LTO. These are test tools, not shipped
+  # binaries: they stay optimized without LTO and build faster. Set for the
+  # whole workflow so the later `cargo run --release` reuses the same build.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
 jobs:
   sqltest-check:
@@ -23,6 +29,7 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build test runner
         run: make -C sqlite/conformance build-runner
       - name: Check test syntax
@@ -30,7 +37,7 @@ jobs:
       - name: Check pg test syntax
         run: make -C postgres/conformance check
 
-  sqltest-run-cli:
+  sqltest-cli:
     name: Run SQL tests (CLI backend)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
@@ -39,6 +46,7 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: "./.github/shared/install_sqlite"
       - name: Build tursodb
         run: make -C sqlite/conformance build-tursodb
@@ -49,7 +57,7 @@ jobs:
       - name: Run tests (MVCC)
         run: make -C sqlite/conformance run-cli MVCC=1
 
-  sqltest-run-rust:
+  sqltest-rust:
     name: Run SQL tests (Rust backend)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
@@ -58,6 +66,7 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build test runner
         run: make -C sqlite/conformance build-runner
       - name: Run tests
@@ -65,18 +74,31 @@ jobs:
       - name: Run tests (MVCC)
         run: make -C sqlite/conformance run-rust MVCC=1
 
-  sqltest-run-js:
-    name: Run SQL tests (JS backend)
+  sqltest-js:
+    name: Run SQL tests (JS backend, ${{ matrix.mode }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    # The normal and MVCC passes run on separate machines at the same time.
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [default, mvcc]
+    # napi-build uses the release-official profile (full LTO, one codegen
+    # unit) meant for published packages. These tests only need a working
+    # binding, so turn off LTO to build it faster.
+    env:
+      CARGO_PROFILE_RELEASE_OFFICIAL_LTO: "false"
+      CARGO_PROFILE_RELEASE_OFFICIAL_CODEGEN_UNITS: "16"
     defaults:
       run:
         working-directory: bindings/javascript
     steps:
       - uses: actions/checkout@v4
+      # Both modes build the same things and share this key; one saves.
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.mode == 'default' }}
       - name: Setup node
         uses: useblacksmith/setup-node@v5
         with:
@@ -93,14 +115,16 @@ jobs:
         working-directory: sqlite/conformance
         run: make build-runner
       - name: Run tests
+        if: matrix.mode == 'default'
         working-directory: sqlite/conformance
         run: make run-js
       - name: Run tests (MVCC)
+        if: matrix.mode == 'mvcc'
         working-directory: sqlite/conformance
         run: make run-js MVCC=1
 
-  sqltest-run-pg:
-    name: Run SQL tests (pg backend)
+  sqltest-tursopg:
+    name: Run SQL tests (tursopg backend)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -108,12 +132,64 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build tursopg
         run: make -C postgres/conformance build-tursopg
       - name: Build test runner
         run: make -C postgres/conformance build-runner
       - name: Run tests
         run: make -C postgres/conformance run
+
+  sqltest-postgres:
+    name: Run SQL tests (PostgreSQL)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build test runner
+        run: make -C postgres/conformance build-runner
+      - name: Run tests against PostgreSQL
+        run: make -C postgres/conformance run-postgres
+
+  pg-dump-fuzzer:
+    name: PostgreSQL dump differential fuzzer
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install PostgreSQL 18 clients
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error --location \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-18
+          echo '/usr/lib/postgresql/18/bin' >> "$GITHUB_PATH"
+      - name: Check fuzzer and comparison logic
+        run: cargo test --locked --profile pg-dump-fuzzer -p turso_pg_dump_fuzzer
+      - name: Compare generated PostgreSQL and Turso dumps
+        env:
+          POSTGRES_VERSION: "18"
+        run: make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast'
+      - name: Upload generation report and failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-dump-fuzzer-results
+          path: postgres/conformance/pgdump/results/
+          if-no-files-found: ignore
+          retention-days: 1
 
   sqltest-sqlite:
     name: Run SQL tests (SQLite)
@@ -124,6 +200,7 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: "./.github/shared/install_sqlite"
       - name: Build test runner
         run: make -C sqlite/conformance build-runner

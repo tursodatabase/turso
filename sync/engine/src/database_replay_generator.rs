@@ -1013,6 +1013,7 @@ mod tests {
     use crate::database_tape::DatabaseReplaySessionOpts;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
+    use turso_core::ConnectOpts;
     use turso_core::SqliteDialect;
 
     enum QueryKind {
@@ -1035,7 +1036,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         for stmt in ddl {
             conn.execute(stmt).unwrap();
         }
@@ -1163,7 +1164,7 @@ mod tests {
         )
         .unwrap();
         let generator = DatabaseReplayGenerator::new(
-            db.connect().unwrap(),
+            db.connect(ConnectOpts::new()).unwrap(),
             DatabaseReplaySessionOpts {
                 use_implicit_rowid: false,
             },
@@ -1208,7 +1209,7 @@ mod tests {
         )
         .unwrap();
         let generator = DatabaseReplayGenerator::new(
-            db.connect().unwrap(),
+            db.connect(ConnectOpts::new()).unwrap(),
             DatabaseReplaySessionOpts {
                 use_implicit_rowid: false,
             },

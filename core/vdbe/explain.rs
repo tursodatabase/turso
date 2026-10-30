@@ -1,9 +1,10 @@
+use crate::translate::collate::CollationSeq;
 use crate::vdbe::{
     builder::CursorType,
     insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
 use crate::HashSet;
-use turso_parser::ast::{ResolveType, SortOrder};
+use turso_parser::ast::SortOrder;
 
 use super::{Insn, InsnReference, PreparedProgram, Value};
 use crate::function::{Func, ScalarFunc};
@@ -27,6 +28,8 @@ pub struct ExplainInfo {
     /// Shared CTEs materialized before the main query, for `EXPLAIN QUERY PLAN`
     /// consumers. Empty outside `EXPLAIN QUERY PLAN` mode.
     pub cte_materializations: Vec<EqpCteMaterialization>,
+    /// Cursor IDs opened as ephemeral (OpenEphemeral / OpenAutoindex / OpenDup).
+    pub ephemeral_cursors: HashSet<usize>,
 }
 
 impl ExplainInfo {
@@ -35,6 +38,24 @@ impl ExplainInfo {
             .iter()
             .find(|(offset, _)| *offset == insn_index)
             .map(|(_, comment)| *comment)
+    }
+
+    pub(crate) fn build_ephemeral_cursors(&mut self, insns: &[(Insn, usize)]) {
+        self.ephemeral_cursors.clear();
+        for (insn, _) in insns {
+            match insn {
+                Insn::OpenEphemeral { cursor_id, .. } => {
+                    self.ephemeral_cursors.insert(*cursor_id);
+                }
+                Insn::OpenAutoindex { cursor_id } => {
+                    self.ephemeral_cursors.insert(*cursor_id);
+                }
+                Insn::OpenDup { new_cursor_id, .. } => {
+                    self.ephemeral_cursors.insert(*new_cursor_id);
+                }
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn remap_insn_indices(&mut self, old_to_new: &[usize]) {
@@ -53,22 +74,7 @@ pub fn insn_to_row(
     program: &PreparedProgram,
     insn: &Insn,
 ) -> (&'static str, i64, i64, i64, Value, i64, String) {
-    let mut ephemeral_cursors = HashSet::default();
-    for (insn, _) in &program.insns {
-        match insn {
-            Insn::OpenEphemeral { cursor_id, .. } => {
-                ephemeral_cursors.insert(*cursor_id);
-            }
-            Insn::OpenAutoindex { cursor_id } => {
-                ephemeral_cursors.insert(*cursor_id);
-            }
-            Insn::OpenDup { new_cursor_id, .. } => {
-                // Note: relies on invariant that OpenDup is only for ephemeral cursors
-                ephemeral_cursors.insert(*new_cursor_id);
-            }
-            _ => {}
-        }
-    }
+    let ephemeral_cursors = &program.explain.ephemeral_cursors;
 
     let get_table_or_index_name = |cursor_id: usize| -> String {
         let cursor_type = &program.cursor_ref[cursor_id].1;
@@ -79,6 +85,7 @@ pub fn insn_to_row(
             CursorType::Pseudo(_) => "pseudo",
             CursorType::VirtualTable(virtual_table) => virtual_table.name.as_str(),
             CursorType::MaterializedView(table, _) => table.name.as_str(),
+            CursorType::ViewDelta { view_name, .. } => view_name.as_str(),
             CursorType::Sorter => "sorter",
         };
         if ephemeral_cursors.contains(&cursor_id) {
@@ -309,7 +316,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]==r[{}] goto {}",
@@ -329,7 +336,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]!=r[{}] goto {}",
@@ -349,7 +356,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!("if r[{}]<r[{}] goto {}", lhs, rhs, target_pc.as_debug_int()),
             ),
@@ -364,7 +371,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]<=r[{}] goto {}",
@@ -384,7 +391,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!("if r[{}]>r[{}] goto {}", lhs, rhs, target_pc.as_debug_int()),
             ),
@@ -399,7 +406,7 @@ pub fn insn_to_row(
                 *lhs as i64,
                 *rhs as i64,
                 target_pc.as_debug_int() as i64,
-                Value::build_text(collation.map_or("".to_string(), |c| c.to_string())),
+                Value::build_text(collation.to_string()),
                 0,
                 format!(
                     "if r[{}]>=r[{}] goto {}",
@@ -643,6 +650,10 @@ pub fn insn_to_row(
                     CursorType::MaterializedView(table, _) => {
                         let name = table.columns().get(*column).and_then(|v| v.name.as_ref());
                         name
+                    }
+                    CursorType::ViewDelta { table, .. } => {
+                        // The trailing weight column has no schema entry.
+                        table.columns().get(*column).and_then(|v| v.name.as_ref())
                     }
                     CursorType::Pseudo(_) => None,
                     CursorType::Sorter => None,
@@ -1015,20 +1026,13 @@ pub fn insn_to_row(
                 description,
                 on_error,
                 description_reg,
+                ..
             } => {
-                let p2 = match on_error {
-                    Some(ResolveType::Rollback) => 1,
-                    Some(ResolveType::Abort) => 2,
-                    Some(ResolveType::Fail) => 3,
-                    Some(ResolveType::Ignore) => 4,
-                    Some(ResolveType::Replace) => 5,
-                    None => 0,
-                };
                 let p3 = description_reg.unwrap_or(0) as i64;
                 (
                     "Halt",
                     *err_code as i64,
-                    p2,
+                    on_error.map_or(0, |rt| rt.bit_value() as i64),
                     p3,
                     Value::build_text(description.clone()),
                     0,
@@ -1039,10 +1043,12 @@ pub fn insn_to_row(
                 err_code,
                 target_reg,
                 description,
+                on_error,
+                ..
             } => (
                 "HaltIfNull",
                 *err_code as i64,
-                0,
+                on_error.map_or(0, |rt| rt.bit_value() as i64),
                 *target_reg as i64,
                 Value::build_text(description.clone()),
                 0,
@@ -1381,9 +1387,10 @@ pub fn insn_to_row(
                 0,
                 data.col as i64,
                 data.acc_reg as i64,
-                Value::build_text(match &data.collation {
-                    Some(collation) => format!("{}({collation})", data.func.as_str()),
-                    None => data.func.as_str().to_string(),
+                Value::build_text(if data.func.compares_values() {
+                    format!("{}({})", data.func.as_str(), data.collation)
+                } else {
+                    data.func.as_str().to_string()
                 }),
                 0,
                 format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
@@ -1425,6 +1432,52 @@ pub fn insn_to_row(
                 0,
                 format!("accum=r[{}] dest=r[{}]", *acc_reg, *dest_reg),
             ),
+            Insn::AggContextLoad {
+                acc_reg,
+                payload_start_reg,
+                func,
+            } => (
+                "AggContextLoad",
+                *acc_reg as i64,
+                *payload_start_reg as i64,
+                0,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] state=r[{}..]", *acc_reg, *payload_start_reg),
+            ),
+            Insn::AggContextStore { acc_reg, payload_start_reg, func } => (
+                "AggContextStore",
+                *acc_reg as i64,
+                *payload_start_reg as i64,
+                0,
+                Value::build_text(func.as_str()),
+                0,
+                format!("accum=r[{}] state=r[{}..]", *acc_reg, *payload_start_reg),
+            ),
+            Insn::IvmSumStep { data } => (
+                "IvmSumStep",
+                data.arg_reg as i64,
+                data.weight_reg as i64,
+                data.int_wrapped_reg as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "state=r[{}..] += r[{}] * r[{}]",
+                    data.int_wrapped_reg, data.arg_reg, data.weight_reg
+                ),
+            ),
+            Insn::IvmSumFinalize { data } => (
+                "IvmSumFinalize",
+                data.kind as i64,
+                data.int_wrapped_reg as i64,
+                data.dest_reg as i64,
+                Value::build_text(""),
+                0,
+                format!(
+                    "{:?} state=r[{}..] dest=r[{}]",
+                    data.kind, data.int_wrapped_reg, data.dest_reg
+                ),
+            ),
             Insn::SorterOpen { data } => {
                 let SorterOpenData {
                     cursor_id,
@@ -1439,10 +1492,9 @@ pub fn insn_to_row(
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
-                        let coll_str = if let Some(coll) = collation {
-                            format!("{sign}{coll}")
-                        } else {
-                            format!("{sign}B")
+                        let coll_str = match collation {
+                            CollationSeq::Binary => format!("{sign}B"),
+                            coll => format!("{sign}{coll}"),
                         };
                         match nulls {
                             Some(turso_parser::ast::NullsOrder::First) => format!("{coll_str} NF"),
@@ -1693,6 +1745,14 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::GetSubtype { src_reg, dest_reg } => (
+                "GetSubtype", *src_reg as i64, *dest_reg as i64, 0,
+                Value::build_text(""), 0, "".to_string(),
+            ),
+            Insn::SetSubtype { subtype_reg, dest_reg } => (
+                "SetSubtype", *subtype_reg as i64, *dest_reg as i64, 0,
+                Value::build_text(""), 0, "".to_string(),
+            ),
             Insn::SoftNull { reg } => (
                 "SoftNull",
                 *reg as i64,
@@ -1862,6 +1922,7 @@ pub fn insn_to_row(
             ),
             Insn::DropTable {
                 db,
+                namespace: _,
                 _p2,
                 _p3,
                 table_name,
@@ -1874,7 +1935,11 @@ pub fn insn_to_row(
                 0,
                 format!("DROP TABLE {table_name}"),
             ),
-            Insn::DropTrigger { db, trigger_name } => (
+            Insn::DropTrigger {
+                db,
+                namespace: _,
+                trigger_name,
+            } => (
                 "DropTrigger",
                 *db as i64,
                 0,
@@ -1901,7 +1966,11 @@ pub fn insn_to_row(
                 0,
                 format!("ADD SEQUENCE {}", data.name),
             ),
-            Insn::DropSequence { db, seq_name } => (
+            Insn::DropSequence {
+                db,
+                namespace: _,
+                seq_name,
+            } => (
                 "DropSequence",
                 *db as i64,
                 0,
@@ -1910,9 +1979,32 @@ pub fn insn_to_row(
                 0,
                 format!("DROP SEQUENCE {seq_name}"),
             ),
+            Insn::AddNamespace {
+                db,
+                namespace,
+                name,
+            } => (
+                "AddNamespace",
+                *db as i64,
+                i64::from(namespace.as_u32()),
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("CREATE SCHEMA {name} id={}", namespace.as_u32()),
+            ),
+            Insn::DropNamespace { db, namespace } => (
+                "DropNamespace",
+                *db as i64,
+                i64::from(namespace.as_u32()),
+                0,
+                Value::Null,
+                0,
+                format!("DROP SCHEMA id={}", namespace.as_u32()),
+            ),
             Insn::SequenceComputeNext {
                 db,
-                seq_name_reg,
+                namespace: _,
+                seq_name,
                 in_value_reg,
                 in_is_called_reg,
                 was_empty_reg,
@@ -1920,53 +2012,57 @@ pub fn insn_to_row(
             } => (
                 "SequenceComputeNext",
                 *db as i64,
-                *seq_name_reg as i64,
+                0,
                 *out_value_reg as i64,
-                Value::Null,
+                Value::build_text(seq_name.clone()),
                 0,
                 format!(
                     "r[{out_value_reg}] = next(r[{in_value_reg}], is_called=r[{in_is_called_reg}], empty=r[{was_empty_reg}])"
                 ),
             ),
             Insn::SetSequenceCurrval {
-                seq_name_reg,
+                db,
+                namespace: _,
+                seq_name,
                 value_reg,
             } => (
                 "SetSequenceCurrval",
-                0,
-                *seq_name_reg as i64,
+                *db as i64,
                 *value_reg as i64,
-                Value::Null,
                 0,
-                format!("currval(r[{seq_name_reg}]) = r[{value_reg}]"),
+                Value::build_text(seq_name.clone()),
+                0,
+                format!("currval({seq_name}) = r[{value_reg}]"),
             ),
             Insn::SequenceTrackAllocation {
                 db,
-                seq_name_reg,
+                namespace: _,
+                seq_name,
                 value_reg,
             } => (
                 "SequenceTrackAllocation",
                 *db as i64,
-                *seq_name_reg as i64,
-                *value_reg as i64,
-                Value::Null,
                 0,
-                format!("track sequence allocation r[{seq_name_reg}] = r[{value_reg}]"),
+                *value_reg as i64,
+                Value::build_text(seq_name.clone()),
+                0,
+                format!("track sequence allocation {seq_name} = r[{value_reg}]"),
             ),
             Insn::SequenceRegisterAllocation {
                 db,
-                seq_name_reg,
+                namespace: _,
+                seq_name,
                 value_reg,
                 saved_outer_reg,
             } => (
                 "SequenceRegisterAllocation",
                 *db as i64,
-                *seq_name_reg as i64,
+                0,
                 *value_reg as i64,
-                Value::Null,
+                Value::build_text(seq_name.clone()),
                 0,
                 format!(
-                    "register allocation r[{seq_name_reg}] = r[{value_reg}] \
+                    "register allocation {seq_name} = r[{value_reg}] \
                      against outer mv_tx r[{saved_outer_reg}]"
                 ),
             ),
@@ -2010,7 +2106,11 @@ pub fn insn_to_row(
                 0,
                 "ADD TYPE".to_string(),
             ),
-            Insn::DropView { db, view_name } => (
+            Insn::DropView {
+                db,
+                namespace: _,
+                view_name,
+            } => (
                 "DropView",
                 *db as i64,
                 0,
@@ -2019,7 +2119,11 @@ pub fn insn_to_row(
                 0,
                 format!("DROP VIEW {view_name}"),
             ),
-            Insn::DropIndex { db: _, index } => (
+            Insn::DropIndex {
+                db: _,
+                namespace: _,
+                index,
+            } => (
                 "DropIndex",
                 0,
                 0,
@@ -2240,14 +2344,19 @@ pub fn insn_to_row(
             Insn::AutoCommit {
                 auto_commit,
                 rollback,
+                concurrent,
             } => (
                 "AutoCommit",
                 *auto_commit as i64,
                 *rollback as i64,
-                0,
+                *concurrent as i64,
                 Value::build_text(""),
                 0,
-                format!("auto_commit={auto_commit}, rollback={rollback}"),
+                if *concurrent {
+                    format!("auto_commit={auto_commit}, rollback={rollback}, concurrent=true")
+                } else {
+                    format!("auto_commit={auto_commit}, rollback={rollback}")
+                },
             ),
             Insn::Savepoint { op, name } => (
                 "Savepoint",
@@ -2440,7 +2549,12 @@ pub fn insn_to_row(
                 0,
                 format!("affinity(r[{}]={:?})", *reg, affinity),
             ),
-            Insn::RenameTable { db: _, from, to } => (
+            Insn::RenameTable {
+                db: _,
+                namespace: _,
+                from,
+                to,
+            } => (
                 "RenameTable",
                 0,
                 0,
@@ -2449,7 +2563,12 @@ pub fn insn_to_row(
                 0,
                 format!("rename_table({from}, {to})"),
             ),
-            Insn::DropColumn { db: _, table, column_index } => (
+            Insn::DropColumn {
+                db: _,
+                namespace: _,
+                table,
+                column_index,
+            } => (
                 "DropColumn",
                 0,
                 0,
@@ -2467,14 +2586,17 @@ pub fn insn_to_row(
                 0,
                 format!("add_column({}, {:?})", data.table, data.column),
             ),
-            Insn::AlterColumn { db: _, table, column_index, definition: column, rename } => (
+            Insn::AlterColumn { data } => (
                 "AlterColumn",
                 0,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("alter_column({table}, {column_index}, {column:?}, {rename:?})"),
+                format!(
+                    "alter_column({}, {}, {:?}, {:?})",
+                    data.table, data.column_index, data.definition, data.rename
+                ),
             ),
             Insn::MaxPgcnt { db, dest, new_max } => (
                 "MaxPgcnt",
@@ -2540,7 +2662,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::FkCounter{increment_value, deferred } => (
+        Insn::FkCounter{increment_value, deferred, .. } => (
         "FkCounter",
             *increment_value as i64,
             *deferred as i64,
@@ -2660,8 +2782,8 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashResetMatched { hash_table_id } => (
-            "HashResetMatched",
+        Insn::HashProbeInit { hash_table_id } => (
+            "HashProbeInit",
             *hash_table_id as i64,
             0,
             0,
@@ -2745,14 +2867,14 @@ pub fn insn_to_row(
                 format!("hash_table_id={hash_table_id}"),
             )
         },
-        Insn::VacuumInto { schema_name, dest_path } => (
+        Insn::VacuumInto { schema_name, dest_reg } => (
             "VacuumInto",
             0,
+            *dest_reg as i64,
             0,
+            Value::build_text(""),
             0,
-            Value::build_text(dest_path.to_string()),
-            0,
-            format!("schema={schema_name}, dest={dest_path}"),
+            format!("schema={schema_name}, dest=r[{dest_reg}]"),
         ),
         Insn::Vacuum { db } => (
             "Vacuum",

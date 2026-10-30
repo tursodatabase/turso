@@ -275,14 +275,15 @@ expect {
     300
 }
 
-@skip-if sqlite "sqlite supports ORDER BY in aggregate functions"
 @cross-check-integrity
-test view-rejects-aggregate-order-by {
+test view-aggregate-order-by {
     CREATE TABLE t(val INT);
-    CREATE VIEW v AS SELECT SUM(val ORDER BY val) FROM t;
+    INSERT INTO t VALUES (3),(1),(2);
+    CREATE VIEW v AS SELECT group_concat(val ORDER BY val) AS ordered FROM t;
+    SELECT * FROM v;
 }
-expect error {
-    ORDER BY clause is not supported yet in aggregate functions
+expect {
+    1,2,3
 }
 
 test view-self-circle-detection {
@@ -355,6 +356,51 @@ test view-quoted-column-list {
 }
 expect {
     4
+}
+
+@cross-check-integrity
+test view-column-list-renames-star {
+    CREATE TABLE t_vs(x INTEGER);
+    INSERT INTO t_vs VALUES (1);
+    CREATE VIEW v_vs(y) AS SELECT * FROM t_vs;
+    SELECT y FROM v_vs;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test view-column-list-renames-table-star {
+    CREATE TABLE t_vts1(x INTEGER);
+    CREATE TABLE t_vts2(x INTEGER, z INTEGER);
+    INSERT INTO t_vts1 VALUES (1);
+    INSERT INTO t_vts2 VALUES (2, 3);
+    CREATE VIEW v_vts(a, b, c, d) AS SELECT t_vts1.*, t_vts2.*, 4 FROM t_vts1, t_vts2;
+    SELECT d, c, b, a FROM v_vts WHERE a = 1;
+}
+expect {
+    4|3|2|1
+}
+
+@cross-check-integrity
+test view-column-list-renames-values {
+    CREATE VIEW v_vv(a, b) AS VALUES (1, 2);
+    SELECT b, a FROM v_vv;
+}
+expect {
+    2|1
+}
+
+@cross-check-integrity
+test view-column-list-renames-compound {
+    CREATE TABLE t_vc(x INTEGER);
+    INSERT INTO t_vc VALUES (1);
+    CREATE VIEW v_vc(a) AS SELECT * FROM t_vc UNION ALL SELECT 2;
+    SELECT a FROM v_vc ORDER BY a;
+}
+expect {
+    1
+    2
 }
 
 @cross-check-integrity
@@ -443,4 +489,64 @@ test view-star-does-not-inherit-source-primary-key {
 expect {
     id|0
     value|0
+}
+
+test view-rejects-ordered-window-direct {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS SELECT group_concat(val ORDER BY val) OVER () FROM t;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test view-rejects-ordered-window-scalar-subquery {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS SELECT (SELECT group_concat(val ORDER BY val) OVER () FROM t);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test view-rejects-ordered-window-from-subquery {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS SELECT * FROM (SELECT group_concat(val ORDER BY val) OVER () FROM t);
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test view-rejects-ordered-window-cte {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS WITH c AS (SELECT group_concat(val ORDER BY val) OVER () FROM t) SELECT * FROM c;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test view-rejects-ordered-window-compound {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS SELECT val FROM t UNION ALL SELECT group_concat(val ORDER BY val) OVER () FROM t;
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+test view-rejects-ordered-window-named-window {
+    CREATE TABLE t(val INT);
+    CREATE VIEW invalid_view AS SELECT group_concat(val ORDER BY val) OVER w FROM t WINDOW w AS ();
+}
+expect error {
+    ORDER BY may not be used with non-aggregate group_concat()
+}
+
+@cross-check-integrity
+test view-window-without-aggregate-order-by {
+    CREATE TABLE t(val INT);
+    INSERT INTO t VALUES (2),(1);
+    CREATE VIEW valid_window AS SELECT val, sum(val) OVER (ORDER BY val) AS total FROM t;
+    SELECT * FROM valid_window ORDER BY val;
+}
+expect {
+    1|1
+    2|3
 }

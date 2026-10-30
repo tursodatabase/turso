@@ -1,388 +1,268 @@
-use crate::numeric::Numeric;
+#[cfg(test)]
+use crate::alloc::TursoIteratorExt;
+#[cfg(test)]
+use crate::incremental::view::ViewChangeSubscription;
+use crate::storage::btree::{BTreeKey, CursorStep, CursorTrait, SavePositionResult};
 use crate::sync::Arc;
-use crate::sync::Mutex;
-use crate::types::IOResultOr;
+use crate::types::{IOResultOr, ImmutableRecord, IndexInfo};
 use crate::{
-    incremental::{
-        compiler::{DeltaSet, ExecuteState},
-        dbsp::{Delta, HashableRow, RowKeyZSet},
-        view::{IncrementalView, ViewTransactionState},
-    },
     return_if_io,
-    storage::btree::CursorTrait,
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
-    LimboError, Pager, Result,
+    LimboError, Pager, Register,
 };
 
-/// State machine for seek operations
-#[derive(Debug)]
-enum SeekState {
-    /// Initial state before seeking
-    Init,
-
-    /// Actively seeking with btree and uncommitted iterators
-    Seek {
-        /// The row we are trying to find
-        target: i64,
-    },
-
-    /// Btree seek returned TryAdvance, now advancing with next()/prev()
-    Advancing {
-        /// The row we are trying to find
-        target: i64,
-        /// The seek operation (determines direction of advance)
-        op: SeekOp,
-    },
-
-    /// Seek completed successfully
-    Done,
-}
-
-/// Cursor for reading materialized views that combines:
-/// 1. Persistent btree data (committed state)
-/// 2. Transaction-specific DBSP deltas (uncommitted changes)
+/// Read cursor for a transactionally maintained materialized-view btree.
 ///
-/// Works like a regular table cursor - reads from disk on-demand
-/// and overlays transaction changes as needed.
+/// The view btree is an ordinary table btree whose records hold the view's
+/// columns followed by the row's weight, so every read goes straight to the
+/// btree cursor and the VDBE treats this cursor like any table cursor. The
+/// one extra duty is running pending view maintenance before the cursor is
+/// positioned: a read from inside a still-running write statement (for
+/// example a trigger) must see that statement's earlier writes.
 pub struct MaterializedViewCursor {
-    // Core components
     btree_cursor: Box<dyn CursorTrait>,
-    view: Arc<Mutex<IncrementalView>>,
     pager: Arc<Pager>,
+    connection: Arc<crate::Connection>,
 
-    // Current changes that are uncommitted
-    uncommitted: RowKeyZSet,
+    // The transaction-wide change-log revision this cursor has applied.
+    // This must be global rather than the direct view subscription revision so
+    // reads through a chain of materialized views see base changes before
+    // commit scheduling has produced the downstream delta.
+    last_change_log_revision: u64,
 
-    // Reference to shared transaction state for this specific view - shared with Connection
-    tx_state: Arc<ViewTransactionState>,
-
-    // The transaction state always grows. It never gets reduced. That is in the very nature of
-    // DBSP, because deletions are just appends with weight < 0. So we will use the length of the
-    // state to check if we have to recompute the transaction state
-    last_tx_state_len: usize,
-
-    // Current row cache - only cache the current row we're looking at
-    current_row: Option<(i64, Vec<Value>)>,
-
-    // Execution state for circuit processing
-    execute_state: ExecuteState,
-
-    // State machine for seek operations
-    seek_state: SeekState,
+    // In-progress maintenance batch, parked across I/O yields when a view is
+    // read before its enclosing write statement reaches Halt.
+    view_delta_state: crate::vdbe::ViewDeltaApplyState,
 }
 
 impl MaterializedViewCursor {
     pub fn new(
         btree_cursor: Box<dyn CursorTrait>,
-        view: Arc<Mutex<IncrementalView>>,
         pager: Arc<Pager>,
-        tx_state: Arc<ViewTransactionState>,
-    ) -> Result<Self> {
-        Ok(Self {
+        connection: Arc<crate::Connection>,
+    ) -> Self {
+        Self {
             btree_cursor,
-            view,
             pager,
-            uncommitted: RowKeyZSet::new(),
-            tx_state,
-            last_tx_state_len: 0,
-            current_row: None,
-            execute_state: ExecuteState::Uninitialized,
-            seek_state: SeekState::Init,
-        })
+            connection,
+            last_change_log_revision: 0,
+            view_delta_state: crate::vdbe::ViewDeltaApplyState::NotStarted,
+        }
     }
 
-    /// Compute transaction changes lazily on first access
+    /// Apply pending transaction changes before reading the view.
+    ///
+    /// This invokes the same dependency-ordered maintenance programs used at
+    /// statement completion and commit. It exists for reads reached from
+    /// inside a still-running write statement; ordinary later statements see
+    /// an already-maintained btree and take the fast path.
     fn ensure_tx_changes_computed(&mut self) -> IOResultOr<()> {
-        // Check if we've already processed the current state
-        let current_len = self.tx_state.len();
-        if current_len == self.last_tx_state_len {
+        let current_revision = self.connection.transaction_changes.change_revision();
+        if current_revision == self.last_change_log_revision {
             return Ok(IOResult::Done(()));
         }
 
-        // Get the view and the current transaction state
-        let mut view_guard = self.view.lock();
-        let table_deltas = self.tx_state.get_table_deltas();
-
-        // Process the deltas through the circuit to get materialized changes
-        let mut uncommitted = DeltaSet::new();
-        for (table_name, delta) in table_deltas {
-            uncommitted.insert(table_name, delta);
-        }
-
-        let processed_delta = return_if_io!(view_guard.execute_with_uncommitted(
-            uncommitted,
-            self.pager.clone(),
-            &mut self.execute_state
-        ));
-
-        self.uncommitted = RowKeyZSet::from_delta(&processed_delta);
-        self.last_tx_state_len = current_len;
-        Ok(IOResult::Done(()))
-    }
-
-    // Read the current btree entry as a vector (empty if no current position)
-    fn read_btree_delta_entry(&mut self) -> IOResultOr<Vec<(HashableRow, isize)>> {
-        let btree_rowid = return_if_io!(self.btree_cursor.rowid());
-        let rowid = match btree_rowid {
-            None => return Ok(IOResult::Done(Vec::new())),
-            Some(rowid) => rowid,
-        };
-
-        let btree_record = return_if_io!(self.btree_cursor.record()).ok_or_else(|| {
-            crate::LimboError::InternalError(
-                "Invalid data in materialized view: found a rowid, but not the row!".to_string(),
-            )
-        })?;
-        let mut btree_values = btree_record.get_values_owned()?;
-
-        // The last column should be the weight
-        let weight_value = btree_values.pop().ok_or_else(|| {
-            crate::LimboError::InternalError(
-                "Invalid data in materialized view: no weight column found".to_string(),
-            )
-        })?;
-
-        // Convert the Value to isize weight
-        let weight = match weight_value {
-            Value::Numeric(Numeric::Integer(w)) => w as isize,
-            _ => {
-                return Err(crate::LimboError::InternalError(format!(
-                    "Invalid data in materialized view: expected integer weight, found {weight_value:?}"
-                )).into())
-            }
-        };
-
-        if weight <= 0 {
-            return Err(crate::LimboError::InternalError(format!(
-                "Invalid data in materialized view: expected a positive weight, found {weight}"
-            ))
-            .into());
-        }
-
-        // TODO: std boundary conversion; adjust once incremental uses the
-        // allocator with fallible allocations everywhere.
-        Ok(IOResult::Done(vec![(
-            HashableRow::new(rowid, btree_values.into_iter().collect()),
-            weight,
-        )]))
-    }
-
-    /// Process btree changes: merge with uncommitted, build zset, and determine result.
-    /// Returns the next state action: either Done with a result, or updates seek_state for another iteration.
-    fn process_btree_changes(
-        &mut self,
-        target: i64,
-        target_rowid: i64,
-        op: SeekOp,
-        changes: Vec<(HashableRow, isize)>,
-    ) -> IOResultOr<()> {
-        let mut btree_entries = Delta { changes };
-        let changes = self.uncommitted.seek(target, op);
-
-        let uncommitted_entries = Delta { changes };
-        btree_entries.merge(&uncommitted_entries);
-
-        // if empty pre-zset, means nothing was found. Empty post-zset can mean that
-        // we just canceled weights.
-        if btree_entries.is_empty() {
-            self.seek_state = SeekState::Done;
-            return Ok(IOResult::Done(()));
-        }
-
-        let min_seen = btree_entries
-            .changes
-            .first()
-            .expect("cannot be empty, we just tested for it")
-            .0
-            .rowid;
-        let max_seen = btree_entries
-            .changes
-            .last()
-            .expect("cannot be empty, we just tested for it")
-            .0
-            .rowid;
-
-        let zset = RowKeyZSet::from_delta(&btree_entries);
-        let ret = zset.seek(target_rowid, op);
-
-        if !ret.is_empty() {
-            let (row, _) = &ret[0];
-            self.current_row = Some((row.rowid, row.values.clone()));
-            self.seek_state = SeekState::Done;
-            return Ok(IOResult::Done(()));
-        }
-
-        let new_target = match op {
-            SeekOp::GT => Some(max_seen),
-            SeekOp::GE { eq_only: false } => Some(max_seen + 1),
-            SeekOp::LT => Some(min_seen),
-            SeekOp::LE { eq_only: false } => Some(min_seen - 1),
-            SeekOp::LE { eq_only: true } | SeekOp::GE { eq_only: true } => None,
-        };
-
-        if let Some(target) = new_target {
-            self.seek_state = SeekState::Seek { target };
-        } else {
-            self.seek_state = SeekState::Done;
-        }
-        Ok(IOResult::Done(()))
-    }
-
-    /// Internal seek implementation that doesn't check preconditions
-    fn do_seek(&mut self, target_rowid: i64, op: SeekOp) -> IOResultOr<SeekResult> {
-        loop {
-            // Process state machine - need to handle mutable borrow carefully
-            match &mut self.seek_state {
-                SeekState::Init => {
-                    self.current_row = None;
-                    self.seek_state = SeekState::Seek {
-                        target: target_rowid,
-                    };
-                }
-                SeekState::Seek { target } => {
-                    let target = *target;
-                    let btree_result =
-                        return_if_io!(self.btree_cursor.seek(SeekKey::TableRowId(target), op));
-
-                    let changes = match btree_result {
-                        SeekResult::Found => return_if_io!(self.read_btree_delta_entry()),
-                        SeekResult::TryAdvance => {
-                            // Transition to Advancing state before calling next/prev.
-                            // This ensures that if next/prev returns IO, we resume in
-                            // Advancing state and don't redundantly call seek again.
-                            self.seek_state = SeekState::Advancing { target, op };
-                            continue;
-                        }
-                        SeekResult::NotFound => Vec::new(),
-                    };
-
-                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
-
-                    // Check if we're done or need to continue seeking
-                    if matches!(self.seek_state, SeekState::Done) {
-                        let result = if self.current_row.is_some() {
-                            SeekResult::Found
-                        } else {
-                            SeekResult::NotFound
-                        };
-                        return Ok(IOResult::Done(result));
-                    }
-                    // Otherwise state is Seek with new target, loop continues
-                }
-                SeekState::Advancing { target, op } => {
-                    let target = *target;
-                    let op = *op;
-
-                    // Cursor is positioned at the leaf but current entry doesn't match.
-                    // Advance in the appropriate direction to find the next matching entry.
-                    match op {
-                        SeekOp::GT | SeekOp::GE { .. } => {
-                            return_if_io!(self.btree_cursor.next())
-                        }
-                        SeekOp::LT | SeekOp::LE { .. } => {
-                            return_if_io!(self.btree_cursor.prev())
-                        }
-                    };
-                    // read_btree_delta_entry handles the case where cursor is at end
-                    let changes = return_if_io!(self.read_btree_delta_entry());
-
-                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
-
-                    // Check if we're done or need to continue seeking
-                    if matches!(self.seek_state, SeekState::Done) {
-                        let result = if self.current_row.is_some() {
-                            SeekResult::Found
-                        } else {
-                            SeekResult::NotFound
-                        };
-                        return Ok(IOResult::Done(result));
-                    }
-                    // Otherwise state is Seek with new target, loop continues
-                }
-                SeekState::Done => {
-                    // We always return before setting the state to done. Meaning if we got here,
-                    // this is a new seek.
-                    self.seek_state = SeekState::Init;
-                }
+        match crate::vdbe::step_view_delta_batch(
+            &self.connection,
+            &mut self.view_delta_state,
+            false,
+            &self.pager,
+        )? {
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+            IOResult::Done(()) => {
+                self.view_delta_state = crate::vdbe::ViewDeltaApplyState::NotStarted;
+                self.last_change_log_revision =
+                    self.connection.transaction_changes.change_revision();
+                Ok(IOResult::Done(()))
             }
         }
     }
+}
 
-    pub fn seek(&mut self, key: SeekKey, op: SeekOp) -> IOResultOr<SeekResult> {
-        // Ensure transaction changes are computed
+/// Positioning methods first bring the view up to date; everything else is
+/// the btree cursor's own behavior. Writes go through the maintenance
+/// programs' own cursors, never through this one.
+impl CursorTrait for MaterializedViewCursor {
+    fn last(&mut self) -> IOResultOr<()> {
         return_if_io!(self.ensure_tx_changes_computed());
-
-        let target_rowid = match &key {
-            SeekKey::TableRowId(rowid) => *rowid,
-            SeekKey::IndexKey(_) => {
-                return Err(LimboError::ParseError(
-                    "Cannot search a materialized view with an index key".to_string(),
-                )
-                .into());
-            }
-        };
-
-        self.do_seek(target_rowid, op)
+        self.btree_cursor.last()
     }
 
-    pub fn next(&mut self) -> IOResultOr<bool> {
-        // If there's a pending seek operation (due to IO), complete it first.
-        // SeekState::Seek or SeekState::Advancing means IO was interrupted mid-seek and we need to resume.
-        // SeekState::Init means cursor was never positioned - don't resume, fall through to check current_row.
-        if matches!(
-            self.seek_state,
-            SeekState::Seek { .. } | SeekState::Advancing { .. }
-        ) {
-            // target is ignored when resuming
-            let result = return_if_io!(self.do_seek(0, SeekOp::GT));
-            return Ok(IOResult::Done(result == SeekResult::Found));
+    fn next(&mut self) -> IOResultOr<()> {
+        self.btree_cursor.next()
+    }
+
+    fn prev(&mut self) -> IOResultOr<()> {
+        self.btree_cursor.prev()
+    }
+
+    fn next_row(&mut self) -> CursorStep {
+        self.btree_cursor.next_row()
+    }
+
+    fn prev_row(&mut self) -> CursorStep {
+        self.btree_cursor.prev_row()
+    }
+
+    fn rowid(&mut self) -> IOResultOr<Option<i64>> {
+        self.btree_cursor.rowid()
+    }
+
+    fn note_external_row_write(&mut self, rowid: Option<i64>) {
+        self.btree_cursor.note_external_row_write(rowid)
+    }
+
+    fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>> {
+        self.btree_cursor.record()
+    }
+
+    fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
+        self.btree_cursor.record_payload()
+    }
+
+    fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        if matches!(key, SeekKey::IndexKey(_)) {
+            return Err(index_seek_error());
         }
-
-        // If cursor is not positioned (no current_row), return false
-        // This matches BTreeCursor behavior when valid_state == Invalid
-        let Some((current_rowid, _)) = &self.current_row else {
-            return Ok(IOResult::Done(false));
-        };
-
-        // Use GT to find the next row after current position
-        let result = return_if_io!(self.do_seek(*current_rowid, SeekOp::GT));
-        Ok(IOResult::Done(result == SeekResult::Found))
-    }
-
-    pub fn column(&mut self, col: usize) -> IOResultOr<Value> {
-        if let Some((_, ref values)) = self.current_row {
-            Ok(IOResult::Done(
-                values.get(col).cloned().unwrap_or(Value::Null),
-            ))
-        } else {
-            Ok(IOResult::Done(Value::Null))
-        }
-    }
-
-    pub fn rowid(&self) -> IOResultOr<Option<i64>> {
-        Ok(IOResult::Done(self.current_row.as_ref().map(|(id, _)| *id)))
-    }
-
-    pub fn rewind(&mut self) -> IOResultOr<()> {
         return_if_io!(self.ensure_tx_changes_computed());
-        // Seek GT from i64::MIN to find the first row using internal do_seek
-        let _result = return_if_io!(self.do_seek(i64::MIN, SeekOp::GT));
-        Ok(IOResult::Done(()))
+        self.btree_cursor.seek(key, op)
     }
 
-    pub fn is_valid(&self) -> Result<bool> {
-        Ok(self.current_row.is_some())
+    fn seek_unpacked(&mut self, _registers: &[Register], _op: SeekOp) -> IOResultOr<SeekResult> {
+        Err(index_seek_error())
     }
+
+    fn insert(&mut self, _key: &BTreeKey) -> IOResultOr<()> {
+        Err(read_only_error())
+    }
+
+    fn delete(&mut self) -> IOResultOr<()> {
+        Err(read_only_error())
+    }
+
+    fn set_null_flag(&mut self, flag: bool) {
+        self.btree_cursor.set_null_flag(flag)
+    }
+
+    fn get_null_flag(&self) -> bool {
+        self.btree_cursor.get_null_flag()
+    }
+
+    fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
+        return_if_io!(self.ensure_tx_changes_computed());
+        self.btree_cursor.exists(key)
+    }
+
+    fn clear_btree(&mut self) -> IOResultOr<u64> {
+        Err(read_only_error())
+    }
+
+    fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
+        Err(read_only_error())
+    }
+
+    fn count(&mut self) -> IOResultOr<usize> {
+        return_if_io!(self.ensure_tx_changes_computed());
+        self.btree_cursor.count()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.btree_cursor.is_empty()
+    }
+
+    fn root_page(&self) -> i64 {
+        self.btree_cursor.root_page()
+    }
+
+    fn rewind(&mut self) -> IOResultOr<()> {
+        return_if_io!(self.ensure_tx_changes_computed());
+        self.btree_cursor.rewind()
+    }
+
+    fn has_record(&self) -> bool {
+        self.btree_cursor.has_record()
+    }
+
+    fn set_has_record(&mut self, has_record: bool) {
+        self.btree_cursor.set_has_record(has_record)
+    }
+
+    fn index_info(&self) -> Option<&Arc<IndexInfo>> {
+        self.btree_cursor.index_info()
+    }
+
+    fn seek_end(&mut self) -> IOResultOr<()> {
+        Err(read_only_error())
+    }
+
+    fn seek_to_last(&mut self) -> IOResultOr<()> {
+        return_if_io!(self.ensure_tx_changes_computed());
+        self.btree_cursor.seek_to_last()
+    }
+
+    fn is_mvcc(&self) -> bool {
+        self.btree_cursor.is_mvcc()
+    }
+
+    fn invalidate_record(&mut self) {
+        self.btree_cursor.invalidate_record()
+    }
+
+    fn has_rowid(&self) -> bool {
+        self.btree_cursor.has_rowid()
+    }
+
+    fn get_pager(&self) -> Arc<Pager> {
+        self.btree_cursor.get_pager()
+    }
+
+    fn get_skip_advance(&self) -> bool {
+        self.btree_cursor.get_skip_advance()
+    }
+
+    fn invalidate_btree_cache(&mut self) {
+        self.btree_cursor.invalidate_btree_cache()
+    }
+
+    fn register_with_pager(&self) {
+        self.btree_cursor.register_with_pager()
+    }
+
+    fn recycle(self: Box<Self>) {
+        self.btree_cursor.recycle()
+    }
+
+    fn set_has_peers_for_external_writes(&self, has_peers: bool) {
+        self.btree_cursor
+            .set_has_peers_for_external_writes(has_peers)
+    }
+
+    fn try_save_position_for_external_balance(&mut self) -> IOResultOr<SavePositionResult> {
+        self.btree_cursor.try_save_position_for_external_balance()
+    }
+}
+
+fn index_seek_error() -> Box<LimboError> {
+    Box::new(LimboError::ParseError(
+        "Cannot search a materialized view with an index key".to_string(),
+    ))
+}
+
+fn read_only_error() -> Box<LimboError> {
+    Box::new(LimboError::InternalError(
+        "a materialized view cursor cannot write; maintenance writes the view".to_string(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespace::NamespaceId;
     use crate::storage::btree::BTreeCursor;
     use crate::sync::Arc;
     use crate::util::IOExt;
-    use crate::SqliteDialect;
-    use crate::{Connection, Database, OpenFlags};
+    use crate::{ConnectOpts, Connection, Database, OpenFlags};
+    use crate::{Result, SqliteDialect};
 
     /// Helper to create a test connection with a table and materialized view
     fn create_test_connection() -> Result<Arc<Connection>> {
@@ -401,16 +281,16 @@ mod tests {
                 enable_autovacuum: false,
                 enable_vacuum: false,
                 enable_attach: false,
-                enable_generated_columns: false,
                 enable_multiprocess_wal: false,
                 enable_without_rowid: false,
+                enable_mvcc: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
                 unsafe_testing: false,
             },
             None,
             Arc::new(SqliteDialect),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
 
         // Create a test table
         conn.execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, value INTEGER)")?;
@@ -426,14 +306,26 @@ mod tests {
         conn: &Arc<Connection>,
     ) -> Result<(
         MaterializedViewCursor,
-        Arc<ViewTransactionState>,
+        Arc<ViewChangeSubscription>,
+        Arc<Pager>,
+    )> {
+        create_view_cursor(conn, "test_view")
+    }
+
+    /// Helper to create a cursor for any materialized view over `test_table`
+    fn create_view_cursor(
+        conn: &Arc<Connection>,
+        view_name: &str,
+    ) -> Result<(
+        MaterializedViewCursor,
+        Arc<ViewChangeSubscription>,
         Arc<Pager>,
     )> {
         // Get the schema and view
         let view_mutex = conn
             .schema
             .read()
-            .get_materialized_view("test_view")
+            .get_materialized_view(NamespaceId::ROOT, view_name)
             .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
 
         // Get the view's root page
@@ -452,17 +344,63 @@ mod tests {
         let btree_cursor = Box::new(BTreeCursor::new(pager.clone(), root_page, num_columns));
 
         // Get or create transaction state for this view
-        let tx_state = conn.view_transaction_states.get_or_create("test_view");
+        let tx_state = conn.transaction_changes.view_subscription(view_name);
 
         // Create the materialized view cursor
-        let cursor = MaterializedViewCursor::new(
-            btree_cursor,
-            view_mutex.clone(),
-            pager.clone(),
-            tx_state.clone(),
-        )?;
+        let cursor = MaterializedViewCursor::new(btree_cursor, pager.clone(), conn.clone());
+        cursor.register_with_pager();
 
         Ok((cursor, tx_state, pager))
+    }
+
+    /// The row-at-a-time reads these tests use, built on the cursor's
+    /// `CursorTrait` methods.
+    trait ViewCursorTestExt {
+        fn seek_row(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult>;
+        fn step_to_next(&mut self) -> IOResultOr<bool>;
+        fn column(&mut self, column: usize) -> IOResultOr<Value>;
+        fn is_valid(&self) -> Result<bool>;
+    }
+
+    impl ViewCursorTestExt for MaterializedViewCursor {
+        /// Seek like the VDBE does: when the btree lands next to the target
+        /// (`TryAdvance`), step once in the seek direction.
+        fn seek_row(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+            match return_if_io!(self.seek(key, op)) {
+                SeekResult::TryAdvance => {}
+                result => return Ok(IOResult::Done(result)),
+            }
+            match op {
+                SeekOp::GT | SeekOp::GE { .. } => return_if_io!(self.next()),
+                SeekOp::LT | SeekOp::LE { .. } => return_if_io!(self.prev()),
+            }
+            Ok(IOResult::Done(if self.has_record() {
+                SeekResult::Found
+            } else {
+                SeekResult::NotFound
+            }))
+        }
+
+        fn step_to_next(&mut self) -> IOResultOr<bool> {
+            return_if_io!(self.next());
+            Ok(IOResult::Done(self.has_record()))
+        }
+
+        fn column(&mut self, column: usize) -> IOResultOr<Value> {
+            if self.get_null_flag() {
+                return Ok(IOResult::Done(Value::Null));
+            }
+            let record = return_if_io!(self.record());
+            let value = record
+                .and_then(|record| record.get_value_opt(column))
+                .map(|value| value.to_owned())
+                .transpose()?;
+            Ok(IOResult::Done(value.unwrap_or(Value::Null)))
+        }
+
+        fn is_valid(&self) -> Result<bool> {
+            Ok(self.has_record())
+        }
     }
 
     /// Helper to populate test table with data through SQL
@@ -474,12 +412,16 @@ mod tests {
         Ok(())
     }
 
-    /// Helper to apply changes through ViewTransactionState
+    /// Helper to apply changes through a view's shared-log subscription.
     fn apply_changes_to_tx_state(
-        tx_state: &ViewTransactionState,
+        tx_state: &ViewChangeSubscription,
         changes: Vec<(i64, Vec<Value>, isize)>,
     ) {
         for (rowid, values, weight) in changes {
+            let values = values
+                .into_iter()
+                .try_collect()
+                .expect("test row allocation should succeed");
             if weight > 0 {
                 tx_state.insert("test_table", rowid, values);
             } else if weight < 0 {
@@ -503,35 +445,35 @@ mod tests {
         // Test 1: Seek exact match (row 3)
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
         // Test 2: Seek GE (row 4 should find row 5)
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(4), SeekOp::GE { eq_only: false }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(4), SeekOp::GE { eq_only: false }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
         // Test 3: Seek GT (row 3 should find row 5)
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(3), SeekOp::GT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(3), SeekOp::GT))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
         // Test 4: Seek LE (row 4 should find row 3)
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(4), SeekOp::LE { eq_only: false }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(4), SeekOp::LE { eq_only: false }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
         // Test 5: Seek LT (row 5 should find row 3)
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(5), SeekOp::LT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(5), SeekOp::LT))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
@@ -560,7 +502,7 @@ mod tests {
         // Test 1: Seek exact match for uncommitted row 3
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
         assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(30));
@@ -568,14 +510,14 @@ mod tests {
         // Test 2: Seek GE for row 2 should find uncommitted row 3
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: false }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(2), SeekOp::GE { eq_only: false }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
         // Test 3: Seek GT for row 5 should find uncommitted row 6
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(5), SeekOp::GT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(5), SeekOp::GT))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(6));
         assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(60));
@@ -583,7 +525,7 @@ mod tests {
         // Test 4: Seek LE for row 6 should find uncommitted row 6
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(6), SeekOp::LE { eq_only: false }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(6), SeekOp::LE { eq_only: false }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(6));
 
@@ -612,27 +554,27 @@ mod tests {
         // Test 1: Seek exact match for deleted row 3 should not find it
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::NotFound);
 
         // Test 2: Seek GE for row 2 should skip deleted row 3 and find row 7
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: false }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(2), SeekOp::GE { eq_only: false }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(7));
 
         // Test 3: Seek GT for row 1 should skip deleted rows and find row 7
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(1), SeekOp::GT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(1), SeekOp::GT))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(7));
 
         // Test 4: Seek LE for row 5 should find row 1 (skipping deleted 3 and 5)
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(5), SeekOp::LE { eq_only: false }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(5), SeekOp::LE { eq_only: false }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
@@ -661,7 +603,7 @@ mod tests {
         // Test: Seek for updated row 3 should find it
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
         // The values should be from the uncommitted set (35 instead of 30)
@@ -685,19 +627,19 @@ mod tests {
         // Test 1: Seek LT for minimum value (should find nothing)
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(1), SeekOp::LT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(1), SeekOp::LT))?;
         assert_eq!(result, SeekResult::NotFound);
 
         // Test 2: Seek GT for maximum value (should find nothing)
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(15), SeekOp::GT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(15), SeekOp::GT))?;
         assert_eq!(result, SeekResult::NotFound);
 
         // Test 3: Seek exact for non-existent key
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(7), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(7), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::NotFound);
 
         Ok(())
@@ -728,7 +670,7 @@ mod tests {
         // Seek for row 5 should find it (net weight = 1 from btree + 0 from uncommitted = 1)
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
         // The final value should be 52 from the last update
@@ -750,20 +692,20 @@ mod tests {
         // Seek for row 2 - doesn't exist
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::NotFound);
 
         // Add row 2 to uncommitted
         tx_state.insert(
             "test_table",
             2,
-            vec![Value::from_i64(2), Value::from_i64(20)],
+            crate::alloc::vec![Value::from_i64(2), Value::from_i64(20)],
         );
 
         // Now seek for row 2 finds it
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
         assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(20));
@@ -947,19 +889,19 @@ mod tests {
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
         // Next should move to row 3
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
         // Next should move to row 5
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
         // Next should move to row 7
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(7));
 
         // Next should reach end
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
         assert!(!cursor.is_valid()?);
 
         Ok(())
@@ -987,15 +929,15 @@ mod tests {
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
 
         // Next should move to row 4
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(4));
 
         // Next should move to row 6
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(6));
 
         // Next should reach end
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
         assert!(!cursor.is_valid()?);
 
         Ok(())
@@ -1024,19 +966,19 @@ mod tests {
         pager.io.block(|| cursor.rewind())?;
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(7));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(9));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
         assert!(!cursor.is_valid()?);
 
         Ok(())
@@ -1065,13 +1007,13 @@ mod tests {
         pager.io.block(|| cursor.rewind())?;
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
         assert!(!cursor.is_valid()?);
 
         Ok(())
@@ -1100,14 +1042,14 @@ mod tests {
         pager.io.block(|| cursor.rewind())?;
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
         assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(35)); // Updated value
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
 
         Ok(())
     }
@@ -1126,7 +1068,7 @@ mod tests {
         assert!(!cursor.is_valid()?);
 
         // Next on uninitialized cursor should return false (matching BTreeCursor behavior)
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
         assert!(!cursor.is_valid()?);
 
         // Position cursor with rewind first
@@ -1134,10 +1076,10 @@ mod tests {
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
 
         // Now next should work
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(4));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
 
         Ok(())
     }
@@ -1150,7 +1092,7 @@ mod tests {
         let (mut cursor, _tx_state, pager) = create_test_cursor(&conn)?;
 
         // Next on empty table should return false
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
         assert!(!cursor.is_valid()?);
 
         Ok(())
@@ -1177,7 +1119,7 @@ mod tests {
         );
 
         // Next should find nothing
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
         assert!(!cursor.is_valid()?);
 
         Ok(())
@@ -1222,26 +1164,26 @@ mod tests {
         pager.io.block(|| cursor.rewind())?;
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(4));
         assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(45)); // Updated value
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(7));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(8));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(9));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
         assert!(!cursor.is_valid()?);
 
         Ok(())
@@ -1260,20 +1202,20 @@ mod tests {
         // Seek to row 5
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
         // Next should move to row 7
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(7));
 
         // Next should move to row 9
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(9));
 
         // Next should reach end
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
 
         Ok(())
     }
@@ -1302,9 +1244,155 @@ mod tests {
         );
 
         // Row should be deleted
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
         assert!(!cursor.is_valid()?);
 
+        Ok(())
+    }
+
+    /// An UPDATE of row 2 and an INSERT-then-DELETE of row 7, each captured
+    /// in the reverse of the order the engine records them.
+    fn reversed_capture_order_changes() -> Vec<(i64, Vec<Value>, isize)> {
+        vec![
+            (2, vec![Value::from_i64(2), Value::from_i64(25)], 1),
+            (2, vec![Value::from_i64(2), Value::from_i64(20)], -1),
+            (7, vec![Value::from_i64(7), Value::from_i64(70)], -1),
+            (7, vec![Value::from_i64(7), Value::from_i64(70)], 1),
+        ]
+    }
+
+    /// Read every row of a two-column view through its cursor.
+    fn read_two_column_rows(
+        cursor: &mut MaterializedViewCursor,
+        pager: &Arc<Pager>,
+    ) -> Result<Vec<(Value, Value)>> {
+        let mut rows = Vec::new();
+        pager.io.block(|| cursor.rewind())?;
+        while cursor.is_valid()? {
+            rows.push((
+                pager.io.block(|| cursor.column(0))?,
+                pager.io.block(|| cursor.column(1))?,
+            ));
+            pager.io.block(|| cursor.step_to_next())?;
+        }
+        Ok(rows)
+    }
+
+    #[test]
+    fn test_view_rows_do_not_depend_on_delta_order() -> Result<()> {
+        let conn = create_test_connection()?;
+        populate_test_table(&conn, vec![(1, 10), (2, 20)])?;
+        let (mut cursor, tx_state, pager) = create_test_cursor(&conn)?;
+
+        apply_changes_to_tx_state(&tx_state, reversed_capture_order_changes());
+
+        assert_eq!(
+            read_two_column_rows(&mut cursor, &pager)?,
+            vec![
+                (Value::from_i64(1), Value::from_i64(10)),
+                (Value::from_i64(2), Value::from_i64(25)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_rows_do_not_depend_on_delta_order() -> Result<()> {
+        let conn = create_test_connection()?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW test_groups AS
+             SELECT value, count(*) FROM test_table GROUP BY value",
+        )?;
+        populate_test_table(&conn, vec![(1, 10), (2, 20)])?;
+        let (mut cursor, tx_state, pager) = create_view_cursor(&conn, "test_groups")?;
+
+        apply_changes_to_tx_state(&tx_state, reversed_capture_order_changes());
+
+        assert_eq!(
+            read_two_column_rows(&mut cursor, &pager)?,
+            vec![
+                (Value::from_i64(10), Value::from_i64(1)),
+                (Value::from_i64(25), Value::from_i64(1)),
+            ]
+        );
+        Ok(())
+    }
+
+    /// A consolidated delta only retracts rows its input holds. Retracting a
+    /// row that no state holds must fail instead of being dropped or stored
+    /// as a negative count.
+    #[test]
+    fn test_retracting_a_row_no_state_holds_is_an_error() -> Result<()> {
+        let views = [
+            ("test_view", None),
+            (
+                "unknown_group",
+                Some("SELECT value, count(*) FROM test_table GROUP BY value"),
+            ),
+            ("unknown_value", Some("SELECT max(value) FROM test_table")),
+            (
+                "unknown_content",
+                Some("SELECT value FROM test_table UNION SELECT id FROM test_table"),
+            ),
+            (
+                "unknown_arranged_row",
+                Some("SELECT id, value FROM test_table UNION ALL SELECT id, value FROM test_table"),
+            ),
+            (
+                "unknown_appended_row",
+                Some(
+                    "SELECT value FROM test_table UNION SELECT id FROM test_table
+                     UNION ALL SELECT value FROM test_table",
+                ),
+            ),
+        ];
+        let mut accepted = Vec::new();
+        for (view_name, select) in views {
+            let conn = create_test_connection()?;
+            if let Some(select) = select {
+                conn.execute(format!("CREATE MATERIALIZED VIEW {view_name} AS {select}"))?;
+            }
+            populate_test_table(&conn, vec![(1, 10)])?;
+            let (mut cursor, tx_state, pager) = create_view_cursor(&conn, view_name)?;
+
+            apply_changes_to_tx_state(
+                &tx_state,
+                vec![(9, vec![Value::from_i64(9), Value::from_i64(90)], -1)],
+            );
+
+            if pager.io.block(|| cursor.rewind()).is_ok() {
+                accepted.push(view_name);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "these views accepted a retraction of an unknown row: {accepted:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_counts_a_summed_weight_in_full() -> Result<()> {
+        let conn = create_test_connection()?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW test_groups AS
+             SELECT value, count(*) FROM test_table GROUP BY value",
+        )?;
+        let (mut cursor, tx_state, pager) = create_view_cursor(&conn, "test_groups")?;
+
+        // Consolidation sums the two equal rows into one row of weight 2.
+        apply_changes_to_tx_state(
+            &tx_state,
+            vec![
+                (5, vec![Value::from_i64(5), Value::from_i64(50)], 1),
+                (5, vec![Value::from_i64(5), Value::from_i64(50)], 1),
+            ],
+        );
+
+        assert_eq!(
+            read_two_column_rows(&mut cursor, &pager)?,
+            vec![(Value::from_i64(50), Value::from_i64(2))]
+        );
         Ok(())
     }
 
@@ -1329,13 +1417,13 @@ mod tests {
         pager.io.block(|| cursor.rewind())?;
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(100));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(500));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(999));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
 
         Ok(())
     }
@@ -1367,7 +1455,7 @@ mod tests {
         // Seek to row 2 should find the final value
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
         assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(32));
@@ -1377,15 +1465,15 @@ mod tests {
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
         assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(10));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
         assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(32)); // Final value
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
         assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(30));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
 
         Ok(())
     }
@@ -1413,14 +1501,14 @@ mod tests {
         // Test seek on empty materialized view with uncommitted data
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(10), SeekOp::GE { eq_only: true }))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(10), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(10));
 
         // Test GT seek
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(7), SeekOp::GT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(7), SeekOp::GT))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(10));
 
@@ -1428,19 +1516,19 @@ mod tests {
         pager.io.block(|| cursor.rewind())?;
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(10));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(15));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
 
         Ok(())
     }
 
     #[test]
-    fn test_exact_match_btree_uncommitted_same_rowid_different_values() -> Result<()> {
+    fn test_second_row_image_for_one_rowid_is_an_error() -> Result<()> {
         let conn = create_test_connection()?;
 
         // Populate table with rows 1, 3, 5
@@ -1449,27 +1537,23 @@ mod tests {
         // Create cursor for testing
         let (mut cursor, tx_state, pager) = create_test_cursor(&conn)?;
 
-        // Add uncommitted row 3 with different value (not a delete+insert, just insert)
-        // This simulates a case where uncommitted has a new version of row 3
+        // Insert a second image for row 3 without retracting (3, 30). The view
+        // keeps one row per rowid, so it cannot hold both images.
         apply_changes_to_tx_state(
             &tx_state,
-            vec![
-                (3, vec![Value::from_i64(3), Value::from_i64(35)], 1), // New version with positive weight
-            ],
+            vec![(3, vec![Value::from_i64(3), Value::from_i64(35)], 1)],
         );
 
-        // Exact match seek for row 3 should find the uncommitted version (35)
-        // because when both exist with positive weight, uncommitted takes precedence
-        let result = pager
+        let error = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
-        assert_eq!(result, SeekResult::Found);
-        assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
-
-        // This test verifies which value we get when both btree and uncommitted
-        // have the same rowid with positive weights
-        // The expected behavior needs to be defined - typically uncommitted wins
-        // or they get merged based on the DBSP semantics
+            .block(|| cursor.seek_row(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))
+            .expect_err("a second image for one rowid must not be merged");
+        assert!(
+            error
+                .to_string()
+                .contains("received a row whose rowid already holds other values"),
+            "unexpected error: {error}"
+        );
 
         Ok(())
     }
@@ -1504,13 +1588,13 @@ mod tests {
         // Test 1: Seek GT with i64::MAX should find nothing
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(i64::MAX), SeekOp::GT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(i64::MAX), SeekOp::GT))?;
         assert_eq!(result, SeekResult::NotFound);
 
         // Test 2: Seek LT with i64::MIN should find nothing
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(i64::MIN), SeekOp::LT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(i64::MIN), SeekOp::LT))?;
         assert_eq!(result, SeekResult::NotFound);
 
         // Test 3: Seek GE with i64::MAX - 1 should find our extreme row
@@ -1536,14 +1620,14 @@ mod tests {
         // Test 5: Seek GT from i64::MIN should find the smallest row
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(i64::MIN), SeekOp::GT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(i64::MIN), SeekOp::GT))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(i64::MIN + 1));
 
         // Test 6: Seek LT from i64::MAX should find the largest row
         let result = pager
             .io
-            .block(|| cursor.seek(SeekKey::TableRowId(i64::MAX), SeekOp::LT))?;
+            .block(|| cursor.seek_row(SeekKey::TableRowId(i64::MAX), SeekOp::LT))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(i64::MAX - 1));
 
@@ -1574,17 +1658,17 @@ mod tests {
         pager.io.block(|| cursor.rewind())?;
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
         assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(25)); // New value
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
 
         Ok(())
     }
@@ -1604,7 +1688,7 @@ mod tests {
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
         // Move to next row
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
         // Now add new uncommitted changes mid-iteration
@@ -1619,32 +1703,32 @@ mod tests {
 
         // Continue iteration - cursor continues from where it was, sees row 5 next
         // (new changes are only visible after rewind/seek)
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
         // No more rows in original iteration
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
 
         // Rewind and verify we see all rows including the newly added ones
         pager.io.block(|| cursor.rewind())?;
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(4));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(6));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
 
         Ok(())
     }
@@ -1669,10 +1753,9 @@ mod tests {
         assert_eq!(
             pager
                 .io
-                .block(|| cursor.seek(SeekKey::TableRowId(4), SeekOp::GE { eq_only: true }))?,
+                .block(|| cursor.seek_row(SeekKey::TableRowId(4), SeekOp::GE { eq_only: true }))?,
             SeekResult::NotFound
         );
-        assert!(!cursor.is_valid()?);
 
         // Rewind should work correctly after failed seek
         pager.io.block(|| cursor.rewind())?;
@@ -1680,22 +1763,22 @@ mod tests {
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
 
         // Verify we can iterate through all rows
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
 
-        assert!(pager.io.block(|| cursor.next())?);
+        assert!(pager.io.block(|| cursor.step_to_next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
 
-        assert!(!pager.io.block(|| cursor.next())?);
+        assert!(!pager.io.block(|| cursor.step_to_next())?);
 
         // Try another failed seek (GT on maximum value)
         assert_eq!(
             pager
                 .io
-                .block(|| cursor.seek(SeekKey::TableRowId(5), SeekOp::GT))?,
+                .block(|| cursor.seek_row(SeekKey::TableRowId(5), SeekOp::GT))?,
             SeekResult::NotFound
         );
         assert!(!cursor.is_valid()?);
@@ -1847,10 +1930,6 @@ mod tests {
                 ImmutableRecord::from_bin_record(payload)
             }
 
-            fn get_seek_count(&self) -> usize {
-                self.seek_count.load(Ordering::SeqCst)
-            }
-
             fn get_prev_count(&self) -> usize {
                 self.prev_count.load(Ordering::SeqCst)
             }
@@ -1993,86 +2072,6 @@ mod tests {
             fn get_skip_advance(&self) -> bool {
                 false
             }
-        }
-
-        /// Test that verifies the bug: when btree.next() returns IO after TryAdvance,
-        /// resuming should NOT call btree.seek() again.
-        ///
-        /// Current behavior (BUG): seek is called twice
-        /// Expected behavior: seek should only be called once
-        #[test]
-        fn test_seek_not_repeated_after_io_during_try_advance() -> Result<()> {
-            let conn = create_test_connection()?;
-
-            // Get the view for creating a cursor
-            let view_mutex = conn
-                .schema
-                .read()
-                .get_materialized_view("test_view")
-                .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
-
-            let pager = conn.get_pager();
-            let tx_state = conn.view_transaction_states.get_or_create("test_view");
-
-            // Create mock cursor that returns TryAdvance from seek and IO from next
-            let mock_cursor = MockBTreeCursor::new();
-            let mock_cursor_box: Box<dyn CursorTrait> = Box::new(mock_cursor);
-
-            // Get a reference to the mock to check counts later
-            // We need to use Any::downcast to access the mock's methods
-            let mock_ptr = mock_cursor_box.as_ref() as *const dyn CursorTrait;
-
-            let mut cursor =
-                MaterializedViewCursor::new(mock_cursor_box, view_mutex, pager, tx_state)?;
-
-            // Use LE so that rowid=1 satisfies the condition (1 <= 5)
-            let seek_op = SeekOp::LE { eq_only: false };
-
-            // First call to do_seek - should call btree.seek() which returns TryAdvance,
-            // then btree.prev() which returns IO
-            let result = cursor.do_seek(5, seek_op);
-
-            // Should return IO (pending)
-            assert!(
-                matches!(result, Ok(IOResult::IO(_))),
-                "Expected IO result, got {result:?}"
-            );
-
-            // Check seek was called once
-            let mock_ref: &MockBTreeCursor = unsafe { &*(mock_ptr as *const MockBTreeCursor) };
-            assert_eq!(
-                mock_ref.get_seek_count(),
-                1,
-                "seek should be called exactly once before IO"
-            );
-            // For LE, we call prev() not next()
-            assert_eq!(
-                mock_ref.get_prev_count(),
-                1,
-                "prev should be called once (returned IO)"
-            );
-
-            // Second call to do_seek (simulating resumption after IO completes)
-            // BUG: This will call btree.seek() again, which is wasteful
-            let result = cursor.do_seek(5, seek_op);
-
-            // The result might be Found or some other result
-            assert!(
-                matches!(result, Ok(IOResult::Done(_))),
-                "Expected Done result on resume, got {result:?}"
-            );
-
-            // Check seek count - seek should only be called once
-            // If this fails with seek_count=2, it means the bug exists:
-            // seek is being redundantly called again after IO resumption
-            let final_seek_count = mock_ref.get_seek_count();
-
-            assert_eq!(
-                final_seek_count, 1,
-                "seek should only be called once, but was called {final_seek_count} times (redundant seek after IO during TryAdvance)"
-            );
-
-            Ok(())
         }
     }
 }
