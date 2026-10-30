@@ -1,3 +1,4 @@
+use crate::namespace::NamespaceId;
 use crate::sync::Arc;
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
@@ -52,8 +53,8 @@ impl TableStat {
 /// Container for ANALYZE statistics across the schema.
 #[derive(Clone, Debug, Default)]
 pub struct AnalyzeStats {
-    /// Per-table statistics keyed by normalized table name.
-    pub tables: HashMap<String, TableStat>,
+    /// Per-table statistics keyed by namespace and normalized table name.
+    pub tables: HashMap<(NamespaceId, String), TableStat>,
 }
 
 impl AnalyzeStats {
@@ -61,28 +62,28 @@ impl AnalyzeStats {
         self.tables.is_empty()
     }
     /// Get the statistics for a table, if present.
-    pub fn table_stats(&self, table_name: &str) -> Option<&TableStat> {
+    pub fn table_stats(&self, namespace: NamespaceId, table_name: &str) -> Option<&TableStat> {
         let table_name = normalize_ident(table_name);
-        self.tables.get(&table_name)
+        self.tables.get(&(namespace, table_name))
     }
 
     /// Get or create the statistics bucket for a table.
-    pub fn table_stats_mut(&mut self, table_name: &str) -> &mut TableStat {
+    pub fn table_stats_mut(&mut self, namespace: NamespaceId, table_name: &str) -> &mut TableStat {
         let table_name = normalize_ident(table_name);
-        self.tables.entry(table_name).or_default()
+        self.tables.entry((namespace, table_name)).or_default()
     }
 
     /// Remove all statistics for a table.
-    pub fn remove_table(&mut self, table_name: &str) {
+    pub fn remove_table(&mut self, namespace: NamespaceId, table_name: &str) {
         let table_name = normalize_ident(table_name);
-        self.tables.remove(&table_name);
+        self.tables.remove(&(namespace, table_name));
     }
 
     /// Remove statistics for a specific index on a table.
-    pub fn remove_index(&mut self, table_name: &str, index_name: &str) {
+    pub fn remove_index(&mut self, namespace: NamespaceId, table_name: &str, index_name: &str) {
         let table_name = normalize_ident(table_name);
         let index_name = normalize_ident(index_name);
-        if let Some(table_stats) = self.tables.get_mut(&table_name) {
+        if let Some(table_stats) = self.tables.get_mut(&(namespace, table_name)) {
             table_stats.index_stats.remove(&index_name);
         }
     }
@@ -154,7 +155,10 @@ pub fn refresh_analyze_stats_nonblock(
                     return Ok(IOResult::Done(()));
                 }
                 let schema_snapshot = { conn.schema.read().clone() };
-                if schema_snapshot.get_btree_table(STATS_TABLE).is_none() {
+                if schema_snapshot
+                    .get_btree_table(NamespaceId::ROOT, STATS_TABLE)
+                    .is_none()
+                {
                     return Ok(IOResult::Done(()));
                 }
                 let mv_tx = conn.get_mv_tx();
@@ -236,7 +240,7 @@ fn load_sqlite_stat1_row(
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> Result<()> {
-    let table_name = row.get::<&str>(0)?;
+    let (namespace, table_name) = schema.demangle_name(row.get::<&str>(0)?);
     let idx_value = row.get::<&Value>(1)?;
     let stat_value = row.get::<&Value>(2)?;
 
@@ -251,7 +255,7 @@ fn load_sqlite_stat1_row(
     };
 
     // Skip if table is not a regular B-tree.
-    if schema.get_btree_table(table_name).is_none() {
+    if schema.get_btree_table(namespace, table_name).is_none() {
         return Ok(());
     }
     let Some(numbers) = parse_stat_numbers(stat) else {
@@ -262,27 +266,29 @@ fn load_sqlite_stat1_row(
     }
     if idx_name.is_none() {
         if let Some(total_rows) = numbers.first().copied() {
-            stats.table_stats_mut(table_name).row_count = Some(total_rows);
+            stats.table_stats_mut(namespace, table_name).row_count = Some(total_rows);
         }
         return Ok(());
     }
 
     // Index-level entry: only keep if the index exists on this table.
     let idx_name = normalize_ident(idx_name.unwrap());
-    if schema.get_index(table_name, &idx_name).is_none() {
+    if schema.get_index(namespace, table_name, &idx_name).is_none() {
         return Ok(());
     }
 
     let total_rows = numbers.first().copied();
     {
-        let idx_stats = stats.table_stats_mut(table_name).index_stats_mut(&idx_name);
+        let idx_stats = stats
+            .table_stats_mut(namespace, table_name)
+            .index_stats_mut(&idx_name);
         idx_stats.total_rows = total_rows;
         idx_stats.avg_rows_per_distinct_prefix = numbers.iter().skip(1).copied().collect();
     }
 
     // If we didn't see a table-level row yet, seed row_count from index stats.
     if let Some(total_rows) = total_rows {
-        let table_stats = stats.table_stats_mut(table_name);
+        let table_stats = stats.table_stats_mut(namespace, table_name);
         if table_stats.row_count.is_none() {
             table_stats.row_count = Some(total_rows);
         }

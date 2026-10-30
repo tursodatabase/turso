@@ -18,10 +18,10 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
-    PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation, QueryMode,
-    SqliteDialect, Statement, StepResult, IO,
+    storage::database::DatabaseFile, types::AsValueRef, ConnectOpts, Connection, Database,
+    DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
+    OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
+    PageLocation, QueryMode, SqliteDialect, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -398,11 +398,10 @@ impl TursoDatabaseConfig {
                 "vacuum" => opts.with_vacuum(true),
                 "encryption" => opts.with_encryption(true),
                 "attach" => opts.with_attach(true),
-                "generated_columns" => opts.with_generated_columns(true),
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
-                // "strict" is always enabled, kept for backwards compatibility
+                // "strict" and "generated_columns" are always enabled, kept for backwards compatibility
                 _ => opts,
             };
         }
@@ -470,7 +469,7 @@ pub unsafe fn bytes_from_slice<'a>(
             "expected slice, got null pointer".to_string(),
         ));
     }
-    Ok(std::slice::from_raw_parts(ptr as *const u8, len))
+    Ok(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
 }
 
 /// SAFETY: slice must points to the valid memory
@@ -737,6 +736,7 @@ impl From<LimboError> for TursoError {
             LimboError::ForeignKeyConstraint(e) | LimboError::Constraint(e) => {
                 TursoError::Constraint(e)
             }
+            LimboError::ConstraintViolation(violation) => TursoError::Constraint(violation.message),
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
             e @ (LimboError::DatabaseFull | LimboError::SequenceExhausted { .. }) => {
@@ -1076,16 +1076,16 @@ impl TursoDatabase {
         };
 
         let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect_with_page_codec(page_codec.clone())?
+            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
         } else {
-            // Parse encryption key if configured - needed for connect_with_encryption
+            // Parse encryption key if configured - needed at connect time
             // which sets up encryption context before reading pages.
             let encryption_key = if let Some(ref encryption_opts) = self.config.encryption {
                 Some(EncryptionKey::from_hex_string(&encryption_opts.hexkey)?)
             } else {
                 None
             };
-            db.connect_with_encryption(encryption_key)?
+            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
         };
 
         Ok(TursoConnection::new(&self.config, connection))
@@ -1195,6 +1195,17 @@ impl TursoConnection {
     }
     pub fn last_insert_rowid(&self) -> i64 {
         self.connection.last_insert_rowid()
+    }
+    /// See `turso_core::Connection::materialized_view_chosen_value_collations`.
+    /// For test oracles only.
+    #[cfg(feature = "test_helper")]
+    pub fn materialized_view_chosen_value_collations(
+        &self,
+        view_name: &str,
+    ) -> Result<Vec<Option<String>>, TursoError> {
+        Ok(self
+            .connection
+            .materialized_view_chosen_value_collations(view_name)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1841,6 +1852,31 @@ mod tests {
     };
 
     #[test]
+    fn structured_constraint_errors_keep_sqlite_codes() {
+        for kind in [
+            turso_core::ConstraintKind::PrimaryKey,
+            turso_core::ConstraintKind::Unique,
+            turso_core::ConstraintKind::ForeignKey,
+            turso_core::ConstraintKind::NotNull,
+            turso_core::ConstraintKind::Check,
+            turso_core::ConstraintKind::Other,
+        ] {
+            let error = LimboError::ConstraintViolation(Box::new(
+                turso_core::ConstraintViolation::new(kind, "constraint message".to_string()),
+            ));
+            let error = TursoError::from(error);
+            assert!(
+                matches!(&error, TursoError::Constraint(message) if message == "constraint message"),
+                "{kind:?}: {error:?}"
+            );
+            assert!(matches!(
+                error.to_capi_code(),
+                c::turso_status_code_t::TURSO_CONSTRAINT
+            ));
+        }
+    }
+
+    #[test]
     fn commit_dependency_abort_requires_transaction_retry() {
         for error in [
             TursoError::from(LimboError::CommitDependencyAborted),
@@ -2052,7 +2088,7 @@ mod tests {
 
         // Each token toggles its corresponding flag.
         let opts = config_with_features(Some(
-            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,generated_columns,multiprocess_wal,without_rowid",
+            "views,index_method,custom_types,autovacuum,vacuum,encryption,attach,multiprocess_wal,without_rowid",
         ))
         .database_opts();
         assert!(opts.enable_views);
@@ -2062,15 +2098,14 @@ mod tests {
         assert!(opts.enable_vacuum);
         assert!(opts.enable_encryption);
         assert!(opts.enable_attach);
-        assert!(opts.enable_generated_columns);
         assert!(opts.enable_multiprocess_wal);
         assert!(opts.enable_without_rowid);
 
-        // Whitespace is trimmed; `strict` and unknown names are ignored.
+        // Whitespace is trimmed; `strict`, `generated_columns` and unknown names are ignored.
         let opts = config_with_features(Some(" views , strict , unknown_one ")).database_opts();
         assert!(opts.enable_views);
         assert_eq!(
-            config_with_features(Some("strict,unknown")).database_opts(),
+            config_with_features(Some("strict,generated_columns,unknown")).database_opts(),
             turso_core::DatabaseOpts::new()
         );
     }

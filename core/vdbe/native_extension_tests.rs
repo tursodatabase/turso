@@ -1,11 +1,12 @@
 use crate::alloc::TryClone;
 use crate::function::ExternalFunc;
+use crate::namespace::NamespaceId;
 use crate::native_ext::*;
 use crate::sync::{Arc, Mutex};
 use crate::types::{AggContext, ExternalAggState, IOCompletions, IOResultOr};
 use crate::{
-    Completion, Connection, Database, IOResult, LimboError, MemoryIO, Numeric, OpenOptions,
-    Register, Result, SqliteDialect, Statement, StepResult, Value,
+    Completion, ConnectOpts, Connection, Database, IOResult, LimboError, MemoryIO, Numeric,
+    OpenOptions, Register, Result, SqliteDialect, Statement, StepResult, Value,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -104,7 +105,7 @@ fn native_scalar_receives_each_executing_connection() {
             .unwrap(),
         ),
     );
-    let other = conn.db.connect().unwrap();
+    let other = conn.db.connect(ConnectOpts::new()).unwrap();
     conn.execute("CREATE TABLE t(x)").unwrap();
     conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
     other.execute("INSERT INTO t VALUES (4)").unwrap();
@@ -137,10 +138,13 @@ fn native_scalar_connection_context_survives_io_and_helper_queries() {
         ),
     );
     let context = Arc::new(AtomicI64::new(7));
-    let first = plain.db.connect_with_context(context.clone()).unwrap();
+    let first = plain
+        .db
+        .connect_with_context(crate::ConnectOpts::new(), context.clone())
+        .unwrap();
     let second = plain
         .db
-        .connect_with_context(Arc::new(AtomicI64::new(19)))
+        .connect_with_context(crate::ConnectOpts::new(), Arc::new(AtomicI64::new(19)))
         .unwrap();
     let mut statement = first.prepare("SELECT connection_context_read(1)").unwrap();
     assert!(matches!(statement.step().unwrap(), StepResult::IO));
@@ -387,11 +391,20 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                 }
                 assert!(!conn.is_nested_stmt(), "{mode}: {explicit}: {cancellation}");
                 assert!(conn.executing_triggers.read().is_empty());
+                // An I/O error rolls back the whole transaction, like SQLite
+                // on SQLITE_IOERR, so the explicit transaction (and its 503
+                // row) is already gone and COMMIT has nothing to commit.
+                let tx_survived = explicit && cancellation != "io_error";
                 if explicit {
-                    conn.execute("COMMIT").unwrap();
+                    let commit = conn.execute("COMMIT");
+                    assert_eq!(
+                        commit.is_ok(),
+                        tx_survived,
+                        "{mode}: {explicit}: {cancellation}: {commit:?}"
+                    );
                 }
                 conn.execute("INSERT INTO audit VALUES (504)").unwrap();
-                let other = conn.db.connect().unwrap();
+                let other = conn.db.connect(ConnectOpts::new()).unwrap();
                 for table in ["parent", "child"] {
                     assert!(other
                         .prepare(format!("SELECT id FROM {table}"))
@@ -401,7 +414,7 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                         .is_empty());
                 }
                 let mut expected = vec![vec![Value::from_i64(501)], vec![Value::from_i64(502)]];
-                if explicit {
+                if tx_survived {
                     expected.push(vec![Value::from_i64(503)]);
                 }
                 expected.push(vec![Value::from_i64(504)]);
@@ -415,6 +428,89 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn io_error_in_a_read_statement_rolls_back_the_transaction() {
+    // An I/O error may come from a cache spill of pages dirtied by earlier
+    // statements in the transaction, so even a failing read-only statement
+    // cannot vouch for the transaction's state: the whole transaction rolls
+    // back, like SQLite on SQLITE_IOERR.
+    for mode in ["wal", "mvcc"] {
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let conn = connection(
+            OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+                ExternalFunc::new_native_scalar(
+                    "gated_seven".into(),
+                    FunctionArity::Exact(1),
+                    false,
+                    GatedSeven {
+                        queue: queue.clone(),
+                    },
+                )
+                .unwrap(),
+            ),
+        );
+        conn.execute(format!("PRAGMA journal_mode = {mode}"))
+            .unwrap();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        let mut stmt = conn.prepare("SELECT gated_seven(x) FROM t").unwrap();
+        assert!(matches!(stmt.step().unwrap(), StepResult::IO), "{mode}");
+        queue
+            .lock()
+            .pop()
+            .unwrap()
+            .error(crate::CompletionError::Aborted);
+        assert!(
+            matches!(
+                stmt.step().unwrap_err(),
+                LimboError::CompletionError(crate::CompletionError::Aborted)
+            ),
+            "{mode}"
+        );
+        assert!(
+            conn.get_auto_commit(),
+            "{mode}: an I/O error must roll back the whole transaction"
+        );
+        drop(stmt);
+        assert!(conn.execute("COMMIT").is_err(), "{mode}");
+        let mut count = conn.prepare("SELECT count(*) FROM t").unwrap();
+        assert_eq!(
+            collect(&mut count, &queue),
+            vec![vec![Value::from_i64(0)]],
+            "{mode}: nothing from the rolled-back transaction may survive"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct GatedSeven {
+    queue: Arc<Mutex<Vec<Completion>>>,
+}
+
+impl ScalarFunction for GatedSeven {
+    type Call = GatedSevenCall;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(GatedSevenCall {
+            gate: Gate::new(self.queue.clone()),
+        })
+    }
+}
+
+struct GatedSevenCall {
+    gate: Gate,
+}
+
+impl ScalarCall for GatedSevenCall {
+    fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
+        if let Some(io) = self.gate.wait() {
+            return Ok(IOResult::IO(io));
+        }
+        Ok(IOResult::Done(Value::from_i64(7)))
     }
 }
 
@@ -654,7 +750,7 @@ fn scalar_calls_resume_independently_and_create_once() {
         ),
     );
     let mut first = conn.prepare("SELECT delayed(7, 3)").unwrap();
-    let other = conn.db.connect().unwrap();
+    let other = conn.db.connect(ConnectOpts::new()).unwrap();
     let mut second = other.prepare("SELECT delayed(2, 9)").unwrap();
     assert!(matches!(first.step().unwrap(), StepResult::IO));
     assert!(matches!(second.step().unwrap(), StepResult::IO));
@@ -877,7 +973,7 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
         ]
     );
     assert_eq!(created.load(Ordering::SeqCst), 4);
-    let other = conn.db.connect().unwrap();
+    let other = conn.db.connect(ConnectOpts::new()).unwrap();
     other.set_vdbe_trace(true);
     let mut empty = other.prepare("SELECT weighted(3, 7) WHERE 0").unwrap();
     assert_eq!(
@@ -1088,7 +1184,10 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
         )
         .unwrap();
     assert!(matches!(
-        schema.get_table("reloaded").unwrap().as_ref(),
+        schema
+            .get_table(NamespaceId::ROOT, "reloaded")
+            .unwrap()
+            .as_ref(),
         crate::schema::Table::Virtual(_)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 5);
@@ -1200,7 +1299,7 @@ fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl()
             collect(&mut stmt, &queue),
             vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
         );
-        let other = conn.db.connect().unwrap();
+        let other = conn.db.connect(ConnectOpts::new()).unwrap();
         other.execute("CREATE TABLE unrelated(value)").unwrap();
         stmt.reset().unwrap();
         assert_eq!(
@@ -1247,16 +1346,18 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
                 .run_collect_rows()
                 .unwrap()
         };
-        let expected_columns = vec![
-            vec![Value::build_text("value")],
-            vec![Value::build_text("lower_bound")],
-        ];
+        let expected_columns = vec![vec![Value::build_text("value")]];
+        let expected_rows = vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]];
         {
             let db = open();
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             if mvcc {
                 conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
             }
+            let mut direct = conn
+                .prepare("SELECT * FROM native_rows(8) ORDER BY value")
+                .unwrap();
+            assert_eq!(collect(&mut direct, &queue), expected_rows);
             conn.execute("CREATE VIEW native_view AS SELECT * FROM native_rows(8)")
                 .unwrap();
             assert_eq!(columns(&conn), expected_columns);
@@ -1264,15 +1365,12 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
             assert_eq!(columns(&conn), expected_columns);
         }
         let db = open();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         assert_eq!(columns(&conn), expected_columns);
         let mut stmt = conn
-            .prepare("SELECT value FROM native_view ORDER BY value")
+            .prepare("SELECT * FROM native_view ORDER BY value")
             .unwrap();
-        assert_eq!(
-            collect(&mut stmt, &queue),
-            vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
-        );
+        assert_eq!(collect(&mut stmt, &queue), expected_rows);
     }
 }
 
@@ -1326,13 +1424,50 @@ fn native_modules_require_trigger_permission_for_both_table_kinds() {
         } else {
             [("restricted_rows", false), ("allowed_rows", true)]
         } {
-            let table = conn.current_schema().get_table(name).unwrap();
+            let table = conn
+                .current_schema()
+                .get_table(NamespaceId::ROOT, name)
+                .unwrap();
             let crate::schema::Table::Virtual(table) = table.as_ref() else {
                 panic!("expected virtual table {name}");
             };
             assert_eq!(table.innocuous, expected, "{name}");
         }
     }
+}
+
+/// A view or trigger of an attached database resolves a name without a
+/// database in its own database, as SQLite's fixer binds it there, so it does
+/// not see a virtual table of main.
+#[test]
+fn view_and_trigger_of_attached_database_do_not_see_a_virtual_table_of_main() {
+    let module = RowsModule {
+        queue: Arc::new(Mutex::new(Vec::new())),
+        rows: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::new(Mutex::new(Vec::new())),
+        writable: false,
+    };
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(crate::DatabaseOpts::new().with_attach(true))
+            .native_module("rows", VTabKind::VirtualTable, InnocuousModule(module)),
+    );
+    conn.execute("CREATE VIRTUAL TABLE vt USING rows").unwrap();
+    conn.execute("ATTACH ':memory:' AS aux").unwrap();
+
+    // The name is resolved when the statement is prepared, so the module is
+    // never run.
+    conn.execute("CREATE VIEW aux.v AS SELECT * FROM vt")
+        .unwrap();
+    let err = conn.prepare("SELECT count(*) FROM aux.v").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+
+    conn.execute("CREATE TABLE aux.t(x)").unwrap();
+    conn.execute("CREATE TABLE aux.log(x)").unwrap();
+    conn.execute("CREATE TRIGGER aux.tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT count(*) FROM vt; END")
+        .unwrap();
+    let err = conn.prepare("INSERT INTO aux.t VALUES (1)").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
 }
 
 #[test]
@@ -1670,7 +1805,7 @@ fn c_extensions_still_execute_with_native_registration() {
                     .unwrap(),
             ),
     );
-    let other = conn.db.connect().unwrap();
+    let other = conn.db.connect(ConnectOpts::new()).unwrap();
     assert_eq!(
         other
             .prepare("SELECT c_open_double(7)")
@@ -1784,7 +1919,7 @@ fn c_and_native_tables_share_cursor_dispatch() {
 fn connection(options: OpenOptions) -> Arc<Connection> {
     Database::open(Arc::new(MemoryIO::new()), ":memory:", options)
         .unwrap()
-        .connect()
+        .connect(ConnectOpts::new())
         .unwrap()
 }
 

@@ -1,19 +1,20 @@
 use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
+use crate::translate::expr_context::{ExprContext, ExprProperties, TableMetadata};
 use crate::{
-    schema::{Column, Index, Schema},
+    schema::{Column, Index, IndexColumn, Schema},
     translate::{
-        collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
+        collate::{comparison_collation, CollationSeq},
         expr::{
-            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
-            walk_expr_mut, WalkControl,
+            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr_mut,
+            WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
             is_non_null_literal, JoinInfo, JoinOrderMember, JoinOrigin, JoinedTable,
-            NonFromClauseSubquery, Plan, SubqueryState, TableReferences, WhereTerm,
-            WhereTermOrigin,
+            NonFromClauseSubquery, Plan, QueryDestination, SubqueryState, TableReferences,
+            WhereTerm, WhereTermOrigin,
         },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
@@ -107,6 +108,13 @@ pub struct Constraint {
     /// many NULL keys, so such a constraint can match many rows and its cost
     /// and row estimates must not be taken from equality statistics.
     pub null_matching: bool,
+    /// The collation the term compares with (see
+    /// [crate::translate::collate::comparison_collation]). An index can serve
+    /// the term only when its key column has this collation. For `x IN (...)`
+    /// it is the collation of x; for `x IN (SELECT y ...)` it is the collation
+    /// of `x = y`. None for terms that are not collating comparisons (LIKE,
+    /// MATCH and other virtual-table operators).
+    pub collation: Option<CollationSeq>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -161,7 +169,12 @@ impl Constraint {
             // known through it. Without it, `text_col < (SELECT int_col ...)`
             // would take the TEXT side's affinity and the seek would compare
             // the integer as text.
-            affinity = comparison_affinity(lhs, rhs, referenced_tables, resolver);
+            affinity = match resolver {
+                Some(resolver) => {
+                    comparison_affinity(lhs, rhs, &ExprContext::new(referenced_tables, resolver))
+                }
+                None => comparison_affinity(lhs, rhs, &TableMetadata::new(referenced_tables)),
+            };
         }
 
         if side == BinaryExprSide::Lhs {
@@ -215,6 +228,8 @@ impl Constraint {
     }
 
     /// Whether this constraint can drive an index seek on its target column.
+    /// Whether the term can drive a seek in a temporary index built over
+    /// `columns`, whose key columns have the collation of their table column.
     pub fn can_drive_index_seek(&self, columns: &[Column]) -> bool {
         if !self.usable || !self.outer_join_compatible {
             return false;
@@ -225,7 +240,17 @@ impl Constraint {
         let col = columns.get(pos).unwrap_or_else(|| {
             unreachable!("constraint table_col_pos {pos} out of bounds for {columns:?}")
         });
-        self.satisfies_index_affinity(col.affinity())
+        self.collation
+            .is_none_or(|collation| collation == col.collation())
+            && self.satisfies_index_affinity(col.affinity())
+    }
+
+    /// Whether an index key column can serve this term: a seek compares keys
+    /// with the key column's collation, so it must be the collation the term
+    /// compares with (SQLite's `azColl` check in `whereScanNext`).
+    pub fn index_column_can_serve(&self, index_column: &IndexColumn) -> bool {
+        self.collation
+            .is_none_or(|collation| collation == index_column.collation)
     }
 }
 
@@ -296,12 +321,25 @@ pub struct TableConstraints {
 pub(super) fn automatic_index_terms(
     table: &JoinedTable,
     constraints: &TableConstraints,
+    schema: &Schema,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
+    let can_use_term = |term: &Constraint| {
+        if !term.can_drive_index_seek(columns) {
+            return false;
+        }
+        let column = &columns[term
+            .table_col_pos
+            .expect("a term that can drive an index seek has a column")];
+        let has_custom_type = schema
+            .get_type_def(&column.ty_str, table.table.is_strict())
+            .is_some();
+        !has_custom_type || term.operator == ast::Operator::Equals.into()
+    };
     let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| term.can_drive_index_seek(columns))
+        .filter(|term| can_use_term(term))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -309,7 +347,7 @@ pub(super) fn automatic_index_terms(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| term.can_drive_index_seek(columns))
+        .filter(|(_, term)| can_use_term(term))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
@@ -324,22 +362,6 @@ pub(super) fn automatic_index_terms(
         .collect();
     terms.sort_by_key(|term| term.index_col_pos);
     terms
-}
-
-/// Return true when an expression names a custom text order.
-pub(super) fn expr_uses_custom_collation(expr: &ast::Expr) -> bool {
-    let mut uses_custom = false;
-    walk_expr(expr, &mut |expr| -> Result<WalkControl> {
-        if let ast::Expr::Collate(_, collation_name) = expr {
-            uses_custom = CollationSeq::known_custom(collation_name.as_str()).is_some();
-            if uses_custom {
-                return Ok(WalkControl::SkipChildren);
-            }
-        }
-        Ok(WalkControl::Continue)
-    })
-    .expect("reading a constraint cannot fail");
-    uses_custom
 }
 
 /// Estimate selectivity for IN expressions given the number of values and table row count.
@@ -370,7 +392,7 @@ fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
 #[allow(clippy::too_many_arguments)]
 fn estimate_selectivity(
     schema: &Schema,
-    table_name: &str,
+    table_reference: &JoinedTable,
     column: Option<&Column>,
     index: Option<&Index>,
     op: ConstraintOperator,
@@ -378,7 +400,10 @@ fn estimate_selectivity(
     is_rowid: bool,
 ) -> f64 {
     // Get ANALYZE stats for this table if available
-    let table_stats = schema.analyze_stats.table_stats(table_name);
+    let table_stats = schema.analyze_stats.table_stats(
+        table_reference.namespace.id,
+        table_reference.table.get_name(),
+    );
     let row_count = table_stats.and_then(|s| s.row_count).unwrap_or(0);
 
     match op {
@@ -462,7 +487,7 @@ fn estimate_constraint_selectivity(
     };
     estimate_selectivity(
         schema,
-        table_reference.table.get_name(),
+        table_reference,
         column,
         index,
         operator,
@@ -477,9 +502,10 @@ fn selectivity_index_for_column<'a>(
     available_indexes: &'a AvailableIndexes,
     column_pos: usize,
 ) -> Option<&'a Index> {
-    let table_stats = schema
-        .analyze_stats
-        .table_stats(table_reference.table.get_name());
+    let table_stats = schema.analyze_stats.table_stats(
+        table_reference.namespace.id,
+        table_reference.table.get_name(),
+    );
     available_indexes
         .btree_indexes_for_column(table_reference.internal_id, column_pos)
         .find(|index| {
@@ -523,6 +549,7 @@ fn expression_matches_table(
 pub(super) fn add_implied_column_equalities(
     where_clause: &mut Vec<WhereTerm>,
     table_references: &TableReferences,
+    resolver: &Resolver,
 ) -> Result<()> {
     let mut columns = Vec::new();
     let mut parents = Vec::new();
@@ -550,10 +577,12 @@ pub(super) fn add_implied_column_equalities(
             continue;
         }
 
-        let left_affinity = get_expr_affinity(left, Some(table_references), None);
-        let right_affinity = get_expr_affinity(right, Some(table_references), None);
-        let left_collation = get_collseq_from_expr(left, table_references)?.unwrap_or_default();
-        let right_collation = get_collseq_from_expr(right, table_references)?.unwrap_or_default();
+        let affinity_metadata = TableMetadata::new(Some(table_references));
+        let collation_metadata = ExprContext::new(Some(table_references), resolver);
+        let left_affinity = get_expr_affinity(left, &affinity_metadata);
+        let right_affinity = get_expr_affinity(right, &affinity_metadata);
+        let left_collation = collation_metadata.expr_collation(left)?;
+        let right_collation = collation_metadata.expr_collation(right)?;
         if left_affinity != right_affinity
             || left_collation != right_collation
             || !matches!(
@@ -704,6 +733,7 @@ pub fn constraints_from_where_clause(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: &Resolver,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -805,7 +835,18 @@ pub fn constraints_from_where_clause(
                 let cmp_aff = operator
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
-                    .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
+                    .map(|_| {
+                        comparison_affinity(lhs, rhs, &TableMetadata::new(Some(table_references)))
+                    });
+                let cmp_collation = match operator.as_ast_operator() {
+                    Some(op) if op.is_comparison() => Some(comparison_collation(
+                        lhs,
+                        rhs,
+                        &ExprContext::new(Some(table_references), resolver),
+                        &resolver.catalog,
+                    )?),
+                    _ => None,
+                };
                 let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
                 let outer_join_compatible = can_use_before_null_extension(is_op);
                 // See [Constraint::null_matching]. The constraining value sits
@@ -840,6 +881,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
+                                collation: cmp_collation,
                             });
                         }
                     }
@@ -872,6 +914,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
+                                collation: cmp_collation,
                             });
                         }
                     }
@@ -913,6 +956,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(rhs),
+                            collation: cmp_collation,
                         });
                     }
                     _ => {}
@@ -943,6 +987,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
+                                collation: cmp_collation,
                             });
                         }
                     }
@@ -975,6 +1020,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
+                                collation: cmp_collation,
                             });
                         }
                     }
@@ -1016,6 +1062,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(lhs),
+                            collation: cmp_collation,
                         });
                     }
                     _ => {}
@@ -1038,9 +1085,10 @@ pub fn constraints_from_where_clause(
                         subqueries,
                     )?)?;
                 }
-                let table_stats = schema
-                    .analyze_stats
-                    .table_stats(table_reference.table.get_name());
+                let table_stats = schema.analyze_stats.table_stats(
+                    table_reference.namespace.id,
+                    table_reference.table.get_name(),
+                );
                 let row_count = table_stats
                     .and_then(|s| s.row_count)
                     .unwrap_or(params.rows_per_table_fallback as u64)
@@ -1048,7 +1096,13 @@ pub fn constraints_from_where_clause(
                 let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
                 // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
                 // is the LHS column's affinity; the RHS literals are not folded.
-                let cmp_aff = Some(get_expr_affinity(lhs, Some(table_references), None));
+                let cmp_aff = Some(get_expr_affinity(
+                    lhs,
+                    &TableMetadata::new(Some(table_references)),
+                ));
+                // `x IN (y1, ..., yN)` compares with the collation of x alone.
+                let cmp_collation =
+                    Some(ExprContext::new(Some(table_references), resolver).expr_collation(lhs)?);
 
                 match lhs.as_ref() {
                     ast::Expr::Column { table, column, .. }
@@ -1071,6 +1125,7 @@ pub fn constraints_from_where_clause(
                             is_rowid,
                             comparison_affinity: cmp_aff,
                             null_matching: false,
+                            collation: cmp_collation,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1090,6 +1145,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: true,
                             comparison_affinity: cmp_aff,
                             null_matching: false,
+                            collation: cmp_collation,
                         });
                     }
                     _ => {}
@@ -1111,9 +1167,10 @@ pub fn constraints_from_where_clause(
                     .expect("subquery not found");
                 // Only use as constraint if NOT correlated
                 if !subquery.correlated {
-                    let table_stats = schema
-                        .analyze_stats
-                        .table_stats(table_reference.table.get_name());
+                    let table_stats = schema.analyze_stats.table_stats(
+                        table_reference.namespace.id,
+                        table_reference.table.get_name(),
+                    );
                     let row_count = table_stats
                         .and_then(|s| s.row_count)
                         .unwrap_or(params.rows_per_table_fallback as u64)
@@ -1148,6 +1205,7 @@ pub fn constraints_from_where_clause(
                     let cmp_aff = (!is_row_value)
                         .then(|| affinity_str.chars().next().map(Affinity::from_char))
                         .flatten();
+                    let cmp_collation = Some(in_subquery_collation(subquery)?);
 
                     match lhs_expr.as_ref() {
                         ast::Expr::Column { table, column, .. }
@@ -1170,6 +1228,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid,
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
+                                collation: cmp_collation,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1189,6 +1248,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
+                                collation: cmp_collation,
                             });
                         }
                         _ => {}
@@ -1209,42 +1269,6 @@ pub fn constraints_from_where_clause(
             // Skip constraints that don't participate in range-seek matching (IN, collation mismatches)
             if !constraint.usable || !constraint.outer_join_compatible {
                 continue;
-            }
-
-            let constrained_column = constraint
-                .table_col_pos
-                .and_then(|pos| table_reference.table.columns().get(pos));
-            let column_collation = constrained_column.map(|c| c.collation());
-            // Index seek keys compare with the index's collation, so the seek is
-            // only valid when the comparison itself uses that collation. The
-            // comparison collation follows the left operand, so a plain BINARY
-            // column on the left disqualifies an index on a NOCASE column even
-            // though neither side declares a collation explicitly.
-            let comparison_collation = if constraint.constraining_expr.is_some() {
-                get_collseq_from_expr(
-                    constraint.get_constraining_expr_ref(where_clause),
-                    table_references,
-                )?
-            } else {
-                let term_expr = &where_clause[constraint.where_clause_pos.0].expr;
-                match as_binary_components(term_expr)? {
-                    Some((lhs, op, rhs))
-                        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) =>
-                    {
-                        Some(resolve_comparison_collseq(lhs, rhs, table_references)?)
-                    }
-                    _ => get_collseq_from_expr(
-                        constraint.get_constraining_expr_ref(where_clause),
-                        table_references,
-                    )?,
-                }
-            };
-            match (comparison_collation, column_collation) {
-                (Some(collation), Some(column_collation)) if collation != column_collation => {
-                    constraint.usable = false;
-                    continue;
-                }
-                _ => {}
             }
 
             if constraint.is_rowid
@@ -1282,19 +1306,14 @@ pub fn constraints_from_where_clause(
                         index.expression_to_index_pos(&normalized)
                     }),
                 } {
-                    turso_assert!(
-                        constraint.usable,
-                        "constraint collation must match table column collation"
-                    );
+                    // An index seek compares keys with the index column's
+                    // collation, so the index serves the term only when that
+                    // is the collation the term compares with.
+                    if !constraint.index_column_can_serve(&index.columns[position_in_index]) {
+                        continue;
+                    }
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
-                        let table_collation = constrained_column.collation();
-                        let index_collation = index.columns[position_in_index]
-                            .collation
-                            .unwrap_or_default();
-                        if table_collation != index_collation {
-                            continue;
-                        }
                         // Custom type columns encode values as blobs. Blob ordering (memcmp)
                         // doesn't necessarily match the custom type's semantic ordering, so
                         // range constraints (>, <, >=, <=) can't use the index. Equality (=)
@@ -1355,18 +1374,27 @@ pub fn constraints_from_where_clause(
             }
             true
         });
-        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs)
-            .into_iter()
-            .filter(|term| {
-                let constraint = &cs.constraints[term.constraint_vec_pos];
-                let where_term = &where_clause[constraint.where_clause_pos.0];
-                !expr_uses_custom_collation(&where_term.expr)
-            })
-            .collect();
+        cs.temporary_index_terms = automatic_index_terms(table_reference, &cs, schema);
         constraints.push(cs);
     }
 
     Ok(constraints)
+}
+
+/// The collation `x IN (SELECT y ...)` compares with. The subquery's ephemeral
+/// index was built with it (the collation of `x = y`), so it is read from there.
+fn in_subquery_collation(subquery: &NonFromClauseSubquery) -> Result<CollationSeq> {
+    let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
+        return Err(crate::LimboError::InternalError(
+            "an IN subquery must have its plan while its terms are analyzed".into(),
+        ));
+    };
+    match plan.select_query_destination() {
+        Some(QueryDestination::EphemeralIndex { index, .. }) => Ok(index.columns[0].collation),
+        _ => Err(crate::LimboError::InternalError(
+            "an IN subquery must write to an ephemeral index".into(),
+        )),
+    }
 }
 
 /// A reference to a [Constraint]s in a [TableConstraints] for single column.
@@ -1748,7 +1776,7 @@ pub(super) fn partial_index_predicate_terms(
     // `x IS NOT NULL`, `x > 10` implies `x > 5`).
 }
 
-pub(super) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
+pub(crate) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
     let index = index?;
     index.where_clause.as_ref()?;
     Some(index.as_ref())
@@ -2182,21 +2210,40 @@ pub(crate) fn summarize_binary_term_for_index(
     rowid_alias_column: Option<usize>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    resolver: &Resolver,
 ) -> Option<IndexableTermSummary> {
     let BinaryTermIndexInfo {
+        lhs,
+        rhs,
         operator,
         table_col_pos,
         constraining_expr,
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    let comparison_collation = comparison_collation(
+        lhs,
+        rhs,
+        &ExprContext::new(Some(table_references), resolver),
+        &resolver.catalog,
+    )
+    .ok()?;
 
+    let affinity = term_comparison_affinity(
+        lhs,
+        rhs,
+        operator,
+        table_col_pos,
+        &TableMetadata::new(Some(table_references)),
+    );
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
         operator,
+        comparison_collation,
         indexes,
         rowid_alias_column,
         is_rowid,
+        affinity,
         table_reference,
         query_where_clause,
     );
@@ -2241,6 +2288,7 @@ pub(crate) fn analyze_binary_term_for_index(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: &Resolver,
 ) -> Option<AnalyzedTerm> {
     let BinaryTermIndexInfo {
         lhs,
@@ -2251,14 +2299,30 @@ pub(crate) fn analyze_binary_term_for_index(
         side,
         is_rowid,
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    let comparison_collation = comparison_collation(
+        lhs,
+        rhs,
+        &ExprContext::new(Some(table_references), resolver),
+        &resolver.catalog,
+    )
+    .ok()?;
 
+    let affinity = term_comparison_affinity(
+        lhs,
+        rhs,
+        operator,
+        table_col_pos,
+        &TableMetadata::new(Some(table_references)),
+    );
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
         operator,
+        comparison_collation,
         indexes,
         rowid_alias_column,
         is_rowid,
+        affinity,
         table_reference,
         query_where_clause,
     );
@@ -2300,17 +2364,6 @@ pub(crate) fn analyze_binary_term_for_index(
         }
     }
 
-    // Compute the affinity for the constraining expression
-    let affinity = if let Some(ast_op) = operator.as_ast_operator() {
-        if ast_op.is_comparison() && table_col_pos.is_some() {
-            comparison_affinity(lhs, rhs, Some(table_references), None)
-        } else {
-            Affinity::Blob
-        }
-    } else {
-        Affinity::Blob
-    };
-
     // Store the pre-computed constraining expression for multi-index branches
     let stored_constraining_expr = operator
         .as_ast_operator()
@@ -2329,6 +2382,7 @@ pub(crate) fn analyze_binary_term_for_index(
         is_rowid,
         comparison_affinity: Some(affinity),
         null_matching,
+        collation: Some(comparison_collation),
     };
 
     Some(AnalyzedTerm {
@@ -2338,13 +2392,31 @@ pub(crate) fn analyze_binary_term_for_index(
     })
 }
 
+fn term_comparison_affinity(
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+    operator: ConstraintOperator,
+    table_col_pos: Option<usize>,
+    metadata: &impl ExprProperties,
+) -> Affinity {
+    match operator.as_ast_operator() {
+        Some(op) if op.is_comparison() && table_col_pos.is_some() => {
+            comparison_affinity(lhs, rhs, metadata)
+        }
+        _ => Affinity::Blob,
+    }
+}
+
 /// Find the best index for a single constraint.
+#[allow(clippy::too_many_arguments)]
 fn find_best_index_for_constraint(
     table_col_pos: Option<usize>,
     operator: ConstraintOperator,
+    comparison_collation: CollationSeq,
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     is_rowid: bool,
+    affinity: Affinity,
     table_reference: &JoinedTable,
     query_where_clause: &[WhereTerm],
 ) -> (Option<Arc<Index>>, Vec<RangeConstraintRef>) {
@@ -2408,6 +2480,15 @@ fn find_best_index_for_constraint(
         return (None, vec![constraint_ref]);
     }
 
+    if !table_reference
+        .table
+        .columns()
+        .get(col_pos)
+        .is_some_and(|column| column.affinity().index_affinity_ok(affinity))
+    {
+        return (None, vec![]);
+    }
+
     // Find the best index that has this column as its first column
     if let Some(indexes) = indexes {
         for index in indexes.iter().filter(|idx| idx.index_method.is_none()) {
@@ -2419,7 +2500,7 @@ fn find_best_index_for_constraint(
             if let Some(idx_col_pos) = index.column_table_pos_to_index_pos(col_pos) {
                 // For multi-index OR, we prefer indexes where the constraint column
                 // is the first column (leftmost prefix)
-                if idx_col_pos == 0 {
+                if idx_col_pos == 0 && index.columns[0].collation == comparison_collation {
                     let constraint_ref = RangeConstraintRef {
                         table_col_pos: Some(col_pos),
                         index_col_pos: 0,

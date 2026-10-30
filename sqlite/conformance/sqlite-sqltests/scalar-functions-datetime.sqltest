@@ -344,6 +344,24 @@ expect {
     1650153600
 }
 
+test datetime-time-offset-of-24-hours-adds-nothing {
+    SELECT datetime('2024-01-01 10:00', '+24:00'),
+           datetime('2024-01-01 10:00', '-24:00:00.000'),
+           unixepoch('2024-01-01', '+24:00'),
+           datetime('2024-01-01 10:00', '+23:59');
+}
+expect {
+    2024-01-01 10:00:00|2024-01-01 10:00:00|1704067200|2024-01-02 09:59:00
+}
+
+test datetime-date-and-time-offset-of-24-hours-adds-only-the-date {
+    SELECT datetime('2024-01-01 10:00', '+0001-00-00 24:00'),
+           datetime('2024-01-01 10:00', '-0000-00-01 24:00');
+}
+expect {
+    2025-01-01 10:00:00|2023-12-31 10:00:00
+}
+
 test date-with-auto-julianday-top {
     SELECT date(5373484, 'auto');
 }
@@ -1415,6 +1433,34 @@ test strftime-error-null {
 expect {
 }
 
+test strftime-modifiers-out-of-range {
+    SELECT quote(strftime('%Y-%m-%d', 0, '-1 day')),
+           quote(strftime('%Y', 1, 'start of year')),
+           quote(strftime('%d', 5373484, '+1 day')),
+           quote(strftime('x', 0, '-1 day')),
+           quote(strftime('x', 5373484, '+1 day')),
+           quote(strftime('', 0, '-1 day'));
+}
+expect {
+    NULL|NULL|NULL|NULL|NULL|NULL
+}
+
+test strftime-modifiers-out-of-range-where {
+    WITH t1(a, b) AS (VALUES (0, '-1 day'), (5373484, '+1 day'))
+    SELECT count(*) FROM t1 WHERE strftime('%Y', a, b) IS NOT NULL;
+}
+expect {
+    0
+}
+
+test strftime-modifiers-valid-boundaries {
+    SELECT strftime('%Y-%m-%d %H:%M:%f', 1, '-1 day'),
+           strftime('%Y-%m-%d %H:%M:%f', '9999-12-31 23:59:58.999', '+1 second');
+}
+expect {
+    -4713-11-24 12:00:00.000|9999-12-31 23:59:59.999
+}
+
 test strftime-day {
     SELECT strftime('%d', '2025-01-23T13:10:30.567');
 }
@@ -1932,6 +1978,28 @@ test timediff-large-difference {
 }
 expect {
     +0000-00-02 02:00:00.000
+}
+
+test timediff-normalizes-overflowing-day {
+    SELECT timediff('2023-02-29', '2023-03-01');
+    SELECT timediff('2024-03-15', '2023-02-29');
+    SELECT timediff('2000-02-31', '2000-01-01');
+    SELECT timediff('2023-02-29 12:00', '2023-03-01');
+}
+expect {
+    +0000-00-00 00:00:00.000
+    +0001-00-14 00:00:00.000
+    +0000-02-01 00:00:00.000
+    +0000-00-00 12:00:00.000
+}
+
+test strftime-normalizes-overflowing-day {
+    SELECT strftime('%Y-%m-%d', '2023-02-29'), strftime('%d', '2000-02-31');
+    SELECT strftime('%Y-%m-%d', '2023-02-31', 'start of month');
+}
+expect {
+    2023-03-01|02
+    2023-02-01
 }
 
 test timediff-with-seconds-precision {
@@ -2620,4 +2688,117 @@ test date-blob-that-is-not-utf8 {
 }
 expect {
     null
+}
+
+test date-text-stops-at-nul {
+    SELECT date('2024-01-01' || char(0) || 'x');
+}
+expect {
+    2024-01-01
+}
+
+test time-blob-stops-at-nul {
+    SELECT time(X'3700'), time(X'3700FF');
+}
+expect {
+    12:00:00|12:00:00
+}
+
+test julianday-text-stops-at-nul {
+    SELECT julianday('2024-01-01' || char(0));
+}
+expect {
+    2460310.5
+}
+
+test date-modifier-stops-at-nul {
+    SELECT date('2024-01-01', '+1 day' || char(0) || 'x'), date('2024-01-01', X'2B312064617900');
+}
+expect {
+    2024-01-02|2024-01-02
+}
+
+test strftime-format-stops-at-nul {
+    SELECT hex(strftime('%Y' || char(0) || '%m', '2024-05-01'));
+}
+expect {
+    32303234
+}
+
+test strftime-time-value-and-modifier-stop-at-nul {
+    SELECT strftime('%Y-%m-%d', '2024-05-01' || char(0) || 'x', '+1 year' || char(0));
+}
+expect {
+    2025-05-01
+}
+
+test timediff-stops-at-nul {
+    SELECT timediff('2024-01-02' || char(0) || 'x', X'323032342D30312D303100');
+}
+expect {
+    +0000-00-01 00:00:00.000
+}
+
+test unixepoch-datetime-stop-at-nul {
+    SELECT unixepoch('2024-01-01' || char(0)), datetime('2024-01-01 10:00' || char(0) || 'zz');
+}
+expect {
+    1704067200|2024-01-01 10:00:00
+}
+
+test where-time-of-blob-with-nul {
+    SELECT count(*) FROM (SELECT X'3700' AS c) WHERE time(c);
+}
+expect {
+    1
+}
+
+test datetime-accepts-vertical-tab-whitespace {
+    SELECT quote(date('2024-01-01' || char(11))), quote(datetime('12:00' || char(11))), quote(date('2460000.5' || char(11))), quote(datetime('0' || char(11))), quote(date('2024-01-01' || char(12))), quote(datetime('2024-01-01' || char(11) || '12:00')), quote(datetime('2024-01-01 12:00' || char(11) || '+01:00'));
+}
+expect {
+    '2024-01-01'|'2000-01-01 12:00:00'|'2023-02-25'|'-4713-11-24 12:00:00'|'2024-01-01'|'2024-01-01 12:00:00'|'2024-01-01 11:00:00'
+}
+
+test datetime-modifier-rejects-text-after-unit-or-date {
+    SELECT quote(date('2024-01-01', '+1 day ')), quote(date('2024-01-01', '+1 day x')), quote(date('2024-01-01', '+1 month ')), quote(date('2024-01-01', '+0001-00-01 ')), quote(date(0, '+1 day ')), quote(date('2024-01-01', '+1 day' || char(9))), quote(date('2024-01-01', '+1 day' || char(10))), quote(date('2024-01-01', '+0001-00-01' || char(9))), quote(datetime('2024-01-01', '+0001-00-01  12:00'));
+}
+expect {
+    NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL|NULL
+}
+
+test datetime-modifier-allows-whitespace-inside {
+    SELECT quote(date('2024-01-01', '+1  day')), quote(date('2024-01-01', '+1' || char(9) || 'days')), quote(datetime('2024-01-01', '+0001-00-01 12:00 ')), quote(datetime('2024-01-01', '+0001-00-01' || char(9) || '12:00'));
+}
+expect {
+    '2024-01-02'|'2024-01-02'|'2025-01-02 12:00:00'|'2025-01-02 12:00:00'
+}
+
+test datetime-modifier-date-offset-requires-sign {
+    SELECT quote(datetime('2024-03-15 10:20:30', '0001-00-01')), quote(datetime('2024-03-15 10:20:30', '0001-00-01 12:00')), quote(datetime('2024-03-15 10:20:30', '0001-00-01' || char(9) || '12:00')), quote(datetime('2024-03-15 10:20:30', '0001-00-01' || char(10) || '12:00'));
+}
+expect {
+    NULL|NULL|NULL|NULL
+}
+
+test datetime-modifier-date-offset-five-digit-year {
+    SELECT quote(datetime('2024-03-15 10:20:30', '+00001-00-01')), quote(datetime('2024-03-15 10:20:30', '-00001-02-03 01:00')), quote(datetime('2024-03-15 10:20:30', '+000001-00-01'));
+}
+expect {
+    '2025-03-16 10:20:30'|'2023-01-12 09:20:30'|NULL
+}
+
+test current-time-same-for-whole-statement {
+    SELECT count(DISTINCT d), count(DISTINCT s), count(DISTINCT j), count(DISTINCT u), count(DISTINCT t)
+    FROM (SELECT datetime('subsecond') AS d, strftime('%Y-%m-%d %H:%M:%f', 'now') AS s, julianday('now') AS j, unixepoch('subsec') AS u, time('subsec') AS t FROM generate_series(1, 100000));
+}
+expect {
+    1|1|1|1|1
+}
+
+test current-time-same-for-streamed-rows {
+    SELECT count(*) FROM (SELECT DISTINCT datetime('subsecond') FROM generate_series(1, 100000));
+}
+expect {
+    1
 }

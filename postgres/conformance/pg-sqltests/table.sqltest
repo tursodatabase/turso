@@ -166,4 +166,428 @@ expect {
 test table-select-into-nested-rejected {
     SELECT * FROM (SELECT 1 INTO dst) sub;
 }
+@sqlstate 42601
 expect error {}
+
+test table-date-arithmetic {
+    CREATE TABLE dates (a date, b date);
+    INSERT INTO dates VALUES ('2025-01-05', '2025-01-01');
+    SELECT a + 1, a - 1, a - b FROM dates;
+}
+expect {
+    2025-01-06|2025-01-04|4
+}
+
+test table-indexed-date-column-with-default {
+    CREATE TABLE dates (a int, b int, c date DEFAULT '2000-01-01');
+    INSERT INTO dates VALUES (1, 2, '2024-05-06');
+    CREATE INDEX dates_c ON dates (c);
+    SELECT c FROM dates;
+    SELECT a, c FROM dates WHERE c = '2024-05-06';
+}
+expect {
+    2024-05-06
+    1|2024-05-06
+}
+
+test table-cast-timestamp-column-to-date-and-time {
+    CREATE TABLE events (ts timestamp);
+    INSERT INTO events VALUES ('2024-01-15 10:30:00');
+    SELECT ts::date, ts::time FROM events;
+}
+expect {
+    2024-01-15|10:30:00
+}
+
+test table-check-on-smallint-column {
+    CREATE TABLE t (n smallint DEFAULT 0 CHECK (n >= 0 AND n <= 2));
+    INSERT INTO t VALUES (1) RETURNING n;
+}
+expect {
+    1
+}
+
+test table-check-on-smallint-column-rejects-value-out-of-range {
+    CREATE TABLE t (n smallint DEFAULT 0 CHECK (n >= 0 AND n <= 2));
+    INSERT INTO t VALUES (3);
+}
+@sqlstate 23514
+expect error {}
+
+test table-check-compares-integer-types-of-different-sizes {
+    CREATE TABLE t (a smallint, b integer, c bigint, CHECK (a < b AND b < c AND c > 0));
+    INSERT INTO t VALUES (1, 2, 3);
+    SELECT a, b, c FROM t;
+}
+expect {
+    1|2|3
+}
+
+test table-delete-row-with-numeric-expression-index {
+    CREATE TABLE prices (id int PRIMARY KEY, val numeric(10,2));
+    CREATE INDEX prices_doubled ON prices ((val * 2));
+    INSERT INTO prices VALUES (1, 1.50);
+    DELETE FROM prices WHERE id = 1;
+    SELECT count(*) FROM prices;
+}
+expect {
+    0
+}
+
+test table-numeric-column-compared-with-expression {
+    CREATE TABLE nm (v numeric(10,2));
+    INSERT INTO nm VALUES (1.50);
+    SELECT count(*) FROM nm WHERE v = 1.5 + 0;
+    SELECT count(*) FROM nm WHERE v = (SELECT 1.5);
+    SELECT count(*) FROM nm WHERE (SELECT 1.5) = v;
+    SELECT count(*) FROM nm WHERE v < 1 + 1;
+    SELECT count(*) FROM nm WHERE v <> 1.5 + 0;
+    SELECT count(*) FROM nm WHERE v = 1.504 + 0;
+}
+expect {
+    1
+    1
+    1
+    1
+    0
+    0
+}
+
+test table-uuid-column-omitted-from-insert-is-null {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid);
+    INSERT INTO t (id) VALUES (1);
+    SELECT count(*) FROM t WHERE u IS NULL;
+}
+expect {
+    1
+}
+
+test table-uuid-column-with-explicit-default-generates-uuid {
+    CREATE TABLE t (id int PRIMARY KEY, u uuid DEFAULT gen_random_uuid());
+    INSERT INTO t (id) VALUES (1);
+    SELECT count(*) FROM t WHERE u IS NOT NULL;
+}
+expect {
+    1
+}
+
+@setup users
+test table-insert-returning-table-star {
+    INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.*;
+}
+expect {
+    4|dave|40|f
+}
+
+@setup users
+test table-update-returning-table-star {
+    UPDATE users SET age = age + 1 WHERE name = 'bob' RETURNING users.*;
+}
+expect {
+    2|bob|26|f
+}
+
+@setup users
+test table-delete-returning-table-star {
+    DELETE FROM users WHERE name = 'carol' RETURNING users.*;
+}
+expect {
+    3|carol|35|t
+}
+
+@setup users
+test table-returning-alias-star {
+    INSERT INTO users AS u VALUES (5, 'eve', 20, true) RETURNING u.*;
+    UPDATE users AS u SET age = 50 WHERE id = 1 RETURNING u.*;
+    DELETE FROM users u WHERE id = 5 RETURNING id, u.*;
+}
+expect {
+    5|eve|20|t
+    1|alice|50|t
+    5|5|eve|20|t
+}
+
+@setup users
+test table-returning-schema-qualified-star {
+    INSERT INTO public.users VALUES (4, 'dave', 40, false) RETURNING public.users.*;
+    UPDATE public.users SET age = 50 WHERE id = 1 RETURNING public.users.*, users.*;
+    DELETE FROM public.users WHERE id = 4 RETURNING public.users.*;
+}
+expect {
+    4|dave|40|f
+    1|alice|50|t|1|alice|50|t
+    4|dave|40|f
+}
+
+@setup users
+test table-returning-star-with-unknown-middle-name-rejected {
+    INSERT INTO users VALUES (4, 'dave', 40, false) RETURNING users.zz.*;
+}
+@sqlstate 42P01
+expect error {}
+
+@setup users
+test table-returning-star-with-other-schema-rejected {
+    INSERT INTO public.users VALUES (4, 'dave', 40, false) RETURNING pg_catalog.users.*;
+}
+@sqlstate 42P01
+expect error {}
+
+@setup users
+test table-returning-table-name-star-after-alias-rejected {
+    INSERT INTO users AS u VALUES (4, 'dave', 40, false) RETURNING users.*;
+}
+@sqlstate 42P01
+expect error {}
+
+setup upsert {
+    CREATE TABLE upsert_t (a int PRIMARY KEY, k int UNIQUE, b int);
+    INSERT INTO upsert_t VALUES (1, 1, 0);
+}
+
+@setup upsert
+test table-upsert-existing-row-updated-twice-rejected {
+    INSERT INTO upsert_t VALUES (1, 10, 1), (1, 11, 5) ON CONFLICT (a) DO UPDATE SET b = excluded.b;
+}
+@sqlstate 21000
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert
+test table-upsert-inserted-row-updated-rejected {
+    INSERT INTO upsert_t VALUES (2, 2, 1), (2, 3, 5) ON CONFLICT (a) DO UPDATE SET b = excluded.b;
+}
+@sqlstate 21000
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert
+test table-upsert-row-updated-twice-through-unique-column-rejected {
+    INSERT INTO upsert_t VALUES (2, 1, 1), (3, 1, 5) ON CONFLICT (k) DO UPDATE SET b = excluded.b;
+}
+@sqlstate 21000
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert
+test table-upsert-row-with-changed-key-updated-again-rejected {
+    INSERT INTO upsert_t VALUES (1, 10, 7), (10, 11, 5) ON CONFLICT (a) DO UPDATE SET a = 10;
+}
+@sqlstate 21000
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert
+test table-upsert-inserted-row-with-false-where-rejected {
+    INSERT INTO upsert_t VALUES (2, 2, 1), (2, 3, 5) ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE false;
+}
+@sqlstate 21000
+expect error {ON CONFLICT DO UPDATE command cannot affect row a second time}
+
+@setup upsert
+test table-upsert-existing-row-with-false-where-twice {
+    INSERT INTO upsert_t VALUES (1, 10, 1), (1, 11, 5) ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE false;
+    SELECT a, k, b FROM upsert_t ORDER BY a;
+}
+expect {
+    1|1|0
+}
+
+@setup upsert
+test table-upsert-different-rows-each-updated-once {
+    INSERT INTO upsert_t VALUES (2, 2, 0);
+    INSERT INTO upsert_t VALUES (1, 10, 1), (2, 20, 5), (3, 3, 9) ON CONFLICT (a) DO UPDATE SET b = excluded.b;
+    SELECT a, k, b FROM upsert_t ORDER BY a;
+}
+expect {
+    1|1|1
+    2|2|5
+    3|3|9
+}
+
+@setup upsert
+test table-upsert-do-nothing-skips-repeated-key {
+    INSERT INTO upsert_t VALUES (2, 2, 1), (2, 3, 5) ON CONFLICT (a) DO NOTHING;
+    SELECT a, k, b FROM upsert_t ORDER BY a;
+}
+expect {
+    1|1|0
+    2|2|1
+}
+
+test table-named-with-a-bracket-at-the-start {
+    CREATE TABLE "[t" (a int);
+    INSERT INTO "[t" VALUES (1);
+    SELECT a FROM "[t";
+}
+expect {
+    1
+}
+
+test table-column-aliases-that-start-with-a-quote-character {
+    CREATE TABLE t (a int);
+    INSERT INTO t VALUES (1);
+    SELECT a AS "[x", a AS """x" FROM t;
+}
+expect {
+    1|1
+}
+
+test table-names-in-brackets-and-without-brackets-are-different-tables {
+    CREATE TABLE "[t]" (a int);
+    CREATE TABLE t (a int);
+    INSERT INTO "[t]" VALUES (1);
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test table-column-names-keep-their-quote-characters {
+    CREATE TABLE t (x int, "'x'" int, "`x`" int, "[x]" int);
+    INSERT INTO t VALUES (1, 2, 3, 4);
+    SELECT x, "'x'", "`x`", "[x]" FROM t;
+}
+expect {
+    1|2|3|4
+}
+
+test table-serial-column-of-a-table-whose-name-has-double-quotes {
+    CREATE TABLE """t""" (id serial, v int);
+    INSERT INTO """t""" (v) VALUES (5);
+    INSERT INTO """t""" (v) VALUES (6);
+    SELECT id, v FROM """t""" ORDER BY id;
+}
+expect {
+    1|5
+    2|6
+}
+
+test table-serial-column-whose-name-has-double-quotes {
+    CREATE TABLE t ("""id""" serial, v int);
+    INSERT INTO t (v) VALUES (5);
+    SELECT """id""", v FROM t;
+}
+expect {
+    1|5
+}
+
+test table-serial-column-of-a-table-whose-name-has-a-double-quote-inside {
+    CREATE TABLE "a""b" (id serial, v int);
+    INSERT INTO "a""b" (v) VALUES (5);
+    SELECT id, v FROM "a""b";
+}
+expect {
+    1|5
+}
+
+test table-sequence-whose-name-has-double-quotes {
+    CREATE SEQUENCE """s""";
+    SELECT sequencename FROM pg_sequences;
+}
+expect {
+    "s"
+}
+
+test drop-materialized-view-on-a-view-errors {
+    CREATE TABLE t (a int);
+    CREATE VIEW v AS SELECT * FROM t;
+    DROP MATERIALIZED VIEW v;
+}
+@sqlstate 42809
+expect error {
+    "v" is not a materialized view
+}
+
+test drop-materialized-view-if-exists-on-a-view-errors {
+    CREATE TABLE t (a int);
+    CREATE VIEW v AS SELECT * FROM t;
+    DROP MATERIALIZED VIEW IF EXISTS public.v;
+}
+@sqlstate 42809
+expect error {
+    "v" is not a materialized view
+}
+
+test drop-view-on-a-table-errors {
+    CREATE TABLE t (a int);
+    DROP VIEW IF EXISTS t;
+}
+@sqlstate 42809
+expect error {
+    "t" is not a view
+}
+
+test table-domain-not-null-default-fills-omitted-column {
+    CREATE DOMAIN nn_default AS int NOT NULL DEFAULT 3;
+    CREATE TABLE t (a nn_default, b int);
+    INSERT INTO t(b) VALUES (2);
+    SELECT a, b FROM t;
+}
+expect {
+    3|2
+}
+
+test table-domain-not-null-default-rejects-explicit-null {
+    CREATE DOMAIN nn_default AS int NOT NULL DEFAULT 3;
+    CREATE TABLE t (a nn_default, b int);
+    INSERT INTO t VALUES (NULL, 2);
+}
+expect error {}
+
+test table-add-column-function-default-fills-each-existing-row {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN c uuid DEFAULT gen_random_uuid();
+    ALTER TABLE t ADD COLUMN d timestamptz DEFAULT now();
+    SELECT count(c), count(DISTINCT c), count(d) FROM t;
+}
+expect {
+    2|2|2
+}
+
+test table-add-column-expression-default-fills-existing-rows {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN e int DEFAULT (5 + 3);
+    INSERT INTO t (x) VALUES (3);
+    SELECT x, e FROM t ORDER BY x;
+}
+expect {
+    1|8
+    2|8
+    3|8
+}
+
+test table-add-column-default-with-column-reference-errors {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (5);
+    ALTER TABLE t ADD COLUMN c int DEFAULT x * 2;
+}
+expect error {}
+
+test table-add-column-not-null-default-with-null-inside-fills-existing-rows {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN c int NOT NULL DEFAULT coalesce(NULL, 7);
+    ALTER TABLE t ADD COLUMN d text NOT NULL DEFAULT CASE WHEN 1 < 2 THEN 'y' ELSE NULL END;
+    SELECT x, c, d FROM t ORDER BY x;
+}
+expect {
+    1|7|y
+    2|7|y
+}
+
+test table-add-column-not-null-default-that-is-null-errors {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN z int NOT NULL DEFAULT nullif(1, 1);
+}
+expect error {}
+
+test add-column-fills-existing-rows-with-a-function-default {
+    CREATE TABLE add_column_fill (id int);
+    INSERT INTO add_column_fill VALUES (1), (2);
+    ALTER TABLE add_column_fill ADD COLUMN schema_name text DEFAULT current_schema;
+    SELECT id, schema_name FROM add_column_fill ORDER BY id;
+}
+expect {
+    1|public
+    2|public
+}

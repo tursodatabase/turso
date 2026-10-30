@@ -8,7 +8,9 @@ use std::{
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde_json::{json, Value as JsonValue};
-use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, StepResult, Value};
+use turso_core::{
+    ConnectOpts, Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, StepResult, Value,
+};
 
 #[derive(Parser)]
 #[command(name = "turso-join-benchmark")]
@@ -61,7 +63,7 @@ fn main() -> Result<()> {
         &args.database.to_string_lossy(),
         OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::ReadOnly),
     )?;
-    let connection = database.connect()?;
+    let connection = database.connect(ConnectOpts::new())?;
 
     for query in queries {
         if args.plans {

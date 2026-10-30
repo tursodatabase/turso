@@ -212,7 +212,7 @@ mod tests {
     use super::*;
     use crate::vdbe::StepResult;
     use crate::SqliteDialect;
-    use crate::{Database, IOResult, OpenFlags};
+    use crate::{ConnectOpts, Database, IOResult, OpenFlags};
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct StepGuardedIO {
@@ -359,7 +359,7 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryYieldIO::new());
         let db = Database::open_file(io.clone(), "memory_yield_test.db", Arc::new(SqliteDialect))
             .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Step statements manually so we can observe the cooperative-yield path.
         // Returns (rows, number of StepResult::IO yields).
@@ -411,7 +411,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let mut stmt = conn.prepare("PRAGMA journal_mode = 'mvcc'").unwrap();
 
         let mut rows = Vec::new();
@@ -456,7 +456,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         let run = |sql: &str| {
             let mut stmt = conn.prepare(sql).unwrap();
@@ -498,7 +498,7 @@ mod tests {
         let io = Arc::new(StepGuardedIO::new());
         let db = Database::open_file(io.clone(), "pager_header_yield.db", Arc::new(SqliteDialect))
             .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
 
         let pager = conn.get_pager();
@@ -531,7 +531,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(x BLOB)").unwrap();
         conn.execute("INSERT INTO t VALUES (zeroblob(20000))")
             .unwrap();
@@ -592,7 +592,7 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Drive one statement to completion exactly like the WASM/OPFS JS
         // binding does: step, and on StepResult::IO hand control back to the

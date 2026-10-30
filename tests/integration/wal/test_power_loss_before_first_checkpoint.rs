@@ -23,7 +23,7 @@
 use asserting::prelude::*;
 use std::sync::Arc;
 
-use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
 
 use crate::common::limbo_exec_rows;
 use crate::unreliable_io::UnreliableIo;
@@ -42,7 +42,7 @@ fn test_committed_wal_survives_power_loss_before_first_checkpoint() {
     // Phase 1: commit 10 transactions with synchronous=FULL, never checkpoint.
     {
         let db = Database::open_file(io.clone(), &db_path_str, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         limbo_exec_rows(&conn, "PRAGMA synchronous=FULL");
         limbo_exec_rows(&conn, "CREATE TABLE t(x)");
         for i in 0..10 {
@@ -71,7 +71,7 @@ fn test_committed_wal_survives_power_loss_before_first_checkpoint() {
     // verify that recovery replays the durable WAL.
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     // All 10 committed, fsync-acknowledged transactions must come back from
     // the WAL after a crash before the first checkpoint.
     assert_that!(limbo_exec_rows(&conn, "SELECT count(*) FROM t")).is_equal_to(vec![row![10]]);
@@ -98,7 +98,7 @@ fn test_page1_is_durable_in_main_file_before_first_wal_commit() {
     // Commit transactions with synchronous=FULL, never checkpoint, "crash".
     {
         let db = Database::open_file(io.clone(), &db_path_str, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         limbo_exec_rows(&conn, "PRAGMA synchronous=FULL");
         limbo_exec_rows(&conn, "CREATE TABLE t(x)");
         for i in 0..10 {
@@ -152,7 +152,7 @@ fn test_orphan_wal_of_an_empty_database_is_discarded_like_sqlite() {
     {
         let db =
             Database::open_file(io.clone(), &source_path_str, Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         limbo_exec_rows(&conn, "PRAGMA synchronous=FULL");
         limbo_exec_rows(&conn, "CREATE TABLE t(x)");
         limbo_exec_rows(&conn, "INSERT INTO t VALUES (1)");
@@ -181,7 +181,7 @@ fn test_orphan_wal_of_an_empty_database_is_discarded_like_sqlite() {
     let (turso_db_path, turso_wal_path) = orphan_wal("turso_reset");
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, &turso_db_path, Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM sqlite_schema");
     assert_eq!(
         rows,
@@ -210,7 +210,7 @@ fn test_orphan_wal_of_an_empty_database_is_discarded_like_sqlite() {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM sqlite_schema");
     assert_eq!(
         rows,

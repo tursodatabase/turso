@@ -12,6 +12,7 @@
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use turso_core::NamespaceId;
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -21,7 +22,7 @@ use codspeed_criterion_compat::{
 
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, StepResult};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -102,7 +103,7 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
 
     // Create table and FTS index
@@ -154,7 +155,7 @@ fn setup_fts_db(temp_dir: &TempDir, row_count: usize) -> Arc<Database> {
 /// Setup an index with one FTS commit per row to exercise segment churn.
 fn setup_fts_churn_db(temp_dir: &TempDir, commit_count: usize) -> Arc<Database> {
     let db = setup_fts_db(temp_dir, 0);
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA fts_merge_threshold = 32").unwrap();
 
     for id in 0..commit_count {
@@ -192,7 +193,7 @@ fn bench_fts_cold_query(criterion: &mut Criterion) {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
                         // Fresh connection = no cached directory
-                        let conn = db.connect().unwrap();
+                        let conn = db.connect(ConnectOpts::new()).unwrap();
                         let start = std::time::Instant::now();
                         let mut stmt = conn
                             .query(
@@ -225,7 +226,7 @@ fn bench_fts_warm_query(criterion: &mut Criterion) {
     for row_count in [1000, 5000, 10000] {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_fts_db(&temp_dir, row_count);
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
 
         // Warm up: run one query to populate the directory cache
         let mut stmt = conn
@@ -272,7 +273,7 @@ fn bench_fts_connection_pool_query(criterion: &mut Criterion) {
 
     for connection_count in [1, 2, 4] {
         let connections = (0..connection_count)
-            .map(|_| db.connect().unwrap())
+            .map(|_| db.connect(ConnectOpts::new()).unwrap())
             .collect::<Vec<_>>();
         for conn in &connections {
             let mut stmt = conn
@@ -321,7 +322,7 @@ fn bench_fts_query_selectivity(criterion: &mut Criterion) {
     let row_count = 10000;
     let temp_dir = tempfile::tempdir().unwrap();
     let db = setup_fts_db(&temp_dir, row_count);
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     // Warm up
     let mut stmt = conn
@@ -370,7 +371,7 @@ fn bench_fts_insert_then_query(criterion: &mut Criterion) {
     for row_count in [1000, 5000] {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_fts_db(&temp_dir, row_count);
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
 
         // Use a shared counter that persists across warmup + sampling invocations
@@ -431,7 +432,7 @@ fn bench_fts_segment_churn_query(criterion: &mut Criterion) {
     for commit_count in [64, 256, 1024] {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_fts_churn_db(&temp_dir, commit_count);
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         let dense_sql = "SELECT fts_score(body, 'common') AS score, id \
                          FROM docs \
                          WHERE fts_match(body, 'common') \
@@ -506,7 +507,7 @@ fn bench_fts_single_row_commit_churn(criterion: &mut Criterion) {
                     for repetition in 0..iters {
                         let temp_dir = tempfile::tempdir().unwrap();
                         let db = setup_fts_db(&temp_dir, 0);
-                        let conn = db.connect().unwrap();
+                        let conn = db.connect(ConnectOpts::new()).unwrap();
                         conn.execute(format!("PRAGMA fts_merge_threshold = {merge_threshold}"))
                             .unwrap();
                         let start = std::time::Instant::now();
@@ -556,7 +557,7 @@ fn bench_fts_large_merge_boundary(criterion: &mut Criterion) {
         let setup = || {
             let temp_dir = tempfile::tempdir().unwrap();
             let db = setup_fts_db(&temp_dir, 0);
-            let conn = db.connect().unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.execute(format!("PRAGMA fts_merge_threshold = {merge_threshold}"))
                 .unwrap();
             (temp_dir, db, conn)
@@ -675,7 +676,7 @@ fn setup_fts_fragmented_db(
 ) -> (TempDir, Arc<Database>, Arc<turso_core::Connection>) {
     let temp_dir = tempfile::tempdir().unwrap();
     let db = setup_fts_db(&temp_dir, 0);
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
     let rows_per_segment = 512 / segment_count;
     assert_eq!(512 % segment_count, 0);
@@ -750,7 +751,7 @@ fn bench_fts_searcher_cache(criterion: &mut Criterion) {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
         conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
             .unwrap();
@@ -772,7 +773,7 @@ fn bench_fts_searcher_cache(criterion: &mut Criterion) {
         let attachment = conn
             .with_schema_mut(|schema| {
                 schema
-                    .get_index("docs", "docs_fts")
+                    .get_index(NamespaceId::ROOT, "docs", "docs_fts")
                     .unwrap()
                     .index_method
                     .clone()

@@ -4,7 +4,7 @@ Turso supports a comprehensive testing system to ensure correctness, performance
 
 ## 1. Compatibility Tests
 
-The `make test` target is the main entry point.
+The `make test` target is the main entry point. It needs [uv](../CONTRIBUTING.md#prerequisites) to be installed, because it uses `uv sync` and `uv run` to install and run the Python test packages. You can install uv with `brew install uv` or `pipx install uv`.
 
 Most compatibility tests live in the testing/ directory and are written in SQLite’s TCL test format. These tests ensure that Turso matches SQLite’s behavior exactly. The database used during these tests is located at testing/testing.db, which includes the following schema:
 
@@ -120,16 +120,16 @@ The Turso deterministic simulator
 Usage: limbo_sim [OPTIONS]
 
 Options:
-  -s, --seed <SEED>                  set seed for reproducible runs
-  -d, --doublecheck                  enable doublechecking, run the simulator with the plan twice and check output equality
-  -n, --maximum-size <MAXIMUM_SIZE>  change the maximum size of the randomly generated sequence of interactions [default: 5000]
-  -k, --minimum-size <MINIMUM_SIZE>  change the minimum size of the randomly generated sequence of interactions [default: 1000]
-  -t, --maximum-time <MAXIMUM_TIME>  change the maximum time of the simulation(in seconds) [default: 3600]
-  -l, --load <LOAD>                  load plan from the bug base
-  -w, --watch                        enable watch mode that reruns the simulation on file changes
-      --differential                 run differential testing between sqlite and Turso
-  -h, --help                         Print help
-  -V, --version                      Print version
+  -s, --seed <SEED>                    set seed for reproducible runs
+  -d, --doublecheck                    enable doublechecking, run the simulator with the plan twice and check output equality
+  -n, --maximum-tests <MAXIMUM_TESTS>  change the maximum size of the randomly generated sequence of interactions [default: 5000]
+  -k, --minimum-tests <MINIMUM_TESTS>  change the minimum size of the randomly generated sequence of interactions [default: 1000]
+  -t, --maximum-time <MAXIMUM_TIME>    change the maximum time of the simulation(in seconds) [default: 3600]
+  -l, --load <LOAD>                    load plan from the bug base
+  -w, --watch                          enable watch mode that reruns the simulation on file changes
+      --differential                   run differential testing between sqlite and Turso
+  -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
 ## Fuzzing

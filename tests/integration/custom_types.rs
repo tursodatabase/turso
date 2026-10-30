@@ -2,6 +2,7 @@
 mod tests {
     use crate::common::{ExecRows, TempDatabase};
     use asserting::prelude::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -139,6 +140,78 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_reopen_fails_when_stored_custom_type_does_not_parse() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_bad_type_sql.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+                .unwrap();
+            conn.execute("CREATE TYPE zz BASE text ENCODE upper(value) DECODE lower(value)")
+                .unwrap();
+            conn.execute("CREATE TABLE t(a cents, b zz) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (5, 'Hi')").unwrap();
+
+            conn.start_nested();
+            let stmt = conn.prepare(
+                "UPDATE __turso_internal_types SET sql = 'CREATE TYPE cents BAZE integer' \
+                 WHERE name = 'cents'",
+            );
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let result = turso_core::Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+            Arc::new(turso_core::SqliteDialect),
+        );
+        let Err(err) = result else {
+            panic!("open must fail when a stored type does not parse");
+        };
+        assert!(
+            err.to_string().contains("malformed database schema"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_reparse_fails_when_stored_custom_type_does_not_parse() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE TABLE t(a cents) STRICT").unwrap();
+
+        conn.start_nested();
+        let stmt = conn.prepare(
+            "UPDATE __turso_internal_types SET sql = 'CREATE TYPE cents BAZE integer' \
+             WHERE name = 'cents'",
+        );
+        conn.end_nested();
+        stmt.unwrap().run_ignore_rows().unwrap();
+
+        assert_that!(conn.execute("VACUUM"))
+            .err()
+            .display_string()
+            .contains("malformed database schema");
+    }
+
     /// After reopening, schema changes (CREATE TABLE) that use a previously
     /// defined custom type must still work. The type must survive the schema
     /// change and new tables must encode/decode correctly.
@@ -199,6 +272,46 @@ mod tests {
             let rows: Vec<(i64,)> = conn.exec_rows("SELECT price FROM t2 WHERE id = 1");
             assert_eq!(rows, vec![(99,)], "t2 should decode after second reopen");
 
+            conn.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_add_column_with_non_literal_type_default_survives_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_add_column_default.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE DOMAIN dm AS text DEFAULT lower('X')")
+                .unwrap();
+            conn.execute("CREATE TYPE ty BASE text ENCODE value DECODE value DEFAULT lower('Y')")
+                .unwrap();
+            conn.execute("CREATE TABLE t(a INTEGER) STRICT").unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN b dm").unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN c ty").unwrap();
+            let rows: Vec<(String,)> =
+                conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+            assert_eq!(
+                rows,
+                vec![(
+                    "CREATE TABLE t (a INTEGER, b dm DEFAULT (lower ('X')), c ty DEFAULT (lower ('Y'))) STRICT"
+                        .to_string(),
+                )]
+            );
+            conn.close().unwrap();
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("INSERT INTO t(a) VALUES (1)").unwrap();
+            let rows: Vec<(i64, String, String)> = conn.exec_rows("SELECT a, b, c FROM t");
+            assert_eq!(rows, vec![(1, "x".to_string(), "y".to_string())]);
             conn.close().unwrap();
         }
     }
@@ -496,5 +609,121 @@ mod tests {
             ],
             "LEFT JOIN on custom type column should find matches and produce NULLs for non-matches"
         );
+    }
+
+    #[test]
+    fn test_date_plus_and_minus_bound_integer() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t1(d date) STRICT").unwrap();
+        conn.execute("INSERT INTO t1 VALUES ('2025-01-05')")
+            .unwrap();
+
+        let mut stmt = conn.prepare("SELECT d + ?1, d - ?1 FROM t1").unwrap();
+        stmt.bind_at(1.try_into().unwrap(), turso_core::Value::from_i64(3))
+            .unwrap();
+        let mut rows = Vec::new();
+        stmt.run_with_row_callback(|row| {
+            rows.push((row.get::<String>(0)?, row.get::<String>(1)?));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![("2025-01-08".to_string(), "2025-01-02".to_string())]
+        );
+    }
+
+    /// A failed `CREATE TYPE` must not leave `__turso_internal_types` behind: the types table is
+    /// registered in the connection schema before the type SQL is parsed, and the rollback
+    /// restores that schema only when the schema cookie was set beforehand.
+    #[test]
+    fn test_failed_create_type_leaves_no_types_table() {
+        for mvcc in [false, true] {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+
+            // 257 variants: the type SQL is persisted first and rejected only when the type
+            // itself is added to the schema
+            let variants = (0..257)
+                .map(|i| format!("v{i} INT"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_that!(conn.execute(format!("CREATE TYPE u AS UNION({variants})")))
+                .err()
+                .display_string()
+                .contains("UNION type cannot have more than 256 variants");
+
+            let tables: Vec<(String, String, String, i64, i64, i64)> =
+                conn.exec_rows("PRAGMA table_list");
+            assert!(
+                !tables
+                    .iter()
+                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                "failed CREATE TYPE left the types table in the schema (mvcc={mvcc}): {tables:?}"
+            );
+
+            // The connection must still be usable: a later CREATE TYPE has to succeed
+            conn.execute("CREATE TYPE t2 BASE text").unwrap();
+            let tables: Vec<(String, String, String, i64, i64, i64)> =
+                conn.exec_rows("PRAGMA table_list");
+            assert!(
+                tables
+                    .iter()
+                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                "CREATE TYPE did not register the types table (mvcc={mvcc}): {tables:?}"
+            );
+            conn.close().unwrap();
+        }
+    }
+
+    /// The other half of the same invariant: when the types table already exists, a failed
+    /// `CREATE TYPE` must leave it in place, and leave the connection usable.
+    #[test]
+    fn test_failed_create_type_keeps_an_existing_types_table() {
+        for mvcc in [false, true] {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+
+            conn.execute("CREATE TYPE type_one BASE text").unwrap();
+
+            let variants = (0..257)
+                .map(|i| format!("v{i} INT"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_that!(conn.execute(format!("CREATE TYPE u AS UNION({variants})")))
+                .err()
+                .display_string()
+                .contains("UNION type cannot have more than 256 variants");
+
+            let tables: Vec<(String, String, String, i64, i64, i64)> =
+                conn.exec_rows("PRAGMA table_list");
+            assert!(
+                tables
+                    .iter()
+                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                "failed CREATE TYPE dropped the existing types table (mvcc={mvcc}): {tables:?}"
+            );
+
+            // The failed type must not be persisted, and the connection must still be usable
+            conn.execute("CREATE TYPE type_two BASE text").unwrap();
+            let types: Vec<(String,)> =
+                conn.exec_rows("SELECT name FROM __turso_internal_types ORDER BY name");
+            assert_eq!(
+                types,
+                vec![("type_one".to_string(),), ("type_two".to_string(),)],
+                "mvcc={mvcc}"
+            );
+            conn.close().unwrap();
+        }
     }
 }

@@ -175,7 +175,6 @@ fn test_vacuum_into_with_triggers(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
 fn test_vacuum_into_preserves_meta_values(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();

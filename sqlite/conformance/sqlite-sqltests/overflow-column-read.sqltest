@@ -1,0 +1,166 @@
+@database :memory:
+
+# Reading columns of rows whose record spills into overflow pages. Like
+# SQLite's OP_Column, values stored on the b-tree page are decoded in place
+# and a value in the overflow pages is read on its own. The 512-byte pages
+# make small values spill.
+
+@cross-check-integrity
+test overflow-columns-before-and-after-large-value {
+    PRAGMA page_size = 512;
+    CREATE TABLE t(a INTEGER, b TEXT, big TEXT, c INTEGER, d TEXT, e REAL);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40)
+    INSERT INTO t SELECT i, 'b' || i, substr(hex(zeroblob(1500 + i * 37)), 1, 1500 + i * 37), i * 1000000007, 'd' || i, i / 4.0 FROM n;
+    SELECT a, b, c, d, e FROM t WHERE a IN (1, 17, 39);
+    SELECT d, a FROM t WHERE a = 17;
+    SELECT count(*), sum(a), sum(c), sum(length(b)), sum(length(d)), CAST(sum(e) * 4 AS INTEGER), sum(length(big)) FROM t;
+}
+expect {
+    1|b1|1000000007|d1|0.25
+    17|b17|17000000119|d17|4.25
+    39|b39|39000000273|d39|9.75
+    d17|17
+    40|820|820000005740|111|111|820|90340
+}
+
+# The first column grows one byte per row, so the values after it end just
+# before, at, and just after the end of the bytes kept on the page.
+@cross-check-integrity
+test overflow-values-across-end-of-page-bytes {
+    PRAGMA page_size = 512;
+    CREATE TABLE s(i INTEGER, pad TEXT, n INTEGER, r REAL, big BLOB, tail TEXT);
+    WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 520)
+    INSERT INTO s SELECT i, substr(hex(zeroblob(i)), 1, i), i * 7205759403792, i + 0.5, zeroblob(600), 't' || i FROM n;
+    SELECT count(*), sum(length(pad)), sum(n), sum(r), sum(length(big)), sum(substr(tail, 2)) FROM s;
+    SELECT i, length(pad), n, r, tail FROM s WHERE i IN (0, 38, 39, 40, 437, 438, 439, 476, 477, 478, 520);
+}
+expect {
+    521|135460|976092168837664320|135720.5|312600|135460
+    0|0|0|0.5|t0
+    38|38|273818857344096|38.5|t38
+    39|39|281024616747888|39.5|t39
+    40|40|288230376151680|40.5|t40
+    437|437|3148916859457104|437.5|t437
+    438|438|3156122618860896|438.5|t438
+    439|439|3163328378264688|439.5|t439
+    476|476|3429941476204992|476.5|t476
+    477|477|3437147235608784|477.5|t477
+    478|478|3444352995012576|478.5|t478
+    520|520|3746994889971840|520.5|t520
+}
+
+# 62 columns give a record header longer than the bytes some of these rows
+# keep on the page, so the header itself spills into the overflow pages.
+@cross-check-integrity
+test overflow-record-header-spills-off-page {
+    PRAGMA page_size = 512;
+    CREATE TABLE w(c1 INTEGER, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23, c24, c25, c26, c27, c28, c29, c30 INTEGER, c31, c32, c33, c34, c35, c36, c37, c38, c39, c40, c41, c42, c43, c44, c45, c46, c47, c48, c49, c50, c51, c52, c53, c54, c55, c56, c57, c58, c59, c60 INTEGER, big BLOB, last TEXT);
+    WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 520)
+    INSERT INTO w(c1, c30, c60, big, last) SELECT i, i * 2, i * 3, zeroblob(1000 + i), 'L' || i FROM n;
+    SELECT count(*), sum(c1), sum(c30), sum(c60), sum(length(big)), count(last), sum(substr(last, 2)), count(c2) FROM w;
+    SELECT c1, c2, c30, c60, last FROM w WHERE c1 IN (0, 418, 419, 450, 487, 488, 520);
+    SELECT c59, c60, length(big), last FROM w WHERE c1 = 450;
+}
+expect {
+    521|135460|270920|406380|656460|521|135460|0
+    0||0|0|L0
+    418||836|1254|L418
+    419||838|1257|L419
+    450||900|1350|L450
+    487||974|1461|L487
+    488||976|1464|L488
+    520||1040|1560|L520
+    |1350|1450|L450
+}
+
+@cross-check-integrity
+test overflow-index-key-columns {
+    PRAGMA page_size = 512;
+    CREATE TABLE x(id INTEGER PRIMARY KEY, k INTEGER, big TEXT, j INTEGER);
+    CREATE INDEX x_k_big_j ON x(k, big, j);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 60)
+    INSERT INTO x SELECT i, i % 7, substr(hex(zeroblob(400 + i)), 1, 800 + 2 * i), i * 3 FROM n;
+    SELECT k, count(*) FROM x INDEXED BY x_k_big_j GROUP BY k;
+    SELECT k, j FROM x INDEXED BY x_k_big_j WHERE k = 3 ORDER BY k, big;
+    SELECT sum(j), sum(length(big)) FROM x INDEXED BY x_k_big_j WHERE k > 4;
+}
+expect {
+    0|8
+    1|9
+    2|9
+    3|9
+    4|9
+    5|8
+    6|8
+    3|9
+    3|30
+    3|51
+    3|72
+    3|93
+    3|114
+    3|135
+    3|156
+    3|177
+    1440|13760
+}
+
+# Rows written before ADD COLUMN have fewer columns, and read the defaults.
+@cross-check-integrity
+test overflow-rows-written-before-add-column {
+    PRAGMA page_size = 512;
+    CREATE TABLE al(a INTEGER, big TEXT);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5)
+    INSERT INTO al SELECT i, substr(hex(zeroblob(1500)), 1, 1500 + i) FROM n;
+    ALTER TABLE al ADD COLUMN n INTEGER DEFAULT 42;
+    ALTER TABLE al ADD COLUMN s TEXT DEFAULT 'dflt';
+    INSERT INTO al VALUES (99, substr(hex(zeroblob(1500)), 1, 2000), 1, 'x');
+    SELECT a, n, s FROM al ORDER BY a;
+    SELECT a, length(big), n, s FROM al ORDER BY a;
+}
+expect {
+    1|42|dflt
+    2|42|dflt
+    3|42|dflt
+    4|42|dflt
+    5|42|dflt
+    99|1|x
+    1|1501|42|dflt
+    2|1502|42|dflt
+    3|1503|42|dflt
+    4|1504|42|dflt
+    5|1505|42|dflt
+    99|2000|1|x
+}
+
+# NULL, empty text and blob, and the constants 0 and 1 take no bytes.
+@cross-check-integrity
+test overflow-values-without-bytes-after-large-value {
+    PRAGMA page_size = 512;
+    CREATE TABLE z(a INTEGER, big BLOB, n, e TEXT, eb BLOB, zero INTEGER, one INTEGER, f REAL);
+    INSERT INTO z VALUES (1, zeroblob(3000), NULL, '', x'', 0, 1, -2.5);
+    SELECT a, n IS NULL, length(e), typeof(e), length(eb), typeof(eb), zero, one, f FROM z;
+    SELECT n IS NULL, e, zero, one FROM z;
+}
+expect {
+    1|1|0|text|0|blob|0|1|-2.5
+    1||0|1
+}
+
+@cross-check-integrity
+test overflow-rows-after-update-and-delete {
+    PRAGMA page_size = 512;
+    CREATE TABLE u(a INTEGER, big TEXT, c INTEGER);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 30)
+    INSERT INTO u SELECT i, substr(hex(zeroblob(1500)), 1, 1500 + i * 11), i FROM n;
+    UPDATE u SET big = big || 'x', c = c + a WHERE a % 3 = 0;
+    DELETE FROM u WHERE a % 5 = 0;
+    SELECT count(*), sum(a), sum(c), sum(length(big)) FROM u;
+    SELECT a, c FROM u WHERE a IN (3, 4, 6, 29);
+}
+expect {
+    24|360|480|39968
+    3|6
+    4|4
+    6|12
+    29|29
+}

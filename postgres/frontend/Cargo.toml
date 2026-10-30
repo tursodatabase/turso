@@ -11,9 +11,12 @@ description = "PostgreSQL frontend for Turso"
 path = "lib.rs"
 
 [dependencies]
+bitflags = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
+chumsky = { workspace = true }
 parking_lot = { workspace = true }
 rustc-hash = "2.0"
+serde_json = { workspace = true }
 strum = { workspace = true }
 tempfile = { workspace = true }
 turso_core = { workspace = true, default-features = true, features = [
@@ -22,6 +25,7 @@ turso_core = { workspace = true, default-features = true, features = [
 turso_parser = { workspace = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 turso_pg_parser = { workspace = true }
+uuid = "1.11.0"
 
 [dev-dependencies]
 turso_core = { workspace = true, features = ["io_memory_yield"] }

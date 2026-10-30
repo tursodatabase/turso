@@ -1,4 +1,5 @@
 use super::*;
+use crate::ConnectOpts;
 use crate::DatabaseAllocators;
 use std::{
     ptr::NonNull,
@@ -144,7 +145,7 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
             }),
     )
     .unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
 
     allocations.store(0, Ordering::Relaxed);
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();

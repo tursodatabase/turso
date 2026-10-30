@@ -17,7 +17,7 @@ use turso_core::alloc::DynAllocator;
 use turso_core::mvcc::clock::MvccClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
-use turso_core::{Connection, Database, MemoryIO, Statement, StepResult, Value};
+use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Statement, StepResult, Value};
 
 struct BenchDb {
     _db: Arc<Database>,
@@ -28,7 +28,7 @@ struct BenchDb {
 fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     // Enable MVCC via PRAGMA
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     let mvcc_store = db.get_mv_store().clone().unwrap();
@@ -113,7 +113,7 @@ fn bench(c: &mut Criterion) {
             db.mvcc_store
                 .update(
                     tx_id,
-                    Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data, 1)
+                    Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data)
                         .unwrap(),
                 )
                 .unwrap();
@@ -137,7 +137,7 @@ fn bench(c: &mut Criterion) {
     db.mvcc_store
         .insert(
             tx_id,
-            Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data, 1).unwrap(),
+            Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data).unwrap(),
         )
         .unwrap();
     group.bench_function("read", |b| {
@@ -159,7 +159,7 @@ fn bench(c: &mut Criterion) {
     db.mvcc_store
         .insert(
             tx_id,
-            Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data, 1).unwrap(),
+            Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data).unwrap(),
         )
         .unwrap();
     group.bench_function("update", |b| {
@@ -167,7 +167,7 @@ fn bench(c: &mut Criterion) {
             db.mvcc_store
                 .update(
                     tx_id,
-                    Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data, 1)
+                    Row::new_table_row(RowID::new((-2).into(), RowKey::Int(1)), record_data)
                         .unwrap(),
                 )
                 .unwrap();
@@ -320,7 +320,7 @@ impl HugeMultiWriteHarness {
         // CPU-bound index-probe path the eq-only seek bound affects.
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect().unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         // Keep everything in MvStore so the measurement reflects the in-memory
         // index path rather than checkpoint I/O.
@@ -336,7 +336,7 @@ impl HugeMultiWriteHarness {
             .unwrap();
 
         let ghost = (pending > 0).then(|| {
-            let ghost = db.connect().unwrap();
+            let ghost = db.connect(ConnectOpts::new()).unwrap();
             ghost.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
             ghost.execute("BEGIN CONCURRENT").unwrap();
             ghost.execute(ghost_insert_sql(pending, placement)).unwrap();

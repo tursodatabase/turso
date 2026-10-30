@@ -160,3 +160,16 @@ expect {
     0|0|a
     0|1|b
 }
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test pragma-index-list-without-rowid-primary-key {
+    CREATE TABLE w(x, PRIMARY KEY(x)) WITHOUT ROWID;
+    CREATE TABLE w2(a, b, c COLLATE NOCASE, d, PRIMARY KEY(c DESC, a)) WITHOUT ROWID;
+    SELECT 'list', * FROM pragma_index_list('w');
+    PRAGMA index_list(w2);
+}
+expect {
+    list|0|sqlite_autoindex_w_1|1|pk|0
+    0|sqlite_autoindex_w2_1|1|pk|0
+}

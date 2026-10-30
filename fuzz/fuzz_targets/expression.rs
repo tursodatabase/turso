@@ -4,6 +4,7 @@ use std::{error::Error, num::NonZero, sync::Arc};
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::{fuzz_target, Corpus};
+use turso_core::ConnectOpts;
 
 macro_rules! str_enum {
     ($vis:vis enum $name:ident { $($variant:ident => $value:literal),*, }) => {
@@ -270,7 +271,7 @@ fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
             ":memory:",
             Arc::new(turso_core::SqliteDialect),
         )?;
-        let conn = db.connect()?;
+        let conn = db.connect(ConnectOpts::new())?;
 
         let mut stmt = conn.prepare(sql)?;
         for (idx, value) in expr.parameters.iter().enumerate() {

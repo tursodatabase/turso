@@ -1,0 +1,18 @@
+//tatp_ddf
+// The folling values have to exist in TIRDB
+db_name = "solidDB" 
+db_version = "6.5.5" 
+os_name = "MS Windows" 
+os_version = "XP" 
+// --- end TIRDB ------------------------
+db_connect = "DSN=solidDB65_local;UID=dba;PWD=dba"
+hardware_id = "Thinkpad-61p"  
+configuration_file = "C:\Program Files\IBM\solidDB\solidDB6.5\eval_kit\standalone\solid.ini"
+configuration_code = "solid_default"
+configuration_comments = "Default solidDB params: DBE, strict durability"
+// target database initialization file
+//TargetDBInit = "targetDBInit.sql"
+// target database schema file 
+TargetDBSchema = "targetDBSchema.sql"
+// target database transaction file
+transaction_file = "tr_mix_solid.sql"

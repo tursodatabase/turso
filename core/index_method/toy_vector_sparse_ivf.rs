@@ -351,34 +351,15 @@ impl IndexMethodAttachment for VectorSparseInvertedIndexMethodAttachment {
             self.configuration.clone(),
         )))
     }
+
+    fn backing_schema(&self) -> BackingSchema {
+        backing_schema(&self.configuration)
+    }
 }
 
 impl VectorSparseInvertedIndexMethodCursor {
     pub fn new(configuration: IndexMethodConfiguration) -> Self {
-        let columns = configuration
-            .columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect::<Vec<_>>();
-        let schema = BackingSchema::new(
-            Vec::new(),
-            vec![
-                BackingIndex::on_table(
-                    &configuration.table_name,
-                    format!("{}_inverted_index", configuration.index_name),
-                    columns.clone(),
-                    // component, length, rowid
-                    vec![key_info(), key_info(), key_info()],
-                ),
-                BackingIndex::on_table(
-                    &configuration.table_name,
-                    format!("{}_stats", configuration.index_name),
-                    columns,
-                    // component
-                    vec![key_info()],
-                ),
-            ],
-        );
+        let schema = backing_schema(&configuration);
         let delta = match configuration.parameters.get("delta") {
             Some(&Value::Numeric(Numeric::Float(delta))) => f64::from(delta),
             _ => 0.0,
@@ -426,6 +407,33 @@ impl VectorSparseInvertedIndexMethodCursor {
         self.stats_cursor = Some(open_store_cursor(context, &self.schema.indexes[1])?);
         Ok(())
     }
+}
+
+fn backing_schema(configuration: &IndexMethodConfiguration) -> BackingSchema {
+    let columns = configuration
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<_>>();
+    BackingSchema::new(
+        Vec::new(),
+        vec![
+            BackingIndex::on_table(
+                &configuration.table_name,
+                format!("{}_inverted_index", configuration.index_name),
+                columns.clone(),
+                // component, length, rowid
+                vec![key_info(), key_info(), key_info()],
+            ),
+            BackingIndex::on_table(
+                &configuration.table_name,
+                format!("{}_stats", configuration.index_name),
+                columns,
+                // component
+                vec![key_info()],
+            ),
+        ],
+    )
 }
 
 fn open_store_cursor(

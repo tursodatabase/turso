@@ -979,8 +979,6 @@ impl MappedSharedWalCoordination {
             region.sanitized_backfill_proof_on_open =
                 region.sanitize_backfill_proof_for_exclusive_open();
         }
-        let mapped_blocks = region.header().frame_index_blocks.load(Ordering::Acquire);
-        region.ensure_mapped_frame_index_blocks(mapped_blocks)?;
         let (registry_path, frame_index_publish_lock, process_local_ownership) =
             Self::register_process_mapping(
                 path,
@@ -1047,8 +1045,6 @@ impl MappedSharedWalCoordination {
                 .shared_wal_unlock_byte(PROCESS_LIFETIME_LOCK_OFFSET, lock_kind)?;
             return Err(err);
         }
-        let mapped_blocks = region.header().frame_index_blocks.load(Ordering::Acquire);
-        region.ensure_mapped_frame_index_blocks(mapped_blocks)?;
         let (registry_path, frame_index_publish_lock, process_local_ownership) =
             Self::register_process_mapping(
                 path,
@@ -1302,6 +1298,11 @@ impl MappedSharedWalCoordination {
     /// "reader slot released by non-owner" when they try to end their read
     /// transactions, corrupting the shared WAL state.
     ///
+    /// Slots held by other connections in this process are skipped before
+    /// probing. On Linux the byte lock belongs to the open file description
+    /// that all connections in this process share, so probing it from here
+    /// would succeed and clear a slot that a live reader still uses.
+    ///
     /// Probe the slot byte lock directly on every platform. That lock is the
     /// authoritative liveness signal for this database file; relying on PID
     /// probes here is weaker and can misclassify recycled PIDs as live.
@@ -1316,11 +1317,13 @@ impl MappedSharedWalCoordination {
         // clearing: another live process may hold a slot. Blindly clearing
         // would cause that process to panic with "reader slot released by
         // non-owner" and corrupt the shared WAL state.
+        let local = self.local_lock_state.lock();
+        let process_local = self.process_local_ownership.lock();
         for slot_index in 0..header.reader_slot_count {
-            if !self.uses_linux_ofd_locking()
-                && self
-                    .with_process_local_ownership(|entry| entry.reader_owner(slot_index).is_some())
-            {
+            if local.reader_locks[slot_index as usize] > 0 {
+                continue;
+            }
+            if !self.uses_linux_ofd_locking() && process_local.reader_owner(slot_index).is_some() {
                 continue;
             }
             let offset = Self::process_lock_offset_for_reader(slot_index);
@@ -1928,14 +1931,12 @@ impl MappedSharedWalCoordination {
     /// actually blocks checkpoints; shared owner metadata can be stale.
     fn try_reclaim_stale_reader_slot(&self, slot_index: u32) -> bool {
         if self.uses_linux_ofd_locking() {
-            let should_probe = self.with_local_lock_state(|entry| {
-                turso_assert!(
-                    (slot_index as usize) < entry.reader_locks.len(),
-                    "reader slot registry index out of range"
-                );
-                entry.reader_locks[slot_index as usize] == 0
-            });
-            if !should_probe {
+            let local = self.local_lock_state.lock();
+            turso_assert!(
+                (slot_index as usize) < local.reader_locks.len(),
+                "reader slot registry index out of range"
+            );
+            if local.reader_locks[slot_index as usize] > 0 {
                 return false;
             }
             let offset = Self::process_lock_offset_for_reader(slot_index);
@@ -2269,13 +2270,12 @@ impl MappedSharedWalCoordination {
                     let _ = self.try_reclaim_dead_reader_owner(slot_index as u32, owner);
                     return None;
                 }
+                let local = self.local_lock_state.lock();
                 let frame = frame.load(Ordering::Acquire);
                 if frame == UNUSED_READER_FRAME {
                     return None;
                 }
-                let local_lock_held =
-                    self.with_local_lock_state(|entry| entry.reader_locks[slot_index] > 0);
-                if local_lock_held {
+                if local.reader_locks[slot_index] > 0 {
                     return Some(frame);
                 }
                 let offset = Self::process_lock_offset_for_reader(slot_index as u32);
@@ -2445,9 +2445,20 @@ impl MappedSharedWalCoordination {
         max_frame: u64,
         frame_watermark: Option<u64>,
     ) -> Option<u64> {
+        self.try_find_frame(page_id, min_frame, max_frame, frame_watermark)
+            .expect("shared WAL lookup failed")
+    }
+
+    pub(crate) fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
         let upper_frame = frame_watermark.unwrap_or(max_frame);
         if upper_frame < min_frame {
-            return None;
+            return Ok(None);
         }
         let lower_frame = if frame_watermark.is_some() {
             0
@@ -2461,15 +2472,14 @@ impl MappedSharedWalCoordination {
             .load(Ordering::Acquire)
             .min(header.frame_index_capacity);
         if len == 0 {
-            return None;
+            return Ok(None);
         }
         let required_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
-        self.ensure_mapped_frame_index_blocks(required_blocks)
-            .expect("shared WAL frame index block missing");
+        self.ensure_mapped_frame_index_blocks(required_blocks)?;
         let mappings = self.frame_index_blocks.read();
         let slots = Self::frame_index_slot_range(&mappings, len, lower_frame, upper_frame);
         if slots.is_empty() {
-            return None;
+            return Ok(None);
         }
         let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
         let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
@@ -2488,11 +2498,11 @@ impl MappedSharedWalCoordination {
                 let slot = block_start_slot + local_entry;
                 let frame_id = Self::frame_index_entry(&mappings, slot).frame_id;
                 if range.contains(&frame_id) {
-                    return Some(frame_id);
+                    return Ok(Some(frame_id));
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Return the latest (page_id, frame_id) for every distinct page that has
@@ -2502,21 +2512,29 @@ impl MappedSharedWalCoordination {
     /// WAL to the DB file. For each page, only the highest-numbered frame is
     /// returned (that frame contains the most recent version of the page).
     pub(crate) fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
+        self.try_iter_latest_frames(min_frame, max_frame)
+            .expect("shared WAL enumeration failed")
+    }
+
+    pub(crate) fn try_iter_latest_frames(
+        &self,
+        min_frame: u64,
+        max_frame: u64,
+    ) -> Result<Vec<(u64, u64)>> {
         let header = self.header();
         let len = header
             .frame_index_len
             .load(Ordering::Acquire)
             .min(header.frame_index_capacity);
         if len == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let required_blocks = len.div_ceil(FRAME_INDEX_BLOCK_CAPACITY);
-        self.ensure_mapped_frame_index_blocks(required_blocks)
-            .expect("shared WAL frame index block missing");
+        self.ensure_mapped_frame_index_blocks(required_blocks)?;
         let mappings = self.frame_index_blocks.read();
         let slots = Self::frame_index_slot_range(&mappings, len, min_frame, max_frame);
         if slots.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut seen_pages = std::collections::BTreeSet::new();
         let mut entries = Vec::new();
@@ -2545,7 +2563,16 @@ impl MappedSharedWalCoordination {
             }
         }
         entries.sort_unstable_by_key(|&(page_id, _)| page_id);
-        entries
+        Ok(entries)
+    }
+
+    pub(crate) fn has_visible_frame(&self, max_frame: u64) -> Result<bool> {
+        if max_frame == 0 || self.header().frame_index_len.load(Ordering::Acquire) == 0 {
+            return Ok(false);
+        }
+        self.ensure_mapped_frame_index_blocks(1)?;
+        let mappings = self.frame_index_blocks.read();
+        Ok(Self::frame_index_entry(&mappings, 0).frame_id <= max_frame)
     }
 
     fn base_mapped_len(reader_slot_count: u32) -> usize {
@@ -3001,6 +3028,98 @@ impl MappedSharedWalCoordination {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct MappingFailureFile {
+        inner: Arc<dyn File>,
+    }
+
+    impl File for MappingFailureFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<crate::Buffer>,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(&self, c: Completion, mode: FileSyncType) -> Result<Completion> {
+            self.inner.sync(c, mode)
+        }
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.inner.truncate(len, c)
+        }
+        fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+            self.inner.shared_wal_unlock_byte(offset, kind)
+        }
+        fn shared_wal_set_len(&self, len: u64) -> Result<()> {
+            self.inner.shared_wal_set_len(len)
+        }
+        fn shared_wal_map(
+            &self,
+            _offset: u64,
+            _len: usize,
+        ) -> Result<Box<dyn SharedWalMappedRegion>> {
+            Err(LimboError::DatabaseFull)
+        }
+    }
+
+    #[test]
+    fn deferred_mapping_failures_return_errors() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let path = dir.path().join("mapping-failure.tshm");
+        {
+            let mapped = create_mapping(&path);
+            mapped.record_frame(7, 1);
+        }
+        let mut reopened = create_mapping(&path);
+        let original = reopened.file.clone();
+        reopened.file = Arc::new(MappingFailureFile {
+            inner: original.clone(),
+        });
+        assert!(reopened.has_visible_frame(1).is_err());
+        assert!(reopened.try_find_frame(7, 0, 1, None).is_err());
+        assert!(reopened.try_iter_latest_frames(0, 1).is_err());
+        reopened.file = original;
+        assert!(reopened
+            .has_visible_frame(1)
+            .expect("retry visibility lookup"));
+        assert_eq!(
+            reopened
+                .try_find_frame(7, 0, 1, None)
+                .expect("retry frame lookup"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn reopening_defers_frame_index_mappings() {
+        let dir = tempfile::tempdir().expect("create directory");
+        let path = dir.path().join("lazy.tshm");
+        {
+            let mapped = create_mapping(&path);
+            mapped.record_frame(7, 1);
+            assert!(mapped.try_grow_frame_index_blocks(4));
+        }
+        let reopened = create_mapping(&path);
+        assert_eq!(reopened.frame_index_blocks.read().len(), 0);
+        assert!(!reopened.has_visible_frame(0).expect("check empty snapshot"));
+        assert_eq!(reopened.frame_index_blocks.read().len(), 0);
+        assert!(reopened.has_visible_frame(1).expect("check visible frame"));
+        assert_eq!(reopened.frame_index_blocks.read().len(), 1);
+        assert_eq!(reopened.find_frame(7, 0, 1, None), Some(1));
+    }
+
     #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
     use crate::io::PlatformIO;
     use crate::io::IO;
@@ -3355,6 +3474,48 @@ mod tests {
         assert_eq!(mapped_a.min_active_reader_frame(), None);
         assert_eq!(mapped_a.find_frame(7, 0, 4, None), Some(2));
         assert_eq!(mapped_a.find_frame(9, 0, 4, None), Some(4));
+    }
+
+    #[test]
+    fn mapped_shared_wal_coordination_repair_preserves_reader_slots_held_by_sibling_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mapped = create_mapping(&path);
+
+        let reader = mapped.register_reader(mapped.owner_record(), 4).unwrap();
+
+        mapped.repair_transient_state_for_exclusive_open();
+
+        assert_eq!(mapped.reader_owner(reader.slot_index), Some(reader.owner));
+        assert_eq!(mapped.min_active_reader_frame(), Some(4));
+
+        mapped.unregister_reader(reader);
+        assert_eq!(mapped.reader_owner(reader.slot_index), None);
+        assert_eq!(mapped.min_active_reader_frame(), None);
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    #[test]
+    fn reader_registered_during_repair_keeps_its_slot() {
+        reader_registered_during_probe_keeps_its_slot(|mapped| {
+            mapped.repair_transient_state_for_exclusive_open();
+        });
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    #[test]
+    fn reader_registered_during_stale_slot_reclamation_keeps_its_slot() {
+        reader_registered_during_probe_keeps_its_slot(|mapped| {
+            mapped.try_reclaim_stale_reader_slot(0);
+        });
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    #[test]
+    fn reader_registered_during_frame_scan_keeps_its_slot() {
+        reader_registered_during_probe_keeps_its_slot(|mapped| {
+            mapped.min_active_reader_frame();
+        });
     }
 
     #[test]
@@ -4359,5 +4520,114 @@ mod tests {
             mapped.find_frame(7, 0, boundary + 3, None),
             Some(boundary + 3)
         );
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    fn reader_registered_during_probe_keeps_its_slot(
+        probe: impl FnOnce(&MappedSharedWalCoordination),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("coordination.tshm");
+        let mut mapped = create_mapping(&path);
+        assert!(mapped.uses_linux_ofd_locking());
+        mapped.reader_bitmap_words()[0].fetch_and(!1u64, Ordering::Release);
+        mapped.reader_frames()[0].store(17, Ordering::Release);
+        mapped.reader_owners()[0].store(mapped.owner_record().raw(), Ordering::Release);
+
+        let mapping = Arc::new(std::sync::OnceLock::<
+            std::sync::Weak<MappedSharedWalCoordination>,
+        >::new());
+        let registered = Arc::new(Mutex::new(None));
+        let file = mapped.file.clone();
+        mapped.file = Arc::new(ReaderRegistrationDuringProbeFile {
+            file,
+            before_probe: Mutex::new(Some(Box::new({
+                let mapping = mapping.clone();
+                let registered = registered.clone();
+                move || {
+                    let mapped = mapping.get().unwrap().upgrade().unwrap();
+                    let Some(local) = mapped.local_lock_state.try_lock() else {
+                        return;
+                    };
+                    drop(local);
+                    assert!(mapped.try_reclaim_stale_reader_slot(0));
+                    *registered.lock() =
+                        Some(mapped.register_reader(mapped.owner_record(), 23).unwrap());
+                }
+            }))),
+        });
+        let mapped = Arc::new(mapped);
+        mapping.set(Arc::downgrade(&mapped)).unwrap();
+
+        probe(&mapped);
+
+        let reader = registered
+            .lock()
+            .take()
+            .unwrap_or_else(|| mapped.register_reader(mapped.owner_record(), 23).unwrap());
+        assert_eq!(reader.slot_index, 0);
+        assert_eq!(mapped.reader_owner(reader.slot_index), Some(reader.owner));
+        assert_eq!(mapped.min_active_reader_frame(), Some(23));
+        mapped.unregister_reader(reader);
+        assert_eq!(mapped.min_active_reader_frame(), None);
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    struct ReaderRegistrationDuringProbeFile {
+        file: Arc<dyn File>,
+        before_probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    #[cfg(all(target_os = "linux", not(shuttle)))]
+    impl File for ReaderRegistrationDuringProbeFile {
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.file.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.file.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+            self.file.pread(pos, c)
+        }
+
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<crate::Buffer>,
+            c: Completion,
+        ) -> Result<Completion> {
+            self.file.pwrite(pos, buffer, c)
+        }
+
+        fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.file.sync(c, sync_type)
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.file.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+            self.file.truncate(len, c)
+        }
+
+        fn shared_wal_try_lock_byte(
+            &self,
+            offset: u64,
+            exclusive: bool,
+            kind: SharedWalLockKind,
+        ) -> Result<bool> {
+            let before_probe = self.before_probe.lock().take();
+            if let Some(before_probe) = before_probe {
+                before_probe();
+            }
+            self.file.shared_wal_try_lock_byte(offset, exclusive, kind)
+        }
+
+        fn shared_wal_unlock_byte(&self, offset: u64, kind: SharedWalLockKind) -> Result<()> {
+            self.file.shared_wal_unlock_byte(offset, kind)
+        }
     }
 }
