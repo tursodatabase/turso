@@ -286,6 +286,20 @@ expect {
     |-1.000
 }
 
+test table-numeric-negation-and-modulo-compare-as-numbers {
+    CREATE TABLE nm (id int PRIMARY KEY, v numeric(10,2));
+    INSERT INTO nm VALUES (1, 9), (2, 10), (3, -1.5), (4, 1.5);
+    SELECT id FROM nm WHERE -v < -5 ORDER BY -v;
+    SELECT id FROM nm WHERE v % 1 > 0.1;
+    SELECT max(-v) FROM nm;
+}
+expect {
+    2
+    1
+    4
+    1.50
+}
+
 test table-uuid-column-omitted-from-insert-is-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
     INSERT INTO t (id) VALUES (1);
