@@ -17,8 +17,9 @@ use crate::translate::{
     },
     expr::expr_type::{type_of, type_ordering, TypeEnv},
     expr::{
-        bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
-        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        bind_and_rewrite_expr, emit_expression_index_key, emit_stored_column,
+        translate_condition_expr, translate_expr, unwrap_parens, walk_expr, BindingBehavior,
+        ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -1355,6 +1356,7 @@ fn emit_index_column_value_from_cursor(
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())
         })?;
+        emit_expression_index_key(program, dest_reg, idx_col, table, resolver)?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
