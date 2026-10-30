@@ -9,7 +9,7 @@ use turso_parser::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
-use crate::function::{AggFunc, Func, ScalarFunc, WindowFunc};
+use crate::function::{AggFunc, Func, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
@@ -816,7 +816,7 @@ fn arithmetic_type(lhs: &ExprType, rhs: &ExprType) -> ExprType {
 }
 
 fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> ExprType {
-    let Ok(Some(func)) = Func::resolve_function(name.as_str(), args.len()) else {
+    let Ok(Some(func)) = env.resolve_function(name.as_str(), args.len()) else {
         return ExprType::Builtin(BuiltinType::Any);
     };
     match func {
@@ -826,14 +826,6 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         Func::Scalar(ScalarFunc::StringToArray) => {
             ExprType::array(ExprType::Builtin(BuiltinType::Text), 1)
         }
-        // The other functions that build an array give an array of the type of
-        // their array argument: array_prepend(element, array) and
-        // array_cat(array1, array2) take it second when the first is not one.
-        Func::Scalar(f) if f.returns_array_blob() => args
-            .iter()
-            .map(|arg| type_of(arg, env))
-            .find(ExprType::is_array)
-            .unwrap_or_else(|| ExprType::array(ExprType::Builtin(BuiltinType::Any), 1)),
         Func::Agg(AggFunc::ArrayAgg) => ExprType::array(
             args.first()
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
@@ -881,7 +873,41 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
             } => ExprType::array(*element, dimensions - 1),
             _ => ExprType::Builtin(BuiltinType::Any),
         },
-        _ => ExprType::Builtin(BuiltinType::Any),
+        func => match func.return_type() {
+            Some(return_type) => declared_return_type(return_type, args, env),
+            None => ExprType::Builtin(BuiltinType::Any),
+        },
+    }
+}
+
+/// The type of a call to a function that declares the type it returns.
+fn declared_return_type(
+    return_type: ReturnType,
+    args: &[Box<ast::Expr>],
+    env: &TypeEnv,
+) -> ExprType {
+    match return_type {
+        ReturnType::Integer => ExprType::Builtin(BuiltinType::Integer),
+        ReturnType::Real => ExprType::Builtin(BuiltinType::Real),
+        ReturnType::Text => ExprType::Builtin(BuiltinType::Text),
+        ReturnType::Blob => ExprType::Builtin(BuiltinType::Blob),
+        // A function may name a type created with CREATE TYPE that this
+        // schema doesn't have; then nothing is known about its values.
+        ReturnType::Custom(type_name) => match env.schema().get_type_def_unchecked(type_name) {
+            Some(type_def) => ExprType::Custom {
+                type_def: Arc::clone(type_def),
+                params: Vec::new(),
+            },
+            None => ExprType::Unknown,
+        },
+        // An array of the type of the array argument: array_prepend(element,
+        // array) and array_cat(array1, array2) take it second when the first
+        // is not one.
+        ReturnType::Array => args
+            .iter()
+            .map(|arg| type_of(arg, env))
+            .find(ExprType::is_array)
+            .unwrap_or_else(|| ExprType::array(ExprType::Builtin(BuiltinType::Any), 1)),
     }
 }
 

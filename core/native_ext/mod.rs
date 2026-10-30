@@ -1,9 +1,10 @@
 mod function;
 mod vtab;
 
+pub use crate::function::ReturnType;
+
 pub use function::{
-    Aggregate, AggregateFunction, FunctionArity, ReturnType, ScalarCall, ScalarFunction,
-    ScalarReturn,
+    Aggregate, AggregateFunction, FunctionArity, ScalarCall, ScalarFunction, ScalarReturn,
 };
 pub use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, VTabKind};
 pub use vtab::{TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};

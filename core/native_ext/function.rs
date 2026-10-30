@@ -1,4 +1,5 @@
 use super::ExtensionState;
+use crate::function::ReturnType;
 use crate::sync::Arc;
 use crate::types::{AggContext, IOResultOr, ValueBlob};
 use crate::{Connection, IOResult, LimboError, Register, Result, Value};
@@ -208,14 +209,6 @@ impl PartialEq for AggregateState {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.0.as_ref(), other.0.as_ref())
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReturnType {
-    Integer,
-    Real,
-    Text,
-    Blob,
 }
 
 #[derive(Debug, Clone, Copy)]

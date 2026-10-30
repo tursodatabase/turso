@@ -1555,3 +1555,32 @@ test check-constraint-calls-an-integer-function {
 expect {
     1
 }
+
+test timestamptz-column-compares-with-now {
+    CREATE TABLE events (at timestamptz);
+    INSERT INTO events VALUES ('2000-01-01 00:00:00+00:00');
+    SELECT count(*) FROM events WHERE at < now();
+}
+expect {
+    1
+}
+
+test now-plus-an-integer-errors {
+    SELECT now() + 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp with time zone \+ integer
+}
+expect @tursopg error {
+    operator does not exist: timestamptz \+ integer
+}
+
+test check-constraint-compares-a-timestamptz-column-with-now {
+    CREATE TABLE past_events (at timestamptz CHECK (at <= now()));
+    INSERT INTO past_events VALUES ('2000-01-01 00:00:00+00:00');
+    SELECT count(*) FROM past_events;
+}
+expect {
+    1
+}

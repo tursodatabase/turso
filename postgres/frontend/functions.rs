@@ -3,7 +3,7 @@ use crate::error::sqlstate_error;
 use crate::settings::SettingScope;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
-use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction, ScalarReturn};
+use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
@@ -113,11 +113,11 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
         "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
             FunctionArity::Variadic, false
-        ) => Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+        ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
     })
 }
 
-fn pg_scalar_function<O: ScalarReturn + 'static>(
+pub(crate) fn pg_scalar_function<O: ScalarReturn + 'static>(
     name: &'static str,
     arity: FunctionArity,
     deterministic: bool,
@@ -160,6 +160,31 @@ impl<O: ScalarReturn + 'static> ScalarCall for PgScalarFunction<O> {
 
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<O> {
         Ok(IOResult::Done((self.step)(connection, args)?))
+    }
+}
+
+/// A `timestamptz` value in its text form, such as `2000-01-01 00:00:00.5`.
+/// Returning one gives the function the type `timestamptz`, so `now() + 1` is
+/// an error as in PostgreSQL instead of adding 1 to text.
+struct Timestamptz(String);
+
+impl ScalarReturn for Timestamptz {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("timestamptz"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
+    }
+}
+
+/// A `uuid` value in its text form, such as
+/// `a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11`.
+pub(crate) struct Uuid(pub(crate) String);
+
+impl ScalarReturn for Uuid {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("uuid"));
+
+    fn into_value(self) -> Value {
+        Value::build_text(self.0)
     }
 }
 

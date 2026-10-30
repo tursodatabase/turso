@@ -541,6 +541,8 @@ struct GatedSevenCall {
 }
 
 impl ScalarCall for GatedSevenCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
