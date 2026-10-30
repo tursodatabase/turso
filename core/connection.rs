@@ -25,7 +25,7 @@ use crate::{
     io::{MemoryIO, IO},
     progress::{ProgressHandler, ProgressHandlerCallback},
     translate,
-    translate::collate::CollationSeq,
+    translate::collate::TextCollation,
     util::IOExt,
     vdbe, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
     CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion,
@@ -210,6 +210,9 @@ pub struct ReparseSchemaInner {
     /// instead of re-reading each backing table. `None` for a normal reparse,
     /// which recovers descriptors from disk in the `PopulateSequences` phase.
     preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
+    /// The `sqlite_schema` scan, which also collects the indexes and
+    /// materialized views that are built once the types are loaded.
+    parse: Box<crate::util::ParseSchemaRowsState>,
     phase: ReparsePhase,
 }
 
@@ -227,9 +230,7 @@ pub enum SubqueryUnnestingMode {
 
 enum ReparsePhase {
     /// Scanning `SELECT * FROM sqlite_schema` into `fresh`.
-    ParseSchema {
-        parse: Box<crate::util::ParseSchemaRowsState>,
-    },
+    ParseSchema,
     /// Loading the names of the namespaces from the namespaces table.
     LoadNamespaces {
         stmt: Box<Statement>,
@@ -262,6 +263,9 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         type_rows: Vec<String>,
     },
+    /// Loading the CREATE TYPE statements `type_sqls`, then building the
+    /// materialized views and indexes collected by the `sqlite_schema` scan.
+    BuildIndexes { type_sqls: Vec<String> },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -1484,9 +1488,8 @@ impl Connection {
             _guard: guard,
             fresh,
             preserved_sequences,
-            phase: ReparsePhase::ParseSchema {
-                parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
-            },
+            parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
+            phase: ReparsePhase::ParseSchema,
         })
     }
 
@@ -1502,7 +1505,7 @@ impl Connection {
                 unreachable!("drive_reparse_building requires Building state");
             };
             match &mut inner.phase {
-                ReparsePhase::ParseSchema { parse } => {
+                ReparsePhase::ParseSchema => {
                     // Resolver so attached-db qualifiers in temp triggers can be
                     // mapped to their actual index on this connection.
                     let attached_resolver = |name: &str| -> Option<usize> {
@@ -1510,7 +1513,7 @@ impl Connection {
                             .database_id(&crate::util::normalize_ident(name))
                     };
                     crate::return_if_io!(crate::util::parse_schema_rows(
-                        parse,
+                        &mut inner.parse,
                         &mut inner.fresh,
                         &self.syms.read(),
                         &attached_resolver,
@@ -1667,9 +1670,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::RefreshStats {
-                            stats: Default::default(),
-                        };
+                        inner.phase = ReparsePhase::BuildIndexes { type_sqls: vec![] };
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
@@ -1677,8 +1678,17 @@ impl Connection {
                         type_rows.push(row.get::<&str>(1)?.to_string());
                         Ok(())
                     }));
-                    let type_rows = std::mem::take(type_rows);
-                    inner.fresh.load_type_definitions(&type_rows)?;
+                    inner.phase = ReparsePhase::BuildIndexes {
+                        type_sqls: std::mem::take(type_rows),
+                    };
+                }
+                ReparsePhase::BuildIndexes { type_sqls } => {
+                    crate::util::populate_types_views_then_indices(
+                        &mut inner.parse,
+                        &mut inner.fresh,
+                        &self.syms.read(),
+                        type_sqls,
+                    )?;
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1993,30 +2003,6 @@ impl Connection {
         Ok(rows)
     }
 
-    /// Query the CREATE TYPE SQL definitions stored in __turso_internal_types.
-    /// The connection's schema must already contain the table definitions so
-    /// that `prepare` can resolve the table name. Returns an empty Vec if the
-    /// types table does not exist.
-    pub(crate) fn query_stored_type_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
-        let has_types_table = {
-            let s = self.schema.read();
-            s.has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
-        };
-        if !has_types_table {
-            return Ok(Vec::new());
-        }
-        let mut type_stmt = self.prepare_internal(format!(
-            "SELECT name, sql FROM {}",
-            crate::schema::TURSO_TYPES_TABLE_NAME
-        ))?;
-        let mut type_rows = Vec::new();
-        type_stmt.run_with_row_callback(|row| {
-            type_rows.push(row.get::<&str>(1)?.to_string());
-            Ok(())
-        })?;
-        Ok(type_rows)
-    }
-
     pub fn maybe_update_schema(&self) {
         if self.schema_reparse_in_progress() {
             return;
@@ -2265,9 +2251,12 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
+        use crate::Buffer;
 
-        let c = self.pager.load().wal_get_frame(frame_no, frame)?;
+        let buffer = Arc::new(Buffer::new_temporary(frame.len()));
+        let c = self.pager.load().wal_get_frame(frame_no, buffer.clone())?;
         self.db.io.wait_for_completion(c)?;
+        frame.copy_from_slice(buffer.as_slice());
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
             page_no: header.page_number,
@@ -2953,8 +2942,10 @@ impl Connection {
                 }
             }
 
-            match schema.populate_materialized_views_then_indices(
+            // The schema already holds every stored type.
+            match schema.populate_types_views_then_indices(
                 &syms,
+                &[],
                 materialized_view_info,
                 dbsp_state_roots,
                 dbsp_state_index_roots,
@@ -5150,7 +5141,7 @@ impl SymbolTable {
             .filter(|func| func.func.matches_arg_count(arg_count))
     }
 
-    pub fn resolve_collation(&self, name: &str) -> Option<CollationSeq> {
+    pub fn resolve_collation(&self, name: &str) -> Option<TextCollation> {
         self.collations
             .get(&crate::util::normalize_ident(name))
             .map(|external| external.collation)

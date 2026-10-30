@@ -19,7 +19,7 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
-use crate::translate::expr::expr_type::{common_type_of, type_of, ExprType, TypeEnv};
+use crate::translate::expr::expr_type::{common_of_types, type_of, ExprType, TypeEnv};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination, SelectPlan};
@@ -451,10 +451,6 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::IntToBoolean
         | ScalarFunc::IsAutocommit
         | ScalarFunc::ConnTxnId
-        | ScalarFunc::TestUintLt
-        | ScalarFunc::TestUintEq
-        | ScalarFunc::NumericLt
-        | ScalarFunc::NumericEq
         | ScalarFunc::ValidateIpAddr
         | ScalarFunc::GetByte
         | ScalarFunc::UnixEpoch => Ok(CheckExprType::Integer),
@@ -533,17 +529,15 @@ fn resolve_scalar_func_return_type(
         // Internal/custom type functions
         ScalarFunc::TestUintEncode
         | ScalarFunc::TestUintDecode
-        | ScalarFunc::TestUintAdd
-        | ScalarFunc::TestUintSub
-        | ScalarFunc::TestUintMul
-        | ScalarFunc::TestUintDiv
         | ScalarFunc::NumericEncode
         | ScalarFunc::NumericFit
         | ScalarFunc::NumericDecode
         | ScalarFunc::NumericAdd
         | ScalarFunc::NumericSub
         | ScalarFunc::NumericMul
-        | ScalarFunc::NumericDiv => Ok(CheckExprType::Blob),
+        | ScalarFunc::NumericDiv
+        | ScalarFunc::NumericMod
+        | ScalarFunc::NumericNeg => Ok(CheckExprType::Blob),
 
         // Remaining functions — treat as ANY
         _ => Ok(CheckExprType::Any),
@@ -818,6 +812,9 @@ fn validate(
                         c.col_name
                     );
                 }
+                if col_type.is_array() {
+                    resolver.schema().check_array_element_type(type_name)?;
+                }
 
                 // Domain types require STRICT tables because domain constraints
                 // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
@@ -1040,7 +1037,7 @@ fn ctas_column_type(arms: &[&SelectPlan], column_index: usize, resolver: &Resolv
     if types.all(|ty| ty == first) {
         return first;
     }
-    let common = common_type_of(
+    let common = common_of_types(
         arms.iter().map(|arm| {
             let env = TypeEnv::new(Some(&arm.table_references), resolver);
             type_of(&arm.result_columns[column_index].expr, &env)
@@ -2458,7 +2455,7 @@ pub fn translate_drop_table(
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::NoCase,
+        collation: CollationSeq::NOCASE,
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -2901,7 +2898,7 @@ pub fn translate_drop_table(
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: CollationSeq::NoCase,
+            collation: CollationSeq::NOCASE,
         });
 
         program.emit_insn(Insn::Delete {

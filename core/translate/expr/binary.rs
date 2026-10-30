@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn binary_expr_shared(
@@ -203,13 +204,8 @@ pub(super) fn emit_binary_expr_row_valued(
         let done_label = program.allocate_label();
         for i in 0..arity {
             let next_label = program.allocate_label();
-            let (affinity, collation) = row_component_affinity_collation(
-                lhs_expr,
-                rhs_expr,
-                i,
-                &metadata,
-                &resolver.catalog,
-            )?;
+            let (affinity, collation) =
+                row_component_affinity_collation(lhs_expr, rhs_expr, i, &metadata)?;
             program.emit_insn(Insn::Eq {
                 lhs: lhs_start + i,
                 rhs: rhs_start + i,
@@ -281,13 +277,8 @@ pub(super) fn emit_binary_expr_row_valued(
             let null_result_label = program.allocate_label();
             for i in 0..arity {
                 let next_cmp_label = program.allocate_label();
-                let (aff, collation) = row_component_affinity_collation(
-                    lhs_expr,
-                    rhs_expr,
-                    i,
-                    &metadata,
-                    &resolver.catalog,
-                )?;
+                let (aff, collation) =
+                    row_component_affinity_collation(lhs_expr, rhs_expr, i, &metadata)?;
                 let lhs = lhs_start + i;
                 let rhs = rhs_start + i;
                 program.emit_insn(Insn::IsNull {
@@ -386,31 +377,51 @@ pub(super) fn invert_boolean_register(program: &mut ProgramBuilder, target_regis
     });
 }
 
-pub(super) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Option<&Expr>> {
-    match unwrap_parens(expr)? {
-        Expr::Parenthesized(exprs) if exprs.len() > 1 => Ok(exprs.get(idx).map(Box::as_ref)),
-        _ => Ok(None),
-    }
-}
-
 pub(super) fn row_component_affinity_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     idx: usize,
-    metadata: &impl ExprProperties,
-    catalog: &crate::translate::catalog::CatalogContext<'_>,
+    metadata: &ExprContext<'_, '_>,
 ) -> Result<(Affinity, CollationSeq)> {
-    // If one side is a decomposable row literal and the other is not, still prefer
-    // the component that is available instead of falling back both sides.
-    // TODO: when both sides are non-decomposable row sources (e.g. subquery row-values),
-    // this falls back to whole-expression affinity/collation and cannot distinguish
-    // per-component metadata.
-    let lhs_for_cmp = row_value_component_expr(lhs_expr, idx)?.unwrap_or(lhs_expr);
-    let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?.unwrap_or(rhs_expr);
+    let lhs_for_cmp = row_value_component_expr(lhs_expr, idx)?;
+    let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?;
     Ok((
-        comparison_affinity(lhs_for_cmp, rhs_for_cmp, metadata),
-        comparison_collation(lhs_for_cmp, rhs_for_cmp, metadata, catalog)?,
+        comparison_affinity(&*lhs_for_cmp, &*rhs_for_cmp, metadata),
+        comparison_collation(&lhs_for_cmp, &rhs_for_cmp, metadata)?,
     ))
+}
+
+/// Component `idx` of a row value: an element of `(a, b)`, or one column of a
+/// row subquery's result, so each component compares with its own type. A
+/// subquery column does not bring its text collation. Any other expression
+/// stands for itself.
+fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
+    match unwrap_parens(expr)? {
+        Expr::Parenthesized(exprs) if exprs.len() > 1 => {
+            Ok(exprs.get(idx).map_or(Cow::Borrowed(expr), |component| {
+                Cow::Borrowed(component.as_ref())
+            }))
+        }
+        Expr::SubqueryResult {
+            subquery_id,
+            lhs: None,
+            not_in,
+            query_type:
+                ast::SubqueryType::RowValue {
+                    result_reg_start,
+                    num_regs,
+                },
+        } if *num_regs > 1 && idx < *num_regs => Ok(Cow::Owned(Expr::SubqueryResult {
+            subquery_id: *subquery_id,
+            lhs: None,
+            not_in: *not_in,
+            query_type: ast::SubqueryType::RowValue {
+                result_reg_start: result_reg_start + idx,
+                num_regs: 1,
+            },
+        })),
+        _ => Ok(Cow::Borrowed(expr)),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -430,17 +441,8 @@ pub(super) fn emit_binary_insn(
     if op.is_comparison() {
         affinity = comparison_affinity(lhs_expr, rhs_expr, &metadata);
     }
-    let collation = || comparison_collation(lhs_expr, rhs_expr, &metadata, &resolver.catalog);
-    let is_array_cmp = is_array(lhs_expr, referenced_tables, resolver)
-        && is_array(rhs_expr, referenced_tables, resolver);
-    let cmp_flags = || {
-        let f = CmpInsFlags::default().with_affinity(affinity);
-        if is_array_cmp {
-            f.array_cmp()
-        } else {
-            f
-        }
-    };
+    let collation = || comparison_collation(lhs_expr, rhs_expr, &metadata);
+    let cmp_flags = || CmpInsFlags::default().with_affinity(affinity);
 
     match op {
         ast::Operator::NotEquals => {
@@ -667,7 +669,7 @@ pub(super) fn emit_binary_insn(
                 func: FuncCtx {
                     func: Func::Json(json_func),
                     arg_count: 2,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 },
             })
         }
@@ -721,7 +723,7 @@ pub(super) fn emit_binary_insn(
                 func: FuncCtx {
                     func: Func::Scalar(func),
                     arg_count: 2,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 },
             });
         }
@@ -749,7 +751,7 @@ pub(super) fn emit_binary_condition_insn(
     if op.is_comparison() {
         affinity = comparison_affinity(lhs_expr, rhs_expr, &metadata);
     }
-    let collation = || comparison_collation(lhs_expr, rhs_expr, &metadata, &resolver.catalog);
+    let collation = || comparison_collation(lhs_expr, rhs_expr, &metadata);
 
     let opposite_op = match op {
         ast::Operator::NotEquals => ast::Operator::Equals,
@@ -780,11 +782,6 @@ pub(super) fn emit_binary_condition_insn(
     // When jump_if_condition_is_true: we jump on true, so set jump_if_null when NULL should also jump (e.g. CHECK constraints in integrity_check).
     // When !jump_if_condition_is_true: we jump on false, so set jump_if_null when NULL should also jump (standard SQL 3-valued logic).
     let mut flags = CmpInsFlags::default().with_affinity(affinity);
-    if is_array(lhs_expr, referenced_tables, resolver)
-        && is_array(rhs_expr, referenced_tables, resolver)
-    {
-        flags = flags.array_cmp();
-    }
     if condition_metadata.jump_if_condition_is_true {
         if condition_metadata.jump_target_when_null == condition_metadata.jump_target_when_true {
             flags = flags.jump_if_null()
@@ -994,7 +991,7 @@ pub(super) fn emit_binary_condition_insn(
                 func: FuncCtx {
                     func: Func::Json(json_func),
                     arg_count: 2,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 },
             });
             eval_result(program, target_register);
@@ -1047,7 +1044,7 @@ pub(super) fn emit_binary_condition_insn(
                 func: FuncCtx {
                     func: Func::Scalar(func),
                     arg_count: 2,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 },
             });
             eval_result(program, target_register);

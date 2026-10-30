@@ -453,17 +453,13 @@ mod tests {
     }
 
     /// An expression of a custom type that isn't a column reports the primitive
-    /// the type is stored as, not one guessed from the type's name. A type's own
-    /// operator function reports nothing, because the function decides the result.
+    /// the type is stored as, not one guessed from the type's name.
     #[test]
     fn type_info_for_custom_type_expressions() {
         let db = fresh_db_with_custom_types("type_info_custom_expressions.db");
         let conn = db.connect_limbo();
-        conn.execute(
-            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 \
-             OPERATOR '+' max",
-        )
-        .unwrap();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
         conn.execute("CREATE TYPE rev BASE text ENCODE value DECODE value")
             .unwrap();
         conn.execute(
@@ -473,14 +469,12 @@ mod tests {
 
         let stmt = conn
             .prepare(
-                "SELECT CAST(id AS cents), CAST(id AS rev), coalesce(code, code), amount + 1 \
-                 FROM accounts",
+                "SELECT CAST(id AS cents), CAST(id AS rev), coalesce(code, code) FROM accounts",
             )
             .unwrap();
         assert_eq!(expect_info(&stmt, 0).declared_name, "INTEGER");
         assert_eq!(expect_info(&stmt, 1).declared_name, "TEXT");
         assert_eq!(expect_info(&stmt, 2).declared_name, "TEXT");
-        assert!(stmt.get_column_type_info(3).unwrap().is_none());
     }
 
     /// A custom type with no function for an operator goes to SQLite's operator as
@@ -509,6 +503,20 @@ mod tests {
                 "column {idx}"
             );
         }
+    }
+
+    /// Date arithmetic declares its result: `date + n` is a date, which is stored
+    /// as text, and `date - date` is a number of days.
+    #[test]
+    fn type_info_for_date_arithmetic() {
+        let db = fresh_db_with_custom_types("type_info_date_arithmetic.db");
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT")
+            .unwrap();
+
+        let stmt = conn.prepare("SELECT d + 1, d - d FROM t").unwrap();
+        assert_eq!(expect_info(&stmt, 0).declared_name, "TEXT");
+        assert_eq!(expect_info(&stmt, 1).declared_name, "INTEGER");
     }
 
     /// Expressions whose primitive can't be determined statically — function

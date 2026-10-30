@@ -5065,6 +5065,13 @@ impl<'a> Parser<'a> {
                                 .and_then(|s| s.strip_suffix('\''))
                                 .unwrap_or(&op_raw)
                                 .to_owned();
+                            // Only the built-in types have arithmetic operators.
+                            if op != "<" {
+                                return Err(Error::ParseError(format!(
+                                    "CREATE TYPE does not accept OPERATOR '{op}': only \
+                                     OPERATOR '<' is supported"
+                                )));
+                            }
                             // Three syntaxes:
                             // 1. OPERATOR 'op' func_name          (named)
                             // 2. OPERATOR 'op' (type) -> func_name (old named)
@@ -5116,6 +5123,15 @@ impl<'a> Parser<'a> {
                                 // End of statement or semicolon: naked operator
                                 None
                             };
+                            // A plain OPERATOR '<' lets the type be sorted, by its
+                            // stored value. A function for it would never be called.
+                            if op == "<" && func_name.is_some() {
+                                return Err(Error::ParseError(
+                                    "OPERATOR '<' takes no function: a type that declares it \
+                                     sorts by its stored value"
+                                        .to_owned(),
+                                ));
+                            }
                             operators.push(TypeOperator { op, func_name });
                         }
                         _ => break,

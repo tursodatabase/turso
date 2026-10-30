@@ -4,15 +4,18 @@ use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
 use crate::namespace::{is_reserved_object_name, NamespaceId, NamespaceRef};
 use crate::numeric::Numeric;
-use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::schema::{
+    Column, GeneratedType, Schema, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
+};
 use crate::sync::Arc;
 use crate::translate::{
     catalog::CatalogContext,
-    collate::CollationSeq,
+    collate::{CollationSeq, TextCollation},
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
     },
+    expr::expr_type::{type_of, type_ordering, TypeEnv},
     expr::{
         bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
         unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
@@ -20,9 +23,12 @@ use crate::translate::{
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
+use crate::type_ordering::TypeOrdering;
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
-use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
+use crate::{
+    bail_parse_error, CaptureDataChangesExt, LimboError, SymbolTable, MAIN_DB_ID, TEMP_DB_ID,
+};
 use crate::{
     schema::{
         is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn, PseudoCursorType,
@@ -206,14 +212,18 @@ pub fn translate_create_index(
         .allows_qualified_columns_in_index_terms()
         && !connection.is_nested_stmt())
     .then_some(db_name.as_str());
-    let columns = resolve_sorted_columns_with_catalog(
-        &tbl,
-        &columns,
-        Some(&resolver.catalog),
-        reject_qualified_columns_in_db,
-    )?;
+    let columns = resolver.with_schema(database_id, |schema| {
+        resolve_sorted_columns_with_catalog(
+            &tbl,
+            &columns,
+            Some(&resolver.catalog),
+            reject_qualified_columns_in_db,
+            schema,
+            resolver.catalog.symbol_table,
+        )
+    })?;
 
-    // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
+    // Block CREATE INDEX on STRUCT/UNION columns and on types that can't be sorted
     for col in &columns {
         if col.expr.is_none() {
             // Simple column reference (not expression index)
@@ -228,9 +238,7 @@ pub fn translate_create_index(
                             col.name
                         );
                     }
-                    if type_def.decode().is_some()
-                        && !type_def.operators().iter().any(|op| op.op == "<")
-                    {
+                    if column.type_ordering().is_none() && !type_def.is_sortable() {
                         bail_parse_error!(
                             "cannot create index on column '{}' of type '{}': type does not declare OPERATOR '<'",
                             col.name,
@@ -557,7 +565,6 @@ pub(crate) fn emit_refill_index(
                 cursor_id: sorter_cursor_id,
                 columns: columns.len(),
                 order_collations_nulls,
-                comparators: crate::alloc::vec![],
             }),
         });
         // SorterData moves each sorted record into the pseudo cursor's
@@ -803,7 +810,9 @@ fn resolve_reindex_targets(
         let collation = CollationSeq::new(&normalized_name).ok();
         if let Some(collation) = collation {
             let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
-            if !targets.is_empty() || !matches!(collation, CollationSeq::Locale(_)) {
+            if !targets.is_empty()
+                || !matches!(collation, CollationSeq::Text(TextCollation::Locale(_)))
+            {
                 return Ok(targets);
             }
         }
@@ -1011,8 +1020,10 @@ fn index_matches_collation(index: &Index, collation: CollationSeq) -> bool {
 pub fn resolve_sorted_columns(
     table: &BTreeTable,
     cols: &[SortedColumn],
+    schema: &Schema,
+    syms: &SymbolTable,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    resolve_sorted_columns_with_catalog(table, cols, None, None)
+    resolve_sorted_columns_with_catalog(table, cols, None, None, schema, syms)
 }
 
 pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
@@ -1024,6 +1035,10 @@ pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
     Ok(())
 }
 
+/// The index columns of `cols`. A column, or an expression, whose type has an
+/// order is kept in that order, so the index is in the order comparisons on
+/// it use; an explicit COLLATE on it is an error.
+///
 /// When `reject_qualified_columns_in_db` names the index's database, a qualified
 /// column name in an indexed term is an error, as in SQLite. The WHERE clause of a
 /// partial index is not checked: SQLite allows qualified names there.
@@ -1032,6 +1047,8 @@ fn resolve_sorted_columns_with_catalog(
     cols: &[SortedColumn],
     resolver: Option<&CatalogContext>,
     reject_qualified_columns_in_db: Option<&str>,
+    schema: &Schema,
+    syms: &SymbolTable,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
@@ -1050,7 +1067,8 @@ fn resolve_sorted_columns_with_catalog(
         let index_column = if let Some((pos, column_name, column)) =
             resolve_index_column(unwrapped_expr, table)
         {
-            let collation = explicit_collation.unwrap_or_else(|| column.collation());
+            let collation = index_collation(explicit_collation, column.type_ordering())?
+                .unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::NotGenerated => None,
@@ -1061,6 +1079,7 @@ fn resolve_sorted_columns_with_catalog(
                 nulls_order: nulls,
                 pos_in_table: pos,
                 collation,
+                explicit_collation,
                 default: column.default.clone(),
                 expr,
             }
@@ -1068,12 +1087,15 @@ fn resolve_sorted_columns_with_catalog(
             if !validate_index_expression(unwrapped_expr, table) {
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
+            let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;
+            let collation = index_collation(explicit_collation, ordering)?;
             IndexColumn {
                 name: sc.expr.to_string(),
                 order,
                 nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
-                collation: explicit_collation.unwrap_or(CollationSeq::Binary),
+                collation: collation.unwrap_or(CollationSeq::BINARY),
+                explicit_collation,
                 default: None,
                 expr: Some(sc.expr.clone()),
             }
@@ -1118,13 +1140,42 @@ fn has_qualified_columns(expr: &Expr, table: &BTreeTable, db_name: &str) -> crat
     Ok(has_qualified_column)
 }
 
+/// The collation of an index column: the order of its type when it has one,
+/// otherwise the explicit COLLATE, if any.
+fn index_collation(
+    explicit_collation: Option<TextCollation>,
+    ordering: Option<TypeOrdering>,
+) -> crate::Result<Option<CollationSeq>> {
+    match (ordering, explicit_collation) {
+        (Some(ordering), Some(_)) => {
+            bail_parse_error!("collations are not supported by type {}", ordering.name())
+        }
+        (Some(ordering), None) => Ok(Some(CollationSeq::Type(ordering))),
+        (None, explicit_collation) => Ok(explicit_collation.map(CollationSeq::Text)),
+    }
+}
+
+/// The order of the type of an index expression over `table`'s columns, such
+/// as numeric's order for `n * 2` when n is numeric.
+pub(crate) fn expression_type_ordering(
+    expr: &Expr,
+    table: &BTreeTable,
+    schema: &Schema,
+    syms: &SymbolTable,
+) -> crate::Result<Option<TypeOrdering>> {
+    let mut expr = expr.clone();
+    crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
+    let ty = type_of(&expr, &TypeEnv::over_table(table, schema, syms));
+    Ok(type_ordering(&ty, schema))
+}
+
 /// Extracts collation sequence from an expression if it is a Collate expression.
 /// Given the example: `col1 COLLATE NOCASE` / Expr::Collation(Expr::Id(col1), CollationSeq)
 /// returns (Some(CollationSeq), Expr::Id(col1))
 fn extract_collation<'a>(
     expr: &'a Expr,
     resolver: Option<&CatalogContext>,
-) -> crate::Result<(Option<CollationSeq>, &'a Expr)> {
+) -> crate::Result<(Option<TextCollation>, &'a Expr)> {
     let mut current = expr;
     let mut coll = None;
     loop {
@@ -1134,7 +1185,7 @@ fn extract_collation<'a>(
                 if coll.is_none() {
                     let collation = match resolver {
                         Some(resolver) => resolver.resolve_collation(seq.as_str())?,
-                        None => CollationSeq::new(seq.as_str())?,
+                        None => TextCollation::new(seq.as_str())?,
                     };
                     if collation.is_custom() {
                         crate::bail_parse_error!("custom collations are not supported in indexes");
@@ -1472,7 +1523,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::NoCase,
+        collation: CollationSeq::NOCASE,
     });
 
     // read type of table

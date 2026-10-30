@@ -5,10 +5,7 @@
 test create-type-basic {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
+        DECODE test_uint_decode(value);
     SELECT name FROM sqlite_turso_types WHERE name LIKE 'test_uint%';
 }
 expect {
@@ -98,50 +95,6 @@ test custom-type-name-does-not-affect-column-affinity {
 }
 expect {
     integer|5
-}
-
-@requires strict "uses STRICT tables"
-test uint-addition {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add;
-    CREATE TABLE t1(val test_uint) STRICT;
-    INSERT INTO t1 VALUES (20);
-    INSERT INTO t1 VALUES (30);
-    SELECT val + val FROM t1;
-}
-expect {
-    40
-    60
-}
-
-@requires strict "uses STRICT tables"
-test uint-comparison-less-than {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt;
-    CREATE TABLE t1(val test_uint) STRICT;
-    INSERT INTO t1 VALUES (9);
-    INSERT INTO t1 VALUES (10);
-    INSERT INTO t1 VALUES (100);
-    SELECT val FROM t1 WHERE val < 10;
-}
-expect {
-    9
-}
-
-@requires strict "uses STRICT tables"
-test uint-comparison-equals {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(val test_uint) STRICT;
-    INSERT INTO t1 VALUES (42);
-    INSERT INTO t1 VALUES (99);
-    SELECT val FROM t1 WHERE val = 42;
-}
-expect {
-    42
 }
 
 @requires strict "uses STRICT tables"
@@ -307,13 +260,13 @@ expect {
     boolean(value any)|integer|boolean_to_int (value)||CASE WHEN value THEN 1 ELSE 0 END||'<'
     bytea(value blob)|blob|||||'<'
     cidr(value text)|text|value||value||
-    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END||value||'+' date_plus, '-' date_minus, '<'
+    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END||value||'<'
     inet(value text)|text|validate_ipaddr (value)||value||
     json(value text)|text|json (value)||value||
     jsonb(value text)|blob|jsonb (value)||json (value)||
     macaddr(value text)|text|value||value||
     macaddr8(value text)|text|value||value||
-    numeric(value any, precision integer, scale integer)|blob|numeric_encode (value)|numeric_fit (value, precision, scale)|numeric_decode (value)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
+    numeric(value any, precision integer, scale integer)|blob|numeric_encode (value)|numeric_fit (value, precision, scale)|numeric_decode (value)||
     smallint(value integer)|integer||CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|||'<'
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END||value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
@@ -327,7 +280,6 @@ test pragma-list-types-with-custom {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
         DEFAULT 0;
     PRAGMA list_types;
 }
@@ -341,15 +293,15 @@ expect {
     boolean(value any)|integer|boolean_to_int (value)||CASE WHEN value THEN 1 ELSE 0 END||'<'
     bytea(value blob)|blob|||||'<'
     cidr(value text)|text|value||value||
-    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END||value||'+' date_plus, '-' date_minus, '<'
+    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END||value||'<'
     inet(value text)|text|validate_ipaddr (value)||value||
     json(value text)|text|json (value)||value||
     jsonb(value text)|blob|jsonb (value)||json (value)||
     macaddr(value text)|text|value||value||
     macaddr8(value text)|text|value||value||
-    numeric(value any, precision integer, scale integer)|blob|numeric_encode (value)|numeric_fit (value, precision, scale)|numeric_decode (value)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
+    numeric(value any, precision integer, scale integer)|blob|numeric_encode (value)|numeric_fit (value, precision, scale)|numeric_decode (value)||
     smallint(value integer)|integer||CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|||'<'
-    test_uint(value any)|text|test_uint_encode (value)||test_uint_decode (value)|0|'+' test_uint_add
+    test_uint(value any)|text|test_uint_encode (value)||test_uint_decode (value)|0|
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END||value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
     timestamptz(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END||value||'<'
@@ -731,9 +683,7 @@ expect {
     1|changed|world
 }
 
-# test_reverse stores reversed text: 'apple' -> 'elppa', 'banana' -> 'ananab'.
-# Without OPERATOR '<', ORDER BY is forbidden because sorting on encoded values
-# would give wrong results (e.g. 'ananab' < 'elppa' < 'yrrehc' is not alphabetical).
+# A type with a DECODE and no OPERATOR '<' has no order to sort by.
 @requires strict "uses STRICT tables"
 test order-by-custom-type-without-lt {
     CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
@@ -745,6 +695,24 @@ test order-by-custom-type-without-lt {
 }
 expect error {
     cannot ORDER BY column 'val' of type 'test_reverse': type does not declare OPERATOR '<'
+}
+
+# test_reverse stores reversed text: 'apple' -> 'elppa', 'banana' -> 'ananab'.
+# With OPERATOR '<', ORDER BY sorts by the stored value: 'ananab' < 'elppa' < 'yrrehc',
+# so the decoded values come out as banana, apple, cherry.
+@requires strict "uses STRICT tables"
+test order-by-custom-type-sorts-by-stored-value {
+    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TABLE t1(val test_reverse) STRICT;
+    INSERT INTO t1 VALUES ('apple');
+    INSERT INTO t1 VALUES ('banana');
+    INSERT INTO t1 VALUES ('cherry');
+    SELECT val FROM t1 ORDER BY val;
+}
+expect {
+    banana
+    apple
+    cherry
 }
 
 @requires strict "uses STRICT tables"
@@ -779,7 +747,6 @@ expect {
 
 # Sorting operates on encoded (on-disk) values, not decoded.
 # Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
-# Naked OPERATOR '<' uses base type (text) comparison on encoded values.
 # DESC encoded: yrrehc > elppa > ananab → decoded display: cherry, apple, banana.
 @requires strict "uses STRICT tables"
 test order-by-custom-type-desc {
@@ -962,7 +929,7 @@ expect {
 # sorts on decoded values: apple < banana < cherry.
 @requires strict "uses STRICT tables"
 test order-by-group-by-custom-type {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
     CREATE TABLE t1(val test_reverse, n INTEGER) STRICT;
     INSERT INTO t1 VALUES ('apple', 1);
     INSERT INTO t1 VALUES ('apple', 2);
@@ -1082,8 +1049,7 @@ expect {
 
 # --- INDEX TESTS ---
 
-# test_reverse needs OPERATOR '<' to allow CREATE INDEX.
-# Equality seek still works the same — find val='hello' (stored as 'olleh').
+# The index holds stored values, so the seek looks up 'olleh' for val='hello'.
 @requires strict "uses STRICT tables"
 test index-equality-seek-custom-type {
     CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
@@ -1264,7 +1230,7 @@ expect {
     1|100.00
 }
 
-# --- DERIVED OPERATOR TESTS ---
+# --- COMPARISON TESTS ---
 
 @requires strict "uses STRICT tables"
 test derived-operator-greater-than {
@@ -1351,53 +1317,6 @@ expect {
     1|100.00
 }
 
-@requires strict "uses STRICT tables"
-test derived-operator-not-equals-with-uint {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    SELECT id, val FROM t1 WHERE val != 20 ORDER BY id;
-}
-expect {
-    1|10
-    3|30
-}
-
-@requires strict "uses STRICT tables"
-test derived-operator-greater-with-uint {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    SELECT id, val FROM t1 WHERE val > 20 ORDER BY id;
-}
-expect {
-    3|30
-}
-
-@requires strict "uses STRICT tables"
-test derived-operator-less-equals-with-uint {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    SELECT id, val FROM t1 WHERE val <= 20 ORDER BY id;
-}
-expect {
-    1|10
-    2|20
-}
-
 # --- TRIGGER TESTS ---
 
 @requires strict "uses STRICT tables"
@@ -1447,9 +1366,7 @@ expect {
 test typecheck-validates-base-type-insert {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
+        DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     INSERT INTO t1 VALUES (2, 100);
@@ -1464,9 +1381,7 @@ expect {
 test typecheck-validates-base-type-update {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
+        DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     UPDATE t1 SET val = 100 WHERE id = 1;
@@ -1480,9 +1395,7 @@ expect {
 test typecheck-validates-base-type-upsert {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
+        DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     INSERT INTO t1 VALUES (1, 100) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
@@ -1490,77 +1403,6 @@ test typecheck-validates-base-type-upsert {
 }
 expect {
     100
-}
-
-@requires strict "uses STRICT tables"
-test order-by-custom-lt-numeric-sort {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 1);
-    INSERT INTO t1 VALUES (2, 10);
-    INSERT INTO t1 VALUES (3, 2);
-    INSERT INTO t1 VALUES (4, 20);
-    INSERT INTO t1 VALUES (5, 100);
-    INSERT INTO t1 VALUES (6, 3);
-    SELECT val FROM t1 ORDER BY val ASC;
-}
-expect {
-    1
-    2
-    3
-    10
-    20
-    100
-}
-
-@requires strict "uses STRICT tables"
-test order-by-custom-lt-desc {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 1);
-    INSERT INTO t1 VALUES (2, 10);
-    INSERT INTO t1 VALUES (3, 2);
-    INSERT INTO t1 VALUES (4, 20);
-    INSERT INTO t1 VALUES (5, 100);
-    INSERT INTO t1 VALUES (6, 3);
-    SELECT val FROM t1 ORDER BY val DESC;
-}
-expect {
-    100
-    20
-    10
-    3
-    2
-    1
-}
-
-@requires strict "uses STRICT tables"
-test order-by-custom-lt-with-limit {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 1);
-    INSERT INTO t1 VALUES (2, 10);
-    INSERT INTO t1 VALUES (3, 2);
-    INSERT INTO t1 VALUES (4, 20);
-    INSERT INTO t1 VALUES (5, 100);
-    SELECT val FROM t1 ORDER BY val ASC LIMIT 3;
-}
-expect {
-    1
-    2
-    10
 }
 
 @requires strict "uses STRICT tables"
@@ -1600,50 +1442,6 @@ test create-type-aggregate-in-decode-rejected {
 }
 expect error {
     aggregate functions prohibited in DECODE expressions
-}
-
-@requires strict "uses STRICT tables"
-test type-roundtrip-special-chars-operator {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    SELECT val FROM t1;
-}
-expect {
-    42
-}
-
-@requires strict "uses STRICT tables"
-test order-by-custom-lt-many-values {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 999);
-    INSERT INTO t1 VALUES (2, 1);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 200);
-    INSERT INTO t1 VALUES (5, 5);
-    INSERT INTO t1 VALUES (6, 1000);
-    INSERT INTO t1 VALUES (7, 42);
-    INSERT INTO t1 VALUES (8, 7);
-    SELECT val FROM t1 ORDER BY val ASC;
-}
-expect {
-    1
-    5
-    7
-    42
-    50
-    200
-    999
-    1000
 }
 
 @requires strict "uses STRICT tables"
@@ -1842,20 +1640,6 @@ test filter-cents-encode-decode {
 }
 expect {
     82|67
-}
-
-@requires strict "uses STRICT tables"
-test filter-uint-with-custom-operators {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint, grp TEXT) STRICT;
-    INSERT INTO t1 VALUES (1, 10, 'a'), (2, 20, 'a'), (3, 30, 'b'), (4, 40, 'b');
-    SELECT COUNT(*), COUNT(*) FILTER (WHERE grp = 'a') FROM t1;
-}
-expect {
-    4|2
 }
 
 @requires strict "uses STRICT tables"

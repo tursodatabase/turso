@@ -48,7 +48,6 @@ pub fn emit_table_column_for_dml(
         &SelfTableContext::ForDML {
             dml_ctx: dml_column_context,
             table: Arc::clone(table),
-            uses_custom_type_operators: false,
         },
         None,
         column,

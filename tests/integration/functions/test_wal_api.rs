@@ -1130,3 +1130,64 @@ fn wal_insert_end_drops_frames_of_concurrent_writer() {
     let lagging: Vec<(i64,)> = setup.exec_rows("SELECT count(*) FROM w WHERE v != 10");
     assert_eq!(lagging, [(0,)], "rows that miss committed updates");
 }
+
+struct StepFailsOnce {
+    io: crate::queued_io::QueuedIo,
+    fail_next_step: std::sync::atomic::AtomicBool,
+}
+
+impl turso_core::Clock for StepFailsOnce {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+        turso_core::Clock::current_time_monotonic(&self.io)
+    }
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+        turso_core::Clock::current_time_wall_clock(&self.io)
+    }
+}
+
+impl turso_core::IO for StepFailsOnce {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: turso_core::OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        turso_core::IO::open_file(&self.io, path, flags, direct)
+    }
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        turso_core::IO::remove_file(&self.io, path)
+    }
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        turso_core::IO::file_id(&self.io, path)
+    }
+    fn step(&self) -> turso_core::Result<()> {
+        if self
+            .fail_next_step
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(LimboError::InternalError("io_uring_enter failed".into()));
+        }
+        turso_core::IO::step(&self.io)
+    }
+}
+
+#[test]
+fn wal_get_frame_does_not_write_into_buffer_after_it_returns_error() {
+    let io = Arc::new(StepFailsOnce {
+        io: crate::queued_io::QueuedIo::new(),
+        fail_next_step: false.into(),
+    });
+    let db =
+        turso_core::Database::open_file(io.clone(), "repro.db", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    let mut frame = [0u8; 24 + 4096];
+    io.fail_next_step
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(conn.wal_get_frame(1, &mut frame).is_err());
+    io.io.step_one().unwrap();
+    assert!(
+        frame.iter().all(|&byte| byte == 0),
+        "the read wrote into the buffer after wal_get_frame returned"
+    );
+}

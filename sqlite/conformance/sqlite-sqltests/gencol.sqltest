@@ -5045,27 +5045,83 @@ test gencol-virtual-union-tag-select-resolves-self-table-type {
     2|f
 }
 
+# A virtual column over a custom-type column must see the user's value, not the
+# value ENCODE stored, in RETURNING and in trigger NEW/OLD rows.
 @skip-if sqlite "SQLite doesn't support custom types"
 @requires custom_types "uses custom types"
-test gencol-virtual-index-key-on-custom-type-column-uses-standard-operators {
+test gencol-virtual-reads-user-value-of-custom-type-column {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p cents, q cents, d ANY AS (p) VIRTUAL) STRICT;
+    CREATE TABLE log(what TEXT, v ANY) STRICT;
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN INSERT INTO log VALUES ('bi', NEW.d); END;
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('bu', NEW.d); END;
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('au-new', NEW.d);
+        INSERT INTO log VALUES ('au-old', OLD.d);
+    END;
+    INSERT INTO t(id, p, q) VALUES (1, 10, 5) RETURNING d;
+    UPDATE t SET q = 6 RETURNING d;
+    UPDATE t SET p = 20 RETURNING d;
+    INSERT INTO t(id, p, q) VALUES (1, 30, 7)
+        ON CONFLICT(id) DO UPDATE SET q = excluded.q RETURNING d;
+    SELECT what, v FROM log ORDER BY rowid;
+} expect {
+    10
+    10
+    20
+    20
+    bi|10
+    bu|10
+    au-new|10
+    au-old|10
+    bu|20
+    au-new|20
+    au-old|10
+    bi|30
+    bu|20
+    au-new|20
+    au-old|20
+}
+
+# UPDATE that sets one numeric column: the indexed virtual column adds it to a
+# column the UPDATE did not set, which is still in its stored form.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol-virtual-index-key-mixes-set-and-unchanged-custom-type-columns {
+    CREATE TABLE m(id INTEGER PRIMARY KEY, a numeric(10,2), b numeric(10,2), s ANY AS (a + b) VIRTUAL) STRICT;
+    CREATE INDEX m_s ON m(s);
+    INSERT INTO m(id, a, b) VALUES (1, 1.25, 2.50);
+    UPDATE m SET a = 2.00;
+    SELECT s FROM m INDEXED BY m_s WHERE s = '4.50';
+    SELECT count(*) FROM m INDEXED BY m_s WHERE s = '3.75';
+    PRAGMA integrity_check;
+} expect {
+    4.50
+    0
+    ok
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol-virtual-index-key-on-custom-type-column-uses-type-operators {
     CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), doubled ANY AS (val * 2) VIRTUAL) STRICT;
     CREATE INDEX prices_doubled ON prices(doubled);
     INSERT INTO prices(id, val) VALUES (1, 1.50);
-    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = 3.0;
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = (SELECT val * 2 FROM prices);
     PRAGMA integrity_check;
     UPDATE prices SET val = 2.50;
-    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = 5.0;
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = (SELECT val * 2 FROM prices);
     INSERT INTO prices(id, val) VALUES (1, 4.50) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
-    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = 9.0;
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = (SELECT val * 2 FROM prices);
     PRAGMA integrity_check;
     DELETE FROM prices WHERE id = 1;
     SELECT count(*) FROM prices;
     PRAGMA integrity_check;
 } expect {
-    real|3.0
+    text|3.00
     ok
-    real|5.0
-    real|9.0
+    text|5.00
+    text|9.00
     ok
     0
     ok

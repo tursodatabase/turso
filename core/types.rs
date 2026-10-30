@@ -2644,7 +2644,7 @@ impl IndexInfo {
             })
             .chain(has_rowid.then_some(KeyInfo {
                 sort_order: SortOrder::Asc,
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
                 nulls_order: None,
             }));
         Self::new_in(
@@ -2811,13 +2811,16 @@ where
 {
     if right_values.len() != 0 && index_info.num_cols <= 13 {
         let val = right_values.peek().unwrap();
+        let collation = index_info.key_info[0].collation;
         match val.as_value_ref() {
-            ValueRef::Numeric(Numeric::Integer(key)) => RecordCompare::Int {
-                rhs_first_value: key,
-            },
-            ValueRef::Text(_) if index_info.key_info[0].collation == CollationSeq::Binary => {
-                RecordCompare::String
+            ValueRef::Numeric(Numeric::Integer(key))
+                if matches!(collation, CollationSeq::Text(_)) =>
+            {
+                RecordCompare::Int {
+                    rhs_first_value: key,
+                }
             }
+            ValueRef::Text(_) if collation == CollationSeq::BINARY => RecordCompare::String,
             _ => RecordCompare::Generic,
         }
     } else {
@@ -4386,7 +4389,7 @@ mod tests {
         let index_info = create_index_info(
             2,
             vec![SortOrder::Asc, SortOrder::Asc],
-            vec![CollationSeq::Binary; 2],
+            vec![CollationSeq::BINARY; 2],
         );
 
         let test_cases = vec![
@@ -4461,7 +4464,7 @@ mod tests {
         let index_info = create_index_info(
             2,
             vec![SortOrder::Asc, SortOrder::Asc],
-            vec![CollationSeq::Binary; 2],
+            vec![CollationSeq::BINARY; 2],
         );
 
         let test_cases = vec![
@@ -4521,7 +4524,7 @@ mod tests {
 
     #[test]
     fn test_type_precedence() {
-        let index_info = create_index_info(1, vec![SortOrder::Asc], vec![CollationSeq::Binary]);
+        let index_info = create_index_info(1, vec![SortOrder::Asc], vec![CollationSeq::BINARY]);
 
         // Test SQLite type precedence: NULL < Numbers < Text < Blob
         let test_cases = vec![
@@ -4606,7 +4609,7 @@ mod tests {
         let index_info = create_index_info(
             2,
             vec![SortOrder::Desc, SortOrder::Asc],
-            vec![CollationSeq::Binary; 2],
+            vec![CollationSeq::BINARY; 2],
         );
 
         let test_cases = vec![
@@ -4645,7 +4648,7 @@ mod tests {
     #[test]
     fn test_edge_cases() {
         let index_info =
-            create_index_info(15, vec![SortOrder::Asc; 15], vec![CollationSeq::Binary; 15]);
+            create_index_info(15, vec![SortOrder::Asc; 15], vec![CollationSeq::BINARY; 15]);
 
         let test_cases = vec![
             (
@@ -4701,7 +4704,7 @@ mod tests {
     #[test]
     fn compare_record_preserves_prefix_tie_breakers() {
         let index_info =
-            create_index_info(2, vec![SortOrder::Asc; 2], vec![CollationSeq::Binary; 2]);
+            create_index_info(2, vec![SortOrder::Asc; 2], vec![CollationSeq::BINARY; 2]);
         for first in [Value::from_i64(42), Value::build_text("key"), Value::Null] {
             let serialized = create_record(vec![first.clone(), Value::from_i64(99)]);
             for tie_breaker in [Ordering::Less, Ordering::Equal, Ordering::Greater] {
@@ -4725,7 +4728,7 @@ mod tests {
         let index_info = create_index_info(
             3,
             vec![SortOrder::Asc, SortOrder::Asc, SortOrder::Asc],
-            vec![CollationSeq::Binary; 3],
+            vec![CollationSeq::BINARY; 3],
         );
 
         let serialized = create_record(vec![
@@ -4764,8 +4767,8 @@ mod tests {
 
     #[test]
     fn test_strategy_selection() {
-        let collations_small = vec![CollationSeq::Binary; 3];
-        let collations_large = vec![CollationSeq::Binary; 15];
+        let collations_small = vec![CollationSeq::BINARY; 3];
+        let collations_large = vec![CollationSeq::BINARY; 15];
         let index_info_small = create_index_info(
             3,
             vec![SortOrder::Asc, SortOrder::Asc, SortOrder::Asc],
@@ -5119,7 +5122,7 @@ mod tests {
         // The single-value compare, now CollationSeq::compare, is where the unwrap panic originally surfaced.
         for a in &values {
             for b in &values {
-                let _ = CollationSeq::Binary.compare(*a, *b);
+                let _ = CollationSeq::BINARY.compare(*a, *b);
             }
         }
 

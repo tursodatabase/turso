@@ -1913,7 +1913,8 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable, resolver: &Resolver)
             .mark_column_used(table_id, column_index);
     }
 
-    subquery.columns = query_output_columns(&subquery.plan, None, resolver)?;
+    (subquery.columns, subquery.column_types) =
+        query_output_columns(&subquery.plan, None, resolver)?;
     assert_eq!(subquery.columns.len(), join_columns.len());
     for column_index in 0..subquery.columns.len() {
         let original_name = subquery.columns[column_index]

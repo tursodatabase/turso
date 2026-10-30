@@ -23,42 +23,7 @@ use super::{
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
-use super::expr::expr_type::{column_custom_type, type_of, TypeEnv};
 use crate::translate::eqp::{EqpDetail, EqpSortMethod};
-use crate::vdbe::insn::SortComparatorType;
-
-/// Maps a custom type `<` operator function name to a SortComparatorType.
-/// Returns None if the function name is not recognized.
-fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType> {
-    match func_name {
-        "numeric_lt" => Some(SortComparatorType::NumericLt),
-        "test_uint_lt" => Some(SortComparatorType::TestUintLt),
-        "string_reverse" => Some(SortComparatorType::StringReverse),
-        "array_lt" => Some(SortComparatorType::ArrayLt),
-        _ => None,
-    }
-}
-
-/// Returns the comparator for sorting an expression: element by element for an
-/// array, or the function behind the `<` operator of a column's custom type when
-/// the sorter knows it. Returns None otherwise, which sorts by the stored bytes.
-pub(crate) fn custom_type_comparator(
-    expr: &ast::Expr,
-    referenced_tables: &TableReferences,
-    resolver: &Resolver,
-) -> Option<SortComparatorType> {
-    let env = TypeEnv::new(Some(referenced_tables), resolver);
-    if type_of(expr, &env).is_array() {
-        return Some(SortComparatorType::ArrayLt);
-    }
-    column_custom_type(expr, &env)?
-        .type_def
-        .operators()
-        .iter()
-        .find(|op| op.op == "<")
-        .and_then(|op| op.func_name.as_ref())
-        .and_then(|func_name| sort_comparator_from_func_name(func_name))
-}
 
 /// For a result column expression that is a column reference to a custom type,
 /// returns the column definition and type definition.
@@ -83,35 +48,6 @@ fn result_column_custom_type_info<'a>(
     } else {
         None
     }
-}
-
-/// Returns true if the expression is a column reference to a custom type
-/// (with encode/decode) that does NOT have a `<` operator with a known
-/// sort comparator. This includes types with no `<` operator at all, and
-/// types whose `<` function is not recognized by the sorter.
-fn is_custom_type_without_lt(
-    expr: &ast::Expr,
-    referenced_tables: &TableReferences,
-    schema: &Schema,
-) -> bool {
-    if let ast::Expr::Column {
-        table: table_ref_id,
-        column,
-        ..
-    } = expr
-    {
-        if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id) {
-            if let Some(col) = table.get_column_at(*column) {
-                if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    if type_def.decode().is_some() {
-                        // No `<` operator at all (naked or with function)
-                        return !type_def.operators().iter().any(|op| op.op == "<");
-                    }
-                }
-            }
-        }
-    }
-    false
 }
 
 // Metadata for handling ORDER BY operations
@@ -152,22 +88,17 @@ impl EmitOrderBy {
         has_distinct: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
-        // Block ORDER BY on custom type columns without OPERATOR '<'
         for (expr, _, _) in order_by.iter() {
-            if is_custom_type_without_lt(expr, referenced_tables, t_ctx.resolver.schema()) {
-                if let Some((col, type_def)) =
-                    result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
-                {
-                    let col_name = col.name.as_deref().unwrap_or("?");
+            if let Some((col, type_def)) =
+                result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
+            {
+                if col.type_ordering().is_none() && !type_def.is_sortable() {
                     crate::bail_parse_error!(
-                    "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
-                    col_name,
-                    type_def.name
-                );
+                        "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
+                        col.name.as_deref().unwrap_or("?"),
+                        type_def.name
+                    );
                 }
-                crate::bail_parse_error!(
-                    "cannot ORDER BY a custom type column that does not declare OPERATOR '<'"
-                );
             }
         }
 
@@ -204,6 +135,7 @@ impl EmitOrderBy {
                     nulls_order: None,
                     pos_in_table,
                     collation,
+                    explicit_collation: None,
                     default: None,
                     expr: None,
                 });
@@ -215,7 +147,8 @@ impl EmitOrderBy {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table,
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
+                explicit_collation: None,
                 default: None,
                 expr: None,
             })?;
@@ -224,7 +157,7 @@ impl EmitOrderBy {
                 index_columns.try_push(IndexColumn::new(
                     pos_in_table.to_string(),
                     pos_in_table,
-                    CollationSeq::Binary,
+                    CollationSeq::BINARY,
                 ))?;
             }
             let index = Arc::new(Index {
@@ -275,13 +208,12 @@ impl EmitOrderBy {
             )?;
 
             if has_sequence {
-                // sequence column: ascending with BINARY collation, no comparator, no nulls order
+                // sequence column: ascending with BINARY collation, no nulls order
                 data.order_collations_nulls.try_push((
                     SortOrder::Asc,
-                    CollationSeq::Binary,
+                    CollationSeq::BINARY,
                     None,
                 ))?;
-                data.comparators.try_push(None)?;
             }
 
             data.columns = data.order_collations_nulls.len();
@@ -495,8 +427,8 @@ impl EmitOrderBy {
                 });
             } else {
                 // Sort keys must be encoded (on-disk) values. Suppress decode so the
-                // sorter compares encoded representations, using either the base type's
-                // built-in comparison (naked OPERATOR '<') or a custom comparator function.
+                // sorter compares stored values, with SQLite's comparison or the
+                // built-in type's own order (numeric).
                 let is_custom =
                     result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
                         .is_some_and(|(_, td)| td.decode().is_some());
@@ -690,14 +622,11 @@ pub(crate) fn sorter_open_data<'a>(
         cursor_id,
         columns: 0,
         order_collations_nulls: Vec::try_with_capacity_ext(capacity)?,
-        comparators: Vec::try_with_capacity_ext(capacity)?,
     };
     for (expr, direction, nulls) in terms {
         let collation = ExprContext::new(Some(tables), resolver).expr_collation(expr)?;
         data.order_collations_nulls
             .try_push((direction, collation, nulls))?;
-        data.comparators
-            .try_push(custom_type_comparator(expr, tables, resolver))?;
     }
     data.columns = data.order_collations_nulls.len();
     Ok(data)

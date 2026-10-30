@@ -1044,18 +1044,29 @@ pub fn exec_date_plus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Val
     }
 }
 
+/// `date - days`: the date that many days earlier.
 pub fn exec_date_minus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
     match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(_), Value::Numeric(Numeric::Integer(days))) => {
             add_days(clock, lhs, days.saturating_neg())
         }
+        _ => Err(crate::LimboError::Constraint(
+            "only an integer number of days can be subtracted from a date".to_string(),
+        )),
+    }
+}
+
+/// `date - date`: the number of days from the second date to the first.
+pub fn exec_date_diff(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
+    match (lhs, rhs) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(_), Value::Text(_)) => {
             let days = julian_day(clock, lhs)? - julian_day(clock, rhs)?;
             Ok(Value::from_i64(days.round() as i64))
         }
         _ => Err(crate::LimboError::Constraint(
-            "only an integer number of days or a date can be subtracted from a date".to_string(),
+            "a date can only be subtracted from a date".to_string(),
         )),
     }
 }

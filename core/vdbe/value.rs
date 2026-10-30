@@ -131,16 +131,16 @@ impl ComparisonOp {
         lhs: V1,
         rhs: V2,
         collation: CollationSeq,
-    ) -> bool {
-        let order = collation.compare(lhs.as_value_ref(), rhs.as_value_ref());
-        match self {
+    ) -> crate::Result<bool> {
+        let order = collation.compare_operands(lhs.as_value_ref(), rhs.as_value_ref())?;
+        Ok(match self {
             ComparisonOp::Eq => order.is_eq(),
             ComparisonOp::Ne => order.is_ne(),
             ComparisonOp::Lt => order.is_lt(),
             ComparisonOp::Le => order.is_le(),
             ComparisonOp::Gt => order.is_gt(),
             ComparisonOp::Ge => order.is_ge(),
-        }
+        })
     }
 }
 
@@ -1880,7 +1880,7 @@ mod tests {
     }
 
     fn binary(lhs: &Value, rhs: &Value) -> crate::Result<std::cmp::Ordering> {
-        Ok(crate::translate::collate::CollationSeq::Binary.compare(lhs.as_ref(), rhs.as_ref()))
+        Ok(crate::translate::collate::CollationSeq::BINARY.compare(lhs.as_ref(), rhs.as_ref()))
     }
 
     fn allocated(result: std::result::Result<Value, crate::alloc::TryReserveError>) -> Value {
