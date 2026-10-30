@@ -1,14 +1,15 @@
 use super::*;
 use crate::{
+    alloc::TursoVecInExt,
     index_method::{
-        IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostContext,
+        IndexMethod, IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCostContext,
         IndexMethodCostEstimate,
     },
     schema::IndexColumn,
 };
 use rustc_hash::FxHashMap;
 use std::num::NonZeroU32;
-use turso_parser::ast::{Expr, Literal, UnaryOperator, Variable};
+use turso_parser::ast::{Expr, Literal, Name, UnaryOperator, Variable};
 
 #[test]
 fn field_weights_reject_non_finite_and_non_positive_values() {
@@ -34,7 +35,10 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
         let result = FtsIndexAttachment::new(IndexMethodConfiguration {
             table_name: "w".to_string(),
             index_name: "wx".to_string(),
-            columns: crate::alloc::vec![IndexColumn::new("title", 0), IndexColumn::new("body", 1)],
+            columns: crate::alloc::vec![
+                IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
+                IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::BINARY)
+            ],
             parameters: FxHashMap::from_iter([(
                 "weights".to_string(),
                 Value::from_text(format!("title={weight},body=1")),
@@ -56,7 +60,10 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
 
 #[test]
 fn field_weights_accept_finite_positive_boundaries() {
-    let columns = [IndexColumn::new("title", 0), IndexColumn::new("body", 1)];
+    let columns = [
+        IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
+        IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::BINARY),
+    ];
     for (input, expected) in [
         ("1e-45", f32::from_bits(1)),
         ("1.17549435e-38", f32::MIN_POSITIVE),
@@ -70,11 +77,37 @@ fn field_weights_accept_finite_positive_boundaries() {
     }
 }
 
+#[test]
+fn field_weights_rename_column() {
+    let rename = |weights: &str, to: &str| -> Result<String> {
+        let mut with_clause = vec![(
+            Name::exact("WEIGHTS".to_string()),
+            Box::new(Expr::Literal(Literal::String(weights.to_string()))),
+        )];
+        FtsIndexMethod.rename_column_in_with_clause(&mut with_clause, "title", to)?;
+        let Expr::Literal(Literal::String(weights)) = *with_clause.remove(0).1 else {
+            panic!("weights must stay a string literal");
+        };
+        Ok(weights)
+    };
+    assert_eq!(
+        rename("'Title=2.0, body=1.5'", "Heading").unwrap(),
+        "'Heading=2.0,body=1.5'"
+    );
+    assert_eq!(rename("'body = 1.5'", "heading").unwrap(), "'body = 1.5'");
+    for to in ["a,b", "a=b", " a", "a ", "it's"] {
+        assert!(rename("'title=2.0'", to).is_err(), "accepted {to:?}");
+    }
+}
+
 fn test_attachment() -> FtsIndexAttachment {
     FtsIndexAttachment::new(IndexMethodConfiguration {
         table_name: "docs".to_string(),
         index_name: "docs_fts".to_string(),
-        columns: crate::alloc::vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
+        columns: crate::alloc::vec![
+            IndexColumn::new("title", 1, crate::translate::collate::CollationSeq::BINARY),
+            IndexColumn::new("body", 2, crate::translate::collate::CollationSeq::BINARY)
+        ],
         parameters: FxHashMap::<String, Value>::default(),
     })
     .unwrap()
@@ -120,7 +153,7 @@ fn score_result_uses_the_fields_selected_by_the_query() {
 #[test]
 fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
     let attachment = test_attachment();
-    for (_, field) in attachment.text_fields {
+    for (_, field) in attachment.indexed_fields {
         assert!(
             !attachment.schema.get_field_entry(field).is_stored(),
             "FTS projections come from the base table, so storing indexed text duplicates data"
@@ -132,7 +165,11 @@ fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstima
     let attachment = FtsIndexAttachment::new(IndexMethodConfiguration {
         table_name: "docs".to_string(),
         index_name: "docs_fts".to_string(),
-        columns: crate::alloc::vec![IndexColumn::new("body", 1)],
+        columns: crate::alloc::vec![IndexColumn::new(
+            "body",
+            1,
+            crate::translate::collate::CollationSeq::BINARY
+        )],
         parameters: FxHashMap::<String, Value>::default(),
     })
     .unwrap();
@@ -228,11 +265,13 @@ fn snapshot_directory_reads_shared_file_bytes_without_copying() {
     use tantivy::directory::Directory;
 
     let path = std::path::Path::new("segment.term");
-    let mut bytes = DynVec::new_in(DynAllocator::default());
+    let mut bytes =
+        <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(DynAllocator::default());
     bytes.try_extend([3, 5, 7, 11, 13]).unwrap();
     let data = Arc::new(bytes);
     let files = HashMap::from_iter([(path.to_path_buf(), Arc::clone(&data))]);
-    let mut meta_json = DynVec::new_in(DynAllocator::default());
+    let mut meta_json =
+        <DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(DynAllocator::default());
     meta_json.try_extend(b"metadata".iter().copied()).unwrap();
     let directory = SnapshotDirectory::new(files, meta_json);
     assert!(directory.exists(path).unwrap());
@@ -287,7 +326,7 @@ fn build_and_load_segment(
     for (rowid, text) in docs {
         let mut doc = TantivyDocument::default();
         doc.add_i64(attachment.rowid_field, *rowid);
-        doc.add_text(attachment.text_fields[0].1, *text);
+        doc.add_text(attachment.indexed_fields[0].1, *text);
         cursor_docs.push(BufferedDoc { rowid: *rowid, doc });
     }
     let mut cursor = FtsCursor::new(attachment);
@@ -382,7 +421,9 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     let mut stray = files;
     stray.insert(
         PathBuf::from("meta.json"),
-        Arc::new(DynVec::new_in(DynAllocator::default())),
+        Arc::new(<DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(
+            DynAllocator::default(),
+        )),
     );
     assert!(matches!(
         rename_segment_files(stray, &segment.id(), &minted),
@@ -1145,4 +1186,120 @@ mod allocation_failures {
             unsafe { Global.deallocate(ptr, layout) }
         }
     }
+}
+
+/// 25 documents inserted by one statement, so the index holds them in one segment in id order:
+/// ids 1 to 20 match 'hello' and the rest do not, and every match is in category 0 but the last,
+/// id 20, in category 1.
+fn documents_in_categories() -> Arc<Connection> {
+    let db = crate::Database::open(
+        Arc::new(crate::MemoryIO::new()),
+        ":memory:",
+        crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+            .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
+    )
+    .unwrap();
+    let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, cat INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    let rows: Vec<String> = (1..=25i64)
+        .map(|id| {
+            let body = if id <= 20 {
+                "hello ".repeat((id % 3 + 1) as usize) + "world"
+            } else {
+                "goodbye world".to_string()
+            };
+            format!("({id}, '{body}', {})", i64::from(id == 20))
+        })
+        .collect();
+    conn.execute(format!("INSERT INTO docs VALUES {}", rows.join(", ")))
+        .unwrap();
+    conn
+}
+
+fn collected(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+    conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+}
+
+/// An FTS pattern with LIMIT applies the LIMIT to the matches it gives out, so it cannot serve a
+/// query whose aggregate or DISTINCT comes before the LIMIT: the aggregate counts every match, and
+/// the DISTINCT keeps every category.
+#[test]
+fn fts_limit_applies_after_aggregates_and_distinct() {
+    let conn = documents_in_categories();
+    assert_eq!(
+        collected(
+            &conn,
+            "SELECT count(*) FROM docs WHERE fts_match(body, 'hello') LIMIT 5"
+        ),
+        vec![vec![Value::from_i64(20)]]
+    );
+    let mut categories = collected(
+        &conn,
+        "SELECT DISTINCT cat FROM docs WHERE fts_match(body, 'hello') LIMIT 2",
+    );
+    categories.sort_by_key(|row| row[0].as_int());
+    assert_eq!(
+        categories,
+        vec![vec![Value::from_i64(0)], vec![Value::from_i64(1)]]
+    );
+}
+
+/// Nine documents inserted by one statement, mentioning 'hello' once, twice or three times, so
+/// their FTS scores take three values.
+fn scored_documents() -> Arc<Connection> {
+    let db = crate::Database::open(
+        Arc::new(crate::MemoryIO::new()),
+        ":memory:",
+        crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+            .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
+    )
+    .unwrap();
+    let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX notes_fts ON notes USING fts(body)")
+        .unwrap();
+    let rows: Vec<String> = (1..=9i64)
+        .map(|id| format!("({id}, '{}world')", "hello ".repeat((id % 3 + 1) as usize)))
+        .collect();
+    conn.execute(format!("INSERT INTO notes VALUES {}", rows.join(", ")))
+        .unwrap();
+    conn
+}
+
+fn rows_of(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+    conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+}
+
+/// The score the FTS index provides for a query is a computed value with no column collation, so
+/// a DISTINCT, a compound SELECT and an IN subquery over it plan and run.
+#[test]
+fn fts_score_from_the_index_has_no_column_collation() {
+    let conn = scored_documents();
+    let score = "fts_score(body, 'hello')";
+    let matching = "FROM notes WHERE fts_match(body, 'hello')";
+    assert_eq!(
+        rows_of(&conn, &format!("SELECT DISTINCT {score} {matching}")).len(),
+        3
+    );
+    assert_eq!(
+        rows_of(
+            &conn,
+            &format!("SELECT {score} {matching} UNION SELECT {score} {matching}")
+        )
+        .len(),
+        3
+    );
+    assert_eq!(
+        rows_of(
+            &conn,
+            &format!(
+                "SELECT count(*) FROM (SELECT {score} AS s {matching}) WHERE s IN (SELECT {score} {matching})"
+            )
+        ),
+        vec![vec![Value::from_i64(9)]]
+    );
 }

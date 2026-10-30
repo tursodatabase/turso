@@ -10,7 +10,7 @@
 pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
-pub(crate) mod attach;
+pub(crate) mod catalog;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
@@ -18,13 +18,13 @@ pub(crate) mod display;
 pub(crate) mod emitter;
 pub mod eqp;
 pub(crate) mod expr;
+pub(crate) mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
 pub(crate) mod index;
 pub(crate) mod insert;
 pub(crate) mod integrity_check;
-pub(crate) mod logical;
 pub(crate) mod main_loop;
 pub(crate) mod optimizer;
 pub(crate) mod order_by;
@@ -32,6 +32,7 @@ pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;
 pub(crate) mod recursive_cte;
+pub(crate) mod result_column_types;
 pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
@@ -49,12 +50,13 @@ mod values;
 pub(crate) mod view;
 mod window;
 
-use crate::connection::PrepareOptions;
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::WalkControl;
+use crate::util::walk_stmt_expressions;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
@@ -83,7 +85,6 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
     origin: crate::statement::StatementOrigin,
-    prepare_options: &PrepareOptions,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -107,28 +108,49 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.flags.set_keep_array_results_as_blobs(matches!(
+        origin,
+        crate::statement::StatementOrigin::InternalHelper
+    ));
 
     program.prologue();
+    // Engine-generated helper statements are always SQLite text and
+    // must resolve functions with SQLite semantics regardless of the
+    // database's dialect — the same invariant as unmarked schema rows.
+    // They look names up in every database, like SQLite does, whatever
+    // the connection's search path says.
+    let is_internal_helper = matches!(origin, crate::statement::StatementOrigin::InternalHelper);
+    let search_path = if is_internal_helper {
+        None
+    } else {
+        connection.search_path()
+    };
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
+        &qualifiers,
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        // Engine-generated helper statements are always SQLite text and
-        // must resolve functions with SQLite semantics regardless of the
-        // database's dialect — the same invariant as unmarked schema rows.
-        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+        if is_internal_helper {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
         },
-        &prepare_options.unqualified_database_search_path,
+        search_path.as_deref(),
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
+
+    walk_stmt_expressions(&stmt, &mut |expr| {
+        if let ast::Expr::Variable(variable) = expr {
+            program.register_variable(variable);
+        }
+        Ok(WalkControl::Continue)
+    })?;
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -161,6 +183,24 @@ pub fn translate_inner(
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
+    // Subqueries are numbered per program, and a trigger body or foreign-key
+    // action is compiled into a program of its own with the resolver of the
+    // statement that fires it. So the same number can name a subquery of
+    // each, and the statement's row-value subqueries are set aside while
+    // another statement is compiled.
+    let callers_row_value_subqueries = std::mem::take(&mut resolver.row_value_subqueries);
+    let result = translate_statement(stmt, resolver, program, connection, input);
+    resolver.row_value_subqueries = callers_row_value_subqueries;
+    result
+}
+
+fn translate_statement(
+    stmt: ast::Stmt,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    input: &str,
+) -> Result<()> {
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
@@ -185,6 +225,8 @@ pub fn translate_inner(
             | ast::Stmt::Insert { .. }
             | ast::Stmt::CreateSequence { .. }
             | ast::Stmt::DropSequence { .. }
+            | ast::Stmt::CreateSchema { .. }
+            | ast::Stmt::DropSchema { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -225,7 +267,14 @@ pub fn translate_inner(
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?;
+            crate::dialect::sqlite::attach::translate_attach(
+                &expr,
+                resolver,
+                &db_name,
+                &key,
+                program,
+                connection.clone(),
+            )?;
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
         ast::Stmt::Commit { name } => {
@@ -259,32 +308,20 @@ pub fn translate_inner(
             for_each_row,
             when_clause,
             commands,
-        } => {
-            // Reconstruct SQL for storage
-            let sql = trigger::create_trigger_to_sql(
-                temporary,
-                if_not_exists,
-                &trigger_name,
-                time,
-                &event,
-                &tbl_name,
-                for_each_row,
-                when_clause.as_deref(),
-                &commands,
-            );
-            trigger::translate_create_trigger(
-                trigger_name,
-                resolver,
-                temporary,
-                if_not_exists,
-                time,
-                tbl_name,
-                program,
-                sql,
-                &commands,
-                when_clause.as_deref(),
-            )?
-        }
+        } => trigger::translate_create_trigger(
+            trigger_name,
+            resolver,
+            temporary,
+            if_not_exists,
+            time,
+            &event,
+            tbl_name,
+            for_each_row,
+            connection,
+            program,
+            &commands,
+            when_clause.as_deref(),
+        )?,
         ast::Stmt::CreateView {
             view_name,
             select,
@@ -298,17 +335,19 @@ pub fn translate_inner(
             &columns,
             temporary,
             if_not_exists,
+            connection,
             program,
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name,
             select,
+            columns,
             if_not_exists,
-            ..
         } => view::translate_create_materialized_view(
             &view_name,
             resolver,
             &select,
+            &columns,
             if_not_exists,
             connection.clone(),
             program,
@@ -339,9 +378,12 @@ pub fn translate_inner(
                 connection,
             )?
         }
-        ast::Stmt::Detach { name } => {
-            attach::translate_detach(&name, resolver, program, connection.clone())?
-        }
+        ast::Stmt::Detach { name } => crate::dialect::sqlite::attach::translate_detach(
+            &name,
+            resolver,
+            program,
+            connection.clone(),
+        )?,
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
@@ -438,9 +480,13 @@ pub fn translate_inner(
             }
             translate_update(update, resolver, program, connection)?
         }
-        ast::Stmt::Vacuum { name, into } => {
-            vacuum::translate_vacuum(program, name.as_ref(), into.as_deref(), connection.clone())?
-        }
+        ast::Stmt::Vacuum { name, into } => vacuum::translate_vacuum(
+            program,
+            resolver,
+            name.as_ref(),
+            into.as_deref(),
+            connection.clone(),
+        )?,
         ast::Stmt::Insert {
             with,
             or_conflict,
@@ -477,6 +523,7 @@ pub fn translate_inner(
                 &max_value,
                 cycle,
                 resolver,
+                connection,
                 program,
             )?;
         }
@@ -485,6 +532,12 @@ pub fn translate_inner(
             seq_name,
         } => {
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+        }
+        ast::Stmt::CreateSchema { name } => {
+            schema::translate_create_schema(&name, resolver, program)?;
+        }
+        ast::Stmt::DropSchema { name } => {
+            schema::translate_drop_schema(&name, resolver, program)?;
         }
     };
 
@@ -514,6 +567,14 @@ pub fn translate_inner(
             program.emit_result_row(reg, 1);
             program.add_pragma_result_column(column_name.to_string());
         }
+    }
+
+    if connection.experimental_custom_types_enabled() {
+        program.result_column_types = result_column_types::result_column_types(
+            &program.result_columns,
+            &program.table_references,
+            resolver,
+        );
     }
 
     Ok(())
@@ -554,6 +615,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Optimize { .. } => "optimize",
         ast::Stmt::CreateSequence { .. } => "create_sequence",
         ast::Stmt::DropSequence { .. } => "drop_sequence",
+        ast::Stmt::CreateSchema { .. } => "create_schema",
+        ast::Stmt::DropSchema { .. } => "drop_schema",
     }
 }
 
@@ -562,6 +625,7 @@ mod tests {
     use super::*;
     use crate::alloc::TryClone;
     use crate::io::MemoryIO;
+    use crate::namespace::NamespaceId;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::vdbe::insn::{ClearBtreeCount, Insn};
     use crate::ConnectOpts;
@@ -637,7 +701,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -828,13 +891,14 @@ mod tests {
 
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         let seq_root_page = schema
-            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
             .root_page;
         let malformed_seq =
             BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
                 .expect("malformed sqlite_sequence SQL should parse");
-        schema.tables.insert(
+        schema.insert_table(
+            NamespaceId::ROOT,
             SQLITE_SEQUENCE_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(Arc::new(malformed_seq))),
         );
@@ -858,7 +922,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -881,7 +944,7 @@ mod tests {
             .unwrap();
 
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
+        schema.take_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME);
 
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();
@@ -902,7 +965,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {

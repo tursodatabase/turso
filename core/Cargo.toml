@@ -219,6 +219,7 @@ harness = false
 [[bench]]
 name = "mvcc_benchmark"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "mvcc_recovery_benchmark"
@@ -307,6 +308,10 @@ harness = false
 
 [[bench]]
 name = "scan_loop_benchmark"
+harness = false
+
+[[bench]]
+name = "overflow_scan_benchmark"
 harness = false
 
 [[bench]]

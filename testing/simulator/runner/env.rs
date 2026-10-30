@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -14,6 +14,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
 use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
+use sql_generation::model::query::Insert;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
@@ -38,9 +39,7 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
             io.clone(),
             aux_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_attach(true)
-                .with_generated_columns(true),
+            turso_core::DatabaseOpts::new().with_attach(true),
             None,
             Arc::new(SqliteDialect),
         )
@@ -138,6 +137,11 @@ pub struct Snapshot {
     operations: Vec<TxOperation>,
     /// Named savepoint snapshots in this transaction.
     savepoints: Vec<ShadowSavepoint>,
+    /// Attached databases that statements in this transaction have used. Like SQLite, the
+    /// engine starts the transaction on an attached database when a statement first uses it,
+    /// so that database's tables are copied from the committed tables then, not when the
+    /// snapshot is created.
+    started_attached_dbs: HashSet<String>,
 
     transaction_mode: TransactionMode,
 }
@@ -668,6 +672,53 @@ where
                 }
             }
         }
+        self.start_attached_dbs(query);
+    }
+
+    /// Copies the committed tables of each attached database that `query` uses for the first
+    /// time in the current transaction. The transaction has not changed those tables yet, so
+    /// the savepoints get the same copy. After BEGIN IMMEDIATE no other connection can commit,
+    /// so the copy matches what the snapshot already has.
+    fn start_attached_dbs(&mut self, query: &Query) {
+        let Some(snapshot) = self
+            .transaction_tables
+            .as_mut()
+            .and_then(TransactionTables::as_snapshot_mut_opt)
+        else {
+            return;
+        };
+        let mut used_tables = query.uses();
+        if let Query::Insert(Insert::Select { select, .. }) = query {
+            used_tables.extend(select.dependencies());
+        }
+        for table_name in used_tables {
+            let Some((database, _)) = table_name.split_once('.') else {
+                continue;
+            };
+            if !snapshot.started_attached_dbs.insert(database.to_string()) {
+                continue;
+            }
+            let in_database = |table: &Table| {
+                table
+                    .name
+                    .split_once('.')
+                    .is_some_and(|(db, _)| db == database)
+            };
+            let committed: Vec<Table> = self
+                .commited_tables
+                .iter()
+                .filter(|table| in_database(table))
+                .cloned()
+                .collect();
+            let savepoint_tables = snapshot
+                .savepoints
+                .iter_mut()
+                .map(|savepoint| &mut savepoint.current_tables);
+            for tables in std::iter::once(&mut snapshot.current_tables).chain(savepoint_tables) {
+                tables.retain(|table| !in_database(table));
+                tables.extend(committed.iter().cloned());
+            }
+        }
     }
 
     #[inline]
@@ -681,6 +732,7 @@ where
             current_tables: self.commited_tables.clone(),
             operations: Vec::new(),
             savepoints: Vec::new(),
+            started_attached_dbs: HashSet::new(),
             transaction_mode,
         }));
     }
@@ -950,6 +1002,37 @@ mod tests {
     }
 
     #[test]
+    fn mvcc_generation_requires_explicit_rowids() {
+        use clap::Parser;
+        for mvcc in [false, true] {
+            let output = tempfile::tempdir().unwrap();
+            let args = SimulatorCLI::parse_from([
+                "limbo_sim",
+                "--io-backend",
+                "memory",
+                "--mvcc",
+                if mvcc { "true" } else { "false" },
+            ]);
+            let env = SimulatorEnv::new(
+                1,
+                &args,
+                Paths::new(output.path()),
+                SimulationType::Default,
+                &Profile::default(),
+            );
+            assert_eq!(
+                env.profile
+                    .query
+                    .gen_opts
+                    .query
+                    .insert
+                    .allow_implicit_rowids,
+                !mvcc
+            );
+        }
+    }
+
+    #[test]
     fn savepoint_outside_transaction_commits_on_release() {
         let mut commited_tables = Vec::new();
         let mut transaction_tables = None;
@@ -1154,6 +1237,67 @@ mod tests {
             .expect_snaphot();
         assert!(snapshot.savepoints.is_empty());
     }
+
+    #[test]
+    fn deferred_transaction_reads_attached_database_when_first_used() {
+        use sql_generation::model::query::Select;
+        use sql_generation::model::query::predicate::Predicate;
+        use sql_generation::model::table::{Column, ColumnType};
+
+        let int_row = |v: i64| vec![SimValue(turso_core::Value::from_i64(v))];
+        let table = |name: &str, rows: Vec<Vec<SimValue>>| Table {
+            name: name.to_string(),
+            columns: vec![Column {
+                name: "x".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            }],
+            rows,
+            indexes: vec![],
+        };
+        let select_aux = || Query::Select(Select::simple("aux0.u".to_string(), Predicate::true_()));
+
+        let mut commited_tables = vec![table("t", vec![]), table("aux0.u", vec![int_row(1)])];
+        let mut transaction_tables = Some(TransactionTables::Deferred);
+        let mut sequences = Vec::new();
+
+        // BEGIN; SAVEPOINT sp; INSERT INTO t VALUES (1);
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+        tables.savepoint("sp".to_string());
+        Query::Insert(Insert::Values {
+            table: "t".to_string(),
+            values: vec![int_row(1)],
+            on_conflict: None,
+        })
+        .shadow(&mut tables)
+        .unwrap();
+
+        // Another connection commits a row into aux0.u.
+        commited_tables[1].rows.push(int_row(2));
+
+        // The transaction has not used aux0 yet, so it sees that row.
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+        assert_eq!(select_aux().shadow(&mut tables).unwrap().len(), 2);
+        tables.rollback_to_savepoint("sp").unwrap();
+        assert_eq!(select_aux().shadow(&mut tables).unwrap().len(), 2);
+
+        // Now that aux0 is in use, later commits there are not visible.
+        commited_tables[1].rows.push(int_row(3));
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+        assert_eq!(select_aux().shadow(&mut tables).unwrap().len(), 2);
+    }
 }
 
 /// Shadow model for a sequence. Sequences are global (not per-connection) and their
@@ -1295,8 +1439,7 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true)
-                .with_generated_columns(true),
+                .with_attach(true),
             None,
             Arc::new(SqliteDialect),
         ) {
@@ -1412,6 +1555,7 @@ impl SimulatorEnv {
             disable_where_true_false_null: cli_opts.disable_where_true_false_null,
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
+            disable_lateral_matches_json_each: cli_opts.disable_lateral_matches_json_each,
             disable_savepoint_rollback: cli_opts.disable_savepoint_rollback,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
             disable_faulty_query: cli_opts.disable_faulty_query,
@@ -1462,6 +1606,9 @@ impl SimulatorEnv {
         if let Some(mvcc) = cli_opts.mvcc {
             profile.mvcc = mvcc;
         }
+        if profile.mvcc {
+            profile.query.gen_opts.query.insert.allow_implicit_rowids = false;
+        }
         if let Some(latency_prob) = cli_opts.latency_probability {
             profile.io.latency.latency_probability = latency_prob;
         }
@@ -1489,6 +1636,9 @@ impl SimulatorEnv {
             profile.query.drop_sequence_weight = 0;
             profile.query.nextval_weight = 0;
             profile.query.setval_weight = 0;
+
+            // SQLite does not have LATERAL joins, so we can't use this property.
+            opts.disable_lateral_matches_json_each = true;
         }
 
         profile.validate().unwrap();
@@ -1523,8 +1673,7 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true)
-                .with_generated_columns(true),
+                .with_attach(true),
             None,
             Arc::new(SqliteDialect),
         ) {
@@ -1774,6 +1923,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_drop_select: bool,
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
+    pub(crate) disable_lateral_matches_json_each: bool,
     pub(crate) disable_savepoint_rollback: bool,
     pub(crate) disable_fsync_no_wait: bool,
     pub(crate) disable_faulty_query: bool,

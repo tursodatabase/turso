@@ -29,19 +29,15 @@ pub(super) fn emit_in_seek_start(
 
     let outer_loop_start = program.allocate_label();
     program.preassign_label_to_next_insn(outer_loop_start);
-    let seek_reg = program.alloc_register();
-    program.emit_insn(Insn::Column {
-        cursor_id: source_cursor_id,
-        column: 0,
-        dest: seek_reg,
-        default: None,
-    });
-
     let next_value = program.allocate_label();
-    program.emit_insn(Insn::IsNull {
-        reg: seek_reg,
-        target_pc: next_value,
-    });
+    let seek_reg = emit_in_seek_key(
+        program,
+        table_references,
+        resolver,
+        index,
+        source_cursor_id,
+        next_value,
+    )?;
     if index.is_none() {
         program.emit_insn(Insn::SeekRowid {
             cursor_id: table_cursor_id.expect("a rowid IN search must have a table cursor"),
@@ -79,6 +75,42 @@ pub(super) fn emit_in_seek_start(
     })
 }
 
+/// Read the current `IN` value into a new register and return it as a seek
+/// key. A NULL value matches nothing, so it jumps to `next_value`. An index
+/// holds encoded values, so the key is encoded as for any other index seek.
+pub(super) fn emit_in_seek_key(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    resolver: &Resolver<'_>,
+    index: Option<&Arc<Index>>,
+    source_cursor_id: CursorID,
+    next_value: BranchOffset,
+) -> Result<usize> {
+    let seek_reg = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: source_cursor_id,
+        column: 0,
+        dest: seek_reg,
+        default: None,
+    });
+    program.emit_insn(Insn::IsNull {
+        reg: seek_reg,
+        target_pc: next_value,
+    });
+    if let Some(index) = index {
+        encode_seek_keys_for_custom_types(
+            program,
+            table_references,
+            index,
+            seek_reg,
+            1,
+            0,
+            resolver,
+        )?;
+    }
+    Ok(seek_reg)
+}
+
 /// Open or reuse the ephemeral cursor that supplies RHS values for an IN-seek.
 ///
 /// Literal lists are materialized once into a unique ephemeral index so both
@@ -106,7 +138,7 @@ pub(super) fn open_in_seek_source_cursor(
             let collation = index
                 .as_ref()
                 .and_then(|idx| idx.columns.first())
-                .and_then(|c| c.collation);
+                .map_or(CollationSeq::BINARY, |c| c.collation);
             let ephemeral_index = Arc::new(Index {
                 name: String::new(),
                 table_name: String::new(),
@@ -117,6 +149,7 @@ pub(super) fn open_in_seek_source_cursor(
                     nulls_order: None,
                     pos_in_table: 0,
                     collation,
+                    explicit_collation: None,
                     default: None,
                     expr: None,
                 }]?,
@@ -126,6 +159,7 @@ pub(super) fn open_in_seek_source_cursor(
                 where_clause: None,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             });
             let eph_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(ephemeral_index));
             program.emit_insn(Insn::OpenEphemeral {

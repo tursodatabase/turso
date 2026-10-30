@@ -1,7 +1,7 @@
 @database :memory:
 @skip-file-if mvcc "materialized views not supported in MVCC mode"
 @skip-file-if sqlite "materialized views are a turso-specific feature"
-@requires materialized_views "requires materialized view support"
+@requires-file materialized_views "requires materialized view support"
 
 test create-index-does-not-corrupt-matview {
     CREATE TABLE t (id INTEGER, val TEXT, score REAL);
@@ -19,4 +19,13 @@ expect {
     2
     1|hello|3.14
     2|world|2.72
+}
+
+test materialized-view-rejects-ordered-aggregate {
+    CREATE TABLE ordered_aggregate_source(v INTEGER, k INTEGER);
+    CREATE MATERIALIZED VIEW ordered_aggregate_view AS
+    SELECT sum(v ORDER BY k) FROM ordered_aggregate_source;
+}
+expect error {
+    materialized views with ORDER BY in aggregates are not yet supported
 }

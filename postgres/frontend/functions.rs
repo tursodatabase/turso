@@ -1,9 +1,18 @@
+use crate::catalog::PG_DATABASE_OWNER_OID;
+use crate::error::sqlstate_error;
+use crate::settings::SettingScope;
 use chrono::Utc;
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result, Value,
+    Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
+};
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
+    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
 };
 
 pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
@@ -64,19 +73,27 @@ scalar_functions! {
     FormatType(FunctionArity::OneOf(&[1, 2]), true),
     PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), false),
     PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), false),
+    PgGetTriggerdef(FunctionArity::OneOf(&[1, 2]), false),
     ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
     ToChar(FunctionArity::Exact(2), true),
     PgInputIsValid(FunctionArity::Exact(2), true),
+    Textlike(FunctionArity::Exact(2), true),
+    LikeEscape(FunctionArity::Exact(2), true),
+    SimilarToEscape(FunctionArity::OneOf(&[1, 2]), true),
     Booleq(FunctionArity::Exact(2), true),
     Boolne(FunctionArity::Exact(2), true),
     ColDescription(FunctionArity::Exact(2), true),
     SetConfig(FunctionArity::Exact(3), false),
+    CurrentSetting(FunctionArity::OneOf(&[1, 2]), false),
     Version(FunctionArity::Exact(0), true),
     CurrentDatabase(FunctionArity::Exact(0), false),
     CurrentSchema(FunctionArity::Exact(0), true),
+    CurrentSchemas(FunctionArity::Exact(1), false),
     PgBackendPid(FunctionArity::Exact(0), true),
     PgIsInRecovery(FunctionArity::Exact(0), false),
+    PgLockAccessShare(FunctionArity::Exact(0), false),
+    PgLimitValue(FunctionArity::Exact(2), true),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
 }
 
@@ -92,15 +109,16 @@ impl ScalarCall for PgScalarFunction {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let value = match self {
             Self::Acldefault => exec_acl_default(args)?,
-            Self::PgGetUserbyid => exec_pg_get_user_by_id(int_arg(args, 0, 0)),
+            Self::PgGetUserbyid => oid_arg(args, 0)?.map_or(Value::Null, exec_pg_get_user_by_id),
             Self::PgTableIsVisible | Self::PgFunctionIsVisible | Self::PgTypeIsVisible => {
-                exec_pg_is_visible(int_arg(args, 0, 0))
+                oid_arg(args, 0)?.map_or(Value::Null, exec_pg_is_visible)
             }
             Self::PgEncodingToChar => exec_pg_encoding_to_char(int_arg(args, 0, 0)),
             Self::PgGetFunctionResult
             | Self::PgGetFunctionArguments
             | Self::PgGetStatisticsobjdefColumns
             | Self::PgRelationIsPublishable
+            | Self::PgGetTriggerdef
             | Self::ObjDescription
             | Self::ColDescription => Value::Null,
             Self::QuoteIdent => match args[0].get_value() {
@@ -108,25 +126,49 @@ impl ScalarCall for PgScalarFunction {
                 _ => Value::build_text(turso_pg_parser::quote_identifier(&text_arg(args, 0))),
             },
             Self::QuoteLiteral => exec_quote_literal(args[0].get_value()),
-            Self::FormatType => exec_pg_format_type(int_arg(args, 0, 0), int_arg(args, 1, -1)),
-            Self::PgGetConstraintdef => exec_pg_get_constraintdef(connection, int_arg(args, 0, 0)),
-            Self::PgGetIndexdef => exec_pg_get_indexdef(connection, int_arg(args, 0, 0)),
+            Self::FormatType => oid_arg(args, 0)?.map_or(Value::Null, |type_oid| {
+                exec_pg_format_type(type_oid, int_arg(args, 1, -1))
+            }),
+            Self::PgGetConstraintdef => oid_arg(args, 0)?.map_or(Value::Null, |oid| {
+                exec_pg_get_constraintdef(connection, oid)
+            }),
+            Self::PgGetIndexdef => {
+                oid_arg(args, 0)?.map_or(Value::Null, |oid| exec_pg_get_indexdef(connection, oid))
+            }
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
+            Self::Textlike => exec_textlike(args)?,
+            Self::LikeEscape => exec_like_escape(args)?,
+            Self::SimilarToEscape => exec_similar_to_escape(args)?,
             Self::Booleq => Value::from_i64((args[0].get_value() == args[1].get_value()) as i64),
             Self::Boolne => Value::from_i64((args[0].get_value() != args[1].get_value()) as i64),
             Self::SetConfig => exec_set_config(connection, args)?,
+            Self::CurrentSetting => exec_current_setting(connection, args)?,
             Self::Version => exec_version(),
             Self::CurrentDatabase => {
                 Value::build_text(crate::catalog::db_name_from_path(connection.db_file_path()))
             }
-            Self::CurrentSchema => Value::build_text("public"),
+            Self::CurrentSchema => match crate::session::current_schema(connection) {
+                Some(schema) => Value::build_text(schema),
+                None => Value::Null,
+            },
+            Self::CurrentSchemas => exec_current_schemas(connection, args[0].get_value())?,
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
                 Value::build_text("t")
             }
+            Self::PgLockAccessShare => {
+                if connection.get_auto_commit() {
+                    return Err(LimboError::InvalidArgument(
+                        "LOCK TABLE can only be used in transaction blocks".to_string(),
+                    )
+                    .into());
+                }
+                Value::from_i64(0)
+            }
+            Self::PgLimitValue => exec_pg_limit_value(args)?,
             Self::Now
             | Self::ClockTimestamp
             | Self::TransactionTimestamp
@@ -136,6 +178,57 @@ impl ScalarCall for PgScalarFunction {
         };
         Ok(IOResult::Done(value))
     }
+}
+
+fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Value> {
+    let include_implicit = match argument {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(text) => parse_pg_bool(text.as_str()).ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type boolean: \"{}\"",
+                    text.as_str()
+                ),
+            )
+        })?,
+        value => match value.as_int() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => {
+                return Err(undefined_function(
+                    "current_schemas",
+                    &[pg_type_name(value)],
+                ))
+            }
+        },
+    };
+    let schemas = crate::session::current_schemas(conn, include_implicit);
+    let mut result = String::from("{");
+    for (i, schema) in schemas.iter().enumerate() {
+        if i > 0 {
+            result.push(',');
+        }
+        let quoted = schema.is_empty()
+            || schema.eq_ignore_ascii_case("null")
+            || schema
+                .chars()
+                .any(|c| c.is_ascii_whitespace() || matches!(c, ',' | '{' | '}' | '"' | '\\'));
+        if quoted {
+            result.push('"');
+        }
+        for c in schema.chars() {
+            if matches!(c, '"' | '\\') {
+                result.push('\\');
+            }
+            result.push(c);
+        }
+        if quoted {
+            result.push('"');
+        }
+    }
+    result.push('}');
+    Ok(Value::build_text(result))
 }
 
 fn exec_acl_default(args: &[Register]) -> Result<Value> {
@@ -159,10 +252,12 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
         .get(..1)
         .unwrap_or("")
         .parse::<AclObjectKind>()
+        // PostgreSQL raises this error with elog(), which gives SQLSTATE XX000.
         .map_err(|_| {
-            LimboError::InvalidArgument(format!(
-                "unrecognized object type abbreviation: {kind_code}"
-            ))
+            sqlstate_error(
+                SQLSTATE_INTERNAL_ERROR,
+                format!("unrecognized object type abbreviation: {kind_code}"),
+            )
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
@@ -170,6 +265,8 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
     // Replace it with a real role OID-to-name lookup later. Keep the numeric fallback for unknown OIDs.
     let role = if owner == 10 {
         "turso".to_string()
+    } else if owner == PG_DATABASE_OWNER_OID {
+        "pg_database_owner".to_string()
     } else {
         owner.to_string()
     };
@@ -304,6 +401,56 @@ fn int_arg(args: &[Register], i: usize, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
+    let value = args[i].get_value();
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => parse_oid(text.as_str()).map(Some),
+        value => value.as_int().map(Some).ok_or_else(|| {
+            LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
+        }),
+    }
+}
+
+fn parse_oid(text: &str) -> Result<i64> {
+    let invalid =
+        || LimboError::ConversionError(format!("invalid input syntax for type oid: \"{text}\""));
+    let out_of_range =
+        || LimboError::ConversionError(format!("value \"{text}\" is out of range for type oid"));
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
+    let number = text.trim_matches(is_space);
+    let (negative, unsigned) = match number.as_bytes().first() {
+        Some(b'-') => (true, &number[1..]),
+        Some(b'+') => (false, &number[1..]),
+        _ => (false, number),
+    };
+    let (radix, digits) = if let Some(hex) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+        .filter(|hex| hex.starts_with(|c: char| c.is_ascii_hexdigit()))
+    {
+        (16, hex)
+    } else if unsigned.len() > 1 && unsigned.starts_with('0') {
+        (8, &unsigned[1..])
+    } else {
+        (10, unsigned)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(invalid());
+    }
+    let magnitude = u64::from_str_radix(digits, radix).map_err(|_| out_of_range())?;
+    let value = if negative {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    };
+    let oid = value as u32;
+    if value != u64::from(oid) && value != oid as i32 as i64 as u64 {
+        return Err(out_of_range());
+    }
+    Ok(i64::from(oid))
+}
+
 fn text_arg(args: &[Register], i: usize) -> String {
     match args.get(i).map(Register::get_value) {
         Some(Value::Text(t)) => t.as_str().to_string(),
@@ -313,8 +460,13 @@ fn text_arg(args: &[Register], i: usize) -> String {
 
 #[derive(strum::EnumString)]
 #[strum(ascii_case_insensitive, serialize_all = "snake_case")]
-enum ConfigParameter {
+pub(crate) enum ConfigParameter {
     SearchPath,
+}
+
+pub(crate) enum Parameter<'a> {
+    BuiltIn(ConfigParameter),
+    Custom(&'a str),
 }
 
 fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
@@ -331,9 +483,7 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             ));
         }
     };
-    let parameter = name.parse::<ConfigParameter>().map_err(|_| {
-        LimboError::InvalidArgument(format!("unrecognized configuration parameter \"{name}\""))
-    })?;
+    let parameter = find_parameter(name).ok_or_else(|| unrecognized_parameter(name))?;
     let value = match args[1].get_value() {
         Value::Text(value) => Some(value.as_str()),
         Value::Null => None,
@@ -343,11 +493,11 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             ));
         }
     };
-    let is_local = match args[2].get_value() {
-        Value::Null => false,
+    let scope = match args[2].get_value() {
+        Value::Null => SettingScope::Session,
         value => match value.as_int() {
-            Some(0) => false,
-            Some(1) => true,
+            Some(0) => SettingScope::Session,
+            Some(1) => SettingScope::Transaction,
             _ => {
                 return Err(LimboError::InvalidArgument(
                     "set_config requires a boolean".to_string(),
@@ -355,18 +505,126 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
             }
         },
     };
-    if is_local {
-        return Err(LimboError::InvalidArgument(
-            "transaction-local settings are not supported".to_string(),
-        ));
-    }
     match parameter {
-        ConfigParameter::SearchPath => crate::session::set_search_path(conn, value),
+        Parameter::BuiltIn(ConfigParameter::SearchPath) => {
+            crate::session::set_search_path(conn, value, scope)
+        }
+        Parameter::Custom(name) => crate::session::set_custom_parameter(conn, name, value, scope),
     }
 }
 
-fn exec_pg_get_user_by_id(_oid: i64) -> Value {
-    Value::build_text("turso")
+fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let Value::Text(name) = args[0].get_value() else {
+        let mut arg_types = vec![pg_type_name(args[0].get_value())];
+        arg_types.extend(args[1..].iter().map(|_| "boolean"));
+        return Err(undefined_function("current_setting", &arg_types));
+    };
+    let name = name.as_str();
+    let missing_ok = match args.get(1).map(Register::get_value) {
+        None => false,
+        Some(Value::Text(text)) => parse_pg_bool(text.as_str()).ok_or_else(|| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type boolean: \"{}\"",
+                    text.as_str()
+                ),
+            )
+        })?,
+        Some(value) => match value.as_int() {
+            Some(0) => false,
+            Some(1) => true,
+            _ => {
+                return Err(LimboError::InvalidArgument(
+                    "current_setting requires a boolean".to_string(),
+                ));
+            }
+        },
+    };
+    let setting = match find_parameter(name) {
+        Some(Parameter::BuiltIn(ConfigParameter::SearchPath)) => Some(
+            crate::session::search_path_setting(conn)
+                .unwrap_or_else(|| crate::session::DEFAULT_SEARCH_PATH.to_owned()),
+        ),
+        Some(Parameter::Custom(name)) => crate::session::custom_parameter(conn, name),
+        None => None,
+    };
+    match setting {
+        Some(setting) => Ok(Value::build_text(setting)),
+        None if missing_ok => Ok(Value::Null),
+        None => Err(unrecognized_parameter(name)),
+    }
+}
+
+fn unrecognized_parameter(name: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_UNDEFINED_OBJECT,
+        format!("unrecognized configuration parameter \"{name}\""),
+    )
+}
+
+pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
+    match name.parse::<ConfigParameter>() {
+        Ok(parameter) => Some(Parameter::BuiltIn(parameter)),
+        Err(_) if name.contains('.') => Some(Parameter::Custom(name)),
+        Err(_) => None,
+    }
+}
+
+/// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding
+/// fractions half away from zero, and rejects negative values.
+fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
+    let value = match args[0].get_value() {
+        Value::Null => return Ok(Value::Null),
+        Value::Numeric(Numeric::Integer(value)) => *value,
+        Value::Numeric(Numeric::Float(value)) => {
+            let rounded = f64::from(*value).round();
+            if !(i64::MIN as f64..i64::MAX as f64).contains(&rounded) {
+                return Err(sqlstate_error(
+                    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                    "bigint out of range",
+                ));
+            }
+            rounded as i64
+        }
+        Value::Text(text) => text.as_str().trim().parse().map_err(|_| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type bigint: \"{}\"",
+                    text.as_str()
+                ),
+            )
+        })?,
+        Value::Blob(_) => return Err(LimboError::InvalidArgument("datatype mismatch".to_string())),
+    };
+    if value < 0 {
+        let clause = text_arg(args, 1);
+        let sqlstate = if clause == "OFFSET" {
+            SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE
+        } else {
+            SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE
+        };
+        return Err(sqlstate_error(
+            sqlstate,
+            format!("{clause} must not be negative"),
+        ));
+    }
+    Ok(Value::from_i64(value))
+}
+
+fn exec_pg_get_user_by_id(oid: i64) -> Value {
+    Value::build_text(if oid == PG_DATABASE_OWNER_OID {
+        "pg_database_owner"
+    } else {
+        "turso"
+    })
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {
@@ -405,6 +663,124 @@ fn exec_quote_literal(value: &Value) -> Value {
         format!("'{}'", text.replace('\'', "''"))
     };
     Value::build_text(quoted)
+}
+
+fn exec_textlike(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let text: Vec<char> = args[0].get_value().to_string().chars().collect();
+    let pattern: Vec<char> = args[1].get_value().to_string().chars().collect();
+    Ok(Value::from_i64(like_matches(&text, &pattern)? as i64))
+}
+
+/// PostgreSQL's LIKE: case-sensitive, `%` and `_` wildcards, and `\` makes the
+/// next pattern character literal. On a mismatch, the last `%` absorbs one more
+/// text character and matching resumes after it.
+fn like_matches(text: &[char], pattern: &[char]) -> Result<bool> {
+    let (mut p, mut t) = (0, 0);
+    let mut backtrack: Option<(usize, usize)> = None;
+    while t < text.len() {
+        let step = match pattern.get(p) {
+            Some('%') => {
+                backtrack = Some((p, t));
+                p += 1;
+                continue;
+            }
+            Some('_') => Some(1),
+            Some('\\') => match pattern.get(p + 1) {
+                Some(&c) => (c == text[t]).then_some(2),
+                None => {
+                    return Err(sqlstate_error(
+                        SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+                        "LIKE pattern must not end with escape character",
+                    ));
+                }
+            },
+            Some(&c) => (c == text[t]).then_some(1),
+            None => None,
+        };
+        match (step, backtrack) {
+            (Some(step), _) => {
+                p += step;
+                t += 1;
+            }
+            (None, Some((percent_p, percent_t))) => {
+                p = percent_p + 1;
+                t = percent_t + 1;
+                backtrack = Some((percent_p, t));
+            }
+            (None, None) => return Ok(false),
+        }
+    }
+    Ok(pattern[p..].iter().all(|&c| c == '%'))
+}
+
+/// Rewrites a `LIKE ... ESCAPE` pattern to use `\` as the escape character,
+/// as PostgreSQL's like_escape() does.
+fn exec_like_escape(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let pattern = args[0].get_value().to_string();
+    let escape = args[1].get_value().to_string();
+    let mut escape_chars = escape.chars();
+    let result = match (escape_chars.next(), escape_chars.next()) {
+        (None, _) => pattern.replace('\\', "\\\\"),
+        (Some('\\'), None) => pattern,
+        (Some(escape), None) => {
+            let mut result = String::with_capacity(pattern.len());
+            let mut after_escape = false;
+            for c in pattern.chars() {
+                if c == escape && !after_escape {
+                    result.push('\\');
+                    after_escape = true;
+                    continue;
+                }
+                if c == '\\' && !after_escape {
+                    result.push('\\');
+                }
+                result.push(c);
+                after_escape = false;
+            }
+            result
+        }
+        _ => {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+                "invalid escape string: Escape string must be empty or one character.",
+            ));
+        }
+    };
+    Ok(Value::build_text(result))
+}
+
+/// Converts a SIMILAR TO pattern to a regular expression, as PostgreSQL's
+/// similar_to_escape() does. Without an ESCAPE argument, `\` is the escape.
+fn exec_similar_to_escape(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let pattern = args[0].get_value().to_string();
+    let escape = args
+        .get(1)
+        .map_or_else(|| "\\".to_string(), |arg| arg.get_value().to_string());
+    match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
+        Ok(regex) => Ok(Value::build_text(regex)),
+        Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
+            Err(sqlstate_error(sqlstate, message))
+        }
+        Err(error) => Err(LimboError::ParseError(error.to_string())),
+    }
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> Value {
@@ -529,9 +905,31 @@ fn exec_pg_get_expr(args: &[Register]) -> Result<Value> {
             Ok(Value::Text(expression.clone()))
         }
         Some(Value::Null) => Ok(Value::Null),
-        Some(_) | None => Err(LimboError::ConversionError(
-            "Expected text value".to_string(),
-        )),
+        Some(expression) => {
+            let arg_types = [pg_type_name(expression), "oid", "boolean"];
+            Err(undefined_function("pg_get_expr", &arg_types[..args.len()]))
+        }
+        None => unreachable!("pg_get_expr takes 2 or 3 arguments"),
+    }
+}
+
+/// The error of PostgreSQL for a call with arguments of types that no
+/// function of this name accepts.
+fn undefined_function(name: &str, arg_types: &[&str]) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_UNDEFINED_FUNCTION,
+        format!("function {name}({}) does not exist", arg_types.join(", ")),
+    )
+}
+
+/// The PostgreSQL type that a value of the engine has, for error messages.
+fn pg_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "unknown",
+        Value::Numeric(Numeric::Integer(_)) => "integer",
+        Value::Numeric(Numeric::Float(_)) => "numeric",
+        Value::Text(_) => "text",
+        Value::Blob(_) => "bytea",
     }
 }
 
@@ -555,12 +953,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
 
     match base_type.as_str() {
         "bool" | "boolean" => {
-            let lower = trimmed.to_lowercase();
-            let valid = matches!(
-                lower.as_str(),
-                "t" | "true" | "y" | "yes" | "on" | "1" | "f" | "false" | "n" | "no" | "off" | "0"
-            );
-            if valid {
+            if parse_pg_bool(trimmed).is_some() {
                 None
             } else {
                 Some((
@@ -818,6 +1211,25 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             format!("type \"{type_name}\" does not exist"),
             "42704".to_string(),
         )),
+    }
+}
+
+/// The value of a PostgreSQL boolean literal such as 'yes', 'off' or 'tr',
+/// with the rules of PostgreSQL's boolean input: white space around the text
+/// and the case of the letters do not matter, and the start of true, false,
+/// yes or no is enough. For on and off, the first two letters are necessary.
+/// None when the text is not a boolean literal.
+fn parse_pg_bool(text: &str) -> Option<bool> {
+    let word = text
+        .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\u{b}')
+        .to_ascii_lowercase();
+    let starts = |full: &str, min_len: usize| word.len() >= min_len && full.starts_with(&word);
+    if starts("true", 1) || starts("yes", 1) || starts("on", 2) || word == "1" {
+        Some(true)
+    } else if starts("false", 1) || starts("no", 1) || starts("off", 2) || word == "0" {
+        Some(false)
+    } else {
+        None
     }
 }
 

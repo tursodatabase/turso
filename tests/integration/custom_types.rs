@@ -2,6 +2,7 @@
 mod tests {
     use crate::common::{ExecRows, TempDatabase};
     use asserting::prelude::*;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -139,6 +140,129 @@ mod tests {
         }
     }
 
+    /// Indexes on custom-type columns must keep their order after reopening:
+    /// the stored-value order of a user type, and numeric's own order, both for
+    /// column indexes and for expression indexes.
+    #[test]
+    fn test_index_keeps_type_order_after_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("type_order_reopen.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
+                 DECODE string_reverse(value) OPERATOR '<'",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX t_word ON t(word)").unwrap();
+            conn.execute("CREATE INDEX t_n_plus_one ON t((n+1))")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1,'cherry',9), (2,'apple',10.5), (3,'banana',100)")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+        // A new row goes to its place in the stored (reversed) text order:
+        // ananab < elppa < tocirpa < yrrehc.
+        conn.execute("INSERT INTO t VALUES (4,'apricot',0)")
+            .unwrap();
+        let rows: Vec<(String,)> =
+            conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
+        let words = ["banana", "apple", "apricot", "cherry"];
+        assert_eq!(rows, words.map(|w| (w.to_string(),)));
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT id FROM t INDEXED BY t_n_plus_one WHERE n+1 = 11.5");
+        assert_eq!(rows, vec![(2,)]);
+        let rows: Vec<(i64,)> = conn
+            .exec_rows("SELECT id FROM t INDEXED BY t_n_plus_one WHERE n+1 > 10.5 ORDER BY n+1");
+        assert_eq!(rows, vec![(2,), (3,)]);
+    }
+
+    #[test]
+    fn test_reopen_fails_when_stored_custom_type_does_not_parse() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_bad_type_sql.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+                .unwrap();
+            conn.execute("CREATE TYPE zz BASE text ENCODE upper(value) DECODE lower(value)")
+                .unwrap();
+            conn.execute("CREATE TABLE t(a cents, b zz) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (5, 'Hi')").unwrap();
+
+            conn.start_nested();
+            let stmt = conn.prepare(
+                "UPDATE __turso_internal_types SET sql = 'CREATE TYPE cents BAZE integer' \
+                 WHERE name = 'cents'",
+            );
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let result = turso_core::Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+            Arc::new(turso_core::SqliteDialect),
+        );
+        let Err(err) = result else {
+            panic!("open must fail when a stored type does not parse");
+        };
+        assert!(
+            err.to_string().contains("malformed database schema"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_schema_reparse_fails_when_stored_custom_type_does_not_parse() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100")
+            .unwrap();
+        conn.execute("CREATE TABLE t(a cents) STRICT").unwrap();
+
+        conn.start_nested();
+        let stmt = conn.prepare(
+            "UPDATE __turso_internal_types SET sql = 'CREATE TYPE cents BAZE integer' \
+             WHERE name = 'cents'",
+        );
+        conn.end_nested();
+        stmt.unwrap().run_ignore_rows().unwrap();
+
+        assert_that!(conn.execute("VACUUM"))
+            .err()
+            .display_string()
+            .contains("malformed database schema");
+    }
+
     /// After reopening, schema changes (CREATE TABLE) that use a previously
     /// defined custom type must still work. The type must survive the schema
     /// change and new tables must encode/decode correctly.
@@ -200,6 +324,127 @@ mod tests {
             assert_eq!(rows, vec![(99,)], "t2 should decode after second reopen");
 
             conn.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_add_column_with_non_literal_type_default_survives_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_add_column_default.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE DOMAIN dm AS text DEFAULT lower('X')")
+                .unwrap();
+            conn.execute("CREATE TYPE ty BASE text ENCODE value DECODE value DEFAULT lower('Y')")
+                .unwrap();
+            conn.execute("CREATE TABLE t(a INTEGER) STRICT").unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN b dm").unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN c ty").unwrap();
+            let rows: Vec<(String,)> =
+                conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+            assert_eq!(
+                rows,
+                vec![(
+                    "CREATE TABLE t (a INTEGER, b dm DEFAULT (lower ('X')), c ty DEFAULT (lower ('Y'))) STRICT"
+                        .to_string(),
+                )]
+            );
+            conn.close().unwrap();
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("INSERT INTO t(a) VALUES (1)").unwrap();
+            let rows: Vec<(i64, String, String)> = conn.exec_rows("SELECT a, b, c FROM t");
+            assert_eq!(rows, vec![(1, "x".to_string(), "y".to_string())]);
+            conn.close().unwrap();
+        }
+    }
+
+    /// An index on a numeric column added by ALTER TABLE must be built in
+    /// numeric order right away, the order the column has after a reopen.
+    #[test]
+    fn test_index_on_added_numeric_column_keeps_its_order_after_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_add_column_index.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT")
+                .unwrap();
+            conn.execute("ALTER TABLE t ADD COLUMN n numeric(10,2)")
+                .unwrap();
+            conn.execute("CREATE INDEX t_n ON t(n)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 9), (2, 10), (3, -3), (4, 100)")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+            assert_eq!(rows, vec![("ok".to_string(),)]);
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE n > 9 ORDER BY id");
+            assert_eq!(rows, vec![(2,), (4,)]);
+            conn.close().unwrap();
+        }
+    }
+
+    /// Without custom types enabled, a database that uses them is refused: its
+    /// custom-type columns would read as stored bytes, and an index on them
+    /// would be read and written in a different order than it was built in.
+    #[test]
+    fn test_database_with_custom_types_is_refused_without_the_flag() {
+        let temp_dir = TempDir::new().unwrap();
+        let cases = [
+            (
+                "builtin_type.db",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT",
+                "column t.n has a custom type",
+            ),
+            (
+                "array.db",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a integer[]) STRICT",
+                "column t.a has a custom type",
+            ),
+            (
+                "created_type.db",
+                "CREATE TYPE neg BASE integer ENCODE -value DECODE -value",
+                "the database has a table of custom types",
+            ),
+        ];
+        for (file, sql, expected_error) in cases {
+            let path = temp_dir.path().join(file);
+            {
+                let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+                let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+                let conn = db.connect_limbo();
+                conn.execute(sql).unwrap();
+                conn.close().unwrap();
+            }
+            let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+            let error = turso_core::Database::open_file(
+                io,
+                path.to_str().unwrap(),
+                Arc::new(turso_core::SqliteDialect),
+            )
+            .and_then(|db| db.connect(turso_core::ConnectOpts::new()))
+            .and_then(|conn| conn.execute("SELECT 1"))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(expected_error),
+                "{file}: unexpected error {error}"
+            );
         }
     }
 
@@ -310,11 +555,12 @@ mod tests {
             "WHERE clause should block update when decoded value 99 >= 20"
         );
 
-        // Complex expression: excluded.amount + t1.amount
+        // Complex expression over excluded.amount and t1.amount. cents declares
+        // no '+', so the values are cast to integers first.
         conn.execute("DELETE FROM t1").unwrap();
         conn.execute("INSERT INTO t1 VALUES (1, 42)").unwrap();
         conn.execute(
-            "INSERT INTO t1 VALUES (1, 8) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount + t1.amount",
+            "INSERT INTO t1 VALUES (1, 8) ON CONFLICT(id) DO UPDATE SET amount = CAST(excluded.amount AS INTEGER) + CAST(t1.amount AS INTEGER)",
         )
         .unwrap();
         let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t1 WHERE id = 1");
@@ -520,5 +766,97 @@ mod tests {
             rows,
             vec![("2025-01-08".to_string(), "2025-01-02".to_string())]
         );
+    }
+
+    /// A failed `CREATE TYPE` must not leave `__turso_internal_types` behind: the types table is
+    /// registered in the connection schema before the type SQL is parsed, and the rollback
+    /// restores that schema only when the schema cookie was set beforehand.
+    #[test]
+    fn test_failed_create_type_leaves_no_types_table() {
+        for mvcc in [false, true] {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+
+            // 257 variants: the type SQL is persisted first and rejected only when the type
+            // itself is added to the schema
+            let variants = (0..257)
+                .map(|i| format!("v{i} INT"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_that!(conn.execute(format!("CREATE TYPE u AS UNION({variants})")))
+                .err()
+                .display_string()
+                .contains("UNION type cannot have more than 256 variants");
+
+            let tables: Vec<(String, String, String, i64, i64, i64)> =
+                conn.exec_rows("PRAGMA table_list");
+            assert!(
+                !tables
+                    .iter()
+                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                "failed CREATE TYPE left the types table in the schema (mvcc={mvcc}): {tables:?}"
+            );
+
+            // The connection must still be usable: a later CREATE TYPE has to succeed
+            conn.execute("CREATE TYPE t2 BASE text").unwrap();
+            let tables: Vec<(String, String, String, i64, i64, i64)> =
+                conn.exec_rows("PRAGMA table_list");
+            assert!(
+                tables
+                    .iter()
+                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                "CREATE TYPE did not register the types table (mvcc={mvcc}): {tables:?}"
+            );
+            conn.close().unwrap();
+        }
+    }
+
+    /// The other half of the same invariant: when the types table already exists, a failed
+    /// `CREATE TYPE` must leave it in place, and leave the connection usable.
+    #[test]
+    fn test_failed_create_type_keeps_an_existing_types_table() {
+        for mvcc in [false, true] {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+
+            conn.execute("CREATE TYPE type_one BASE text").unwrap();
+
+            let variants = (0..257)
+                .map(|i| format!("v{i} INT"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            assert_that!(conn.execute(format!("CREATE TYPE u AS UNION({variants})")))
+                .err()
+                .display_string()
+                .contains("UNION type cannot have more than 256 variants");
+
+            let tables: Vec<(String, String, String, i64, i64, i64)> =
+                conn.exec_rows("PRAGMA table_list");
+            assert!(
+                tables
+                    .iter()
+                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                "failed CREATE TYPE dropped the existing types table (mvcc={mvcc}): {tables:?}"
+            );
+
+            // The failed type must not be persisted, and the connection must still be usable
+            conn.execute("CREATE TYPE type_two BASE text").unwrap();
+            let types: Vec<(String,)> =
+                conn.exec_rows("SELECT name FROM __turso_internal_types ORDER BY name");
+            assert_eq!(
+                types,
+                vec![("type_one".to_string(),), ("type_two".to_string(),)],
+                "mvcc={mvcc}"
+            );
+            conn.close().unwrap();
+        }
     }
 }

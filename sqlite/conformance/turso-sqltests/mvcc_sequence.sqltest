@@ -19,6 +19,55 @@ expect {
     2|4
 }
 
+# With change capture on, each change record id comes from the CDC table's
+# sequence, which runs after the user's insert. It must not replace
+# last_insert_rowid().
+test mvcc-cdc-change-id-does-not-change-last-insert-rowid {
+    PRAGMA journal_mode = 'mvcc';
+    PRAGMA unstable_capture_data_changes_conn('full');
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t (v) VALUES ('x');
+    SELECT last_insert_rowid(), max(id) FROM t;
+    INSERT INTO t (v) VALUES ('x');
+    SELECT last_insert_rowid(), max(id) FROM t;
+    INSERT INTO t (v) VALUES ('x');
+    SELECT last_insert_rowid(), max(id) FROM t;
+    UPDATE t SET v = 'z' WHERE id = 1;
+    SELECT last_insert_rowid();
+    INSERT INTO u (v) VALUES ('a');
+    SELECT last_insert_rowid();
+    INSERT INTO t (v) VALUES ('y') RETURNING id;
+    SELECT last_insert_rowid();
+}
+expect {
+    mvcc
+    1|1
+    2|2
+    3|3
+    3
+    1
+    4
+    4
+}
+
+test mvcc-nextval-and-setval-do-not-change-last-insert-rowid {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE SEQUENCE s;
+    INSERT INTO t (v) VALUES ('a');
+    INSERT INTO t (v) VALUES ('b');
+    SELECT nextval('s');
+    SELECT setval('s', 10);
+    SELECT last_insert_rowid();
+}
+expect {
+    mvcc
+    1
+    10
+    2
+}
+
 # MVCC autoincrement: sqlite_sequence has correct high-water mark after checkpoint
 test mvcc-autoincrement-sqlite-sequence-after-checkpoint {
     PRAGMA journal_mode = 'mvcc';
@@ -263,6 +312,19 @@ expect {
     b|7
 }
 
+test mvcc-autoincrement-table-name-may-contain-a-dot {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE "x.y" (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO "x.y"(v) VALUES ('a');
+    INSERT INTO "x.y"(v) VALUES ('b');
+    SELECT id, v FROM "x.y" ORDER BY id;
+}
+expect {
+    mvcc
+    1|a
+    2|b
+}
+
 test mvcc-autoincrement-checkpoint-compaction-many-tables {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE stress_00(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
@@ -427,4 +489,19 @@ expect {
     8
     0|0|0
     3
+}
+
+test mvcc-sequence-watermark-reads-the-database-the-name-resolves-to {
+    PRAGMA journal_mode = 'mvcc';
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.only_aux START 5;
+    SELECT nextval('aux.only_aux');
+    SELECT sequence_watermark_experimental('only_aux');
+    SELECT sequence_watermark_experimental('aux.only_aux');
+}
+expect {
+    mvcc
+    5
+    6
+    6
 }

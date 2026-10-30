@@ -451,6 +451,44 @@ expect {
     1
 }
 
+# UPDATE OF matches the SET names as written, so rowid, oid and _rowid_ are different names
+@cross-check-integrity
+test trigger-update-of-rowid-without-rowid-alias {
+    CREATE TABLE t(y TEXT);
+    CREATE TABLE log(msg TEXT);
+    INSERT INTO t VALUES ('a');
+    CREATE TRIGGER tr AFTER UPDATE OF rowid ON t BEGIN INSERT INTO log VALUES ('rowid ' || OLD.rowid || '->' || NEW.rowid); END;
+    CREATE TRIGGER tr_oid BEFORE UPDATE OF oid ON t BEGIN INSERT INTO log VALUES ('oid'); END;
+    UPDATE t SET y = 'b';
+    UPDATE t SET rowid = 5;
+    UPDATE t SET _rowid_ = 6;
+    UPDATE t SET OID = 7, Rowid = 8;
+    SELECT * FROM log;
+}
+expect {
+    rowid 1->5
+    oid
+    rowid 6->8
+}
+
+# On a table with a rowid alias, SET rowid fires UPDATE OF rowid but not UPDATE OF <alias>
+@cross-check-integrity
+test trigger-update-of-rowid-with-rowid-alias {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, y TEXT);
+    CREATE TABLE log(msg TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    CREATE TRIGGER tr AFTER UPDATE OF rowid ON t BEGIN INSERT INTO log VALUES ('rowid ' || OLD.rowid || '->' || NEW.rowid); END;
+    CREATE TRIGGER tr_id AFTER UPDATE OF id ON t BEGIN INSERT INTO log VALUES ('id ' || OLD.id || '->' || NEW.id); END;
+    UPDATE t SET rowid = 5;
+    UPDATE t SET ID = 6;
+    UPDATE t SET _rowid_ = 7;
+    SELECT * FROM log;
+}
+expect {
+    rowid 1->5
+    id 5->6
+}
+
 # Complex WHEN clause with AND
 @cross-check-integrity
 test trigger-when-complex {
@@ -2403,6 +2441,171 @@ expect {
     t_auto|4
 }
 
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-after-insert-deletes-new-row-then-inserts {
+    CREATE TABLE t_auto(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TRIGGER t_auto_ai AFTER INSERT ON t_auto WHEN new.v = 'real' BEGIN
+        DELETE FROM t_auto WHERE id = new.id;
+        INSERT INTO t_auto(v) VALUES ('from trigger');
+    END;
+    INSERT INTO t_auto(v) VALUES ('real');
+    SELECT id, v FROM t_auto ORDER BY id;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    2|from trigger
+    t_auto|2
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-before-insert-deletes-earlier-row-then-inserts {
+    CREATE TABLE t_auto(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TRIGGER t_auto_bi BEFORE INSERT ON t_auto WHEN new.v = 'second' BEGIN
+        DELETE FROM t_auto WHERE v = 'first';
+        INSERT INTO t_auto(v) VALUES ('from trigger');
+    END;
+    INSERT INTO t_auto(v) VALUES ('first'), ('second');
+    SELECT id, v FROM t_auto ORDER BY id;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    2|from trigger
+    3|second
+    t_auto|3
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-upsert-update-trigger-deletes-new-row-then-inserts {
+    CREATE TABLE t_auto(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT UNIQUE);
+    INSERT INTO t_auto(v) VALUES ('b');
+    CREATE TRIGGER t_auto_au AFTER UPDATE ON t_auto BEGIN
+        DELETE FROM t_auto WHERE v = 'a';
+        INSERT INTO t_auto(v) VALUES ('from trigger');
+    END;
+    INSERT INTO t_auto(v) VALUES ('a'), ('b') ON CONFLICT(v) DO UPDATE SET v = 'b2';
+    SELECT id, v FROM t_auto ORDER BY id;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    1|b2
+    4|from trigger
+    t_auto|4
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-fk-cascade-trigger-deletes-new-row-then-inserts {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE t_auto(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT UNIQUE);
+    CREATE TABLE child(p REFERENCES t_auto(id) ON DELETE CASCADE);
+    CREATE TRIGGER child_ad AFTER DELETE ON child BEGIN
+        DELETE FROM t_auto WHERE v = 'a';
+        INSERT INTO t_auto(v) VALUES ('from trigger');
+    END;
+    INSERT INTO t_auto(v) VALUES ('b');
+    INSERT INTO child VALUES (1);
+    INSERT OR REPLACE INTO t_auto(v) VALUES ('a'), ('b');
+    SELECT id, v FROM t_auto ORDER BY id;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    3|b
+    4|from trigger
+    t_auto|4
+}
+
+# The INSERT reads sqlite_sequence once, before its BEFORE trigger runs, and
+# writes the new value back to the sqlite_sequence row it found then.
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-before-insert-changes-sqlite-sequence {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('seed');
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN
+        INSERT INTO sqlite_sequence(name, seq) VALUES('t', 5);
+        UPDATE sqlite_sequence SET seq = 4 WHERE name = 't';
+    END;
+    INSERT INTO t(v) VALUES('x');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1|seed
+    2|x
+    1|t|2
+    2|t|4
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-before-insert-raises-sqlite-sequence {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN
+        UPDATE sqlite_sequence SET seq = seq + 10 WHERE name = 't';
+    END;
+    INSERT INTO t(v) VALUES('a');
+    INSERT INTO t(v) VALUES('b'), ('c');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    1|t|3
+}
+
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-before-insert-clears-sqlite-sequence {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('seed');
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN
+        DELETE FROM sqlite_sequence;
+        INSERT INTO sqlite_sequence VALUES('zz', 1);
+    END;
+    INSERT INTO t(v) VALUES('a');
+    INSERT INTO t(v) VALUES('b'), ('c');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+    1|seed
+    2|a
+    3|b
+    4|c
+    1|t|4
+}
+
+# A trigger on another table inserts into t while the outer INSERT runs. The
+# outer INSERT must read sqlite_sequence again before writing it, or it adds a
+# second row for t.
+@skip-if mvcc "AUTOINCREMENT is not supported in MVCC mode"
+@cross-check-integrity
+test trigger-autoincrement-insert-through-other-table-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    CREATE TABLE log(x);
+    CREATE TRIGGER ai AFTER INSERT ON t WHEN new.v = 'outer' BEGIN
+        INSERT INTO log VALUES(new.id);
+    END;
+    CREATE TRIGGER al AFTER INSERT ON log BEGIN
+        INSERT INTO t(v) VALUES('nested');
+    END;
+    INSERT INTO t(v) VALUES('outer');
+    SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+    DELETE FROM t WHERE v = 'nested';
+    INSERT INTO t(v) VALUES('after');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    1|t|2
+    1|outer
+    3|after
+}
+
 test before-update-trigger-panic-on-update {
     CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
     CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN SELECT 1; END;
@@ -2425,4 +2628,38 @@ test selectC-2-1 {
 }
 expect error {
     no such column: new.x
+}
+
+# Views only allow INSTEAD OF triggers.
+@skip-if mvcc "views not supported in MVCC mode"
+test create-after-trigger-on-view-rejected {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    CREATE TRIGGER tr AFTER INSERT ON v BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create AFTER trigger on view: v
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test create-before-trigger-on-view-rejected {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT a FROM t;
+    CREATE TRIGGER tr DELETE ON main.v BEGIN SELECT 1; END;
+}
+expect error {
+    cannot create BEFORE trigger on view: v
+}
+
+test current-time-same-in-trigger {
+    CREATE TABLE t(x);
+    CREATE TABLE log(x, d);
+    CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN
+      INSERT INTO log VALUES (NEW.x, datetime('subsecond'));
+    END;
+    INSERT INTO t SELECT value FROM generate_series(1, 2000);
+    SELECT count(*), count(DISTINCT d) FROM log;
+}
+expect {
+    2000|1
 }

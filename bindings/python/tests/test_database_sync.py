@@ -69,6 +69,34 @@ def test_push():
         assert r2 == [["hello"], ["turso"], ["sync"], ["push works"]]
 
 
+def test_callable_remote_url():
+    with TursoServer() as server:
+        server.db_sql("CREATE TABLE t(x)")
+        server.db_sql("INSERT INTO t VALUES ('hello')")
+
+        with CountingProxy(server.db_url(), "/pull-updates") as proxy:
+            conn = turso.sync.connect(":memory:", lambda: proxy.url())
+            assert conn.execute("SELECT * FROM t").fetchall() == [("hello",)]
+
+            server.db_sql("INSERT INTO t VALUES ('pull works')")
+            assert conn.pull()
+            assert conn.execute("SELECT * FROM t").fetchall() == [("hello",), ("pull works",)]
+
+            conn.execute("INSERT INTO t VALUES ('push works')")
+            conn.commit()
+            conn.push()
+            assert server.db_sql("SELECT * FROM t") == [["hello"], ["pull works"], ["push works"]]
+
+            # bootstrap and pull both went through the url returned by the callable
+            assert proxy.count >= 2
+
+
+def test_callable_remote_url_rewrites_turso_schemes():
+    for url in ["libsql://example.com", "turso://example.com"]:
+        ctx = turso.lib_sync._HttpContext(remote_url=lambda: url, auth_token=None, client_name="test")
+        assert ctx.base_url() == "https://example.com"
+
+
 def test_checkpoint():
     # turso.setup_logging(level=logging.DEBUG)
 
@@ -271,7 +299,7 @@ def test_configuration_persistence():
 
             server.db_sql("INSERT INTO t VALUES (43)")
 
-            assert "http://localhost" in open(f"{path}-info", "r").read()
+            assert server.db_url() in open(f"{path}-info", "r").read()
 
             conn2 = turso.sync.connect(path)
             conn2.pull()

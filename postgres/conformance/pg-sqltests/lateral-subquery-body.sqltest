@@ -1,0 +1,1041 @@
+@database :memory:
+
+# Clauses inside a LATERAL subquery that read columns of the left side.
+# The statements run through the PostgreSQL frontend (tursopg).
+# PostgreSQL 16 gave every expected result.
+
+setup data {
+    CREATE TABLE t1(a INT, b TEXT);
+    CREATE TABLE t2(a INT, c INT, d TEXT);
+    CREATE TABLE t3(c INT, e TEXT);
+    INSERT INTO t1 VALUES (1, 'p'), (2, 'q'), (3, 'r'), (4, 's');
+    INSERT INTO t2 VALUES (1, 10, 'x'), (2, 20, 'y'), (2, 30, 'z'), (3, 40, 'w'), (5, 50, 'v'), (2, 25, 'y'), (3, 40, 'x');
+    INSERT INTO t3 VALUES (10, 'k'), (20, 'l'), (30, 'm'), (30, 'n'), (60, 'o');
+}
+
+@setup data
+test where-equality-on-outer-column {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|25
+    2|30
+    3|40
+    3|40
+}
+
+@setup data
+test where-inequality-on-outer-column {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a <> t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|6
+    2|4
+    3|5
+    4|7
+}
+
+@setup data
+test where-range-on-outer-column {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.c > t1.a * 10 AND t2.c < t1.a * 10 + 15) AS s ORDER BY 1, 2;
+}
+expect {
+    1|20
+    2|25
+    2|30
+    3|40
+    3|40
+    4|50
+}
+
+@setup data
+test where-or-on-outer-column {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a OR t2.c = t1.a * 10) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|25
+    2|30
+    3|30
+    3|40
+    3|40
+    4|40
+    4|40
+}
+
+@setup data
+test where-outer-column-only {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t1.a > 2) AS s ORDER BY 1;
+}
+expect {
+    1|0
+    2|0
+    3|7
+    4|7
+}
+
+@setup data
+test where-outer-expression-equals-inner-expression {
+    SELECT t1.a, s.d FROM t1, LATERAL (SELECT d FROM t2 WHERE t2.c = (t1.a + 1) * 10) AS s ORDER BY 1, 2;
+}
+expect {
+    1|y
+    2|z
+    3|w
+    3|x
+    4|v
+}
+
+@setup data
+test where-text-comparison-with-outer-column {
+    SELECT t1.b, s.d FROM t1, LATERAL (SELECT d FROM t2 WHERE t2.d > t1.b AND t2.d < 'x') AS s ORDER BY 1, 2;
+}
+expect {
+    p|v
+    p|w
+    q|v
+    q|w
+    r|v
+    r|w
+    s|v
+    s|w
+}
+
+@setup data
+test group-by-inner-column {
+    SELECT t1.a, s.d, s.n FROM t1, LATERAL (SELECT d, count(*) AS n FROM t2 WHERE t2.a <= t1.a GROUP BY d) AS s ORDER BY 1, 2;
+}
+expect {
+    1|x|1
+    2|x|1
+    2|y|2
+    2|z|1
+    3|w|1
+    3|x|2
+    3|y|2
+    3|z|1
+    4|w|1
+    4|x|2
+    4|y|2
+    4|z|1
+}
+
+@setup data
+test group-by-and-having-on-outer-column {
+    SELECT t1.a, s.a, s.n FROM t1, LATERAL (SELECT a, count(*) AS n FROM t2 GROUP BY a HAVING count(*) >= t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1|1
+    1|2|3
+    1|3|2
+    1|5|1
+    2|2|3
+    2|3|2
+    3|2|3
+}
+
+@setup data
+test having-on-sum-reads-outer-column {
+    SELECT t1.a, s.a, s.total FROM t1, LATERAL (SELECT a, sum(c) AS total FROM t2 GROUP BY a HAVING sum(c) > t1.a * 20) AS s ORDER BY 1, 2;
+}
+expect {
+    1|2|75
+    1|3|80
+    1|5|50
+    2|2|75
+    2|3|80
+    2|5|50
+    3|2|75
+    3|3|80
+}
+
+@setup data
+test aggregates-over-inner-columns {
+    SELECT t1.a, s.n, s.lo, s.hi, s.total FROM t1, LATERAL (SELECT count(*) AS n, min(c) AS lo, max(c) AS hi, sum(c) AS total FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|1|10|10|10
+    2|3|20|30|75
+    3|2|40|40|80
+    4|0|||
+}
+
+@setup data
+test aggregate-over-inner-and-outer-expression {
+    SELECT t1.a, s.total FROM t1, LATERAL (SELECT sum(c + t1.a) AS total FROM t2 WHERE t2.a >= t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|222
+    2|217
+    3|139
+    4|54
+}
+
+@setup data
+test aggregate-times-outer-column {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT max(c) * t1.a AS v FROM t2) AS s ORDER BY 1;
+}
+expect {
+    1|50
+    2|100
+    3|150
+    4|200
+}
+
+@setup data
+test count-of-an-outer-and-inner-case {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(CASE WHEN t2.a > t1.a THEN 1 END) AS n FROM t2) AS s ORDER BY 1;
+}
+expect {
+    1|6
+    2|3
+    3|1
+    4|1
+}
+
+@setup data
+test count-distinct-inside-lateral {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(DISTINCT d) AS n FROM t2 WHERE t2.a <= t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|3
+    3|4
+    4|4
+}
+
+@setup data
+test sum-distinct-inside-lateral {
+    SELECT t1.a, s.total FROM t1, LATERAL (SELECT sum(DISTINCT c) AS total FROM t2 WHERE t2.a <= t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|85
+    3|125
+    4|125
+}
+
+@setup data
+test min-max-text-inside-lateral {
+    SELECT t1.a, s.lo, s.hi FROM t1, LATERAL (SELECT min(d) AS lo, max(d) AS hi FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|x|x
+    2|y|z
+    3|w|x
+    4||
+}
+
+@setup data
+test aggregate-in-order-by-of-grouped-lateral {
+    SELECT t1.a, s.a FROM t1, LATERAL (SELECT a FROM t2 WHERE t2.a <= t1.a GROUP BY a ORDER BY sum(c) DESC LIMIT 1) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|3
+}
+
+@setup data
+test distinct-inside-lateral {
+    SELECT t1.a, s.d FROM t1, LATERAL (SELECT DISTINCT d FROM t2 WHERE t2.a >= t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|v
+    1|w
+    1|x
+    1|y
+    1|z
+    2|v
+    2|w
+    2|x
+    2|y
+    2|z
+    3|v
+    3|w
+    3|x
+    4|v
+}
+
+@setup data
+test distinct-on-expression-with-outer-column {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT DISTINCT c + t1.a AS v FROM t2 WHERE t2.a = 3) AS s ORDER BY 1, 2;
+}
+expect {
+    1|41
+    2|42
+    3|43
+    4|44
+}
+
+@setup data
+test distinct-two-columns-inside-lateral {
+    SELECT t1.a, s.a, s.d FROM t1, LATERAL (SELECT DISTINCT a, d FROM t2 WHERE t2.a BETWEEN t1.a AND t1.a + 1) AS s ORDER BY 1, 2, 3;
+}
+expect {
+    1|1|x
+    1|2|y
+    1|2|z
+    2|2|y
+    2|2|z
+    2|3|w
+    2|3|x
+    3|3|w
+    3|3|x
+    4|5|v
+}
+
+@setup data
+test order-by-limit-one-per-left-row {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c LIMIT 1) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+    3|40
+}
+
+@setup data
+test order-by-desc-limit-two-per-left-row {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c DESC LIMIT 2) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|25
+    2|30
+    3|40
+    3|40
+}
+
+@setup data
+test order-by-limit-offset-per-left-row {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a <= t1.a ORDER BY c LIMIT 2 OFFSET 1) AS s ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    3|20
+    3|25
+    4|20
+    4|25
+}
+
+@setup data
+test order-by-outer-dependent-expression-with-limit {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 ORDER BY abs(c - t1.a * 12), c LIMIT 1) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|25
+    3|40
+    4|50
+}
+
+@setup data
+test order-by-two-keys-limit {
+    SELECT t1.a, s.d, s.c FROM t1, LATERAL (SELECT d, c FROM t2 WHERE t2.a >= t1.a ORDER BY d, c DESC LIMIT 2) AS s ORDER BY 1, 2, 3;
+}
+expect {
+    1|v|50
+    1|w|40
+    2|v|50
+    2|w|40
+    3|v|50
+    3|w|40
+    4|v|50
+}
+
+@setup data
+test limit-without-order-on-unique-rows {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a = t1.a LIMIT 5) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|3
+    3|2
+    4|0
+}
+
+@setup data
+test limit-larger-than-rows {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c LIMIT 100) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|25
+    2|30
+    3|40
+    3|40
+}
+
+@setup data
+test offset-without-a-row-left {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a = t1.a ORDER BY c LIMIT 10 OFFSET 2) AS s ORDER BY 1, 2;
+}
+expect {
+    2|30
+}
+
+@setup data
+test top-n-per-group-with-ties-broken {
+    SELECT t1.a, s.c, s.d FROM t1, LATERAL (SELECT c, d FROM t2 WHERE t2.a >= t1.a ORDER BY c DESC, d LIMIT 1) AS s ORDER BY 1;
+}
+expect {
+    1|50|v
+    2|50|v
+    3|50|v
+    4|50|v
+}
+
+@setup data
+test row-number-inside-lateral {
+    SELECT t1.a, s.c, s.rn FROM t1, LATERAL (SELECT c, row_number() OVER (ORDER BY c) AS rn FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10|1
+    2|20|1
+    2|25|2
+    2|30|3
+    3|40|1
+    3|40|2
+}
+
+@setup data
+test rank-inside-lateral {
+    SELECT t1.a, s.c, s.r FROM t1, LATERAL (SELECT c, rank() OVER (ORDER BY c) AS r FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a = 3 ORDER BY 2, 3;
+}
+expect {
+    3|10|1
+    3|20|2
+    3|25|3
+    3|30|4
+    3|40|5
+    3|40|5
+}
+
+@setup data
+test window-partition-inside-lateral {
+    SELECT t1.a, s.a, s.c, s.total FROM t1, LATERAL (SELECT a, c, sum(c) OVER (PARTITION BY a) AS total FROM t2 WHERE t2.a <= t1.a) AS s WHERE t1.a = 2 ORDER BY 2, 3;
+}
+expect {
+    2|1|10|10
+    2|2|20|75
+    2|2|25|75
+    2|2|30|75
+}
+
+@setup data
+test window-running-sum-inside-lateral {
+    SELECT t1.a, s.c, s.running FROM t1, LATERAL (SELECT c, sum(c) OVER (ORDER BY c ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10|10
+    2|20|20
+    2|25|45
+    2|30|75
+    3|40|40
+    3|40|80
+}
+
+@setup data
+test window-reads-outer-column-in-argument {
+    SELECT t1.a, s.c, s.v FROM t1, LATERAL (SELECT c, max(c + t1.a) OVER () AS v FROM t2 WHERE t2.a = 2) AS s WHERE t1.a < 3 ORDER BY 1, 2;
+}
+expect {
+    1|20|31
+    1|25|31
+    1|30|31
+    2|20|32
+    2|25|32
+    2|30|32
+}
+
+@setup data
+test window-result-filtered-outside {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c, row_number() OVER (ORDER BY c DESC) AS rn FROM t2 WHERE t2.a = t1.a) AS s WHERE s.rn = 1 ORDER BY 1;
+}
+expect {
+    1|10
+    2|30
+    3|40
+}
+
+@setup data
+test window-lag-inside-lateral {
+    SELECT t1.a, s.c, s.prev FROM t1, LATERAL (SELECT c, lag(c) OVER (ORDER BY c) AS prev FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10|
+    2|20|
+    2|25|20
+    2|30|25
+    3|40|
+    3|40|40
+}
+
+@setup data
+test union-all-of-outer-and-inner {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT c AS v FROM t2 WHERE t2.a = t1.a UNION ALL SELECT c FROM t3 WHERE t3.c = t1.a * 10) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    1|10
+    2|20
+    2|20
+    2|25
+    2|30
+    3|30
+    3|30
+    3|40
+    3|40
+}
+
+@setup data
+test union-removes-duplicates-per-row {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT c AS v FROM t2 WHERE t2.a = t1.a UNION SELECT c FROM t3 WHERE t3.c <= t1.a * 10) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|10
+    2|20
+    2|25
+    2|30
+    3|10
+    3|20
+    3|30
+    3|40
+    4|10
+    4|20
+    4|30
+}
+
+@setup data
+test intersect-reads-outer-in-both-arms {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT c AS v FROM t2 WHERE t2.a <= t1.a INTERSECT SELECT c FROM t3 WHERE t3.c <= t1.a * 10) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|10
+    2|20
+    3|10
+    3|20
+    3|30
+    4|10
+    4|20
+    4|30
+}
+
+@setup data
+test except-reads-outer-in-both-arms {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT c AS v FROM t2 WHERE t2.a <= t1.a EXCEPT SELECT c FROM t3 WHERE t3.c < t1.a * 10) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|25
+    2|30
+    3|25
+    3|30
+    3|40
+    4|25
+    4|40
+}
+
+@setup data
+test union-all-with-aggregate-arm {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT count(*) AS v FROM t2 WHERE t2.a = t1.a UNION ALL SELECT max(c) FROM t3 WHERE t3.c <= t1.a * 10) AS s ORDER BY 1, 2 NULLS FIRST;
+}
+expect {
+    1|1
+    1|10
+    2|3
+    2|20
+    3|2
+    3|30
+    4|0
+    4|30
+}
+
+@setup data
+test compound-with-order-by-and-limit-reads-outer {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT c AS v FROM t2 WHERE t2.a = t1.a UNION SELECT c FROM t3 ORDER BY 1 DESC LIMIT 2) AS s ORDER BY 1, 2;
+}
+expect {
+    1|30
+    1|60
+    2|30
+    2|60
+    3|40
+    3|60
+    4|30
+    4|60
+}
+
+@setup data
+test in-list-with-outer-columns {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.a IN (t1.a, t1.a + 3)) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    2|25
+    2|30
+    2|50
+    3|40
+    3|40
+}
+
+@setup data
+test in-list-of-inner-column-against-outer-value {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t1.a IN (t2.a, t2.c)) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|3
+    3|2
+    4|0
+}
+
+@setup data
+test not-in-list-with-outer-columns {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.a NOT IN (t1.a, 5)) AS s ORDER BY 1;
+}
+expect {
+    1|5
+    2|3
+    3|4
+    4|6
+}
+
+@setup data
+test in-subquery-reads-outer-column {
+    SELECT t1.a, s.e FROM t1, LATERAL (SELECT e FROM t3 WHERE t3.c IN (SELECT c FROM t2 WHERE t2.a = t1.a)) AS s ORDER BY 1, 2;
+}
+expect {
+    1|k
+    2|l
+    2|m
+    2|n
+}
+
+@setup data
+test not-in-subquery-reads-outer-column {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t3 WHERE t3.c NOT IN (SELECT c FROM t2 WHERE t2.a = t1.a)) AS s ORDER BY 1;
+}
+expect {
+    1|4
+    2|2
+    3|5
+    4|5
+}
+
+@setup data
+test outer-value-in-subquery {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT CASE WHEN t1.a IN (SELECT a FROM t2) THEN 'yes' ELSE 'no' END AS v) AS s ORDER BY 1;
+}
+expect {
+    1|yes
+    2|yes
+    3|yes
+    4|no
+}
+
+@setup data
+test exists-reads-outer-column {
+    SELECT t1.a, s.e FROM t1, LATERAL (SELECT e FROM t3 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.c = t3.c AND t2.a = t1.a)) AS s ORDER BY 1, 2;
+}
+expect {
+    1|k
+    2|l
+    2|m
+    2|n
+}
+
+@setup data
+test not-exists-reads-outer-column {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t3 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.c = t3.c AND t2.a = t1.a)) AS s ORDER BY 1;
+}
+expect {
+    1|4
+    2|2
+    3|5
+    4|5
+}
+
+@setup data
+test exists-reads-only-outer-column {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t3 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.a)) AS s ORDER BY 1;
+}
+expect {
+    1|5
+    2|5
+    3|5
+    4|0
+}
+
+@setup data
+test scalar-subquery-in-select-reads-outer-and-inner {
+    SELECT t1.a, s.c, s.e FROM t1, LATERAL (SELECT c, (SELECT max(e) FROM t3 WHERE t3.c = t2.c + t1.a - t1.a) AS e FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1, 2, 3 NULLS FIRST;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|25|
+    2|30|n
+    3|40|
+    3|40|
+}
+
+@setup data
+test scalar-subquery-in-where-reads-outer {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.c > (SELECT min(c) FROM t3 WHERE t3.c > t1.a * 10)) AS s WHERE t1.a < 3 ORDER BY 1, 2;
+}
+expect {
+    1|25
+    1|30
+    1|40
+    1|40
+    1|50
+    2|40
+    2|40
+    2|50
+}
+
+@setup data
+test scalar-subquery-in-select-reads-only-outer {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT (SELECT count(*) FROM t2 WHERE t2.a = t1.a) AS v) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|3
+    3|2
+    4|0
+}
+
+@setup data
+test scalar-subquery-with-limit-reads-outer {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT (SELECT d FROM t2 WHERE t2.a = t1.a ORDER BY c DESC LIMIT 1) AS v) AS s ORDER BY 1;
+}
+expect {
+    1|x
+    2|z
+    3|w
+    4|
+}
+
+@setup data
+test inner-join-of-two-tables-reads-outer {
+    SELECT t1.a, s.d, s.e FROM t1, LATERAL (SELECT t2.d, t3.e FROM t2 JOIN t3 ON t3.c = t2.c WHERE t2.a = t1.a) AS s ORDER BY 1, 2, 3;
+}
+expect {
+    1|x|k
+    2|y|l
+    2|z|m
+    2|z|n
+}
+
+@setup data
+test join-condition-inside-reads-outer {
+    SELECT t1.a, s.d, s.e FROM t1, LATERAL (SELECT t2.d, t3.e FROM t2 JOIN t3 ON t3.c = t2.c AND t2.a = t1.a) AS s ORDER BY 1, 2, 3;
+}
+expect {
+    1|x|k
+    2|y|l
+    2|z|m
+    2|z|n
+}
+
+@setup data
+test left-join-inside-reads-outer {
+    SELECT t1.a, s.c, s.e FROM t1, LATERAL (SELECT t2.c, t3.e FROM t2 LEFT JOIN t3 ON t3.c = t2.c WHERE t2.a = t1.a) AS s ORDER BY 1, 2, 3 NULLS FIRST;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|25|
+    2|30|m
+    2|30|n
+    3|40|
+    3|40|
+}
+
+@setup data
+test left-join-condition-inside-reads-outer {
+    SELECT t1.a, s.c, s.e FROM t1, LATERAL (SELECT t2.c, t3.e FROM t2 LEFT JOIN t3 ON t3.c = t2.c AND t1.a > 1 WHERE t2.a <= 2) AS s WHERE t1.a < 3 ORDER BY 1, 2, 3 NULLS FIRST;
+}
+expect {
+    1|10|
+    1|20|
+    1|25|
+    1|30|
+    2|10|k
+    2|20|l
+    2|25|
+    2|30|m
+    2|30|n
+}
+
+@setup data
+test cross-join-inside-reads-outer {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 CROSS JOIN t3 WHERE t2.a = t1.a AND t3.c > t2.c) AS s ORDER BY 1;
+}
+expect {
+    1|4
+    2|7
+    3|2
+    4|0
+}
+
+@setup data
+test three-table-join-inside-reads-outer {
+    SELECT t1.a, s.n FROM t1, LATERAL (SELECT count(*) AS n FROM t2 JOIN t3 ON t3.c = t2.c JOIN t1 AS x ON x.a = t2.a WHERE x.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|3
+    3|0
+    4|0
+}
+
+@setup data
+test join-using-inside-reads-outer {
+    SELECT t1.a, s.c, s.e FROM t1, LATERAL (SELECT c, t3.e FROM t2 JOIN t3 USING (c) WHERE t2.a = t1.a) AS s ORDER BY 1, 2, 3;
+}
+expect {
+    1|10|k
+    2|20|l
+    2|30|m
+    2|30|n
+}
+
+@setup data
+test from-subquery-inside-reads-outer {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT q.c + 1 AS v FROM (SELECT c FROM t2 WHERE t2.a = t1.a) AS q) AS s ORDER BY 1, 2;
+}
+expect {
+    1|11
+    2|21
+    2|26
+    2|31
+    3|41
+    3|41
+}
+
+@setup data
+test cte-inside-reads-outer {
+    SELECT t1.a, s.c FROM t1, LATERAL (WITH w AS (SELECT c FROM t2 WHERE t2.a = t1.a) SELECT c FROM w WHERE c > 15) AS s ORDER BY 1, 2;
+}
+expect {
+    2|20
+    2|25
+    2|30
+    3|40
+    3|40
+}
+
+@setup data
+test cte-used-twice-inside-reads-outer {
+    SELECT t1.a, s.x, s.y FROM t1, LATERAL (WITH w AS (SELECT c FROM t2 WHERE t2.a = t1.a) SELECT p.c AS x, q.c AS y FROM w AS p, w AS q WHERE p.c < q.c) AS s ORDER BY 1, 2, 3;
+}
+expect {
+    2|20|25
+    2|20|30
+    2|25|30
+}
+
+@setup data
+test materialized-cte-inside-reads-outer {
+    SELECT t1.a, s.n FROM t1, LATERAL (WITH w AS MATERIALIZED (SELECT c FROM t2 WHERE t2.a = t1.a) SELECT count(*) AS n FROM w AS p, w AS q) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|9
+    3|4
+    4|0
+}
+
+@setup data
+test not-materialized-cte-inside-reads-outer {
+    SELECT t1.a, s.n FROM t1, LATERAL (WITH w AS NOT MATERIALIZED (SELECT c FROM t2 WHERE t2.a = t1.a) SELECT count(*) AS n FROM w) AS s ORDER BY 1;
+}
+expect {
+    1|1
+    2|3
+    3|2
+    4|0
+}
+
+@setup data
+test cte-inside-with-aggregate-reads-outer {
+    SELECT t1.a, s.total FROM t1, LATERAL (WITH w AS (SELECT sum(c) AS total FROM t2 WHERE t2.a <= t1.a) SELECT total FROM w) AS s ORDER BY 1;
+}
+expect {
+    1|10
+    2|85
+    3|165
+    4|165
+}
+
+@setup data
+test cte-chain-inside-reads-outer-in-second-cte {
+    SELECT t1.a, s.v FROM t1, LATERAL (WITH w1 AS (SELECT c FROM t2), w2 AS (SELECT c FROM w1 WHERE c = t1.a * 10) SELECT c AS v FROM w2) AS s ORDER BY 1, 2;
+}
+expect {
+    1|10
+    2|20
+    3|30
+    4|40
+    4|40
+}
+
+@setup data
+test outer-cte-read-inside-lateral {
+    WITH w AS (SELECT c, e FROM t3)
+    SELECT t1.a, s.e FROM t1, LATERAL (SELECT e FROM w WHERE w.c = t1.a * 10) AS s ORDER BY 1, 2;
+}
+expect {
+    1|k
+    2|l
+    3|m
+    3|n
+}
+
+@setup data
+test outer-cte-with-the-name-of-a-table-on-the-left {
+    WITH t2 AS (SELECT 100 AS b, 'cte' AS c)
+    SELECT t2.a, s.c FROM t1 AS t2, LATERAL (SELECT c FROM t2) AS s ORDER BY 1, 2;
+}
+expect {
+    1|cte
+    2|cte
+    3|cte
+    4|cte
+}
+
+@setup data
+test recursive-cte-bounded-by-outer-column {
+    SELECT t1.a, s.n FROM t1, LATERAL (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < t1.a) SELECT n FROM r) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|1
+    2|2
+    3|1
+    3|2
+    3|3
+    4|1
+    4|2
+    4|3
+    4|4
+}
+
+@setup data
+test recursive-cte-starts-at-outer-column {
+    SELECT t1.a, s.n FROM t1, LATERAL (WITH RECURSIVE r(n) AS (SELECT t1.a UNION ALL SELECT n + 1 FROM r WHERE n < 4) SELECT n FROM r) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1
+    1|2
+    1|3
+    1|4
+    2|2
+    2|3
+    2|4
+    3|3
+    3|4
+    4|4
+}
+
+@setup data
+test recursive-cte-aggregated-by-outer-column {
+    SELECT t1.a, s.total FROM t1, LATERAL (WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < t1.a * 2) SELECT sum(n) AS total FROM r) AS s ORDER BY 1;
+}
+expect {
+    1|3
+    2|10
+    3|21
+    4|36
+}
+
+@setup data
+test recursive-cte-walks-a-table-from-outer-row {
+    CREATE TABLE t4(id INT, parent INT);
+    INSERT INTO t4 VALUES (1, NULL), (2, 1), (3, 2), (4, 3), (5, 1);
+    SELECT t4.id, s.depth FROM t4, LATERAL (
+        WITH RECURSIVE up(id, depth) AS (SELECT t4.id, 0 UNION ALL SELECT x.parent, up.depth + 1 FROM up JOIN t4 AS x ON x.id = up.id WHERE x.parent IS NOT NULL)
+        SELECT max(depth) AS depth FROM up
+    ) AS s ORDER BY 1;
+}
+expect {
+    1|0
+    2|1
+    3|2
+    4|3
+    5|1
+}
+
+@setup data
+test case-in-select-reads-inner-and-outer {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT CASE WHEN c > t1.a * 10 THEN 'big' ELSE 'small' END AS v FROM t2 WHERE t2.a = 2) AS s WHERE t1.a < 4 ORDER BY 1, 2;
+}
+expect {
+    1|big
+    1|big
+    1|big
+    2|big
+    2|big
+    2|small
+    3|small
+    3|small
+    3|small
+}
+
+@setup data
+test outer-column-in-every-clause-except-group-by {
+    SELECT t1.a, s.k, s.n
+    FROM t1, LATERAL (
+        SELECT c % 3 + t1.a AS k, count(*) + t1.a AS n
+        FROM t2
+        WHERE t2.a <= t1.a + 1
+        GROUP BY c % 3
+        HAVING count(*) >= t1.a - 1
+        ORDER BY 1
+        LIMIT 2
+    ) AS s
+    ORDER BY 1, 2;
+}
+expect {
+    1|1|2
+    1|2|3
+    2|2|3
+    2|3|6
+    3|4|7
+    4|5|8
+}
+
+@setup data
+test aggregate-plus-outer-column-when-no-rows-match {
+    SELECT t1.a, s.v FROM t1, LATERAL (SELECT max(c) + t1.a AS v FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|11
+    2|32
+    3|43
+    4|
+}
+
+@setup data
+test outer-column-next-to-an-aggregate-when-no-rows-match {
+    SELECT t1.a, s.m, s.v FROM t1, LATERAL (SELECT max(c) AS m, t1.a AS v FROM t2 WHERE t2.a = t1.a) AS s ORDER BY 1;
+}
+expect {
+    1|10|1
+    2|30|2
+    3|40|3
+    4||4
+}

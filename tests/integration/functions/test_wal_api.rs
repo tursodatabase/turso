@@ -324,6 +324,25 @@ fn test_wal_frame_far_away_write(db: TempDatabase) {
     assert!(conn2.wal_insert_frame(5, &frame).is_err());
 }
 
+#[test]
+fn test_wal_insert_frame_without_session_does_not_overwrite_committed_frames() {
+    let db = TempDatabase::new_empty();
+    let stale = db.connect_limbo();
+    let writer = db.connect_limbo();
+    writer.execute("CREATE TABLE t(x)").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+    let _: Vec<(i64,)> = stale.exec_rows("SELECT count(*) FROM t");
+    let max_frame = stale.wal_state().unwrap().max_frame;
+    let mut frame = [0u8; 24 + 4096];
+    stale.wal_get_frame(max_frame, &mut frame).unwrap();
+    writer.execute("INSERT INTO t VALUES (2)").unwrap();
+    writer.execute("INSERT INTO t VALUES (3)").unwrap();
+    let insert = stale.wal_insert_frame(max_frame + 1, &frame);
+    assert!(matches!(insert, Err(LimboError::TxError(_))), "{insert:?}");
+    let rows: Vec<(i64,)> = db.connect_limbo().exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, [(3,)]);
+}
+
 // TODO: mvcc
 #[turso_macros::test()]
 fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
@@ -1034,4 +1053,141 @@ fn test_wal_watermark_read_page_out_of_range_returns_error(db: TempDatabase) {
 
     let result = conn.try_wal_watermark_read_page(1, &mut page, Some(max_frame - 1));
     assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
+}
+
+#[test]
+fn wal_insert_end_syncs_committed_frames() {
+    for force_commit in [false, true] {
+        let source = TempDatabase::new_empty();
+        let src = source.connect_limbo();
+        src.execute("CREATE TABLE t(x)").unwrap();
+        src.execute("INSERT INTO t VALUES (1)").unwrap();
+        let frames = src.wal_state().unwrap().max_frame;
+        let io = Arc::new(crate::unreliable_io::UnreliableIo::new());
+        let db = turso_core::Database::open_file(io.clone(), "target.db", Arc::new(SqliteDialect))
+            .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("PRAGMA synchronous = FULL").unwrap();
+        let mut frame = [0u8; 24 + 4096];
+        conn.wal_insert_begin().unwrap();
+        for frame_no in 1..=frames {
+            src.wal_get_frame(frame_no, &mut frame).unwrap();
+            conn.wal_insert_frame(frame_no, &frame).unwrap();
+        }
+        conn.wal_insert_end(force_commit).unwrap();
+        let rows: Vec<(i64,)> = db
+            .connect(ConnectOpts::new())
+            .unwrap()
+            .exec_rows("SELECT count(*) FROM t");
+        assert_eq!(rows, [(1,)]);
+        let durable_wal = io
+            .durable_files()
+            .remove("target.db-wal")
+            .unwrap_or_default();
+        assert_eq!(
+            durable_wal.len(),
+            32 + frames as usize * (24 + 4096),
+            "WAL bytes that survive a power loss with force_commit={force_commit}"
+        );
+    }
+}
+
+#[test]
+fn wal_insert_end_drops_frames_of_concurrent_writer() {
+    let db = TempDatabase::new_empty();
+    let setup = db.connect_limbo();
+    setup.execute("CREATE TABLE big(x BLOB)").unwrap();
+    setup
+        .execute("CREATE TABLE w(v INTEGER, pad BLOB)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO big SELECT randomblob(3000) FROM generate_series(1, 20000)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO w SELECT 0, randomblob(3000) FROM generate_series(1, 1000)")
+        .unwrap();
+    let session = db.connect_limbo();
+    session.execute("PRAGMA cache_size = 100000").unwrap();
+    let writer = db.connect_limbo();
+    writer.execute("PRAGMA cache_size = 100").unwrap();
+    let updates = std::thread::spawn(move || {
+        for _ in 0..10 {
+            loop {
+                match writer.execute("UPDATE w SET v = v + 1") {
+                    Err(LimboError::Busy) => continue,
+                    result => break result.unwrap(),
+                }
+            }
+        }
+    });
+    while !updates.is_finished() {
+        if session.wal_insert_begin().is_ok() {
+            let _: Vec<(i64,)> = session.exec_rows("SELECT count(*) FROM big WHERE length(x) > 0");
+            session.wal_insert_end(false).unwrap();
+        }
+    }
+    updates.join().unwrap();
+    let lagging: Vec<(i64,)> = setup.exec_rows("SELECT count(*) FROM w WHERE v != 10");
+    assert_eq!(lagging, [(0,)], "rows that miss committed updates");
+}
+
+struct StepFailsOnce {
+    io: crate::queued_io::QueuedIo,
+    fail_next_step: std::sync::atomic::AtomicBool,
+}
+
+impl turso_core::Clock for StepFailsOnce {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+        turso_core::Clock::current_time_monotonic(&self.io)
+    }
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+        turso_core::Clock::current_time_wall_clock(&self.io)
+    }
+}
+
+impl turso_core::IO for StepFailsOnce {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: turso_core::OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        turso_core::IO::open_file(&self.io, path, flags, direct)
+    }
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        turso_core::IO::remove_file(&self.io, path)
+    }
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        turso_core::IO::file_id(&self.io, path)
+    }
+    fn step(&self) -> turso_core::Result<()> {
+        if self
+            .fail_next_step
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(LimboError::InternalError("io_uring_enter failed".into()));
+        }
+        turso_core::IO::step(&self.io)
+    }
+}
+
+#[test]
+fn wal_get_frame_does_not_write_into_buffer_after_it_returns_error() {
+    let io = Arc::new(StepFailsOnce {
+        io: crate::queued_io::QueuedIo::new(),
+        fail_next_step: false.into(),
+    });
+    let db =
+        turso_core::Database::open_file(io.clone(), "repro.db", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    let mut frame = [0u8; 24 + 4096];
+    io.fail_next_step
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(conn.wal_get_frame(1, &mut frame).is_err());
+    io.io.step_one().unwrap();
+    assert!(
+        frame.iter().all(|&byte| byte == 0),
+        "the read wrote into the buffer after wal_get_frame returned"
+    );
 }

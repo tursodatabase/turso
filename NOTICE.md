@@ -64,6 +64,12 @@ This project depends on windows-sys, distributed by the Microsoft:
 * License: licenses/core/windows-mit-license.md (MIT License)
 * Homepage: https://github.com/microsoft/windows-rs
 
+The sdk-kit build script depends on find-msvc-tools, distributed by the rust-lang project:
+
+* License: licenses/sdk-kit/find-msvc-tools-apache-license.md (Apache License v2.0)
+* License: licenses/sdk-kit/find-msvc-tools-mit-license.md (MIT License)
+* Homepage: https://github.com/rust-lang/cc-rs
+
 This project depends on SQLAlchemy, distributed by the SQLAlchemy authors:
 
 * License: licenses/bindings/python/sqlalchemy-mit-license.md (MIT License)
@@ -83,3 +89,13 @@ The PostgreSQL frontend depends on Chumsky, distributed by the Chumsky authors:
 
 * License: licenses/chumsky-mit-license.md (MIT License)
 * Homepage: https://codeberg.org/zesterer/chumsky
+
+The PostgreSQL dump fuzzer uses Hegel, distributed by Antithesis, LLC:
+
+* License: licenses/testing/hegeltest-mit-license.md (MIT License)
+* Homepage: https://github.com/hegeldev/hegel-rust
+
+The PostgreSQL dump fuzzer uses comfy-table, distributed by its authors:
+
+* License: licenses/testing/comfy-table-mit-license.md (MIT License)
+* Homepage: https://github.com/nukesor/comfy-table

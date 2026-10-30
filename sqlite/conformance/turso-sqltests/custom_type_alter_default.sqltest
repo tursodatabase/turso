@@ -123,3 +123,213 @@ test alter-column-custom-type-parameter-change-runs-encode {
 expect error {
     value too long for varchar
 }
+
+@requires strict "uses STRICT tables"
+test alter-column-to-different-array-element-type-converts-each-element {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER[]) STRICT;
+    INSERT INTO t VALUES (1, '{5}'), (2, '{1,-2,3}'), (3, '{}');
+    ALTER TABLE t ALTER COLUMN a TO a2 smallint[];
+    SELECT id, a2 FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|{5}
+    2|{1,-2,3}
+    3|{}
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-to-different-array-element-type-checks-each-element {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER[]) STRICT;
+    INSERT INTO t VALUES (1, '{5,40000}');
+    ALTER TABLE t ALTER COLUMN a TO a2 smallint[];
+}
+expect error {
+    integer out of range for smallint
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-old-row-index-and-update-use-encoded-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    SELECT id, x, c FROM t;
+    CREATE INDEX ic ON t(c);
+    SELECT count(*) FROM t WHERE c = 5;
+    UPDATE t SET x = 11;
+    SELECT id, x, c FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|10|5
+    1
+    1|11|5
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-old-row-upsert-uses-encoded-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, y INT) STRICT;
+    INSERT INTO t VALUES (1, 10, 1);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    INSERT INTO t VALUES (1, 20, 2, 7) ON CONFLICT(id) DO UPDATE SET x = excluded.x;
+    SELECT id, x, c FROM t;
+}
+expect {
+    1|20|5
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-old-row-drop-column-uses-encoded-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, y INT) STRICT;
+    INSERT INTO t VALUES (1, 10, 1);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    ALTER TABLE t DROP COLUMN y;
+    SELECT id, x, c FROM t;
+}
+expect {
+    1|10|5
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-old-row-alter-column-uses-encoded-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    ALTER TABLE t ALTER COLUMN c TO c2 INTEGER;
+    SELECT id, x, c2 FROM t;
+}
+expect {
+    1|10|5
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test alter-add-default-old-row-trigger-and-returning-use-encoded-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    CREATE TABLE log(old_c, new_c);
+    CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (old.c, new.c); END;
+    UPDATE t SET x = 11 RETURNING c;
+    SELECT * FROM log;
+}
+expect {
+    5
+    5|5
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-old-row-index-delete {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    CREATE INDEX ic ON t(c);
+    DELETE FROM t WHERE id = 1;
+    SELECT count(*) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    0
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-old-row-order-by-uses-encoded-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    INSERT INTO t VALUES (2, 20, 3);
+    SELECT id, c FROM t ORDER BY c;
+}
+expect {
+    2|3
+    1|5
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-old-row-domain-over-encoded-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN d AS cents;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c d DEFAULT 5;
+    SELECT id, x, c FROM t;
+    UPDATE t SET x = 11;
+    SELECT id, x, c FROM t;
+}
+expect {
+    1|10|5
+    1|11|5
+}
+
+@requires strict "uses STRICT tables"
+@skip-if mvcc "CDC not supported in MVCC mode"
+test alter-add-default-old-row-cdc-before-image-uses-encoded-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    PRAGMA capture_data_changes_conn('full');
+    DELETE FROM t;
+    SELECT bin_record_json_object(table_columns_json_array('t'), before) FROM turso_cdc WHERE change_type = -1;
+}
+expect {
+    {"id":1,"x":10,"c":500}
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-old-row-join-uses-encoded-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    CREATE TABLE u(id INTEGER PRIMARY KEY, x INT, c cents) STRICT;
+    INSERT INTO u VALUES (1, 10, 5);
+    SELECT t.c, u.c FROM t JOIN u ON t.x = u.x;
+    SELECT u.id FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.c = u.c);
+}
+expect {
+    5|5
+    1
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-old-row-integrity-check-uses-encoded-default {
+    CREATE TYPE b BASE blob ENCODE CAST(value AS BLOB) DECODE CAST(value AS TEXT);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c b DEFAULT 'a';
+    SELECT id, x, c FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|10|a
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-default-left-join-unmatched-row-is-null {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT) STRICT;
+    INSERT INTO t VALUES (1, 10);
+    ALTER TABLE t ADD COLUMN c cents DEFAULT 5;
+    CREATE TABLE u(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO u VALUES (1), (2);
+    SELECT u.id, t.c, t.c IS NULL FROM u LEFT JOIN t ON t.id = u.id ORDER BY u.id;
+    SELECT u.id, t.c FROM u LEFT JOIN t ON t.id = u.id ORDER BY t.c;
+}
+expect {
+    1|5|0
+    2||1
+    2|
+    1|5
+}

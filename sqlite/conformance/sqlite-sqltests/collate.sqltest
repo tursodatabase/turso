@@ -528,6 +528,20 @@ expect {
     1
 }
 
+# The first SELECT decides the collation even when its column has none: a
+# later SELECT's NOCASE column does not make the outer comparison NOCASE.
+test collate_union_all_first_branch_without_collation_is_binary {
+    CREATE TABLE u3(b TEXT COLLATE NOCASE);
+    INSERT INTO u3 VALUES ('A'), ('b');
+    SELECT 'eq', x FROM (SELECT 'A' x UNION ALL SELECT b FROM u3) WHERE x = 'a';
+    SELECT 'order', x FROM (SELECT 'a' x UNION ALL SELECT b FROM u3) ORDER BY x;
+}
+expect {
+    order|A
+    order|a
+    order|b
+}
+
 # --- CASE expression: NOCASE column in WHEN clause after hash join ---
 @cross-check-integrity
 test collate_case_when_nocase_after_join {
@@ -1429,6 +1443,99 @@ expect {
     a|b|c|Z
 }
 
+# ORDER BY uses a column collation only when the term is that column, possibly
+# behind unary +, CAST, or parentheses. An explicit COLLATE anywhere in the
+# term still wins. Any other expression, including `x || ''`, sorts as BINARY.
+
+test collate_orderby_concat_nocase_is_binary {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT x FROM t ORDER BY x || '';
+}
+expect {
+    A
+    B
+    a
+    b
+}
+
+test collate_orderby_concat_rtrim_is_binary {
+    CREATE TABLE r(x TEXT COLLATE RTRIM);
+    INSERT INTO r VALUES ('a '), ('a');
+    SELECT group_concat(quote(x)) FROM (SELECT x FROM r ORDER BY x || '');
+}
+expect {
+    'a','a '
+}
+
+test collate_orderby_function_is_binary {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT x FROM t ORDER BY substr(x, 1);
+}
+expect {
+    A
+    B
+    a
+    b
+}
+
+test collate_orderby_unary_plus_keeps_column_collation {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT x FROM t ORDER BY +x;
+}
+expect {
+    a
+    A
+    B
+    b
+}
+
+test collate_orderby_cast_keeps_column_collation {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT x FROM t ORDER BY CAST(x AS TEXT);
+}
+expect {
+    a
+    A
+    B
+    b
+}
+
+test collate_orderby_explicit_collate_in_concat {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT
+        (SELECT group_concat(x, '|') FROM (SELECT x FROM t ORDER BY (x COLLATE NOCASE) || '')),
+        (SELECT group_concat(x, '|') FROM (SELECT x FROM t ORDER BY x || '' COLLATE NOCASE));
+}
+expect {
+    a|A|B|b|a|A|B|b
+}
+
+test collate_orderby_concat_alias_and_ordinal {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT
+        (SELECT group_concat(y, '|') FROM (SELECT x || '' AS y FROM t ORDER BY y)),
+        (SELECT group_concat(c, '|') FROM (SELECT x || '' AS c FROM t ORDER BY 1));
+}
+expect {
+    A|B|a|b|A|B|a|b
+}
+
+test collate_orderby_concat_limit_is_binary {
+    CREATE TABLE t(x TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B'), ('a'), ('b'), ('A');
+    SELECT x FROM t ORDER BY x || '' LIMIT 2;
+}
+expect {
+    A
+    B
+}
+
 # =============================================================================
 # COLLATION PROPAGATION THROUGH CONCAT (||)
 # =============================================================================
@@ -1567,4 +1674,690 @@ test nocase-index-does-not-serve-binary-comparison {
     ORDER BY n.id;
 }
 expect {
+}
+
+# Same rule for `IN (SELECT ...)`: the LHS column supplies the comparison
+# collation, even when it has no declared collation (BINARY). (#6088)
+@setup mixed_collation_join
+test in-select-uses-left-column-collation {
+    SELECT b.v FROM binary_side b WHERE b.k IN (SELECT k FROM nocase_side) ORDER BY b.v;
+}
+expect {
+}
+
+# Flipped: the NOCASE column is the LHS now, so the comparison is NOCASE.
+@setup mixed_collation_join
+test in-select-uses-left-column-collation-flipped {
+    SELECT n.id FROM nocase_side n WHERE n.k IN (SELECT k FROM binary_side) ORDER BY n.id;
+}
+expect {
+    1
+    2
+}
+
+# A correlated `IN (SELECT ...)` must follow the same rule.
+setup correlated_in_mixed_collation {
+    CREATE TABLE o(k INTEGER, v TEXT);
+    CREATE TABLE i(k INTEGER, x TEXT COLLATE NOCASE);
+    INSERT INTO o VALUES (1,'a');
+    INSERT INTO i VALUES (1,'A');
+}
+
+@setup correlated_in_mixed_collation
+test correlated-in-select-uses-left-column-collation {
+    SELECT count(*) FROM o WHERE v IN (SELECT x FROM i WHERE i.k = o.k);
+}
+expect {
+    0
+}
+
+# A plain IN-list follows the same precedence rule as `=` and `IN (SELECT ...)`.
+setup in_list_mixed_collation {
+    CREATE TABLE t(plain_key TEXT, nocase_key TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('a', 'A');
+}
+
+@setup in_list_mixed_collation
+test in-list-uses-left-column-collation {
+    SELECT count(*) FROM t WHERE plain_key IN (nocase_key);
+}
+expect {
+    0
+}
+
+# Flipped: the NOCASE column is the LHS now, so the comparison is NOCASE.
+@setup in_list_mixed_collation
+test in-list-uses-left-column-collation-flipped {
+    SELECT count(*) FROM t WHERE nocase_key IN (plain_key);
+}
+expect {
+    1
+}
+
+# The exact repro from #6088: a plain BINARY left column must not inherit the
+# NOCASE collation of the right-hand subquery's source column.
+@setup in_list_mixed_collation
+test in-select-same-table-uses-left-column-collation {
+    SELECT count(*) FROM t WHERE plain_key IN (SELECT nocase_key FROM t);
+}
+expect {
+    0
+}
+
+# Row-valued (tuple) comparisons follow the same per-component precedence rule.
+@setup in_list_mixed_collation
+test row-valued-comparison-uses-left-column-collation {
+    SELECT count(*) FROM t WHERE (plain_key, 1) = (nocase_key, 1);
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test group_concat_column_uses_binary_collation {
+    CREATE TABLE t(value TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('abc'), ('ABC'), ('Abc'), ('abc');
+    SELECT count(*) FROM t GROUP BY value ORDER BY 1;
+    SELECT count(*) FROM t GROUP BY (value || '') ORDER BY 1;
+    SELECT count(*) FROM t GROUP BY (value || '') COLLATE NOCASE ORDER BY 1;
+}
+expect {
+    4
+    1
+    1
+    2
+    4
+}
+
+@cross-check-integrity
+test order_concat_column_uses_binary_collation {
+    CREATE TABLE t(id INTEGER, value TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES (1, 'abc  '), (2, 'abc'), (3, 'abc '), (4, 'ABC');
+    SELECT id FROM t ORDER BY value, id;
+    SELECT id FROM t ORDER BY (value || ''), id;
+    SELECT id FROM t ORDER BY (value || ''), id LIMIT 4;
+    SELECT id FROM t ORDER BY value COLLATE NOCASE, id;
+}
+expect {
+    4
+    1
+    2
+    3
+    4
+    2
+    3
+    1
+    4
+    2
+    3
+    1
+    2
+    4
+    3
+    1
+}
+
+test compound-chain-leftmost-collation {
+    CREATE TABLE compound_collate_left(n TEXT COLLATE NOCASE, p TEXT);
+    CREATE TABLE compound_collate_right(n TEXT);
+    INSERT INTO compound_collate_left VALUES ('a', 'z'), ('A', 'A');
+    INSERT INTO compound_collate_right VALUES ('a');
+    SELECT count(*) FROM (
+        SELECT n FROM compound_collate_left
+        EXCEPT SELECT p FROM compound_collate_left
+        INTERSECT SELECT n FROM compound_collate_right
+    );
+}
+expect {
+    0
+}
+
+# A comparison uses one collation, decided from its operands, whatever the
+# way of comparing: operators, IN, BETWEEN, CASE, nullif, min/max, sorting,
+# grouping, compound selects, joins, windows and row values; and the same
+# rows come back with and without an index.
+
+test collate-nocase-every-comparison-form-with-and-without-index {
+    -- Every query runs before and after the index exists, so the rows are listed twice.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES (1, 'abc'), (2, 'ABC'), (3, 'b'), (4, 'xyz'), (5, NULL), (6, 'Abc');
+    SELECT 'eq', id FROM t WHERE a = 'abc' ORDER BY id;
+    SELECT 'lt', id FROM t WHERE a < 'B' ORDER BY id;
+    SELECT 'in', id FROM t WHERE a IN ('abc', 'xyz') ORDER BY id;
+    SELECT 'not-in', id FROM t WHERE a NOT IN ('abc', 'xyz') ORDER BY id;
+    SELECT 'between', id FROM t WHERE a BETWEEN 'abc' AND 'B' ORDER BY id;
+    SELECT 'is', id FROM t WHERE a IS 'abc' ORDER BY id;
+    SELECT 'is-not', id FROM t WHERE a IS NOT 'abc' ORDER BY id;
+    SELECT 'case', id FROM t WHERE CASE a WHEN 'abc' THEN 1 ELSE 0 END ORDER BY id;
+    SELECT 'nullif', id FROM t WHERE nullif(a, 'abc') IS NULL ORDER BY id;
+    SELECT 'scalar-min-max', id, min(a, 'b'), max(a, 'b') FROM t ORDER BY id;
+    SELECT 'agg-min-max', min(a), max(a) FROM t;
+    SELECT 'order', group_concat(id) FROM (SELECT id FROM t ORDER BY a, id);
+    SELECT 'group-by', count(*) FROM (SELECT a FROM t GROUP BY a);
+    SELECT 'distinct', count(*) FROM (SELECT DISTINCT a FROM t);
+    SELECT 'union', count(*) FROM (SELECT a FROM t UNION SELECT a FROM t);
+    SELECT 'intersect', count(*) FROM (SELECT a FROM t INTERSECT SELECT 'ABC');
+    SELECT 'except', count(*) FROM (SELECT a FROM t EXCEPT SELECT 'ABC');
+    SELECT 'in-select', id FROM t WHERE a IN (SELECT 'ABC') ORDER BY id;
+    SELECT 'join', x.id, y.id FROM t x JOIN t y ON x.a = y.a WHERE x.id < y.id ORDER BY 2, 3;
+    SELECT 'window', id, count(*) OVER (PARTITION BY a) FROM t ORDER BY id;
+    SELECT 'row-value', id FROM t WHERE (a, 1) = ('abc', 1) ORDER BY id;
+    SELECT 'row-value-lt', id FROM t WHERE (a, id) < ('abc', 3) ORDER BY id;
+    CREATE INDEX t_a ON t(a);
+    SELECT 'eq', id FROM t WHERE a = 'abc' ORDER BY id;
+    SELECT 'lt', id FROM t WHERE a < 'B' ORDER BY id;
+    SELECT 'in', id FROM t WHERE a IN ('abc', 'xyz') ORDER BY id;
+    SELECT 'not-in', id FROM t WHERE a NOT IN ('abc', 'xyz') ORDER BY id;
+    SELECT 'between', id FROM t WHERE a BETWEEN 'abc' AND 'B' ORDER BY id;
+    SELECT 'is', id FROM t WHERE a IS 'abc' ORDER BY id;
+    SELECT 'is-not', id FROM t WHERE a IS NOT 'abc' ORDER BY id;
+    SELECT 'case', id FROM t WHERE CASE a WHEN 'abc' THEN 1 ELSE 0 END ORDER BY id;
+    SELECT 'nullif', id FROM t WHERE nullif(a, 'abc') IS NULL ORDER BY id;
+    SELECT 'scalar-min-max', id, min(a, 'b'), max(a, 'b') FROM t ORDER BY id;
+    SELECT 'agg-min-max', min(a), max(a) FROM t;
+    SELECT 'order', group_concat(id) FROM (SELECT id FROM t ORDER BY a, id);
+    SELECT 'group-by', count(*) FROM (SELECT a FROM t GROUP BY a);
+    SELECT 'distinct', count(*) FROM (SELECT DISTINCT a FROM t);
+    SELECT 'union', count(*) FROM (SELECT a FROM t UNION SELECT a FROM t);
+    SELECT 'intersect', count(*) FROM (SELECT a FROM t INTERSECT SELECT 'ABC');
+    SELECT 'except', count(*) FROM (SELECT a FROM t EXCEPT SELECT 'ABC');
+    SELECT 'in-select', id FROM t WHERE a IN (SELECT 'ABC') ORDER BY id;
+    SELECT 'join', x.id, y.id FROM t x JOIN t y ON x.a = y.a WHERE x.id < y.id ORDER BY 2, 3;
+    SELECT 'window', id, count(*) OVER (PARTITION BY a) FROM t ORDER BY id;
+    SELECT 'row-value', id FROM t WHERE (a, 1) = ('abc', 1) ORDER BY id;
+    SELECT 'row-value-lt', id FROM t WHERE (a, id) < ('abc', 3) ORDER BY id;
+}
+expect {
+    eq|1
+    eq|2
+    eq|6
+    lt|1
+    lt|2
+    lt|6
+    in|1
+    in|2
+    in|4
+    in|6
+    not-in|3
+    between|1
+    between|2
+    between|3
+    between|6
+    is|1
+    is|2
+    is|6
+    is-not|3
+    is-not|4
+    is-not|5
+    case|1
+    case|2
+    case|6
+    nullif|1
+    nullif|2
+    nullif|5
+    nullif|6
+    scalar-min-max|1|abc|b
+    scalar-min-max|2|ABC|b
+    scalar-min-max|3|b|b
+    scalar-min-max|4|b|xyz
+    scalar-min-max|5||
+    scalar-min-max|6|Abc|b
+    agg-min-max|abc|xyz
+    order|5,1,2,6,3,4
+    group-by|4
+    distinct|4
+    union|4
+    intersect|1
+    except|3
+    in-select|1
+    in-select|2
+    in-select|6
+    join|1|2
+    join|1|6
+    join|2|6
+    window|1|3
+    window|2|3
+    window|3|1
+    window|4|1
+    window|5|1
+    window|6|3
+    row-value|1
+    row-value|2
+    row-value|6
+    row-value-lt|1
+    row-value-lt|2
+    eq|1
+    eq|2
+    eq|6
+    lt|1
+    lt|2
+    lt|6
+    in|1
+    in|2
+    in|4
+    in|6
+    not-in|3
+    between|1
+    between|2
+    between|3
+    between|6
+    is|1
+    is|2
+    is|6
+    is-not|3
+    is-not|4
+    is-not|5
+    case|1
+    case|2
+    case|6
+    nullif|1
+    nullif|2
+    nullif|5
+    nullif|6
+    scalar-min-max|1|abc|b
+    scalar-min-max|2|ABC|b
+    scalar-min-max|3|b|b
+    scalar-min-max|4|b|xyz
+    scalar-min-max|5||
+    scalar-min-max|6|Abc|b
+    agg-min-max|abc|xyz
+    order|5,1,2,6,3,4
+    group-by|4
+    distinct|4
+    union|4
+    intersect|1
+    except|3
+    in-select|1
+    in-select|2
+    in-select|6
+    join|1|2
+    join|1|6
+    join|2|6
+    window|1|3
+    window|2|3
+    window|3|1
+    window|4|1
+    window|5|1
+    window|6|3
+    row-value|1
+    row-value|2
+    row-value|6
+    row-value-lt|1
+    row-value-lt|2
+}
+
+test collate-rtrim-every-comparison-form-with-and-without-index {
+    -- Every query runs before and after the index exists, so the rows are listed twice.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES (1, 'abc'), (2, 'abc  '), (3, 'b'), (4, 'xyz'), (5, NULL), (6, 'abc ');
+    SELECT 'eq', id FROM t WHERE a = 'abc' ORDER BY id;
+    SELECT 'lt', id FROM t WHERE a < 'b' ORDER BY id;
+    SELECT 'in', id FROM t WHERE a IN ('abc', 'xyz') ORDER BY id;
+    SELECT 'not-in', id FROM t WHERE a NOT IN ('abc', 'xyz') ORDER BY id;
+    SELECT 'between', id FROM t WHERE a BETWEEN 'abc' AND 'b' ORDER BY id;
+    SELECT 'is', id FROM t WHERE a IS 'abc' ORDER BY id;
+    SELECT 'is-not', id FROM t WHERE a IS NOT 'abc' ORDER BY id;
+    SELECT 'case', id FROM t WHERE CASE a WHEN 'abc' THEN 1 ELSE 0 END ORDER BY id;
+    SELECT 'nullif', id FROM t WHERE nullif(a, 'abc') IS NULL ORDER BY id;
+    SELECT 'scalar-min-max', id, min(a, 'b'), max(a, 'b') FROM t ORDER BY id;
+    SELECT 'agg-min-max', min(a), max(a) FROM t;
+    SELECT 'order', group_concat(id) FROM (SELECT id FROM t ORDER BY a, id);
+    SELECT 'group-by', count(*) FROM (SELECT a FROM t GROUP BY a);
+    SELECT 'distinct', count(*) FROM (SELECT DISTINCT a FROM t);
+    SELECT 'union', count(*) FROM (SELECT a FROM t UNION SELECT a FROM t);
+    SELECT 'intersect', count(*) FROM (SELECT a FROM t INTERSECT SELECT 'abc ');
+    SELECT 'except', count(*) FROM (SELECT a FROM t EXCEPT SELECT 'abc ');
+    SELECT 'in-select', id FROM t WHERE a IN (SELECT 'abc ') ORDER BY id;
+    SELECT 'join', x.id, y.id FROM t x JOIN t y ON x.a = y.a WHERE x.id < y.id ORDER BY 2, 3;
+    SELECT 'window', id, count(*) OVER (PARTITION BY a) FROM t ORDER BY id;
+    SELECT 'row-value', id FROM t WHERE (a, 1) = ('abc', 1) ORDER BY id;
+    SELECT 'row-value-lt', id FROM t WHERE (a, id) < ('abc', 3) ORDER BY id;
+    CREATE INDEX t_a ON t(a);
+    SELECT 'eq', id FROM t WHERE a = 'abc' ORDER BY id;
+    SELECT 'lt', id FROM t WHERE a < 'b' ORDER BY id;
+    SELECT 'in', id FROM t WHERE a IN ('abc', 'xyz') ORDER BY id;
+    SELECT 'not-in', id FROM t WHERE a NOT IN ('abc', 'xyz') ORDER BY id;
+    SELECT 'between', id FROM t WHERE a BETWEEN 'abc' AND 'b' ORDER BY id;
+    SELECT 'is', id FROM t WHERE a IS 'abc' ORDER BY id;
+    SELECT 'is-not', id FROM t WHERE a IS NOT 'abc' ORDER BY id;
+    SELECT 'case', id FROM t WHERE CASE a WHEN 'abc' THEN 1 ELSE 0 END ORDER BY id;
+    SELECT 'nullif', id FROM t WHERE nullif(a, 'abc') IS NULL ORDER BY id;
+    SELECT 'scalar-min-max', id, min(a, 'b'), max(a, 'b') FROM t ORDER BY id;
+    SELECT 'agg-min-max', min(a), max(a) FROM t;
+    SELECT 'order', group_concat(id) FROM (SELECT id FROM t ORDER BY a, id);
+    SELECT 'group-by', count(*) FROM (SELECT a FROM t GROUP BY a);
+    SELECT 'distinct', count(*) FROM (SELECT DISTINCT a FROM t);
+    SELECT 'union', count(*) FROM (SELECT a FROM t UNION SELECT a FROM t);
+    SELECT 'intersect', count(*) FROM (SELECT a FROM t INTERSECT SELECT 'abc ');
+    SELECT 'except', count(*) FROM (SELECT a FROM t EXCEPT SELECT 'abc ');
+    SELECT 'in-select', id FROM t WHERE a IN (SELECT 'abc ') ORDER BY id;
+    SELECT 'join', x.id, y.id FROM t x JOIN t y ON x.a = y.a WHERE x.id < y.id ORDER BY 2, 3;
+    SELECT 'window', id, count(*) OVER (PARTITION BY a) FROM t ORDER BY id;
+    SELECT 'row-value', id FROM t WHERE (a, 1) = ('abc', 1) ORDER BY id;
+    SELECT 'row-value-lt', id FROM t WHERE (a, id) < ('abc', 3) ORDER BY id;
+}
+expect {
+    eq|1
+    eq|2
+    eq|6
+    lt|1
+    lt|2
+    lt|6
+    in|1
+    in|2
+    in|4
+    in|6
+    not-in|3
+    between|1
+    between|2
+    between|3
+    between|6
+    is|1
+    is|2
+    is|6
+    is-not|3
+    is-not|4
+    is-not|5
+    case|1
+    case|2
+    case|6
+    nullif|1
+    nullif|2
+    nullif|5
+    nullif|6
+    scalar-min-max|1|abc|b
+    scalar-min-max|2|abc  |b
+    scalar-min-max|3|b|b
+    scalar-min-max|4|b|xyz
+    scalar-min-max|5||
+    scalar-min-max|6|abc |b
+    agg-min-max|abc|xyz
+    order|5,1,2,6,3,4
+    group-by|4
+    distinct|4
+    union|4
+    intersect|1
+    except|3
+    in-select|1
+    in-select|2
+    in-select|6
+    join|1|2
+    join|1|6
+    join|2|6
+    window|1|3
+    window|2|3
+    window|3|1
+    window|4|1
+    window|5|1
+    window|6|3
+    row-value|1
+    row-value|2
+    row-value|6
+    row-value-lt|1
+    row-value-lt|2
+    eq|1
+    eq|2
+    eq|6
+    lt|1
+    lt|2
+    lt|6
+    in|1
+    in|2
+    in|4
+    in|6
+    not-in|3
+    between|1
+    between|2
+    between|3
+    between|6
+    is|1
+    is|2
+    is|6
+    is-not|3
+    is-not|4
+    is-not|5
+    case|1
+    case|2
+    case|6
+    nullif|1
+    nullif|2
+    nullif|5
+    nullif|6
+    scalar-min-max|1|abc|b
+    scalar-min-max|2|abc  |b
+    scalar-min-max|3|b|b
+    scalar-min-max|4|b|xyz
+    scalar-min-max|5||
+    scalar-min-max|6|abc |b
+    agg-min-max|abc|xyz
+    order|5,1,2,6,3,4
+    group-by|4
+    distinct|4
+    union|4
+    intersect|1
+    except|3
+    in-select|1
+    in-select|2
+    in-select|6
+    join|1|2
+    join|1|6
+    join|2|6
+    window|1|3
+    window|2|3
+    window|3|1
+    window|4|1
+    window|5|1
+    window|6|3
+    row-value|1
+    row-value|2
+    row-value|6
+    row-value-lt|1
+    row-value-lt|2
+}
+
+test collate-of-function-results {
+    -- min, max and nullif compare with their arguments' collation. The results
+    -- of coalesce, || and a scalar subquery have no collation, so comparing them
+    -- uses BINARY even when an argument is a NOCASE column; CAST and unary + keep
+    -- the column's collation, and so does a comparison inside iif.
+    CREATE TABLE t(a TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('B');
+    SELECT min(a, 'a'), max(a, 'c'), min('a', a), max('c' COLLATE NOCASE, 'B') FROM t;
+    SELECT nullif(a, 'b') IS NULL, nullif('A' COLLATE NOCASE, 'a') IS NULL FROM t;
+    SELECT coalesce(a, 'x') = 'b', a || '' = 'b', iif(a = 'b', 1, 0), CAST(a AS TEXT) = 'b', +a = 'b', (SELECT a) = 'b' FROM t;
+}
+expect {
+    a|c|a|c
+    1|1
+    0|0|1|1|1|0
+}
+
+# An index can serve a comparison only when the index column's own collation is
+# the comparison's collation. This holds for expression indexes and for an
+# index that declares a collation its table column does not have.
+test collate-index-seek-uses-comparison-collation {
+    CREATE TABLE t(a TEXT);
+    CREATE INDEX t_expr ON t(a || '');
+    INSERT INTO t VALUES ('abc'), ('xyz');
+    SELECT 'expr-eq', a FROM t WHERE a || '' = 'ABC' COLLATE NOCASE;
+    SELECT 'expr-gt', a FROM t WHERE a || '' > 'ABC' COLLATE NOCASE;
+    SELECT 'expr-in', a FROM t WHERE a || '' COLLATE NOCASE IN ('ABC');
+    SELECT 'expr-binary-eq', a FROM t WHERE a || '' = 'abc';
+    CREATE TABLE u(a TEXT);
+    CREATE INDEX u_nocase ON u(a COLLATE NOCASE);
+    INSERT INTO u VALUES ('abc'), ('ABC'), ('x');
+    SELECT 'nocase-index-eq', a FROM u WHERE a = 'Abc' COLLATE NOCASE ORDER BY a;
+    SELECT 'nocase-index-binary-eq', a FROM u WHERE a = 'Abc' ORDER BY a;
+    SELECT 'nocase-index-in', a FROM u WHERE a COLLATE NOCASE IN ('Abc') ORDER BY a;
+    SELECT 'nocase-index-binary-in', a FROM u WHERE a IN ('Abc', 'abc') ORDER BY a;
+}
+expect {
+    expr-eq|abc
+    expr-gt|xyz
+    expr-in|abc
+    expr-binary-eq|abc
+    nocase-index-eq|ABC
+    nocase-index-eq|abc
+    nocase-index-in|ABC
+    nocase-index-in|abc
+    nocase-index-binary-in|abc
+}
+
+# NEW.x and OLD.x in a trigger compare with the collation of column x.
+test collate-trigger-new-and-old-use-column-collation {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT);
+    CREATE TABLE log(k, v1, v2, v3, v4);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN NEW.a = 'ABC' BEGIN
+        INSERT INTO log VALUES ('ins', NEW.a = 'ABC', NEW.a IN ('ABC'), min(NEW.a, 'B'), NEW.b = 'X');
+    END;
+    CREATE TRIGGER tu AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('upd', OLD.a = 'ABC', OLD.a IN ('ABC', 'Q'), max(OLD.a, 'B'), NEW.a < 'B');
+    END;
+    CREATE TRIGGER td BEFORE DELETE ON t WHEN OLD.a BETWEEN 'A' AND 'B' BEGIN
+        INSERT INTO log VALUES ('del', CASE OLD.a WHEN 'ABC' THEN 1 ELSE 0 END, nullif(OLD.a, 'ABC') IS NULL, 0, 0);
+    END;
+    INSERT INTO t VALUES ('abc', 'x');
+    UPDATE t SET b = 'y';
+    DELETE FROM t;
+    SELECT * FROM log;
+}
+expect {
+    ins|1|1|abc|0
+    upd|1|1|B|1
+    del|1|1|0|0
+}
+
+# A foreign key finds the child rows of a parent row with the collation of the
+# parent key column.
+@cross-check-integrity
+test collate-fk-delete-parent-with-nocase-key-restricts {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k));
+    INSERT INTO p VALUES ('abc');
+    INSERT INTO c VALUES (1, 'ABC');
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test collate-fk-update-parent-with-nocase-key-restricts {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k));
+    INSERT INTO p VALUES ('abc');
+    INSERT INTO c VALUES (1, 'ABC');
+    UPDATE p SET k = 'new';
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test collate-fk-deferred-delete-parent-with-nocase-key-fails-at-commit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES ('abc');
+    INSERT INTO c VALUES (1, 'ABC');
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# A BINARY index on the child key cannot find the child rows of a NOCASE
+# parent key, so the check must not use it.
+@cross-check-integrity
+test collate-fk-delete-parent-ignores-child-index-with-other-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k));
+    CREATE INDEX c_r ON c(r);
+    INSERT INTO p VALUES ('abc');
+    INSERT INTO c VALUES (1, 'ABC');
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+# Only a UNIQUE index with the parent column's collation can be the parent key.
+@cross-check-integrity
+test collate-fk-parent-index-with-other-collation-is-a-mismatch {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT);
+    CREATE UNIQUE INDEX p_k ON p(k COLLATE NOCASE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k));
+    INSERT INTO p VALUES ('abc');
+    INSERT INTO c VALUES (1, 'ABC');
+}
+expect error {
+    foreign key mismatch
+}
+
+@cross-check-integrity
+test collate-fk-cascade-and-set-null-with-nocase-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE cascade_delete(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k) ON DELETE CASCADE);
+    CREATE TABLE set_null(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k) ON DELETE SET NULL);
+    CREATE TABLE cascade_update(id INTEGER PRIMARY KEY, r TEXT REFERENCES p(k) ON UPDATE CASCADE ON DELETE CASCADE);
+    INSERT INTO p VALUES ('abc'), ('zzz');
+    INSERT INTO cascade_delete VALUES (1, 'ABC'), (2, 'zzz');
+    INSERT INTO set_null VALUES (1, 'ABC'), (2, 'zzz');
+    INSERT INTO cascade_update VALUES (1, 'ABC'), (2, 'zzz');
+    -- Changing the parent key only in letter case keeps it equal under NOCASE,
+    -- so ON UPDATE CASCADE leaves the child alone.
+    UPDATE p SET k = 'Zzz' WHERE k = 'zzz';
+    SELECT 'after-update', * FROM cascade_update ORDER BY id;
+    DELETE FROM p WHERE k = 'abc';
+    SELECT 'cascade-delete', * FROM cascade_delete ORDER BY id;
+    SELECT 'set-null', * FROM set_null ORDER BY id;
+    SELECT 'cascade-update', * FROM cascade_update ORDER BY id;
+}
+expect {
+    after-update|1|ABC
+    after-update|2|zzz
+    cascade-delete|2|zzz
+    set-null|1|
+    set-null|2|zzz
+    cascade-update|2|zzz
+}
+
+# A compound SELECT removes duplicates with its own collation, also when it is
+# the right side of IN and IN compares with another collation.
+test collate-compound-select-inside-in-removes-duplicates-with-its-own-collation {
+    CREATE TABLE t(a TEXT);
+    INSERT INTO t VALUES ('abc'), ('ABC'), ('x');
+    CREATE TABLE n(a TEXT COLLATE NOCASE);
+    INSERT INTO n VALUES ('abc');
+    SELECT 'except', 'abc' COLLATE NOCASE IN (SELECT 'abc' EXCEPT SELECT 'ABC');
+    SELECT 'union-except', a FROM t WHERE a COLLATE NOCASE IN (SELECT 'ABC' UNION SELECT 'abc' EXCEPT SELECT 'abc') ORDER BY a;
+    SELECT 'intersect', a FROM t WHERE a COLLATE NOCASE IN (SELECT 'ABC' INTERSECT SELECT 'abc') ORDER BY a;
+    SELECT 'nocase-compound', a FROM t WHERE a IN (SELECT a FROM n EXCEPT SELECT 'ABC') ORDER BY a;
+}
+expect {
+    except|1
+    union-except|ABC
+    union-except|abc
+}
+
+# Every temporary index of a compound uses the collations of the whole
+# compound, so the INTERSECT inside compares with the NOCASE of the last arm.
+test collate-nested-compound-arms-use-the-whole-compound-collation {
+    SELECT 'i', * FROM (SELECT 'a' INTERSECT SELECT 'A' UNION SELECT 'b' COLLATE NOCASE);
+    SELECT 'e', * FROM (SELECT 'a' EXCEPT SELECT 'A' UNION SELECT 'b' COLLATE NOCASE);
+    SELECT 'u', * FROM (SELECT 'a' UNION SELECT 'A' UNION SELECT 'b' COLLATE NOCASE);
+    SELECT 'ui', * FROM (SELECT 'a' UNION SELECT 'A' INTERSECT SELECT 'a' COLLATE NOCASE);
+}
+expect {
+    i|a
+    i|b
+    e|b
+    u|A
+    u|b
+    ui|A
 }

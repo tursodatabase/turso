@@ -40,9 +40,7 @@ use std::io::Write;
 use tantivy::{index::SegmentId, schema::Schema, Index, IndexMeta, IndexSettings};
 
 use super::directory::FileBytes;
-#[cfg(not(nightly))]
-use crate::alloc::TursoVecInExt;
-use crate::alloc::{DynAllocator, DynVec, TursoFromIterator};
+use crate::alloc::{DynAllocator, DynVec, TursoFromIterator, TursoVecInExt};
 use crate::sync::Arc;
 use crate::{LimboError, Result};
 
@@ -557,7 +555,9 @@ pub(super) fn synthesize_meta_json(
         opstamp: 0,
         payload: None,
     };
-    let mut bytes = FallibleBytesWriter(DynVec::new_in(allocator.clone()));
+    let mut bytes = FallibleBytesWriter(<DynVec<u8> as TursoVecInExt<u8, DynAllocator>>::new_in(
+        allocator.clone(),
+    ));
     bytes.write_json(&meta, "FTS meta synthesis failed")?;
     Ok(bytes.0)
 }

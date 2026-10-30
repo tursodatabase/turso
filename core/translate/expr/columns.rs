@@ -71,15 +71,92 @@ pub(super) fn do_emit_table_column(
 ) -> Result<()> {
     match column.generated_type() {
         GeneratedType::Virtual { expr, .. } => {
+            let end_column_emission = match self_table_context {
+                SelfTableContext::ForSelect { .. } => {
+                    let end = program.allocate_label();
+                    program.emit_insn(Insn::IfNullRow {
+                        cursor_id,
+                        target_pc: end,
+                        dest: target_register,
+                    });
+                    Some(end)
+                }
+                SelfTableContext::ForDML { .. } => None,
+            };
             resolver.with_self_table_context(program, Some(self_table_context), |program, _| {
-                translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                if end_column_emission.is_some() {
+                    translate_expr_no_constant_opt(
+                        program,
+                        referenced_tables,
+                        expr,
+                        target_register,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                } else {
+                    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                }
                 Ok(())
             })?;
             program.emit_column_affinity(target_register, column.affinity());
+            if let Some(end) = end_column_emission {
+                program.preassign_label_to_next_insn(end);
+            }
         }
         _ => {
-            program.emit_column_or_rowid(cursor_id, column_index, target_register);
+            emit_stored_column(program, cursor_id, column_index, target_register, resolver)?;
+            maybe_apply_affinity(column.ty(), target_register, program);
         }
     }
+    Ok(())
+}
+
+pub fn emit_stored_column(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let table = program.btree_table_from_cursor(cursor_id).map(Arc::clone);
+    let encoded_default = table.as_ref().and_then(|table| {
+        let column = &table.columns()[column_index];
+        let default_expr = column.default.as_ref()?;
+        let resolved = resolver
+            .schema()
+            .resolve_type(&column.ty_str, table.is_strict)
+            .ok()??;
+        resolved
+            .chain
+            .iter()
+            .any(|td| td.has_encode_or_coerce())
+            .then_some((table, column, default_expr))
+    });
+    let Some((table, column, default_expr)) = encoded_default else {
+        program.emit_column_or_rowid(cursor_id, column_index, target_register);
+        return Ok(());
+    };
+    program.flags.set_suppress_column_default(true);
+    program.emit_column_or_rowid(cursor_id, column_index, target_register);
+    let has_field_label = program.allocate_label();
+    program.emit_column_has_field(cursor_id, column_index, has_field_label);
+    translate_expr_no_constant_opt(
+        program,
+        None,
+        default_expr,
+        target_register,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    )?;
+    emit_custom_type_encode_columns(
+        program,
+        resolver,
+        std::slice::from_ref(column),
+        target_register,
+        None,
+        &table.name,
+        &ColumnLayout::Identity { column_count: 1 },
+    )?;
+    program.preassign_label_to_next_insn(has_field_label);
     Ok(())
 }

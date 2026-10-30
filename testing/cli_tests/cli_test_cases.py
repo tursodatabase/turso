@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -396,6 +397,11 @@ def test_parse_error():
         lambda res: "Parse error: " in res,
         "Try to LIMIT using an identifier should trigger a Parse error",
     )
+    turso.run_test_fn(
+        "SELECT group_concat('a', 'b', 'c');",
+        lambda res: res == "× Parse error: wrong number of arguments to function group_concat()",
+        "Wrong argument count for group_concat prints only the error",
+    )
     turso.quit()
 
 
@@ -543,6 +549,30 @@ def test_blob_bytes_are_printed_raw_in_list_mode():
     )
 
 
+def test_exit_checkpoints_wal_into_db_file():
+    exec_name = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
+    db_path = "testing/system/exit.db"
+    copy_path = "testing/system/exit_copy.db"
+    for name, args, open_command, exit_command in [
+        ("exit-with-path-arg", [db_path], "", ".exit"),
+        ("exit-after-open", [], f".open {db_path}\n", ".exit"),
+        ("exit-0-with-path-arg", [db_path], "", ".exit 0"),
+    ]:
+        console.test(f"Running test: {name}")
+        for path in [db_path, db_path + "-wal", copy_path]:
+            if os.path.exists(path):
+                os.remove(path)
+        script = f"{open_command}CREATE TABLE t31(a,b);\nINSERT INTO t31 VALUES(1,4),(2,3);\n{exit_command}\n"
+        result = subprocess.run([exec_name, *args], input=script.encode(), capture_output=True, check=False, timeout=60)
+        assert result.returncode == 0, result.stderr
+        shutil.copyfile(db_path, copy_path)
+        result = subprocess.run(["sqlite3", copy_path, "SELECT count(*) FROM t31;"], capture_output=True, check=False)
+        assert result.stdout == b"2\n", f"database file without its WAL must hold the data; got {result!r}"
+        for path in [db_path, db_path + "-wal", copy_path]:
+            if os.path.exists(path):
+                os.remove(path)
+
+
 def main():
     console.info("Running all turso CLI tests...")
     test_read_command()
@@ -572,6 +602,7 @@ def main():
     test_tables_with_attached_db()
     test_dbtotxt()
     test_blob_bytes_are_printed_raw_in_list_mode()
+    test_exit_checkpoints_wal_into_db_file()
     console.info("All tests have passed")
 
 

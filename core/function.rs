@@ -7,6 +7,7 @@ use turso_ext::{
     ValueDestructor,
 };
 
+use crate::translate::collate::{CollationSeq, TextCollation};
 use crate::LimboError;
 
 pub type ContextCollationFunction = unsafe extern "C" fn(
@@ -26,7 +27,11 @@ pub struct ExternalFunc {
     pub func: ExtFunc,
 }
 
+/// A collation that an application registered on a connection: a callback
+/// that orders two texts.
 pub struct ExternalCollation {
+    /// The collation that calls this callback.
+    pub collation: TextCollation,
     pub name: String,
     pub context: usize,
     pub callback: ContextCollationFunction,
@@ -39,18 +44,33 @@ impl ExternalCollation {
         context: usize,
         callback: ContextCollationFunction,
         context_destructor: Option<ContextDestructor>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        TextCollation::new_custom(|collation| Self {
+            collation,
             name,
             context,
             callback,
             context_destructor,
-        }
+        })
+    }
+
+    pub fn compare(&self, left: &str, right: &str) -> std::cmp::Ordering {
+        let result = unsafe {
+            (self.callback)(
+                self.context,
+                left.as_ptr(),
+                left.len(),
+                right.as_ptr(),
+                right.len(),
+            )
+        };
+        result.cmp(&0)
     }
 }
 
 impl Drop for ExternalCollation {
     fn drop(&mut self) {
+        self.collation.remove_custom();
         if let Some(destructor) = self.context_destructor {
             unsafe { destructor(self.context) };
         }
@@ -588,8 +608,8 @@ impl WindowFunc {
     ///
     /// This is taken from SQLite's `sqlite3WindowUpdate` table at `window.c:699-708`.
     pub fn coerced_frame(&self) -> Option<crate::translate::plan::Frame> {
-        use crate::translate::plan::{Frame, FrameBoundary};
-        use turso_parser::ast::{Expr, FrameMode, Literal};
+        use crate::translate::plan::Frame;
+        use turso_parser::ast::{Expr, FrameBound, FrameMode, Literal};
         match self {
             // Lag shares row_number's streaming frame even though its lookup
             // can point forward (negative offset): SQLite emits a row as soon
@@ -598,40 +618,40 @@ impl WindowFunc {
             // using the same frame rather than caching the whole partition.
             Self::RowNumber | Self::Lag => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::CurrentRow,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
                 exclude: None,
             }),
             Self::Rank | Self::DenseRank => Some(Frame {
                 mode: FrameMode::Range,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::CurrentRow,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
                 exclude: None,
             }),
             Self::PercentRank => Some(Frame {
                 mode: FrameMode::Groups,
-                start: FrameBoundary::CurrentRow,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::CurrentRow,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::CumeDist => Some(Frame {
                 mode: FrameMode::Groups,
-                start: FrameBoundary::Following(Box::new(Expr::Literal(Literal::Numeric(
+                start: FrameBound::Following(Box::new(Expr::Literal(Literal::Numeric(
                     "1".to_string(),
                 )))),
-                end: FrameBoundary::UnboundedFollowing,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::Ntile => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::CurrentRow,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::CurrentRow,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::Lead => Some(Frame {
                 mode: FrameMode::Rows,
-                start: FrameBoundary::UnboundedPreceding,
-                end: FrameBoundary::UnboundedFollowing,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::UnboundedFollowing,
                 exclude: None,
             }),
             Self::FirstValue | Self::LastValue | Self::NthValue => None,
@@ -702,6 +722,21 @@ pub enum AccumulatorFunc {
 }
 
 impl AccumulatorFunc {
+    /// Whether the aggregate compares its argument values, and so uses the
+    /// collation of its AggStep.
+    pub fn compares_values(&self) -> bool {
+        matches!(
+            self,
+            Self::Agg(
+                AggFunc::Min
+                    | AggFunc::Max
+                    | AggFunc::Mode
+                    | AggFunc::PercentileCont
+                    | AggFunc::PercentileDisc
+            )
+        )
+    }
+
     /// Extract the inner `AggFunc` when this kind is known to be an
     /// aggregate. `unreachable!`s on `Window(...)` — the only opcodes
     /// that carry an `AccumulatorFunc` are the AggStep / AggValue /
@@ -911,12 +946,6 @@ pub enum ScalarFunc {
     // Test type functions (for custom type system testing)
     TestUintEncode,
     TestUintDecode,
-    TestUintAdd,
-    TestUintSub,
-    TestUintMul,
-    TestUintDiv,
-    TestUintLt,
-    TestUintEq,
     /// Test-only: returns a monotonically increasing 64-bit integer on every
     /// evaluation. Used to verify that the planner does not deduplicate
     /// equivalent SQL calls that contain nondeterministic functions.
@@ -935,16 +964,18 @@ pub enum ScalarFunc {
     ValidateIpAddr,
     // Numeric type functions
     NumericEncode,
+    NumericFit,
     NumericDecode,
     NumericAdd,
     NumericSub,
     NumericMul,
     NumericDiv,
-    NumericLt,
-    NumericEq,
+    NumericMod,
+    NumericNeg,
     // Date type functions
     DatePlus,
     DateMinus,
+    DateDiff,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,
     ArrayElement,
@@ -1047,15 +1078,9 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::ConnTxnId => false, // depends on connection state
             ScalarFunc::IsAutocommit => false, // depends on connection state
             ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
-            ScalarFunc::TestUintEncode
-            | ScalarFunc::TestUintDecode
-            | ScalarFunc::TestUintAdd
-            | ScalarFunc::TestUintSub
-            | ScalarFunc::TestUintMul
-            | ScalarFunc::TestUintDiv
-            | ScalarFunc::TestUintLt
-            | ScalarFunc::TestUintEq
-            | ScalarFunc::StringReverse => true,
+            ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode | ScalarFunc::StringReverse => {
+                true
+            }
             ScalarFunc::Gcd
             | ScalarFunc::Lcm
             | ScalarFunc::Repeat
@@ -1067,15 +1092,17 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
             | ScalarFunc::NumericEncode
+            | ScalarFunc::NumericFit
             | ScalarFunc::NumericDecode
             | ScalarFunc::NumericAdd
             | ScalarFunc::NumericSub
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
-            | ScalarFunc::NumericLt
-            | ScalarFunc::NumericEq
+            | ScalarFunc::NumericMod
+            | ScalarFunc::NumericNeg
             | ScalarFunc::DatePlus
-            | ScalarFunc::DateMinus => true,
+            | ScalarFunc::DateMinus
+            | ScalarFunc::DateDiff => true,
             ScalarFunc::Array
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
@@ -1120,6 +1147,19 @@ impl ScalarFunc {
                 | Self::ArrayRemove
                 | Self::ArraySlice
                 | Self::StringToArray
+        )
+    }
+
+    pub fn is_date_time_function(&self) -> bool {
+        matches!(
+            self,
+            Self::Date
+                | Self::Time
+                | Self::DateTime
+                | Self::JulianDay
+                | Self::UnixEpoch
+                | Self::StrfTime
+                | Self::TimeDiff
         )
     }
 }
@@ -1199,12 +1239,6 @@ impl Display for ScalarFunc {
             Self::SequenceWatermark => "sequence_watermark_experimental",
             Self::TestUintEncode => "test_uint_encode",
             Self::TestUintDecode => "test_uint_decode",
-            Self::TestUintAdd => "test_uint_add",
-            Self::TestUintSub => "test_uint_sub",
-            Self::TestUintMul => "test_uint_mul",
-            Self::TestUintDiv => "test_uint_div",
-            Self::TestUintLt => "test_uint_lt",
-            Self::TestUintEq => "test_uint_eq",
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
             Self::StringReverse => "string_reverse",
@@ -1217,15 +1251,17 @@ impl Display for ScalarFunc {
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
             Self::NumericEncode => "numeric_encode",
+            Self::NumericFit => "numeric_fit",
             Self::NumericDecode => "numeric_decode",
             Self::NumericAdd => "numeric_add",
             Self::NumericSub => "numeric_sub",
             Self::NumericMul => "numeric_mul",
             Self::NumericDiv => "numeric_div",
-            Self::NumericLt => "numeric_lt",
-            Self::NumericEq => "numeric_eq",
+            Self::NumericMod => "numeric_mod",
+            Self::NumericNeg => "numeric_neg",
             Self::DatePlus => "date_plus",
             Self::DateMinus => "date_minus",
+            Self::DateDiff => "date_diff",
             Self::Array => "array",
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
@@ -1355,28 +1391,24 @@ impl ScalarFunc {
             // SQL-standard string and math extensions
             Self::Gcd | Self::Lcm | Self::Repeat => &[2],
             Self::Lpad | Self::Rpad => &[2, 3],
-            // Test functions for custom types (1-arg encode/decode, 2-arg operators)
+            // Test functions for custom types
             Self::TestUintEncode | Self::TestUintDecode | Self::StringReverse => &[1],
-            Self::TestUintAdd
-            | Self::TestUintSub
-            | Self::TestUintMul
-            | Self::TestUintDiv
-            | Self::TestUintLt
-            | Self::TestUintEq => &[2],
             // Built-in type functions
             Self::BooleanToInt
             | Self::IntToBoolean
             | Self::ValidateIpAddr
-            | Self::NumericDecode => &[1],
+            | Self::NumericEncode
+            | Self::NumericDecode
+            | Self::NumericNeg => &[1],
             Self::NumericAdd
             | Self::NumericSub
             | Self::NumericMul
             | Self::NumericDiv
-            | Self::NumericLt
-            | Self::NumericEq
+            | Self::NumericMod
             | Self::DatePlus
-            | Self::DateMinus => &[2],
-            Self::NumericEncode => &[3],
+            | Self::DateMinus
+            | Self::DateDiff => &[2],
+            Self::NumericFit => &[3],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],
@@ -1604,6 +1636,9 @@ impl Display for Func {
 pub struct FuncCtx {
     pub func: Func,
     pub arg_count: usize,
+    /// The collation the function compares its arguments with when
+    /// [Func::needs_collation] is true. BINARY for the other functions.
+    pub collation: CollationSeq,
 }
 
 impl Deterministic for Func {
@@ -1629,6 +1664,16 @@ impl Deterministic for Func {
 }
 
 impl Func {
+    /// Whether the function compares its arguments, and so needs the
+    /// collation of its first argument that has one. SQLite marks these
+    /// functions `SQLITE_FUNC_NEEDCOLL`.
+    pub fn needs_collation(&self) -> bool {
+        matches!(
+            self,
+            Self::Scalar(ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif)
+        )
+    }
+
     pub fn supports_star_syntax(&self) -> bool {
         // Functions that need star expansion also support star syntax
         if self.needs_star_expansion() {

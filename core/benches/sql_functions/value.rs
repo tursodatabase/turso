@@ -1,5 +1,6 @@
 use divan::{black_box, Bencher};
 use turso_core::types::Value;
+use turso_core::vdbe::CollationSeq;
 
 // =============================================================================
 // String Case Functions
@@ -834,7 +835,7 @@ fn min_integers(bencher: Bencher) {
         Value::from_i64(1),
         Value::from_i64(9),
     ];
-    bencher.bench_local(|| black_box(Value::exec_min(black_box(values.iter()))));
+    bencher.bench_local(|| black_box(Value::exec_min(black_box(values.iter()), binary)));
 }
 
 #[cfg(feature = "nanosecond-bench")]
@@ -847,7 +848,7 @@ fn max_integers(bencher: Bencher) {
         Value::from_i64(1),
         Value::from_i64(9),
     ];
-    bencher.bench_local(|| black_box(Value::exec_max(black_box(values.iter()))));
+    bencher.bench_local(|| black_box(Value::exec_max(black_box(values.iter()), binary)));
 }
 
 #[turso_macros::divan_bench]
@@ -857,7 +858,7 @@ fn min_strings(bencher: Bencher) {
         Value::build_text("apple"),
         Value::build_text("cherry"),
     ];
-    bencher.bench_local(|| black_box(Value::exec_min(black_box(values.iter()))));
+    bencher.bench_local(|| black_box(Value::exec_min(black_box(values.iter()), binary)));
 }
 
 #[turso_macros::divan_bench]
@@ -867,7 +868,7 @@ fn max_strings(bencher: Bencher) {
         Value::build_text("apple"),
         Value::build_text("cherry"),
     ];
-    bencher.bench_local(|| black_box(Value::exec_max(black_box(values.iter()))));
+    bencher.bench_local(|| black_box(Value::exec_max(black_box(values.iter()), binary)));
 }
 
 // =============================================================================
@@ -879,7 +880,7 @@ fn max_strings(bencher: Bencher) {
 fn nullif_equal(bencher: Bencher) {
     let a = Value::from_i64(42);
     let b = Value::from_i64(42);
-    bencher.bench_local(|| black_box(black_box(&a).exec_nullif(black_box(&b))));
+    bencher.bench_local(|| black_box(black_box(&a).exec_nullif(black_box(&b), binary)));
 }
 
 #[cfg(feature = "nanosecond-bench")]
@@ -887,7 +888,7 @@ fn nullif_equal(bencher: Bencher) {
 fn nullif_not_equal(bencher: Bencher) {
     let a = Value::from_i64(42);
     let b = Value::from_i64(100);
-    bencher.bench_local(|| black_box(black_box(&a).exec_nullif(black_box(&b))));
+    bencher.bench_local(|| black_box(black_box(&a).exec_nullif(black_box(&b), binary)));
 }
 
 #[cfg(feature = "nanosecond-bench")]
@@ -895,7 +896,7 @@ fn nullif_not_equal(bencher: Bencher) {
 fn nullif_strings(bencher: Bencher) {
     let a = Value::build_text("hello");
     let b = Value::build_text("hello");
-    bencher.bench_local(|| black_box(black_box(&a).exec_nullif(black_box(&b))));
+    bencher.bench_local(|| black_box(black_box(&a).exec_nullif(black_box(&b), binary)));
 }
 
 // =============================================================================
@@ -1049,4 +1050,8 @@ fn exec_randomblob_large(bencher: Bencher) {
                 .unwrap(),
         )
     });
+}
+
+fn binary(a: &Value, b: &Value) -> turso_core::Result<std::cmp::Ordering> {
+    Ok(CollationSeq::BINARY.compare(a.as_ref(), b.as_ref()))
 }

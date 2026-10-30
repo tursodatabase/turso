@@ -1,14 +1,18 @@
 use crate::alloc::TursoSliceExt;
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
+use crate::namespace::NamespaceRef;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
-use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TranslateCtx};
+use crate::translate::expr::expr_type::{type_of, ExprType};
 use crate::translate::expr::{
+    custom_operator_call, emit_operator_call_on_registers,
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
     walk_expr, walk_expr_mut, NoConstantOptReason, WalkControl,
 };
+use crate::translate::expr_context::ExprContext;
 use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
@@ -29,9 +33,10 @@ use crate::Result;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
-use turso_parser::ast::{Expr, Literal, Over, SortOrder, TableInternalId};
+use turso_parser::ast::{Expr, FrameBound, Literal, Over, SortOrder, TableInternalId};
 
 const SUBQUERY_DATABASE_ID: usize = 0;
+const SUBQUERY_NAMESPACE: NamespaceRef = NamespaceRef::root_of(SUBQUERY_DATABASE_ID);
 
 struct WindowSubqueryContext<'a> {
     resolver: &'a Resolver<'a>,
@@ -240,7 +245,6 @@ fn prepare_window_subquery(
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
-        phantom_params: vec![],
     };
 
     prepare_window_subquery(
@@ -257,14 +261,15 @@ fn prepare_window_subquery(
         inner_plan,
         None,
         subquery_id,
+        resolver,
     )?;
 
     // Verify that the subquery has the expected database ID.
     // This is required to ensure that assumptions in `rewrite_terminal_expr` are valid.
     turso_assert_eq!(
-        subquery.database_id,
-        SUBQUERY_DATABASE_ID,
-        "subquery database id must be SUBQUERY_DATABASE_ID",
+        subquery.namespace,
+        SUBQUERY_NAMESPACE,
+        "subquery namespace must be SUBQUERY_NAMESPACE",
         {"SUBQUERY_DATABASE_ID": SUBQUERY_DATABASE_ID}
     );
 
@@ -618,11 +623,9 @@ fn allocate_window_minmax(
     program: &mut ProgramBuilder,
     window: &Window,
     table_references: &TableReferences,
+    resolver: &Resolver,
 ) -> Result<Vec<Option<WindowMinMax>>> {
-    let moving_start = !matches!(
-        window.frame.start,
-        crate::translate::plan::FrameBoundary::UnboundedPreceding
-    );
+    let moving_start = !matches!(window.frame.start, FrameBound::UnboundedPreceding);
     let mut states = Vec::with_capacity(window.functions.len());
 
     for (i, func) in window.functions.iter().enumerate() {
@@ -643,7 +646,7 @@ fn allocate_window_minmax(
         let arg = args
             .first()
             .expect("min/max window calls must have one argument");
-        let collation = get_collseq_from_expr(arg, table_references)?;
+        let collation = ExprContext::new(Some(table_references), resolver).expr_collation(arg)?;
         let index = Arc::new(Index {
             name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
             table_name: String::new(),
@@ -659,10 +662,11 @@ fn allocate_window_minmax(
                     nulls_order: None,
                     pos_in_table: 0,
                     collation,
+                    explicit_collation: None,
                     default: None,
                     expr: None,
                 },
-                IndexColumn::new("1", 1),
+                IndexColumn::new("1", 1, CollationSeq::BINARY),
             ],
             unique: false,
             ephemeral: true,
@@ -670,6 +674,7 @@ fn allocate_window_minmax(
             where_clause: None,
             index_method: None,
             on_conflict: None,
+            constraint_name: None,
         });
         let cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index));
         let registers = program.alloc_registers(3);
@@ -918,12 +923,14 @@ pub struct WindowCursors {
 fn build_order_by_key_info(
     window: &Window,
     table_references: &crate::translate::plan::TableReferences,
+    resolver: &Resolver,
 ) -> crate::Result<Vec<KeyInfo>> {
     window
         .order_by
         .iter()
         .map(|(expr, _, _)| {
-            let collation = get_collseq_from_expr(expr, table_references)?.unwrap_or_default();
+            let collation =
+                ExprContext::new(Some(table_references), resolver).expr_collation(expr)?;
             Ok(KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation,
@@ -1038,7 +1045,7 @@ fn emit_window_check_offset(
             flags: crate::vdbe::insn::CmpInsFlags::default()
                 .jump_if_null()
                 .with_affinity(crate::vdbe::affinity::Affinity::Numeric),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
     } else {
         // A ROWS / GROUPS offset has to be an integer. MustBeInt converts
@@ -1060,7 +1067,7 @@ fn emit_window_check_offset(
         target_pc: label_ok,
         flags: crate::vdbe::insn::CmpInsFlags::default()
             .with_affinity(crate::vdbe::affinity::Affinity::Numeric),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
     program.preassign_label_to_next_insn(label_halt);
     let msg = match (mode, pos) {
@@ -1074,6 +1081,7 @@ fn emit_window_check_offset(
         (_, FrameBoundPosition::End) => "frame ending offset must be a non-negative integer",
     };
     program.emit_insn(Insn::Halt {
+        constraint_info: None,
         err_code: crate::error::SQLITE_ERROR,
         description: msg.to_string(),
         on_error: None,
@@ -1144,10 +1152,7 @@ impl EmitWindow {
         // frame start can move off the first row of the partition (ntile,
         // percent_rank, cume_dist); AggInverse reads from this cursor as
         // rows drop off the start of the frame.
-        let has_moving_start = !matches!(
-            window.frame.start,
-            crate::translate::plan::FrameBoundary::UnboundedPreceding
-        );
+        let has_moving_start = !matches!(window.frame.start, FrameBound::UnboundedPreceding);
         let cursor_csr_start = if has_moving_start {
             Some(program.alloc_cursor_id(CursorType::BTreeTable(buffer_table.clone())))
         } else {
@@ -1224,7 +1229,8 @@ impl EmitWindow {
                 new_cursor_id: csr_app,
             });
         }
-        let minmax = allocate_window_minmax(program, window, &plan.table_references)?;
+        let minmax =
+            allocate_window_minmax(program, window, &plan.table_references, &t_ctx.resolver)?;
 
         // Window function processing is similar to aggregation processing in how results are mapped
         // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
@@ -1240,7 +1246,6 @@ impl EmitWindow {
                 std::borrow::Cow::Borrowed(func.current_expr()),
                 reg_acc_result_start + i,
                 false,
-                None,
             );
         }
 
@@ -1255,12 +1260,11 @@ impl EmitWindow {
         )?;
         let reg_col_start = program.alloc_registers(expressions_referencing_subquery.len());
         for (i, (expr, _)) in expressions_referencing_subquery.iter().enumerate() {
-            t_ctx.resolver.cache_scalar_expr_reg(
+            t_ctx.resolver.cache_expr_reg(
                 std::borrow::Cow::Borrowed(expr),
                 reg_col_start + i,
                 false,
-                &plan.table_references,
-            )?;
+            );
         }
 
         t_ctx.meta_window = Some(WindowMetadata {
@@ -1311,15 +1315,13 @@ impl EmitWindow {
                     ])
                 },
                 start_offset_reg: match window.frame.start {
-                    crate::translate::plan::FrameBoundary::Preceding(_)
-                    | crate::translate::plan::FrameBoundary::Following(_) => {
+                    FrameBound::Preceding(_) | FrameBound::Following(_) => {
                         Some(program.alloc_register())
                     }
                     _ => None,
                 },
                 end_offset_reg: match window.frame.end {
-                    crate::translate::plan::FrameBoundary::Preceding(_)
-                    | crate::translate::plan::FrameBoundary::Following(_) => {
+                    FrameBound::Preceding(_) | FrameBound::Following(_) => {
                         Some(program.alloc_register())
                     }
                     _ => None,
@@ -1404,7 +1406,14 @@ impl EmitWindow {
         let minmax = meta.minmax.clone();
 
         emit_load_order_by_columns(program, window, &registers);
-        emit_flush_buffer_if_new_partition(program, &labels, &registers, window, plan)?;
+        emit_flush_buffer_if_new_partition(
+            program,
+            &labels,
+            &registers,
+            window,
+            plan,
+            &t_ctx.resolver,
+        )?;
 
         // `rowid_reg` was NULL'd at partition entry; it stays NULL until the
         // first Insert of this partition. That tells the two branches apart:
@@ -1480,8 +1489,7 @@ impl EmitWindow {
         // partition on. Mirrors SQLite's `regStart` init at `window.c:2942`.
         if let Some(start_offset_reg) = registers.start_offset_reg {
             let offset_expr = match &window.frame.start {
-                crate::translate::plan::FrameBoundary::Preceding(expr)
-                | crate::translate::plan::FrameBoundary::Following(expr) => expr,
+                FrameBound::Preceding(expr) | FrameBound::Following(expr) => expr,
                 _ => unreachable!(
                     "start_offset_reg is only allocated when frame.start is Preceding/Following"
                 ),
@@ -1498,8 +1506,7 @@ impl EmitWindow {
         }
         if let Some(end_offset_reg) = registers.end_offset_reg {
             let offset_expr = match &window.frame.end {
-                crate::translate::plan::FrameBoundary::Preceding(expr)
-                | crate::translate::plan::FrameBoundary::Following(expr) => expr,
+                FrameBound::Preceding(expr) | FrameBound::Following(expr) => expr,
                 _ => unreachable!(
                     "end_offset_reg is only allocated when frame.end is Preceding/Following"
                 ),
@@ -1537,13 +1544,8 @@ impl EmitWindow {
         let same_kind_bounded = window.frame.mode != turso_parser::ast::FrameMode::Range
             && matches!(
                 (&window.frame.start, &window.frame.end),
-                (
-                    crate::translate::plan::FrameBoundary::Preceding(_),
-                    crate::translate::plan::FrameBoundary::Preceding(_)
-                ) | (
-                    crate::translate::plan::FrameBoundary::Following(_),
-                    crate::translate::plan::FrameBoundary::Following(_)
-                )
+                (FrameBound::Preceding(_), FrameBound::Preceding(_))
+                    | (FrameBound::Following(_), FrameBound::Following(_))
             );
         if same_kind_bounded {
             let start_offset_reg = registers
@@ -1557,16 +1559,13 @@ impl EmitWindow {
             // FOLLOWING pair: valid iff end >= start. PRECEDING pair:
             // valid iff end <= start. Mirrors the Ge/Le pick at
             // window.c:2951.
-            if matches!(
-                window.frame.start,
-                crate::translate::plan::FrameBoundary::Following(_)
-            ) {
+            if matches!(window.frame.start, FrameBound::Following(_)) {
                 program.emit_insn(Insn::Ge {
                     lhs: end_offset_reg,
                     rhs: start_offset_reg,
                     target_pc: label_frame_valid,
                     flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::for_internal_values(),
                 });
             } else {
                 program.emit_insn(Insn::Le {
@@ -1574,7 +1573,7 @@ impl EmitWindow {
                     rhs: start_offset_reg,
                     target_pc: label_frame_valid,
                     flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
             if window.frame.exclude.is_none() {
@@ -1607,10 +1606,8 @@ impl EmitWindow {
         // rather than lag emitting the result (RETURN_ROW) by M. So the
         // start count is set to the difference of the two offsets
         // (window.c:2962-2965).
-        if matches!(
-            window.frame.start,
-            crate::translate::plan::FrameBoundary::Following(_)
-        ) && window.frame.mode != turso_parser::ast::FrameMode::Range
+        if matches!(window.frame.start, FrameBound::Following(_))
+            && window.frame.mode != turso_parser::ast::FrameMode::Range
         {
             if let (Some(start_offset_reg), Some(end_offset_reg)) =
                 (registers.start_offset_reg, registers.end_offset_reg)
@@ -1679,16 +1676,16 @@ impl EmitWindow {
                 registers.new_order_by_columns_start,
                 registers.source_peer_values,
                 label_step_end,
+                &t_ctx.resolver,
             )?;
         }
 
         // Pick the order to run the three operations in, based on the
         // frame's bounds — one of SQLite's three `sqlite3WindowCodeStep`
         // cases (window.c:2987-3037).
-        use crate::translate::plan::FrameBoundary;
         let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
-        let end_is_unbounded = matches!(window.frame.end, FrameBoundary::UnboundedFollowing);
-        if matches!(window.frame.start, FrameBoundary::Following(_)) {
+        let end_is_unbounded = matches!(window.frame.end, FrameBound::UnboundedFollowing);
+        if matches!(window.frame.start, FrameBound::Following(_)) {
             // Pattern A — the frame starts after the current row (`<expr>
             // FOLLOWING` start), e.g. `ROWS BETWEEN 1 FOLLOWING AND 3
             // FOLLOWING` (window.c:2987-3002). Every row is added to the
@@ -1710,8 +1707,10 @@ impl EmitWindow {
                         registers
                             .end_offset_reg
                             .expect("bounded RANGE end has an offset register"),
+                        FrameBoundPosition::End,
                         cursors.csr_end,
                         label_done,
+                        &t_ctx.resolver,
                     )?;
                     emit_window_op(
                         program,
@@ -1748,7 +1747,7 @@ impl EmitWindow {
                     )?;
                 }
             }
-        } else if matches!(window.frame.end, FrameBoundary::Preceding(_)) {
+        } else if matches!(window.frame.end, FrameBound::Preceding(_)) {
             // Pattern B — the frame ends before the current row (`<expr>
             // PRECEDING` end), e.g. `ROWS BETWEEN UNBOUNDED PRECEDING AND
             // 2 PRECEDING` (window.c:3004-3009). A row's result can be
@@ -1771,7 +1770,7 @@ impl EmitWindow {
             // end cursor when the two offsets differ. SQLite's `bRPS` at
             // window.c:3005.
             let inverse_before_return =
-                is_range && matches!(window.frame.start, FrameBoundary::Preceding(_));
+                is_range && matches!(window.frame.start, FrameBound::Preceding(_));
             if inverse_before_return {
                 emit_window_op(
                     program,
@@ -1812,8 +1811,10 @@ impl EmitWindow {
                         RangeCmp::Ge,
                         cursors.csr_current,
                         registers.end_offset_reg.expect("checked above"),
+                        FrameBoundPosition::End,
                         cursors.csr_end,
                         label_done,
+                        &t_ctx.resolver,
                     )?;
                 }
                 // A `<expr> FOLLOWING` end delays both producing the
@@ -1883,6 +1884,7 @@ fn emit_if_new_peer(
     reg_new: Option<usize>,
     reg_old: Option<usize>,
     target_if_peer: BranchOffset,
+    resolver: &Resolver,
 ) -> Result<()> {
     let order_by_len = window.order_by.len();
     if order_by_len == 0 {
@@ -1902,7 +1904,7 @@ fn emit_if_new_peer(
         start_reg_a: reg_a,
         start_reg_b: reg_b,
         count: order_by_len,
-        key_info: build_order_by_key_info(window, table_references)?,
+        key_info: build_order_by_key_info(window, table_references, resolver)?,
     });
     program.emit_insn(Insn::Jump {
         target_pc_lt: label_new_peer,
@@ -1977,6 +1979,7 @@ fn emit_flush_buffer_if_new_partition(
     registers: &WindowRegisters,
     window: &Window,
     plan: &SelectPlan,
+    resolver: &Resolver,
 ) -> Result<()> {
     if let Some(reg_partition_start) = registers.partition_start {
         let same_partition_label = program.allocate_label();
@@ -1992,30 +1995,25 @@ fn emit_flush_buffer_if_new_partition(
             program.offset(),
             "compare partition keys to detect new partition",
         );
-        let mut compare_key_info = (0..partition_by_len)
-            .map(|_| KeyInfo {
-                sort_order: SortOrder::Asc,
-                collation: CollationSeq::default(),
-                nulls_order: None,
+        let compare_key_info = (0..partition_by_len)
+            .map(|i| {
+                // After rewriting, partition_by entries are Expr::Column references to the
+                // subquery. Duplicates reference the same column index, so we find the entry
+                // that references column i (the i-th unique partition column) to get the
+                // correct collation.
+                let expr = window
+                    .partition_by
+                    .iter()
+                    .find(|e| matches!(e, Expr::Column { column, .. } if *column == i))
+                    .expect("every deduplicated partition column has a PARTITION BY entry");
+                Ok(KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: ExprContext::new(Some(&plan.table_references), resolver)
+                        .expr_collation(expr)?,
+                    nulls_order: None,
+                })
             })
-            .collect::<Vec<_>>();
-        for (i, c) in compare_key_info
-            .iter_mut()
-            .enumerate()
-            .take(partition_by_len)
-        {
-            // After rewriting, partition_by entries are Expr::Column references to the
-            // subquery. Duplicates reference the same column index, so we find the entry
-            // that references column i (the i-th unique partition column) to get the
-            // correct collation.
-            let expr = window
-                .partition_by
-                .iter()
-                .find(|e| matches!(e, Expr::Column { column, .. } if *column == i))
-                .unwrap_or(&window.partition_by[i]);
-            let maybe_collation = get_collseq_from_expr(expr, &plan.table_references)?;
-            c.collation = maybe_collation.unwrap_or_default();
-        }
+            .collect::<Result<Vec<_>>>()?;
         program.emit_insn(Insn::Compare {
             start_reg_a: registers.src_columns_start,
             start_reg_b: reg_partition_start,
@@ -2143,23 +2141,22 @@ enum WindowOp {
 ///   first_value / nth_value: only rows that have already left the frame
 ///   are deleted, and those functions only ever look up rows still in it.
 fn window_delete_op(window: &Window) -> Option<WindowOp> {
-    use crate::translate::plan::FrameBoundary;
     let is_range = window.frame.mode == turso_parser::ast::FrameMode::Range;
     match &window.frame.start {
-        FrameBoundary::Following(expr) => {
+        FrameBound::Following(expr) => {
             (!is_range && window_expr_gt_zero(expr)).then_some(WindowOp::ReturnRow)
         }
-        FrameBoundary::UnboundedPreceding => {
+        FrameBound::UnboundedPreceding => {
             if window_cache_frame(window) {
                 None
-            } else if let FrameBoundary::Preceding(expr) = &window.frame.end {
+            } else if let FrameBound::Preceding(expr) = &window.frame.end {
                 (!is_range && window_expr_gt_zero(expr)).then_some(WindowOp::AggStep)
             } else {
                 Some(WindowOp::ReturnRow)
             }
         }
-        FrameBoundary::CurrentRow | FrameBoundary::Preceding(_) => Some(WindowOp::AggInverse),
-        FrameBoundary::UnboundedFollowing => {
+        FrameBound::CurrentRow | FrameBound::Preceding(_) => Some(WindowOp::AggInverse),
+        FrameBound::UnboundedFollowing => {
             unreachable!("UNBOUNDED FOLLOWING can never be a frame start")
         }
     }
@@ -2372,7 +2369,7 @@ fn emit_window_full_scan(
         rhs: frame_end_rowid,
         target_pc: label_break,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: None,
+        collation: CollationSeq::for_internal_values(),
     });
 
     match exclude {
@@ -2383,7 +2380,7 @@ fn emit_window_full_scan(
                 rhs: scan_rowid,
                 target_pc: label_next,
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
         }
         turso_parser::ast::FrameExclude::Group | turso_parser::ast::FrameExclude::Ties => {
@@ -2393,7 +2390,7 @@ fn emit_window_full_scan(
                     rhs: scan_rowid,
                     target_pc: label_step,
                     flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
             if order_by_len == 0 {
@@ -2421,7 +2418,11 @@ fn emit_window_full_scan(
                     start_reg_a: reg_a,
                     start_reg_b: reg_b,
                     count: order_by_len,
-                    key_info: build_order_by_key_info(window, &plan.table_references)?,
+                    key_info: build_order_by_key_info(
+                        window,
+                        &plan.table_references,
+                        &t_ctx.resolver,
+                    )?,
                 });
                 program.emit_insn(Insn::Jump {
                     target_pc_lt: label_step,
@@ -2467,7 +2468,7 @@ fn emit_range_cmp(
     rhs: usize,
     target_pc: BranchOffset,
     flags: crate::vdbe::insn::CmpInsFlags,
-    collation: Option<CollationSeq>,
+    collation: CollationSeq,
 ) {
     let insn = match op {
         RangeCmp::Lt => Insn::Lt {
@@ -2510,14 +2511,17 @@ fn emit_range_cmp(
 /// Descending order subtracts the offset and flips `op` instead.
 /// Non-numeric values skip the arithmetic, and an explicit NULLS
 /// FIRST/LAST is handled first. Mirrors SQLite's `windowCodeRangeTest`.
+#[allow(clippy::too_many_arguments)]
 fn emit_window_range_test(
     program: &mut ProgramBuilder,
     plan: &SelectPlan,
     op: RangeCmp,
     csr1: CursorID,
     offset_reg: usize,
+    offset_bound: FrameBoundPosition,
     csr2: CursorID,
     target_pc: BranchOffset,
+    resolver: &Resolver,
 ) -> Result<()> {
     let window = plan.window.as_ref().expect("missing window");
     let [(order_expr, sort_order, nulls_order)] = window.order_by.as_slice() else {
@@ -2554,7 +2558,34 @@ fn emit_window_range_test(
     } else {
         (op, false)
     };
-    let collation = get_collseq_from_expr(order_expr, &plan.table_references)?.unwrap_or_default();
+    // The offset is added with the ORDER BY value's own `+` or `-`, chosen by
+    // the value's type as in any other arithmetic: numeric adds exactly, and
+    // a date moves by days. None means SQLite's operator runs.
+    let offset_expr = frame_offset_expr(&window.frame, offset_bound);
+    let operator = if subtract {
+        turso_parser::ast::Operator::Subtract
+    } else {
+        turso_parser::ast::Operator::Add
+    };
+    let arithmetic = Expr::Binary(
+        Box::new(order_expr.clone()),
+        operator,
+        Box::new(offset_expr.clone()),
+    );
+    let context = ExprContext::new(Some(&plan.table_references), resolver);
+    let env = context.type_env();
+    let type_arithmetic = custom_operator_call(&arithmetic, &env)?;
+    // A type with its own order but no `+` or `-` has no distance to add. A
+    // NULL offset is rejected before any arithmetic, so it needs no call.
+    let collation = context.expr_collation(order_expr)?;
+    if let CollationSeq::Type(ordering) = collation {
+        if type_arithmetic.is_none() && !matches!(type_of(offset_expr, &env), ExprType::Null) {
+            crate::bail_parse_error!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
+                ordering.name()
+            )
+        }
+    }
     let big_null = matches!(
         (sort_order, nulls_order),
         (SortOrder::Asc, Some(turso_parser::ast::NullsOrder::Last))
@@ -2597,21 +2628,25 @@ fn emit_window_range_test(
         });
     }
 
-    // Text and blobs sort at or above the empty string, so only numeric
-    // values fall through to Add/Subtract. NULL arithmetic remains NULL.
-    let reg_empty = program.alloc_register();
+    // For SQLite's operator, text and blobs sort at or above the empty
+    // string, so only numeric values fall through to Add/Subtract. NULL
+    // arithmetic remains NULL. A type's own operator always runs: numeric
+    // and date values are texts, and their `+` and `-` read them.
     let label_after_arithmetic = program.allocate_label();
-    program.emit_insn(Insn::String8 {
-        value: String::new(),
-        dest: reg_empty,
-    });
-    program.emit_insn(Insn::Ge {
-        lhs: reg1,
-        rhs: reg_empty,
-        target_pc: label_after_arithmetic,
-        flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: None,
-    });
+    if type_arithmetic.is_none() {
+        let reg_empty = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            value: String::new(),
+            dest: reg_empty,
+        });
+        program.emit_insn(Insn::Ge {
+            lhs: reg1,
+            rhs: reg_empty,
+            target_pc: label_after_arithmetic,
+            flags: crate::vdbe::insn::CmpInsFlags::default(),
+            collation: CollationSeq::for_internal_values(),
+        });
+    }
 
     // SQLite performs this comparison before arithmetic in the two cases
     // where overflow to +/-infinity cannot change a successful result.
@@ -2623,10 +2658,12 @@ fn emit_window_range_test(
             reg2,
             target_pc,
             crate::vdbe::insn::CmpInsFlags::default(),
-            Some(collation),
+            collation,
         );
     }
-    if subtract {
+    if let Some(call) = &type_arithmetic {
+        emit_operator_call_on_registers(program, call, &[reg1, offset_reg], reg1, resolver)?;
+    } else if subtract {
         program.emit_insn(Insn::Subtract {
             lhs: reg1,
             rhs: offset_reg,
@@ -2647,10 +2684,22 @@ fn emit_window_range_test(
         reg2,
         target_pc,
         crate::vdbe::insn::CmpInsFlags::default().null_eq(),
-        Some(collation),
+        collation,
     );
     program.preassign_label_to_next_insn(label_done);
     Ok(())
+}
+
+/// The `N` of the frame's `N PRECEDING` or `N FOLLOWING` bound.
+fn frame_offset_expr(frame: &crate::translate::plan::Frame, bound: FrameBoundPosition) -> &Expr {
+    let bound = match bound {
+        FrameBoundPosition::Start => &frame.start,
+        FrameBoundPosition::End => &frame.end,
+    };
+    match bound {
+        FrameBound::Preceding(offset) | FrameBound::Following(offset) => offset,
+        _ => unreachable!("a RANGE offset comes from an N PRECEDING or N FOLLOWING bound"),
+    }
 }
 
 /// Emit one of the three operations that move the frame forward — add a
@@ -2698,10 +2747,7 @@ fn emit_window_op(
     // return at window.c:2252-2257, which lets every caller emit all three
     // operations without first checking for this case.
     if matches!(op, WindowOp::AggInverse)
-        && matches!(
-            window.frame.start,
-            crate::translate::plan::FrameBoundary::UnboundedPreceding
-        )
+        && matches!(window.frame.start, FrameBound::UnboundedPreceding)
     {
         assert!(
             countdown_reg.is_none() && break_on_eof.is_none(),
@@ -2740,18 +2786,17 @@ fn emit_window_op(
             program.preassign_label_to_next_insn(label);
             match op {
                 WindowOp::AggInverse => {
-                    if matches!(
-                        window.frame.start,
-                        crate::translate::plan::FrameBoundary::Following(_)
-                    ) {
+                    if matches!(window.frame.start, FrameBound::Following(_)) {
                         emit_window_range_test(
                             program,
                             plan,
                             RangeCmp::Le,
                             cursors.csr_current,
                             reg,
+                            FrameBoundPosition::Start,
                             cursor_for_op,
                             label_done,
+                            &t_ctx.resolver,
                         )?;
                     } else {
                         emit_window_range_test(
@@ -2760,8 +2805,10 @@ fn emit_window_op(
                             RangeCmp::Ge,
                             cursor_for_op,
                             reg,
+                            FrameBoundPosition::Start,
                             cursors.csr_current,
                             label_done,
+                            &t_ctx.resolver,
                         )?;
                     }
                 }
@@ -2771,8 +2818,10 @@ fn emit_window_op(
                     RangeCmp::Gt,
                     cursor_for_op,
                     reg,
+                    FrameBoundPosition::End,
                     cursors.csr_current,
                     label_done,
+                    &t_ctx.resolver,
                 )?,
                 WindowOp::ReturnRow => {
                     unreachable!("RANGE offsets never gate RETURN_ROW directly")
@@ -2808,13 +2857,8 @@ fn emit_window_op(
         && countdown_reg.is_some()
         && matches!(
             (&window.frame.start, &window.frame.end),
-            (
-                crate::translate::plan::FrameBoundary::Preceding(_),
-                crate::translate::plan::FrameBoundary::Preceding(_)
-            ) | (
-                crate::translate::plan::FrameBoundary::Following(_),
-                crate::translate::plan::FrameBoundary::Following(_)
-            )
+            (FrameBound::Preceding(_), FrameBound::Preceding(_))
+                | (FrameBound::Following(_), FrameBound::Following(_))
         );
     if same_kind_range_offsets {
         match op {
@@ -2834,7 +2878,7 @@ fn emit_window_op(
                     rhs: end_rowid,
                     target_pc: label_done,
                     flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
             WindowOp::AggStep if !in_flush => {
@@ -2848,7 +2892,7 @@ fn emit_window_op(
                     rhs: registers.rowid,
                     target_pc: label_done,
                     flags: crate::vdbe::insn::CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::for_internal_values(),
                 });
             }
             WindowOp::AggStep | WindowOp::ReturnRow => {}
@@ -2982,6 +3026,7 @@ fn emit_window_op(
             temp_start,
             peer_ref_reg,
             label_continue,
+            &t_ctx.resolver,
         )?;
     }
 
@@ -3067,7 +3112,6 @@ fn emit_window_arg_from_cursor(
                     std::borrow::Cow::Owned(node.clone()),
                     value_reg,
                     false,
-                    None,
                 );
                 return Ok(WalkControl::SkipChildren);
             }
@@ -3084,7 +3128,7 @@ fn emit_window_arg_from_cursor(
     }
     t_ctx
         .resolver
-        .cache_expr_reg(std::borrow::Cow::Owned(arg.clone()), dest, false, None);
+        .cache_expr_reg(std::borrow::Cow::Owned(arg.clone()), dest, false);
     Ok(())
 }
 
@@ -3252,8 +3296,7 @@ fn emit_function_step(
                         col: arg_load_start.unwrap_or(0),
                         delimiter: 0,
                         func: AccumulatorFunc::Window(win_func.clone()),
-                        comparator: None,
-                        collation: None,
+                        collation: CollationSeq::BINARY,
                     }),
                 });
             }
@@ -3363,7 +3406,6 @@ fn emit_function_inverse(
                 col: arg_load_start.unwrap_or(0),
                 delimiter: 0,
                 func: func.func.clone(),
-                comparator: None,
             });
 
             if let Some(label) = filter_skip_label {
@@ -3610,10 +3652,11 @@ fn emit_first_value_nth_value_lookup(
                 rhs: reg_zero,
                 target_pc: lbl_n_ok,
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
-                collation: None,
+                collation: CollationSeq::for_internal_values(),
             });
             program.preassign_label_to_next_insn(lbl_n_err);
             program.emit_insn(Insn::Halt {
+                constraint_info: None,
                 err_code: crate::error::SQLITE_ERROR,
                 description: "second argument to nth_value must be a positive integer".to_string(),
                 on_error: None,
@@ -3667,7 +3710,7 @@ fn emit_first_value_nth_value_lookup(
             rhs: frame_counters + 1,
             target_pc: lbl_past_frame_end,
             flags: crate::vdbe::insn::CmpInsFlags::default(),
-            collation: None,
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::SeekRowid {
             cursor_id: csr_app,
@@ -3685,6 +3728,7 @@ fn emit_first_value_nth_value_lookup(
         });
         program.preassign_label_to_next_insn(lbl_missing_row);
         program.emit_insn(Insn::Halt {
+            constraint_info: None,
             err_code: crate::error::SQLITE_ERROR,
             description: "first_value/nth_value could not find a saved row within its frame"
                 .to_string(),
@@ -3864,8 +3908,7 @@ pub fn emit_window_flush(
     // loop was never added to the totals (under ROWS), or its peer group
     // might still have been incomplete (under RANGE / GROUPS).
     let window = plan.window.as_ref().expect("missing window");
-    use crate::translate::plan::FrameBoundary;
-    if matches!(window.frame.end, FrameBoundary::Preceding(_)) {
+    if matches!(window.frame.end, FrameBound::Preceding(_)) {
         // Pattern B flush (window.c:3052-3056): the main loop emitted a
         // row on every iteration, so exactly one row is still waiting to
         // be output — a single RETURN_ROW with no delay and no loop. The
@@ -3881,7 +3924,7 @@ pub fn emit_window_flush(
             true,
         )?;
         let inverse_before_return = window.frame.mode == turso_parser::ast::FrameMode::Range
-            && matches!(window.frame.start, FrameBoundary::Preceding(_));
+            && matches!(window.frame.start, FrameBound::Preceding(_));
         if inverse_before_return {
             emit_window_op(
                 program,
@@ -3894,7 +3937,7 @@ pub fn emit_window_flush(
             )?;
         }
         emit_window_op(program, t_ctx, plan, WindowOp::ReturnRow, None, None, true)?;
-    } else if matches!(window.frame.start, FrameBoundary::Following(_)) {
+    } else if matches!(window.frame.start, FrameBound::Following(_)) {
         // Pattern A flush (window.c:3057-3084): two-stage loop.
         //
         //   loop_1:
@@ -3923,7 +3966,7 @@ pub fn emit_window_flush(
         let (return_row_countdown, agg_inverse_countdown) =
             if window.frame.mode == turso_parser::ast::FrameMode::Range {
                 (None, registers.start_offset_reg)
-            } else if matches!(window.frame.end, FrameBoundary::UnboundedFollowing) {
+            } else if matches!(window.frame.end, FrameBound::UnboundedFollowing) {
                 (registers.start_offset_reg, None)
             } else {
                 (registers.end_offset_reg, registers.start_offset_reg)

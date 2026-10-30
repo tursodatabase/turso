@@ -1964,6 +1964,16 @@ expect {
     10|20|100
 }
 
+setup gencol_untyped_virtual_columns {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_untyped_virtual_columns
+snapshot gencol_select_untyped_virtual_columns {
+    SELECT c, d FROM t;
+}
+
 # =============================================================================
 # 10. Constraints
 # =============================================================================
@@ -4588,6 +4598,47 @@ expect error {
 }
 
 @cross-check-integrity
+test fk-deferred-insert-parent-fixes-virtual-col-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER, g INTEGER GENERATED ALWAYS AS (x * 2) VIRTUAL REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c(x) VALUES(7);
+    INSERT INTO p VALUES(14);
+    COMMIT;
+    SELECT x, g FROM c;
+}
+expect {
+    7|14
+}
+
+@cross-check-integrity
+test fk-delete-parent-referenced-by-virtual-col-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER, g INTEGER GENERATED ALWAYS AS (x * 2) VIRTUAL REFERENCES p(id), y INTEGER);
+    INSERT INTO p VALUES(14);
+    INSERT INTO c(x, y) VALUES(7, 1);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-drop-parent-referenced-by-virtual-col-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(x INTEGER, g INTEGER GENERATED ALWAYS AS (x * 2) VIRTUAL REFERENCES p(id));
+    INSERT INTO p VALUES(14);
+    INSERT INTO c(x) VALUES(7);
+    DROP TABLE p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
 test fk-child-references-parent-virtual-col {
     PRAGMA foreign_keys=ON;
     CREATE TABLE parent(id INTEGER PRIMARY KEY, a INTEGER, v AS (a * 2) VIRTUAL UNIQUE);
@@ -4992,6 +5043,88 @@ test gencol-virtual-union-tag-select-resolves-self-table-type {
 } expect {
     1|i
     2|f
+}
+
+# A virtual column over a custom-type column must see the user's value, not the
+# value ENCODE stored, in RETURNING and in trigger NEW/OLD rows.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol-virtual-reads-user-value-of-custom-type-column {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, p cents, q cents, d ANY AS (p) VIRTUAL) STRICT;
+    CREATE TABLE log(what TEXT, v ANY) STRICT;
+    CREATE TRIGGER bi BEFORE INSERT ON t BEGIN INSERT INTO log VALUES ('bi', NEW.d); END;
+    CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('bu', NEW.d); END;
+    CREATE TRIGGER au AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES ('au-new', NEW.d);
+        INSERT INTO log VALUES ('au-old', OLD.d);
+    END;
+    INSERT INTO t(id, p, q) VALUES (1, 10, 5) RETURNING d;
+    UPDATE t SET q = 6 RETURNING d;
+    UPDATE t SET p = 20 RETURNING d;
+    INSERT INTO t(id, p, q) VALUES (1, 30, 7)
+        ON CONFLICT(id) DO UPDATE SET q = excluded.q RETURNING d;
+    SELECT what, v FROM log ORDER BY rowid;
+} expect {
+    10
+    10
+    20
+    20
+    bi|10
+    bu|10
+    au-new|10
+    au-old|10
+    bu|20
+    au-new|20
+    au-old|10
+    bi|30
+    bu|20
+    au-new|20
+    au-old|20
+}
+
+# UPDATE that sets one numeric column: the indexed virtual column adds it to a
+# column the UPDATE did not set, which is still in its stored form.
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol-virtual-index-key-mixes-set-and-unchanged-custom-type-columns {
+    CREATE TABLE m(id INTEGER PRIMARY KEY, a numeric(10,2), b numeric(10,2), s ANY AS (a + b) VIRTUAL) STRICT;
+    CREATE INDEX m_s ON m(s);
+    INSERT INTO m(id, a, b) VALUES (1, 1.25, 2.50);
+    UPDATE m SET a = 2.00;
+    SELECT s FROM m INDEXED BY m_s WHERE s = '4.50';
+    SELECT count(*) FROM m INDEXED BY m_s WHERE s = '3.75';
+    PRAGMA integrity_check;
+} expect {
+    4.50
+    0
+    ok
+}
+
+@skip-if sqlite "SQLite doesn't support custom types"
+@requires custom_types "uses custom types"
+test gencol-virtual-index-key-on-custom-type-column-uses-type-operators {
+    CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), doubled ANY AS (val * 2) VIRTUAL) STRICT;
+    CREATE INDEX prices_doubled ON prices(doubled);
+    INSERT INTO prices(id, val) VALUES (1, 1.50);
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = (SELECT val * 2 FROM prices);
+    PRAGMA integrity_check;
+    UPDATE prices SET val = 2.50;
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = (SELECT val * 2 FROM prices);
+    INSERT INTO prices(id, val) VALUES (1, 4.50) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = (SELECT val * 2 FROM prices);
+    PRAGMA integrity_check;
+    DELETE FROM prices WHERE id = 1;
+    SELECT count(*) FROM prices;
+    PRAGMA integrity_check;
+} expect {
+    text|3.00
+    ok
+    text|5.00
+    text|9.00
+    ok
+    0
+    ok
 }
 
 @cross-check-integrity
@@ -5713,6 +5846,182 @@ test gencol_issue7071_strict_gencol_violation_rejected {
 }
 expect error {
     cannot store TEXT value in INT column t.b
+}
+
+# Issue #7064: on the NULL-extended side of an outer join, virtual
+# generated columns must read as NULL instead of being recomputed from
+# their expression (which can yield non-NULL for constant/coalesce/typeof).
+
+test gencol_issue7064_left_join_constant_gencol {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1);
+    SELECT x, a, g, typeof(g) FROM l LEFT JOIN r ON false;
+}
+expect {
+    1|||null
+}
+
+test gencol_issue7064_left_join_gencol_is_null_filter {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1);
+    SELECT x FROM l LEFT JOIN r ON false WHERE g IS NULL;
+}
+expect {
+    1
+}
+
+test gencol_issue7064_left_join_null_swallowing_exprs {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (coalesce(a, 99)), h AS (typeof(a)));
+    INSERT INTO l VALUES(1);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, a, g, h FROM l LEFT JOIN r ON l.x = r.a;
+}
+expect {
+    1|||
+}
+
+test gencol_issue7064_left_join_mixed_matches {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (coalesce(a, 99)));
+    INSERT INTO l VALUES(1),(5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, a, g FROM l LEFT JOIN r ON l.x = r.a ORDER BY x;
+}
+expect {
+    1||
+    5|5|5
+}
+
+# A constant generating expression must be recomputed after a null-extended
+# row clears the register; hoisting it out of the join loop would leave the
+# NULL behind for every later matched row.
+test gencol_issue7064_constant_gencol_matched_after_unmatched {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1),(5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, a, g FROM l LEFT JOIN r ON l.x = r.a ORDER BY x;
+}
+expect {
+    1||
+    5|5|1
+}
+
+test gencol_issue7064_right_join {
+    CREATE TABLE l(a, g AS (1));
+    CREATE TABLE r(x);
+    INSERT INTO l(a) VALUES(5);
+    INSERT INTO r VALUES(1), (5);
+    SELECT x, a, g, typeof(g), coalesce(g, 'sentinel') FROM l RIGHT JOIN r ON a = x ORDER BY x;
+}
+expect {
+    1|||null|sentinel
+    5|5|1|integer|1
+}
+
+test gencol_issue7064_full_join {
+    CREATE TABLE l(a, g AS (1));
+    CREATE TABLE r(b, h AS (coalesce(b, 99)));
+    INSERT INTO l(a) VALUES(1), (5);
+    INSERT INTO r(b) VALUES(5), (7);
+    SELECT a, g, b, h FROM l FULL JOIN r ON a = b ORDER BY coalesce(a, b);
+}
+expect {
+    1|1||
+    5|1|5|5
+    ||7|7
+}
+
+test gencol_issue7064_where_is_null_with_matches {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, g FROM l LEFT JOIN r ON x = a WHERE g IS NULL ORDER BY x;
+}
+expect {
+    1|
+}
+
+test gencol_issue7064_indexed_dependencies {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (coalesce(a, 99)));
+    CREATE INDEX rg ON r(g, a);
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, g, typeof(g), coalesce(g, 'sentinel') FROM l LEFT JOIN r INDEXED BY rg ON x = g ORDER BY x;
+}
+expect {
+    1||null|sentinel
+    5|5|integer|5
+}
+
+test gencol_issue7064_noncovering_index {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, b, g AS (1));
+    CREATE INDEX rg ON r(g);
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a, b) VALUES(5, 8);
+    SELECT x, a, b, g FROM l LEFT JOIN r INDEXED BY rg ON x = a AND g = 1 ORDER BY x;
+}
+expect {
+    1|||
+    5|5|8|1
+}
+
+test gencol_issue7064_nested_left_joins {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    CREATE TABLE s(b, h AS (coalesce(b, 99)));
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a) VALUES(5);
+    INSERT INTO s(b) VALUES(1);
+    SELECT x, a, g, b, h FROM l LEFT JOIN r ON x = a LEFT JOIN s ON g = b ORDER BY x;
+}
+expect {
+    1||||
+    5|5|1|1|1
+}
+
+test gencol_issue7064_generated_column_in_on_clause {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, a, g, typeof(g), coalesce(g, 'sentinel') FROM l LEFT JOIN r ON x = a AND g = 1 ORDER BY x;
+}
+expect {
+    1|||null|sentinel
+    5|5|1|integer|1
+}
+
+test gencol_issue7064_correlated_subquery {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES(1), (5);
+    INSERT INTO r(a) VALUES(5);
+    SELECT x, (SELECT g) FROM l LEFT JOIN r ON x = a ORDER BY x;
+}
+expect {
+    1|
+    5|1
+}
+
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test gencol_issue7064_without_rowid_matched_rows_after_unmatched_row {
+    CREATE TABLE l(x);
+    CREATE TABLE r(a PRIMARY KEY, b, g AS (b + 1), h AS (1)) WITHOUT ROWID;
+    INSERT INTO l VALUES(1), (5), (6);
+    INSERT INTO r(a, b) VALUES(5, 10), (6, 20);
+    SELECT x, a, b, g, h FROM l LEFT JOIN r ON r.a = l.x ORDER BY x;
+}
+expect {
+    1||||
+    5|5|10|11|1
+    6|6|20|21|1
 }
 
 # Issue #7058: ALTER TABLE ADD COLUMN must reject a column that has

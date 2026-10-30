@@ -945,13 +945,15 @@ pub struct BTreeCursor {
     /// Reusable buffer for cell payloads during insert/update operations.
     /// This avoids allocating a new Vec for each write operation.
     reusable_cell_payload: crate::alloc::Vec<u8>,
-    /// Per-cell access cache for incremental blob I/O. Caches the leaf cell's payload
-    /// layout, the overflow-page-number array (Turso's runtime reconstruction of
-    /// SQLite's `aOverflow`), and the byte range of the most recently accessed column,
-    /// so repeated byte accesses to the same row avoid re-parsing the cell and record
-    /// header and re-walking the overflow chain — turning each access into an O(1)
-    /// page lookup. Invalidated when the cursor moves to a different (page, cell). The
-    /// on-disk format is unchanged; this index lives only in RAM.
+    /// Per-cell access cache for reads of overflowing records and for incremental
+    /// blob I/O. Caches the cell's payload layout, the overflow-page-number array
+    /// (Turso's runtime reconstruction of SQLite's `aOverflow`), and, for blob I/O,
+    /// the byte range of the most recently accessed column, so repeated byte accesses
+    /// to the same row avoid re-parsing the cell and record header and re-walking the
+    /// overflow chain — turning each access into an O(1) page lookup. Marked
+    /// invalid on every cursor move, like SQLite's BTCF_ValidOvfl, and reset before
+    /// every write through the cursor and when its position is saved. The on-disk
+    /// format is unchanged; this index lives only in RAM.
     blob_cache: BlobCellCache,
     /// Rowid the incremental-blob machinery last addressed. Unlike `blob_cache` it
     /// survives position saves: it is what `note_external_row_write` compares against
@@ -1011,7 +1013,8 @@ enum IterationPendingDescent {
     Backwards(i64),
 }
 
-/// Cache backing the incremental-blob-I/O fast path (see [`BTreeCursor::blob_cache`]).
+/// Cache backing reads of overflowing records and incremental blob I/O (see
+/// [`BTreeCursor::blob_cache`]).
 /// `valid`/`col_valid` gate the two tiers: the cell payload layout and the parsed byte
 /// range of the last-accessed column. `overflow_pages[i]` is the i-th overflow page
 /// number (`overflow_pages[0]` == the value's first overflow page); it grows lazily as
@@ -1051,6 +1054,39 @@ struct BlobCellCache {
     /// Serial type of column `col`, kept so every access can re-assert the value is
     /// TEXT or BLOB (byte-addressable) without re-parsing the record header.
     col_serial: u64,
+    /// The record header, when it does not fit on the page, read for column reads.
+    kept_header: KeptPayloadRead,
+    /// The bytes of the column values a column read needs from the overflow pages.
+    kept_values: KeptPayloadRead,
+}
+
+/// Bytes of the record under the cursor, read from `offset` into a buffer the
+/// cursor keeps. A page read can yield for IO, which makes the instruction
+/// start again; the bytes read so far stay here, so the next read of the
+/// same range continues where it stopped instead of starting over.
+struct KeptPayloadRead {
+    valid: bool,
+    offset: usize,
+    len: usize,
+    bytes: crate::alloc::Vec<u8>,
+}
+
+impl Default for KeptPayloadRead {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            offset: 0,
+            len: 0,
+            bytes: crate::alloc::vec![],
+        }
+    }
+}
+
+/// Which of the cursor's [`KeptPayloadRead`] buffers a read uses.
+#[derive(Clone, Copy)]
+pub(crate) enum KeptRead {
+    Header,
+    Values,
 }
 
 impl Default for BlobCellCache {
@@ -1072,6 +1108,8 @@ impl Default for BlobCellCache {
             col_body_off: 0,
             col_len: 0,
             col_serial: 0,
+            kept_header: KeptPayloadRead::default(),
+            kept_values: KeptPayloadRead::default(),
         }
     }
 }
@@ -1082,10 +1120,25 @@ impl BlobCellCache {
     /// so no stale offset or page number can ever back a byte-level read or write.
     fn reset(&mut self) {
         self.valid = false;
-        self.col_valid = false;
+        self.forget_column_reads();
         self.first_overflow = None;
         self.overflow_pages.clear();
         self.release_pinned_overflow();
+    }
+
+    /// Forget what was read from the cell's record: the blob column's place and
+    /// the kept header and value bytes.
+    fn forget_column_reads(&mut self) {
+        self.col_valid = false;
+        self.kept_header.valid = false;
+        self.kept_values.valid = false;
+    }
+
+    fn kept_read_mut(&mut self, which: KeptRead) -> &mut KeptPayloadRead {
+        match which {
+            KeptRead::Header => &mut self.kept_header,
+            KeptRead::Values => &mut self.kept_values,
+        }
     }
 
     /// Pin `page` and remember it as the spatial-locality overflow page for `idx`,
@@ -1129,43 +1182,76 @@ enum BlobSpan {
     },
 }
 
-/// Walk the serial types of a record header and locate `column`'s value. `header`
-/// must be exactly the header bytes (so a varint can never stray into the body) and
-/// `hpos0` the offset of the first serial type, i.e. the width of the header-size
-/// varint. Returns the value's payload-relative byte offset, its byte length, and
-/// its serial type, after checking the range lies inside `payload_size`.
+/// Locate `column`'s value among `columns`.
 fn blob_locate_column_in_header(
-    header: &[u8],
-    hpos0: usize,
-    payload_size: usize,
+    columns: HeaderColumns<'_>,
     column: usize,
 ) -> Result<(usize, usize, u64)> {
-    let header_size = header.len();
-    let mut hpos = hpos0;
-    let mut body = header_size;
-    let mut col = 0usize;
-    loop {
-        if hpos >= header_size {
-            return Err(LimboError::InternalError(format!(
-                "blob column {column} out of range for row with {col} columns"
-            )));
+    let mut col = 0;
+    for located in columns {
+        let located = located?;
+        if col == column {
+            return Ok(located);
         }
-        let (serial, n) = crate::storage::sqlite3_ondisk::read_varint(&header[hpos..])?;
-        hpos += n;
+        col += 1;
+    }
+    Err(LimboError::InternalError(format!(
+        "blob column {column} out of range for row with {col} columns"
+    )))
+}
+
+/// The columns of a record header in order, each as its value's payload-relative
+/// byte offset, byte length and serial type, after checking that the value lies
+/// inside `payload_size`.
+pub(crate) struct HeaderColumns<'a> {
+    header: &'a [u8],
+    hpos: usize,
+    body: usize,
+    column: usize,
+    payload_size: usize,
+}
+
+impl<'a> HeaderColumns<'a> {
+    /// `header` must be exactly the header bytes (so a varint can never stray into
+    /// the body) and `hpos0` the offset of the first serial type, i.e. the width of
+    /// the header-size varint.
+    fn new(header: &'a [u8], hpos0: usize, payload_size: usize) -> Self {
+        Self {
+            header,
+            hpos: hpos0,
+            body: header.len(),
+            column: 0,
+            payload_size,
+        }
+    }
+}
+
+impl Iterator for HeaderColumns<'_> {
+    type Item = Result<(usize, usize, u64)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        (self.hpos < self.header.len()).then(|| self.read_column())
+    }
+}
+
+impl HeaderColumns<'_> {
+    fn read_column(&mut self) -> Result<(usize, usize, u64)> {
+        let (serial, n) = crate::storage::sqlite3_ondisk::read_varint(&self.header[self.hpos..])?;
+        self.hpos += n;
         let size = crate::types::get_serial_type_size(serial)?;
+        let body = self.body;
         let end = body
             .checked_add(size)
             .ok_or_else(|| LimboError::Corrupt("record body offsets overflow usize".to_string()))?;
-        if end > payload_size {
+        if end > self.payload_size {
             return Err(LimboError::Corrupt(format!(
-                "column {col} claims bytes {body}..{end} beyond payload size {payload_size}"
+                "column {} claims bytes {body}..{end} beyond payload size {}",
+                self.column, self.payload_size
             )));
         }
-        if col == column {
-            return Ok((body, size, serial));
-        }
-        body = end;
-        col += 1;
+        self.body = end;
+        self.column += 1;
+        Ok((body, size, serial))
     }
 }
 
@@ -1290,7 +1376,7 @@ impl BTreeCursor {
                 .expect("WITHOUT ROWID primary key column should exist");
             crate::types::KeyInfo {
                 sort_order: *order,
-                collation: column.collation_opt().unwrap_or_default(),
+                collation: column.collation(),
                 nulls_order: None,
             }
         });
@@ -1441,7 +1527,25 @@ impl BTreeCursor {
                             break;
                         }
                         if self.stack.has_parent() {
+                            let child_page_id = self.stack.top_ref().get().id();
                             self.pop_upwards();
+                            // A forward seek, such as the one in restore_context, leaves an
+                            // index interior page at the cell whose left child we came from.
+                            // That cell sorts after the child, so step back to the one before it.
+                            let came_from_left_child_of_current_cell = {
+                                let contents = self.stack.top_ref().get_contents();
+                                let cell_idx = self.stack.current_cell_index();
+                                contents.page_type()? == PageType::IndexInterior
+                                    && cell_idx >= 0
+                                    && (cell_idx as usize) < contents.cell_count()
+                                    && contents
+                                        .cell_interior_read_left_child_page(cell_idx as usize)?
+                                        as usize
+                                        == child_page_id
+                            };
+                            if came_from_left_child_of_current_cell {
+                                self.stack.retreat();
+                            }
                         } else {
                             // moved to begin of btree
                             return Ok(IOResult::Done(false));
@@ -2468,6 +2572,10 @@ impl BTreeCursor {
             let cell_count = contents.cell_count();
             if cell_count == 0 {
                 self.stack.set_cell_index(0);
+                // Deleting the final row can leave this cursor carrying its
+                // old position while the cell bytes remain physically intact.
+                // A seek into the now-empty tree must invalidate that position.
+                self.set_has_record(false);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
             self.start_table_leaf_search(cell_count, seek_op);
@@ -2772,6 +2880,8 @@ impl BTreeCursor {
             let contents = page.get_contents();
             let cell_count = contents.cell_count();
             if cell_count == 0 {
+                // Match table seeks: an empty leaf never has a current record.
+                self.set_has_record(false);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
 
@@ -5800,52 +5910,59 @@ impl BTreeCursor {
         Ok(IOResult::Done(()))
     }
 
-    /// Populate the cell-layout tier of `blob_cache` for the cursor's current
-    /// table-leaf cell, unless it is already cached for this (page, cell), and pin
-    /// the cell's rowid for expiry tracking. Restoring a disturbed position may
-    /// yield IO; the layout parse itself reads only the resident leaf page.
+    /// Check that the cursor is on a table row, cache its layout, and remember its
+    /// rowid for expiry tracking. Restoring a disturbed position may yield IO.
     fn blob_ensure_layout(&mut self) -> IOResultOr<()> {
         return_if_io!(self.blob_ensure_position());
-        let usable = self.pager.usable_space();
-        turso_assert!(usable > 4, "usable space must exceed overflow header");
         let cell_idx = self.stack.current_cell_index();
         if cell_idx < 0 {
             return Err(LimboError::BlobHandleExpired.into());
         }
+        let contents = self.stack.top_ref().get_contents();
+        if contents.page_type()? != PageType::TableLeaf {
+            return Err(LimboError::InternalError(
+                "incremental blob I/O requires a table (rowid) row".to_string(),
+            )
+            .into());
+        }
+        let rowid = contents
+            .cell_table_leaf_read_header(cell_idx as usize)?
+            .rowid;
+        self.ensure_payload_layout()?;
+        self.blob_pinned_rowid = Some(rowid);
+        Ok(IOResult::Done(()))
+    }
+
+    /// Populate the cell-layout tier of `blob_cache` for the cell under the
+    /// cursor, in a table or an index b-tree, unless it is already cached for
+    /// this (page, cell). This and `overflow_pages` are SQLite's BtCursor.info
+    /// and BtCursor.aOverflow, which accessPayload (btree.c) uses for both
+    /// column reads and incremental blob I/O.
+    fn ensure_payload_layout(&mut self) -> Result<()> {
+        let usable = self.usable_space();
+        turso_assert!(usable > 4, "usable space must exceed overflow header");
+        let cell_idx = self.stack.current_cell_index();
+        turso_assert!(
+            cell_idx >= 0,
+            "cursor must be on a cell to read its payload"
+        );
         let cell_idx = cell_idx as usize;
         let leaf_id = self.stack.top_ref().get().id();
         if self.blob_cache.valid
             && self.blob_cache.leaf_id == leaf_id
             && self.blob_cache.cell_idx == cell_idx
         {
-            return Ok(IOResult::Done(()));
+            return Ok(());
         }
-        // Extract owned scalars from the cell before mutating the cache (the cell borrows
-        // the page, which borrows `self`).
-        let (rowid, local_off, local_len, payload_size, first_overflow) = {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            let base = contents.as_ptr().as_ptr() as usize;
-            let BTreeCell::TableLeafCell(cell) = contents.cell_get(cell_idx, usable)? else {
-                return Err(LimboError::InternalError(
-                    "incremental blob I/O requires a table (rowid) row".to_string(),
-                )
-                .into());
-            };
-            (
-                cell.rowid,
-                cell.payload.as_ptr() as usize - base,
-                cell.payload.len(),
-                cell.payload_size as usize,
-                cell.first_overflow_page,
-            )
-        };
-        if local_len > payload_size {
-            return Err(LimboError::Corrupt(format!(
-                "cell claims {payload_size} payload bytes but holds {local_len} locally"
-            ))
-            .into());
-        }
+        let contents = self.stack.top_ref().get_contents();
+        let (local, local_off, payload_size, first_overflow) =
+            contents.cell_read_payload_at(cell_idx, self.payload_limits)?;
+        let local_len = local.len();
+        let payload_size = payload_size as usize;
+        turso_debug_assert!(
+            local_len <= payload_size,
+            "a cell holds no more payload bytes on the page than the payload has"
+        );
         let c = &mut self.blob_cache;
         c.valid = false;
         c.leaf_id = leaf_id;
@@ -5859,12 +5976,11 @@ impl BTreeCursor {
         if let Some(fo) = first_overflow {
             crate::with_btree_allocation_site!(OverflowRead, c.overflow_pages.try_push(fo))?;
         }
-        self.blob_pinned_rowid = Some(rowid);
         c.valid = true;
         // Moving to a different cell: unpin the previous cell's cached overflow page.
         c.release_pinned_overflow();
-        c.col_valid = false;
-        Ok(IOResult::Done(()))
+        c.forget_column_reads();
+        Ok(())
     }
 
     /// Fetch the `idx`-th overflow page, reusing the pinned last page on a spatial-
@@ -5906,45 +6022,8 @@ impl BTreeCursor {
         if self.blob_cache.col_valid && self.blob_cache.col == column {
             return Ok(IOResult::Done(()));
         }
-        let local_off = self.blob_cache.local_off;
-        let local_len = self.blob_cache.local_len;
-        let payload_size = self.blob_cache.payload_size;
-        // The header-size varint itself is always local: either the record fits
-        // entirely in the local payload, or SQLite's minimum-local formula keeps
-        // well over 9 bytes (one max-size varint) on the leaf. A truncated varint
-        // here therefore means a corrupt cell, and read_varint reports it as such.
-        let (header_size, hpos0) = {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            let local = &contents.as_ptr()[local_off..local_off + local_len];
-            crate::storage::sqlite3_ondisk::read_varint(local)?
-        };
-        let header_size = usize::try_from(header_size)
-            .map_err(|_| LimboError::Corrupt("record header size does not fit".to_string()))?;
-        if header_size < hpos0 || header_size > payload_size || header_size > MAX_RECORD_HEADER_SIZE
-        {
-            return Err(LimboError::Corrupt(format!(
-                "record header size {header_size} out of bounds (payload {payload_size})"
-            ))
-            .into());
-        }
-        let (body_off, len, serial) = if header_size <= local_len {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            let local = &contents.as_ptr()[local_off..local_off + local_len];
-            blob_locate_column_in_header(&local[..header_size], hpos0, payload_size, column)?
-        } else {
-            // Header spills into the overflow chain: materialize exactly the header
-            // bytes (bounded above by MAX_RECORD_HEADER_SIZE) and parse those. On an
-            // IO yield the whole function restarts; every step up to here is a pure
-            // cached read, so the restart is cheap and idempotent.
-            let mut header = crate::with_btree_allocation_site!(
-                BlobRecordHeader,
-                crate::alloc::try_vec![0u8; header_size]
-            )?;
-            return_if_io!(self.blob_read_range(0, &mut header));
-            blob_locate_column_in_header(&header, hpos0, payload_size, column)?
-        };
+        let (columns, _) = return_if_io!(self.record_columns());
+        let (body_off, len, serial) = blob_locate_column_in_header(columns, column)?;
         let c = &mut self.blob_cache;
         c.col = column;
         c.col_body_off = body_off;
@@ -5995,7 +6074,7 @@ impl BTreeCursor {
                     Some(p) => *p,
                     None => {
                         return Err(LimboError::Corrupt(
-                            "blob value needs overflow pages but has none".to_string(),
+                            "record needs overflow pages but has none".to_string(),
                         )
                         .into())
                     }
@@ -6027,10 +6106,10 @@ impl BTreeCursor {
     /// Map payload offset `pos` (0 = first payload byte) to the physical span that
     /// begins there, yielding at most `remaining` bytes. Pure arithmetic over the
     /// cached cell layout; the caller fetches the page and copies. Requires
-    /// `blob_ensure_layout` to have populated the layout tier.
+    /// `ensure_payload_layout` to have populated the layout tier.
     fn blob_span(&self, pos: usize, remaining: usize) -> BlobSpan {
         // Overflow spans divide by `per` (bytes per overflow page); it is `usable - 4`,
-        // established > 0 by blob_ensure_layout. Assert it so the invariant is explicit.
+        // established > 0 by ensure_payload_layout. Assert it so the invariant is explicit.
         turso_debug_assert!(
             self.blob_cache.per > 0,
             "overflow bytes-per-page must be > 0"
@@ -6055,24 +6134,31 @@ impl BTreeCursor {
         }
     }
 
-    /// Copy `buf.len()` bytes starting at payload offset `off` (0 = first byte of the
-    /// value) into `buf`, spanning the leaf-local payload and the overflow chain. Uses
-    /// the O(1) overflow cache to locate each page. Requires `blob_ensure_layout` first.
-    fn blob_read_range(&mut self, off: usize, buf: &mut [u8]) -> IOResultOr<()> {
-        let len = buf.len();
+    /// Pass the `len` payload bytes starting at payload offset `off` to `sink`, in
+    /// order, one page's worth at a time. Uses the O(1) overflow cache to locate each
+    /// page, and reads the overflow pages before the range only for their next-page
+    /// pointers, as SQLite's accessPayload (btree.c) does. When a page read yields
+    /// for IO, `sink` has received every byte before that page. Requires
+    /// `ensure_payload_layout` first.
+    fn copy_payload_range(
+        &mut self,
+        off: usize,
+        len: usize,
+        mut sink: impl FnMut(&[u8]),
+    ) -> IOResultOr<()> {
         let mut done = 0usize;
         while done < len {
             match self.blob_span(off + done, len - done) {
                 // Local bytes are on the resident leaf page — no IO.
                 BlobSpan::Local { page_off, take } => {
                     let src = self.stack.top_ref().get_contents().as_ptr();
-                    buf[done..done + take].copy_from_slice(&src[page_off..page_off + take]);
+                    sink(&src[page_off..page_off + take]);
                     done += take;
                 }
                 BlobSpan::Overflow { idx, within, take } => {
                     let page = return_if_io!(self.blob_overflow_page(idx));
                     let src = page.get_contents().as_ptr();
-                    buf[done..done + take].copy_from_slice(&src[4 + within..4 + within + take]);
+                    sink(&src[4 + within..4 + within + take]);
                     done += take;
                 }
             }
@@ -6118,7 +6204,7 @@ impl BTreeCursor {
     }
 
     /// Validate the byte range `[off, off+len)` against column `column`'s value and
-    /// return its payload-relative start offset (for `blob_read_range` /
+    /// return its payload-relative start offset (for `copy_payload_range` /
     /// `blob_write_range`). One bounds check backs both read and write.
     fn blob_resolve_range(&mut self, column: usize, off: usize, len: usize) -> IOResultOr<usize> {
         return_if_io!(self.blob_typed_column(column));
@@ -6160,8 +6246,9 @@ impl BTreeCursor {
         if len == 0 {
             return Ok(IOResult::Done(()));
         }
-        out.resize(len, 0);
-        return_if_io!(self.blob_read_range(payload_off, out));
+        return_if_io!(
+            self.copy_payload_range(payload_off, len, |chunk| { out.extend_from_slice(chunk) })
+        );
         Ok(IOResult::Done(()))
     }
 
@@ -6445,10 +6532,20 @@ impl BTreeCursor {
 
     /// Drop any pending saved seek-context; used by callers that re-navigate
     /// from the root and don't want restore_context to clobber them.
+    ///
+    /// Also drops skip_advance. That flag says "the next next() must return
+    /// the cell the cursor already sits on" and only describes the position a
+    /// delete or restore left behind. Once the cursor moves somewhere else,
+    /// the flag is wrong: after seek_to_last() it would stop the next() in
+    /// NewRowid from stepping past the last row, and the following insert
+    /// would land before that row. SQLite keeps this "skip" state in eState,
+    /// and moveToRoot() resets eState (btree.c:5619), so sqlite3BtreeFirst()
+    /// and sqlite3BtreeLast() always discard it.
     #[inline]
     fn clear_saved_seek(&mut self) {
         self.context = None;
         self.valid_state = CursorValidState::Valid;
+        self.skip_advance = false;
     }
 
     #[inline]
@@ -6472,8 +6569,9 @@ impl BTreeCursor {
                 IterationDirection::Forwards => self.get_next_record(),
                 IterationDirection::Backwards => self.get_prev_record(),
             });
-            self.context = None;
+            let ctx = self.context.take().unwrap();
             self.valid_state = CursorValidState::Valid;
+            self.stay_before_entry_if_saved_in_gap(ctx.seek_op);
             return Ok(IOResult::Done(()));
         }
         let ctx = self.context.take().unwrap();
@@ -6487,6 +6585,7 @@ impl BTreeCursor {
                 match res {
                     SeekResult::Found => {
                         self.valid_state = CursorValidState::Valid;
+                        self.stay_before_entry_if_saved_in_gap(ctx.seek_op);
                         Ok(IOResult::Done(()))
                     }
                     SeekResult::TryAdvance => {
@@ -6513,6 +6612,17 @@ impl BTreeCursor {
                 self.context = Some(ctx);
                 Ok(IOResult::IO(io))
             }
+        }
+    }
+
+    /// A non-exact seek op (GE { eq_only: false } or GT) means the cursor was
+    /// saved in a gap by try_save_position_for_external_balance. The seek
+    /// landed on the row after the gap; put the cursor back in the gap so the
+    /// next next() returns that row instead of skipping it.
+    fn stay_before_entry_if_saved_in_gap(&mut self, seek_op: SeekOp) {
+        if !seek_op.eq_only() {
+            self.set_has_record(false);
+            self.skip_advance = true;
         }
     }
 
@@ -6745,6 +6855,12 @@ impl CursorTrait for BTreeCursor {
             match self.advance_state {
                 AdvanceState::Start => {
                     return_if_io!(self.restore_context());
+                    // skip_advance only tells a forward step to stay put. A
+                    // backward step from the cell after a deleted row is
+                    // already right, and it must consume the flag so a later
+                    // next() advances normally. Matches btreePrevious(),
+                    // which clears CURSOR_SKIPNEXT (btree.c:6439-6442).
+                    self.skip_advance = false;
                     self.advance_state = AdvanceState::Advance;
                 }
                 AdvanceState::Advance => {
@@ -6882,51 +6998,23 @@ impl CursorTrait for BTreeCursor {
 
     #[inline(always)]
     fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
-        if self.needs_restore() {
-            return restore_record_payload(self);
-        }
-        if self.null_flag || !self.has_record() {
+        let Some((local, payload_size)) = return_if_io!(self.fetch_payload_static()) else {
             return Ok(IOResult::Done(None));
+        };
+        if local.len() == payload_size {
+            return Ok(IOResult::Done(Some(local)));
         }
-        let noted = self.noted_payload;
-        if noted.size != 0 {
-            let size = noted.size as usize;
-            // A cell that keeps its whole payload on the page: the rowid
-            // read already found where it starts.
-            if size <= self.payload_limits.max_local_table {
-                let start = noted.start as usize;
-                let contents = self.stack.top_ref().get_contents();
-                if let Some(payload) = contents.payload_on_page(start, size) {
-                    return Ok(IOResult::Done(Some(payload)));
-                }
-            }
-        }
-        let contents = self.stack.top_ref().get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
-        // If this fails, we'll degrade to the slower path.
-        if let Some((payload, start)) =
-            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
-        {
-            self.noted_payload = NotedPayload {
-                start: start as u32,
-                size: payload.len() as u32,
-            };
-            return Ok(IOResult::Done(Some(payload)));
-        }
-        return self.record_payload_general();
-
-        #[inline(never)]
-        fn restore_record_payload(cursor: &mut BTreeCursor) -> IOResultOr<Option<&[u8]>> {
-            return_if_io!(cursor.restore_context());
-            cursor.record_payload()
-        }
+        let record = return_if_io!(self.record());
+        Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         self.noted_payload = NotedPayload::NONE;
+        // invalidateOverflowCache in sqlite3BtreeInsert and sqlite3BtreeDelete:
+        // the write may change the cells under the cursor.
+        self.blob_cache.reset();
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
         return_if_io!(self.insert_into_page(key));
@@ -6952,6 +7040,7 @@ impl CursorTrait for BTreeCursor {
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> IOResultOr<()> {
         self.noted_payload = NotedPayload::NONE;
+        self.blob_cache.reset();
         if let CursorState::None = &self.state {
             // saveAllCursors at the head of sqlite3BtreeDelete (btree.c:9841). The
             // cursor is positioned on the row being deleted, so its rowid tells peer
@@ -6991,10 +7080,14 @@ impl CursorTrait for BTreeCursor {
                 }
 
                 DeleteState::DeterminePostBalancingSeekKey => {
-                    // FIXME: skip this work if we determine deletion wont result in balancing
-                    // Right now we calculate the key every time for simplicity/debugging
-                    // since it won't affect correctness which is more important
                     let page = self.stack.top_ref();
+                    let cell_idx = self.stack.current_cell_index() as usize;
+                    if !delete_may_need_balancing(page.get_contents(), cell_idx, usable_space)? {
+                        self.state = CursorState::Delete(DeleteState::LoadPage {
+                            post_balancing_seek_key: None,
+                        });
+                        continue;
+                    }
                     let target_key = if page.is_index()? {
                         let record = match return_if_io!(self.record()) {
                             Some(record) => record.clone(),
@@ -7489,37 +7582,28 @@ impl CursorTrait for BTreeCursor {
                             }
                         }
                     } else {
-                        // Move to child left page
-                        let cell = contents.cell_get(cell_idx, self.usable_space())?;
+                        // Move to child left page.
+                        // Avoid full cell decoding (transmute, varint parsing, record building)
+                        // by directly reading the 4-byte left child pointer.
+                        let left_child_page =
+                            contents.cell_interior_read_left_child_page(cell_idx)?;
 
-                        match cell {
-                            BTreeCell::TableInteriorCell(TableInteriorCell {
-                                left_child_page,
-                                ..
-                            })
-                            | BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                                left_child_page,
-                                ..
-                            }) => {
-                                // Same re-entry handling as the rightmost
-                                // branch above.
-                                match self.pager.read_page(left_child_page as i64)? {
-                                    IOResult::Done((child, c)) => {
-                                        self.stack.advance();
-                                        self.stack.push(child)?;
-                                        if let Some(c) = c {
-                                            io_yield_one!(c);
-                                        }
-                                    }
-                                    IOResult::IO(IOCompletions(spill_c)) => {
-                                        self.count_state = CountState::Descend {
-                                            target: left_child_page as i64,
-                                        };
-                                        io_yield_one!(spill_c);
-                                    }
+                        // Same re-entry handling as the rightmost
+                        // branch above.
+                        match self.pager.read_page(left_child_page as i64)? {
+                            IOResult::Done((child, c)) => {
+                                self.stack.advance();
+                                self.stack.push(child)?;
+                                if let Some(c) = c {
+                                    io_yield_one!(c);
                                 }
                             }
-                            _ => unreachable!(),
+                            IOResult::IO(IOCompletions(spill_c)) => {
+                                self.count_state = CountState::Descend {
+                                    target: left_child_page as i64,
+                                };
+                                io_yield_one!(spill_c);
+                            }
                         }
                     }
                 }
@@ -7568,7 +7652,6 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         self.clear_saved_seek();
-        self.skip_advance = false;
         loop {
             match self.rewind_state {
                 RewindState::Start => {
@@ -7599,6 +7682,10 @@ impl CursorTrait for BTreeCursor {
     #[inline]
     fn invalidate_record(&mut self) {
         self.noted_payload = NotedPayload::NONE;
+        // SQLite clears BTCF_ValidOvfl on every cursor move: the next row
+        // read parses the cell again and drops the overflow page list and
+        // the kept bytes, which may belong to an earlier version of the row.
+        self.blob_cache.valid = false;
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }
@@ -7622,6 +7709,8 @@ impl CursorTrait for BTreeCursor {
     /// next; next/prev land on `current_page == -1` and return Done(false).
     fn invalidate_btree_cache(&mut self) {
         self.stack.clear();
+        self.balance_state.sub_state = BalanceSubState::Start;
+        self.balance_state.balance_info = None;
         self.has_record = false;
         self.noted_payload = NotedPayload::NONE;
         self.move_to_right_state.1 = None;
@@ -7682,7 +7771,8 @@ impl CursorTrait for BTreeCursor {
         // Idempotent, so safe across IO re-entry into this function.
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
-        if self.valid_state != CursorValidState::Valid || !self.has_record() {
+        if self.valid_state != CursorValidState::Valid || !(self.has_record() || self.skip_advance)
+        {
             // Nothing to save: cursor has no live position. No invalidation
             // needed either — the stack is already in a state where the next
             // entry point will re-navigate from the root.
@@ -7704,48 +7794,67 @@ impl CursorTrait for BTreeCursor {
         if cell_idx < 0 {
             return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
         }
-        let (is_table, cell_count) = {
+        let (is_table, is_leaf, cell_count) = {
             let page = self.stack.top_ref();
             let contents = page.get_contents();
-            (contents.page_type()?.is_table(), contents.cell_count())
+            (
+                contents.page_type()?.is_table(),
+                contents.is_leaf(),
+                contents.cell_count(),
+            )
         };
-        if (cell_idx as usize) >= cell_count {
+        // With skip_advance, the next next() returns the cell at cell_idx
+        // without advancing, i.e. the cursor is in a gap (e.g. its row was
+        // deleted). Save the gap, not a row:
+        //   gap before cell K:                SeekTo(K, GE { eq_only: false })
+        //   gap after the leaf's last cell K: SeekTo(K, GT)
+        // restore_context sees the non-exact op and puts the cursor back in
+        // the gap. Without skip_advance, save the exact row as before.
+        let (key_cell, seek_op) = if !self.skip_advance {
+            if (cell_idx as usize) >= cell_count {
+                return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
+            }
+            (cell_idx as usize, SeekOp::GE { eq_only: true })
+        } else if (cell_idx as usize) < cell_count {
+            (cell_idx as usize, SeekOp::GE { eq_only: false })
+        } else if is_leaf && cell_count > 0 && cell_idx as usize == cell_count {
+            (cell_count - 1, SeekOp::GT)
+        } else {
             return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
-        }
+        };
         if is_table {
             let page = self.stack.top_ref();
             let contents = page.get_contents();
             debug_assert!(
                 matches!(contents.page_type(), Ok(PageType::TableLeaf)),
-                "save_position: table cursor with has_record=true must be on a leaf"
+                "save_position: table cursor with a saved position must be on a leaf"
             );
-            let rowid = contents.cell_table_leaf_read_rowid(cell_idx as usize)?;
+            let rowid = contents.cell_table_leaf_read_rowid(key_cell)?;
             self.save_context(CursorContext {
                 key: CursorContextKey::TableRowId(rowid),
-                seek_op: SeekOp::GE { eq_only: true },
+                seek_op,
             });
             return Ok(IOResult::Done(SavePositionResult::Saved));
         }
-        // Index btree: yield IO for overflow chains. Allocate to the actual
-        // payload size so wide-key indexes don't keep a page-sized buffer
-        // per saved cursor.
-        let cloned = {
-            let record = return_if_io!(self.record());
-            let record = record.expect("has_record=true but record() returned None");
-            let payload = record.get_payload();
-            let mut owned = crate::with_btree_allocation_site!(
-                SavedCursorRecord,
-                ImmutableRecord::new(payload.len())
-            )?;
-            crate::with_btree_allocation_site!(
-                SavedCursorRecord,
-                owned.start_serialization(payload)
-            )?;
-            owned
-        };
+        // record() only reads the cell when has_record is set. A cursor in a
+        // gap has no record, so point it at key_cell to copy the key, then
+        // move it back (also when the read yields IO).
+        let in_gap = !self.has_record();
+        if in_gap {
+            self.stack.set_cell_index(key_cell as i32);
+            self.set_has_record(true);
+            self.invalidate_record();
+        }
+        let cloned = self.copy_current_index_record();
+        if in_gap {
+            self.stack.set_cell_index(cell_idx);
+            self.set_has_record(false);
+            self.invalidate_record();
+        }
+        let cloned = return_if_io!(cloned);
         self.save_context(CursorContext {
             key: CursorContextKey::IndexKeyRowId(ImmutableRecordRef::from_owned_record(cloned)),
-            seek_op: SeekOp::GE { eq_only: true },
+            seek_op,
         });
         Ok(IOResult::Done(SavePositionResult::Saved))
     }
@@ -7837,22 +7946,171 @@ impl CursorTrait for BTreeCursor {
 }
 
 impl BTreeCursor {
-    #[inline(never)]
-    fn record_payload_general(&mut self) -> IOResultOr<Option<&[u8]>> {
-        let page = self.stack.top_ref();
-        let contents = page.get_contents();
+    /// Index btree: yields IO for overflow chains. Allocates to the actual
+    /// payload size so wide-key indexes don't keep a page-sized buffer per
+    /// saved cursor.
+    fn copy_current_index_record(&mut self) -> IOResultOr<ImmutableRecord> {
+        let record = return_if_io!(self.record());
+        let record = record.expect("has_record=true but record() returned None");
+        let payload = record.get_payload();
+        let mut owned = crate::with_btree_allocation_site!(
+            SavedCursorRecord,
+            ImmutableRecord::new(payload.len())
+        )?;
+        crate::with_btree_allocation_site!(SavedCursorRecord, owned.start_serialization(payload))?;
+        Ok(IOResult::Done(owned))
+    }
+
+    /// The bytes of the current record that are stored on the b-tree page,
+    /// and the size of the whole record. The two differ when the record
+    /// spills into overflow pages; `read_payload` reads any part of it.
+    /// Like SQLite's sqlite3BtreePayloadFetch and sqlite3BtreePayloadSize.
+    #[inline(always)]
+    pub(crate) fn payload_fetch(&mut self) -> IOResultOr<Option<(&[u8], usize)>> {
+        self.fetch_payload_static()
+    }
+
+    /// The columns of the current record's header, and the record bytes stored
+    /// on the b-tree page. Like SQLite's OP_Column, a header that does not fit
+    /// on the page is read on its own, and the page bytes then come back empty
+    /// so that every value is read through `read_payload`.
+    pub(crate) fn record_columns(&mut self) -> IOResultOr<(HeaderColumns<'_>, &[u8])> {
+        let Some((local, payload_size)) = return_if_io!(self.fetch_payload_static()) else {
+            return Err(LimboError::InternalError(
+                "reading a record header needs a row under the cursor".to_string(),
+            )
+            .into());
+        };
+        // The header-size varint itself is always local: either the record fits
+        // entirely in the local payload, or SQLite's minimum-local formula keeps
+        // well over 9 bytes (one max-size varint) on the leaf. A truncated varint
+        // here therefore means a corrupt cell, and read_varint reports it as such.
+        let (header_size, hpos0) = read_varint(local)?;
+        let header_size = usize::try_from(header_size)
+            .ok()
+            .filter(|&size| size >= hpos0 && size <= payload_size && size <= MAX_RECORD_HEADER_SIZE)
+            .ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "record header size {header_size} out of bounds (payload {payload_size})"
+                ))
+            })?;
+        if header_size <= local.len() {
+            let columns = HeaderColumns::new(&local[..header_size], hpos0, payload_size);
+            return Ok(IOResult::Done((columns, local)));
+        }
+        let header = return_if_io!(self.read_payload(KeptRead::Header, 0, header_size));
+        Ok(IOResult::Done((
+            HeaderColumns::new(header, hpos0, payload_size),
+            &[],
+        )))
+    }
+
+    /// The `len` bytes of the current record that start at byte `offset`, like
+    /// SQLite's sqlite3BtreePayload, read into the cursor's `which` buffer (see
+    /// [`KeptPayloadRead`]).
+    pub(crate) fn read_payload(
+        &mut self,
+        which: KeptRead,
+        offset: usize,
+        len: usize,
+    ) -> IOResultOr<&[u8]> {
+        self.ensure_payload_layout()?;
+        let mut kept = std::mem::take(self.blob_cache.kept_read_mut(which));
+        if !(kept.valid && kept.offset == offset && kept.len == len) {
+            kept.bytes.clear();
+            match which {
+                KeptRead::Header => crate::with_btree_allocation_site!(
+                    BlobRecordHeader,
+                    kept.bytes.try_reserve(len)
+                )?,
+                KeptRead::Values => {
+                    crate::with_btree_allocation_site!(OverflowRead, kept.bytes.try_reserve(len))?
+                }
+            }
+            kept.valid = true;
+            kept.offset = offset;
+            kept.len = len;
+        }
+        let read = kept.bytes.len();
+        let copied = self.copy_payload_range(offset + read, len - read, |chunk| {
+            kept.bytes.extend_from_slice(chunk)
+        });
+        *self.blob_cache.kept_read_mut(which) = kept;
+        return_if_io!(copied);
+        Ok(IOResult::Done(&self.blob_cache.kept_read_mut(which).bytes))
+    }
+
+    /// `payload_fetch` with the page bytes typed as `'static`. `record_payload`
+    /// needs that: it either returns these bytes or goes on to call
+    /// `self.record()`, and with the bytes borrowing `self` the borrow checker
+    /// rejects the second branch.
+    #[inline(always)]
+    fn fetch_payload_static(&mut self) -> IOResultOr<Option<(&'static [u8], usize)>> {
+        if self.needs_restore() {
+            return restore_and_fetch_payload(self);
+        }
+        if self.null_flag || !self.has_record() {
+            return Ok(IOResult::Done(None));
+        }
+        let noted = self.noted_payload;
+        if noted.size != 0 {
+            let size = noted.size as usize;
+            // A cell that keeps its whole payload on the page: the rowid
+            // read already found where it starts.
+            if size <= self.payload_limits.max_local_table {
+                let start = noted.start as usize;
+                let contents = self.stack.top_ref().get_contents();
+                if let Some(payload) = contents.payload_on_page(start, size) {
+                    return Ok(IOResult::Done(Some((payload, size))));
+                }
+            }
+        }
+        let contents = self.stack.top_ref().get_contents();
         let cell_idx = self.stack.current_cell_index();
-        let (payload, payload_start, _payload_size, first_overflow_page) =
-            contents.cell_read_payload_at(cell_idx as usize, self.payload_limits)?;
-        if first_overflow_page.is_none() {
+        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
+        // If this fails, we'll degrade to the slower path.
+        if let Some((payload, start)) =
+            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
+        {
             self.noted_payload = NotedPayload {
-                start: payload_start as u32,
+                start: start as u32,
                 size: payload.len() as u32,
             };
-            return Ok(IOResult::Done(Some(payload)));
+            return Ok(IOResult::Done(Some((payload, payload.len()))));
         }
-        let record = return_if_io!(self.record());
-        Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
+        return self.fetch_payload_general();
+
+        #[inline(never)]
+        fn restore_and_fetch_payload(
+            cursor: &mut BTreeCursor,
+        ) -> IOResultOr<Option<(&'static [u8], usize)>> {
+            return_if_io!(cursor.restore_context());
+            cursor.fetch_payload_static()
+        }
+    }
+
+    /// Parses the cell once into `blob_cache`, so the further reads of an
+    /// overflowing row find its layout there, as SQLite keeps BtCursor.info.
+    #[inline(never)]
+    fn fetch_payload_general(&mut self) -> IOResultOr<Option<(&'static [u8], usize)>> {
+        self.ensure_payload_layout()?;
+        let c = &self.blob_cache;
+        let contents = self.stack.top_ref().get_contents();
+        let Some(payload) = contents.payload_on_page(c.local_off, c.local_len) else {
+            return Err(LimboError::Corrupt(format!(
+                "cell payload {}..{} is outside the page",
+                c.local_off,
+                c.local_off + c.local_len
+            ))
+            .into());
+        };
+        if c.first_overflow.is_none() {
+            self.noted_payload = NotedPayload {
+                start: c.local_off as u32,
+                size: c.local_len as u32,
+            };
+        }
+        Ok(IOResult::Done(Some((payload, c.payload_size))))
     }
 
     /// True when the next cell is on the same leaf page and no resumable
@@ -7940,6 +8198,15 @@ pub enum IntegrityCheckError {
         page_id: i64,
         start: usize,
         end: usize,
+    },
+    #[error(
+        "Page {page_id} freeblock list not in ascending order at pc={pc} size={size} next={next}"
+    )]
+    FreeBlockOutOfOrder {
+        page_id: i64,
+        pc: usize,
+        size: usize,
+        next: usize,
     },
     #[error("Page {page_id} cell overlap detected at position={start} with previous_end={prev_end}. content_area={content_area}, is_free_block={is_free_block}")]
     CellOverlap {
@@ -8571,6 +8838,18 @@ pub fn integrity_check(
                     break;
                 }
                 coverage_checker.add_free_block(pc, pc + size);
+                if next != 0 && next <= pc + size + 3 {
+                    push_integrity_error(
+                        errors,
+                        IntegrityCheckError::FreeBlockOutOfOrder {
+                            page_id: page.get().id() as i64,
+                            pc,
+                            size,
+                            next,
+                        },
+                    )?;
+                    break;
+                }
                 pc = next;
             }
         }
@@ -10548,6 +10827,21 @@ pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: usize)
     ((usable_space - 12) * 32 / 255) - 23
 }
 
+/// Same rule as `sqlite3BtreeDelete`: an interior delete may always need balancing, and a leaf
+/// delete needs it when the freed cell and its 2-byte cell pointer leave more than 2/3 of the page free.
+fn delete_may_need_balancing(
+    page: &PageContent,
+    cell_idx: usize,
+    usable_space: usize,
+) -> Result<bool> {
+    if !page.is_leaf() || page.cell_count() == 1 || !page.overflow_cells.is_empty() {
+        return Ok(true);
+    }
+    let (_, cell_len) = page.cell_get_raw_region(cell_idx, usable_space)?;
+    let free_space_after_delete = compute_free_space(page, usable_space)? + cell_len + 2;
+    Ok(free_space_after_delete * 3 > usable_space * 2)
+}
+
 /// Drop a cell from a page.
 /// This is done by freeing the range of bytes that the cell occupies.
 #[inline]
@@ -11994,6 +12288,7 @@ mod tests {
                 has_rowid: false,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             };
             let num_columns = index_def.columns.len();
             let mut cursor =
@@ -12170,6 +12465,7 @@ mod tests {
                 has_rowid: false,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             };
             let mut cursor =
                 BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
@@ -12433,6 +12729,58 @@ mod tests {
     }
 
     #[test]
+    fn leaf_delete_balancing_prediction_matches_underflow_after_drop() {
+        let (db, _temp_dir) = get_database();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let usable_space = 4096;
+        let mut rng = ChaCha8Rng::seed_from_u64(1700);
+        let mut predicted_no_balancing = 0;
+        let mut predicted_balancing = 0;
+
+        for _ in 0..1000 {
+            let page = get_page(2);
+            let page_contents = page.get_contents();
+            let mut rowid = 0;
+            loop {
+                let blob_len = rng.random_range(1..300);
+                if compute_free_space(page_contents, usable_space).unwrap() < blob_len + 20 {
+                    break;
+                }
+                let regs = &[Register::Value(Value::from_blob(
+                    crate::alloc::vec![0xab; blob_len],
+                ))];
+                let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+                add_record(
+                    rowid,
+                    page_contents.cell_count(),
+                    page.clone(),
+                    record,
+                    &conn,
+                );
+                rowid += 1;
+            }
+
+            while page_contents.cell_count() > 1 {
+                let cell_idx = rng.random_range(0..page_contents.cell_count());
+                let predicted =
+                    delete_may_need_balancing(page_contents, cell_idx, usable_space).unwrap();
+                drop_cell(page_contents, cell_idx, usable_space).unwrap();
+                let free_space = compute_free_space(page_contents, usable_space).unwrap();
+                assert_eq!(predicted, free_space * 3 > usable_space * 2);
+                if predicted {
+                    predicted_balancing += 1;
+                } else {
+                    predicted_no_balancing += 1;
+                }
+            }
+            assert!(delete_may_need_balancing(page_contents, 0, usable_space).unwrap());
+        }
+
+        assert!(predicted_no_balancing > 0);
+        assert!(predicted_balancing > 0);
+    }
+
+    #[test]
     pub fn btree_insert_fuzz_run_equal_size() {
         for size in 1..8 {
             tracing::info!("======= size:{} =======", size);
@@ -12524,6 +12872,7 @@ mod tests {
                 has_rowid: false,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             };
             let mut cursor =
                 BTreeCursor::new_index(pager.clone(), index_root_page, &index_def, 1).unwrap();
@@ -13371,6 +13720,42 @@ mod tests {
         Ok(())
     }
 
+    /// Verify that count() correctly navigates multi-level B-trees with interior
+    /// pages and reads left-child pointers accurately.
+    #[test]
+    pub fn test_btree_count_multi_level_table() -> Result<()> {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 1;
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
+
+        // Insert enough records with moderate payload to force multi-level B-tree splits
+        let n = 300;
+        for rowid in 1..=n {
+            let blob = crate::alloc::vec![0xAA; 60];
+            insert_record(&mut cursor, &pager, rowid, Value::Blob(blob))?;
+        }
+
+        // Verify root has split and is indeed an interior page
+        let (root, _) = pager.io.block(|| pager.read_page(root_page))?;
+        while root.is_locked() {
+            pager.io.step()?;
+        }
+        let root_type = root.get_contents().page_type()?;
+        assert!(
+            matches!(root_type, PageType::TableInterior),
+            "expected multi-level tree with TableInterior root, got {root_type:?}"
+        );
+
+        // Count via cursor must accurately traverse interior pages and leaf pages
+        let count = run_until_done(|| cursor.count(), pager.deref())?;
+        assert_eq!(
+            count, n as usize,
+            "multi-level table count must equal the number of inserted records"
+        );
+
+        Ok(())
+    }
+
     #[test]
     pub fn test_clear_btree_with_overflow_pages() -> Result<()> {
         let (pager, root_page, _, _) = empty_btree();
@@ -14125,6 +14510,241 @@ mod tests {
         dbg!(free);
     }
 
+    /// Does what NewRowid followed by an Insert without a seek do on one
+    /// cursor: move to the last row, read its rowid, step past it, insert.
+    fn append_with_new_rowid(cursor: &mut BTreeCursor, pager: &Arc<Pager>) -> i64 {
+        run_until_done(|| cursor.seek_to_last(), pager.deref()).unwrap();
+        let max = run_until_done(|| cursor.rowid(), pager.deref()).unwrap();
+        let new_rowid = max.map_or(1, |m| m + 1);
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        let regs = &[Register::Value(Value::from_i64(new_rowid))];
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+        run_until_done(
+            || cursor.insert(&BTreeKey::new_table_rowid(new_rowid, Some(&record))),
+            pager.deref(),
+        )
+        .unwrap();
+        new_rowid
+    }
+
+    fn scan_rowids(pager: &Arc<Pager>, root_page: i64) -> Vec<i64> {
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+        let mut out = Vec::new();
+        while cursor.has_record() {
+            out.push(
+                run_until_done(|| cursor.rowid(), pager.deref())
+                    .unwrap()
+                    .unwrap(),
+            );
+            run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        }
+        out
+    }
+
+    /// Inserts rows 1..=3 and deletes row 2. The delete underflows the root
+    /// leaf, so the cursor is re-seeked onto row 3 and told that its next
+    /// next() must stay there.
+    fn three_rows_with_middle_deleted() -> (Arc<Pager>, i64, BTreeCursor) {
+        let (pager, root_page, _, _) = empty_btree();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        for rowid in 1..=3 {
+            insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid)).unwrap();
+        }
+        run_until_done(
+            || cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+        assert!(cursor.skip_advance);
+        (pager, root_page, cursor)
+    }
+
+    #[test]
+    fn prev_after_delete_lets_next_advance() {
+        let (pager, _, mut cursor) = three_rows_with_middle_deleted();
+        run_until_done(|| cursor.prev(), pager.deref()).unwrap();
+        let after_prev = run_until_done(|| cursor.rowid(), pager.deref()).unwrap();
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        let after_next = run_until_done(|| cursor.rowid(), pager.deref()).unwrap();
+        assert_eq!((after_prev, after_next), (Some(1), Some(3)));
+    }
+
+    #[test]
+    fn last_after_delete_then_next_reaches_end() {
+        let (pager, _, mut cursor) = three_rows_with_middle_deleted();
+        run_until_done(|| cursor.last(), pager.deref()).unwrap();
+        assert_eq!(
+            run_until_done(|| cursor.rowid(), pager.deref()).unwrap(),
+            Some(3)
+        );
+        run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        assert!(!cursor.has_record());
+    }
+
+    #[test]
+    fn new_rowid_after_delete_appends_after_last_row() {
+        let (pager, root_page, mut cursor) = three_rows_with_middle_deleted();
+        let new_rowid = append_with_new_rowid(&mut cursor, &pager);
+        assert_eq!(new_rowid, 4);
+        assert_eq!(scan_rowids(&pager, root_page), vec![1, 3, 4]);
+        let found = run_until_done(
+            || cursor.seek(SeekKey::TableRowId(4), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::Found);
+    }
+
+    /// Same as above over more tree shapes: one leaf or many, deleting the
+    /// first, middle, or last row, or every row one by one.
+    #[test]
+    fn new_rowid_after_delete_appends_after_last_row_in_any_tree_shape() {
+        for n in [1i64, 2, 3, 10, 200] {
+            for large in [false, true] {
+                for target in ["min", "max", "mid", "drain"] {
+                    let (pager, root_page, _, _) = empty_btree();
+                    let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+                    for rowid in 1..=n {
+                        let v = if large {
+                            Value::Text(Text::new("x".repeat(300)))
+                        } else {
+                            Value::from_i64(rowid)
+                        };
+                        insert_record(&mut cursor, &pager, rowid, v).unwrap();
+                    }
+                    let mut expected: Vec<i64> = (1..=n).collect();
+                    let victims: Vec<i64> = match target {
+                        "min" => vec![1],
+                        "max" => vec![n],
+                        "mid" => vec![n / 2 + 1],
+                        _ => (1..=n).collect(),
+                    };
+                    for v in victims {
+                        let found = run_until_done(
+                            || cursor.seek(SeekKey::TableRowId(v), SeekOp::GE { eq_only: true }),
+                            pager.deref(),
+                        )
+                        .unwrap();
+                        assert_eq!(found, SeekResult::Found);
+                        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+                        expected.retain(|r| *r != v);
+                    }
+                    let new_rowid = append_with_new_rowid(&mut cursor, &pager);
+                    expected.push(new_rowid);
+                    expected.sort_unstable();
+                    let ctx = format!("n={n} large={large} target={target} new={new_rowid}");
+                    let found = run_until_done(
+                        || {
+                            cursor
+                                .seek(SeekKey::TableRowId(new_rowid), SeekOp::GE { eq_only: true })
+                        },
+                        pager.deref(),
+                    )
+                    .unwrap();
+                    assert_eq!(found, SeekResult::Found, "{ctx}");
+                    assert_eq!(scan_rowids(&pager, root_page), expected, "{ctx}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seek_after_delete_to_empty_clears_record_position() {
+        let (pager, root_page, _, _) = empty_btree();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+
+        insert_record(&mut cursor, &pager, 1, Value::from_i64(10)).unwrap();
+        let found = run_until_done(
+            || cursor.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::Found);
+        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+
+        let found = run_until_done(
+            || cursor.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::NotFound);
+        assert!(!cursor.has_record());
+        assert_eq!(
+            run_until_done(|| cursor.rowid(), pager.deref()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn index_seek_after_delete_to_empty_clears_record_position() {
+        let (pager, _, _, _) = empty_btree();
+        let root_page = run_until_done(
+            || pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()),
+            pager.deref(),
+        )
+        .unwrap() as i64;
+        let index = Index {
+            name: "seek_empty_index".to_string(),
+            where_clause: None,
+            columns: IndexColumn::new_many(["value".to_string()]),
+            table_name: "seek_empty_table".to_string(),
+            root_page,
+            unique: false,
+            ephemeral: false,
+            has_rowid: false,
+            index_method: None,
+            on_conflict: None,
+            constraint_name: None,
+        };
+        let mut cursor = BTreeCursor::new_index(pager.clone(), root_page, &index, 1).unwrap();
+        let registers = [Register::Value(Value::from_i64(10))];
+        let record = ImmutableRecord::from_registers(&registers, registers.len()).unwrap();
+
+        let found = run_until_done(
+            || {
+                cursor.seek(
+                    SeekKey::IndexKey(record.as_record_ref()),
+                    SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::NotFound);
+        run_until_done(
+            || cursor.insert(&BTreeKey::new_index_key(record.as_record_ref())),
+            pager.deref(),
+        )
+        .unwrap();
+        let found = run_until_done(
+            || {
+                cursor.seek(
+                    SeekKey::IndexKey(record.as_record_ref()),
+                    SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::Found);
+        run_until_done(|| cursor.delete(), pager.deref()).unwrap();
+
+        let found = run_until_done(
+            || {
+                cursor.seek(
+                    SeekKey::IndexKey(record.as_record_ref()),
+                    SeekOp::GE { eq_only: true },
+                )
+            },
+            pager.deref(),
+        )
+        .unwrap();
+        assert_eq!(found, SeekResult::NotFound);
+        assert!(!cursor.has_record());
+    }
+
     #[test]
     pub fn test_delete_balancing() {
         // What does this test do:
@@ -14674,6 +15294,293 @@ mod tests {
                 Some(6),
                 "next() after peer deletion of our row must land on the next-greater rowid"
             );
+        }
+
+        /// Deletes the last row of the first leaf while `peer` is on it. The
+        /// peer ends up past the leaf's last cell: no record, skip_advance set.
+        /// Returns the rowid of the row before the deleted one.
+        fn delete_last_row_of_first_leaf_under_peer(
+            pager: &Arc<Pager>,
+            writer: &mut BTreeCursor,
+            peer: &mut BTreeCursor,
+        ) -> i64 {
+            for rowid in (10..=200).step_by(10) {
+                insert_record(
+                    writer,
+                    pager,
+                    rowid,
+                    Value::Blob(crate::alloc::vec![0u8; 600]),
+                )
+                .unwrap();
+            }
+            run_until_done(|| peer.rewind(), pager.deref()).unwrap();
+            let mut previous_rowid = None;
+            loop {
+                let cell_count = peer.stack.top_ref().get_contents().cell_count();
+                if peer.stack.current_cell_index() as usize + 1 == cell_count {
+                    break;
+                }
+                previous_rowid = run_until_done(|| peer.rowid(), pager.deref()).unwrap();
+                run_until_done(|| peer.next(), pager.deref()).unwrap();
+            }
+            let deleted_rowid = run_until_done(|| peer.rowid(), pager.deref())
+                .unwrap()
+                .unwrap();
+
+            run_until_done(
+                || {
+                    writer.seek(
+                        SeekKey::TableRowId(deleted_rowid),
+                        SeekOp::GE { eq_only: true },
+                    )
+                },
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| writer.delete(), pager.deref()).unwrap();
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                None
+            );
+            assert!(peer.skip_advance && !peer.has_record());
+            previous_rowid.unwrap()
+        }
+
+        /// Inserts 1..=5 and the two rowids before `deleted_rowid`, which
+        /// splits the first leaf.
+        fn split_first_leaf(pager: &Arc<Pager>, writer: &mut BTreeCursor, deleted_rowid: i64) {
+            for rowid in (1..=5).chain(deleted_rowid - 2..deleted_rowid) {
+                insert_record(
+                    writer,
+                    pager,
+                    rowid,
+                    Value::Blob(crate::alloc::vec![0u8; 600]),
+                )
+                .unwrap();
+            }
+        }
+
+        #[test]
+        fn peer_after_last_cell_of_leaf_continues_forward_after_split() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+            let previous_rowid =
+                delete_last_row_of_first_leaf_under_peer(&pager, &mut writer, &mut peer);
+            let deleted_rowid = previous_rowid + 10;
+            split_first_leaf(&pager, &mut writer, deleted_rowid);
+
+            let mut rowids = Vec::new();
+            loop {
+                run_until_done(|| peer.next(), pager.deref()).unwrap();
+                match run_until_done(|| peer.rowid(), pager.deref()).unwrap() {
+                    Some(rowid) => rowids.push(rowid),
+                    None => break,
+                }
+            }
+            let expected: Vec<i64> = (deleted_rowid - 2..deleted_rowid)
+                .chain((deleted_rowid + 10..=200).step_by(10))
+                .collect();
+            assert_eq!(rowids, expected);
+        }
+
+        #[test]
+        fn peer_after_last_cell_of_leaf_continues_forward_after_two_splits() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+            let previous_rowid =
+                delete_last_row_of_first_leaf_under_peer(&pager, &mut writer, &mut peer);
+            let deleted_rowid = previous_rowid + 10;
+            split_first_leaf(&pager, &mut writer, deleted_rowid);
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                None
+            );
+            for rowid in (6..=9).chain(deleted_rowid + 1..deleted_rowid + 5) {
+                insert_record(
+                    &mut writer,
+                    &pager,
+                    rowid,
+                    Value::Blob(crate::alloc::vec![0u8; 600]),
+                )
+                .unwrap();
+            }
+
+            let mut rowids = Vec::new();
+            loop {
+                run_until_done(|| peer.next(), pager.deref()).unwrap();
+                match run_until_done(|| peer.rowid(), pager.deref()).unwrap() {
+                    Some(rowid) => rowids.push(rowid),
+                    None => break,
+                }
+            }
+            let expected: Vec<i64> = (deleted_rowid - 2..deleted_rowid)
+                .chain(deleted_rowid + 1..deleted_rowid + 5)
+                .chain((deleted_rowid + 10..=200).step_by(10))
+                .collect();
+            assert_eq!(rowids, expected);
+        }
+
+        #[test]
+        fn peer_after_last_cell_of_leaf_steps_back_to_that_cell_after_split() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+            let previous_rowid =
+                delete_last_row_of_first_leaf_under_peer(&pager, &mut writer, &mut peer);
+            split_first_leaf(&pager, &mut writer, previous_rowid + 10);
+
+            run_until_done(|| peer.prev(), pager.deref()).unwrap();
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                Some(previous_rowid)
+            );
+        }
+
+        #[test]
+        fn peer_left_on_emptied_tree_stays_at_end_after_split() {
+            let (pager, root_page, _db, _conn) = empty_btree();
+            let mut writer = make_registered_cursor(&pager, root_page, 1);
+            let mut peer = make_registered_cursor(&pager, root_page, 1);
+            insert_record(&mut writer, &pager, 10, Value::from_i64(10)).unwrap();
+            run_until_done(|| peer.rewind(), pager.deref()).unwrap();
+            run_until_done(
+                || writer.seek(SeekKey::TableRowId(10), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            run_until_done(|| writer.delete(), pager.deref()).unwrap();
+            assert_eq!(
+                run_until_done(|| peer.rowid(), pager.deref()).unwrap(),
+                None
+            );
+            assert!(peer.skip_advance && !peer.has_record());
+
+            for rowid in (20..=100).step_by(10) {
+                insert_record(
+                    &mut writer,
+                    &pager,
+                    rowid,
+                    Value::Blob(crate::alloc::vec![0u8; 600]),
+                )
+                .unwrap();
+            }
+
+            run_until_done(|| peer.next(), pager.deref()).unwrap();
+            assert!(!peer.has_record());
+        }
+
+        #[test]
+        fn index_peer_after_last_cell_of_leaf_continues_forward_after_two_inserts() {
+            let (pager, _, _db, _conn) = empty_btree();
+            let root_page = run_until_done(
+                || pager.btree_create(&crate::storage::pager::CreateBTreeFlags::new_index()),
+                pager.deref(),
+            )
+            .unwrap() as i64;
+            let index = Index {
+                name: "peer_index".to_string(),
+                where_clause: None,
+                columns: IndexColumn::new_many(["k".to_string(), "v".to_string()]),
+                table_name: "peer_table".to_string(),
+                root_page,
+                unique: false,
+                ephemeral: false,
+                has_rowid: false,
+                index_method: None,
+                on_conflict: None,
+                constraint_name: None,
+            };
+            let new_cursor = || {
+                let cursor =
+                    Box::new(BTreeCursor::new_index(pager.clone(), root_page, &index, 2).unwrap());
+                (*cursor).register_with_pager();
+                cursor
+            };
+            let mut writer = new_cursor();
+            let mut peer = new_cursor();
+            // Keys larger than a page's max local payload, so reading the
+            // saved key walks an overflow chain.
+            let key = |k: i64| {
+                let registers = [
+                    Register::Value(Value::from_i64(k)),
+                    Register::Value(Value::Blob(crate::alloc::vec![0u8; 1500])),
+                ];
+                ImmutableRecord::from_registers(&registers, registers.len()).unwrap()
+            };
+            let seek_writer = |writer: &mut BTreeCursor, k: i64| {
+                let record = key(k);
+                run_until_done(
+                    || {
+                        writer.seek(
+                            SeekKey::IndexKey(record.as_record_ref()),
+                            SeekOp::GE { eq_only: true },
+                        )
+                    },
+                    pager.deref(),
+                )
+                .unwrap()
+            };
+            let insert = |writer: &mut BTreeCursor, k: i64| {
+                seek_writer(writer, k);
+                let record = key(k);
+                run_until_done(
+                    || writer.insert(&BTreeKey::new_index_key(record.as_record_ref())),
+                    pager.deref(),
+                )
+                .unwrap();
+            };
+            let peer_key = |peer: &mut BTreeCursor| {
+                run_until_done(
+                    || {
+                        Ok(peer.record()?.map(|record| {
+                            record.map(|record| match record.first_value().unwrap() {
+                                ValueRef::Numeric(Numeric::Integer(k)) => k,
+                                value => panic!("unexpected key {value:?}"),
+                            })
+                        }))
+                    },
+                    pager.deref(),
+                )
+                .unwrap()
+            };
+            for k in (10..=300).step_by(10) {
+                insert(&mut writer, k);
+            }
+
+            run_until_done(|| peer.rewind(), pager.deref()).unwrap();
+            while peer.stack.current_cell_index() as usize + 1
+                != peer.stack.top_ref().get_contents().cell_count()
+            {
+                run_until_done(|| peer.next(), pager.deref()).unwrap();
+            }
+            let deleted_key = peer_key(&mut peer).unwrap();
+            assert_eq!(seek_writer(&mut writer, deleted_key), SeekResult::Found);
+            run_until_done(|| writer.delete(), pager.deref()).unwrap();
+            assert_eq!(peer_key(&mut peer), None);
+            assert!(peer.skip_advance && !peer.has_record());
+
+            // Inserting 1000 doesn't split the first leaf, but the peer is
+            // restored onto the divider cell after the deleted key (an
+            // interior page). Inserting 1..=9 then splits the first leaf.
+            insert(&mut writer, 1000);
+            assert_eq!(peer_key(&mut peer), None);
+            assert!(!peer.stack.top_ref().get_contents().is_leaf());
+            for k in 1..=9 {
+                insert(&mut writer, k);
+            }
+
+            let mut keys = Vec::new();
+            loop {
+                run_until_done(|| peer.next(), pager.deref()).unwrap();
+                match peer_key(&mut peer) {
+                    Some(k) => keys.push(k),
+                    None => break,
+                }
+            }
+            let expected: Vec<i64> = (deleted_key + 10..=300).step_by(10).chain([1000]).collect();
+            assert_eq!(keys, expected);
         }
 
         #[test]

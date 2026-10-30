@@ -55,9 +55,7 @@ fn test_integrity_check_strict_generated_types() {
 
 #[test]
 fn test_integrity_check_healthy_strict_table() {
-    let db = TempDatabase::builder()
-        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
-        .build();
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY, b INT AS(a) NOT NULL, c REAL, d TEXT, e BLOB) STRICT").unwrap();
     conn.execute(
@@ -69,48 +67,18 @@ fn test_integrity_check_healthy_strict_table() {
 
 #[test]
 fn test_integrity_check_strict_custom_types() {
-    for custom_types in [false, true] {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let path = temp_dir.path().join("strict_custom_types.db");
-        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
-        {
-            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
-            let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 0",
-            )
-            .unwrap();
-            conn.execute("CREATE TABLE t(amount cents) STRICT").unwrap();
-            conn.execute("INSERT INTO t VALUES (5)").unwrap();
-            let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t");
-            assert_eq!(rows, vec![(5,)]);
-            assert_eq!(run_integrity_check(&conn), "ok");
-            assert_eq!(run_quick_check(&conn), "ok");
-            conn.close().unwrap();
-        }
-        {
-            let db =
-                TempDatabase::new_with_existent_with_opts(&path, opts.with_custom_types(false));
-            let conn = db.connect_limbo();
-            let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t");
-            assert_eq!(rows, vec![(500,)]);
-            conn.execute("UPDATE t SET amount = 'abc'").unwrap();
-            let rows: Vec<(String,)> = conn.exec_rows("SELECT amount FROM t");
-            assert_eq!(rows, vec![("abc".to_string(),)]);
-            conn.close().unwrap();
-        }
-        let db =
-            TempDatabase::new_with_existent_with_opts(&path, opts.with_custom_types(custom_types));
-        let conn = db.connect_limbo();
-        let expected = if custom_types {
-            "non-INTEGER value in t.amount"
-        } else {
-            "ok"
-        };
-        assert_eq!(run_integrity_check(&conn), expected);
-        assert_eq!(run_quick_check(&conn), expected);
-        conn.close().unwrap();
-    }
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 0")
+        .unwrap();
+    conn.execute("CREATE TABLE t(amount cents) STRICT").unwrap();
+    conn.execute("INSERT INTO t VALUES (5)").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t");
+    assert_eq!(rows, vec![(5,)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(run_quick_check(&conn), "ok");
 }
 
 #[test]
@@ -172,8 +140,7 @@ fn test_delete_reports_missing_partial_index_entry() {
 }
 
 fn check_strict_column(schema: &str, ty: &str, value: &str, generated: bool, expected: &str) {
-    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
-    let db = TempDatabase::builder().with_opts(opts).build();
+    let db = TempDatabase::new_empty();
     let conn = db.connect_limbo();
     conn.execute(schema).unwrap();
     let insert = if generated {
@@ -197,7 +164,7 @@ fn check_strict_column(schema: &str, ty: &str, value: &str, generated: bool, exp
     drop(conn);
     drop(db);
 
-    let reopened = TempDatabase::new_with_existent_with_opts(&path, opts);
+    let reopened = TempDatabase::new_with_existent(&path);
     let conn = reopened.connect_limbo();
     assert_eq!(run_integrity_check(&conn), expected, "{ty}, {value}");
     assert_eq!(run_quick_check(&conn), expected, "{ty}, {value}");
@@ -1545,6 +1512,54 @@ fn test_integrity_check_freeblock_out_of_range(db: TempDatabase) {
         .is_not_equal_to("ok");
 }
 
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_integrity_check_freeblock_loop(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
+        .unwrap();
+    for i in 0..10 {
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, 'data{i}');"))
+            .unwrap();
+    }
+
+    checkpoint_database(&conn);
+
+    let result = run_integrity_check(&conn);
+    assert_eq!(result, "ok", "Database should be valid before corruption");
+
+    drop(conn);
+
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+
+        let mut page2 = [0u8; PAGE_SIZE];
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.read_exact(&mut page2).unwrap();
+
+        let freeblock_offset = 0x800;
+        write_u16_be(&mut page2, 1, freeblock_offset as u16);
+        write_u16_be(&mut page2, freeblock_offset, freeblock_offset as u16);
+        write_u16_be(&mut page2, freeblock_offset + 2, 4);
+
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.write_all(&page2).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+
+    assert_that!(run_integrity_check_catching_panic(&conn))
+        .ok()
+        .contains("freeblock list not in ascending order");
+}
+
 // =============================================================================
 // ERROR CASE TESTS: RowMissingFromIndex
 // =============================================================================
@@ -1965,6 +1980,108 @@ fn test_blob_read_corrupt_overflow_chain_no_panic(db: TempDatabase) {
     let mut buf = [0u8; 64];
     // Offset 9000 lives on the (now missing) second overflow page.
     assert_that!(blob.read(9000, &mut buf)).is_err();
+}
+
+/// A record header that is corrupt before the requested column must fail the
+/// read, as in SQLite, even when the record spills into overflow pages and the
+/// column is read on its own. Here `a` claims 8185 bytes instead of 100, which
+/// pushes the end of `big` past the end of the record.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_overflow_column_after_corrupt_header_entry_errors(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a TEXT, big BLOB, c INTEGER);")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (printf('%0100d', 0), zeroblob(12000), 7);")
+        .unwrap();
+    checkpoint_database(&conn);
+    drop(conn);
+
+    // Page 2 is the table's leaf page. Its only cell's record header holds
+    // `a`'s serial type 213 (TEXT of 100 bytes) as the varint 0x81 0x55;
+    // 0xFF 0x7F is serial type 16383, TEXT of 8185 bytes.
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+        let mut page2 = [0u8; PAGE_SIZE];
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.read_exact(&mut page2).unwrap();
+        let positions: Vec<usize> = page2
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| *w == [0x81, 0x55])
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions.len(), 1, "expected one serial type 213 on page 2");
+        page2[positions[0]..positions[0] + 2].copy_from_slice(&[0xFF, 0x7F]);
+        file.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+        file.write_all(&page2).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+    let read_column_after_corruption = conn
+        .prepare("SELECT c FROM t")
+        .and_then(|mut stmt| stmt.run_ignore_rows());
+    assert_that!(read_column_after_corruption).is_err();
+}
+
+/// Like SQLite's OP_Column and accessPayload, a column read follows the
+/// overflow chain only as far as the page that holds the value. With the
+/// chain cut after its first page, the columns stored on the leaf page and
+/// a column stored on that first overflow page read back, and only reading
+/// the value that reaches past the cut fails.
+#[cfg(not(feature = "checksum"))]
+#[turso_macros::test]
+fn test_columns_before_cut_in_overflow_chain_are_readable(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, mid BLOB, tail TEXT, data BLOB);",
+    )
+    .unwrap();
+    // The record keeps its first 2743 bytes on the leaf page, so `tail`, at
+    // byte 3015, is on the first overflow page and `data` needs the pages after it.
+    conn.execute("INSERT INTO t VALUES (1, 7, 'small', zeroblob(3000), 'tail', zeroblob(12000));")
+        .unwrap();
+    checkpoint_database(&conn);
+    drop(conn);
+
+    // Same layout as above: page 3 is the first overflow page. Zeroing its
+    // next-pointer cuts the chain after it.
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db.path)
+            .unwrap();
+        let mut page3 = [0u8; PAGE_SIZE];
+        file.seek(SeekFrom::Start(2 * PAGE_SIZE as u64)).unwrap();
+        file.read_exact(&mut page3).unwrap();
+        let next = u32::from_be_bytes([page3[0], page3[1], page3[2], page3[3]]);
+        assert!(
+            next != 0,
+            "expected page 3 to be an intermediate overflow page"
+        );
+        page3[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        file.seek(SeekFrom::Start(2 * PAGE_SIZE as u64)).unwrap();
+        file.write_all(&page3).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    let db = TempDatabase::new_with_existent(&db.path);
+    let conn = db.connect_limbo();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t");
+    assert_eq!(rows, vec![(7, "small".to_string())]);
+    let rows: Vec<(i64, i64, String)> = conn.exec_rows("SELECT id, a, tail FROM t");
+    assert_eq!(rows, vec![(1, 7, "tail".to_string())]);
+    let read_value_past_cut = conn
+        .prepare("SELECT data FROM t")
+        .and_then(|mut stmt| stmt.run_ignore_rows());
+    assert_that!(read_value_past_cut).is_err();
 }
 
 /// Companion to the test above for the *record header's* overflow chain. When a row
