@@ -1619,9 +1619,7 @@ pub fn translate_alter_table(
                 program.emit_string8_new_reg(mangled_table_name.clone());
                 program.mark_last_insn_constant();
 
-                program.emit_string8_new_reg(
-                    resolver.mangle_name(namespace, &normalize_ident(new_name)),
-                );
+                program.emit_string8_new_reg(resolver.mangle_name(namespace, new_name));
                 program.mark_last_insn_constant();
 
                 let out = program.alloc_registers(5);

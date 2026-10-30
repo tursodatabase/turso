@@ -308,3 +308,23 @@ test create_table_existing_table_reported_before_body_errors {
 expect error {
     table t already exists
 }
+
+@cross-check-integrity
+test create-table-and-view-keep-declared-name-in-schema {
+    CREATE TABLE "Pk6" (id INTEGER, u TEXT UNIQUE);
+    CREATE VIEW testView AS SELECT * FROM "Pk6";
+    CREATE INDEX pk6_id ON pk6 (id);
+    INSERT INTO PK6 VALUES (1, 'a');
+    SELECT type, name, tbl_name FROM sqlite_schema WHERE type IN ('table', 'view') ORDER BY name;
+    SELECT tbl_name FROM sqlite_schema WHERE type = 'index' ORDER BY name;
+    SELECT * FROM pk6;
+    SELECT * FROM TESTVIEW;
+}
+expect {
+    table|Pk6|Pk6
+    view|testView|testView
+    Pk6
+    Pk6
+    1|a
+    1|a
+}

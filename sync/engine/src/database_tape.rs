@@ -2242,6 +2242,61 @@ mod tests {
     }
 
     #[test]
+    pub fn test_database_tape_replay_mixed_case_create_ddl_idempotent() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db =
+            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload TEXT)")
+                    .unwrap();
+
+                let opts = DatabaseReplaySessionOpts {
+                    use_implicit_rowid: false,
+                };
+                let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                for sql in [
+                    "CREATE INDEX \"IdxPayload\" ON t(payload)",
+                    "CREATE INDEX idxpayload ON t(payload)",
+                    "CREATE VIEW \"TestView\" AS SELECT * FROM t",
+                    "CREATE VIEW TESTVIEW AS SELECT * FROM t",
+                ] {
+                    session
+                        .replay(
+                            &coro,
+                            DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Create {
+                                sql: sql.to_string(),
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                }
+                session
+                    .replay(&coro, DatabaseTapeOperation::Commit)
+                    .await
+                    .unwrap();
+                crate::Result::Ok(())
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
     pub fn test_database_tape_replay_alter_table() {
         let temp_file1 = NamedTempFile::new().unwrap();
         let db_path1 = temp_file1.path().to_str().unwrap();
