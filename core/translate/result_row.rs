@@ -65,13 +65,16 @@ pub fn emit_select_result(
     // and CTE materialization. This is slightly over-broad (e.g., simple INSERT INTO ...
     // SELECT with no UNION doesn't need this), but we lack context here to distinguish
     // compound vs non-compound cases.
-    let disable_constant_opt = matches!(
-        plan.query_destination,
-        QueryDestination::EphemeralIndex { .. }
-            | QueryDestination::CoroutineYield { .. }
-            | QueryDestination::EphemeralTable { .. }
-            | QueryDestination::RecursiveCteQueue { .. }
-    );
+    // Keep result expressions in the row body when WHERE is constant false.
+    // The no-rows jump must skip expressions that produce no result row.
+    let disable_constant_opt = plan.contains_constant_false_condition
+        || matches!(
+            plan.query_destination,
+            QueryDestination::EphemeralIndex { .. }
+                | QueryDestination::CoroutineYield { .. }
+                | QueryDestination::EphemeralTable { .. }
+                | QueryDestination::RecursiveCteQueue { .. }
+        );
 
     if !skip_column_eval {
         for (i, rc) in plan.result_columns.iter().enumerate().filter(|(_, rc)| {
@@ -86,13 +89,18 @@ pub fn emit_select_result(
         }) {
             let reg = start_reg + i;
             if disable_constant_opt {
+                let reason = if plan.contains_constant_false_condition {
+                    NoConstantOptReason::FilteredResultRow
+                } else {
+                    NoConstantOptReason::RegisterReuse
+                };
                 translate_expr_no_constant_opt(
                     program,
                     Some(&plan.table_references),
                     &rc.expr,
                     reg,
                     resolver,
-                    NoConstantOptReason::RegisterReuse,
+                    reason,
                 )?;
             } else {
                 translate_expr(

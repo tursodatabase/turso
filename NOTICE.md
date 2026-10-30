@@ -89,3 +89,13 @@ The PostgreSQL frontend depends on Chumsky, distributed by the Chumsky authors:
 
 * License: licenses/chumsky-mit-license.md (MIT License)
 * Homepage: https://codeberg.org/zesterer/chumsky
+
+The PostgreSQL dump fuzzer uses Hegel, distributed by Antithesis, LLC:
+
+* License: licenses/testing/hegeltest-mit-license.md (MIT License)
+* Homepage: https://github.com/hegeldev/hegel-rust
+
+The PostgreSQL dump fuzzer uses comfy-table, distributed by its authors:
+
+* License: licenses/testing/comfy-table-mit-license.md (MIT License)
+* Homepage: https://github.com/nukesor/comfy-table

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::alloc::TursoSliceExt;
+use crate::translate::expr_context::{ExprContext, TableMetadata};
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
@@ -18,7 +19,7 @@ use crate::{
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
-        collate::in_subquery_side_collation,
+        collate::comparison_collation_across_queries,
         compound_select::emit_program_for_compound_select,
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
@@ -862,8 +863,10 @@ fn get_subquery_parser<'a>(
 
                 if reg_count == 1 {
                     if let Some(result_col) = plan.result_columns.first() {
-                        let affinity =
-                            get_expr_affinity(&result_col.expr, Some(&plan.table_references), None);
+                        let affinity = get_expr_affinity(
+                            &result_col.expr,
+                            &TableMetadata::new(Some(&plan.table_references)),
+                        );
                         resolver
                             .subquery_affinities
                             .borrow_mut()
@@ -998,25 +1001,23 @@ fn get_subquery_parser<'a>(
                         result_columns.len()
                     );
                 }
-                // Collect affinity and LHS collation in a single pass over lhs_columns.
-                // "x IN (SELECT y ...)" uses the collation of x
-                // (https://www.sqlite.org/datatype3.html#collation §7.1),
-                // so the ephemeral index must use the LHS collation for correct
-                // NotFound/Found probe comparisons.
+                // "x IN (SELECT y ...)" compares x and y like "x = y" does, so
+                // the ephemeral index uses the collation of that comparison
+                // for its NotFound/Found probes.
                 let mut affinity_chars = String::with_capacity(lhs_column_count);
-                let mut lhs_collations = Vec::with_capacity(lhs_column_count);
+                let mut lhs_exprs = Vec::with_capacity(lhs_column_count);
                 for (i, lhs_expr) in lhs_columns.enumerate() {
-                    let lhs_affinity = get_expr_affinity(lhs_expr, Some(referenced_tables), None);
+                    let lhs_affinity =
+                        get_expr_affinity(lhs_expr, &TableMetadata::new(Some(referenced_tables)));
                     affinity_chars.push(
                         comparison_affinity(
                             &result_columns[i].expr,
                             lhs_affinity,
-                            Some(table_references),
-                            None,
+                            &TableMetadata::new(Some(table_references)),
                         )
                         .aff_mask(),
                     );
-                    lhs_collations.push(in_subquery_side_collation(lhs_expr, referenced_tables)?);
+                    lhs_exprs.push(lhs_expr);
                 }
                 let in_affinity_str: Arc<String> = Arc::new(affinity_chars);
 
@@ -1024,13 +1025,19 @@ fn get_subquery_parser<'a>(
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let rhs_collation = in_subquery_side_collation(&c.expr, table_references)?;
+                        let collation = comparison_collation_across_queries(
+                            lhs_exprs[i],
+                            &ExprContext::new(Some(referenced_tables), resolver),
+                            &c.expr,
+                            &ExprContext::new(Some(table_references), resolver),
+                            &resolver.catalog,
+                        )?;
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),
                             order: SortOrder::Asc,
                             nulls_order: None,
                             pos_in_table: i,
-                            collation: lhs_collations[i].or(rhs_collation),
+                            collation,
                             default: None,
                             expr: None,
                         })

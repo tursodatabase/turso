@@ -87,6 +87,7 @@ fn emit_current_time_function(
         FuncCtx {
             func: Func::Scalar(func),
             arg_count: 0,
+            collation: CollationSeq::Binary,
         },
         &[],
         target_register,
@@ -369,7 +370,6 @@ pub(crate) fn seed_returning_row_image_in_cache<'a>(
         }),
         rowid_reg,
         false,
-        None,
     );
     for (i, column) in table.columns().iter().enumerate() {
         let raw_reg = if column.is_rowid_alias() {
@@ -395,12 +395,7 @@ pub(crate) fn seed_returning_row_image_in_cache<'a>(
             column: i,
             is_rowid_alias: column.is_rowid_alias(),
         };
-        resolver.cache_scalar_expr_reg(
-            std::borrow::Cow::Owned(expr),
-            decoded_reg,
-            false,
-            table_references,
-        )?;
+        resolver.cache_expr_reg(std::borrow::Cow::Owned(expr), decoded_reg, false);
     }
 
     Ok(ReturningRowImageCacheState {

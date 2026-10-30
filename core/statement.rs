@@ -202,6 +202,9 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    /// The command the statement was prepared from, when its SQL text cannot
+    /// be parsed again, so that preparing it again translates the command.
+    reprepare_cmd: Option<Cmd>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -283,6 +286,7 @@ impl Statement {
             is_blob_handle: false,
             nested_guard_active,
             analyze_refresh: None,
+            reprepare_cmd: None,
         }
     }
 
@@ -950,6 +954,12 @@ impl Statement {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    /// Makes preparing the statement again translate `cmd`, the command it
+    /// was prepared from, instead of parsing its SQL text.
+    pub(crate) fn reprepare_from(&mut self, cmd: Cmd) {
+        self.reprepare_cmd = Some(cmd);
+    }
+
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
@@ -963,8 +973,13 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
-            let cmd = cmd.expect("Same SQL string should be able to be parsed");
+            let cmd = match &self.reprepare_cmd {
+                Some(cmd) => cmd.clone(),
+                None => {
+                    let (cmd, _) = conn.parse_sql(&self.program.sql)?;
+                    cmd.expect("Same SQL string should be able to be parsed")
+                }
+            };
 
             let syms = conn.syms.read();
             let mode = self.query_mode;
@@ -1272,8 +1287,7 @@ impl Statement {
         let column = &self.program.result_columns.get(idx)?;
         let affinity = translate::expr::get_expr_affinity(
             &column.expr,
-            Some(&self.program.table_references),
-            None,
+            &translate::expr_context::TableMetadata::new(Some(&self.program.table_references)),
         );
         affinity_to_primitive(affinity).map(str::to_string)
     }

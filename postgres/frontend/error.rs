@@ -61,6 +61,16 @@ pub(crate) fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>)
     }))
 }
 
+/// The error PostgreSQL returns for every statement in an aborted
+/// transaction block, until COMMIT, ROLLBACK, or ROLLBACK TO SAVEPOINT
+/// ends it.
+pub(crate) fn in_failed_sql_transaction_error() -> LimboError {
+    sqlstate_error(
+        turso_pg_parser::sqlstate::SQLSTATE_IN_FAILED_SQL_TRANSACTION,
+        "current transaction is aborted, commands ignored until end of transaction block",
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct ErrorReport {
     pub sqlstate: &'static str,
@@ -83,7 +93,10 @@ impl From<&LimboError> for ErrorReport {
         };
         if let LimboError::ConstraintViolation(violation) = error {
             if let Some(table) = &violation.table_name {
-                report.table_name = Some(table.clone());
+                // Core names the table as it is stored; the user knows it by
+                // its bare name.
+                let table = turso_core::namespace::demangle_name(true, table).1;
+                report.table_name = Some(table.to_string());
                 report.constraint_name = constraint_name(violation, table);
                 if violation.kind == ConstraintKind::NotNull {
                     report.column_name = violation.column_names.first().cloned();

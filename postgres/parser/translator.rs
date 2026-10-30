@@ -5,7 +5,8 @@
 
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_UNDEFINED_FUNCTION,
+    SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -61,7 +62,7 @@ impl PostgreSQLTranslator {
         let schema = if range_var.schemaname.is_empty() {
             is_catalog_table_name(name.as_str()).then_some("main")
         } else {
-            Some(map_schema_name(&range_var.schemaname))
+            Some(schema_qualifier(&range_var.schemaname)?)
         };
         let mut qn = match schema {
             Some(schema) => ast::QualifiedName::fullname(exact_name(schema), name),
@@ -358,14 +359,13 @@ impl PostgreSQLTranslator {
                         col_def,
                         has_table_pk,
                         &tbl_name,
-                        &relation.schemaname,
                         &mut serial_sequences,
                         &mut check_names,
                     )?;
                     columns.push(col);
                 }
                 Node::Constraint(constraint) => {
-                    reject_constraint_attributes(constraint, &relation.schemaname)?;
+                    reject_constraint_attributes(constraint)?;
                     let contype =
                         ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
                     match contype {
@@ -373,7 +373,10 @@ impl PostgreSQLTranslator {
                             let pk_cols = extract_key_columns(&constraint.keys)?;
                             table_constraints.push(ast::NamedTableConstraint {
                                 name: if constraint.conname.is_empty() {
-                                    Some(exact_name(format!("{tbl_name_str}_pkey")))
+                                    Some(exact_name(format!(
+                                        "{}_pkey",
+                                        bare_table_name(&tbl_name_str)
+                                    )))
                                 } else {
                                     Some(exact_name(constraint.conname.clone()))
                                 },
@@ -512,7 +515,6 @@ impl PostgreSQLTranslator {
         col_def: &pg_query::protobuf::ColumnDef,
         has_table_pk: bool,
         tbl_name: &ast::QualifiedName,
-        table_schema: &str,
         serial_sequences: &mut Vec<String>,
         check_names: &mut std::collections::HashSet<String>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
@@ -544,7 +546,7 @@ impl PostgreSQLTranslator {
                     "unexpected column constraint node".into(),
                 ));
             };
-            reject_constraint_attributes(constraint, table_schema)?;
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
                 ConstrType::ConstrPrimary => {
@@ -630,13 +632,20 @@ impl PostgreSQLTranslator {
                 tbl_name.name.as_str().to_lowercase(),
                 name.to_lowercase()
             );
-            serial_sequences.push(seq_name.clone());
-            let namespace = serial_sequence_namespace(tbl_name);
+            // The stored text of a table of a schema names the table by its
+            // mangled name, and the sequence's mangled name is that name with
+            // the same suffix, so the default names the sequence that way.
+            let sequence = if bare_table_name(tbl_name.name.as_str()) != tbl_name.name.as_str() {
+                seq_name.clone()
+            } else {
+                format!("{}.{seq_name}", serial_sequence_namespace(tbl_name))
+            };
+            serial_sequences.push(seq_name);
             default_expr = Some(ast::Expr::FunctionCall {
                 name: exact_name("nextval"),
                 distinctness: None,
                 args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{namespace}.{seq_name}'"
+                    "'{sequence}'"
                 ))))],
                 order_by: vec![],
                 within_group: vec![],
@@ -650,10 +659,9 @@ impl PostgreSQLTranslator {
         // PRIMARY KEY (only on column level if there's no table-level PK)
         if is_primary_key && !has_table_pk {
             constraints.push(ast::NamedColumnConstraint {
-                name: Some(
-                    pk_conname
-                        .unwrap_or_else(|| exact_name(format!("{}_pkey", tbl_name.name.as_str()))),
-                ),
+                name: Some(pk_conname.unwrap_or_else(|| {
+                    exact_name(format!("{}_pkey", bare_table_name(tbl_name.name.as_str())))
+                })),
                 constraint: ast::ColumnConstraint::PrimaryKey {
                     order: None,
                     conflict_clause: None,
@@ -769,6 +777,12 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::TransactionStmtKind;
 
+        // Implementing AND CHAIN requires more than translation: on an
+        // aborted block PostgreSQL still starts the chained transaction, and
+        // the frontend's aborted-state redirect (tx_gate in
+        // postgres/frontend/statement.rs) ends the block without chaining.
+        // The and_chain_is_rejected_in_every_transaction_state test pins the
+        // rejection and says what must change.
         if txn.chain {
             return Err(not_supported("COMMIT/ROLLBACK AND CHAIN"));
         }
@@ -876,7 +890,7 @@ impl PostgreSQLTranslator {
                         ));
                     }
                 };
-                let col = self.translate_column_def(col_def, &relation.schemaname)?;
+                let col = self.translate_column_def(col_def)?;
                 ast::AlterTableBody::AddColumn(col)
             }
             AlterTableType::AtDropColumn => ast::AlterTableBody::DropColumn(exact_name(&cmd.name)),
@@ -901,7 +915,7 @@ impl PostgreSQLTranslator {
                 if col_def.raw_default.is_some() {
                     return Err(not_supported("ALTER COLUMN TYPE ... USING"));
                 }
-                self.translate_column_def(col_def, &relation.schemaname)?;
+                self.translate_column_def(col_def)?;
                 return Err(not_supported("ALTER TABLE ... ALTER COLUMN ... TYPE"));
             }
             AlterTableType::AtColumnDefault => {
@@ -990,7 +1004,6 @@ impl PostgreSQLTranslator {
     fn translate_column_def(
         &self,
         col_def: &pg_query::protobuf::ColumnDef,
-        table_schema: &str,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
@@ -1027,7 +1040,7 @@ impl PostgreSQLTranslator {
                     "unexpected column constraint node".into(),
                 ));
             };
-            reject_constraint_attributes(constraint, table_schema)?;
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             let constraint_ast = match contype {
                 ConstrType::ConstrNotnull => Some(ast::ColumnConstraint::NotNull {
@@ -1099,7 +1112,7 @@ impl PostgreSQLTranslator {
             ast::QualifiedName::single(exact_name(&idx.idxname))
         } else {
             ast::QualifiedName::fullname(
-                exact_name(map_schema_name(&relation.schemaname)),
+                exact_name(schema_qualifier(&relation.schemaname)?),
                 exact_name(&idx.idxname),
             )
         };
@@ -1202,7 +1215,7 @@ impl PostgreSQLTranslator {
                     [] => return Err(ParseError::ParseError("DROP: empty name list".into())),
                     [name] => ast::QualifiedName::single(exact_name(name.clone())),
                     [schema, name] => ast::QualifiedName::fullname(
-                        exact_name(map_schema_name(schema)),
+                        exact_name(schema_qualifier(schema)?),
                         exact_name(name.clone()),
                     ),
                     _ => return Err(not_supported("a cross-database reference")),
@@ -2203,7 +2216,10 @@ impl PostgreSQLTranslator {
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
         reject_column_aliases(&range_var.alias, "a table")?;
-        let qualified_name = self.qualified_name_from_range_var(range_var)?;
+        let mut qualified_name = self.qualified_name_from_range_var(range_var)?;
+        // The FROM item carries the alias; a name that carried it too would
+        // print it twice in stored SQL.
+        qualified_name.alias = None;
         let alias = match &range_var.alias {
             Some(a) => Some(a.aliasname.clone()),
             None if qualified_name.name.as_str() != range_var.relname => {
@@ -2906,7 +2922,7 @@ impl PostgreSQLTranslator {
                                         // schema.table.column. The table name is not mapped:
                                         // FROM aliases a renamed table with its original name.
                                         Ok(ast::Expr::DoublyQualified(
-                                            exact_name(map_schema_name(&parts[0])),
+                                            exact_name(schema_qualifier(&parts[0])?),
                                             exact_name(parts[1].clone()),
                                             exact_name(parts[2].clone()),
                                         ))
@@ -4993,7 +5009,7 @@ impl PostgreSQLTranslator {
                     "CREATE DOMAIN: unexpected constraint node".into(),
                 ));
             };
-            reject_constraint_attributes(constraint, "")?;
+            reject_constraint_attributes(constraint)?;
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
                 ConstrType::ConstrDefault => {
@@ -5276,6 +5292,7 @@ fn pg_check_constraint_name(
             }
         }
     }
+    let table_name = bare_table_name(table_name);
     let base = if let [column] = columns.as_slice() {
         format!("{table_name}_{column}_check")
     } else {
@@ -5298,19 +5315,50 @@ fn join_keeps_unmatched_right_rows(join: &ast::JoinedSelectTable) -> bool {
 }
 
 /// The namespace of the sequences of the serial columns of table `tbl_name`:
-/// the namespace of the table, or main when the table has none.
+/// the namespace of the table, or public when the table has none.
 fn serial_sequence_namespace(tbl_name: &ast::QualifiedName) -> String {
     tbl_name
         .namespace
         .as_ref()
         .map(|namespace| namespace.as_str().to_string())
-        .unwrap_or_else(|| "main".to_string())
+        .unwrap_or_else(|| "public".to_string())
+}
+
+/// The name of a table as the user knows it, for naming its constraints.
+/// Core stores a table of a schema under `__turso_ns<id>_<name>` and the
+/// stored text of a CREATE TABLE names it so; a constraint is named after
+/// the bare name, as PostgreSQL names it. See docs/internals/namespaces.md.
+fn bare_table_name(name: &str) -> &str {
+    let Some(rest) = name.strip_prefix("__turso_ns") else {
+        return name;
+    };
+    let digits = rest
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    match rest[digits..].strip_prefix('_') {
+        Some(bare) if digits > 0 => bare,
+        _ => name,
+    }
 }
 
 /// Maps a PostgreSQL schema name to the Turso schema that holds its tables.
+/// The schema that a qualifier written in a statement names. PostgreSQL has
+/// no schema called main or temp: those name databases of the engine, and
+/// an object stored under them would be in no schema the catalogs show.
+fn schema_qualifier(schema: &str) -> Result<&str, ParseError> {
+    if schema.eq_ignore_ascii_case("main") || schema.eq_ignore_ascii_case("temp") {
+        return Err(ParseError::Sqlstate {
+            sqlstate: SQLSTATE_INVALID_SCHEMA_NAME,
+            message: format!("schema \"{schema}\" does not exist"),
+        });
+    }
+    Ok(map_schema_name(schema))
+}
+
 fn map_schema_name(schema: &str) -> &str {
     match schema.to_ascii_lowercase().as_str() {
-        "pg_catalog" | "public" | "information_schema" => "main",
+        "pg_catalog" | "information_schema" => "main",
         _ => schema,
     }
 }
@@ -5894,6 +5942,7 @@ fn translate_create_enum(
             }],
             base: "text".into(),
             encode: Some(Box::new(encode)),
+            coerce: None,
             decode: Some(Box::new(decode)),
             operators: vec![ast::TypeOperator {
                 op: "<".into(),
@@ -6072,12 +6121,16 @@ fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>,
 fn extract_foreign_key(
     constraint: &pg_query::protobuf::Constraint,
 ) -> Result<PgForeignKey, ParseError> {
-    let ref_table = constraint
+    let pktable = constraint
         .pktable
         .as_ref()
-        .ok_or_else(|| ParseError::ParseError("REFERENCES missing table name".into()))?
-        .relname
-        .clone();
+        .ok_or_else(|| ParseError::ParseError("REFERENCES missing table name".into()))?;
+    if !pktable.schemaname.is_empty() && schema_qualifier(&pktable.schemaname)? != "main" {
+        return Err(not_supported(
+            "a foreign key naming a table of a schema that was not replaced by its mangled name",
+        ));
+    }
+    let ref_table = pktable.relname.clone();
     let ref_columns = extract_key_columns(&constraint.pk_attrs)?;
     let on_delete = pg_fk_action_to_string(&constraint.fk_del_action)?;
     let on_update = pg_fk_action_to_string(&constraint.fk_upd_action)?;
@@ -6111,8 +6164,17 @@ fn pg_fk_action_to_string(action: &str) -> Result<Option<String>, ParseError> {
 /// Represents a parsed SET statement from the PostgreSQL protocol.
 pub struct PgSetStmt {
     pub name: String,
-    pub values: Vec<PgSetValue>,
+    pub to: PgSetTo,
     pub is_local: bool,
+}
+
+/// What a SET statement sets its parameter to.
+pub enum PgSetTo {
+    Values(Vec<PgSetValue>),
+    /// RESET and SET ... TO DEFAULT.
+    Default,
+    /// SET ... FROM CURRENT, which keeps the current value.
+    Current,
 }
 
 #[derive(Clone)]
@@ -6181,10 +6243,35 @@ pub struct PgShowStmt {
     pub name: String,
 }
 
-/// Try to extract a SET statement from a PG parse result.
-/// Returns None if the statement is not a SET.
-pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
+/// Whether a parsed statement is one PostgreSQL still accepts inside an
+/// aborted transaction block: COMMIT/END, ROLLBACK/ABORT, or ROLLBACK TO
+/// SAVEPOINT (`IsTransactionExitStmt` in PostgreSQL's postgres.c).
+/// PostgreSQL's list also has PREPARE TRANSACTION; it is left out here
+/// deliberately while two-phase commit is unsupported.
+pub fn is_tx_exit_stmt(parse_result: &ParseResult) -> bool {
+    use pg_query::protobuf::TransactionStmtKind;
     use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(node) = nodes.first() else {
+        return false;
+    };
+    let NodeRef::TransactionStmt(txn) = &node.0 else {
+        return false;
+    };
+    matches!(
+        TransactionStmtKind::try_from(txn.kind),
+        Ok(TransactionStmtKind::TransStmtCommit
+            | TransactionStmtKind::TransStmtRollback
+            | TransactionStmtKind::TransStmtRollbackTo)
+    )
+}
+
+/// Try to extract a SET, SET ... TO DEFAULT, SET ... FROM CURRENT or RESET
+/// statement of one parameter from a PG parse result.
+/// Returns None if the statement is not one of those.
+pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
 
     if parse_result.protobuf.nodes().is_empty() {
         return None;
@@ -6196,23 +6283,44 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         _ => return None,
     };
 
-    // Only handle VAR_SET_VALUE (kind == 1)
-    if set_stmt.kind != 1 {
-        return None;
-    }
-
-    // Extract the value from args
-    let values = set_stmt
-        .args
-        .iter()
-        .map(PgSetValue::from_node)
-        .collect::<Option<Vec<_>>>()?;
+    let to = match VariableSetKind::try_from(set_stmt.kind).ok()? {
+        VariableSetKind::VarSetValue => PgSetTo::Values(
+            set_stmt
+                .args
+                .iter()
+                .map(PgSetValue::from_node)
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        VariableSetKind::VarSetDefault | VariableSetKind::VarReset => PgSetTo::Default,
+        VariableSetKind::VarSetCurrent => PgSetTo::Current,
+        _ => return None,
+    };
 
     Some(PgSetStmt {
         name: set_stmt.name.clone(),
-        values,
+        to,
         is_local: set_stmt.is_local,
     })
+}
+
+/// Returns true if the parse result is a RESET ALL statement.
+pub fn is_reset_all(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(NodeRef::VariableSetStmt(stmt)) if stmt.kind == VariableSetKind::VarResetAll as i32
+    )
+}
+
+/// Returns true if the parse result is a DISCARD ALL statement.
+pub fn is_discard_all(parse_result: &ParseResult) -> bool {
+    use pg_query::{protobuf::DiscardMode, NodeRef};
+
+    matches!(
+        parse_result.protobuf.nodes().first().map(|node| &node.0),
+        Some(NodeRef::DiscardStmt(stmt)) if stmt.target == DiscardMode::DiscardAll as i32
+    )
 }
 
 fn check_transaction_options(
@@ -7013,7 +7121,6 @@ fn not_supported(what: impl std::fmt::Display) -> ParseError {
 
 fn reject_constraint_attributes(
     constraint: &pg_query::protobuf::Constraint,
-    table_schema: &str,
 ) -> Result<(), ParseError> {
     use pg_query::protobuf::ConstrType;
 
@@ -7029,17 +7136,14 @@ fn reject_constraint_attributes(
             "a DEFERRABLE / INITIALLY DEFERRED constraint",
         ));
     }
-    if let Some(pktable) = &constraint.pktable {
-        let schema_of =
-            |s: &str| map_schema_name(if s.is_empty() { "public" } else { s }).to_string();
-        if !pktable.catalogname.is_empty()
-            || (!pktable.schemaname.is_empty()
-                && schema_of(&pktable.schemaname) != schema_of(table_schema))
-        {
-            return Err(not_supported(
-                "foreign key referencing a table in another schema",
-            ));
-        }
+    if constraint
+        .pktable
+        .as_ref()
+        .is_some_and(|pktable| !pktable.catalogname.is_empty())
+    {
+        return Err(not_supported(
+            "foreign key referencing a table in another database",
+        ));
     }
     if !constraint.including.is_empty() {
         return Err(not_supported("INCLUDE on a constraint"));
@@ -7327,8 +7431,10 @@ fn is_pg_catalog(schema: &str) -> bool {
     schema == "pg_catalog"
 }
 
+/// Whether `schema` names the schema that types and functions are looked
+/// up in anyway: the catalog, or public, where PostgreSQL puts user types.
 fn is_default_schema(schema: &str) -> bool {
-    map_schema_name(schema) == "main"
+    map_schema_name(schema) == "main" || schema.eq_ignore_ascii_case("public")
 }
 
 fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
@@ -10198,22 +10304,28 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_fk_other_schema() {
+    fn fail_closed_fk_other_database() {
+        assert_not_supported(
+            "CREATE TABLE c (a int REFERENCES db.other.p(id))",
+            "another database",
+        );
+        assert_not_supported(
+            "ALTER TABLE c ADD COLUMN a int REFERENCES db.other.p(id)",
+            "another database",
+        );
         assert_not_supported(
             "CREATE TABLE c (a int REFERENCES other.p(id))",
-            "another schema",
+            "replaced by its mangled name",
         );
         assert_not_supported(
             "CREATE TABLE s.c (a int, FOREIGN KEY (a) REFERENCES p2.p(id))",
-            "another schema",
+            "replaced by its mangled name",
         );
         assert_not_supported(
-            "ALTER TABLE c ADD COLUMN a int REFERENCES other.p(id)",
-            "another schema",
+            "CREATE TABLE public.c (a int REFERENCES public.p(id))",
+            "replaced by its mangled name",
         );
-        assert_translates("CREATE TABLE public.c (a int REFERENCES public.p(id))");
-        assert_translates("CREATE TABLE c (a int REFERENCES public.p(id))");
-        assert_translates("CREATE TABLE s.c (a int REFERENCES s.p(id))");
+        assert_translates("CREATE TABLE s.c (a int REFERENCES __turso_ns1_p(id))");
     }
 
     #[test]

@@ -4,8 +4,9 @@ use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
-use super::collate::{resolve_comparison_collseq_with_resolver, CollationSeq};
+use super::collate::{comparison_collation, first_collation, CollationSeq};
 use super::emitter::Resolver;
+use super::expr_context::{ExprContext, ExprProperties};
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -82,7 +83,8 @@ use vectors::*;
 use walk::*;
 
 pub(crate) use affinity::{
-    comparison_affinity, expr_data_type, get_expr_affinity, StorageClassMask,
+    comparison_affinity, do_comparison_affinity, expr_data_type, get_expr_affinity,
+    StorageClassMask,
 };
 pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
@@ -92,7 +94,7 @@ pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{
-    emit_dml_expr_index_value, emit_trigger_decode_registers, emit_type_expr,
+    emit_dml_expr_index_value, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
     emit_user_facing_column_value,
 };
 pub use emission::{

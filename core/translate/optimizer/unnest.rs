@@ -124,13 +124,13 @@ use turso_parser::ast::{
     self, Expr, FunctionTail, Name, SortOrder, TableInternalId, UnaryOperator,
 };
 
+use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::Plan;
 
 use crate::function::AggFunc;
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::{
-    collate::get_collseq_from_expr,
     emitter::Resolver,
     expr::{
         expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
@@ -553,7 +553,7 @@ fn try_rewrite_single_value_aggregate(
         let Some(pair) = read_column_pair(&term.expr, &outer_table_ids, &inner_table_ids) else {
             return Ok(None);
         };
-        if !column_pair_compares_the_same(&pair, &inner_plan.table_references)? {
+        if !column_pair_compares_the_same(&pair, &inner_plan.table_references, resolver)? {
             return Ok(None);
         }
         pairs.push(pair);
@@ -1122,15 +1122,21 @@ fn read_column_pair(
 /// to both. Either case would return the outer row twice. Use the grouped form
 /// only when both columns use the same number/text conversion rule and the same
 /// text order.
-fn column_pair_compares_the_same(pair: &ColumnPair, tables: &TableReferences) -> Result<bool> {
-    if get_expr_affinity(&pair.inner, Some(tables), None)
-        != get_expr_affinity(&pair.outer, Some(tables), None)
+fn column_pair_compares_the_same(
+    pair: &ColumnPair,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let affinity_metadata = TableMetadata::new(Some(tables));
+    if get_expr_affinity(&pair.inner, &affinity_metadata)
+        != get_expr_affinity(&pair.outer, &affinity_metadata)
     {
         return Ok(false);
     }
 
-    let inner_collation = get_collseq_from_expr(&pair.inner, tables)?.unwrap_or_default();
-    let outer_collation = get_collseq_from_expr(&pair.outer, tables)?.unwrap_or_default();
+    let collation_metadata = super::ExprContext::new(Some(tables), resolver);
+    let inner_collation = collation_metadata.expr_collation(&pair.inner)?;
+    let outer_collation = collation_metadata.expr_collation(&pair.outer)?;
     Ok(inner_collation == outer_collation)
 }
 

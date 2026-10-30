@@ -931,14 +931,16 @@ fn test_prepared_serial_table_rolls_back_sequence_on_execution_conflict(db: Temp
     assert!(err.contains("already exists"), "unexpected error: {err}");
     assert!(pg_sequence_names(&conn).is_empty());
 
-    // Explicit transaction: failed execution rolls back only the failed statement's sequence.
+    // Explicit transaction: a constraint violation aborts the entire transaction
+    // (PostgreSQL 25P02 semantics). Issuing COMMIT on an aborted transaction
+    // triggers a ROLLBACK, undoing all changes including kept_tx_k_seq.
     pg_execute(&conn, "BEGIN");
     pg_execute(&conn, "CREATE TABLE kept_tx (k SERIAL)");
     let mut prepared_tx = conn.prepare("CREATE TABLE conflict_tx (b SERIAL)").unwrap();
     pg_execute(&conn, "CREATE TABLE conflict_tx (y INTEGER)");
-    assert!(prepared_tx.run_ignore_rows().is_err());
-    pg_execute(&conn, "COMMIT");
-    assert_eq!(pg_sequence_names(&conn), vec!["kept_tx_k_seq".to_string()]);
+    assert!(prepared_tx.run_ignore_rows().is_err()); // tx aborted (25P02)
+    pg_execute(&conn, "COMMIT"); // triggers ROLLBACK, losing all changes in the tx
+    assert!(pg_sequence_names(&conn).is_empty());
 }
 
 #[test]

@@ -26,10 +26,7 @@ use crate::{
     emit_explain,
     schema::{Index, IndexColumn, Table},
     translate::{
-        collate::{
-            get_collseq_from_expr_with_symbols, resolve_comparison_collseq_with_symbols,
-            CollationSeq,
-        },
+        collate::{comparison_collation, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
         planner::{expr_reads_an_outer_query, table_mask_from_expr, TableMask},
         result_row::emit_select_result,

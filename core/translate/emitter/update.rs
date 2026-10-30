@@ -3,6 +3,8 @@ use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
+use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::RegisterColumn;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -903,7 +905,7 @@ fn emit_update_column_values<'a>(
                             // against this column's union type. See ProgramBuilder::target_union_type.
                             let union_td = t_ctx
                                 .resolver
-                                .schema
+                                .schema()
                                 .get_type_def_unchecked(&table_column.ty_str)
                                 .filter(|td| td.is_union())
                                 .cloned();
@@ -915,11 +917,13 @@ fn emit_update_column_values<'a>(
                             // comment on NoConstantOptReason::CustomTypeEncode.
                             let has_custom_encode = t_ctx
                                 .resolver
-                                .schema
+                                .schema()
                                 .resolve_type_unchecked(&table_column.ty_str)
                                 .ok()
                                 .flatten()
-                                .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
+                                .is_some_and(|r| {
+                                    r.chain.iter().any(|td| td.has_encode_or_coerce())
+                                });
                             let translate_result = if has_custom_encode {
                                 translate_expr_no_constant_opt(
                                     program,
@@ -1593,15 +1597,15 @@ fn emit_update_insns<'a>(
     {
         let columns = target_table.table.columns();
         for (idx, col) in columns.iter().enumerate() {
-            t_ctx
-                .resolver
-                .register_affinities
-                .insert(layout.to_register(start, idx), col.affinity());
+            t_ctx.resolver.register_columns.insert(
+                layout.to_register(start, idx),
+                RegisterColumn::table_column(col),
+            );
         }
         t_ctx
             .resolver
-            .register_affinities
-            .insert(effective_rowid_reg, Affinity::Integer);
+            .register_columns
+            .insert(effective_rowid_reg, RegisterColumn::rowid());
     }
 
     let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
@@ -1681,7 +1685,7 @@ fn emit_update_insns<'a>(
             rhs: beg,
             target_pc: record_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
 
         // If a row with the new rowid doesn't exist, no conflict
@@ -2030,7 +2034,7 @@ fn emit_update_insns<'a>(
                 rhs: idx_rowid_reg,
                 target_pc: constraint_check,
                 flags: CmpInsFlags::default(),
-                collation: program.curr_collation(),
+                collation: CollationSeq::for_internal_values(),
             });
             match idx_conflict {
                 ResolveType::Ignore => {
@@ -2144,7 +2148,7 @@ fn emit_update_insns<'a>(
             rhs: beg,
             target_pc: no_rowid_conflict_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
 
         // If a row with the new rowid doesn't exist, no conflict.
@@ -2519,7 +2523,9 @@ fn emit_update_insns<'a>(
                 && table.has_autoincrement
                 && connection.mv_store_for_db(update_database_id).is_some()
             {
-                let seq_name = crate::schema::autoincrement_sequence_name(&target_table.identifier);
+                let seq_name = crate::schema::autoincrement_sequence_name(
+                    &t_ctx.resolver.mangle_name(update_namespace, &table.name),
+                );
                 let seq = t_ctx
                     .resolver
                     .with_schema(update_database_id, |s| {
@@ -2534,7 +2540,7 @@ fn emit_update_insns<'a>(
                 crate::translate::sequence::emit_disk_advance_past(
                     program,
                     &t_ctx.resolver,
-                    update_namespace,
+                    NamespaceRef::root_of(update_database_id),
                     &seq_name,
                     &seq,
                     effective_rowid_reg,
@@ -2728,7 +2734,6 @@ fn emit_update_insns<'a>(
     }
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
-    t_ctx.resolver.register_affinities.clear();
-    t_ctx.resolver.register_collations.clear();
+    t_ctx.resolver.register_columns.clear();
     Ok(())
 }

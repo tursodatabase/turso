@@ -32,18 +32,12 @@ use super::*;
 /// Compute the affinity for an IN expression.
 /// For `x IN (y1, y2, ..., yN)`, the affinity is determined by the LHS expression `x`.
 /// This follows SQLite's `exprINAffinity()` function.
-pub(super) fn in_expr_affinity(
-    lhs: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
-) -> Affinity {
+pub(super) fn in_expr_affinity(lhs: &ast::Expr, metadata: &impl ExprProperties) -> Affinity {
     // For parenthesized expressions (vectors), we take the first element's affinity
     // since scalar IN comparisons only use the first element
     match lhs {
-        Expr::Parenthesized(exprs) if !exprs.is_empty() => {
-            get_expr_affinity(&exprs[0], referenced_tables, resolver)
-        }
-        _ => get_expr_affinity(lhs, referenced_tables, resolver),
+        Expr::Parenthesized(exprs) if !exprs.is_empty() => get_expr_affinity(&exprs[0], metadata),
+        _ => get_expr_affinity(lhs, metadata),
     }
 }
 
@@ -68,8 +62,12 @@ pub(super) fn translate_in_list(
 
     // Compute the affinity for the IN comparison based on the LHS expression
     // This follows SQLite's exprINAffinity() approach
-    let affinity = in_expr_affinity(lhs, referenced_tables, Some(resolver));
+    let metadata = ExprContext::new(referenced_tables, resolver);
+    let affinity = in_expr_affinity(lhs, &metadata);
     let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
+    // `x IN (y1, ..., yN)` compares with the collation of x alone, as SQLite
+    // does; the list items do not take part.
+    let collation = metadata.expr_collation(lhs)?;
 
     if lhs_arity == 1 && false_null_jump_targets_differ {
         check_null_reg = program.alloc_register();
@@ -119,12 +117,7 @@ pub(super) fn translate_in_list(
                         rhs: rhs_reg,
                         target_pc: label_ok,
                         flags: cmp_flags,
-                        collation: comparison_collation(
-                            lhs,
-                            expr,
-                            referenced_tables,
-                            Some(resolver),
-                        )?,
+                        collation,
                     });
                 } else {
                     program.emit_insn(Insn::NotNull {
@@ -138,7 +131,7 @@ pub(super) fn translate_in_list(
                     rhs: rhs_reg,
                     target_pc: condition_metadata.jump_target_when_false,
                     flags: cmp_flags.jump_if_null(),
-                    collation: comparison_collation(lhs, expr, referenced_tables, Some(resolver))?,
+                    collation,
                 });
             } else {
                 program.emit_insn(Insn::IsNull {
@@ -158,8 +151,8 @@ pub(super) fn translate_in_list(
                         lhs,
                         expr,
                         j,
-                        referenced_tables,
-                        Some(resolver),
+                        &metadata,
+                        &resolver.catalog,
                     )?;
                     let flags = CmpInsFlags::default().with_affinity(aff);
                     program.emit_insn(Insn::Ne {
@@ -215,8 +208,8 @@ pub(super) fn translate_in_list(
                         lhs,
                         expr,
                         j,
-                        referenced_tables,
-                        Some(resolver),
+                        &metadata,
+                        &resolver.catalog,
                     )?;
                     let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
                     program.emit_insn(Insn::Ne {
@@ -230,7 +223,6 @@ pub(super) fn translate_in_list(
             }
         }
     }
-    program.reset_collation();
     if check_null_reg != 0 {
         program.emit_insn(Insn::IsNull {
             reg: check_null_reg,
