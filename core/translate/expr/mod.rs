@@ -24,7 +24,7 @@ use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorKey, DmlColumnContext, SelfTableContext};
+use crate::vdbe::builder::{CursorKey, DmlColumnContext, DmlRowForm, SelfTableContext};
 use crate::vdbe::{
     builder::ProgramBuilder,
     insn::{CmpInsFlags, InsertFlags, Insn},
@@ -42,6 +42,7 @@ mod binding;
 pub(crate) use binding::validate_function_tail;
 mod columns;
 mod condition;
+mod custom_type_operators;
 mod custom_types;
 mod emission;
 pub(crate) mod expr_type;
@@ -63,6 +64,8 @@ use binding::*;
 use columns::*;
 #[allow(unused_imports)]
 use condition::*;
+#[allow(unused_imports)]
+use custom_type_operators::*;
 #[allow(unused_imports)]
 use custom_types::*;
 #[allow(unused_imports)]
@@ -93,6 +96,8 @@ pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
+pub(crate) use custom_type_operators::{custom_operator_call, emit_operator_call_on_registers};
+pub(crate) use custom_types::runs_custom_type_function;
 pub(crate) use custom_types::{
     emit_dml_expr_index_value, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
     emit_user_facing_column_value,
@@ -113,9 +118,10 @@ pub use utils::{
     unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;
+pub(crate) use walk::expression_can_fail_on_input;
 pub use walk::{
     expr_contains_function_that_changes_within_statement,
     expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-    expr_references_outer_query, expr_references_subquery_id, expression_can_fail_on_input,
-    walk_expr, walk_expr_mut, WalkControl,
+    expr_references_outer_query, expr_references_subquery_id, walk_expr, walk_expr_mut,
+    WalkControl,
 };

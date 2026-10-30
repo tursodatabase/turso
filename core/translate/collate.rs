@@ -1596,6 +1596,8 @@ mod typed_value_order_tests {
         // ORDER BY
         ("SELECT n FROM t ORDER BY n", 0),
         ("SELECT n FROM t ORDER BY a DESC, b", 0),
+        ("SELECT n FROM t ORDER BY likely(n), coalesce(n, 1)", 0),
+        ("SELECT n + 1 AS x FROM t ORDER BY x", 0),
         // GROUP BY
         ("SELECT n FROM t GROUP BY n", 0),
         ("SELECT a, b FROM t GROUP BY a, b", 0),
@@ -1641,6 +1643,7 @@ mod typed_value_order_tests {
         ("SELECT n FROM t WHERE string_to_array('9', ',') = b", 0),
         // A compound subquery in FROM.
         ("SELECT x FROM (SELECT n AS x FROM t UNION ALL SELECT m FROM u) WHERE x > 1.5", 0),
+        ("SELECT DISTINCT x FROM (SELECT 1 AS x UNION ALL SELECT n FROM t)", 0),
         // Automatic indexes.
         ("SELECT t.n FROM t, u WHERE t.n = u.m AND u.m > 1", 0),
     ];

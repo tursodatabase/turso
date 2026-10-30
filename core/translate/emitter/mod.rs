@@ -36,7 +36,9 @@ use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
-    builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
+    builder::{
+        CursorKey, CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder, SelfTableContext,
+    },
     insn::{to_u32, ConstraintInfo, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
@@ -492,17 +494,6 @@ impl<'a> Resolver<'a> {
                 .find_table_by_internal_id(*table_ref_id)?
                 .1
                 .btree(),
-        }
-    }
-
-    pub(crate) fn self_table_with_custom_type_operators(&self) -> Option<Arc<BTreeTable>> {
-        match &self.self_table_scope.borrow().as_ref()?.context {
-            SelfTableContext::ForDML {
-                table,
-                uses_custom_type_operators: true,
-                ..
-            } => Some(Arc::clone(table)),
-            _ => None,
         }
     }
 
@@ -2034,7 +2025,7 @@ pub(crate) fn emit_columns_and_dependencies(
         };
         pairs.push((col, reg));
     }
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs.into_iter());
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs.into_iter(), DmlRowForm::Stored);
     if targets
         .iter()
         .all(|&idx| !table.columns()[idx].is_rowid_alias())
@@ -2190,7 +2181,7 @@ fn emit_index_column_value_new_image(
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let expr = expr.as_ref().clone();
-        let mut column_regs: Vec<usize> = columns
+        let column_regs: Vec<usize> = columns
             .iter()
             .enumerate()
             .map(|(i, col)| {
@@ -2206,10 +2197,9 @@ fn emit_index_column_value_new_image(
             resolver,
             expr,
             columns,
-            &mut column_regs,
+            &column_regs,
             table,
             dest_reg,
-            idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
         )?;
     } else {
         let col_in_table = columns

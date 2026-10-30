@@ -12,7 +12,7 @@ use crate::mvcc::database::{
 };
 use crate::mvcc::MvccClock;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
-use crate::numeric::decimal::numeric_from_value;
+use crate::numeric::decimal::{numeric_from_value, MAX_FRACTION_DIGITS};
 use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
@@ -87,8 +87,8 @@ use crate::{
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
-            exec_date, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
-            exec_strftime, exec_time, exec_unixepoch,
+            exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full,
+            exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
         printf::exec_printf,
     },
@@ -11162,42 +11162,6 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::TestUintAdd
-            | ScalarFunc::TestUintSub
-            | ScalarFunc::TestUintMul
-            | ScalarFunc::TestUintDiv => {
-                check_arg_count!(arg_count, 2);
-                let a = parse_test_uint(&state.registers[*start_reg])?;
-                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
-                let result = match (a, b) {
-                    (Some(a), Some(b)) => {
-                        let r = match scalar_func {
-                            ScalarFunc::TestUintAdd => a.checked_add(b),
-                            ScalarFunc::TestUintSub => a.checked_sub(b),
-                            ScalarFunc::TestUintMul => a.checked_mul(b),
-                            ScalarFunc::TestUintDiv => {
-                                if b == 0 {
-                                    None
-                                } else {
-                                    Some(a / b)
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-                        match r {
-                            Some(v) => Value::build_text(v.to_string()),
-                            None => {
-                                return Err(LimboError::InternalError(
-                                    "test_uint arithmetic overflow/underflow".to_string(),
-                                )
-                                .into());
-                            }
-                        }
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
             ScalarFunc::StringReverse => {
                 check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
@@ -11340,14 +11304,16 @@ pub fn op_function(
                 let val = &state.registers[*start_reg];
                 let precision_reg = &state.registers[*start_reg + 1];
                 let scale_reg = &state.registers[*start_reg + 2];
+                // COERCE runs on the value ENCODE stored, so the value is a
+                // stored numeric.
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
-                    other => {
+                    Value::Blob(stored) => {
                         use crate::numeric::decimal::{
-                            bigdecimal_to_blob, validate_precision_scale,
+                            bigdecimal_to_blob, blob_to_bigdecimal, validate_precision_scale,
                         };
 
-                        let bd = numeric_from_value(other)?;
+                        let bd = blob_to_bigdecimal(stored)?;
                         let (
                             Value::Numeric(Numeric::Integer(precision)),
                             Value::Numeric(Numeric::Integer(scale)),
@@ -11360,6 +11326,13 @@ pub fn op_function(
                         };
                         let fitted = validate_precision_scale(&bd, *precision, *scale)?;
                         Value::from_blob(bigdecimal_to_blob(&fitted))
+                    }
+                    other => {
+                        return Err(LimboError::InternalError(format!(
+                            "numeric_fit expects a stored numeric, got {}",
+                            other.value_type()
+                        ))
+                        .into());
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -11385,7 +11358,8 @@ pub fn op_function(
             ScalarFunc::NumericAdd
             | ScalarFunc::NumericSub
             | ScalarFunc::NumericMul
-            | ScalarFunc::NumericDiv => {
+            | ScalarFunc::NumericDiv
+            | ScalarFunc::NumericMod => {
                 check_arg_count!(arg_count, 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();
                 let rhs_val = state.registers[*start_reg + 1].get_value().clone();
@@ -11394,11 +11368,20 @@ pub fn op_function(
                     _ => {
                         let a = numeric_from_value(&lhs_val)?;
                         let b = numeric_from_value(&rhs_val)?;
+                        // The result keeps every decimal of its operands, as in
+                        // PostgreSQL: 1.00 * 3 is 3.00 and 0.00 + 3 is 3.00. A
+                        // product may have more decimals than a numeric can hold,
+                        // so PostgreSQL rounds it to the most a numeric can hold.
+                        let (a_scale, b_scale) =
+                            (a.fractional_digit_count(), b.fractional_digit_count());
                         let res = match scalar_func {
-                            ScalarFunc::NumericAdd => a + b,
-                            ScalarFunc::NumericSub => a - b,
-                            ScalarFunc::NumericMul => a * b,
-                            ScalarFunc::NumericDiv => {
+                            ScalarFunc::NumericAdd => (a + b).with_scale(a_scale.max(b_scale)),
+                            ScalarFunc::NumericSub => (a - b).with_scale(a_scale.max(b_scale)),
+                            ScalarFunc::NumericMul => (a * b).with_scale_round(
+                                (a_scale + b_scale).min(MAX_FRACTION_DIGITS),
+                                bigdecimal::RoundingMode::HalfUp,
+                            ),
+                            ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
                                 use bigdecimal::Zero;
                                 if b.is_zero() {
                                     return Err(LimboError::Constraint(
@@ -11406,16 +11389,34 @@ pub fn op_function(
                                     )
                                     .into());
                                 }
-                                a / b
+                                if matches!(scalar_func, ScalarFunc::NumericDiv) {
+                                    a / b
+                                } else {
+                                    // The remainder has the dividend's sign.
+                                    (a % b).with_scale(a_scale.max(b_scale))
+                                }
                             }
                             _ => unreachable!(),
                         };
+                        crate::numeric::decimal::check_numeric_limits(&res)?;
                         Value::build_text(crate::numeric::decimal::format_numeric(&res))
                     }
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::DatePlus | ScalarFunc::DateMinus => {
+            ScalarFunc::NumericNeg => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value().clone();
+                let result = match val {
+                    Value::Null => Value::Null,
+                    // Negating keeps the decimal places: -(1.50) is -1.50.
+                    _ => Value::build_text(crate::numeric::decimal::format_numeric(
+                        &-numeric_from_value(&val)?,
+                    )),
+                };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => {
                 check_arg_count!(arg_count, 2);
                 let lhs = state.registers[*start_reg].get_value();
                 let rhs = state.registers[*start_reg + 1].get_value();
@@ -11423,6 +11424,7 @@ pub fn op_function(
                 let result = match scalar_func {
                     ScalarFunc::DatePlus => exec_date_plus(&clock, lhs, rhs)?,
                     ScalarFunc::DateMinus => exec_date_minus(&clock, lhs, rhs)?,
+                    ScalarFunc::DateDiff => exec_date_diff(&clock, lhs, rhs)?,
                     _ => unreachable!(),
                 };
                 state.registers[*dest].set_value(result);
@@ -19552,31 +19554,6 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     // but return false to indicate the conversion wasn't "complete"
     *value = Value::from_f64(fl);
     false
-}
-
-fn parse_test_uint(reg: &Register) -> Result<Option<u64>> {
-    match reg.get_value() {
-        Value::Null => Ok(None),
-        Value::Numeric(Numeric::Integer(i)) => {
-            if *i < 0 {
-                Err(LimboError::InternalError(
-                    "test_uint: negative value".to_string(),
-                ))
-            } else {
-                Ok(Some(*i as u64))
-            }
-        }
-        Value::Text(t) => {
-            let s = t.to_string();
-            let v = s
-                .parse::<u64>()
-                .map_err(|_| LimboError::InternalError(format!("test_uint: invalid uint: {s}")))?;
-            Ok(Some(v))
-        }
-        _ => Err(LimboError::InternalError(
-            "test_uint: unsupported type".to_string(),
-        )),
-    }
 }
 
 // Compat for applications that test for SQLite.

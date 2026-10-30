@@ -16,15 +16,20 @@ const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 const MAX_INTEGER_DIGITS: i64 = 131_072;
 pub(crate) const MAX_FRACTION_DIGITS: i64 = 16_383;
 
-/// The numeric value of `val`: an integer, a real, text such as `1.5` or `1e5`,
-/// or a stored numeric blob. Every numeric function reads its arguments with
-/// this, so they all accept the same values within the same limits.
+/// The numeric value of `val`: an integer, a real, or text such as `1.5` or
+/// `1e5`. Every numeric function reads its arguments with this, so they all
+/// accept the same values within the same limits. A blob is not a number, even
+/// one that holds a stored numeric: `n + x` with a blob in `x` is an error.
 pub fn numeric_from_value(val: &Value) -> crate::Result<BigDecimal> {
     let value = match val {
         Value::Numeric(Numeric::Integer(i)) => return Ok(BigDecimal::from(*i)),
         Value::Numeric(Numeric::Float(f)) => parse_numeric(&f.to_string())?,
         Value::Text(t) => parse_numeric(t.as_str())?,
-        Value::Blob(b) => blob_to_bigdecimal(b)?,
+        Value::Blob(_) => {
+            return Err(LimboError::Constraint(
+                "invalid input syntax for type numeric: a blob is not a number".to_string(),
+            ))
+        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "invalid input syntax for type numeric: \"{val}\""

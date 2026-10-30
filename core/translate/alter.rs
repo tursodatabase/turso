@@ -2,7 +2,7 @@ use crate::alloc::TursoIteratorExt;
 use crate::namespace::{demangle_name, NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
-use crate::{turso_assert_eq, turso_assert_ne};
+use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -40,7 +40,7 @@ use crate::{
     },
     vdbe::{
         affinity::Affinity,
-        builder::{CursorType, DmlColumnContext, ProgramBuilder},
+        builder::{CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder},
         insn::{to_u32, AddColumnData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
@@ -652,8 +652,13 @@ fn emit_column_constraints_validation(
         program.emit_column_or_rowid(cursor_id, idx, layout.to_register(base_dest_reg, idx));
     }
 
-    let dml_ctx =
-        DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
+    let dml_ctx = DmlColumnContext::layout(
+        resolved_table.columns(),
+        base_dest_reg,
+        rowid_reg,
+        layout,
+        DmlRowForm::Stored,
+    );
     compute_virtual_columns(
         program,
         &resolved_table.columns_topo_sort()?,
@@ -1960,6 +1965,7 @@ pub fn translate_alter_table(
                     &table_indexes,
                     column_index,
                     resolver.schema(),
+                    resolver.catalog.symbol_table,
                 )?;
             }
 
@@ -2418,6 +2424,7 @@ fn reject_change_of_indexed_column_order(
     indexes: &[Arc<Index>],
     column_index: usize,
     schema: &Schema,
+    syms: &SymbolTable,
 ) -> Result<()> {
     let column_name = original_table.columns()[column_index]
         .name
@@ -2453,8 +2460,8 @@ fn reject_change_of_indexed_column_order(
                     .expect("expression index column must have an expression");
                 let mut renamed = expr.as_ref().clone();
                 rename_identifiers(&mut renamed, column_name, new_column_name);
-                expression_type_ordering(expr, original_table, schema)?
-                    != expression_type_ordering(&renamed, rewritten_table, schema)?
+                expression_type_ordering(expr, original_table, schema, syms)?
+                    != expression_type_ordering(&renamed, rewritten_table, schema, syms)?
             } else {
                 false
             };

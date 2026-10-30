@@ -534,10 +534,6 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         // Test type functions (for custom type system testing)
         "test_uint_encode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintEncode))),
         "test_uint_decode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintDecode))),
-        "test_uint_add" => Ok(Some(Func::Scalar(ScalarFunc::TestUintAdd))),
-        "test_uint_sub" => Ok(Some(Func::Scalar(ScalarFunc::TestUintSub))),
-        "test_uint_mul" => Ok(Some(Func::Scalar(ScalarFunc::TestUintMul))),
-        "test_uint_div" => Ok(Some(Func::Scalar(ScalarFunc::TestUintDiv))),
         #[cfg(feature = "test_helper")]
         "test_nondet_counter" => Ok(Some(Func::Scalar(ScalarFunc::TestNondetCounter))),
         "string_reverse" | "reverse" => Ok(Some(Func::Scalar(ScalarFunc::StringReverse))),
@@ -557,8 +553,11 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),
         "numeric_mul" => Ok(Some(Func::Scalar(ScalarFunc::NumericMul))),
         "numeric_div" => Ok(Some(Func::Scalar(ScalarFunc::NumericDiv))),
+        "numeric_mod" => Ok(Some(Func::Scalar(ScalarFunc::NumericMod))),
+        "numeric_neg" => Ok(Some(Func::Scalar(ScalarFunc::NumericNeg))),
         "date_plus" => Ok(Some(Func::Scalar(ScalarFunc::DatePlus))),
         "date_minus" => Ok(Some(Func::Scalar(ScalarFunc::DateMinus))),
+        "date_diff" => Ok(Some(Func::Scalar(ScalarFunc::DateDiff))),
         // Array construction / element access (desugared from syntax)
         "array" => Ok(Some(Func::Scalar(ScalarFunc::Array))),
         "array_element" => Ok(Some(Func::Scalar(ScalarFunc::ArrayElement))),

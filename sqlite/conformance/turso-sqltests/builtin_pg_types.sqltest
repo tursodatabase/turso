@@ -490,6 +490,21 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test numeric-limits-apply-to-the-value-not-the-text {
+    -- Zero has no digits, whatever its exponent, and leading zeros are not
+    -- digits of the value: PostgreSQL accepts both.
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('0e131073'), ('-0.0e200000');
+    SELECT val FROM t1;
+    SELECT val + '0e999999999', val + (hex(zeroblob(150000)) || '1') FROM t1 LIMIT 1;
+}
+expect {
+    0.00
+    0.00
+    0.00|1.00
+}
+
+@requires strict "uses STRICT tables"
 test numeric-limits-refuse-zero-with-too-many-decimals {
     CREATE TABLE t1(val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1);

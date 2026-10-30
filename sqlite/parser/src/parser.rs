@@ -5065,10 +5065,11 @@ impl<'a> Parser<'a> {
                                 .and_then(|s| s.strip_suffix('\''))
                                 .unwrap_or(&op_raw)
                                 .to_owned();
-                            if matches!(op.as_str(), "<=" | ">" | ">=" | "=" | "!=") {
+                            // Only the built-in types have arithmetic operators.
+                            if op != "<" {
                                 return Err(Error::ParseError(format!(
-                                    "OPERATOR '{op}' is not supported: values of a custom type \
-                                     compare by their decoded value"
+                                    "CREATE TYPE does not accept OPERATOR '{op}': only \
+                                     OPERATOR '<' is supported"
                                 )));
                             }
                             // Three syntaxes:

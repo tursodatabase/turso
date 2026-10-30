@@ -562,15 +562,15 @@ fn translate_binary_expr(
         }
     }
 
-    if try_translate_custom_type_operator(
-        program,
-        referenced_tables,
-        e1,
-        op,
-        e2,
-        target_register,
-        resolver,
-    )? {
+    if let Some(result_reg) = emit_custom_type_operator(program, referenced_tables, expr, resolver)?
+    {
+        if result_reg != target_register {
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+        }
         return Ok(target_register);
     }
 
@@ -608,33 +608,6 @@ fn translate_truth_test_expr(
         invert: is_not == is_true_literal,
     });
     Ok(target_register)
-}
-
-/// Translates the binary expression with the operator of a custom type, if
-/// either operand has a custom type that defines one. Returns false otherwise.
-#[inline(never)]
-fn try_translate_custom_type_operator(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    e1: &ast::Expr,
-    op: &ast::Operator,
-    e2: &ast::Expr,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<bool> {
-    let Some(resolved) = find_custom_type_operator(e1, e2, op, referenced_tables, resolver) else {
-        return Ok(false);
-    };
-    let result_reg =
-        emit_custom_type_operator(program, referenced_tables, e1, e2, &resolved, resolver)?;
-    if result_reg != target_register {
-        program.emit_insn(Insn::Copy {
-            src_reg: result_reg,
-            dst_reg: target_register,
-            extra_amount: 0,
-        });
-    }
-    Ok(true)
 }
 
 #[inline(never)]
@@ -1907,10 +1880,6 @@ fn translate_function_call_expr(
                 }
                 ScalarFunc::TestUintEncode
                 | ScalarFunc::TestUintDecode
-                | ScalarFunc::TestUintAdd
-                | ScalarFunc::TestUintSub
-                | ScalarFunc::TestUintMul
-                | ScalarFunc::TestUintDiv
                 | ScalarFunc::StringReverse
                 | ScalarFunc::Gcd
                 | ScalarFunc::Lcm
@@ -1927,8 +1896,11 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericSub
                 | ScalarFunc::NumericMul
                 | ScalarFunc::NumericDiv
+                | ScalarFunc::NumericMod
+                | ScalarFunc::NumericNeg
                 | ScalarFunc::DatePlus
-                | ScalarFunc::DateMinus => translate_function(
+                | ScalarFunc::DateMinus
+                | ScalarFunc::DateDiff => translate_function(
                     program,
                     args,
                     referenced_tables,
@@ -2365,11 +2337,23 @@ fn translate_self_table_column_expr(
                     crate::bail_parse_error!("column index out of bounds");
                 }
                 let src_reg = dml_ctx.to_column_reg(*column);
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: target_register,
-                    extra_amount: 0,
-                });
+                let table_column = &table.columns()[*column];
+                if dml_ctx.holds_stored_value(*column, table_column) {
+                    emit_user_facing_column_value(
+                        program,
+                        src_reg,
+                        target_register,
+                        table_column,
+                        table.is_strict,
+                        resolver,
+                    )?;
+                } else {
+                    program.emit_insn(Insn::Copy {
+                        src_reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                }
                 Ok(target_register)
             }
             None => {
@@ -3168,6 +3152,17 @@ fn translate_unary_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    if let Some(result_reg) = emit_custom_type_operator(program, referenced_tables, expr, resolver)?
+    {
+        if result_reg != target_register {
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+        }
+        return Ok(target_register);
+    }
     let ast::Expr::Unary(op, expr) = expr else {
         unreachable!("translate_unary_expr expects Expr::Unary");
     };

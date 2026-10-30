@@ -528,17 +528,15 @@ fn resolve_scalar_func_return_type(
         // Internal/custom type functions
         ScalarFunc::TestUintEncode
         | ScalarFunc::TestUintDecode
-        | ScalarFunc::TestUintAdd
-        | ScalarFunc::TestUintSub
-        | ScalarFunc::TestUintMul
-        | ScalarFunc::TestUintDiv
         | ScalarFunc::NumericEncode
         | ScalarFunc::NumericFit
         | ScalarFunc::NumericDecode
         | ScalarFunc::NumericAdd
         | ScalarFunc::NumericSub
         | ScalarFunc::NumericMul
-        | ScalarFunc::NumericDiv => Ok(CheckExprType::Blob),
+        | ScalarFunc::NumericDiv
+        | ScalarFunc::NumericMod
+        | ScalarFunc::NumericNeg => Ok(CheckExprType::Blob),
 
         // Remaining functions — treat as ANY
         _ => Ok(CheckExprType::Any),
