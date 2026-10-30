@@ -441,3 +441,14 @@ expect {
     0|a|TEXT|0||0
     1|b|varchar|0||0
 }
+
+@cross-check-integrity
+test pragma-table-info-signed-type-parameters {
+    CREATE TABLE t(a VARCHAR(+10), b DECIMAL(-5), c NUMERIC(10,-2));
+    PRAGMA table_info(t);
+}
+expect {
+    0|a|VARCHAR(+10)|0||0
+    1|b|DECIMAL(-5)|0||0
+    2|c|NUMERIC(10,-2)|0||0
+}
