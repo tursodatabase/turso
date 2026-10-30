@@ -264,6 +264,26 @@ test select-cast-to-domain-checks-constraint {
 @sqlstate 23514
 expect error {}
 
+test select-cast-integer-to-domain-over-boolean {
+    CREATE DOMAIN db AS boolean;
+    CREATE DOMAIN true_db AS db CHECK (VALUE);
+    SELECT CASE WHEN 5::db THEN 't' ELSE 'f' END,
+           CASE WHEN 0::db THEN 't' ELSE 'f' END,
+           CASE WHEN (-3)::db THEN 't' ELSE 'f' END,
+           CASE WHEN 7::true_db THEN 't' ELSE 'f' END,
+           CASE WHEN (NULL::integer)::db IS NULL THEN 'null' END,
+           CASE WHEN 'yes'::db THEN 't' ELSE 'f' END;
+}
+expect {
+    t|f|t|t|null|t
+}
+
+test select-cast-text-that-is-not-a-boolean-to-domain-over-boolean-errors {
+    CREATE DOMAIN db AS boolean;
+    SELECT '5'::db;
+}
+expect error {}
+
 test select-cast-text-to-date-and-time {
     SELECT '2024-01-15 10:30:00'::date, CAST('2024-01-15 10:30:00' AS time);
 }

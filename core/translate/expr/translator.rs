@@ -800,6 +800,16 @@ fn translate_cast_expr(
             // runs the ENCODE and COERCE of the types under it, then check
             // the domain's constraints on the stored value.
             if resolved.is_domain() {
+                // A cast to a domain over boolean gives true for every
+                // nonzero integer in dialects whose integer-to-boolean cast
+                // does, before boolean's ENCODE sees the value.
+                if resolved
+                    .chain
+                    .iter()
+                    .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
+                {
+                    emit_integer_to_boolean_cast(program, target_register);
+                }
                 emit_store_value(
                     program,
                     &resolved.chain,
@@ -841,6 +851,39 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// True when a cast to `type_def` turns every nonzero integer into true.
+fn casts_nonzero_integer_to_true(type_def: &TypeDef, resolver: &Resolver) -> bool {
+    type_def.is_builtin
+        && type_def.name == "boolean"
+        && resolver.catalog.dialect.casts_nonzero_integer_to_true()
+}
+
+/// Replaces an integer in `reg` with 1 when it is nonzero and 0 when it is
+/// zero. Other values are left for the boolean type's ENCODE.
+fn emit_integer_to_boolean_cast(program: &mut ProgramBuilder, reg: usize) {
+    let to_boolean = program.allocate_label();
+    let done = program.allocate_label();
+    // IsType also jumps for NULL, which must stay NULL.
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: done,
+    });
+    program.emit_insn(Insn::IsType {
+        reg,
+        target_pc: to_boolean,
+        value_type: crate::types::ValueType::Integer,
+    });
+    program.emit_insn(Insn::Goto { target_pc: done });
+    program.preassign_label_to_next_insn(to_boolean);
+    program.emit_insn(Insn::IsTrue {
+        reg,
+        dest: reg,
+        null_value: false,
+        invert: false,
+    });
+    program.preassign_label_to_next_insn(done);
 }
 
 #[inline(never)]
