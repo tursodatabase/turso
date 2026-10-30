@@ -538,8 +538,6 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "test_uint_sub" => Ok(Some(Func::Scalar(ScalarFunc::TestUintSub))),
         "test_uint_mul" => Ok(Some(Func::Scalar(ScalarFunc::TestUintMul))),
         "test_uint_div" => Ok(Some(Func::Scalar(ScalarFunc::TestUintDiv))),
-        "test_uint_lt" => Ok(Some(Func::Scalar(ScalarFunc::TestUintLt))),
-        "test_uint_eq" => Ok(Some(Func::Scalar(ScalarFunc::TestUintEq))),
         #[cfg(feature = "test_helper")]
         "test_nondet_counter" => Ok(Some(Func::Scalar(ScalarFunc::TestNondetCounter))),
         "string_reverse" | "reverse" => Ok(Some(Func::Scalar(ScalarFunc::StringReverse))),
@@ -559,8 +557,6 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),
         "numeric_mul" => Ok(Some(Func::Scalar(ScalarFunc::NumericMul))),
         "numeric_div" => Ok(Some(Func::Scalar(ScalarFunc::NumericDiv))),
-        "numeric_lt" => Ok(Some(Func::Scalar(ScalarFunc::NumericLt))),
-        "numeric_eq" => Ok(Some(Func::Scalar(ScalarFunc::NumericEq))),
         "date_plus" => Ok(Some(Func::Scalar(ScalarFunc::DatePlus))),
         "date_minus" => Ok(Some(Func::Scalar(ScalarFunc::DateMinus))),
         // Array construction / element access (desugared from syntax)

@@ -7,7 +7,7 @@ use turso_ext::{
     ValueDestructor,
 };
 
-use crate::translate::collate::CollationSeq;
+use crate::translate::collate::{CollationSeq, TextCollation};
 use crate::LimboError;
 
 pub type ContextCollationFunction = unsafe extern "C" fn(
@@ -31,7 +31,7 @@ pub struct ExternalFunc {
 /// that orders two texts.
 pub struct ExternalCollation {
     /// The collation that calls this callback.
-    pub collation: CollationSeq,
+    pub collation: TextCollation,
     pub name: String,
     pub context: usize,
     pub callback: ContextCollationFunction,
@@ -45,7 +45,7 @@ impl ExternalCollation {
         callback: ContextCollationFunction,
         context_destructor: Option<ContextDestructor>,
     ) -> Arc<Self> {
-        CollationSeq::new_custom(|collation| Self {
+        TextCollation::new_custom(|collation| Self {
             collation,
             name,
             context,
@@ -950,8 +950,6 @@ pub enum ScalarFunc {
     TestUintSub,
     TestUintMul,
     TestUintDiv,
-    TestUintLt,
-    TestUintEq,
     /// Test-only: returns a monotonically increasing 64-bit integer on every
     /// evaluation. Used to verify that the planner does not deduplicate
     /// equivalent SQL calls that contain nondeterministic functions.
@@ -976,8 +974,6 @@ pub enum ScalarFunc {
     NumericSub,
     NumericMul,
     NumericDiv,
-    NumericLt,
-    NumericEq,
     // Date type functions
     DatePlus,
     DateMinus,
@@ -1089,8 +1085,6 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::TestUintSub
             | ScalarFunc::TestUintMul
             | ScalarFunc::TestUintDiv
-            | ScalarFunc::TestUintLt
-            | ScalarFunc::TestUintEq
             | ScalarFunc::StringReverse => true,
             ScalarFunc::Gcd
             | ScalarFunc::Lcm
@@ -1109,8 +1103,6 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericSub
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
-            | ScalarFunc::NumericLt
-            | ScalarFunc::NumericEq
             | ScalarFunc::DatePlus
             | ScalarFunc::DateMinus => true,
             ScalarFunc::Array
@@ -1253,8 +1245,6 @@ impl Display for ScalarFunc {
             Self::TestUintSub => "test_uint_sub",
             Self::TestUintMul => "test_uint_mul",
             Self::TestUintDiv => "test_uint_div",
-            Self::TestUintLt => "test_uint_lt",
-            Self::TestUintEq => "test_uint_eq",
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
             Self::StringReverse => "string_reverse",
@@ -1273,8 +1263,6 @@ impl Display for ScalarFunc {
             Self::NumericSub => "numeric_sub",
             Self::NumericMul => "numeric_mul",
             Self::NumericDiv => "numeric_div",
-            Self::NumericLt => "numeric_lt",
-            Self::NumericEq => "numeric_eq",
             Self::DatePlus => "date_plus",
             Self::DateMinus => "date_minus",
             Self::Array => "array",
@@ -1408,12 +1396,7 @@ impl ScalarFunc {
             Self::Lpad | Self::Rpad => &[2, 3],
             // Test functions for custom types (1-arg encode/decode, 2-arg operators)
             Self::TestUintEncode | Self::TestUintDecode | Self::StringReverse => &[1],
-            Self::TestUintAdd
-            | Self::TestUintSub
-            | Self::TestUintMul
-            | Self::TestUintDiv
-            | Self::TestUintLt
-            | Self::TestUintEq => &[2],
+            Self::TestUintAdd | Self::TestUintSub | Self::TestUintMul | Self::TestUintDiv => &[2],
             // Built-in type functions
             Self::BooleanToInt
             | Self::IntToBoolean
@@ -1424,8 +1407,6 @@ impl ScalarFunc {
             | Self::NumericSub
             | Self::NumericMul
             | Self::NumericDiv
-            | Self::NumericLt
-            | Self::NumericEq
             | Self::DatePlus
             | Self::DateMinus => &[2],
             Self::NumericFit => &[3],

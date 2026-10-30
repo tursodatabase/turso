@@ -65,9 +65,7 @@ pub(super) fn translate_in_list(
     let metadata = ExprContext::new(referenced_tables, resolver);
     let affinity = in_expr_affinity(lhs, &metadata);
     let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
-    // `x IN (y1, ..., yN)` compares with the collation of x alone, as SQLite
-    // does; the list items do not take part.
-    let collation = metadata.expr_collation(lhs)?;
+    let collation = in_list_collation(lhs, rhs, &metadata)?;
 
     if lhs_arity == 1 && false_null_jump_targets_differ {
         check_null_reg = program.alloc_register();
@@ -147,13 +145,8 @@ pub(super) fn translate_in_list(
 
                 // Check for unequal values and skip if one is found.
                 for j in 0..lhs_arity {
-                    let (aff, collation) = row_component_affinity_collation(
-                        lhs,
-                        expr,
-                        j,
-                        &metadata,
-                        &resolver.catalog,
-                    )?;
+                    let (aff, collation) =
+                        row_component_affinity_collation(lhs, expr, j, &metadata)?;
                     let flags = CmpInsFlags::default().with_affinity(aff);
                     program.emit_insn(Insn::Ne {
                         lhs: lhs_reg + j,
@@ -204,13 +197,8 @@ pub(super) fn translate_in_list(
             } else {
                 // Last condition, simple case: jump to false if any component doesn't match
                 for j in 0..lhs_arity {
-                    let (aff, collation) = row_component_affinity_collation(
-                        lhs,
-                        expr,
-                        j,
-                        &metadata,
-                        &resolver.catalog,
-                    )?;
+                    let (aff, collation) =
+                        row_component_affinity_collation(lhs, expr, j, &metadata)?;
                     let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
                     program.emit_insn(Insn::Ne {
                         lhs: lhs_reg + j,

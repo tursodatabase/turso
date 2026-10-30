@@ -2794,7 +2794,7 @@ mod tests {
         let skip = program.allocate_label();
         let changed = program.allocate_label();
 
-        emit_key_change_check(&mut program, 1, 2, &[CollationSeq::Binary], skip, changed);
+        emit_key_change_check(&mut program, 1, 2, &[CollationSeq::BINARY], skip, changed);
 
         assert!(
             program.insns.iter().any(|(insn, _)| matches!(

@@ -4335,6 +4335,7 @@ fn ephemeral_index_build(
                 nulls_order: None,
                 pos_in_table: i,
                 collation: c.collation(),
+                explicit_collation: None,
                 default: c.default.clone(),
                 expr: expr.map(Box::new),
             }

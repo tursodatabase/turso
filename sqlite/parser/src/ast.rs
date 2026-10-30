@@ -1465,9 +1465,9 @@ pub enum AlterTableBody {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TypeOperator {
-    /// operator symbol: "+", "-", "*", "/", "<", "=", etc.
+    /// operator symbol: "+", "-", "*", "/", "%"
     pub op: String,
-    /// function name to call, or None for naked operators (use base type comparison)
+    /// function name to call, or None for naked operators (use the base type's operator)
     pub func_name: Option<String>,
 }
 
