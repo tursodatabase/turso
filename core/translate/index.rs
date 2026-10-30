@@ -17,8 +17,9 @@ use crate::translate::{
     },
     expr::expr_type::{type_of, type_ordering, TypeEnv},
     expr::{
-        bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
-        translate_expr, unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        bind_and_rewrite_expr, emit_expression_index_key, emit_stored_column, emit_table_column,
+        translate_condition_expr, translate_expr, unwrap_parens, walk_expr, BindingBehavior,
+        ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -1341,6 +1342,7 @@ fn emit_index_column_value_from_cursor(
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())
         })?;
+        emit_expression_index_key(program, dest_reg, idx_col, table, resolver)?;
     } else if table.columns()[idx_col.pos_in_table].is_virtual_generated() {
         emit_table_column(
             program,

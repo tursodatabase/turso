@@ -3625,6 +3625,9 @@ fn emit_index_column_value_for_insert(
             table,
             dest_reg,
         )?;
+        crate::translate::expr::emit_expression_index_key(
+            program, dest_reg, idx_col, table, resolver,
+        )?;
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(
