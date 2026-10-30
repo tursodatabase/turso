@@ -277,6 +277,8 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
+    } else if msg.starts_with("cannot open relation \"") {
+        SQLSTATE_WRONG_OBJECT_TYPE
     } else if msg.contains("no such table")
         || msg.contains("table not found")
         || msg.starts_with("no such object")

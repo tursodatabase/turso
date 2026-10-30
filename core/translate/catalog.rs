@@ -357,9 +357,9 @@ impl<'a> CatalogContext<'a> {
                 && Self::namespace_has_relation(schema, namespace.id, &name)
         });
         if is_other_relation {
-            return Err(self
-                .dialect
-                .wrong_relation_kind_error(format!("cannot open relation \"{name}\"")));
+            return Err(LimboError::ParseError(format!(
+                "cannot open relation \"{name}\""
+            )));
         }
         Ok(())
     }
@@ -549,9 +549,9 @@ impl<'a> CatalogContext<'a> {
                     && Self::namespace_has_relation(schema, namespace.id, seq_name)
             });
         if is_other_relation {
-            return Err(self
-                .dialect
-                .wrong_relation_kind_error(format!("cannot open relation \"{seq_name}\"")));
+            return Err(LimboError::ParseError(format!(
+                "cannot open relation \"{seq_name}\""
+            )));
         }
         Ok(namespace)
     }

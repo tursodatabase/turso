@@ -195,12 +195,6 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// The error for a name that is a relation of another kind than the
-    /// statement needs, with the message `message`.
-    fn wrong_relation_kind_error(&self, message: String) -> crate::LimboError {
-        crate::LimboError::ParseError(message)
-    }
-
     /// Whether a database of this dialect supports namespaces: the objects of
     /// a namespace are kept in the schema rows of the main database
     /// under names that encode the namespace's id, which the loader decodes
