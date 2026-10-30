@@ -312,8 +312,11 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
 }
 
 /// Whether a parse error reports that an object already exists, for example
-/// `table t already exists`. Only the kind at the start and the suffix are
-/// checked, so the name in between can be anything.
+/// `table t already exists`. The kind at the start and the suffix are checked,
+/// so the name in between can contain the "no such ..." phrases. The message
+/// for a missing INSERT column (`table t has no column named c`) has the same
+/// start and can end with ` already exists` when the column name does, so it
+/// is excluded.
 fn is_duplicate_object_error(msg: &str) -> bool {
     const KINDS: [&str; 8] = [
         "table ",
@@ -325,7 +328,9 @@ fn is_duplicate_object_error(msg: &str) -> bool {
         "type ",
         "sequence ",
     ];
-    msg.ends_with(" already exists") && KINDS.iter().any(|kind| msg.starts_with(kind))
+    msg.ends_with(" already exists")
+        && KINDS.iter().any(|kind| msg.starts_with(kind))
+        && !msg.contains(" has no column named ")
 }
 
 fn invalid_argument_sqlstate(msg: &str) -> &'static str {
@@ -448,6 +453,10 @@ mod tests {
                 SQLSTATE_DUPLICATE_TABLE,
             ),
             ("no such table: already exists", SQLSTATE_UNDEFINED_TABLE),
+            (
+                "table plain has no column named no such column already exists",
+                SQLSTATE_UNDEFINED_COLUMN,
+            ),
             ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
             ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
             ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
