@@ -4396,6 +4396,11 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// [`crate::mvcc::cursor::IndexShadowScan`] on a mismatch (#7578), and
     /// `MvccLazyCursor` seeks its next MVCC index entry again.
     index_rows_epoch: AtomicU64,
+    /// Bumped whenever a table version is inserted or deleted, including the
+    /// undo at `ROLLBACK TO`. Table cursors compare it on each step and seek
+    /// their next MVCC row again on a mismatch, like index cursors do with
+    /// [`Self::index_rows_epoch`].
+    table_rows_epoch: AtomicU64,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
@@ -4631,6 +4636,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
+            table_rows_epoch: AtomicU64::new(0),
             txs: SkipMap::new_in(alloc.clone()),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_table_keys: SkipMap::new_in(alloc.clone()),
@@ -5741,6 +5747,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let version_id = rv.id;
                     rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
                     drop(locked_row_versions);
+                    self.bump_table_rows_epoch();
                     if !chain_in_write_set {
                         tx.add_to_write_set(id.clone(), row_versions);
                     }
@@ -5762,6 +5769,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let version_id =
                     self.insert_tombstone(tx_id, Some(data), &mut locked_row_versions)?;
                 drop(locked_row_versions);
+                self.bump_table_rows_epoch();
                 tx.record_created_table_version(id.clone(), version_id);
                 if !chain_in_write_set {
                     tx.add_to_write_set(id, row_versions);
@@ -7493,6 +7501,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             deleted_index_versions.len()
         );
 
+        let undoes_table_versions =
+            !created_table_versions.is_empty() || !deleted_table_versions.is_empty();
         let undoes_index_versions =
             !created_index_versions.is_empty() || !deleted_index_versions.is_empty();
 
@@ -7574,6 +7584,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     }
                 }
             }
+        }
+        if undoes_table_versions {
+            self.bump_table_rows_epoch();
         }
         if undoes_index_versions {
             self.bump_index_rows_epoch();
@@ -8691,6 +8704,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let chain_in_write_set = chain_in_write_set_of_creator(&versions, &row_version);
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);
+            self.bump_table_rows_epoch();
             return Ok((row_versions, chain_in_write_set));
         }
     }
@@ -8781,6 +8795,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.index_rows_epoch.fetch_add(1, Ordering::SeqCst);
         #[cfg(shuttle)]
         crate::thread::yield_now();
+    }
+
+    /// Current epoch of table version changes; see the field docs.
+    pub(crate) fn table_rows_epoch(&self) -> u64 {
+        self.table_rows_epoch.load(Ordering::SeqCst)
+    }
+
+    /// A table version was inserted, deleted or rolled back; see field docs.
+    fn bump_table_rows_epoch(&self) {
+        self.table_rows_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::IndexRowsEntry)]
