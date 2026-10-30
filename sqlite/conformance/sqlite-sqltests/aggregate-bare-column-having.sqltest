@@ -1,0 +1,319 @@
+@database :memory:
+
+# Bare columns in an aggregate query with HAVING and no GROUP BY. Like SQLite,
+# a column read outside an aggregate function reads the first row that reaches
+# the aggregate, or with MIN/MAX the row holding the MIN/MAX value, both in the
+# result columns and in HAVING, and reads NULL when no row does.
+
+setup issue {
+    CREATE TABLE t(id INT PRIMARY KEY, x INT, y INT);
+    INSERT INTO t VALUES (1, 1, 100), (2, 2, 200);
+}
+
+@setup issue
+test having-bare-column-in-result-with-max {
+    SELECT x, max(y) FROM t HAVING max(y) > 0;
+}
+expect {
+    2|200
+}
+
+@setup issue
+test having-bare-column-in-result-with-min {
+    SELECT x, min(y) FROM t HAVING min(y) > 0;
+}
+expect {
+    1|100
+}
+
+@setup issue
+test having-bare-column-in-having-with-max {
+    SELECT max(y) FROM t HAVING x > 0;
+}
+expect {
+    200
+}
+
+# With MIN/MAX, a bare column reads the row holding the MIN/MAX value, also in
+# HAVING and inside a result column that contains the aggregate.
+setup max-row-first {
+    CREATE TABLE t(x INT, y INT);
+    INSERT INTO t VALUES (2, 100), (1, 200), (3, 150);
+}
+
+@setup max-row-first
+test having-bare-column-reads-max-row {
+    SELECT max(y) FROM t HAVING x = 1;
+}
+expect {
+    200
+}
+
+@setup max-row-first
+test having-bare-column-does-not-read-first-row-with-max {
+    SELECT max(y) FROM t HAVING x = 2;
+}
+expect {
+}
+
+@setup max-row-first
+test having-bare-column-reads-min-row {
+    SELECT min(y) FROM t HAVING x = 2;
+}
+expect {
+    100
+}
+
+@setup max-row-first
+test bare-column-inside-max-result-column-reads-max-row {
+    SELECT max(y) + x FROM t;
+}
+expect {
+    201
+}
+
+@setup max-row-first
+test bare-column-inside-min-result-column-reads-min-row {
+    SELECT x || ':' || min(y) FROM t;
+}
+expect {
+    2:100
+}
+
+@setup max-row-first
+test bare-column-with-sum-and-max-reads-max-row {
+    SELECT x, sum(y), max(y) FROM t HAVING sum(y) > 0;
+}
+expect {
+    1|450|200
+}
+
+# A row that the FILTER of a MIN/MAX skips is not the MIN/MAX row. When every
+# MIN/MAX has a FILTER, the bare columns read the first row until a MIN/MAX
+# step stores a value.
+setup filter-rows {
+    CREATE TABLE t(x INT, y INT, z INT);
+    INSERT INTO t VALUES (1, 100, 5), (2, 50, 1), (3, 70, 9), (4, 200, 3);
+}
+
+@setup filter-rows
+test filtered-max-skipped-row-is-not-read {
+    SELECT x, max(y) FILTER (WHERE x IN (1, 3)) FROM t;
+}
+expect {
+    1|100
+}
+
+@setup filter-rows
+test filtered-max-skipped-row-is-not-read-in-having {
+    SELECT max(y) FILTER (WHERE x IN (1, 3)) FROM t HAVING x = 2;
+}
+expect {
+}
+
+@setup filter-rows
+test filtered-min-reads-min-row {
+    SELECT x, min(y) FILTER (WHERE x > 1) FROM t;
+}
+expect {
+    2|50
+}
+
+@setup filter-rows
+test filtered-max-matching-no-row-reads-first-row {
+    SELECT x, max(y) FILTER (WHERE x > 10) FROM t;
+}
+expect {
+    1|
+}
+
+@setup filter-rows
+test filtered-max-with-unfiltered-min-reads-min-row {
+    SELECT x, max(y) FILTER (WHERE x > 1), min(z) FROM t;
+}
+expect {
+    2|200|1
+}
+
+@setup filter-rows
+test two-filtered-min-max-read-last-changed-row {
+    SELECT x, max(y) FILTER (WHERE x < 4), min(z) FILTER (WHERE x > 1) FROM t;
+}
+expect {
+    2|100|1
+}
+
+setup two-rows {
+    CREATE TABLE t(x INT, y INT);
+    INSERT INTO t VALUES (1, 100), (2, 200);
+}
+
+@setup two-rows
+test having-bare-column-in-result-with-count {
+    SELECT x, count(*) FROM t HAVING count(*) > 0;
+}
+expect {
+    1|2
+}
+
+@setup two-rows
+test having-bare-column-in-result-with-sum {
+    SELECT x, sum(y) FROM t HAVING sum(y) > 0;
+}
+expect {
+    1|300
+}
+
+@setup two-rows
+test having-bare-column-is-not-null {
+    SELECT count(*) FROM t HAVING x IS NOT NULL;
+}
+expect {
+    2
+}
+
+@setup two-rows
+test having-bare-column-reads-first-row {
+    SELECT sum(y) FROM t HAVING x = 1;
+}
+expect {
+    300
+}
+
+@setup two-rows
+test having-bare-column-does-not-read-last-row {
+    SELECT sum(y) FROM t HAVING x = 2;
+}
+expect {
+}
+
+@setup two-rows
+test having-bare-column-with-aggregate {
+    SELECT sum(y) FROM t HAVING x + sum(y) = 301;
+}
+expect {
+    300
+}
+
+@setup two-rows
+test having-bare-column-zero-rows {
+    SELECT count(*) FROM t WHERE y > 999 HAVING x IS NULL;
+}
+expect {
+    0
+}
+
+@setup two-rows
+test bare-column-inside-aggregate-result-column-reads-first-row {
+    SELECT CASE WHEN sum(y) > 0 THEN x END, x + sum(y) FROM t;
+}
+expect {
+    1|301
+}
+
+setup outer-rows {
+    CREATE TABLE t(x INT, y INT);
+    CREATE TABLE o(a INT);
+    INSERT INTO t VALUES (1, 100), (2, 200);
+    INSERT INTO o VALUES (1), (5), (2);
+}
+
+@setup outer-rows
+test correlated-having-bare-column-zero-rows-reads-null {
+    SELECT a, (SELECT count(*) FROM t WHERE t.x = o.a HAVING x IS NULL) FROM o ORDER BY rowid;
+}
+expect {
+    1|
+    5|0
+    2|
+}
+
+@setup outer-rows
+test correlated-bare-column-inside-aggregate-zero-rows-reads-null {
+    SELECT a, (SELECT CASE WHEN count(*) >= 0 THEN x END FROM t WHERE t.x = o.a) FROM o ORDER BY rowid;
+}
+expect {
+    1|1
+    5|
+    2|2
+}
+
+# A bare column in HAVING with MIN/MAX reads the MIN/MAX row, also when that
+# row holds NULL in the column and is not the first row.
+setup null-in-min-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, y INT);
+    INSERT INTO t VALUES (1, 1, 100), (2, 2, 200), (3, NULL, 50);
+}
+
+@setup null-in-min-row
+test having-bare-column-is-null-in-min-row {
+    SELECT min(y) FROM t HAVING x IS NULL;
+}
+expect {
+    50
+}
+
+@setup null-in-min-row
+test having-bare-column-in-result-reads-max-row {
+    SELECT x, max(y) FROM t HAVING max(y) > 0;
+}
+expect {
+    2|200
+}
+
+@setup null-in-min-row
+test having-bare-column-is-not-null-skips-min-row {
+    SELECT min(y) FROM t HAVING x IS NOT NULL;
+}
+expect {
+}
+
+@setup null-in-min-row
+test having-bare-column-reads-max-row-not-first-row {
+    SELECT max(y) FROM t HAVING x = 1;
+}
+expect {
+}
+
+# A MIN/MAX step that keeps its value does not read the row: a tie, a NULL
+# argument, or a value equal under the collation. Like SQLite, a DISTINCT
+# duplicate skips the step, so the row is read if the previous row was.
+setup kept-value-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, y, z TEXT);
+    INSERT INTO t VALUES (1, 1, 100, 'b'), (2, 2, 300, 'A'), (3, 3, 300, 'a'), (4, 4, NULL, 'B');
+}
+
+@setup kept-value-rows
+test max-tie-reads-first-max-row {
+    SELECT x, max(y) FROM t HAVING max(y) > 0;
+}
+expect {
+    2|300
+}
+
+@setup kept-value-rows
+test max-distinct-duplicate-reads-row-after-max-row {
+    SELECT x, max(DISTINCT y) FROM t HAVING x > 0;
+}
+expect {
+    3|300
+}
+
+@setup kept-value-rows
+test max-nocase-equal-value-does-not-read-row {
+    SELECT x, max(z COLLATE NOCASE) FROM t;
+}
+expect {
+    1|b
+}
+
+@setup kept-value-rows
+test correlated-max-reads-max-row-per-outer-row {
+    SELECT o.id, (SELECT t.x || '-' || max(t.y) FROM t WHERE t.id <= o.id) FROM t o ORDER BY o.id;
+}
+expect {
+    1|1-100
+    2|2-300
+    3|2-300
+    4|2-300
+}

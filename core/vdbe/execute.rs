@@ -7394,6 +7394,8 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
 ///
 /// The payload slice contains the intermediate aggregate state (initialized by
 /// `init_agg_payload`), and this function incorporates the new row's values.
+/// It returns true when a MIN or MAX step keeps the value it already had,
+/// like SQLite's skip flag, and false otherwise.
 ///
 /// # Payload layouts (see `init_agg_payload` for initial values):
 /// - **Count**: `[count: Integer]` - increments if arg is not NULL
@@ -7420,7 +7422,7 @@ fn update_agg_payload(
     maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
-) -> Result<()> {
+) -> Result<bool> {
     match func {
         AggFunc::Count => {
             // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
@@ -7448,7 +7450,7 @@ fn update_agg_payload(
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
             let [sum_val, r_err_val, count_val, ..] = payload.as_mut_slice() else {
@@ -7458,7 +7460,7 @@ fn update_agg_payload(
                 ));
             };
             if matches!(*sum_val, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let r_err = r_err_val.to_float_or_zero();
             let Value::Numeric(Numeric::Integer(count)) = count_val else {
@@ -7517,7 +7519,7 @@ fn update_agg_payload(
                 *count = count.checked_add(1).or_overflow()?;
             }
             if matches!(*acc, Value::Null) && sum_state.approx {
-                return Ok(());
+                return Ok(false);
             }
             match arg {
                 Value::Null => {}
@@ -7584,12 +7586,12 @@ fn update_agg_payload(
             *ovrfl_i = sum_state.ovrfl as i64;
         }
         AggFunc::Min | AggFunc::Max => {
-            if matches!(arg, Value::Null) {
-                return Ok(());
-            }
             if matches!(payload[0], Value::Null) {
                 payload[0].try_clone_from(arg)?;
-                return Ok(());
+                return Ok(false);
+            }
+            if matches!(arg, Value::Null) {
+                return Ok(true);
             }
             use std::cmp::Ordering;
             let cmp = collation.compare(arg.as_ref(), payload[0].as_ref());
@@ -7598,13 +7600,14 @@ fn update_agg_payload(
                 AggFunc::Min => cmp == Ordering::Less,
                 _ => false,
             };
-            if should_update {
-                payload[0].try_clone_from(arg)?;
+            if !should_update {
+                return Ok(true);
             }
+            payload[0].try_clone_from(arg)?;
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             let [acc, count_slot, first_separator_len_slot, separator_lengths_slot, ..] =
                 payload.as_mut_slice()
@@ -7695,7 +7698,7 @@ fn update_agg_payload(
             // SQLite skips rows whose object label is SQL NULL. A NULL value is
             // still encoded as JSON null, so only the key is filtered here.
             if matches!(arg, Value::Null) {
-                return Ok(());
+                return Ok(false);
             }
             ensure_blob_arg_is_jsonb(value.as_value_ref())?;
             let mut key_vec = convert_dbtype_to_raw_jsonb(arg, Conv::ToString)?;
@@ -7763,7 +7766,7 @@ fn update_agg_payload(
             vec.append(&mut data);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Max limit of aggregate Vecs we keep around to reuse their allocations. This is a very naive
@@ -9332,6 +9335,10 @@ pub fn op_agg_step(
                             if better {
                                 *best = arg;
                             }
+                            if let Some(skip_reg) = data.skip_reg {
+                                state.registers[skip_reg] =
+                                    Register::Value(Value::from_i64(!better as i64));
+                            }
                             state.pc += 1;
                             return Ok(InsnFunctionStepResult::Step);
                         }
@@ -9352,6 +9359,7 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
         delimiter,
         func,
         collation,
+        skip_reg,
     } = data;
 
     if let AccumulatorFunc::Window(win_func) = func {
@@ -9441,7 +9449,11 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
                 .into());
             };
             let payload = agg.payload_vec_mut();
-            update_agg_payload(func, arg, maybe_arg2.as_ref(), payload, collation)?;
+            let kept_value =
+                update_agg_payload(func, arg, maybe_arg2.as_ref(), payload, collation)?;
+            if let Some(skip_reg) = skip_reg {
+                state.registers[*skip_reg] = Register::Value(Value::from_i64(kept_value as i64));
+            }
         }
     };
 
