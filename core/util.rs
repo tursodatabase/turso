@@ -1684,26 +1684,7 @@ where
             walk_with_expressions(with.as_ref(), func)?;
             if let ast::InsertBody::Select(select, upsert) = body {
                 walk_select_expressions_inner(select, func)?;
-                let mut upsert = upsert.as_deref();
-                while let Some(clause) = upsert {
-                    if let Some(index) = &clause.index {
-                        for target in &index.targets {
-                            walk_expr_with_subqueries(&target.expr, func)?;
-                        }
-                        if let Some(where_clause) = &index.where_clause {
-                            walk_expr_with_subqueries(where_clause, func)?;
-                        }
-                    }
-                    if let ast::UpsertDo::Set { sets, where_clause } = &clause.do_clause {
-                        for set in sets {
-                            walk_expr_with_subqueries(&set.expr, func)?;
-                        }
-                        if let Some(where_clause) = where_clause {
-                            walk_expr_with_subqueries(where_clause, func)?;
-                        }
-                    }
-                    upsert = clause.next.as_deref();
-                }
+                walk_upsert_expressions(upsert.as_deref(), func)?;
             }
             walk_result_column_expressions(returning, func)?;
         }
@@ -1781,6 +1762,32 @@ where
         | ast::Stmt::DropSequence { .. }
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::DropSchema { .. } => {}
+    }
+    Ok(())
+}
+
+fn walk_upsert_expressions<F>(mut upsert: Option<&ast::Upsert>, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    while let Some(clause) = upsert {
+        if let Some(index) = &clause.index {
+            for target in &index.targets {
+                walk_expr_with_subqueries(&target.expr, func)?;
+            }
+            if let Some(where_clause) = &index.where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+        }
+        if let ast::UpsertDo::Set { sets, where_clause } = &clause.do_clause {
+            for set in sets {
+                walk_expr_with_subqueries(&set.expr, func)?;
+            }
+            if let Some(where_clause) = where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+        }
+        upsert = clause.next.as_deref();
     }
     Ok(())
 }
