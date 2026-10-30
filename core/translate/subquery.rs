@@ -12,8 +12,10 @@ use super::{
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
-use crate::translate::expr::comparison_affinity;
 use crate::translate::expr::expr_type::{type_of, TypeEnv};
+use crate::translate::expr::{
+    cast_compared_builtin_types, cast_in_subquery_builtin_types, comparison_affinity,
+};
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
@@ -616,8 +618,22 @@ fn plan_subqueries_with_outer_query_access<'a>(
         same_query_map,
         shared,
     );
-    for expr in exprs {
+    let mut exprs: Vec<&mut ast::Expr> = exprs.collect();
+    for expr in exprs.iter_mut() {
         walk_expr_mut(expr, &mut subquery_parser)?;
+    }
+    drop(subquery_parser);
+    // Binding casts compared values of different built-in types to a common
+    // one, but a scalar subquery's type is known only now that it is planned:
+    // `ts = (SELECT d ...)` becomes `ts = CAST((SELECT d ...) AS timestamp)`.
+    if !resolver.schema().type_registry.is_empty() {
+        let env = TypeEnv::new(Some(referenced_tables), resolver);
+        for expr in exprs {
+            walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
+                cast_compared_builtin_types(expr, &env, resolver)?;
+                Ok(WalkControl::Continue)
+            })?;
+        }
     }
 
     Ok(())
@@ -959,13 +975,13 @@ fn get_subquery_parser<'a>(
                     get_outer_query_refs(referenced_tables)
                 }?;
 
-                let ast::Expr::InSelect { lhs, not, rhs } = ({
+                let ast::Expr::InSelect { mut lhs, not, rhs } = ({
                     crate::stack::trace_stack!("take_in_select_expr");
                     std::mem::take(expr)
                 }) else {
                     unreachable!();
                 };
-                let plan = prepare_select_plan(
+                let mut plan = prepare_select_plan(
                     *rhs,
                     resolver,
                     program,
@@ -973,7 +989,12 @@ fn get_subquery_parser<'a>(
                     QueryDestination::Unset,
                     connection,
                 )?;
-                let mut plan = plan;
+                cast_in_subquery_builtin_types(
+                    &mut lhs,
+                    Some(referenced_tables),
+                    &mut plan,
+                    resolver,
+                )?;
                 let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {

@@ -1,6 +1,7 @@
 use super::*;
 use crate::schema::{IndexColumn, ResolvedType, Schema, EXPR_INDEX_SENTINEL};
 use crate::translate::expr_context::ExprContext;
+use crate::translate::plan::{Plan, SelectPlan};
 use std::borrow::Borrow;
 
 /// Get the effective type name of a literal expression.
@@ -586,32 +587,133 @@ pub(crate) fn cast_compared_builtin_types(
             .chain(rhs.iter_mut())
             .map(|operand| operand.as_mut())
             .collect(),
+        // `CASE x WHEN y ...` compares x with each y.
+        ast::Expr::Case {
+            base: Some(base),
+            when_then_pairs,
+            ..
+        } => std::iter::once(base.as_mut())
+            .chain(when_then_pairs.iter_mut().map(|(when, _)| when.as_mut()))
+            .collect(),
         _ => return Ok(()),
     };
-    let types = operands
-        .iter()
-        .map(|operand| stored_form_type(&type_of(operand, env), env.schema()))
-        .collect::<Result<Vec<_>>>()?;
+    let operands = operands.into_iter().map(|operand| (operand, env));
+    cast_operands_to_builtin_comparison_type(operands, resolver)
+}
+
+/// [cast_compared_builtin_types] for `x IN (SELECT y ...)`: when x and y have
+/// different built-in types that the dialect compares as one of them, both are
+/// cast to it. The cast on y is in every SELECT of the subquery, so the values
+/// the subquery writes to its ephemeral index are the cast ones. Row values,
+/// `(x1, x2) IN (SELECT y1, y2 ...)`, are cast column by column.
+pub(crate) fn cast_in_subquery_builtin_types(
+    lhs: &mut ast::Expr,
+    outer_tables: Option<&TableReferences>,
+    query: &mut Plan,
+    resolver: &Resolver,
+) -> Result<()> {
+    let mut lhs_columns: Vec<&mut ast::Expr> = match lhs {
+        ast::Expr::Parenthesized(exprs) if exprs.len() > 1 => {
+            exprs.iter_mut().map(|expr| expr.as_mut()).collect()
+        }
+        lhs => vec![lhs],
+    };
+    let outer_env = TypeEnv::new(outer_tables, resolver);
+    for (column, lhs_column) in lhs_columns.iter_mut().enumerate() {
+        let column_types = [
+            stored_form_type(&type_of(lhs_column, &outer_env), resolver.schema())?,
+            stored_form_type(
+                &query_column_type(query, column, resolver),
+                resolver.schema(),
+            )?,
+        ];
+        let Some(target) = builtin_comparison_type(&column_types, resolver) else {
+            continue;
+        };
+        if is_other_custom_type(&column_types[1], &target) {
+            // A recursive CTE feeds its own rows back into itself, so a cast
+            // on its result would change what it computes. The comparison
+            // then fails as one of two different types.
+            let Some(selects) = query_selects_mut(query) else {
+                continue;
+            };
+            for select in selects {
+                cast_to(&mut select.result_columns[column].expr, &target);
+            }
+        }
+        if is_other_custom_type(&column_types[0], &target) {
+            cast_to(lhs_column, &target);
+        }
+    }
+    Ok(())
+}
+
+/// Casts each of `operands` whose built-in type is not the one the dialect
+/// compares them all as. Each operand comes with the tables its columns
+/// belong to.
+fn cast_operands_to_builtin_comparison_type<'e>(
+    operands: impl IntoIterator<Item = (&'e mut ast::Expr, &'e TypeEnv<'e>)>,
+    resolver: &Resolver,
+) -> Result<()> {
+    let (operands, types): (Vec<_>, Vec<_>) = operands
+        .into_iter()
+        .map(|(operand, env)| {
+            let ty = stored_form_type(&type_of(operand, env), env.schema());
+            (operand, ty)
+        })
+        .unzip();
+    let types = types.into_iter().collect::<Result<Vec<_>>>()?;
     let Some(target) = builtin_comparison_type(&types, resolver) else {
         return Ok(());
     };
     for (operand, ty) in operands.into_iter().zip(&types) {
-        if ty
-            .as_ref()
-            .is_some_and(|ty| !same_type_def(ty.leaf(), &target))
-        {
-            let value = std::mem::replace(operand, ast::Expr::Literal(ast::Literal::Null));
-            *operand = ast::Expr::Cast {
-                expr: Box::new(value),
-                type_name: Some(ast::Type {
-                    name: target.name.clone(),
-                    size: None,
-                    array_dimensions: 0,
-                }),
-            };
+        if is_other_custom_type(ty, &target) {
+            cast_to(operand, &target);
         }
     }
     Ok(())
+}
+
+/// Whether an operand of type `operand_type` needs a cast to `target`. An
+/// operand of no custom type is a constant, which the comparison converts
+/// anyway.
+fn is_other_custom_type(operand_type: &Option<ResolvedType>, target: &TypeDef) -> bool {
+    operand_type
+        .as_ref()
+        .is_some_and(|ty| !same_type_def(ty.leaf(), target))
+}
+
+/// Every SELECT of `query` whose result is the query's result: one, or each
+/// SELECT of a compound SELECT. None for a recursive CTE.
+fn query_selects_mut(query: &mut Plan) -> Option<Vec<&mut SelectPlan>> {
+    match query {
+        Plan::Select(select) => Some(vec![select]),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => Some(
+            left.iter_mut()
+                .map(|(select, _)| select)
+                .chain(core::iter::once(right_most.as_mut()))
+                .collect(),
+        ),
+        Plan::RecursiveCte(_) => None,
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE and UPDATE plans have no result columns")
+        }
+    }
+}
+
+/// Replaces `operand` with `CAST(operand AS target)`.
+fn cast_to(operand: &mut ast::Expr, target: &TypeDef) {
+    let value = std::mem::replace(operand, ast::Expr::Literal(ast::Literal::Null));
+    *operand = ast::Expr::Cast {
+        expr: Box::new(value),
+        type_name: Some(ast::Type {
+            name: target.name.clone(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    };
 }
 
 /// The type that the dialect compares all the custom types of compared
