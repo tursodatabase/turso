@@ -2657,8 +2657,7 @@ pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -
             end,
         } = e
         {
-            if is_literal_between_bound(start) && is_literal_between_bound(end)
-            {
+            if is_literal_between_bound(start) && is_literal_between_bound(end) {
                 let mut lhs_has_subquery = false;
                 walk_expr(lhs, &mut |expr| {
                     if matches!(
@@ -2674,7 +2673,9 @@ pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -
                     Ok(WalkControl::Continue)
                 })?;
                 let lhs_is_nondeterministic = match resolver {
-                    Some(resolver) => expr_contains_nondeterministic_scalar_function(lhs, resolver)?,
+                    Some(resolver) => {
+                        expr_contains_nondeterministic_scalar_function(lhs, resolver)?
+                    }
                     None => false,
                 };
                 if lhs_has_subquery || lhs_is_nondeterministic {
