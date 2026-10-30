@@ -1,6 +1,6 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::Func;
+use crate::function::{Deterministic, Func};
 use crate::index_method::IndexMethodConfiguration;
 use crate::namespace::{is_reserved_object_name, NamespaceId, NamespaceRef};
 use crate::numeric::Numeric;
@@ -1084,7 +1084,10 @@ fn resolve_sorted_columns_with_catalog(
                 expr,
             }
         } else {
-            if !validate_index_expression(unwrapped_expr, table) {
+            if let Some(col_name) = first_unknown_column(unwrapped_expr, table) {
+                crate::bail_parse_error!("no such column: {}", col_name);
+            }
+            if !validate_index_expression(unwrapped_expr, table, syms) {
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
             let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;
@@ -1225,7 +1228,23 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+fn first_unknown_column(expr: &Expr, table: &BTreeTable) -> Option<String> {
+    let mut unknown = None;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+        if unknown.is_some() {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if let Expr::Id(name) | Expr::Name(name) = e {
+            if table.get_column(name.as_str()).is_none() {
+                unknown = Some(name.as_str().to_string());
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    unknown
+}
+
+fn validate_index_expression(expr: &Expr, table: &BTreeTable, syms: &SymbolTable) -> bool {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
@@ -1247,6 +1266,9 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         let n = normalize_ident(name);
         Func::resolve_function(&n, args.len())
             .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
+            || syms
+                .resolve_function(&n, args.len())
+                .is_some_and(|f| f.is_deterministic())
     };
 
     let mut ok = true;

@@ -774,14 +774,13 @@ fn translate_cast_expr(
                 None => Vec::new(),
             };
 
-            // A cast to a domain over boolean gives true for every nonzero
-            // integer in dialects whose integer-to-boolean cast does, before
-            // boolean's ENCODE sees the value.
+            // A cast to boolean, or to a domain over boolean, gives true for
+            // every nonzero integer in dialects whose integer-to-boolean cast
+            // does, before boolean's ENCODE sees the value.
             let is_domain = chain[0].is_domain;
-            if is_domain
-                && chain
-                    .iter()
-                    .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
+            if chain
+                .iter()
+                .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
             {
                 emit_integer_to_boolean_cast(program, target_register);
             }
@@ -970,7 +969,7 @@ fn translate_function_call_expr(
         Func::Window(_) => {
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
-        Func::External(_) | Func::Dialect(_) => {
+        Func::External(_) | Func::Dialect { .. } => {
             let regs = program.alloc_registers(args_count);
             for (i, arg_expr) in args.iter().enumerate() {
                 translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;

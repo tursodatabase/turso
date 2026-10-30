@@ -2605,6 +2605,9 @@ pub fn parse_where(
     resolver: &Resolver,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
+        if !resolver.catalog.dialect.allows_numeric_constants_in_where() {
+            reject_numeric_constant_condition(where_expr, "WHERE")?;
+        }
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
@@ -2646,6 +2649,37 @@ pub fn parse_where(
         Ok(())
     } else {
         Ok(())
+    }
+}
+
+/// PostgreSQL requires WHERE, HAVING, and JOIN/ON to be boolean
+/// expressions and rejects a numeric constant like WHERE 1 after it has
+/// resolved the names in the statement. Only constants are checked: anything deeper needs expression
+/// types.
+pub(crate) fn reject_numeric_constant_condition(condition: &Expr, clause_name: &str) -> Result<()> {
+    let mut expr = condition;
+    while let Expr::Parenthesized(inner) = expr {
+        if inner.len() != 1 {
+            return Ok(());
+        }
+        expr = &inner[0];
+    }
+    let Expr::Literal(ast::Literal::Numeric(text)) = expr else {
+        return Ok(());
+    };
+    crate::bail_parse_error!(
+        "argument of {} must be type boolean, not type {}",
+        clause_name,
+        numeric_constant_type_name(text)
+    );
+}
+
+/// The type PostgreSQL gives a numeric constant, for error messages.
+fn numeric_constant_type_name(text: &str) -> &'static str {
+    match text.parse::<i64>() {
+        Ok(value) if i32::try_from(value).is_ok() => "integer",
+        Ok(_) => "bigint",
+        Err(_) => "numeric",
     }
 }
 
@@ -3129,6 +3163,9 @@ fn parse_join(
     if let Some(constraint) = constraint {
         match constraint {
             ast::JoinConstraint::On(ref expr) => {
+                if !resolver.catalog.dialect.allows_numeric_constants_in_where() {
+                    reject_numeric_constant_condition(expr, "JOIN/ON")?;
+                }
                 let start_idx = out_where_clause.len();
                 break_predicate_at_and_boundaries(expr, out_where_clause);
                 for predicate in out_where_clause[start_idx..].iter_mut() {
