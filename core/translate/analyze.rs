@@ -250,6 +250,7 @@ pub fn translate_analyze(
             db: database_id,
             where_clause: Some(parse_schema_where_clause),
             trigger_target_database_id: None,
+            reloaded_objects: vec![],
         });
 
         // Bump schema cookie so subsequent statements reparse schema.

@@ -1558,6 +1558,7 @@ pub fn translate_create_table(
         db: database_id,
         where_clause: Some(parse_schema_where_clause),
         trigger_target_database_id: None,
+        reloaded_objects: vec![],
     });
 
     // For CTAS, emit bytecode to populate the new table from the SELECT
@@ -1760,6 +1761,7 @@ fn open_namespaces_table_for_writing(
                     "tbl_name = '{TURSO_NAMESPACES_TABLE_NAME}' AND type != 'trigger'"
                 )),
                 trigger_target_database_id: None,
+                reloaded_objects: vec![],
             });
             (table, RegisterOrLiteral::Register(root_reg))
         }
@@ -2155,6 +2157,7 @@ pub fn translate_create_virtual_table(
         db: sqlite_schema_cursor_id,
         where_clause: Some(parse_schema_where_clause),
         trigger_target_database_id: None,
+        reloaded_objects: vec![],
     });
 
     Ok(())
@@ -3014,6 +3017,7 @@ fn persist_type_definition(
                 "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
             )),
             trigger_target_database_id: None,
+            reloaded_objects: vec![],
         });
     }
 

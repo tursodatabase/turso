@@ -2563,41 +2563,6 @@ pub fn insn_to_row(
                 0,
                 format!("rename_table({from}, {to})"),
             ),
-            Insn::DropColumn {
-                db: _,
-                namespace: _,
-                table,
-                column_index,
-            } => (
-                "DropColumn",
-                0,
-                0,
-                0,
-                Value::build_text(""),
-                0,
-                format!("drop_column({table}, {column_index})"),
-            ),
-            Insn::AddColumn { data } => (
-                "AddColumn",
-                0,
-                0,
-                0,
-                Value::build_text(""),
-                0,
-                format!("add_column({}, {:?})", data.table, data.column),
-            ),
-            Insn::AlterColumn { data } => (
-                "AlterColumn",
-                0,
-                0,
-                0,
-                Value::build_text(""),
-                0,
-                format!(
-                    "alter_column({}, {}, {:?}, {:?})",
-                    data.table, data.column_index, data.definition, data.rename
-                ),
-            ),
             Insn::MaxPgcnt { db, dest, new_max } => (
                 "MaxPgcnt",
                 *db as i64,

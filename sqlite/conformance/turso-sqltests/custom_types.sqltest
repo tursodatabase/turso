@@ -581,6 +581,30 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test add-column-custom-type-uses-base-type-affinity {
+    CREATE TYPE tag BASE text;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    ALTER TABLE t1 ADD COLUMN val tag;
+    INSERT INTO t1 VALUES (1, '7');
+    SELECT id, val, typeof(val) FROM t1;
+}
+expect {
+    1|7|text
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-to-custom-type-uses-base-type-affinity {
+    CREATE TYPE tag BASE text;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER) STRICT;
+    ALTER TABLE t1 ALTER COLUMN val TO v tag;
+    INSERT INTO t1 VALUES (1, '7');
+    SELECT id, v, typeof(v) FROM t1;
+}
+expect {
+    1|7|text
+}
+
+@requires strict "uses STRICT tables"
 test add-column-numeric-default-preexisting {
     CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
     INSERT INTO t1 VALUES (1);

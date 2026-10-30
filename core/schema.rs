@@ -2122,23 +2122,37 @@ impl Schema {
         objects.views.get(&name).cloned()
     }
 
+    /// Add `trigger`, or replace the trigger of the same name in its place when
+    /// ALTER TABLE has rewritten that trigger's SQL. Triggers fire in the order
+    /// of their list, so a replaced trigger keeps its position. It also keeps
+    /// the database that a TEMP trigger on an unqualified table targets, which
+    /// is not in the SQL.
     pub fn add_trigger(
         &mut self,
         namespace: NamespaceId,
-        trigger: Trigger,
+        mut trigger: Trigger,
         table_name: &str,
     ) -> Result<()> {
         let objects = self.namespace_mut(namespace);
         // Triggers have their own namespace and duplicate trigger names
         // are checked in `translate_create_trigger`
         let table_name = normalize_ident(table_name);
+        let triggers = objects.triggers.entry(table_name).or_default();
+
+        let trigger_name = normalize_ident(&trigger.name);
+        if let Some(existing) = triggers
+            .iter_mut()
+            .find(|existing| normalize_ident(&existing.name) == trigger_name)
+        {
+            if trigger.target_database_id.is_none() {
+                trigger.target_database_id = existing.target_database_id;
+            }
+            *existing = Arc::new(trigger);
+            return Ok(());
+        }
 
         // See [Schema::add_index] for why we push to the front of the deque.
-        objects
-            .triggers
-            .entry(table_name)
-            .or_default()
-            .push_front(Arc::new(trigger));
+        triggers.push_front(Arc::new(trigger));
 
         Ok(())
     }
@@ -2344,6 +2358,25 @@ impl Schema {
             self.unregister_table_root_page(&table);
         }
         self.analyze_stats.remove_table(namespace, &name);
+    }
+
+    /// Remove a B-tree table and its indexes so that they can be loaded again
+    /// from sqlite_schema. Unlike DROP TABLE, this keeps the table's triggers
+    /// and its ANALYZE statistics.
+    pub fn remove_table_for_reload(&mut self, namespace: NamespaceId, table_name: &str) {
+        let name = normalize_ident(table_name);
+        let objects = self.namespace_mut(namespace);
+        let removed = objects.tables.remove(&name);
+        turso_assert!(
+            removed.as_ref().is_some_and(|table| table.btree().is_some()),
+            "table to reload must be a B-tree table in the schema",
+            { "table": name }
+        );
+        objects.indexes.remove(&name);
+        #[cfg(feature = "conn_raw_api")]
+        if let Some(table) = removed {
+            self.unregister_table_root_page(&table);
+        }
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -3693,6 +3726,33 @@ impl Schema {
             }
         }
         Ok(out)
+    }
+
+    /// The B-tree tables, with their namespaces, that have a foreign key whose
+    /// parent is table `parent_table` of `parent_namespace`.
+    pub fn tables_referencing(
+        &self,
+        parent_namespace: NamespaceId,
+        parent_table: &str,
+    ) -> Result<Vec<(NamespaceId, Arc<BTreeTable>)>> {
+        let tables = self
+            .namespaces
+            .iter()
+            .flat_map(|(namespace, objects)| {
+                objects
+                    .tables
+                    .values()
+                    .filter_map(|table| table.btree())
+                    .filter(|table| {
+                        table.foreign_keys.iter().any(|fk| {
+                            fk.parent_namespace == parent_namespace
+                                && fk.parent_table.eq_ignore_ascii_case(parent_table)
+                        })
+                    })
+                    .map(move |table| (*namespace, table))
+            })
+            .try_collect()?;
+        Ok(tables)
     }
 
     /// Compute all resolved FKs *declared by* `child_table`.
@@ -5369,43 +5429,6 @@ impl BTreeTable {
         Ok(())
     }
 
-    pub fn shift_generated_column_indices_after_drop(
-        &mut self,
-        dropped_index: usize,
-    ) -> Result<()> {
-        if !self.has_virtual_columns {
-            return Ok(());
-        }
-
-        for column in &mut self.columns {
-            let Some(expr) = column.generated_expr_mut() else {
-                continue;
-            };
-
-            walk_expr_mut(expr, &mut |e| match e {
-                Expr::Column {
-                    table,
-                    column,
-                    is_rowid_alias: _,
-                    ..
-                } if table.is_self_table() => {
-                    if *column == dropped_index {
-                        return Err(LimboError::InternalError(
-                            "dropped column remained referenced by generated column".to_string(),
-                        ));
-                    }
-                    if *column > dropped_index {
-                        *column -= 1;
-                    }
-                    Ok(WalkControl::Continue)
-                }
-                _ => Ok(WalkControl::Continue),
-            })?;
-        }
-
-        Ok(())
-    }
-
     fn column_graph(&self) -> Result<&GeneratedColGraph> {
         if let Some(graph) = self.column_dependencies.0.get() {
             return Ok(graph);
@@ -5798,28 +5821,6 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
         _ => Ok(WalkControl::Continue),
     })?;
     Ok(())
-}
-
-/// Re-render the SQL text of a generated-column expression using current column names. The input
-/// AST may have been previously resolved into `Expr::Column { table: SELF_TABLE, column: idx, .. }`
-/// nodes; we replace each such self-table reference with a fresh `Expr::Id(<col-name>)` before
-/// stringifying so the result round-trips through the parser, even if a referenced column was
-/// renamed since the original `original_sql` was captured.
-pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) -> Result<String> {
-    let mut clone = expr.clone();
-    walk_expr_mut(&mut clone, &mut |e| -> Result<WalkControl> {
-        if let Expr::Column { table, column, .. } = e {
-            if table.is_self_table() {
-                if let Some(col) = columns.get(*column) {
-                    if let Some(name) = col.name.as_ref() {
-                        *e = Expr::Id(Name::exact(name.clone()));
-                    }
-                }
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(clone.to_string())
 }
 
 pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
@@ -7242,17 +7243,6 @@ impl Column {
         match &mut self.generated_type {
             GeneratedType::Virtual { expr, .. } => Some(expr.as_mut()),
             GeneratedType::NotGenerated => None,
-        }
-    }
-
-    #[inline]
-    pub fn set_generated_original_sql(&mut self, new_sql: String) {
-        if let GeneratedType::Virtual {
-            ref mut original_sql,
-            ..
-        } = self.generated_type
-        {
-            *original_sql = new_sql;
         }
     }
 

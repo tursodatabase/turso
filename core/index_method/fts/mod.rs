@@ -997,18 +997,14 @@ impl IndexMethodAttachment for FtsIndexAttachment {
         Some(result)
     }
 
-    fn rename_column(
-        &self,
-        from: &str,
-        to: &str,
-    ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
+    fn check_rename_column(&self, from: &str, to: &str) -> Result<()> {
         if !self
             .cfg
             .columns
             .iter()
             .any(|column| column.name.eq_ignore_ascii_case(from))
         {
-            return Ok(None);
+            return Ok(());
         }
         let mut cfg = self.cfg.clone();
         for column in &mut cfg.columns {
@@ -1025,7 +1021,8 @@ impl IndexMethodAttachment for FtsIndexAttachment {
                 *weights = crate::types::Text::new(renamed_weights);
             }
         }
-        Ok(Some(Arc::new(FtsIndexAttachment::new(cfg)?)))
+        FtsIndexAttachment::new(cfg)?;
+        Ok(())
     }
 }
 

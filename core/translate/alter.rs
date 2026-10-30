@@ -1,5 +1,6 @@
+use crate::alloc::TryClone;
 use crate::alloc::TursoIteratorExt;
-use crate::namespace::{demangle_name, NamespaceId, NamespaceRef};
+use crate::namespace::{demangle_name, mangle_name, NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::{turso_assert_eq, turso_assert_ne};
@@ -28,8 +29,9 @@ use crate::{
         },
         plan::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
-            TableReferences,
+            QueryDestination, TableReferences,
         },
+        select::translate_select,
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -39,14 +41,15 @@ use crate::{
     },
     vdbe::{
         affinity::Affinity,
-        builder::{CursorType, DmlColumnContext, ProgramBuilder},
-        insn::{to_u32, AddColumnData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
+        builder::{CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts, QueryMode},
+        insn::{to_u32, CmpInsFlags, Cookie, Insn, RegisterOrLiteral, ReloadedObject},
     },
     vtab::VirtualTable,
     LimboError, Numeric, Result, Value, ValueRef,
 };
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
+use std::collections::BTreeMap;
 
 fn validate(
     alter_table: &ast::AlterTableBody,
@@ -993,8 +996,6 @@ pub fn translate_alter_table(
                 }
             }
 
-            // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
-
             // Like SQLite, re-validate ALL triggers after the drop. Any trigger whose
             // body references a nonexistent column (in the altered table or any other
             // table) causes the DROP to fail. This catches cross-table references to
@@ -1046,6 +1047,15 @@ pub fn translate_alter_table(
                     )));
                 }
             }
+
+            let schema_after_drop = schema_after_alter(resolver, namespace, &post_drop_btree, &[])?;
+            check_views_compile(
+                resolver,
+                connection,
+                namespace,
+                &schema_after_drop,
+                &format!("cannot drop column \"{column_name}\""),
+            )?;
 
             btree.columns_mut().remove(dropped_index);
 
@@ -1121,12 +1131,9 @@ pub fn translate_alter_table(
                         p5: 0,
                     });
 
-                    program.emit_insn(Insn::DropColumn {
-                        db: database_id,
-                        namespace: namespace.id,
-                        table: btree.name.clone(),
-                        column_index: dropped_index,
-                    })
+                    let mut rewritten_objects = RewrittenObjects::default();
+                    rewritten_objects.add_table(namespace, &btree.name);
+                    rewritten_objects.emit(program);
                 },
             )?;
             rewrite_rows_result?
@@ -1484,16 +1491,9 @@ pub fn translate_alter_table(
                         value: schema_version as i32 + 1,
                         p5: 0,
                     });
-                    program.emit_insn(Insn::AddColumn {
-                        data: Box::new(AddColumnData {
-                            db: database_id,
-                            namespace: namespace.id,
-                            table: table_name.to_owned(),
-                            column,
-                            check_constraints: btree.check_constraints.to_vec(),
-                            foreign_keys: btree.foreign_keys.to_vec(),
-                        }),
-                    });
+                    let mut rewritten_objects = RewrittenObjects::default();
+                    rewritten_objects.add_table(namespace, &btree.name);
+                    rewritten_objects.emit(program);
                 },
             )?
         }
@@ -1790,18 +1790,15 @@ pub fn translate_alter_table(
                 )));
             };
 
-            // Built here so a name an index method cannot use fails before anything is written
             let old_column_name = btree.columns()[column_index]
                 .name
                 .as_deref()
                 .expect("column being ALTERed should be named");
-            let mut renamed_index_methods = Vec::new();
+            // Fail before anything is written if an index method cannot use the
+            // new name. The renamed index itself is loaded from its rewritten SQL.
             for index in &table_indexes {
-                let Some(index_method) = &index.index_method else {
-                    continue;
-                };
-                if let Some(attachment) = index_method.rename_column(old_column_name, col_name)? {
-                    renamed_index_methods.push((index.name.clone(), attachment));
+                if let Some(index_method) = &index.index_method {
+                    index_method.check_rename_column(old_column_name, col_name)?;
                 }
             }
 
@@ -1823,6 +1820,24 @@ pub fn translate_alter_table(
                 return Err(LimboError::ParseError(
                     "UNIQUE constraint cannot be altered".to_string(),
                 ));
+            }
+
+            // The column keeps its PRIMARY KEY unless it is a rowid alias. Changing such a key
+            // to INTEGER would make the column a rowid alias and leave its automatic index
+            // without a constraint.
+            let old_column = &btree.columns()[column_index];
+            if old_column.primary_key()
+                && !old_column.is_rowid_alias()
+                && btree.has_rowid
+                && btree.primary_key_columns.len() == 1
+                && definition
+                    .col_type
+                    .as_ref()
+                    .is_some_and(|ty| crate::util::is_rowid_alias_type(&ty.name))
+            {
+                return Err(LimboError::ParseError(format!(
+                    "cannot change the type of PRIMARY KEY column \"{from}\" to INTEGER"
+                )));
             }
 
             let (rewrites_physical_layout, virtual_generated_values_may_change, replacement_column) =
@@ -1962,7 +1977,7 @@ pub fn translate_alter_table(
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
             let mut triggers_to_rewrite: Vec<(NamespaceRef, String, String)> = Vec::new();
-            let mut views_to_rewrite: Vec<(usize, String, String)> = Vec::new();
+            let mut views_to_rewrite: Vec<(NamespaceRef, String, String)> = Vec::new();
             if rename {
                 // Try to rewrite every trigger's SQL for the column rename.
                 // If the rewritten SQL differs from the original, include it
@@ -2043,11 +2058,7 @@ pub fn translate_alter_table(
                             from,
                             col_name,
                         )? {
-                            rewrites.push((
-                                database_id,
-                                resolver.mangle_name(namespace, view_name),
-                                rewritten.sql,
-                            ));
+                            rewrites.push((namespace, view_name.to_string(), rewritten.sql));
                         }
                     }
                     Ok(rewrites)
@@ -2069,7 +2080,7 @@ pub fn translate_alter_table(
                                     col_name,
                                 )? {
                                     rewrites.push((
-                                        crate::TEMP_DB_ID,
+                                        NamespaceRef::root_of(crate::TEMP_DB_ID),
                                         view_name.to_string(),
                                         rewritten.sql,
                                     ));
@@ -2080,12 +2091,32 @@ pub fn translate_alter_table(
                     views_to_rewrite.extend(temp_rewrites);
                 }
             }
+            if rename && database_id != crate::MAIN_DB_ID {
+                let mut renamed_table = btree.clone();
+                // Rename the key column before columns_mut(), whose drop rebuilds the
+                // WITHOUT ROWID key order from primary_key_columns by name.
+                for (pk_name, _) in &mut renamed_table.primary_key_columns {
+                    if pk_name.eq_ignore_ascii_case(old_column_name) {
+                        *pk_name = col_name.to_string();
+                    }
+                }
+                renamed_table.columns_mut()[column_index].name = Some(col_name.to_string());
+                let schema_after_rename =
+                    schema_after_alter(resolver, namespace, &renamed_table, &views_to_rewrite)?;
+                check_views_compile(
+                    resolver,
+                    connection,
+                    NamespaceRef::root_of(database_id),
+                    &schema_after_rename,
+                    &format!("cannot rename column \"{old_column_name}\""),
+                )?;
+            }
             let has_temp_rewrites = triggers_to_rewrite
                 .iter()
                 .any(|(namespace, _, _)| namespace.database_id == crate::TEMP_DB_ID)
                 || views_to_rewrite
                     .iter()
-                    .any(|(db, _, _)| *db == crate::TEMP_DB_ID);
+                    .any(|(namespace, _, _)| namespace.database_id == crate::TEMP_DB_ID);
             let temp_schema_version = if has_temp_rewrites {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
                 program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
@@ -2214,14 +2245,17 @@ pub fn translate_alter_table(
             }
 
             // Update view SQL for renamed columns
-            for (view_database_id, view_name, new_sql) in views_to_rewrite {
-                let escaped_sql = escape_sql_string_literal(&new_sql);
-                let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
+            for (view_namespace, view_name, new_sql) in &views_to_rewrite {
+                let escaped_sql = escape_sql_string_literal(new_sql);
+                let view_schema_table =
+                    schema_table_name_for_db(resolver, view_namespace.database_id);
+                let escaped_view_name =
+                    escape_sql_string_literal(&resolver.mangle_name(*view_namespace, view_name));
                 let update_stmt = format!(
                     r#"
                         UPDATE {view_schema_table}
                         SET sql = '{escaped_sql}'
-                        WHERE name = '{view_name}' COLLATE NOCASE AND type = 'view'
+                        WHERE name = '{escaped_view_name}' COLLATE NOCASE AND type = 'view'
                     "#,
                 );
 
@@ -2334,21 +2368,180 @@ pub fn translate_alter_table(
                 value: schema_version as i32 + 1,
                 p5: 0,
             });
-            program.emit_insn(Insn::AlterColumn {
-                data: Box::new(crate::vdbe::insn::AlterColumnData {
-                    db: database_id,
-                    namespace: namespace.id,
-                    table: table_name.to_owned(),
-                    column_index,
-                    definition,
-                    rename,
-                    rewritten_triggers: triggers_to_rewrite,
-                    renamed_index_methods,
-                }),
-            });
+            let mut rewritten_objects = RewrittenObjects::default();
+            rewritten_objects.add_table(namespace, &original_btree.name);
+            // The statement also rewrote the foreign keys of the tables whose
+            // parent is this table.
+            let child_tables = resolver.with_schema(database_id, |s| {
+                s.tables_referencing(namespace.id, &original_btree.name)
+            })?;
+            for (child_namespace, child_table) in child_tables {
+                let is_altered_table = child_namespace == namespace.id
+                    && child_table.name.eq_ignore_ascii_case(&original_btree.name);
+                if !is_altered_table {
+                    rewritten_objects.add_table(
+                        NamespaceRef {
+                            database_id,
+                            id: child_namespace,
+                        },
+                        &child_table.name,
+                    );
+                }
+            }
+            for (trigger_namespace, trigger_name, _) in &triggers_to_rewrite {
+                rewritten_objects.add_trigger(*trigger_namespace, trigger_name);
+            }
+            for (view_namespace, view_name, _) in &views_to_rewrite {
+                rewritten_objects.add_view(*view_namespace, view_name);
+            }
+            rewritten_objects.emit(program);
         }
     };
 
+    Ok(())
+}
+
+/// The objects whose sqlite_schema rows an ALTER TABLE statement rewrote, by
+/// database. The statement loads them again from those rows, the same way
+/// CREATE statements load the objects they add.
+#[derive(Default)]
+struct RewrittenObjects {
+    databases: BTreeMap<usize, RewrittenRows>,
+}
+
+#[derive(Default)]
+struct RewrittenRows {
+    /// Conditions on sqlite_schema rows; a row is loaded if it meets any of them.
+    conditions: Vec<String>,
+    reloaded_objects: Vec<ReloadedObject>,
+}
+
+impl RewrittenObjects {
+    /// A B-tree table and its indexes.
+    fn add_table(&mut self, namespace: NamespaceRef, name: &str) {
+        let rows = self.databases.entry(namespace.database_id).or_default();
+        let stored_name = escape_sql_string_literal(&mangle_name(namespace.id, name));
+        rows.conditions.push(format!(
+            "(tbl_name = '{stored_name}' COLLATE NOCASE AND type IN ('table', 'index'))"
+        ));
+        rows.reloaded_objects.push(ReloadedObject::Table {
+            namespace: namespace.id,
+            name: name.to_string(),
+        });
+    }
+
+    fn add_view(&mut self, namespace: NamespaceRef, name: &str) {
+        let rows = self.databases.entry(namespace.database_id).or_default();
+        let stored_name = escape_sql_string_literal(&mangle_name(namespace.id, name));
+        rows.conditions.push(format!(
+            "(name = '{stored_name}' COLLATE NOCASE AND type = 'view')"
+        ));
+        rows.reloaded_objects.push(ReloadedObject::View {
+            namespace: namespace.id,
+            name: name.to_string(),
+        });
+    }
+
+    fn add_trigger(&mut self, namespace: NamespaceRef, name: &str) {
+        let rows = self.databases.entry(namespace.database_id).or_default();
+        let stored_name = escape_sql_string_literal(&mangle_name(namespace.id, name));
+        rows.conditions.push(format!(
+            "(name = '{stored_name}' COLLATE NOCASE AND type = 'trigger')"
+        ));
+    }
+
+    fn emit(self, program: &mut ProgramBuilder) {
+        for (database_id, rows) in self.databases {
+            program.emit_insn(Insn::ParseSchema {
+                db: database_id,
+                where_clause: Some(rows.conditions.join(" OR ")),
+                trigger_target_database_id: None,
+                reloaded_objects: rows.reloaded_objects,
+            });
+        }
+    }
+}
+
+/// The schema of `namespace`'s database once `table` replaces the table of
+/// the same name and the views in `rewritten_views` are loaded from their new
+/// SQL.
+fn schema_after_alter(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    table: &BTreeTable,
+    rewritten_views: &[(NamespaceRef, String, String)],
+) -> Result<Arc<Schema>> {
+    let mut schema = resolver.with_schema(namespace.database_id, |s| s.try_clone())?;
+    schema.remove_table_for_reload(namespace.id, &table.name);
+    schema.add_btree_table(namespace.id, Arc::new(table.clone()))?;
+    for (view_namespace, view_name, sql) in rewritten_views
+        .iter()
+        .filter(|(view_namespace, _, _)| view_namespace.database_id == namespace.database_id)
+    {
+        schema.remove_view(view_namespace.id, view_name)?;
+        let stored_name = mangle_name(view_namespace.id, view_name);
+        schema.handle_schema_row(
+            "view",
+            &stored_name,
+            &stored_name,
+            0,
+            Some(sql),
+            resolver.catalog.symbol_table,
+            &mut <crate::alloc::Vec<_> as crate::alloc::TursoAllocExt>::new(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &mut Default::default(),
+            &|_| None,
+            resolver.catalog.dialect.as_ref(),
+        )?;
+    }
+    Ok(Arc::new(schema))
+}
+
+/// Fail if a view of `namespace` does not compile against `schema`, the schema
+/// of its database after the ALTER TABLE statement.
+fn check_views_compile(
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    namespace: NamespaceRef,
+    schema: &Arc<Schema>,
+    error_prefix: &str,
+) -> Result<()> {
+    let resolver = resolver.fork_with_schema(namespace.database_id, schema);
+    let qualifier = match schema.namespace_name(namespace.id) {
+        Some(namespace_name) => namespace_name.to_string(),
+        None => resolver
+            .namespace_name(namespace.database_id)
+            .expect("the database of a view has a name"),
+    };
+    for (view_name, view) in schema.views(namespace.id) {
+        let sql = format!(
+            "SELECT * FROM \"{}\".\"{}\"",
+            qualifier.replace('"', "\"\""),
+            view_name.replace('"', "\"\"")
+        );
+        let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) =
+            Parser::new(sql.as_bytes()).next_cmd()?
+        else {
+            unreachable!("a SELECT from a view parses as a SELECT");
+        };
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 2));
+        translate_select(
+            select,
+            &resolver,
+            &mut program,
+            QueryDestination::ResultRows,
+            connection,
+        )
+        .map_err(|e| {
+            LimboError::ParseError(format!(
+                "{error_prefix}: referenced in VIEW {view_name}: {}. {e}",
+                view.sql
+            ))
+        })?;
+    }
     Ok(())
 }
 

@@ -165,6 +165,7 @@ pub fn emit_sequence_backing_table(
         db: database_id,
         where_clause: Some(format!("name = '{escaped}'")),
         trigger_target_database_id: None,
+        reloaded_objects: vec![],
     });
 
     Ok(())

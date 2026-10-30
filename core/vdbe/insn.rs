@@ -11,9 +11,9 @@ pub fn to_u32(v: usize) -> u32 {
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::function::AccumulatorFunc;
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::NamespaceId;
 use crate::{
-    schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
+    schema::{BTreeTable, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::TransactionMode, plan::BitSet},
@@ -298,28 +298,20 @@ impl From<BitSet> for NullMatchingMask {
     }
 }
 
-/// Data for AddColumn instruction (boxed to keep Insn small).
+/// An object that `ParseSchema` removes from the schema so that its
+/// sqlite_schema row loads it again. A trigger needs no entry: loading a
+/// trigger replaces the one with the same name.
 #[derive(Debug, Clone)]
-pub struct AddColumnData {
-    pub db: usize,
-    pub namespace: NamespaceId,
-    pub table: String,
-    pub column: Column,
-    pub check_constraints: Vec<CheckConstraint>,
-    pub foreign_keys: Vec<Arc<ForeignKey>>,
-}
-
-/// Data for AlterColumn instruction (boxed to keep Insn small).
-#[derive(Debug, Clone)]
-pub struct AlterColumnData {
-    pub db: usize,
-    pub namespace: NamespaceId,
-    pub table: String,
-    pub column_index: usize,
-    pub definition: turso_parser::ast::ColumnDefinition,
-    pub rename: bool,
-    pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
-    pub renamed_index_methods: Vec<(String, Arc<dyn crate::index_method::IndexMethodAttachment>)>,
+pub enum ReloadedObject {
+    /// A B-tree table and its indexes.
+    Table {
+        namespace: NamespaceId,
+        name: String,
+    },
+    View {
+        namespace: NamespaceId,
+        name: String,
+    },
 }
 
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
@@ -1959,6 +1951,11 @@ pub enum Insn {
         /// it on the in-memory trigger. Every other ParseSchema use leaves this
         /// as `None`.
         trigger_target_database_id: Option<usize>,
+        /// Objects already in the schema whose rows `where_clause` selects.
+        /// They are removed from the schema before the rows are read, so ALTER
+        /// TABLE ends with the same objects as reopening the database would
+        /// give.
+        reloaded_objects: Vec<ReloadedObject>,
     },
 
     /// Populate all materialized views after schema parsing
@@ -2153,18 +2150,6 @@ pub enum Insn {
         namespace: NamespaceId,
         from: String,
         to: String,
-    },
-    DropColumn {
-        db: usize,
-        namespace: NamespaceId,
-        table: String,
-        column_index: usize,
-    },
-    AddColumn {
-        data: Box<AddColumnData>,
-    },
-    AlterColumn {
-        data: Box<AlterColumnData>,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.
     /// Do not let the maximum page count fall below the current page count and
@@ -2613,9 +2598,6 @@ impl InsnVariants {
             InsnVariants::Count => execute::op_count,
             InsnVariants::IntegrityCk => execute::op_integrity_check,
             InsnVariants::RenameTable => execute::op_rename_table,
-            InsnVariants::DropColumn => execute::op_drop_column,
-            InsnVariants::AddColumn => execute::op_add_column,
-            InsnVariants::AlterColumn => execute::op_alter_column,
             InsnVariants::MaxPgcnt => execute::op_max_pgcnt,
             InsnVariants::JournalMode => execute::op_journal_mode,
             InsnVariants::IfNeg => execute::op_if_neg,
@@ -2712,9 +2694,6 @@ impl Insn {
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }
             | Self::RenameTable { .. }
-            | Self::DropColumn { .. }
-            | Self::AddColumn { .. }
-            | Self::AlterColumn { .. }
             | Self::JournalMode { .. }
             | Self::Vacuum { .. } => false,
             Self::MaxPgcnt { new_max, .. } => *new_max == 0,

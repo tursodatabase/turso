@@ -93,13 +93,9 @@ pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     }
 
     /// Called when ALTER TABLE renames column `from` of the indexed table to `to`
-    /// Returns the attachment to use from now on, or None to keep this one
-    fn rename_column(
-        &self,
-        _from: &str,
-        _to: &str,
-    ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
-        Ok(None)
+    /// Fails if the index cannot use the new name
+    fn check_rename_column(&self, _from: &str, _to: &str) -> Result<()> {
+        Ok(())
     }
 }
 

@@ -352,6 +352,7 @@ pub fn translate_create_index(
         db: database_id,
         where_clause: Some(parse_schema_where_clause),
         trigger_target_database_id: None,
+        reloaded_objects: vec![],
     });
     // Close the final sqlite_schema cursor
     program.emit_insn(Insn::Close {
