@@ -1564,12 +1564,12 @@ impl Value {
                     Value::Null => 0,
                 };
                 // Invalid codepoints (negative, surrogates, or > U+10FFFF)
-                // become U+FFFD, matching SQLite.
-                if codepoint >= 0 {
-                    char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}')
-                } else {
-                    '\u{FFFD}'
-                }
+                // become U+FFFD, matching SQLite. Range-check the i64 before
+                // narrowing, or 4294967296 would wrap to U+0000.
+                u32::try_from(codepoint)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or('\u{FFFD}')
             })
             .collect();
         Value::build_text(result)
