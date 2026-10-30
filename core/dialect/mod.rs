@@ -269,6 +269,18 @@ pub trait Dialect: Send + Sync + 'static {
     fn comparison_type(&self, _lhs_type: &str, _rhs_type: &str) -> Option<&'static str> {
         None
     }
+
+    /// Whether a value of no custom type that changes per row is cast to the
+    /// custom type it is compared with. `type_is_known` says whether the value
+    /// has a known SQL type, as a text column has; a function's result may not.
+    ///
+    /// SQLite casts any such value, as it applies a column's affinity to the
+    /// other side of a comparison: `date_col = text_col` compares
+    /// `CAST(text_col AS date)`. PostgreSQL makes `date_col = text_col` an
+    /// error, so it casts only values of unknown type.
+    fn casts_compared_value_to_custom_type(&self, _type_is_known: bool) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
