@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::{ResolvedType, Schema};
+use crate::schema::{IndexColumn, ResolvedType, Schema, EXPR_INDEX_SENTINEL};
 use crate::translate::expr::expr_type::compound_column_type;
 use crate::translate::expr_context::ExprContext;
 use crate::translate::plan::SelectPlan;
@@ -83,6 +83,63 @@ pub(crate) fn emit_dml_expr_index_value(
         Ok(())
     })?;
     Ok(())
+}
+
+/// Turns the value of index expression `idx_col` in `reg` into the index key.
+/// The key of an expression of a custom type is the expression's stored form,
+/// as the key of a column of the type is the column's stored value. So an
+/// index on `coalesce(c, c)` sorts its rows as `ORDER BY coalesce(c, c)` does.
+/// An index column on a generated column keeps the column's value.
+pub(crate) fn emit_expression_index_key(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    idx_col: &IndexColumn,
+    table: &BTreeTable,
+    resolver: &Resolver,
+) -> Result<()> {
+    if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+        return Ok(());
+    }
+    if let Some(stored) = expression_index_stored_form(idx_col, table, resolver)? {
+        emit_stored_form(program, reg, &stored, resolver)?;
+    }
+    Ok(())
+}
+
+/// Turns the key of index expression `idx_col`, read from the index into
+/// `reg`, into the expression's value (see [emit_expression_index_key]).
+pub(crate) fn emit_expression_index_value(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    idx_col: &IndexColumn,
+    table: &BTreeTable,
+    resolver: &Resolver,
+) -> Result<()> {
+    if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+        return Ok(());
+    }
+    if let Some(stored) = expression_index_stored_form(idx_col, table, resolver)? {
+        emit_presentation_form(program, reg, &stored, resolver)?;
+    }
+    Ok(())
+}
+
+/// The type whose stored form the index keeps for index expression `idx_col`
+/// over the columns of `table`.
+fn expression_index_stored_form(
+    idx_col: &IndexColumn,
+    table: &BTreeTable,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    let mut expr = idx_col
+        .expr
+        .as_deref()
+        .expect("expression index column must have an expression")
+        .clone();
+    crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
+    let schema = resolver.schema();
+    let env = TypeEnv::over_table(table, schema, resolver.catalog.symbol_table);
+    stored_form_type(&type_of(&expr, &env), schema)
 }
 
 /// Emit bytecode that transforms a stored column value into its user-facing

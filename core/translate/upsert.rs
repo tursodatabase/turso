@@ -1861,7 +1861,7 @@ fn emit_upsert_expr_index_value(
         &bt,
         dest_reg,
     )?;
-    Ok(())
+    crate::translate::expr::emit_expression_index_key(program, dest_reg, idx_col, &bt, resolver)
 }
 
 #[allow(clippy::too_many_arguments)]

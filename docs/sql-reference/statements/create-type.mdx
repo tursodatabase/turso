@@ -124,7 +124,7 @@ The built-in `numeric` type uses both clauses: `ENCODE numeric_encode(value)` tu
 
 ### Sorting and comparing
 
-A custom type sorts and compares by its stored value, using SQLite's comparison for the base type. This holds for ORDER BY, MIN, MAX, GROUP BY, DISTINCT and indexes. For a type whose ENCODE does not keep the order of its input, the order follows the stored form:
+A custom type sorts and compares by its stored value, using SQLite's comparison for the base type. This holds for ORDER BY, MIN, MAX, GROUP BY, DISTINCT and indexes. An index on an expression of the type, such as `CAST(x AS reversed_text)`, also keeps the stored value, so it sorts rows the same way. For a type whose ENCODE does not keep the order of its input, the order follows the stored form:
 
 ```sql
 CREATE TYPE reversed_text BASE text
