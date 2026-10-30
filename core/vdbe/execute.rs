@@ -11,7 +11,7 @@ use crate::mvcc::database::{
     BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
 };
 use crate::mvcc::MvccClock;
-use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
+use crate::namespace::{mangle_name, NamespaceId};
 use crate::numeric::decimal::numeric_from_value;
 use crate::numeric::Numeric;
 use crate::schema::{Schema, Table, SCHEMA_TABLE_NAME};
@@ -38,8 +38,7 @@ use crate::util::{
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
     rewrite_inline_col_fk_target_if_needed, rewrite_select_namespace_table_refs,
-    rewrite_select_table_refs, rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
-    trim_ascii_whitespace, RewrittenView,
+    rewrite_select_table_refs, rewrite_trigger_cmd_table_refs, trim_ascii_whitespace,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -47,7 +46,7 @@ use crate::vdbe::affinity::{
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
-use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags};
+use crate::vdbe::insn::{ConstraintInfo, InsertFlags, ReloadedObject};
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
@@ -16019,7 +16018,7 @@ pub fn op_parse_schema(
             db,
             where_clause,
             trigger_target_database_id,
-            reloaded_table
+            reloaded_objects
         },
         insn
     );
@@ -16093,14 +16092,26 @@ pub fn op_parse_schema(
     } else {
         conn.schema.read().clone()
     };
-    if let Some((namespace, table_name)) = reloaded_table {
-        match Schema::try_make_mut(&mut schema_arc) {
-            Ok(schema) => schema.remove_table_for_reload(*namespace, table_name),
-            Err(e) => {
-                conn.auto_commit
-                    .store(previous_auto_commit, Ordering::SeqCst);
-                return Err(e.into());
-            }
+    if !reloaded_objects.is_empty() {
+        let removed = Schema::try_make_mut(&mut schema_arc)
+            .map_err(LimboError::from)
+            .and_then(|schema| {
+                for object in reloaded_objects {
+                    match object {
+                        ReloadedObject::Table { namespace, name } => {
+                            schema.remove_table_for_reload(*namespace, name)
+                        }
+                        ReloadedObject::View { namespace, name } => {
+                            schema.remove_view(*namespace, name)?
+                        }
+                    }
+                }
+                Ok(())
+            });
+        if let Err(e) = removed {
+            conn.auto_commit
+                .store(previous_auto_commit, Ordering::SeqCst);
+            return Err(e.into());
         }
     }
 
@@ -18098,247 +18109,6 @@ fn table_qualifiers(schema: &Schema, namespace: NamespaceId) -> Option<Vec<Strin
         schema.namespace_name(namespace)
     };
     Some(name.into_iter().map(str::to_string).collect())
-}
-
-pub fn op_check_views(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(
-        CheckViews {
-            db,
-            namespace,
-            error_prefix
-        },
-        insn
-    );
-
-    let conn = program.connection.clone();
-    conn.with_schema(*db, |schema| -> crate::Result<()> {
-        for (view_name, view) in schema.views(*namespace) {
-            let view_select_sql = select_from_view_sql(&conn, *db, schema, *namespace, view_name);
-            let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
-                LimboError::ParseError(format!(
-                    "{error_prefix}: referenced in VIEW {view_name}: {}. {e}",
-                    view.sql,
-                ))
-            })?;
-        }
-        Ok(())
-    })?;
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-/// SQL that selects from the view `view_name` of database `db`, named with
-/// its database so the lookup does not go through the search path.
-/// A statement that reads view `view_name` of `namespace` in database `db`,
-/// named so that it resolves without a search path: by the namespace's name
-/// when the namespace is stored, else by the database's name.
-fn select_from_view_sql(
-    conn: &Connection,
-    db: usize,
-    schema: &crate::schema::Schema,
-    namespace: NamespaceId,
-    view_name: &str,
-) -> String {
-    let qualifier = match schema.namespace_name(namespace) {
-        Some(namespace_name) => namespace_name.to_string(),
-        None => conn
-            .namespace_name(db)
-            .expect("the database of a view has a name"),
-    };
-    format!(
-        "SELECT * FROM \"{}\".\"{}\"",
-        qualifier.replace('"', "\"\""),
-        view_name.replace('"', "\"\"")
-    )
-}
-
-pub fn op_alter_column(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(AlterColumn { data }, insn);
-    let AlterColumnData {
-        db,
-        namespace,
-        table: table_name,
-        column_index,
-        definition,
-        rename,
-        rewritten_triggers,
-    } = data.as_ref();
-
-    let conn = program.connection.clone();
-
-    let normalized_table_name = normalize_ident(table_name.as_str());
-    let old_column_name = conn.with_schema(*db, |schema| {
-        let table = schema
-            .get_table(*namespace, &normalized_table_name)
-            .expect("table being ALTERed should be in schema");
-        table
-            .get_column_at(*column_index)
-            .expect("column being ALTERed should be in schema")
-            .name
-            .as_ref()
-            .expect("column being ALTERed should be named")
-            .clone()
-    });
-    let new_name = definition.col_name.as_str().to_owned();
-
-    let view_rewrites: Vec<(NamespaceRef, String, RewrittenView)> = if *rename {
-        let target_db_name = conn.namespace_name(*db).ok_or_else(|| {
-            LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
-        })?;
-        let mut all_rewrites = conn.with_schema(
-            *db,
-            |schema| -> crate::Result<Vec<(NamespaceRef, String, RewrittenView)>> {
-                let mut rewrites = Vec::new();
-                for (view_name, view) in schema.views(*namespace) {
-                    if let Some(rewritten) = rewrite_view_sql_for_column_rename(
-                        &view.sql,
-                        schema,
-                        *namespace,
-                        table_name.as_str(),
-                        &target_db_name,
-                        &old_column_name,
-                        &new_name,
-                    )? {
-                        rewrites.push((
-                            NamespaceRef {
-                                database_id: *db,
-                                id: *namespace,
-                            },
-                            view_name.to_string(),
-                            rewritten,
-                        ));
-                    }
-                }
-                Ok(rewrites)
-            },
-        )?;
-        // Also search temp schema for views referencing the renamed column.
-        if *db != crate::TEMP_DB_ID {
-            let temp_rewrites = conn.with_schema(
-                crate::TEMP_DB_ID,
-                |schema| -> crate::Result<Vec<(NamespaceRef, String, RewrittenView)>> {
-                    let mut rewrites = Vec::new();
-                    for (view_name, view) in schema.views(NamespaceId::ROOT) {
-                        if let Some(rewritten) = rewrite_view_sql_for_column_rename(
-                            &view.sql,
-                            schema,
-                            NamespaceId::ROOT,
-                            table_name.as_str(),
-                            &target_db_name,
-                            &old_column_name,
-                            &new_name,
-                        )? {
-                            rewrites.push((
-                                NamespaceRef::root_of(crate::TEMP_DB_ID),
-                                view_name.to_string(),
-                                rewritten,
-                            ));
-                        }
-                    }
-                    Ok(rewrites)
-                },
-            )?;
-            all_rewrites.extend(temp_rewrites);
-        }
-        all_rewrites
-    } else {
-        Vec::new()
-    };
-
-    // The altered table and its indexes are loaded again from sqlite_schema
-    // by the ParseSchema that follows. Here, update the other objects that
-    // name the column.
-    conn.with_database_schema_mut(*db, |schema| -> Result<()> {
-        // fix OTHER tables, of any namespace, that reference this table as parent
-        for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
-            if child_namespace == *namespace && normalize_ident(tname) == normalized_table_name {
-                continue;
-            }
-            if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
-                let child_btree = Arc::make_mut(child_btree_arc);
-                for fk_arc in &mut child_btree.foreign_keys {
-                    if fk_arc.parent_namespace != *namespace
-                        || normalize_ident(&fk_arc.parent_table) != normalized_table_name
-                    {
-                        continue;
-                    }
-                    let fk = Arc::make_mut(fk_arc);
-                    for pc in &mut fk.parent_columns {
-                        if pc.eq_ignore_ascii_case(&old_column_name) {
-                            pc.clone_from(&new_name);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    })??;
-
-    if *rename {
-        for (trigger_namespace, trigger_name, sql) in rewritten_triggers {
-            conn.with_database_schema_mut(trigger_namespace.database_id, |schema| {
-                replace_trigger_sql(schema, trigger_namespace.id, trigger_name, sql)
-            })??;
-        }
-
-        for (view_namespace, view_name, rewritten) in view_rewrites {
-            conn.with_database_schema_mut(
-                view_namespace.database_id,
-                move |schema| -> crate::Result<()> {
-                    if let Some(view_arc) = schema.view_mut(view_namespace.id, &view_name) {
-                        let view = Arc::make_mut(view_arc);
-                        view.sql = rewritten.sql;
-                        view.select_stmt = rewritten.select_stmt;
-                        view.columns = rewritten.columns;
-                    }
-                    Ok(())
-                },
-            )??;
-        }
-    }
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-fn replace_trigger_sql(
-    schema: &mut Schema,
-    namespace: NamespaceId,
-    trigger_name: &str,
-    sql: &str,
-) -> Result<()> {
-    let mut parser = Parser::new(sql.as_bytes());
-    let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
-        event,
-        when_clause,
-        commands,
-        ..
-    })) = parser.next_cmd()?
-    else {
-        return Err(LimboError::ParseError(format!(
-            "invalid trigger sql: {sql}"
-        )));
-    };
-    let trigger = schema
-        .trigger_mut(namespace, trigger_name)
-        .expect("rewritten trigger should be in schema");
-    let trigger = Arc::make_mut(trigger);
-    trigger.sql = sql.to_string();
-    trigger.event = event;
-    trigger.when_clause = when_clause.map(|expr| *expr);
-    trigger.commands = commands;
-    Ok(())
 }
 
 pub fn op_if_neg(

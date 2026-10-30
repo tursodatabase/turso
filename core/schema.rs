@@ -2122,23 +2122,37 @@ impl Schema {
         objects.views.get(&name).cloned()
     }
 
+    /// Add `trigger`, or replace the trigger of the same name in its place when
+    /// ALTER TABLE has rewritten that trigger's SQL. Triggers fire in the order
+    /// of their list, so a replaced trigger keeps its position. It also keeps
+    /// the database that a TEMP trigger on an unqualified table targets, which
+    /// is not in the SQL.
     pub fn add_trigger(
         &mut self,
         namespace: NamespaceId,
-        trigger: Trigger,
+        mut trigger: Trigger,
         table_name: &str,
     ) -> Result<()> {
         let objects = self.namespace_mut(namespace);
         // Triggers have their own namespace and duplicate trigger names
         // are checked in `translate_create_trigger`
         let table_name = normalize_ident(table_name);
+        let triggers = objects.triggers.entry(table_name).or_default();
+
+        let trigger_name = normalize_ident(&trigger.name);
+        if let Some(existing) = triggers
+            .iter_mut()
+            .find(|existing| normalize_ident(&existing.name) == trigger_name)
+        {
+            if trigger.target_database_id.is_none() {
+                trigger.target_database_id = existing.target_database_id;
+            }
+            *existing = Arc::new(trigger);
+            return Ok(());
+        }
 
         // See [Schema::add_index] for why we push to the front of the deque.
-        objects
-            .triggers
-            .entry(table_name)
-            .or_default()
-            .push_front(Arc::new(trigger));
+        triggers.push_front(Arc::new(trigger));
 
         Ok(())
     }
@@ -3712,6 +3726,31 @@ impl Schema {
             }
         }
         Ok(out)
+    }
+
+    /// The B-tree tables, with their namespaces, that have a foreign key whose
+    /// parent is table `parent_table` of `parent_namespace`.
+    pub fn tables_referencing(
+        &self,
+        parent_namespace: NamespaceId,
+        parent_table: &str,
+    ) -> Vec<(NamespaceId, Arc<BTreeTable>)> {
+        self.namespaces
+            .iter()
+            .flat_map(|(namespace, objects)| {
+                objects
+                    .tables
+                    .values()
+                    .filter_map(|table| table.btree())
+                    .filter(|table| {
+                        table.foreign_keys.iter().any(|fk| {
+                            fk.parent_namespace == parent_namespace
+                                && fk.parent_table.eq_ignore_ascii_case(parent_table)
+                        })
+                    })
+                    .map(move |table| (*namespace, table))
+            })
+            .collect()
     }
 
     /// Compute all resolved FKs *declared by* `child_table`.

@@ -118,6 +118,25 @@ impl<'a> CatalogContext<'a> {
         }
     }
 
+    /// A copy of this context that sees `schema` as the schema of database
+    /// `database_id`.
+    pub(crate) fn fork_with_schema<'b>(
+        &'b self,
+        database_id: usize,
+        schema: &'b Arc<Schema>,
+    ) -> CatalogContext<'b> {
+        let mut catalog: CatalogContext<'b> = self.fork();
+        if database_id == crate::MAIN_DB_ID {
+            catalog.schema = schema;
+        } else {
+            catalog
+                .non_main_schema_cache
+                .borrow_mut()
+                .insert(database_id, schema.clone());
+        }
+        catalog
+    }
+
     pub fn schema(&self) -> &Schema {
         self.schema
     }

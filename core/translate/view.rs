@@ -302,7 +302,7 @@ pub fn translate_create_materialized_view(
         db: database_id,
         where_clause: Some(where_clause),
         trigger_target_database_id: None,
-        reloaded_table: None,
+        reloaded_objects: vec![],
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
@@ -466,7 +466,7 @@ pub fn translate_create_view(
         db: database_id,
         where_clause: Some(format!("name = '{escaped_view_name}'")),
         trigger_target_database_id: None,
-        reloaded_table: None,
+        reloaded_objects: vec![],
     });
 
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);

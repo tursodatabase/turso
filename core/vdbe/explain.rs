@@ -2563,31 +2563,6 @@ pub fn insn_to_row(
                 0,
                 format!("rename_table({from}, {to})"),
             ),
-            Insn::CheckViews {
-                db,
-                namespace: _,
-                error_prefix,
-            } => (
-                "CheckViews",
-                *db as i64,
-                0,
-                0,
-                Value::build_text(""),
-                0,
-                format!("check_views(db[{db}], {error_prefix:?})"),
-            ),
-            Insn::AlterColumn { data } => (
-                "AlterColumn",
-                0,
-                0,
-                0,
-                Value::build_text(""),
-                0,
-                format!(
-                    "alter_column({}, {}, {:?}, {:?})",
-                    data.table, data.column_index, data.definition, data.rename
-                ),
-            ),
             Insn::MaxPgcnt { db, dest, new_max } => (
                 "MaxPgcnt",
                 *db as i64,

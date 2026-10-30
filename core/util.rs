@@ -2811,7 +2811,6 @@ mod rename_column_view {
     #[derive(Debug, Clone)]
     pub struct RewrittenView {
         pub sql: String,
-        pub select_stmt: ast::Select,
         pub columns: crate::alloc::Vec<Column>,
     }
 
@@ -2917,7 +2916,6 @@ mod rename_column_view {
 
             Ok(Some(RewrittenView {
                 sql: new_sql,
-                select_stmt: select,
                 columns: final_columns,
             }))
         })();
@@ -3900,7 +3898,7 @@ mod rename_column_view {
     }
 }
 
-pub use rename_column_view::{rewrite_view_sql_for_column_rename, RewrittenView};
+pub use rename_column_view::rewrite_view_sql_for_column_rename;
 
 /// Rewrite table-qualified column references in a CHECK constraint expression,
 /// replacing the table name from `from` to `to`. For example, `t1.a > 0` becomes

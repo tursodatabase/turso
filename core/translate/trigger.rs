@@ -298,7 +298,7 @@ pub fn translate_create_trigger(
         )),
         trigger_target_database_id: (temporary && tbl_name.namespace.is_none())
             .then_some(target_table_database_id),
-        reloaded_table: None,
+        reloaded_objects: vec![],
     });
 
     Ok(())

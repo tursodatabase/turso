@@ -357,6 +357,20 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// A copy of this resolver that sees `schema` as the schema of database
+    /// `database_id`, to compile statements against a schema that a DDL
+    /// statement has not written yet.
+    pub(crate) fn fork_with_schema<'b>(
+        &'b self,
+        database_id: usize,
+        schema: &'b Arc<Schema>,
+    ) -> Resolver<'b> {
+        Resolver {
+            catalog: self.catalog.fork_with_schema(database_id, schema),
+            ..self.fork()
+        }
+    }
+
     pub fn fork_with_expr_cache(&self) -> Resolver<'a> {
         Resolver {
             catalog: self.catalog.fork(),
