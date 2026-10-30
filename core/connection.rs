@@ -207,6 +207,10 @@ impl PrepareOptions {
 }
 
 /// Re-entrant state for [`Connection::maybe_reparse_schema_nonblock`].
+///
+/// Every state but `Start` holds a read transaction, which
+/// [`Connection::end_maybe_reparse_schema`] ends when an I/O error stops the
+/// reload before it finishes.
 #[derive(Default)]
 pub(crate) enum MaybeReparseSchemaState {
     #[default]
@@ -1294,7 +1298,11 @@ impl Connection {
     pub fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let io = self.pager.load().io.clone();
         let mut state = MaybeReparseSchemaState::default();
-        io.block(|| self.maybe_reparse_schema_nonblock(&mut state))
+        let result = io.block(|| self.maybe_reparse_schema_nonblock(&mut state));
+        if result.is_err() {
+            self.end_maybe_reparse_schema(&mut state);
+        }
+        result
     }
 
     /// Non-blocking [`Self::maybe_reparse_schema`]. Call again with the same
@@ -1330,14 +1338,18 @@ impl Connection {
                         had_main_mv_tx,
                     };
                 }
-                MaybeReparseSchemaState::ReadCookie {
-                    pager,
-                    had_main_mv_tx,
-                } => {
+                MaybeReparseSchemaState::ReadCookie { .. } => {
                     let cookie = self.read_current_schema_cookie_nonblock();
                     if let Ok(IOResult::IO(io)) = cookie {
                         return Ok(IOResult::IO(io));
                     }
+                    let MaybeReparseSchemaState::ReadCookie {
+                        pager,
+                        had_main_mv_tx,
+                    } = std::mem::take(state)
+                    else {
+                        unreachable!("state is ReadCookie");
+                    };
                     if self.mv_store().is_none() {
                         pager.end_read_tx();
                     }
@@ -1369,41 +1381,54 @@ impl Connection {
                     pager.begin_read_tx()?;
                     self.set_tx_state(TransactionState::Read);
                     *state = MaybeReparseSchemaState::Reparse {
-                        pager: pager.clone(),
-                        had_main_mv_tx: *had_main_mv_tx,
+                        pager,
+                        had_main_mv_tx,
                         reparse: ReparseSchemaState::default(),
                     };
                 }
-                MaybeReparseSchemaState::Reparse {
-                    pager,
-                    had_main_mv_tx,
-                    reparse,
-                } => {
+                MaybeReparseSchemaState::Reparse { reparse, .. } => {
                     let reparse_result = match self.reparse_schema_nonblock(reparse) {
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                         Ok(IOResult::Done(())) => Ok(()),
                         Err(err) => Err(err),
                     };
-
-                    let previous = self.transaction_state.swap(TransactionState::None);
-                    turso_assert!(
-                        matches!(previous, TransactionState::None | TransactionState::Read),
-                        "unexpected end transaction state"
-                    );
-                    // close opened transaction if it was kept open
-                    // (in most cases, it will be automatically closed if stmt was executed properly)
-                    if previous == TransactionState::Read {
-                        pager.end_read_tx();
-                    }
-                    if !*had_main_mv_tx {
-                        self.clear_internal_main_mvcc_tx(pager);
-                    }
-
+                    self.end_maybe_reparse_schema(state);
                     reparse_result?;
 
                     let schema = self.schema.read().clone();
                     self.db.update_schema_if_newer(schema);
                     return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
+    /// Ends the read transaction that `state` holds and returns it to `Start`.
+    fn end_maybe_reparse_schema(self: &Arc<Connection>, state: &mut MaybeReparseSchemaState) {
+        match std::mem::take(state) {
+            MaybeReparseSchemaState::Start => {}
+            MaybeReparseSchemaState::ReadCookie { pager, .. } => {
+                if self.mv_store().is_none() {
+                    pager.end_read_tx();
+                }
+            }
+            MaybeReparseSchemaState::Reparse {
+                pager,
+                had_main_mv_tx,
+                ..
+            } => {
+                let previous = self.transaction_state.swap(TransactionState::None);
+                turso_assert!(
+                    matches!(previous, TransactionState::None | TransactionState::Read),
+                    "unexpected end transaction state"
+                );
+                // close opened transaction if it was kept open
+                // (in most cases, it will be automatically closed if stmt was executed properly)
+                if previous == TransactionState::Read {
+                    pager.end_read_tx();
+                }
+                if !had_main_mv_tx {
+                    self.clear_internal_main_mvcc_tx(&pager);
                 }
             }
         }

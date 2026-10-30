@@ -231,6 +231,47 @@ fn test_open_file_with_table_named_like_the_roles_table() {
     assert_that!(rows).is_equal_to(vec![vec![turso_core::Value::from_i64(5)]]);
 }
 
+/// A read error while a connection checks whether the schema changed must end
+/// the read transaction the check started, or checkpoints stay busy and the
+/// connection's next transaction panics.
+#[test]
+fn test_failed_schema_check_ends_its_read_transaction() {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+
+    let io = Arc::new(QueuedIo::new());
+    let db =
+        Database::open_file(io.clone(), "schema-check-fault.db", Arc::new(SqliteDialect)).unwrap();
+    let conn1 = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    conn1.execute("CREATE TABLE t(x)").unwrap();
+    conn1.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let conn2 = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
+    // The schema cookie is then read from the database file, where the
+    // fault is.
+    conn2.get_pager().clear_page_cache(false);
+
+    io.fault_after("schema-check-fault.db", QueuedIoOpKind::Pread, 0);
+    assert!(conn2.maybe_reparse_schema().is_err());
+    io.clear_fault();
+
+    conn1.execute("INSERT INTO t VALUES (2)").unwrap();
+    let mut checkpoint = conn1.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let rows = checkpoint.run_collect_rows().unwrap();
+    assert_that!(rows).is_equal_to(vec![vec![
+        turso_core::Value::from_i64(0),
+        turso_core::Value::from_i64(0),
+        turso_core::Value::from_i64(0),
+    ]]);
+    // The read that failed may still fail the insert, as it does on main, but
+    // the insert must not find a read transaction left open.
+    conn2.execute("BEGIN").unwrap();
+    let _ = conn2.execute("INSERT INTO t VALUES (3)");
+}
+
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///
