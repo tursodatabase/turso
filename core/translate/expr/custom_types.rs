@@ -1,8 +1,6 @@
 use super::*;
 use crate::schema::{IndexColumn, ResolvedType, Schema, EXPR_INDEX_SENTINEL};
-use crate::translate::expr::expr_type::compound_column_type;
 use crate::translate::expr_context::ExprContext;
-use crate::translate::plan::SelectPlan;
 use std::borrow::Borrow;
 
 /// Get the effective type name of a literal expression.
@@ -119,7 +117,7 @@ pub(crate) fn emit_expression_index_value(
         return Ok(());
     }
     if let Some(stored) = expression_index_stored_form(idx_col, table, resolver)? {
-        emit_presentation_form(program, reg, &stored, resolver)?;
+        emit_decode(program, &stored.chain, reg, resolver)?;
     }
     Ok(())
 }
@@ -694,17 +692,6 @@ pub(crate) fn emit_stored_form(
     Ok(())
 }
 
-/// Turns the value in `reg`, in the stored form of `ty`, into the form a query
-/// returns, with the type's DECODE. NULL is left as it is.
-pub(crate) fn emit_presentation_form(
-    program: &mut ProgramBuilder,
-    reg: usize,
-    ty: &ResolvedType,
-    resolver: &Resolver,
-) -> Result<()> {
-    emit_decode(program, &ty.chain, reg, resolver)
-}
-
 /// Runs the DECODE of each type in `chain` on the value in `reg`, the last
 /// type's first. NULL is left as it is.
 pub(crate) fn emit_decode(
@@ -730,45 +717,12 @@ pub(crate) fn emit_decode(
     Ok(())
 }
 
-/// The type whose ENCODE turns a value into what a column declared as
-/// `ty_str` stores, as an index on the column keeps it. None when the column
-/// stores values as they are.
-pub(crate) fn column_stored_form(
-    ty_str: &str,
-    is_strict: bool,
-    schema: &Schema,
-) -> Result<Option<ResolvedType>> {
-    let Some(resolved) = schema.resolve_type(ty_str, is_strict)? else {
-        return Ok(None);
-    };
-    let Some(stored) = resolved.without_domains()? else {
-        return Ok(None);
-    };
-    if stored.chain.iter().all(|td| td.encode().is_none()) {
-        return Ok(None);
-    }
-    Ok(Some(stored))
-}
-
-/// The type whose stored form column `column` of a compound SELECT sorts in,
-/// where `arms` are its SELECTs. It is the column's type as a query over the
-/// compound sees it, so ORDER BY on the compound sorts as ORDER BY on the
-/// compound used as a subquery.
-pub(crate) fn compound_column_stored_form(
-    arms: &[&SelectPlan],
-    column: usize,
-    resolver: &Resolver,
-) -> Result<Option<ResolvedType>> {
-    let ty = compound_column_type(arms.iter().copied(), column, resolver);
-    stored_form_type(&ty, resolver.schema())
-}
-
 /// The type whose stored form a value of type `ty` compares in. A domain
 /// stores its values as its base type does, so it compares as that type. None
 /// for a type with its own order and for a type without ENCODE, such as
 /// `varchar`: it stores the value as it is, so a `varchar` compares with a
 /// `text` like two texts do.
-fn stored_form_type(ty: &ExprType, schema: &Schema) -> Result<Option<ResolvedType>> {
+pub(crate) fn stored_form_type(ty: &ExprType, schema: &Schema) -> Result<Option<ResolvedType>> {
     let ExprType::Custom { type_def, .. } = ty else {
         return Ok(None);
     };
@@ -778,13 +732,7 @@ fn stored_form_type(ty: &ExprType, schema: &Schema) -> Result<Option<ResolvedTyp
     let Some(resolved) = schema.resolve_type_unchecked(&type_def.name)? else {
         return Ok(None);
     };
-    let Some(stored) = resolved.without_domains()? else {
-        return Ok(None);
-    };
-    if stored.chain.iter().all(|td| td.encode().is_none()) {
-        return Ok(None);
-    }
-    Ok(Some(stored))
+    resolved.stored_form()
 }
 
 /// Whether `expr` reads a table column that [translate_expr] DECODEs only
