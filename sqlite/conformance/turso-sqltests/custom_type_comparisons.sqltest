@@ -1406,8 +1406,8 @@ expect {
 }
 
 # coalesce(c, c) > 4 compares stored values: -c > -4, which holds for c = 1.
-# An index on coalesce(c, c) holds the decoded values 1, 5, 10 and would find
-# 5 and 10 instead, so the query scans t.
+# The comparison encodes the value of coalesce(c, c), so the query scans t
+# instead of searching the index on it.
 @requires strict "uses STRICT tables"
 test cmp-expression-index-unused-when-expression-is-encoded {
     CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
@@ -1418,6 +1418,118 @@ test cmp-expression-index-unused-when-expression-is-encoded {
 }
 expect {
     1
+}
+
+# An index on an expression of a custom type keeps the expression's stored
+# value, as an index on a column of the type does. ORDER BY, GROUP BY and max
+# give the same rows with and without the index, and reading the expression
+# from the index still gives the user's values.
+@requires strict "uses STRICT tables"
+test cmp-expression-index-keeps-stored-value {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 5), (3, 10), (4, NULL), (5, 5);
+    SELECT 'order', coalesce(c, c) FROM t ORDER BY coalesce(c, c);
+    SELECT 'desc', coalesce(c, c) FROM t ORDER BY coalesce(c, c) DESC;
+    SELECT 'group', coalesce(c, c), count(*) FROM t GROUP BY coalesce(c, c) ORDER BY coalesce(c, c);
+    SELECT 'max', max(coalesce(c, c)), min(coalesce(c, c)) FROM t;
+    CREATE INDEX i ON t(coalesce(c, c));
+    SELECT 'order', coalesce(c, c) FROM t ORDER BY coalesce(c, c);
+    SELECT 'desc', coalesce(c, c) FROM t ORDER BY coalesce(c, c) DESC;
+    SELECT 'group', coalesce(c, c), count(*) FROM t GROUP BY coalesce(c, c) ORDER BY coalesce(c, c);
+    SELECT 'max', max(coalesce(c, c)), min(coalesce(c, c)) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    order|
+    order|10
+    order|5
+    order|5
+    order|1
+    desc|1
+    desc|5
+    desc|5
+    desc|10
+    desc|
+    group||1
+    group|10|1
+    group|5|2
+    group|1|1
+    max|1|10
+    order|
+    order|10
+    order|5
+    order|5
+    order|1
+    desc|1
+    desc|5
+    desc|5
+    desc|10
+    desc|
+    group||1
+    group|10|1
+    group|5|2
+    group|1|1
+    max|1|10
+    ok
+}
+
+# Writes keep the keys of expression indexes in stored form: an index on
+# CAST(x AS cents) keeps 500 for x = 5, while the CAST returns 5.
+@requires strict "uses STRICT tables"
+test cmp-expression-index-keys-after-writes {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg, x integer) STRICT;
+    CREATE INDEX t_c ON t(coalesce(c, c));
+    CREATE INDEX t_x ON t(CAST(x AS cents));
+    INSERT INTO t VALUES (1, 1, 1), (2, 5, 5), (3, 10, 10), (4, NULL, NULL);
+    UPDATE t SET c = 6, x = 6 WHERE id = 2;
+    DELETE FROM t WHERE id = 3;
+    INSERT INTO t VALUES (3, 7, 7) ON CONFLICT(id) DO UPDATE SET c = 0, x = 0;
+    INSERT INTO t VALUES (2, 0, 0) ON CONFLICT(id) DO UPDATE SET c = excluded.c, x = excluded.x;
+    REPLACE INTO t VALUES (1, 2, 2);
+    PRAGMA integrity_check;
+    SELECT 'order', id, coalesce(c, c) FROM t ORDER BY coalesce(c, c);
+    SELECT 'cast', id, CAST(x AS cents) FROM t ORDER BY CAST(x AS cents);
+}
+expect {
+    ok
+    order|4|
+    order|3|7
+    order|1|2
+    order|2|0
+    cast|4|
+    cast|2|0
+    cast|1|2
+    cast|3|7
+}
+
+# CREATE INDEX on a table with rows computes the same keys as INSERT does.
+@requires strict "uses STRICT tables"
+test cmp-expression-index-built-from-existing-rows {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg, x integer) STRICT;
+    INSERT INTO t VALUES (1, 1, 1), (2, 5, 5), (3, 10, 10), (4, NULL, NULL);
+    CREATE INDEX t_c ON t(coalesce(c, c));
+    CREATE INDEX t_x ON t(CAST(x AS cents));
+    INSERT INTO t VALUES (5, 3, 3);
+    PRAGMA integrity_check;
+    SELECT 'order', id FROM t ORDER BY coalesce(c, c);
+    SELECT 'cast', id, CAST(x AS cents) FROM t WHERE x IS NOT NULL ORDER BY CAST(x AS cents);
+}
+expect {
+    ok
+    order|4
+    order|3
+    order|2
+    order|5
+    order|1
+    cast|1|1
+    cast|5|3
+    cast|2|5
+    cast|3|10
 }
 
 # A value compared with a date column goes through the date's ENCODE, so a
