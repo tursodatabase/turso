@@ -814,7 +814,6 @@ fn emit_update_column_values<'a>(
     skip_row_label: BranchOffset,
     skip_notnull_checks: bool,
 ) -> crate::Result<bool> {
-    let or_conflict = program.resolve_type;
     let mut table_column_was_read = false;
     if let Some(expr) = set_clauses
         .iter()
@@ -945,20 +944,13 @@ fn emit_update_column_values<'a>(
                             program.target_union_type = prev_union;
                             translate_result?;
                             if table_column.notnull() && !skip_notnull_checks {
-                                let notnull_conflict = if program.flags.has_statement_conflict() {
-                                    or_conflict
-                                } else {
-                                    table_column
-                                        .notnull_conflict_clause
-                                        .unwrap_or(ResolveType::Abort)
-                                };
                                 emit_notnull_constraint_check(
                                     program,
                                     table_references,
                                     target_reg,
                                     table_column,
                                     column_ctx.table_name(),
-                                    notnull_conflict,
+                                    notnull_conflict_resolution(program, table_column),
                                     skip_row_label,
                                     &t_ctx.resolver,
                                 )?;
@@ -1054,25 +1046,33 @@ fn emit_update_column_values<'a>(
     Ok(table_column_was_read)
 }
 
-/// Emit NOT NULL constraint checks for SET clause columns after BEFORE triggers have fired.
-/// This is deferred from the first `emit_update_column_values` call so that triggers
-/// run before constraint checks, matching SQLite's behavior.
+/// The UPDATE's OR clause wins over the column's own ON CONFLICT clause.
+fn notnull_conflict_resolution(program: &ProgramBuilder, table_column: &Column) -> ResolveType {
+    if program.flags.has_statement_conflict() {
+        program.resolve_type
+    } else {
+        table_column
+            .notnull_conflict_clause
+            .unwrap_or(ResolveType::Abort)
+    }
+}
+
+/// Emit NOT NULL constraint checks for the columns the UPDATE changes, for the cases
+/// where they must run later than the first `emit_update_column_values` call:
+/// after BEFORE triggers have fired, or after the STRICT type check.
 fn emit_deferred_notnull_checks<'a>(
     program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
     target_table: &Arc<JoinedTable>,
-    updated_column_indices: &ColumnMask,
     column_ctx: &UpdateColumnCtx<'_>,
     skip_row_label: BranchOffset,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> crate::Result<()> {
-    let or_conflict = program.resolve_type;
     for (idx, table_column) in target_table.table.columns().iter().enumerate() {
         if !table_column.notnull() || table_column.is_rowid_alias() {
             continue;
         }
-        // Only check columns that are in SET clauses
-        if !updated_column_indices.get(idx) {
+        if !column_ctx.affected_columns.get(idx) {
             continue;
         }
         let target_reg = column_ctx.layout.to_register(column_ctx.start, idx);
@@ -1082,7 +1082,7 @@ fn emit_deferred_notnull_checks<'a>(
             target_reg,
             table_column,
             column_ctx.table_name(),
-            or_conflict,
+            notnull_conflict_resolution(program, table_column),
             skip_row_label,
             &t_ctx.resolver,
         )?;
@@ -1565,7 +1565,6 @@ fn emit_update_insns<'a>(
             program,
             table_references,
             &target_table,
-            &updated_column_indices,
             &column_ctx,
             skip_row_label,
             t_ctx,

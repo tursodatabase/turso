@@ -1225,3 +1225,26 @@ expect {
     1|2
     2|1
 }
+
+@cross-check-integrity
+test update-before-trigger-checks-not-null-of-generated-column {
+    CREATE TABLE t(a INT, c INT AS (a) NOT NULL);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN SELECT 1; END;
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+@cross-check-integrity
+test update-before-trigger-uses-not-null-on-conflict-clause {
+    CREATE TABLE t(a INT, b TEXT NOT NULL ON CONFLICT IGNORE);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN SELECT 1; END;
+    INSERT INTO t VALUES (1, 'x');
+    UPDATE t SET b = NULL;
+    SELECT * FROM t;
+}
+expect {
+    1|x
+}
