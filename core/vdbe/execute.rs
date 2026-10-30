@@ -12,6 +12,7 @@ use crate::mvcc::database::{
 };
 use crate::mvcc::MvccClock;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
+use crate::numeric::decimal::numeric_from_value;
 use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
@@ -56,7 +57,7 @@ use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
-    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
+    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState, WriteBaseline,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -275,23 +276,6 @@ impl<T> OrOverflow<T> for Option<T> {
     }
 }
 
-/// Parse a Value (text, int, float, or blob) into a BigDecimal.
-fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
-    use bigdecimal::BigDecimal;
-    use std::str::FromStr;
-    match val {
-        Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
-        Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
-        Value::Text(t) => BigDecimal::from_str(&t.value)
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
-        Value::Blob(b) => crate::numeric::decimal::blob_to_bigdecimal(b),
-        _ => Err(LimboError::Constraint(format!(
-            "cannot convert to numeric: \"{val}\""
-        ))),
-    }
-}
-
 /// Create a sort comparator closure from a SortComparatorType enum.
 fn make_sort_comparator(
     cmp_type: &SortComparatorType,
@@ -305,10 +289,10 @@ fn make_sort_comparator(
                     (ValueRef::Null, _) => Ordering::Less,
                     (_, ValueRef::Null) => Ordering::Greater,
                     _ => {
-                        // Decode from ValueRef to Value for value_to_bigdecimal
+                        // Decode from ValueRef to Value for numeric_from_value
                         let a_val = a.to_owned()?;
                         let b_val = b.to_owned()?;
-                        match (value_to_bigdecimal(&a_val), value_to_bigdecimal(&b_val)) {
+                        match (numeric_from_value(&a_val), numeric_from_value(&b_val)) {
                             (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
                             _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                         }
@@ -1939,6 +1923,8 @@ pub fn op_rewind(
         insn
     );
     assert!(pc_if_empty.is_offset());
+    // Like SQLite, positioning the cursor cancels a DeferredSeek still pending on it.
+    state.deferred_seeks[*cursor_id] = None;
     // Clear any bloom filter associated with this cursor so stale filter data
     // does not incorrectly reject valid matches in subsequent iterations.
     if let Some(filter) = state.get_bloom_filter_mut(*cursor_id) {
@@ -1980,6 +1966,8 @@ pub fn op_last(
         insn
     );
     assert!(pc_if_empty.is_offset());
+    // Like SQLite, positioning the cursor cancels a DeferredSeek still pending on it.
+    state.deferred_seeks[*cursor_id] = None;
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
         let cursor = cursor.as_btree_mut();
@@ -5293,6 +5281,13 @@ pub fn op_transaction_inner(
                             "write statement started with view changes left by an earlier statement"
                         );
                         state.is_active_write = true;
+                        if is_main_db {
+                            state.write_baseline = WriteBaseline::capture(
+                                mv_store.as_deref(),
+                                &program.connection,
+                                &pager,
+                            );
+                        }
                     }
                     if is_main_db && in_explicit_txn && state.has_stmt_transaction {
                         state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
@@ -6677,6 +6672,9 @@ pub fn op_seek(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
+    // Like SQLite, positioning the cursor cancels a DeferredSeek still pending on it.
+    // Otherwise RowId and Column would keep reading the row that seek saved.
+    state.deferred_seeks[*cursor_id] = None;
     let has_null_that_cannot_match = match insn {
         Insn::SeekGE {
             eq_only: true,
@@ -10770,13 +10768,14 @@ pub fn op_function(
             }
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => {
-                // Test-only: process-global atomic counter that increments on
-                // every evaluation. Used in sqltests to verify that the
-                // planner does not deduplicate equivalent SQL calls that
-                // contain nondeterministic functions.
-                static TEST_NONDET_COUNTER: std::sync::atomic::AtomicI64 =
-                    std::sync::atomic::AtomicI64::new(0);
-                let value = TEST_NONDET_COUNTER.fetch_add(1, Ordering::Relaxed);
+                // Test-only: per-connection counter that increments on every
+                // evaluation. Used in sqltests to verify that the planner does
+                // not deduplicate equivalent SQL calls that contain
+                // nondeterministic functions.
+                let value = program
+                    .connection
+                    .test_nondet_counter
+                    .fetch_add(1, Ordering::Relaxed);
                 state.registers[*dest].set_int(value);
             }
             ScalarFunc::Trim => {
@@ -11508,6 +11507,17 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::NumericEncode => {
+                check_arg_count!(arg_count, 1);
+                let result = match state.registers[*start_reg].get_value() {
+                    Value::Null => Value::Null,
+                    other => {
+                        let bd = numeric_from_value(other)?;
+                        Value::from_blob(crate::numeric::decimal::bigdecimal_to_blob(&bd))
+                    }
+                };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::NumericFit => {
                 check_arg_count!(arg_count, 3);
                 let val = &state.registers[*start_reg];
                 let precision_reg = &state.registers[*start_reg + 1];
@@ -11518,45 +11528,20 @@ pub fn op_function(
                         use crate::numeric::decimal::{
                             bigdecimal_to_blob, validate_precision_scale,
                         };
-                        use bigdecimal::BigDecimal;
-                        use std::str::FromStr;
 
-                        let precision = match precision_reg.get_value() {
-                            Value::Numeric(Numeric::Integer(i)) => *i,
-                            _ => {
-                                return Err(LimboError::Constraint(
-                                    "numeric_encode: precision must be an integer".to_string(),
-                                )
-                                .into());
-                            }
+                        let bd = numeric_from_value(other)?;
+                        let (
+                            Value::Numeric(Numeric::Integer(precision)),
+                            Value::Numeric(Numeric::Integer(scale)),
+                        ) = (precision_reg.get_value(), scale_reg.get_value())
+                        else {
+                            return Err(LimboError::Constraint(
+                                "numeric_fit: precision and scale must be integers".to_string(),
+                            )
+                            .into());
                         };
-                        let scale = match scale_reg.get_value() {
-                            Value::Numeric(Numeric::Integer(i)) => *i,
-                            _ => {
-                                return Err(LimboError::Constraint(
-                                    "numeric_encode: scale must be an integer".to_string(),
-                                )
-                                .into());
-                            }
-                        };
-                        let text = match other {
-                            Value::Numeric(Numeric::Integer(i)) => i.to_string(),
-                            Value::Numeric(Numeric::Float(f)) => f.to_string(),
-                            Value::Text(t) => t.value.to_string(),
-                            _ => {
-                                return Err(LimboError::Constraint(format!(
-                                    "invalid input for type numeric: \"{other}\""
-                                ))
-                                .into());
-                            }
-                        };
-                        let bd = BigDecimal::from_str(&text).map_err(|_| {
-                            LimboError::Constraint(format!(
-                                "invalid input for type numeric: \"{text}\""
-                            ))
-                        })?;
-                        let validated = validate_precision_scale(&bd, precision, scale)?;
-                        Value::from_blob(bigdecimal_to_blob(&validated))
+                        let fitted = validate_precision_scale(&bd, *precision, *scale)?;
+                        Value::from_blob(bigdecimal_to_blob(&fitted))
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -11589,8 +11574,8 @@ pub fn op_function(
                 let result = match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = numeric_from_value(&lhs_val)?;
+                        let b = numeric_from_value(&rhs_val)?;
                         let res = match scalar_func {
                             ScalarFunc::NumericAdd => a + b,
                             ScalarFunc::NumericSub => a - b,
@@ -11619,8 +11604,8 @@ pub fn op_function(
                 match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = numeric_from_value(&lhs_val)?;
+                        let b = numeric_from_value(&rhs_val)?;
                         let cmp_result = match scalar_func {
                             ScalarFunc::NumericLt => a < b,
                             ScalarFunc::NumericEq => a == b,
@@ -17825,6 +17810,7 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
+                normalized_to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
@@ -17900,7 +17886,9 @@ pub fn op_rename_table(
             if let Some(mut backing_arc) = schema.take_table(NamespaceId::ROOT, &old_backing_table)
             {
                 if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
-                    Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
+                    let btree = Arc::make_mut(btree_arc);
+                    btree.name.clone_from(&new_backing_table);
+                    btree.declared_name.clone_from(&new_backing_table);
                 }
                 schema.insert_table(NamespaceId::ROOT, new_backing_table, backing_arc);
             }
@@ -18265,6 +18253,7 @@ pub fn op_alter_column(
         definition,
         rename,
         rewritten_triggers,
+        renamed_index_methods,
     } = data.as_ref();
 
     let conn = program.connection.clone();
@@ -18432,6 +18421,12 @@ pub fn op_alter_column(
             // Update partial index WHERE clause column references
             if let Some(ref mut wc) = idx.where_clause {
                 rename_identifiers(wc, &old_column_name, &new_name);
+            }
+            if let Some((_, attachment)) = renamed_index_methods
+                .iter()
+                .find(|(name, _)| *name == idx.name)
+            {
+                idx.index_method = Some(attachment.clone());
             }
         }
 

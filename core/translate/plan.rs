@@ -8,12 +8,13 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::{expr_collation, CollationSeq},
+        collate::CollationSeq,
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
             lookup_unqualified_column, StorageClassMask,
         },
+        expr_context::{ExprContext, TableMetadata},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -51,7 +52,7 @@ use super::expr::expr_type::{type_of, TypeEnv};
 /// The affinity (and whether it's a real declared one) determines comparison
 /// behavior in IN expressions, etc.
 fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
-    get_expr_affinity(expr, tables, None)
+    get_expr_affinity(expr, &TableMetadata::new(tables))
 }
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
@@ -71,13 +72,13 @@ pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affini
     let col_affinities = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
+            .map(|rc| get_expr_affinity(&rc.expr, &TableMetadata::new(Some(&arm.table_references))))
             .unwrap_or(Affinity::None)
     };
     let col_data_type = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
+            .map(|rc| expr_data_type(&rc.expr, &TableMetadata::new(Some(&arm.table_references))))
             .unwrap_or(StorageClassMask::from_null())
     };
 
@@ -172,7 +173,7 @@ impl ResultSetColumn {
     /// Returns the canonical short type name for this column's affinity,
     /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
     pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
-        get_expr_affinity(&self.expr, Some(tables), None).short_type_name()
+        get_expr_affinity(&self.expr, &TableMetadata::new(Some(tables))).short_type_name()
     }
 }
 
@@ -2235,6 +2236,17 @@ impl TableReferences {
             .find(|t| t.internal_id == internal_id)
     }
 
+    /// Whether `column` of the joined table `internal_id` is a value its index method query
+    /// provides (see [IndexMethodQuery::covered_columns]) instead of a column of the table: it
+    /// stands for an expression the index method computes, such as a score or a distance.
+    pub fn provided_by_index_method(&self, internal_id: TableInternalId, column: usize) -> bool {
+        self.find_joined_table_by_internal_id(internal_id)
+            .is_some_and(|table| match &table.op {
+                Operation::IndexMethodQuery(query) => query.covered_columns.contains_key(&column),
+                _ => false,
+            })
+    }
+
     /// Returns a mutable reference to the [JoinedTable] with the given internal ID.
     pub fn find_joined_table_by_internal_id_mut(
         &mut self,
@@ -3134,11 +3146,9 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        column.set_collation(Some(expr_collation(
-            result_expr,
-            Some(table_references),
-            resolver,
-        )?));
+        column.set_collation(Some(
+            ExprContext::new(Some(table_references), resolver).expr_collation(result_expr)?,
+        ));
     }
     Ok(columns)
 }

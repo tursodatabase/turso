@@ -10,36 +10,48 @@ fn main() {
     divan::main();
 }
 
-fn table_upsert(payload_len: usize) -> RowVersion {
+fn table_upsert(payload_len: usize) -> (RowID, RowVersion) {
     let payload = vec![0x5a; payload_len];
     let row =
-        Row::new_table_row(RowID::new(MVTableId::new(-1), RowKey::Int(42)), &payload, 1).unwrap();
-    RowVersion::new(1, Some(TxTimestampOrID::Timestamp(1)), None, row, false)
+        Row::new_table_row(RowID::new(MVTableId::new(-1), RowKey::Int(42)), &payload).unwrap();
+    let version = RowVersion::new(
+        1,
+        Some(TxTimestampOrID::Timestamp(1)),
+        None,
+        row.data,
+        false,
+    );
+    (row.id, version)
 }
 
 #[turso_macros::divan_bench(args = [16, 1_024, 65_536])]
 fn cold_buffer(bencher: Bencher, payload_len: usize) {
-    let row_version = table_upsert(payload_len);
+    let (row_id, row_version) = table_upsert(payload_len);
 
     bencher
         .with_inputs(Vec::new)
         .bench_local_values(|mut buffer| {
-            benchmark_serialize_op_entry(black_box(&mut buffer), black_box(&row_version), None)
-                .unwrap();
+            benchmark_serialize_op_entry(
+                black_box(&mut buffer),
+                black_box(&row_id),
+                black_box(&row_version),
+                None,
+            )
+            .unwrap();
             black_box(buffer)
         });
 }
 
 #[turso_macros::divan_bench(args = [1, 16, 256])]
 fn transaction_batch(bencher: Bencher, op_count: usize) {
-    let row_version = table_upsert(128);
+    let (row_id, row_version) = table_upsert(128);
 
     // CodSpeed instruments a single iteration, unlike Divan's wall-time runner.
     // Prime mimalloc's size classes so segment setup is not charged to whichever
     // batch size happens to request a fresh allocator page first.
     let mut warm_buffer = Vec::new();
     for _ in 0..op_count {
-        benchmark_serialize_op_entry(&mut warm_buffer, &row_version, None).unwrap();
+        benchmark_serialize_op_entry(&mut warm_buffer, &row_id, &row_version, None).unwrap();
     }
     black_box(warm_buffer);
 
@@ -47,8 +59,13 @@ fn transaction_batch(bencher: Bencher, op_count: usize) {
         .with_inputs(Vec::new)
         .bench_local_values(|mut buffer| {
             for _ in 0..op_count {
-                benchmark_serialize_op_entry(black_box(&mut buffer), black_box(&row_version), None)
-                    .unwrap();
+                benchmark_serialize_op_entry(
+                    black_box(&mut buffer),
+                    black_box(&row_id),
+                    black_box(&row_version),
+                    None,
+                )
+                .unwrap();
             }
             black_box(buffer)
         });
@@ -56,7 +73,7 @@ fn transaction_batch(bencher: Bencher, op_count: usize) {
 
 #[turso_macros::divan_bench(args = [16, 1_024, 65_536])]
 fn portable_extension(bencher: Bencher, extension_len: usize) {
-    let row_version = table_upsert(128);
+    let (row_id, row_version) = table_upsert(128);
     let extension = vec![0xa5; extension_len];
 
     bencher
@@ -64,6 +81,7 @@ fn portable_extension(bencher: Bencher, extension_len: usize) {
         .bench_local_values(|mut buffer| {
             benchmark_serialize_op_entry(
                 black_box(&mut buffer),
+                black_box(&row_id),
                 black_box(&row_version),
                 Some(black_box(&extension)),
             )

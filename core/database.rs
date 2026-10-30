@@ -491,6 +491,7 @@ enum StatsRefresh {
 
 /// Settings for a single connection, passed to [`Database::connect`] and
 /// [`Database::connect_async`].
+#[derive(Clone)]
 pub struct ConnectOpts {
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
@@ -2502,47 +2503,54 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>, opts: ConnectOpts) -> Result<Arc<Connection>> {
+        self.connect_with(opts, ConnectionContext::default())
+    }
+
+    /// Connects with `opts`, and with `context` as the value that
+    /// [`Connection::context`] returns for the connection.
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn connect_with_context<C: Any + Send + Sync>(
+        self: &Arc<Database>,
+        opts: ConnectOpts,
+        context: Arc<C>,
+    ) -> Result<Arc<Connection>> {
+        self.connect_with(
+            opts,
+            ConnectionContext {
+                value: Some(context),
+                hooks: None,
+            },
+        )
+    }
+
+    /// Connects with `opts`, and with `hooks` as the hooks that the
+    /// connection calls, which are also the value that
+    /// [`Connection::context`] returns for it.
+    pub fn connect_with_hooks<C: ConnectionHooks + Any>(
+        self: &Arc<Database>,
+        opts: ConnectOpts,
+        hooks: Arc<C>,
+    ) -> Result<Arc<Connection>> {
+        self.connect_with(
+            opts,
+            ConnectionContext {
+                value: Some(hooks.clone()),
+                hooks: Some(hooks),
+            },
+        )
+    }
+
+    fn connect_with(
+        self: &Arc<Database>,
+        opts: ConnectOpts,
+        context: ConnectionContext,
+    ) -> Result<Arc<Connection>> {
         self._connect(
             false,
             None,
             opts.encryption_key,
             opts.page_codec,
-            ConnectionContext::default(),
-            StatsRefresh::Blocking,
-        )
-    }
-
-    #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn connect_with_context<C: Any + Send + Sync>(
-        self: &Arc<Database>,
-        context: Arc<C>,
-    ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            None,
-            None,
-            ConnectionContext {
-                value: Some(context),
-                hooks: None,
-            },
-            StatsRefresh::Blocking,
-        )
-    }
-
-    pub fn connect_with_hooks<C: ConnectionHooks + Any>(
-        self: &Arc<Database>,
-        context: Arc<C>,
-    ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            None,
-            None,
-            ConnectionContext {
-                value: Some(context.clone()),
-                hooks: Some(context),
-            },
+            context,
             StatsRefresh::Blocking,
         )
     }
@@ -2719,6 +2727,8 @@ impl Database {
             fts_merge_threshold: AtomicI64::new(crate::index_method::DEFAULT_FTS_MERGE_THRESHOLD),
             dqs_dml: AtomicBool::new(true),
             sequence_inner_retries: AtomicU64::new(0),
+            #[cfg(feature = "test_helper")]
+            test_nondet_counter: AtomicI64::new(0),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]

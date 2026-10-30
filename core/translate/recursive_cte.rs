@@ -11,6 +11,7 @@ use crate::translate::emitter::{
     Resolver, TranslateCtx,
 };
 use crate::translate::eqp::EqpDetail;
+use crate::translate::expr_context::ExprContext;
 use crate::translate::plan::{
     Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey, SelectPlan,
 };
@@ -284,10 +285,13 @@ fn recursive_cte_result_column_collation(
                 .first()
                 .and_then(|row| row.get(result_column_index))
                 .unwrap_or(&select.result_columns[result_column_index].expr);
-            columns.push((expr, Some(&select.table_references)));
+            columns.push((
+                expr,
+                ExprContext::new(Some(&select.table_references), resolver),
+            ));
         }
     }
-    first_collation(columns, resolver)
+    first_collation(columns, &resolver.catalog)
 }
 
 fn emit_recursive_cte_query(

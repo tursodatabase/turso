@@ -2188,6 +2188,7 @@ fn emit_check_constraint_bytecode(
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
     or_conflict: ResolveType,
+    halt_on_error: Option<ResolveType>,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
     table_name: &str,
@@ -2270,7 +2271,7 @@ fn emit_check_constraint_bytecode(
                     ))),
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
-                    on_error: program.constraint_halt_on_error(or_conflict),
+                    on_error: halt_on_error,
                     description_reg: None,
                 });
             }
@@ -2293,6 +2294,7 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
 /// Takes column-to-register mappings as an iterator to avoid heap allocation.
+/// `halt_on_error` is the resolve type carried by the Halt of a failed CHECK.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
@@ -2303,6 +2305,7 @@ pub(crate) fn emit_check_constraints<'a>(
     column_mappings: impl Iterator<Item = (&'a str, usize)>,
     connection: &Arc<Connection>,
     or_conflict: ResolveType,
+    halt_on_error: Option<ResolveType>,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
 ) -> Result<()> {
@@ -2375,6 +2378,7 @@ pub(crate) fn emit_check_constraints<'a>(
         check_constraints,
         resolver,
         or_conflict,
+        halt_on_error,
         skip_row_label,
         referenced_tables,
         table_name,

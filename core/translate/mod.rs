@@ -18,6 +18,7 @@ pub(crate) mod display;
 pub(crate) mod emitter;
 pub mod eqp;
 pub(crate) mod expr;
+pub(crate) mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;

@@ -1,6 +1,21 @@
 @database :memory:
 
 @cross-check-integrity
+test alter-table-rename-mixed-case-autoincrement {
+    CREATE TABLE "Foo"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO foo(v) VALUES(1),(2),(3);
+    ALTER TABLE FOO RENAME TO bar;
+    DELETE FROM bar;
+    INSERT INTO bar(v) VALUES(9);
+    SELECT * FROM bar;
+    SELECT * FROM sqlite_sequence;
+}
+expect {
+    4|9
+    bar|4
+}
+
+@cross-check-integrity
 test alter-table-rename-table {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY, u);
     ALTER TABLE t1 RENAME TO t2;

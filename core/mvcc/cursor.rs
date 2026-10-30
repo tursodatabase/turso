@@ -521,7 +521,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
                     // Version present at this key -> resolve the shadow bit now,
                     // on the one key that actually matches a B-tree row.
                     std::cmp::Ordering::Equal => {
-                        return Ok(!db.index_chain_invalidates_btree(versions, tx_id)?);
+                        return Ok(!db.index_chain_invalidates_btree(versions, table_id, tx_id)?);
                     }
                     // Scan is behind the B-tree (a version-only key). Catch up below.
                     std::cmp::Ordering::Less => {}
@@ -699,7 +699,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     // reusable record — like the btree cursor does with a cell —
                     // instead of cloning a `Row` first.
                     self.db
-                        .read_visible_into_record(self.snapshot, versions, record)?
+                        .read_visible_into_record(self.snapshot, row_id, versions, record)?
                 } else {
                     // Cold fallback (seek-positioned, no cached chain): point
                     // lookup, then serialize.
@@ -753,7 +753,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // Scan path: the range iterator already resolved this row's version
         // chain, so read it directly instead of a second skiplist lookup.
         if let Some(versions) = versions {
-            return self.db.read_visible_from_versions(self.snapshot, versions);
+            return self
+                .db
+                .read_visible_from_versions(self.snapshot, row_id, versions);
         }
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
@@ -873,10 +875,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 },
                 None => CursorPeek::Exhausted,
             },
-            MvccCursorType::Index(_) => match self
-                .db
-                .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, self.snapshot)
-            {
+            MvccCursorType::Index(_) => match self.db.advance_cursor_and_get_row_id_for_index(
+                &mut self.index_iterator,
+                self.snapshot,
+                self.table_id,
+            ) {
                 Some((row_id, versions)) => CursorPeek::Row {
                     key: row_id.row_id,
                     versions: Some(versions),
@@ -1905,25 +1908,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 let record = record.as_ref().ok_or_else(|| {
                     LimboError::InternalError("TableRowId should have a record".to_string())
                 })?;
-                let num_columns = record.column_count();
                 crate::with_mv_store_allocation_site!(
                     RowPayload,
-                    Row::new_table_row_in(
-                        row_id,
-                        record.get_payload(),
-                        num_columns,
-                        self.db.allocator(),
-                    )
+                    Row::new_table_row_in(row_id, record.get_payload(), self.db.allocator(),)
                 )
             }
             MvccCursorType::Index(_) => {
-                let BTreeKey::IndexKey(record) = key else {
+                let BTreeKey::IndexKey(_) = key else {
                     return Err(LimboError::InternalError(
                         "Index cursor requires an IndexKey".to_string(),
                     )
                     .into());
                 };
-                Ok(Row::new_index_row(row_id, record.column_count()))
+                Ok(Row::new_index_row(row_id))
             }
         }?;
 

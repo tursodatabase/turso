@@ -2218,6 +2218,29 @@ expect {
     |1
 }
 
+@cross-check-integrity
+test right-join-copied-subquery-opens-multi-index-cursors {
+    CREATE TABLE l(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE r(y INTEGER);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, x INTEGER UNIQUE, value INTEGER);
+    INSERT INTO r VALUES (2), (3);
+    INSERT INTO s VALUES (1, 10, 2), (2, -2, 3);
+
+    SELECT l.id, r.y FROM l RIGHT JOIN r ON l.x < r.y
+     WHERE r.y IN (SELECT value FROM s WHERE -1 <= s.x OR l.id = s.id)
+     ORDER BY r.y LIMIT 4;
+
+    INSERT INTO l VALUES (2, 1);
+    SELECT l.id, r.y FROM l RIGHT JOIN r ON l.x < r.y
+     WHERE r.y IN (SELECT value FROM s WHERE -1 <= s.x OR l.id = s.id)
+     ORDER BY r.y LIMIT 4;
+}
+expect {
+    |2
+    2|2
+    2|3
+}
+
 # From SQLite join8-24000. The unmatched
 # pass must not reuse the CTE cursor that the left join group uses.
 @cross-check-integrity

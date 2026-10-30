@@ -197,9 +197,9 @@ fn test_pg_settings_omits_unsupported_restrictions(db: TempDatabase) {
 fn test_pg_get_tabledef_names_tables_as_a_user_writes_them(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE SCHEMA app").unwrap();
-    conn.execute("CREATE TABLE t(x int PRIMARY KEY, y int REFERENCES t(x))")
+    conn.execute("CREATE TABLE \"T\"(x int PRIMARY KEY, y int REFERENCES \"T\"(x))")
         .unwrap();
-    conn.execute("CREATE TABLE app.u(a int REFERENCES t(x))")
+    conn.execute("CREATE TABLE app.\"U\"(a int REFERENCES \"T\"(x))")
         .unwrap();
     let mut stmt = conn
         .query("SELECT schema_name, table_name, ddl FROM pg_get_tabledef ORDER BY schema_name")
@@ -219,14 +219,50 @@ fn test_pg_get_tabledef_names_tables_as_a_user_writes_them(db: TempDatabase) {
         vec![
             vec![
                 "app".to_string(),
-                "u".to_string(),
-                "CREATE TABLE u(a int REFERENCES public.t(x))".to_string()
+                "U".to_string(),
+                "CREATE TABLE \"U\"(a int REFERENCES public.\"T\"(x))".to_string()
             ],
             vec![
                 "public".to_string(),
-                "t".to_string(),
-                "CREATE TABLE t(x int PRIMARY KEY, y int REFERENCES t(x))".to_string()
+                "T".to_string(),
+                "CREATE TABLE \"T\"(x int PRIMARY KEY, y int REFERENCES \"T\"(x))".to_string()
             ],
+        ]
+    );
+}
+
+#[turso_macros::test]
+fn test_alter_table_preserves_catalog_names_after_reopen(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA app").unwrap();
+    conn.execute("CREATE TABLE \"Mixed\"(id int)").unwrap();
+    conn.execute("CREATE TABLE app.\"Mixed\"(id int, removed int)")
+        .unwrap();
+    conn.execute("ALTER TABLE \"Mixed\" ADD COLUMN added int")
+        .unwrap();
+    conn.execute("ALTER TABLE app.\"Mixed\" DROP COLUMN removed")
+        .unwrap();
+
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_custom_types(true),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT schemaname, tablename FROM pg_tables ORDER BY schemaname")
+        .unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap(),
+        vec![
+            vec![Value::build_text("app"), Value::build_text("Mixed")],
+            vec![Value::build_text("public"), Value::build_text("Mixed")],
         ]
     );
 }
