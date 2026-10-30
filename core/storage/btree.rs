@@ -955,6 +955,8 @@ pub struct BTreeCursor {
     /// every write through the cursor and when its position is saved. The on-disk
     /// format is unchanged; this index lives only in RAM.
     blob_cache: BlobCellCache,
+    /// The page count that `check_overflow_page_id` last computed.
+    overflow_database_size: Option<u32>,
     /// Rowid the incremental-blob machinery last addressed. Unlike `blob_cache` it
     /// survives position saves: it is what `note_external_row_write` compares against
     /// to decide whether a peer's write hit *this* handle's row (expire, like SQLite's
@@ -1332,6 +1334,7 @@ impl BTreeCursor {
             skip_advance: false,
             reusable_cell_payload: crate::alloc::vec![],
             blob_cache: BlobCellCache::default(),
+            overflow_database_size: None,
             blob_pinned_rowid: None,
             blob_expired: false,
             iteration_pending_descent: None,
@@ -1635,6 +1638,7 @@ impl BTreeCursor {
                 // would leave `read_overflow_state` half-initialized on a
                 // page that doesn't exist yet, and re-entry would skip the
                 // `is_none()` branch entirely.
+                return_if_io!(self.check_overflow_page_id(start_next_page));
                 let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
                 let payload =
                     crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
@@ -1671,6 +1675,7 @@ impl BTreeCursor {
                 )
             };
             let new_page_and_c = if need_next_page {
+                return_if_io!(self.check_overflow_page_id(next));
                 Some(return_if_io!(self.read_page(next as i64)))
             } else {
                 None
@@ -6004,6 +6009,7 @@ impl BTreeCursor {
                 self.blob_cache.overflow_pages.len()
             ))
         })?;
+        return_if_io!(self.check_overflow_page_id(pageno));
         let (page, c) = return_if_io!(self.read_page(pageno as i64));
         if let Some(c) = c {
             io_yield_one!(c);
@@ -6080,6 +6086,7 @@ impl BTreeCursor {
                     }
                 }
             };
+            return_if_io!(self.check_overflow_page_id(last));
             let (page, c) = return_if_io!(self.read_page(last as i64));
             if let Some(c) = c {
                 io_yield_one!(c);
@@ -6101,6 +6108,44 @@ impl BTreeCursor {
                 self.blob_cache.overflow_pages.try_push(next)
             )?;
         }
+    }
+
+    /// Error unless `page_id` is a valid overflow page number: not page 1 and not
+    /// past the end of the database.
+    fn check_overflow_page_id(&mut self, page_id: u32) -> IOResultOr<()> {
+        if self
+            .overflow_database_size
+            .is_some_and(|database_size| Self::valid_overflow_page_id(page_id, database_size))
+        {
+            return Ok(IOResult::Done(()));
+        }
+        // The database can grow while the cursor is open, so read the size from
+        // the header again before reporting the page as out of range.
+        let header_size =
+            return_if_io!(self.pager.with_header(|header| header.database_size)).get();
+        // The header size can be 0 or out of date in files written by SQLite
+        // before 3.7.0, and SQLite then uses the file size. A valid page is within
+        // at least one of the two.
+        let database_size = header_size.max(self.database_file_page_count());
+        self.overflow_database_size = Some(database_size);
+        if unlikely(!Self::valid_overflow_page_id(page_id, database_size)) {
+            return Err(LimboError::Corrupt(format!(
+                "overflow page {page_id} is out of range: the database has {database_size} pages"
+            ))
+            .into());
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// The number of whole pages in the database file, or `u32::MAX` when the
+    /// page size or the file size is unknown.
+    fn database_file_page_count(&self) -> u32 {
+        let (Some(page_size), Ok(file_size)) =
+            (self.pager.get_page_size(), self.pager.db_file.size())
+        else {
+            return u32::MAX;
+        };
+        u32::try_from(file_size / page_size.get() as u64).unwrap_or(u32::MAX)
     }
 
     /// Map payload offset `pos` (0 = first payload byte) to the physical span that
