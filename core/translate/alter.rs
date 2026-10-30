@@ -1496,15 +1496,20 @@ pub fn translate_alter_table(
                     emit_add_column_default_type_validation(program, &original_btree, database_id)?;
                 }
 
-                emit_add_column_encode_validation(
-                    program,
-                    &btree,
-                    &original_btree,
-                    &column,
-                    effective_default,
-                    resolver,
-                    database_id,
-                )?;
+                // A default computed for each row is stored through the type
+                // chain by the rewrite below, and evaluating it here as well
+                // would run it one extra time (e.g. nextval()).
+                if !computes_default_for_existing_rows {
+                    emit_add_column_encode_validation(
+                        program,
+                        &btree,
+                        &original_btree,
+                        &column,
+                        effective_default,
+                        resolver,
+                        database_id,
+                    )?;
+                }
             }
 
             if computes_default_for_existing_rows {
