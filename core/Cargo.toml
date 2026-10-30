@@ -141,7 +141,8 @@ either = { workspace = true }
 tracing-subscriber.workspace = true
 rapidhash = "4.1.1"
 simdutf8 = "0.1.5"
-branches = { version = "0.4.3", default-features = false }
+# Use std's abort on both older and current nightly compilers, without prefetch.
+branches = { version = "0.5.1", default-features = false, features = ["std"] }
 bumpalo = { version = "3", features = ["collections"] }
 smallvec = "1.15.1"
 fastbloom = { version = "0.14.1", default-features = false }
