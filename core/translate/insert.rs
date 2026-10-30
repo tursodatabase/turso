@@ -4330,6 +4330,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         if !force_immediate && !pref.fk.deferred && !is_self_ref {
             continue;
         }
+        resolver.with_schema(database_id, |schema| schema.validate_fk_parent_key(&pref))?;
         // Nothing to do if the parent counter is 0
         let skip_fk = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {

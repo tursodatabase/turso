@@ -199,6 +199,9 @@ pub fn affected_parent_fks_for_update(
             table_btree,
         )
     });
+    for fk in &affected_fks {
+        resolver.with_schema(database_id, |schema| schema.validate_fk_parent_key(fk))?;
+    }
     Ok(affected_fks)
 }
 
@@ -2300,6 +2303,7 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
         for fk_ref in resolver.with_schema(database_id, |s| {
             s.resolved_fks_referencing(namespace.id, parent_table_name)
         })? {
+            resolver.with_schema(database_id, |schema| schema.validate_fk_parent_key(&fk_ref))?;
             let parent_cols: &[String] = &fk_ref.parent_cols;
             let ncols = parent_cols.len();
             let key_regs_start = program.alloc_registers(ncols);
