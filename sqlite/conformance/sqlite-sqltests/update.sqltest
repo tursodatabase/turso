@@ -1248,3 +1248,123 @@ test update-before-trigger-uses-not-null-on-conflict-clause {
 expect {
     1|x
 }
+
+@cross-check-integrity
+test update-or-ignore-strict-generated-column-type-error-before-not-null {
+    CREATE TABLE t(a INT, b TEXT NOT NULL, c INT AS (a + 1)) STRICT;
+    INSERT INTO t(a, b) VALUES (1, 'x');
+    UPDATE OR IGNORE t SET a = 'x', b = NULL;
+}
+expect error {
+    cannot store TEXT value in INT column t.a
+}
+
+@cross-check-integrity
+test update-or-ignore-strict-before-trigger-type-error-before-not-null {
+    CREATE TABLE t(a INT, b TEXT NOT NULL) STRICT;
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN SELECT 1; END;
+    INSERT INTO t VALUES (1, 'x');
+    UPDATE OR IGNORE t SET a = 'x', b = NULL;
+}
+expect error {
+    cannot store TEXT value in INT column t.a
+}
+
+@cross-check-integrity
+test update-strict-generated-column-type-error-before-not-null {
+    CREATE TABLE t(a INT, b TEXT NOT NULL, c INT AS (a + 1)) STRICT;
+    INSERT INTO t(a, b) VALUES (1, 'x');
+    UPDATE t SET a = 'x', b = NULL;
+}
+expect error {
+    cannot store TEXT value in INT column t.a
+}
+
+@cross-check-integrity
+test update-or-ignore-strict-no-generated-column-skips-row-before-type-error {
+    CREATE TABLE t(a INT, b TEXT NOT NULL) STRICT;
+    INSERT INTO t VALUES (1, 'x');
+    UPDATE OR IGNORE t SET a = 'x', b = NULL;
+    SELECT * FROM t;
+}
+expect {
+    1|x
+}
+
+@cross-check-integrity
+test update-or-ignore-strict-generated-column-skips-null-row {
+    CREATE TABLE t(a INT, b TEXT NOT NULL, c INT AS (a + 1)) STRICT;
+    INSERT INTO t(a, b) VALUES (1, 'x');
+    UPDATE OR IGNORE t SET a = 5, b = NULL;
+    SELECT * FROM t;
+}
+expect {
+    1|x|2
+}
+
+@cross-check-integrity
+test update-strict-generated-column-not-null-still-fails {
+    CREATE TABLE t(a INT, b TEXT NOT NULL, c INT AS (a + 1)) STRICT;
+    INSERT INTO t(a, b) VALUES (1, 'x');
+    UPDATE t SET a = 5, b = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.b
+}
+
+@cross-check-integrity
+test update-strict-generated-column-not-null-on-generated-column {
+    CREATE TABLE t(a INT, c INT AS (a) NOT NULL) STRICT;
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+@cross-check-integrity
+test update-strict-generated-column-uses-not-null-on-conflict-clause {
+    CREATE TABLE t(a INT, b TEXT NOT NULL ON CONFLICT IGNORE, c INT AS (a + 1)) STRICT;
+    INSERT INTO t(a, b) VALUES (1, 'x');
+    UPDATE t SET b = NULL;
+    SELECT * FROM t;
+}
+expect {
+    1|x|2
+}
+
+@cross-check-integrity
+test update-or-replace-strict-generated-column-uses-default {
+    CREATE TABLE t(a INT, b TEXT NOT NULL DEFAULT 'd', c INT AS (a + 1)) STRICT;
+    INSERT INTO t(a, b) VALUES (1, 'x');
+    UPDATE OR REPLACE t SET a = 7, b = NULL;
+    SELECT * FROM t;
+}
+expect {
+    7|d|8
+}
+
+@cross-check-integrity
+test update-or-replace-strict-generated-column-default-of-wrong-type {
+    CREATE TABLE t(a INT, b INT NOT NULL DEFAULT 'zz', c INT AS (a + 1)) STRICT;
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE OR REPLACE t SET b = NULL;
+}
+expect error {
+    cannot store TEXT value in INT column t.b
+}
+
+@cross-check-integrity
+test update-or-ignore-strict-generated-column-and-trigger-skips-row-after-trigger {
+    CREATE TABLE log(x);
+    CREATE TABLE t(a INT, b TEXT NOT NULL, c INT AS (a + 1)) STRICT;
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('fired'); END;
+    INSERT INTO t(a, b) VALUES (1, 'x');
+    UPDATE OR IGNORE t SET a = 5, b = NULL;
+    SELECT * FROM t;
+    SELECT * FROM log;
+}
+expect {
+    1|x|2
+    fired
+}

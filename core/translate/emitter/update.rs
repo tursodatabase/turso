@@ -1090,6 +1090,29 @@ fn emit_deferred_notnull_checks<'a>(
     Ok(())
 }
 
+/// Check the new values of the SET columns against their declared types, before
+/// custom type encoding.
+fn emit_input_type_check(
+    program: &mut ProgramBuilder,
+    btree: &Arc<BTreeTable>,
+    start: usize,
+    layout: &ColumnLayout,
+    updated_column_indices: &ColumnMask,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: layout.num_non_virtual_cols(),
+        check_generated: false,
+        table_reference: BTreeTable::input_type_check_table_ref(
+            btree,
+            resolver.schema(),
+            Some(updated_column_indices),
+        )?,
+    });
+    Ok(())
+}
+
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 /// Emits the instructions for the UPDATE loop.
@@ -1369,6 +1392,13 @@ fn emit_update_insns<'a>(
     };
     let has_before_triggers = !relevant_before_update_triggers.is_empty();
 
+    // SQLite type-checks a STRICT table's new values while computing generated
+    // columns, so on such a table a wrong type wins over a NOT NULL violation.
+    let notnull_checks_follow_type_check = !has_before_triggers
+        && target_table.table.btree().is_some_and(|btree| {
+            btree.is_strict && btree.columns().iter().any(|c| c.is_generated())
+        });
+
     let table_column_was_read = emit_update_column_values(
         program,
         table_references,
@@ -1377,7 +1407,7 @@ fn emit_update_insns<'a>(
         t_ctx,
         skip_set_clauses,
         skip_row_label,
-        has_before_triggers,
+        has_before_triggers || notnull_checks_follow_type_check,
     )?;
 
     // For non-STRICT tables, apply column affinity to the NEW values early.
@@ -1446,6 +1476,18 @@ fn emit_update_insns<'a>(
             if has_before_triggers {
                 let old_registers =
                     old_registers.expect("old_registers allocated when has_before_triggers");
+                // SQLite rejects a wrong type before firing the triggers, so they
+                // never see it.
+                if btree_table.is_strict {
+                    emit_input_type_check(
+                        program,
+                        &btree_table,
+                        start,
+                        &layout,
+                        &updated_column_indices,
+                        &t_ctx.resolver,
+                    )?;
+                }
                 // NEW row values are already in 'start' registers.
                 // If the rowid is being updated (INTEGER PRIMARY KEY in SET clause),
                 // use the new rowid register; otherwise use the current rowid (beg).
@@ -1615,16 +1657,14 @@ fn emit_update_insns<'a>(
     if let Table::BTree(ref btree) = target_table.table {
         if btree.is_strict {
             // pre-encode typecheck for updated columns
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: start,
-                count: layout.num_non_virtual_cols(),
-                check_generated: false,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    btree,
-                    t_ctx.resolver.schema(),
-                    Some(&updated_column_indices),
-                )?,
-            });
+            emit_input_type_check(
+                program,
+                btree,
+                start,
+                &layout,
+                &updated_column_indices,
+                &t_ctx.resolver,
+            )?;
         }
         let has_check_constraints = !btree.check_constraints.is_empty();
         let cols = btree.columns();
@@ -1669,6 +1709,17 @@ fn emit_update_insns<'a>(
                 btree,
             )?;
         }
+    }
+
+    if notnull_checks_follow_type_check {
+        emit_deferred_notnull_checks(
+            program,
+            table_references,
+            &target_table,
+            &column_ctx,
+            skip_row_label,
+            t_ctx,
+        )?;
     }
 
     // Non-REPLACE PK constraint check. Must run BEFORE the index preflight so that
