@@ -1478,16 +1478,6 @@ pub enum AlterTableBody {
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
 }
 
-/// Operator mapping in a `CREATE TYPE` body
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct TypeOperator {
-    /// operator symbol: "+", "-", "*", "/", "%"
-    pub op: String,
-    /// function name to call, or None for naked operators (use the base type's operator)
-    pub func_name: Option<String>,
-}
-
 /// A parameter in a `CREATE TYPE` definition, with an optional type annotation.
 /// e.g. `value text` or `maxlen integer` or just `maxlen` (untyped, backward compat).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1526,8 +1516,6 @@ pub enum CreateTypeBody {
         coerce: Option<Box<Expr>>,
         /// decode expression (called on read), uses `value` placeholder for input
         decode: Option<Box<Expr>>,
-        /// operator-to-function mappings
-        operators: Vec<TypeOperator>,
         /// default expression for columns of this type
         default: Option<Box<Expr>>,
     },

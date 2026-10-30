@@ -88,20 +88,6 @@ impl EmitOrderBy {
         has_distinct: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
-        for (expr, _, _) in order_by.iter() {
-            if let Some((col, type_def)) =
-                result_column_custom_type_info(expr, referenced_tables, t_ctx.resolver.schema())
-            {
-                if col.type_ordering().is_none() && !type_def.is_sortable() {
-                    crate::bail_parse_error!(
-                        "cannot ORDER BY column '{}' of type '{}': type does not declare OPERATOR '<'",
-                        col.name.as_deref().unwrap_or("?"),
-                        type_def.name
-                    );
-                }
-            }
-        }
-
         let only_aggs = order_by
             .iter()
             .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
