@@ -4613,6 +4613,128 @@ expect {
 }
 
 @cross-check-integrity
+test fk-deferred-delete-virtual-col-child-fixes-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(a, g AS (a) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c(a) VALUES(7);
+    DELETE FROM c WHERE a=7;
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-deferred-delete-virtual-col-child-with-non-integer-key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(a, g AS (a) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c(a) VALUES('x'), (1.5);
+    DELETE FROM c;
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-deferred-delete-parent-then-virtual-col-child-unique-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id UNIQUE);
+    CREATE TABLE c(a, g AS (a) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c(a) VALUES(1);
+    BEGIN;
+    DELETE FROM p;
+    DELETE FROM c;
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-deferred-replace-virtual-col-child-fixes-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(k INTEGER PRIMARY KEY, a, g AS (a) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c(k, a) VALUES(1, 7);
+    INSERT INTO p VALUES(8);
+    INSERT OR REPLACE INTO c(k, a) VALUES(1, 8);
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|8|8
+}
+
+@cross-check-integrity
+test fk-deferred-update-replace-virtual-col-child-fixes-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(k INTEGER PRIMARY KEY, a, g AS (a) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(8);
+    INSERT INTO c(k, a) VALUES(2, 8);
+    BEGIN;
+    INSERT INTO c(k, a) VALUES(1, 7);
+    UPDATE OR REPLACE c SET k=1 WHERE k=2;
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|8|8
+}
+
+@cross-check-integrity
+test fk-deferred-upsert-virtual-col-child-fixes-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(k INTEGER PRIMARY KEY, a UNIQUE, b, g AS (b) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c(k, a, b) VALUES(1, 7, 6);
+    INSERT INTO p VALUES(5);
+    INSERT INTO c(k, a, b) VALUES(3, 7, 5) ON CONFLICT DO UPDATE SET b=5;
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|7|5|5
+}
+
+test fk-deferred-upsert-virtual-col-child-creates-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(k INTEGER PRIMARY KEY, a UNIQUE, b, g AS (b) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(5);
+    INSERT INTO c(k, a, b) VALUES(1, 7, 5);
+    BEGIN;
+    INSERT INTO c(k, a, b) VALUES(3, 7, 5) ON CONFLICT DO UPDATE SET b=6;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-upsert-virtual-col-child-of-virtual-col-without-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(k INTEGER PRIMARY KEY, a UNIQUE, b, h AS (b + 1), g AS (h - 1) REFERENCES p(id));
+    INSERT INTO p VALUES(5);
+    INSERT INTO c(k, a, b) VALUES(1, 7, 5);
+    INSERT INTO c(k, a, b) VALUES(3, 7, 5) ON CONFLICT DO UPDATE SET b=6;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
 test fk-delete-parent-referenced-by-virtual-col-child {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id INTEGER PRIMARY KEY);

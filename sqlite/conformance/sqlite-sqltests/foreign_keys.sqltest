@@ -4851,3 +4851,43 @@ expect {
     2
     0
 }
+
+# A child key that is not an integer has no INTEGER PRIMARY KEY parent, so
+# deleting the child row removes the deferred violation.
+@cross-check-integrity
+test fk-deferred-delete-child-with-non-integer-key-of-rowid-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(a REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES('x'), (1.5);
+    DELETE FROM c;
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-deferred-repeated-child-column {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(x, y, PRIMARY KEY(x, y));
+    CREATE TABLE c(k INTEGER PRIMARY KEY, a, FOREIGN KEY(a, a) REFERENCES p(x, y) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(2, 2);
+    BEGIN;
+    INSERT INTO c(k, a) VALUES(1, 1);
+    UPDATE c SET a=2;
+    INSERT INTO c(k, a) VALUES(2, 1);
+    INSERT OR REPLACE INTO c(k, a) VALUES(2, 2);
+    INSERT INTO c(k, a) VALUES(3, 1);
+    UPDATE OR REPLACE c SET k=3 WHERE k=2;
+    INSERT INTO c(k, a) VALUES(4, 1);
+    DELETE FROM c WHERE k=4;
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|2
+    3|2
+}
