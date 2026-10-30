@@ -266,3 +266,46 @@ fn test_alter_table_preserves_catalog_names_after_reopen(db: TempDatabase) {
         ]
     );
 }
+
+#[turso_macros::test]
+fn test_pg_dump_schema_details_survive_reopen(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE \"Mixed Table\" (\"Mixed Key\" TEXT PRIMARY KEY, n INTEGER DEFAULT -1)",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX descending_key ON \"Mixed Table\" (\"Mixed Key\" DESC)")
+        .unwrap();
+    conn.execute("ALTER TABLE \"Mixed Table\" ADD COLUMN extra INTEGER")
+        .unwrap();
+    let path = db.path.clone();
+    let io = db.io.clone();
+    drop(conn);
+    drop(db);
+    let db = turso_pg::open_database_with_io(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_custom_types(true),
+    )
+    .unwrap();
+    let conn = turso_pg::Connection::connect(&db).unwrap();
+    let mut rows = conn
+        .query("SELECT indexdef FROM pg_indexes WHERE indexname = 'descending_key'")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(rows.step().unwrap(), turso_core::StepResult::Row));
+    assert_eq!(
+        rows.row().unwrap().get_value(0).to_string(),
+        "CREATE INDEX descending_key ON public.\"Mixed Table\" USING btree (\"Mixed Key\" DESC)"
+    );
+    let mut rows = conn
+        .query("SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(rows.step().unwrap(), turso_core::StepResult::Row));
+    assert_eq!(
+        rows.row().unwrap().get_value(0).to_string(),
+        "'-1'::integer"
+    );
+}

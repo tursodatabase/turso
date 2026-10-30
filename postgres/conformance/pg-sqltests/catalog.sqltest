@@ -1452,3 +1452,29 @@ test pg-dump-descending-index-keys {
 expect {
     CREATE INDEX idx ON public.indexed USING btree (first DESC, second, third DESC)
 }
+
+test pg-dump-integer-defaults {
+    CREATE TABLE "Table 1" (
+        "Mixed Case" INTEGER DEFAULT -1,
+        low INTEGER DEFAULT -2147483648,
+        big BIGINT DEFAULT -2147483649,
+        high BIGINT DEFAULT 2147483648,
+        minimum BIGINT DEFAULT -9223372036854775808,
+        maximum BIGINT DEFAULT 9223372036854775807,
+        zero INTEGER DEFAULT 0,
+        positive BIGINT DEFAULT 2147483647
+    );
+    SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef
+    JOIN pg_class ON pg_class.oid = adrelid
+    WHERE relname = 'Table 1' ORDER BY adnum;
+}
+expect {
+    '-1'::integer
+    '-2147483648'::integer
+    '-2147483649'::bigint
+    '2147483648'::bigint
+    '-9223372036854775808'::bigint
+    '9223372036854775807'::bigint
+    0
+    2147483647
+}

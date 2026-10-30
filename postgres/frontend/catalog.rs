@@ -12,7 +12,7 @@ use turso_core::{
     Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::{RefAct, SortOrder};
+use turso_parser::ast::{Expr, Literal, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -2126,10 +2126,10 @@ impl SnapshotRows for PgAttrdefTable {
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
                     rows.push(vec![
-                        Value::from_i64(attrdef_oid),                // oid
-                        Value::from_i64(table_oid),                  // adrelid
-                        Value::from_i64(col_idx as i64 + 1),         // adnum (1-based)
-                        Value::build_text(default_expr.to_string()), // adbin
+                        Value::from_i64(attrdef_oid),                        // oid
+                        Value::from_i64(table_oid),                          // adrelid
+                        Value::from_i64(col_idx as i64 + 1),                 // adnum (1-based)
+                        Value::build_text(default_expression(default_expr)), // adbin
                     ]);
                     attrdef_oid += 1;
                 }
@@ -2137,6 +2137,33 @@ impl SnapshotRows for PgAttrdefTable {
         }
         rows
     }
+}
+
+fn default_expression(expr: &Expr) -> String {
+    use turso_parser::ast::UnaryOperator;
+
+    let value = match expr {
+        Expr::Literal(Literal::Numeric(number)) => number.parse::<i64>().ok(),
+        Expr::Unary(UnaryOperator::Negative, inner) => match inner.as_ref() {
+            Expr::Literal(Literal::Numeric(number)) => number
+                .parse::<i128>()
+                .ok()
+                .and_then(i128::checked_neg)
+                .and_then(|value| i64::try_from(value).ok()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(value) = value {
+        if i32::try_from(value).is_err() {
+            return format!("'{value}'::bigint");
+        }
+        if value < 0 {
+            return format!("'{value}'::integer");
+        }
+        return value.to_string();
+    }
+    expr.to_string()
 }
 
 #[derive(Debug)]
