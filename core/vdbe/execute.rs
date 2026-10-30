@@ -7572,7 +7572,13 @@ fn update_agg_payload(
                 },
                 Value::Text(t) => {
                     let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
+                    let overflowed = sum_state.ovrfl;
                     handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, false);
+                    // SQLite reads numeric text only up to a NUL byte and try_for_float does not.
+                    // Until they agree, text with a NUL byte keeps a pending overflow.
+                    if overflowed && t.as_str().contains('\0') {
+                        sum_state.ovrfl = true;
+                    }
                 }
                 Value::Blob(b) => {
                     let (parse_result, parsed_number) = try_for_float(b);
@@ -18450,17 +18456,19 @@ fn handle_text_sum(
     match parsed_number {
         ParsedNumber::Integer(i) => {
             if is_approx {
+                sum_state.ovrfl = false;
                 sum_state.approx = true;
                 match acc {
                     Value::Null => {
                         *acc = Value::from_f64(i as f64);
                     }
                     Value::Numeric(Numeric::Integer(acc_i)) => {
-                        *acc = Value::from_f64(*acc_i as f64);
-                        apply_kbn_step_int(acc, i, sum_state);
+                        let prev = *acc_i;
+                        kbn_init_from_int(acc, prev, sum_state);
+                        apply_kbn_step(acc, i as f64, sum_state);
                     }
                     Value::Numeric(Numeric::Float(_)) => {
-                        apply_kbn_step_int(acc, i, sum_state);
+                        apply_kbn_step(acc, i as f64, sum_state);
                     }
                     _ => unreachable!(),
                 }
@@ -18472,10 +18480,10 @@ fn handle_text_sum(
                     Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(i) {
                         Some(sum) => *acc = Value::from_i64(sum),
                         None => {
-                            let acc_f = *acc_i as f64;
-                            *acc = Value::from_f64(acc_f);
+                            let prev = *acc_i;
                             sum_state.approx = true;
                             sum_state.ovrfl = true;
+                            kbn_init_from_int(acc, prev, sum_state);
                             apply_kbn_step_int(acc, i, sum_state);
                         }
                     },
@@ -18487,9 +18495,10 @@ fn handle_text_sum(
             }
         }
         ParsedNumber::Float(f) => {
+            sum_state.ovrfl = false;
             if !sum_state.approx {
                 if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
+                    kbn_init_from_int(acc, current_sum, sum_state);
                 } else if matches!(*acc, Value::Null) {
                     *acc = Value::from_f64(0.0);
                 }
@@ -18498,9 +18507,10 @@ fn handle_text_sum(
             apply_kbn_step(acc, f, sum_state);
         }
         ParsedNumber::None => {
+            sum_state.ovrfl = false;
             if !sum_state.approx {
                 if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
+                    kbn_init_from_int(acc, current_sum, sum_state);
                 } else if matches!(*acc, Value::Null) {
                     *acc = Value::from_f64(0.0);
                 }
