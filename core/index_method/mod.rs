@@ -91,6 +91,16 @@ pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     ) -> Option<Box<ast::Expr>> {
         crate::util::try_substitute_parameters(pattern, parameters)
     }
+
+    /// Called when ALTER TABLE renames column `from` of the indexed table to `to`
+    /// Returns the attachment to use from now on, or None to keep this one
+    fn rename_column(
+        &self,
+        _from: &str,
+        _to: &str,
+    ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

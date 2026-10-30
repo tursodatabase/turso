@@ -486,7 +486,10 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
 /// For expressions whose type is only known through their SQLite affinity: a column
 /// that could not be found, a register, a subquery result.
 fn affinity_type(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
-    builtin_type_of_affinity(get_expr_affinity(expr, env.tables, Some(env.resolver)))
+    builtin_type_of_affinity(get_expr_affinity(
+        expr,
+        &super::ExprContext::new(env.tables, env.resolver),
+    ))
 }
 
 fn builtin_type_of_affinity(affinity: Affinity) -> ExprType {

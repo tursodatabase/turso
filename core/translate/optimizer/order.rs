@@ -1,10 +1,11 @@
 use crate::schema::{impl_effective_nulls_order, Column, Table};
+use crate::translate::expr_context::ExprContext;
 use crate::turso_assert_greater_than_or_equal;
 use crate::Result;
 use crate::{
     schema::{FromClauseSubquery, Index, Schema},
     translate::{
-        collate::{expr_collation, CollationSeq},
+        collate::CollationSeq,
         emitter::Resolver,
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
@@ -98,7 +99,7 @@ impl OrderTarget {
         }
         let mut cols = Vec::new();
         for (expr, order, nulls) in list {
-            let collation = expr_collation(expr, Some(tables), resolver)?;
+            let collation = ExprContext::new(Some(tables), resolver).expr_collation(expr)?;
             let Some(col) = expr_to_column_order(expr, order, nulls, collation, tables) else {
                 return Ok(None);
             };

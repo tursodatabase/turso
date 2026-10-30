@@ -715,6 +715,37 @@ fn wire_create_table_as_returns_select_n() {
     });
 }
 
+#[test]
+fn wire_command_tag_ignores_comments_and_names_the_object() {
+    with_pg_client(|c| {
+        for (sql, tag) in [
+            ("CREATE TABLE t(x INT)", "CREATE TABLE"),
+            ("-- a comment\nINSERT INTO t VALUES (1)", "INSERT 0 1"),
+            (
+                "/* a /* nested */ comment */ UPDATE t SET x = 2",
+                "UPDATE 1",
+            ),
+            ("CREATE\nVIEW v AS SELECT x FROM t", "CREATE VIEW"),
+            ("CREATE UNIQUE INDEX i ON t (x)", "CREATE INDEX"),
+            ("DROP /* a comment */ INDEX i", "DROP INDEX"),
+            (
+                "CREATE TABLE t2 AS SELECT x FROM t WITH NO DATA -- a comment",
+                "CREATE TABLE AS",
+            ),
+            ("CREATE SEQUENCE s", "CREATE SEQUENCE"),
+            ("DROP SEQUENCE s", "DROP SEQUENCE"),
+            ("TRUNCATE t", "TRUNCATE TABLE"),
+        ] {
+            assert_eq!(c.query_command_tags(sql), [tag], "{sql}");
+        }
+        // A comment in front of SET must not turn it into a query that
+        // returns rows.
+        let sql = "-- a comment\nSET search_path TO public";
+        assert!(c.query_column_oids(sql).is_empty(), "{sql}");
+        assert_eq!(c.query_command_tags(sql), ["SET"], "{sql}");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Named windows (WINDOW clause)
 // ---------------------------------------------------------------------------

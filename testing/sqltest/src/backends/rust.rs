@@ -88,6 +88,7 @@ impl SqlBackend for RustBackend {
             Capability::Trigger,
             Capability::MaterializedViews,
             Capability::CustomTypes,
+            Capability::IndexMethod,
         ])
     }
 

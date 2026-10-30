@@ -2,12 +2,12 @@ use std::{cmp::Ordering, collections::HashMap, hash::Hasher, str::FromStr as _};
 
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
-use turso_parser::ast::{Expr, TableInternalId, UnaryOperator};
+use turso_parser::ast::{Expr, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
     sync::{Arc, LazyLock, RwLock, Weak},
-    translate::{emitter::Resolver, plan::TableReferences},
+    translate::{catalog::CatalogContext, expr_context::ExprProperties},
     types::ValueRef,
     vdbe::hash_table::normalized_f64_bits,
     LimboError, Numeric, Result,
@@ -407,10 +407,10 @@ impl LocaleCollationRegistry {
 pub fn comparison_collation(
     lhs: &Expr,
     rhs: &Expr,
-    tables: Option<&TableReferences>,
-    resolver: &Resolver,
+    metadata: &impl ExprProperties,
+    catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
-    comparison_collation_across_queries(lhs, tables, rhs, tables, resolver)
+    comparison_collation_across_queries(lhs, metadata, rhs, metadata, catalog)
 }
 
 /// [comparison_collation] for `x IN (SELECT y ...)` and other comparisons
@@ -418,19 +418,19 @@ pub fn comparison_collation(
 /// looked up in its own tables.
 pub fn comparison_collation_across_queries(
     lhs: &Expr,
-    lhs_tables: Option<&TableReferences>,
+    lhs_metadata: &impl ExprProperties,
     rhs: &Expr,
-    rhs_tables: Option<&TableReferences>,
-    resolver: &Resolver,
+    rhs_metadata: &impl ExprProperties,
+    catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
     let collation = if has_collate_operator(lhs) {
-        expr_collation_if_any(lhs, lhs_tables, resolver)?
+        expr_collation_if_any(lhs, lhs_metadata, catalog)?
     } else if has_collate_operator(rhs) {
-        expr_collation_if_any(rhs, rhs_tables, resolver)?
+        expr_collation_if_any(rhs, rhs_metadata, catalog)?
     } else {
-        match expr_collation_if_any(lhs, lhs_tables, resolver)? {
+        match expr_collation_if_any(lhs, lhs_metadata, catalog)? {
             Some(collation) => Some(collation),
-            None => expr_collation_if_any(rhs, rhs_tables, resolver)?,
+            None => expr_collation_if_any(rhs, rhs_metadata, catalog)?,
         }
     };
     Ok(collation.unwrap_or(CollationSeq::Binary))
@@ -441,10 +441,10 @@ pub fn comparison_collation_across_queries(
 /// does `x IN (y1, ..., yN)`, which compares with the collation of x alone.
 pub fn expr_collation(
     expr: &Expr,
-    tables: Option<&TableReferences>,
-    resolver: &Resolver,
+    metadata: &impl ExprProperties,
+    catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
-    Ok(expr_collation_if_any(expr, tables, resolver)?.unwrap_or(CollationSeq::Binary))
+    Ok(expr_collation_if_any(expr, metadata, catalog)?.unwrap_or(CollationSeq::Binary))
 }
 
 /// The collation of the first expression that has one, BINARY when none has.
@@ -454,12 +454,12 @@ pub fn expr_collation(
 /// marked `SQLITE_FUNC_NEEDCOLL`), and a compound SELECT compares a result
 /// column with the collation of the leftmost SELECT whose column has one.
 /// Each expression comes with the tables its columns refer to.
-pub fn first_collation<'a>(
-    exprs: impl IntoIterator<Item = (&'a Expr, Option<&'a TableReferences>)>,
-    resolver: &Resolver,
+pub fn first_collation<'a, M: ExprProperties>(
+    exprs: impl IntoIterator<Item = (&'a Expr, M)>,
+    catalog: &CatalogContext<'_>,
 ) -> Result<CollationSeq> {
-    for (expr, tables) in exprs {
-        if let Some(collation) = expr_collation_if_any(expr, tables, resolver)? {
+    for (expr, metadata) in exprs {
+        if let Some(collation) = expr_collation_if_any(expr, &metadata, catalog)? {
             return Ok(collation);
         }
     }
@@ -469,43 +469,39 @@ pub fn first_collation<'a>(
 /// The collation of one expression, or None when it has none (SQLite's
 /// `sqlite3ExprCollSeq`). A column has its declared collation, BINARY when it
 /// declares none, and so do a register and a variable that stand for a column
-/// (rewritten column references, a trigger's NEW.x and OLD.x). CAST and unary `+` pass on the collation of their operand. A
+/// (rewritten column references, a trigger's NEW.x and OLD.x). A value an index
+/// method provides in place of an expression it computes has none. CAST and unary `+` pass on the collation of their operand. A
 /// row value has the collation of its first element. Any other expression has
 /// the collation of its leftmost COLLATE operator, or none when it contains no
 /// COLLATE operator.
 fn expr_collation_if_any(
     expr: &Expr,
-    tables: Option<&TableReferences>,
-    resolver: &Resolver,
+    metadata: &impl ExprProperties,
+    catalog: &CatalogContext<'_>,
 ) -> Result<Option<CollationSeq>> {
     match expr {
-        Expr::Column { table, column, .. } => {
-            referenced_column_collation(*table, *column, tables, resolver)
-        }
+        Expr::Column { table, column, .. } => metadata.column_collation(*table, *column),
         Expr::RowId { .. } => Ok(None),
-        Expr::Register(register) => Ok(resolver
-            .register_columns
-            .get(register)
-            .and_then(|column| column.collation)),
+        Expr::Register(register) => Ok(metadata.register_collation(*register)),
         Expr::Variable(variable) => variable
             .col_collation
             .as_deref()
-            .map(|name| resolver.resolve_collation(name))
+            .map(|name| catalog.resolve_collation(name))
             .transpose(),
         Expr::MergedColumn(columns) => {
             let first_column = columns
                 .first()
                 .expect("a merged column must have at least two source columns");
-            expr_collation_if_any(first_column, tables, resolver)
+            expr_collation_if_any(first_column, metadata, catalog)
         }
         Expr::Cast { expr, .. } | Expr::Unary(UnaryOperator::Positive, expr) => {
-            expr_collation_if_any(expr, tables, resolver)
+            expr_collation_if_any(expr, metadata, catalog)
         }
         Expr::Parenthesized(exprs) => {
             let first = exprs.first().expect("parentheses must hold an expression");
-            expr_collation_if_any(first, tables, resolver)
+            expr_collation_if_any(first, metadata, catalog)
         }
-        Expr::Collate(_, name) => Ok(Some(resolver.resolve_collation(name.as_str())?)),
+        Expr::Collate(_, name) => Ok(Some(catalog.resolve_collation(name.as_str())?)),
         _ => {
             let mut operand_with_collate = None;
             for_each_operand(expr, &mut |operand| {
@@ -514,36 +510,11 @@ fn expr_collation_if_any(
                 }
             });
             match operand_with_collate {
-                Some(operand) => expr_collation_if_any(operand, tables, resolver),
+                Some(operand) => expr_collation_if_any(operand, metadata, catalog),
                 None => Ok(None),
             }
         }
     }
-}
-
-fn referenced_column_collation(
-    table: TableInternalId,
-    column: usize,
-    tables: Option<&TableReferences>,
-    resolver: &Resolver,
-) -> Result<Option<CollationSeq>> {
-    if table.is_self_table() {
-        let self_table = resolver
-            .self_table()
-            .ok_or_else(|| LimboError::InternalError("no table for a self-table column".into()))?;
-        let column = self_table
-            .columns()
-            .get(column)
-            .ok_or_else(|| LimboError::ParseError("column not found".to_string()))?;
-        return Ok(column_collation(column));
-    }
-    let (_, table_ref) = tables
-        .and_then(|tables| tables.find_table_by_internal_id(table))
-        .ok_or_else(|| LimboError::ParseError("table not found".to_string()))?;
-    let column = table_ref
-        .get_column_at(column)
-        .ok_or_else(|| LimboError::ParseError("column not found".to_string()))?;
-    Ok(column_collation(column))
 }
 
 /// A column has its declared collation, BINARY when it declares none. A rowid
@@ -664,6 +635,7 @@ mod tests {
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Table, Type},
         translate::plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan},
+        translate::{emitter::Resolver, expr_context::TableMetadata, plan::TableReferences},
     };
 
     use super::*;
@@ -739,9 +711,12 @@ mod tests {
                 column: 0,
                 is_rowid_alias: false,
             };
-            let collseq =
-                expr_collation_if_any(&expr, Some(&table_references), &Resolver::empty_for_tests())
-                    .unwrap();
+            let collseq = expr_collation_if_any(
+                &expr,
+                &TableMetadata::new(Some(&table_references)),
+                &Resolver::empty_for_tests().catalog,
+            )
+            .unwrap();
             assert_eq!(collseq, Some(collation.unwrap_or(CollationSeq::Binary)));
         }
     }
@@ -763,9 +738,12 @@ mod tests {
                 }),
                 Name::exact(collation.to_string()),
             );
-            let collseq =
-                expr_collation_if_any(&expr, Some(&table_references), &Resolver::empty_for_tests())
-                    .unwrap();
+            let collseq = expr_collation_if_any(
+                &expr,
+                &TableMetadata::new(Some(&table_references)),
+                &Resolver::empty_for_tests().catalog,
+            )
+            .unwrap();
             assert_eq!(collseq, Some(expected_collation));
         }
     }
@@ -789,9 +767,12 @@ mod tests {
             Box::new(Expr::Parenthesized(std::vec![Box::new(inner)])),
             Name::exact("RTRIM".to_string()),
         );
-        let collseq =
-            expr_collation_if_any(&expr, Some(&table_references), &Resolver::empty_for_tests())
-                .unwrap();
+        let collseq = expr_collation_if_any(
+            &expr,
+            &TableMetadata::new(Some(&table_references)),
+            &Resolver::empty_for_tests().catalog,
+        )
+        .unwrap();
         assert_eq!(collseq, Some(CollationSeq::Rtrim));
     }
 
@@ -812,8 +793,8 @@ mod tests {
         );
         let collseq_plus = expr_collation_if_any(
             &expr_plus,
-            Some(&table_references),
-            &Resolver::empty_for_tests(),
+            &TableMetadata::new(Some(&table_references)),
+            &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
         assert_eq!(collseq_plus, Some(CollationSeq::NoCase));
@@ -835,8 +816,8 @@ mod tests {
         );
         let collseq_cast = expr_collation_if_any(
             &expr_cast,
-            Some(&table_references),
-            &Resolver::empty_for_tests(),
+            &TableMetadata::new(Some(&table_references)),
+            &Resolver::empty_for_tests().catalog,
         )
         .unwrap();
         assert_eq!(collseq_cast, Some(CollationSeq::NoCase));
@@ -860,9 +841,12 @@ mod tests {
             Name::exact("RTRIM".to_string()),
         ))]);
         let expr = Expr::binary(lhs, Operator::Add, rhs);
-        let collseq =
-            expr_collation_if_any(&expr, Some(&table_references), &Resolver::empty_for_tests())
-                .unwrap();
+        let collseq = expr_collation_if_any(
+            &expr,
+            &TableMetadata::new(Some(&table_references)),
+            &Resolver::empty_for_tests().catalog,
+        )
+        .unwrap();
         assert_eq!(collseq, Some(CollationSeq::Rtrim));
     }
 
@@ -887,9 +871,12 @@ mod tests {
             is_rowid_alias: false,
         };
         let expr = Expr::binary(lhs, Operator::Add, rhs);
-        let collseq =
-            expr_collation_if_any(&expr, Some(&table_references), &Resolver::empty_for_tests())
-                .unwrap();
+        let collseq = expr_collation_if_any(
+            &expr,
+            &TableMetadata::new(Some(&table_references)),
+            &Resolver::empty_for_tests().catalog,
+        )
+        .unwrap();
         assert_eq!(collseq, None);
     }
 
@@ -906,9 +893,12 @@ mod tests {
             Name::exact("RTRIM".to_string()),
         );
         let expr = Expr::binary(lhs, Operator::Add, rhs);
-        let collseq =
-            expr_collation_if_any(&expr, Some(&table_references), &Resolver::empty_for_tests())
-                .unwrap();
+        let collseq = expr_collation_if_any(
+            &expr,
+            &TableMetadata::new(Some(&table_references)),
+            &Resolver::empty_for_tests().catalog,
+        )
+        .unwrap();
         assert_eq!(collseq, Some(CollationSeq::NoCase));
     }
 
@@ -916,9 +906,12 @@ mod tests {
     fn expr_collation_default_binary_when_no_collate_or_column() {
         let table_references = TableReferences::new_empty();
         let expr = Expr::Literal(Literal::String("abc".to_string()));
-        let collseq =
-            expr_collation_if_any(&expr, Some(&table_references), &Resolver::empty_for_tests())
-                .unwrap();
+        let collseq = expr_collation_if_any(
+            &expr,
+            &TableMetadata::new(Some(&table_references)),
+            &Resolver::empty_for_tests().catalog,
+        )
+        .unwrap();
         assert_eq!(collseq, None);
     }
 
@@ -933,9 +926,12 @@ mod tests {
         };
         // As in SQLite, the rowid has no collation even when its INTEGER PRIMARY KEY
         // alias declares one.
-        let collseq =
-            expr_collation_if_any(&expr, Some(&table_references), &Resolver::empty_for_tests())
-                .unwrap();
+        let collseq = expr_collation_if_any(
+            &expr,
+            &TableMetadata::new(Some(&table_references)),
+            &Resolver::empty_for_tests().catalog,
+        )
+        .unwrap();
         assert_eq!(collseq, None);
     }
 
@@ -959,15 +955,25 @@ mod tests {
             is_rowid_alias: false,
         };
         assert_eq!(
-            comparison_collation(&lhs, &rhs, Some(&table_refs), &Resolver::empty_for_tests())
-                .unwrap(),
+            comparison_collation(
+                &lhs,
+                &rhs,
+                &TableMetadata::new(Some(&table_refs)),
+                &Resolver::empty_for_tests().catalog
+            )
+            .unwrap(),
             CollationSeq::NoCase
         );
         // Swapped: the LHS column is still a column, so its default BINARY
         // collation wins over the NOCASE column on the RHS.
         assert_eq!(
-            comparison_collation(&rhs, &lhs, Some(&table_refs), &Resolver::empty_for_tests())
-                .unwrap(),
+            comparison_collation(
+                &rhs,
+                &lhs,
+                &TableMetadata::new(Some(&table_refs)),
+                &Resolver::empty_for_tests().catalog
+            )
+            .unwrap(),
             CollationSeq::Binary
         );
     }
@@ -1006,8 +1012,8 @@ mod tests {
             comparison_collation(
                 &function_of_binary_column,
                 &nocase_column,
-                Some(&table_refs),
-                &Resolver::empty_for_tests()
+                &TableMetadata::new(Some(&table_refs)),
+                &Resolver::empty_for_tests().catalog
             )
             .unwrap(),
             CollationSeq::NoCase
@@ -1041,8 +1047,8 @@ mod tests {
             comparison_collation(
                 &wrapped_binary_column,
                 &nocase_column,
-                Some(&table_refs),
-                &Resolver::empty_for_tests()
+                &TableMetadata::new(Some(&table_refs)),
+                &Resolver::empty_for_tests().catalog
             )
             .unwrap(),
             CollationSeq::Binary
@@ -1072,8 +1078,13 @@ mod tests {
             Name::exact("RTRIM".to_string()),
         );
         assert_eq!(
-            comparison_collation(&lhs, &rhs, Some(&table_refs), &Resolver::empty_for_tests())
-                .unwrap(),
+            comparison_collation(
+                &lhs,
+                &rhs,
+                &TableMetadata::new(Some(&table_refs)),
+                &Resolver::empty_for_tests().catalog
+            )
+            .unwrap(),
             CollationSeq::Rtrim
         );
     }
@@ -1094,8 +1105,13 @@ mod tests {
             is_rowid_alias: false,
         };
         assert_eq!(
-            comparison_collation(&lhs, &rhs, Some(&table_refs), &Resolver::empty_for_tests())
-                .unwrap(),
+            comparison_collation(
+                &lhs,
+                &rhs,
+                &TableMetadata::new(Some(&table_refs)),
+                &Resolver::empty_for_tests().catalog
+            )
+            .unwrap(),
             CollationSeq::Binary
         );
     }

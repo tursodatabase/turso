@@ -182,13 +182,13 @@ pub fn translate_create_index(
     }) {
         crate::bail_parse_error!("views may not be indexed");
     }
+    let db_name = resolver
+        .namespace_name(database_id)
+        .unwrap_or_else(|| "main".to_string());
     let table = resolver.with_schema(database_id, |s| s.get_table(namespace.id, &tbl_name));
     let Some(table) = table else {
         // The index's target table always lives in the index's own database,
         // so SQLite qualifies the missing table with that database name.
-        let db_name = resolver
-            .namespace_name(database_id)
-            .unwrap_or_else(|| "main".to_string());
         crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
     let Some(tbl) = table.btree() else {
@@ -197,7 +197,21 @@ pub fn translate_create_index(
     if !tbl.has_rowid {
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
-    let columns = resolve_sorted_columns_with_catalog(&tbl, &columns, Some(&resolver.catalog))?;
+    // Not checked when the schema loads or when a nested statement such as VACUUM
+    // replays the stored schema, so databases that already have such an index keep
+    // working.
+    let reject_qualified_columns_in_db = (!resolver
+        .catalog
+        .dialect
+        .allows_qualified_columns_in_index_terms()
+        && !connection.is_nested_stmt())
+    .then_some(db_name.as_str());
+    let columns = resolve_sorted_columns_with_catalog(
+        &tbl,
+        &columns,
+        Some(&resolver.catalog),
+        reject_qualified_columns_in_db,
+    )?;
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
@@ -998,7 +1012,7 @@ pub fn resolve_sorted_columns(
     table: &BTreeTable,
     cols: &[SortedColumn],
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    resolve_sorted_columns_with_catalog(table, cols, None)
+    resolve_sorted_columns_with_catalog(table, cols, None, None)
 }
 
 pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
@@ -1010,45 +1024,51 @@ pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
     Ok(())
 }
 
+/// When `reject_qualified_columns_in_db` names the index's database, a qualified
+/// column name in an indexed term is an error, as in SQLite. The WHERE clause of a
+/// partial index is not checked: SQLite allows qualified names there.
 fn resolve_sorted_columns_with_catalog(
     table: &BTreeTable,
     cols: &[SortedColumn],
     resolver: Option<&CatalogContext>,
+    reject_qualified_columns_in_db: Option<&str>,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
             cols.len(),
         )?;
     for sc in cols {
+        let has_qualified_column = match reject_qualified_columns_in_db {
+            Some(db_name) => has_qualified_columns(&sc.expr, table, db_name)?,
+            None => false,
+        };
         let order = sc.order.unwrap_or(SortOrder::Asc);
         let nulls = sc.nulls;
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref(), resolver)?;
         // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
         let unwrapped_expr = unwrap_parens(base_expr)?;
-        if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
+        let index_column = if let Some((pos, column_name, column)) =
+            resolve_index_column(unwrapped_expr, table)
+        {
             let collation = explicit_collation.unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
                 GeneratedType::NotGenerated => None,
             };
-            resolved
-                .push_within_capacity(IndexColumn {
-                    name: column_name,
-                    order,
-                    nulls_order: nulls,
-                    pos_in_table: pos,
-                    collation,
-                    default: column.default.clone(),
-                    expr,
-                })
-                .expect("resolved index columns vector was preallocated to cols.len()");
-            continue;
-        }
-        if !validate_index_expression(unwrapped_expr, table) {
-            crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
-        }
-        resolved
-            .push_within_capacity(IndexColumn {
+            IndexColumn {
+                name: column_name,
+                order,
+                nulls_order: nulls,
+                pos_in_table: pos,
+                collation,
+                default: column.default.clone(),
+                expr,
+            }
+        } else {
+            if !validate_index_expression(unwrapped_expr, table) {
+                crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
+            }
+            IndexColumn {
                 name: sc.expr.to_string(),
                 order,
                 nulls_order: nulls,
@@ -1056,10 +1076,46 @@ fn resolve_sorted_columns_with_catalog(
                 collation: explicit_collation.unwrap_or(CollationSeq::Binary),
                 default: None,
                 expr: Some(sc.expr.clone()),
-            })
+            }
+        };
+        // SQLite reports any other error in the same term instead of this one.
+        if has_qualified_column {
+            crate::bail_parse_error!("the \".\" operator prohibited in index expressions");
+        }
+        resolved
+            .push_within_capacity(index_column)
             .expect("resolved index columns vector was preallocated to cols.len()");
     }
     Ok(resolved)
+}
+
+/// Returns whether `expr` contains a qualified column name. A qualified name that
+/// does not name a column of `table` is reported as `no such column`, which SQLite
+/// reports before any other error in the term.
+fn has_qualified_columns(expr: &Expr, table: &BTreeTable, db_name: &str) -> crate::Result<bool> {
+    let mut has_qualified_column = false;
+    walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+        let (db_qualifier, table_qualifier, column) = match e {
+            Expr::Qualified(table_qualifier, column) => (None, table_qualifier, column),
+            Expr::DoublyQualified(db_qualifier, table_qualifier, column) => {
+                (Some(db_qualifier), table_qualifier, column)
+            }
+            _ => return Ok(WalkControl::Continue),
+        };
+        let resolves = db_qualifier.is_none_or(|db| db.as_str().eq_ignore_ascii_case(db_name))
+            && table_qualifier.as_str().eq_ignore_ascii_case(&table.name)
+            && table.get_column(column.as_str()).is_some();
+        if !resolves {
+            let table_column = format!("{}.{}", table_qualifier.as_str(), column.as_str());
+            match db_qualifier {
+                Some(db) => bail_parse_error!("no such column: {}.{table_column}", db.as_str()),
+                None => bail_parse_error!("no such column: {table_column}"),
+            }
+        }
+        has_qualified_column = true;
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(has_qualified_column)
 }
 
 /// Extracts collation sequence from an expression if it is a Collate expression.

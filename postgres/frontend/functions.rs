@@ -80,6 +80,7 @@ scalar_functions! {
     PgInputIsValid(FunctionArity::Exact(2), true),
     Textlike(FunctionArity::Exact(2), true),
     LikeEscape(FunctionArity::Exact(2), true),
+    SimilarToEscape(FunctionArity::OneOf(&[1, 2]), true),
     Booleq(FunctionArity::Exact(2), true),
     Boolne(FunctionArity::Exact(2), true),
     ColDescription(FunctionArity::Exact(2), true),
@@ -108,9 +109,9 @@ impl ScalarCall for PgScalarFunction {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let value = match self {
             Self::Acldefault => exec_acl_default(args)?,
-            Self::PgGetUserbyid => exec_pg_get_user_by_id(int_arg(args, 0, 0)),
+            Self::PgGetUserbyid => oid_arg(args, 0)?.map_or(Value::Null, exec_pg_get_user_by_id),
             Self::PgTableIsVisible | Self::PgFunctionIsVisible | Self::PgTypeIsVisible => {
-                exec_pg_is_visible(int_arg(args, 0, 0))
+                oid_arg(args, 0)?.map_or(Value::Null, exec_pg_is_visible)
             }
             Self::PgEncodingToChar => exec_pg_encoding_to_char(int_arg(args, 0, 0)),
             Self::PgGetFunctionResult
@@ -125,14 +126,21 @@ impl ScalarCall for PgScalarFunction {
                 _ => Value::build_text(turso_pg_parser::quote_identifier(&text_arg(args, 0))),
             },
             Self::QuoteLiteral => exec_quote_literal(args[0].get_value()),
-            Self::FormatType => exec_pg_format_type(int_arg(args, 0, 0), int_arg(args, 1, -1)),
-            Self::PgGetConstraintdef => exec_pg_get_constraintdef(connection, int_arg(args, 0, 0)),
-            Self::PgGetIndexdef => exec_pg_get_indexdef(connection, int_arg(args, 0, 0)),
+            Self::FormatType => oid_arg(args, 0)?.map_or(Value::Null, |type_oid| {
+                exec_pg_format_type(type_oid, int_arg(args, 1, -1))
+            }),
+            Self::PgGetConstraintdef => oid_arg(args, 0)?.map_or(Value::Null, |oid| {
+                exec_pg_get_constraintdef(connection, oid)
+            }),
+            Self::PgGetIndexdef => {
+                oid_arg(args, 0)?.map_or(Value::Null, |oid| exec_pg_get_indexdef(connection, oid))
+            }
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
             Self::Textlike => exec_textlike(args)?,
             Self::LikeEscape => exec_like_escape(args)?,
+            Self::SimilarToEscape => exec_similar_to_escape(args)?,
             Self::Booleq => Value::from_i64((args[0].get_value() == args[1].get_value()) as i64),
             Self::Boolne => Value::from_i64((args[0].get_value() != args[1].get_value()) as i64),
             Self::SetConfig => exec_set_config(connection, args)?,
@@ -391,6 +399,56 @@ fn int_arg(args: &[Register], i: usize, default: i64) -> i64 {
     args.get(i)
         .and_then(|arg| arg.get_value().as_int())
         .unwrap_or(default)
+}
+
+fn oid_arg(args: &[Register], i: usize) -> Result<Option<i64>> {
+    let value = args[i].get_value();
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(text) => parse_oid(text.as_str()).map(Some),
+        value => value.as_int().map(Some).ok_or_else(|| {
+            LimboError::ConversionError(format!("invalid input syntax for type oid: \"{value}\""))
+        }),
+    }
+}
+
+fn parse_oid(text: &str) -> Result<i64> {
+    let invalid =
+        || LimboError::ConversionError(format!("invalid input syntax for type oid: \"{text}\""));
+    let out_of_range =
+        || LimboError::ConversionError(format!("value \"{text}\" is out of range for type oid"));
+    let is_space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
+    let number = text.trim_matches(is_space);
+    let (negative, unsigned) = match number.as_bytes().first() {
+        Some(b'-') => (true, &number[1..]),
+        Some(b'+') => (false, &number[1..]),
+        _ => (false, number),
+    };
+    let (radix, digits) = if let Some(hex) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+        .filter(|hex| hex.starts_with(|c: char| c.is_ascii_hexdigit()))
+    {
+        (16, hex)
+    } else if unsigned.len() > 1 && unsigned.starts_with('0') {
+        (8, &unsigned[1..])
+    } else {
+        (10, unsigned)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(invalid());
+    }
+    let magnitude = u64::from_str_radix(digits, radix).map_err(|_| out_of_range())?;
+    let value = if negative {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    };
+    let oid = value as u32;
+    if value != u64::from(oid) && value != oid as i32 as i64 as u64 {
+        return Err(out_of_range());
+    }
+    Ok(i64::from(oid))
 }
 
 fn text_arg(args: &[Register], i: usize) -> String {
@@ -701,6 +759,28 @@ fn exec_like_escape(args: &[Register]) -> Result<Value> {
         }
     };
     Ok(Value::build_text(result))
+}
+
+/// Converts a SIMILAR TO pattern to a regular expression, as PostgreSQL's
+/// similar_to_escape() does. Without an ESCAPE argument, `\` is the escape.
+fn exec_similar_to_escape(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let pattern = args[0].get_value().to_string();
+    let escape = args
+        .get(1)
+        .map_or_else(|| "\\".to_string(), |arg| arg.get_value().to_string());
+    match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
+        Ok(regex) => Ok(Value::build_text(regex)),
+        Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
+            Err(sqlstate_error(sqlstate, message))
+        }
+        Err(error) => Err(LimboError::ParseError(error.to_string())),
+    }
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> Value {

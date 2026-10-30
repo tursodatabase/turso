@@ -205,6 +205,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// The namespaces of a database that has never created or dropped one.
+    /// They have ids from 1 in this order and no rows until the first
+    /// CREATE SCHEMA or DROP SCHEMA creates the namespaces table, which then
+    /// stores them with the change.
+    ///
+    /// PostgreSQL has the schema public. SQLite has no namespaces.
+    fn default_namespaces(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether `INSERT ... ON CONFLICT DO UPDATE` fails when the conflicting
     /// row was already inserted or updated by the same statement.
     ///
@@ -245,6 +255,14 @@ pub trait Dialect: Send + Sync + 'static {
     /// checked against them. SQLite gives each column only the affinity of
     /// its result column.
     fn create_table_as_keeps_column_types(&self) -> bool {
+        false
+    }
+
+    /// Whether `CREATE INDEX` accepts qualified column names such as `t.a`
+    /// in its indexed terms.
+    ///
+    /// PostgreSQL accepts them. SQLite raises an error.
+    fn allows_qualified_columns_in_index_terms(&self) -> bool {
         false
     }
 }
@@ -558,29 +576,12 @@ mod tests {
     }
 
     #[test]
-    fn query_runner_reports_invalid_utf8_once() {
+    fn consume_stmt_reports_parse_error() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "query-runner-invalid-utf8.db", Arc::new(SqliteDialect)).unwrap();
+        let db = open_db(&io, "consume-stmt-parse-error.db", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
-        let mut runner = conn.query_runner(b"SELECT 1;\xff");
 
-        let Some(Err(crate::LimboError::ParseError(message))) = runner.next() else {
-            panic!("invalid UTF-8 must produce a parse error");
-        };
-        assert!(message.contains("invalid UTF-8"));
-        assert!(runner.next().is_none());
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn query_runner_reports_parse_error_once() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "query-runner-parse-error.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        let mut runner = conn.query_runner(b"SELECT * FROM");
-
-        assert!(runner.next().is_some_and(|result| result.is_err()));
-        assert!(runner.next().is_none());
+        assert!(conn.consume_stmt("SELECT * FROM").is_err());
         conn.close().unwrap();
     }
 

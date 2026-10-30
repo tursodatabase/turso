@@ -34,7 +34,7 @@
     "@vitest/browser-playwright": "^4.1.11",
     "playwright": "^1.55.0",
     "typescript": "^5.9.2",
-    "vite": "^7.3.5",
+    "vite": "^7.3.7",
     "vitest": "^4.1.11"
   },
   "scripts": {

@@ -2727,6 +2727,8 @@ impl Database {
             fts_merge_threshold: AtomicI64::new(crate::index_method::DEFAULT_FTS_MERGE_THRESHOLD),
             dqs_dml: AtomicBool::new(true),
             sequence_inner_retries: AtomicU64::new(0),
+            #[cfg(feature = "test_helper")]
+            test_nondet_counter: AtomicI64::new(0),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]
