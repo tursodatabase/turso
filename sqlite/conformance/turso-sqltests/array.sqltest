@@ -409,7 +409,7 @@ test array-type-check-numbers-coerced-to-text {
     SELECT items FROM t30;
 }
 expect {
-    {1,2,3.14}
+    {"1","2","3.14"}
 }
 
 test array-type-check-string-in-real-array {
