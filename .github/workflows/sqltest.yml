@@ -154,6 +154,12 @@ jobs:
         run: make -C postgres/conformance build-runner
       - name: Run tests against PostgreSQL
         run: make -C postgres/conformance run-postgres
+      # The SQLSTATE differential fuzzer still reports one divergence —
+      # int4 arithmetic overflow needs expression types the engine does not
+      # track yet — so it runs manually, not in CI:
+      #   make -C postgres/conformance run-sqlstate-fuzzer
+      # - name: Run SQLSTATE differential fuzzer
+      #   run: make -C postgres/conformance run-sqlstate-fuzzer
 
   pg-dump-fuzzer:
     name: PostgreSQL dump differential fuzzer
