@@ -1803,9 +1803,10 @@ fn reset_all_settings(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Resets the session as DISCARD ALL does. tursopg has no temporary
-/// tables, SQL-level prepared statements or cached plans to drop. A server
-/// client's protocol-level prepared statements are not dropped.
+/// Resets the session as DISCARD ALL does, including the current role.
+/// tursopg has no temporary tables, SQL-level prepared statements or cached
+/// plans to drop. A server client's protocol-level prepared statements are
+/// not dropped.
 fn discard_all(conn: &Connection) -> Result<()> {
     if !conn.get_auto_commit() {
         return Err(sqlstate_error(
@@ -1815,6 +1816,7 @@ fn discard_all(conn: &Connection) -> Result<()> {
     }
     reset_all_settings(conn)?;
     conn.clear_sequence_currvals();
+    conn.reset_current_role();
     Ok(())
 }
 
