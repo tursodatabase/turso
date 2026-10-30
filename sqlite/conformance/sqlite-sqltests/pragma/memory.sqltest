@@ -409,3 +409,35 @@ expect {
     0
     0
 }
+
+@cross-check-integrity
+test pragma-table-info-quoted-type-parameters {
+    CREATE TABLE t(a "varchar"(10), b 'x y'(3,4), c `decimal`(5,2));
+    PRAGMA table_info(t);
+}
+expect {
+    0|a|varchar|0||0
+    1|b|x y|0||0
+    2|c|decimal|0||0
+}
+
+@cross-check-integrity
+test pragma-table-xinfo-quoted-type-parameters {
+    CREATE TABLE t(a "varchar"(10), b 'x y'(3,4) AS (a));
+    PRAGMA table_xinfo(t);
+}
+expect {
+    0|a|varchar|0||0|0
+    1|b|x y|0||0|2
+}
+
+@cross-check-integrity
+test pragma-alter-add-quoted-type-parameters {
+    CREATE TABLE t(a TEXT);
+    ALTER TABLE t ADD COLUMN b "varchar"(10);
+    PRAGMA table_info(t);
+}
+expect {
+    0|a|TEXT|0||0
+    1|b|varchar|0||0
+}
