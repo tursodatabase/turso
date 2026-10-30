@@ -341,14 +341,14 @@ impl<'a> CatalogContext<'a> {
         Ok(namespace)
     }
 
-    /// Fails when a dialect whose relations share names finds an index or a
-    /// sequence where a statement reads or writes a table.
+    /// Fails when a namespace has an index or a sequence of the name where a
+    /// statement reads or writes a table.
     fn reject_query_of_other_relation_kind(
         &self,
         namespace: NamespaceRef,
         name: &str,
     ) -> Result<()> {
-        if !self.dialect.relations_share_names() {
+        if !self.dialect.supports_namespaces() {
             return Ok(());
         }
         let name = normalize_ident(name);
@@ -453,9 +453,10 @@ impl<'a> CatalogContext<'a> {
         None
     }
 
-    /// Like `find_unqualified_existing` for a relation: when the relations of
-    /// the dialect share names, the first namespace that has a relation of
-    /// the name, whatever its kind.
+    /// Like `find_unqualified_existing` for a relation. A search through
+    /// namespaces stops at the first one that has a relation of the name,
+    /// whatever its kind. A database has no namespaces in SQLite, where the
+    /// search goes through attached databases and looks for one kind.
     fn find_unqualified_relation<F>(
         &self,
         object_name: &str,
@@ -464,7 +465,7 @@ impl<'a> CatalogContext<'a> {
     where
         F: Fn(&Schema, NamespaceId, &str) -> bool,
     {
-        if self.dialect.relations_share_names() {
+        if self.dialect.supports_namespaces() {
             self.find_unqualified_existing(object_name, Self::namespace_has_relation)
         } else {
             self.find_unqualified_existing(object_name, namespace_has_object)
@@ -542,7 +543,7 @@ impl<'a> CatalogContext<'a> {
         let namespace = self
             .find_existing_sequence(seq_name)
             .ok_or_else(|| LimboError::ParseError(format!("no such object: {seq_name}")))?;
-        let is_other_relation = self.dialect.relations_share_names()
+        let is_other_relation = self.dialect.supports_namespaces()
             && self.with_schema(namespace.database_id, |schema| {
                 !schema.has_sequence(namespace.id, seq_name)
                     && Self::namespace_has_relation(schema, namespace.id, seq_name)

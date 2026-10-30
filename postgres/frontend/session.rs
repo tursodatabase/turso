@@ -714,9 +714,9 @@ fn names_missing_schema(conn: &Arc<Connection>, name: &ast::QualifiedName) -> bo
 
 /// PostgreSQL keeps tables, views, indexes and sequences under one set of
 /// names per schema, and refuses a DROP statement on a relation of another
-/// kind, also with IF EXISTS. Core looks up each kind on its own, so it would
-/// go on to a later schema of the search path. The relation is the first one
-/// named `name` in the schemas that it is looked up in.
+/// kind, also with IF EXISTS. Core reports such a relation as missing, or does
+/// nothing with IF EXISTS. The relation is the first one named `name` in the
+/// schemas that it is looked up in.
 fn reject_drop_of_other_relation_kind(
     conn: &Arc<Connection>,
     name: &ast::QualifiedName,

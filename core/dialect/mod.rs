@@ -195,16 +195,6 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
-    /// Whether the tables, views, indexes and sequences of a namespace share
-    /// one set of names, so that a name without a namespace is looked up only
-    /// in the first namespace of the search path that has a relation of that
-    /// name, whatever its kind.
-    ///
-    /// PostgreSQL works this way. SQLite looks up each kind on its own.
-    fn relations_share_names(&self) -> bool {
-        false
-    }
-
     /// The error for a name that is a relation of another kind than the
     /// statement needs, with the message `message`.
     fn wrong_relation_kind_error(&self, message: String) -> crate::LimboError {

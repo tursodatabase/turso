@@ -200,10 +200,6 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn relations_share_names(&self) -> bool {
-        true
-    }
-
     fn wrong_relation_kind_error(&self, message: String) -> LimboError {
         sqlstate_error(SQLSTATE_WRONG_OBJECT_TYPE, message)
     }
