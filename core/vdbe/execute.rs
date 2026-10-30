@@ -12,7 +12,7 @@ use crate::mvcc::database::{
 };
 use crate::mvcc::MvccClock;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
-use crate::numeric::decimal::numeric_from_value;
+use crate::numeric::decimal::{numeric_from_value, MAX_FRACTION_DIGITS};
 use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
@@ -57,7 +57,7 @@ use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
-    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
+    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState, WriteBaseline,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -87,8 +87,8 @@ use crate::{
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
-            exec_date, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
-            exec_strftime, exec_time, exec_unixepoch,
+            exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full,
+            exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
         printf::exec_printf,
     },
@@ -153,7 +153,7 @@ impl OpenedBTree {
 
 use super::{
     array::{
-        array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
+        array_values_from_blob, compute_array_length, compute_array_length_at_dim,
         exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
         exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
         exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
@@ -161,7 +161,7 @@ use super::{
     },
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
-        IvmSumKind, RegisterOrLiteral, SortComparatorType, SorterOpenData,
+        IvmSumKind, RegisterOrLiteral, SorterOpenData,
     },
     CommitState,
 };
@@ -273,128 +273,6 @@ impl<T> OrOverflow<T> for Option<T> {
             Some(value) => Ok(value),
             None => Err(LimboError::IntegerOverflow),
         }
-    }
-}
-
-/// Create a sort comparator closure from a SortComparatorType enum.
-fn make_sort_comparator(
-    cmp_type: &SortComparatorType,
-) -> Result<crate::vdbe::sorter::SortComparator> {
-    use std::cmp::Ordering;
-    let cmp: crate::vdbe::sorter::SortComparator = match cmp_type {
-        SortComparatorType::NumericLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => {
-                        // Decode from ValueRef to Value for numeric_from_value
-                        let a_val = a.to_owned()?;
-                        let b_val = b.to_owned()?;
-                        match (numeric_from_value(&a_val), numeric_from_value(&b_val)) {
-                            (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
-                            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                        }
-                    }
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::StringReverse => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                fn reverse_str(v: &ValueRef) -> String {
-                    match v {
-                        ValueRef::Text(t) => t.to_string().chars().rev().collect(),
-                        _ => String::new(),
-                    }
-                }
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => reverse_str(a).cmp(&reverse_str(b)),
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::TestUintLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                fn to_u64(v: &ValueRef) -> Option<u64> {
-                    match v {
-                        ValueRef::Null => None,
-                        ValueRef::Numeric(Numeric::Integer(i)) => {
-                            if *i >= 0 {
-                                Some(*i as u64)
-                            } else {
-                                None
-                            }
-                        }
-                        ValueRef::Text(t) => t.to_string().parse::<u64>().ok(),
-                        _ => None,
-                    }
-                }
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => match (to_u64(a), to_u64(b)) {
-                        (Some(a), Some(b)) => a.cmp(&b),
-                        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                    },
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::ArrayLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    (ValueRef::Blob(a_blob), ValueRef::Blob(b_blob)) => {
-                        crate::vdbe::array::compare_arrays(a_blob, b_blob)
-                            .unwrap_or(Ordering::Equal)
-                    }
-                    (ValueRef::Text(a_text), ValueRef::Text(b_text)) => {
-                        let a_vals = crate::vdbe::array::parse_text_array(a_text);
-                        let b_vals = crate::vdbe::array::parse_text_array(b_text);
-                        match (a_vals, b_vals) {
-                            (Some(av), Some(bv)) => {
-                                let a_blob = crate::vdbe::array::values_to_record_blob(&av)?;
-                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv)?;
-                                if let (Value::Blob(ab), Value::Blob(bb)) = (&a_blob, &b_blob) {
-                                    crate::vdbe::array::compare_arrays(ab, bb)
-                                        .unwrap_or(Ordering::Equal)
-                                } else {
-                                    Ordering::Equal
-                                }
-                            }
-                            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                        }
-                    }
-                    _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                };
-                Ok(res)
-            })
-        }
-    };
-    Ok(cmp)
-}
-
-/// Compare two values using the specified collation for text values.
-/// Non-text values are compared using their natural ordering.
-fn compare_with_collation(
-    lhs: &Value,
-    rhs: &Value,
-    collation: CollationSeq,
-    collation_comparator: &Option<crate::vdbe::sorter::SortComparator>,
-) -> Result<std::cmp::Ordering> {
-    match (lhs, rhs, collation_comparator) {
-        (Value::Text(_), Value::Text(_), Some(comparator)) => {
-            comparator(&lhs.as_ref(), &rhs.as_ref())
-        }
-        _ => Ok(collation.compare(lhs.as_ref(), rhs.as_ref())),
     }
 }
 
@@ -1107,12 +985,17 @@ macro_rules! comparison_opcode {
                 return Err(unresolved_branch_target(*target_pc));
             };
 
-            // Two integers compare directly: no NULL handling, affinity or collation.
+            // Two integers compare directly: no NULL handling, affinity or
+            // text collation. A type's order may place integers differently.
             if let (
                 Register::Value(Value::Numeric(Numeric::Integer(l))),
                 Register::Value(Value::Numeric(Numeric::Integer(r))),
-            ) = (&state.registers[*lhs], &state.registers[*rhs])
-            {
+                true,
+            ) = (
+                &state.registers[*lhs],
+                &state.registers[*rhs],
+                matches!(collation, CollationSeq::Text(_)),
+            ) {
                 let jumps = $jumps;
                 state.pc = if jumps(*l, *r) {
                     target_pc
@@ -1154,7 +1037,7 @@ fn texts_compare_as_bytes(
     flags: crate::vdbe::insn::CmpInsFlags,
     collation: CollationSeq,
 ) -> bool {
-    if collation != CollationSeq::Binary {
+    if collation != CollationSeq::BINARY {
         return false;
     }
     !flags.get_affinity().is_numeric()
@@ -1209,20 +1092,6 @@ fn op_comparison_slow(
             };
             take_jump_if!(should_jump);
         }
-        (Value::Blob(lb), Value::Blob(rb)) if flags.has_array_cmp() => {
-            // Element-wise array comparison
-            if let Ok(ord) = compare_arrays(lb, rb) {
-                let should_jump = match op {
-                    ComparisonOp::Eq => ord.is_eq(),
-                    ComparisonOp::Ne => !ord.is_eq(),
-                    ComparisonOp::Lt => ord.is_lt(),
-                    ComparisonOp::Le => ord.is_le(),
-                    ComparisonOp::Gt => ord.is_gt(),
-                    ComparisonOp::Ge => ord.is_ge(),
-                };
-                take_jump_if!(should_jump);
-            }
-        }
         (_, _) => {}
     }
 
@@ -1238,7 +1107,7 @@ fn op_comparison_slow(
     let rhs_for_compare = new_rhs
         .as_ref()
         .map_or(Either::Left(rhs_value), Either::Right);
-    let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation);
+    let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation)?;
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
@@ -5281,6 +5150,13 @@ pub fn op_transaction_inner(
                             "write statement started with view changes left by an earlier statement"
                         );
                         state.is_active_write = true;
+                        if is_main_db {
+                            state.write_baseline = WriteBaseline::capture(
+                                mv_store.as_deref(),
+                                &program.connection,
+                                &pager,
+                            );
+                        }
                     }
                     if is_main_db && in_explicit_txn && state.has_stmt_transaction {
                         state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
@@ -7544,7 +7420,6 @@ fn update_agg_payload(
     maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
-    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
 ) -> Result<()> {
     match func {
         AggFunc::Count => {
@@ -7717,15 +7592,7 @@ fn update_agg_payload(
                 return Ok(());
             }
             use std::cmp::Ordering;
-            let comparator = comparator()?;
-            // Use custom type comparator if available, otherwise fall back to collation
-            let cmp = if let Some(ref cmp_fn) = comparator {
-                let arg_ref = arg.as_ref();
-                let payload_ref = payload[0].as_ref();
-                cmp_fn(&arg_ref, &payload_ref)?
-            } else {
-                compare_with_collation(arg, &payload[0], collation, &comparator)?
-            };
+            let cmp = collation.compare(arg.as_ref(), payload[0].as_ref());
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
                 AggFunc::Min => cmp == Ordering::Less,
@@ -9017,7 +8884,6 @@ pub fn op_agg_inverse(
             col,
             delimiter: _,
             func,
-            comparator: _,
         },
         insn
     );
@@ -9451,7 +9317,7 @@ pub fn op_agg_step(
                     }
                 }
             }
-            AggFunc::Min | AggFunc::Max if data.comparator.is_none() => {
+            AggFunc::Min | AggFunc::Max if matches!(data.collation, CollationSeq::Text(_)) => {
                 if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
                     state.registers[data.col]
                 {
@@ -9485,7 +9351,6 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
         col,
         delimiter,
         func,
-        comparator,
         collation,
     } = data;
 
@@ -9536,9 +9401,6 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
     }
 
     let collation = *collation;
-    let comparator_factory = move || -> Result<Option<crate::vdbe::sorter::SortComparator>> {
-        comparator.as_ref().map(make_sort_comparator).transpose()
-    };
 
     // Step the aggregate
     match func {
@@ -9579,14 +9441,7 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
                 .into());
             };
             let payload = agg.payload_vec_mut();
-            update_agg_payload(
-                func,
-                arg,
-                maybe_arg2.as_ref(),
-                payload,
-                collation,
-                comparator_factory,
-            )?;
+            update_agg_payload(func, arg, maybe_arg2.as_ref(), payload, collation)?;
         }
     };
 
@@ -9727,7 +9582,6 @@ pub fn op_sorter_open(
         cursor_id,
         columns: _,
         order_collations_nulls,
-        comparators,
     } = data.as_ref();
     // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
     let page_size = match pager.with_header(|header| header.page_size) {
@@ -9754,23 +9608,11 @@ pub fn op_sorter_open(
         collations.push(*coll);
         nulls_orders.push(*nulls);
     }
-    let mut sort_comparators =
-        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
-    for idx in 0..order_collations_nulls.len() {
-        let comparator = comparators
-            .get(idx)
-            .and_then(|c| c.as_ref())
-            .map(make_sort_comparator)
-            .transpose()?;
-        // Preallocated for every ORDER BY term above, so this push cannot grow the vector.
-        sort_comparators.push(comparator);
-    }
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
         nulls_orders,
-        sort_comparators,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
@@ -10761,13 +10603,14 @@ pub fn op_function(
             }
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => {
-                // Test-only: process-global atomic counter that increments on
-                // every evaluation. Used in sqltests to verify that the
-                // planner does not deduplicate equivalent SQL calls that
-                // contain nondeterministic functions.
-                static TEST_NONDET_COUNTER: std::sync::atomic::AtomicI64 =
-                    std::sync::atomic::AtomicI64::new(0);
-                let value = TEST_NONDET_COUNTER.fetch_add(1, Ordering::Relaxed);
+                // Test-only: per-connection counter that increments on every
+                // evaluation. Used in sqltests to verify that the planner does
+                // not deduplicate equivalent SQL calls that contain
+                // nondeterministic functions.
+                let value = program
+                    .connection
+                    .test_nondet_counter
+                    .fetch_add(1, Ordering::Relaxed);
                 state.registers[*dest].set_int(value);
             }
             ScalarFunc::Trim => {
@@ -11319,59 +11162,6 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::TestUintAdd
-            | ScalarFunc::TestUintSub
-            | ScalarFunc::TestUintMul
-            | ScalarFunc::TestUintDiv => {
-                check_arg_count!(arg_count, 2);
-                let a = parse_test_uint(&state.registers[*start_reg])?;
-                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
-                let result = match (a, b) {
-                    (Some(a), Some(b)) => {
-                        let r = match scalar_func {
-                            ScalarFunc::TestUintAdd => a.checked_add(b),
-                            ScalarFunc::TestUintSub => a.checked_sub(b),
-                            ScalarFunc::TestUintMul => a.checked_mul(b),
-                            ScalarFunc::TestUintDiv => {
-                                if b == 0 {
-                                    None
-                                } else {
-                                    Some(a / b)
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-                        match r {
-                            Some(v) => Value::build_text(v.to_string()),
-                            None => {
-                                return Err(LimboError::InternalError(
-                                    "test_uint arithmetic overflow/underflow".to_string(),
-                                )
-                                .into());
-                            }
-                        }
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TestUintLt | ScalarFunc::TestUintEq => {
-                check_arg_count!(arg_count, 2);
-                let a = parse_test_uint(&state.registers[*start_reg])?;
-                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
-                let result = match (a, b) {
-                    (Some(a), Some(b)) => {
-                        let cmp = match scalar_func {
-                            ScalarFunc::TestUintLt => a < b,
-                            ScalarFunc::TestUintEq => a == b,
-                            _ => unreachable!(),
-                        };
-                        Value::from_i64(if cmp { 1 } else { 0 })
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
             ScalarFunc::StringReverse => {
                 check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
@@ -11514,14 +11304,16 @@ pub fn op_function(
                 let val = &state.registers[*start_reg];
                 let precision_reg = &state.registers[*start_reg + 1];
                 let scale_reg = &state.registers[*start_reg + 2];
+                // COERCE runs on the value ENCODE stored, so the value is a
+                // stored numeric.
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
-                    other => {
+                    Value::Blob(stored) => {
                         use crate::numeric::decimal::{
-                            bigdecimal_to_blob, validate_precision_scale,
+                            bigdecimal_to_blob, blob_to_bigdecimal, validate_precision_scale,
                         };
 
-                        let bd = numeric_from_value(other)?;
+                        let bd = blob_to_bigdecimal(stored)?;
                         let (
                             Value::Numeric(Numeric::Integer(precision)),
                             Value::Numeric(Numeric::Integer(scale)),
@@ -11534,6 +11326,13 @@ pub fn op_function(
                         };
                         let fitted = validate_precision_scale(&bd, *precision, *scale)?;
                         Value::from_blob(bigdecimal_to_blob(&fitted))
+                    }
+                    other => {
+                        return Err(LimboError::InternalError(format!(
+                            "numeric_fit expects a stored numeric, got {}",
+                            other.value_type()
+                        ))
+                        .into());
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -11569,10 +11368,19 @@ pub fn op_function(
                     _ => {
                         let a = numeric_from_value(&lhs_val)?;
                         let b = numeric_from_value(&rhs_val)?;
+                        // The result keeps every decimal of its operands, as in
+                        // PostgreSQL: 1.00 * 3 is 3.00 and 0.00 + 3 is 3.00. A
+                        // product may have more decimals than a numeric can hold,
+                        // so PostgreSQL rounds it to the most a numeric can hold.
+                        let (a_scale, b_scale) =
+                            (a.fractional_digit_count(), b.fractional_digit_count());
                         let res = match scalar_func {
-                            ScalarFunc::NumericAdd => a + b,
-                            ScalarFunc::NumericSub => a - b,
-                            ScalarFunc::NumericMul => a * b,
+                            ScalarFunc::NumericAdd => (a + b).with_scale(a_scale.max(b_scale)),
+                            ScalarFunc::NumericSub => (a - b).with_scale(a_scale.max(b_scale)),
+                            ScalarFunc::NumericMul => (a * b).with_scale_round(
+                                (a_scale + b_scale).min(MAX_FRACTION_DIGITS),
+                                bigdecimal::RoundingMode::HalfUp,
+                            ),
                             ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
                                 use bigdecimal::Zero;
                                 if b.is_zero() {
@@ -11584,35 +11392,31 @@ pub fn op_function(
                                 if matches!(scalar_func, ScalarFunc::NumericDiv) {
                                     a / b
                                 } else {
-                                    a % b
+                                    // The remainder has the dividend's sign.
+                                    (a % b).with_scale(a_scale.max(b_scale))
                                 }
                             }
                             _ => unreachable!(),
                         };
+                        crate::numeric::decimal::check_numeric_limits(&res)?;
                         Value::build_text(crate::numeric::decimal::format_numeric(&res))
                     }
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
-                check_arg_count!(arg_count, 2);
-                let lhs_val = state.registers[*start_reg].get_value().clone();
-                let rhs_val = state.registers[*start_reg + 1].get_value().clone();
-                match (&lhs_val, &rhs_val) {
-                    (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
-                    _ => {
-                        let a = numeric_from_value(&lhs_val)?;
-                        let b = numeric_from_value(&rhs_val)?;
-                        let cmp_result = match scalar_func {
-                            ScalarFunc::NumericLt => a < b,
-                            ScalarFunc::NumericEq => a == b,
-                            _ => unreachable!(),
-                        };
-                        state.registers[*dest].set_int(cmp_result as i64)
-                    }
+            ScalarFunc::NumericNeg => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value().clone();
+                let result = match val {
+                    Value::Null => Value::Null,
+                    // Negating keeps the decimal places: -(1.50) is -1.50.
+                    _ => Value::build_text(crate::numeric::decimal::format_numeric(
+                        &-numeric_from_value(&val)?,
+                    )),
                 };
+                state.registers[*dest].set_value(result);
             }
-            ScalarFunc::DatePlus | ScalarFunc::DateMinus => {
+            ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => {
                 check_arg_count!(arg_count, 2);
                 let lhs = state.registers[*start_reg].get_value();
                 let rhs = state.registers[*start_reg + 1].get_value();
@@ -11620,6 +11424,7 @@ pub fn op_function(
                 let result = match scalar_func {
                     ScalarFunc::DatePlus => exec_date_plus(&clock, lhs, rhs)?,
                     ScalarFunc::DateMinus => exec_date_minus(&clock, lhs, rhs)?,
+                    ScalarFunc::DateDiff => exec_date_diff(&clock, lhs, rhs)?,
                     _ => unreachable!(),
                 };
                 state.registers[*dest].set_value(result);
@@ -16156,8 +15961,10 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
-                let populate_result = schema.populate_materialized_views_then_indices(
+                // The schema already holds every stored type.
+                let populate_result = schema.populate_types_views_then_indices(
                     &syms,
+                    &[],
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,
@@ -17807,6 +17614,7 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
+                normalized_to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
@@ -17882,7 +17690,9 @@ pub fn op_rename_table(
             if let Some(mut backing_arc) = schema.take_table(NamespaceId::ROOT, &old_backing_table)
             {
                 if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
-                    Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
+                    let btree = Arc::make_mut(btree_arc);
+                    btree.name.clone_from(&new_backing_table);
+                    btree.declared_name.clone_from(&new_backing_table);
                 }
                 schema.insert_table(NamespaceId::ROOT, new_backing_table, backing_arc);
             }
@@ -19746,31 +19556,6 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     false
 }
 
-fn parse_test_uint(reg: &Register) -> Result<Option<u64>> {
-    match reg.get_value() {
-        Value::Null => Ok(None),
-        Value::Numeric(Numeric::Integer(i)) => {
-            if *i < 0 {
-                Err(LimboError::InternalError(
-                    "test_uint: negative value".to_string(),
-                ))
-            } else {
-                Ok(Some(*i as u64))
-            }
-        }
-        Value::Text(t) => {
-            let s = t.to_string();
-            let v = s
-                .parse::<u64>()
-                .map_err(|_| LimboError::InternalError(format!("test_uint: invalid uint: {s}")))?;
-            Ok(Some(v))
-        }
-        _ => Err(LimboError::InternalError(
-            "test_uint: unsupported type".to_string(),
-        )),
-    }
-}
-
 // Compat for applications that test for SQLite.
 fn execute_sqlite_version() -> String {
     crate::dialect::sqlite::SQLITE_VERSION.to_string()
@@ -20954,7 +20739,7 @@ mod tests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![CollationSeq::BINARY],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             ..Default::default()
@@ -21613,8 +21398,7 @@ mod tests {
             &Value::Null,
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5)); // unchanged
@@ -21628,8 +21412,7 @@ mod tests {
             &Value::from_i64(42),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(6));
@@ -21649,8 +21432,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10));
@@ -21660,8 +21442,7 @@ mod tests {
             &Value::from_i64(5),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(15));
@@ -21681,8 +21462,7 @@ mod tests {
             &Value::Null,
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10)); // unchanged
@@ -21697,8 +21477,7 @@ mod tests {
             &Value::from_i64(5),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5));
@@ -21709,8 +21488,7 @@ mod tests {
             &Value::from_i64(3),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21721,8 +21499,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21741,8 +21518,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(10.0));
@@ -21753,8 +21529,7 @@ mod tests {
             &Value::from_i64(20),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(30.0));
@@ -21805,8 +21580,7 @@ mod tests {
             &Value::from_i64(9007199254740994),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         update_agg_payload(
@@ -21814,8 +21588,7 @@ mod tests {
             &Value::from_i64(-9007199254740993),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
 

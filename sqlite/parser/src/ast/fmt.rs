@@ -935,7 +935,7 @@ impl ToTokens for Expr {
                 op.to_tokens(s, context)?;
                 rhs.to_tokens(s, context)
             }
-            Self::Register(reg) => {
+            Self::Register { register: reg, .. } => {
                 // This is for internal use only, not part of SQL syntax
                 // Use a special notation that won't conflict with SQL
                 s.append(TK_VARIABLE, Some(&format!("$r{reg}")))

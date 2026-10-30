@@ -1,6 +1,6 @@
 ---
 title: CREATE TYPE
-description: Define a custom type with encoding, decoding, validation, operators, and defaults for use in STRICT tables
+description: Define a custom type with encoding, decoding, validation, and defaults for use in STRICT tables
 sidebarTitle: CREATE TYPE
 ---
 
@@ -20,7 +20,7 @@ CREATE TYPE [IF NOT EXISTS] type-name [(parameters)]
     [ENCODE encode-expr]
     [COERCE coerce-expr]
     [DECODE decode-expr]
-    [OPERATOR 'op' [function-name] ...]
+    [OPERATOR '<']
     [DEFAULT default-expr];
 ```
 
@@ -104,8 +104,7 @@ The first parameter is always the input `value`. Additional parameters are the a
 The COERCE expression fits an already encoded value to what the column may store, such as the maximum length of a `varchar(100)`, the scale of a `numeric(10,2)` or the range of a `smallint`. `value` is the output of ENCODE, and each parameter is the column's argument for it. COERCE may only round, pad, cut or reject the value (with RAISE), so the result stays the same value in the type's order: a COERCE like `value * f` would make stored values disagree with values that were only encoded, such as index lookup keys. Put limit checks in COERCE, not ENCODE: ENCODE also runs on values that are only compared, so a range check there would make `smallint_col < 100000` fail.
 
 - **When it runs**: on INSERT, UPDATE, and column defaults, after ENCODE, and on `CAST(x AS t(args))`. For a type without parameters it also runs on `CAST(x AS t)`. `CAST(x AS t)` on a type with parameters is SQLite's CAST, so `CAST(x AS NUMERIC)` keeps its SQLite meaning.
-- **When it does not run**: on a column of a type with parameters declared without arguments (`name varchar`), and on NULL values.
-- Index lookups also run ENCODE and COERCE on the key, as do constants passed to a type's operator. For a `numeric(10,2)` column holding `3.50`, `n = 3.504` is true, because `3.504` is rounded to `3.50` first.
+- **When it does not run**: on a column of a type with parameters declared without arguments (`name varchar`), on NULL values, and on constants compared with a column. For a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false, because `3.504` is encoded but not rounded. An index lookup uses the same rule, so it finds the same rows as a table scan.
 - **DECODE** never sees the parameters.
 
 ```sql
@@ -113,8 +112,7 @@ CREATE TYPE capped(value integer, maxval integer) BASE integer
     COERCE CASE
         WHEN value <= maxval THEN value
         ELSE RAISE(ABORT, 'value above maximum for capped')
-    END
-    OPERATOR '<';
+    END;
 
 CREATE TABLE t(x capped(10)) STRICT;
 INSERT INTO t VALUES (11);
@@ -125,48 +123,46 @@ SELECT CAST(11 AS capped(10));  -- Runtime error: value above maximum for capped
 
 The built-in `numeric` type uses both clauses: `ENCODE numeric_encode(value)` turns the input into a decimal, and `COERCE numeric_fit(value, precision, scale)` rounds it to `scale` decimal places and rejects it if it has more than `precision` digits.
 
-### OPERATOR
+### Sorting and comparing
 
-The OPERATOR clause maps SQL operators to functions. This allows columns of a custom type to participate in comparisons, arithmetic, and ordering.
-
-```sql
-OPERATOR 'op' function-name
-```
-
-| Component | Description |
-|-----------|-------------|
-| `'op'` | The operator symbol as a string literal: `'+'`, `'-'`, `'*'`, `'/'`, `'<'`, `'='`, etc. |
-| `function-name` | The name of a SQL function to call when this operator is used. Omit to use the base type's native comparison. |
-
-When an operator is defined, expressions like `column + 1` are rewritten into `function_name(column, 1)`.
-
-#### Ordering with OPERATOR '<'
-
-The `<` operator is special: it controls how values of this type are sorted in ORDER BY, MIN, MAX, and CREATE INDEX.
-
-- **`OPERATOR '<'`** (no function name): Uses the base type's native comparison for ordering. This is sufficient for types where the encoded form sorts correctly (e.g., text dates in ISO 8601 format).
-- **`OPERATOR '<' my_compare`**: Uses `my_compare(a, b)` as a custom comparator. The function must return a negative integer if `a < b`, zero if `a = b`, and a positive integer if `a > b`.
-- **No `<` operator**: The type cannot be used in ORDER BY or CREATE INDEX.
+ORDER BY and indexes sort a custom type by its stored value, using SQLite's comparison for the base type. Comparison operators, MIN and MAX use the value DECODE returns. The two orders agree only when ENCODE keeps the order of its input, so a type with a DECODE must declare `OPERATOR '<'` to say that it does. Without it, ORDER BY and CREATE INDEX on a column of the type fail with `type does not declare OPERATOR '<'`. When ENCODE does not keep the order, ORDER BY follows the stored form:
 
 ```sql
--- Use base type comparison for ordering
-CREATE TYPE cents BASE integer
-    ENCODE value * 100
-    DECODE value / 100
+CREATE TYPE reversed_text BASE text
+    ENCODE turso_reverse(value)
+    DECODE turso_reverse(value)
     OPERATOR '<';
-
--- Full operator set for a numeric type
-CREATE TYPE uint BASE integer
-    ENCODE CASE WHEN value >= 0 THEN value ELSE RAISE(ABORT, 'uint must be non-negative') END
-    DECODE value
-    OPERATOR '+' uint_add
-    OPERATOR '-' uint_sub
-    OPERATOR '*' uint_mul
-    OPERATOR '<'
-    OPERATOR '=';
+CREATE TABLE t(w reversed_text) STRICT;
+INSERT INTO t VALUES ('apple'), ('banana'), ('cherry');
+SELECT w FROM t ORDER BY w;
+-- banana   (stored as 'ananab')
+-- apple    (stored as 'elppa')
+-- cherry   (stored as 'yrrehc')
 ```
 
-The `=` operator, when defined, is also used to derive `!=`. The `<` operator is used to derive `>`, `>=`, and `<=` automatically by swapping arguments or negating the result.
+The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and comparing two types with different orders fails with `cannot compare type x with type y`.
+
+### Arithmetic
+
+A user-defined type has no arithmetic operators. `+`, `-`, `*`, `/`, `%`, `&`, `|`, `<<`, `>>`, unary `-` and `~` on a value of the type fail with `operator does not exist`:
+
+```sql
+CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+CREATE TABLE t(c cents) STRICT;
+SELECT c + 1 FROM t;
+-- Parse error: operator does not exist: cents + integer
+```
+
+The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic operators. The operator is chosen once, when the statement is compiled:
+
+- If either operand has a custom type and no operator of the type fits, the statement fails with `operator does not exist`. Turso does not fall back to SQLite's operator.
+- If neither operand has a custom type, or one is the literal `NULL`, SQLite's operator runs.
+- A domain uses the operators of its base type.
+- A column of a subquery, view or CTE has the type of the value it selects. In `SELECT x + 1 FROM (SELECT d AS x FROM t)`, `x` is a date, and `x * 2` fails with `operator does not exist: date * integer`.
+
+### OPERATOR '<'
+
+`OPERATOR '<'`, with no function, says that the type can be sorted by its stored value (see [Sorting and comparing](#sorting-and-comparing)). It takes no function: `OPERATOR '<' f` fails with `OPERATOR '<' takes no function: a type that declares it sorts by its stored value`. It is the only OPERATOR clause CREATE TYPE accepts: `OPERATOR '+' f` fails with `CREATE TYPE does not accept OPERATOR '+': only OPERATOR '<' is supported`, and so do the other operators.
 
 ### DEFAULT
 
@@ -287,11 +283,11 @@ Turso provides the following built-in custom types in STRICT tables:
 | `smallint` | integer | -- | Integer constrained to -32768 through 32767. Aliases: `int2`. |
 | `bigint` | integer | -- | Integer (no range constraint). Aliases: `int8`. |
 | `varchar(N)` | text | `maxlen` | Text with a maximum length of N characters. |
-| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. Supports `+` and `-` with whole-day integers. |
+| `date` | text | -- | ISO 8601 date (YYYY-MM-DD), validated on insert. `date + n`, `n + date` and `date - n` add or subtract whole days and give a date; `date - date` gives the number of days between them. In `date - x`, a value `x` of unknown type, such as a parameter, is taken as a number of days, and anything other than an integer fails when the statement runs. `x - date` fails with `operator does not exist`; cast `x` to `date` first. |
 | `time` | text | -- | ISO 8601 time (HH:MM:SS), validated on insert. |
 | `timestamp` | text | -- | ISO 8601 datetime, validated on insert. |
 | `timestamptz` | text | -- | ISO 8601 datetime with the same validation and normalization as `timestamp`. PostgreSQL-compatible name; the stored text carries no offset. |
-| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. Supports `+`, `-`, `*`, `/`, `%` and unary `-`. As in PostgreSQL, a value may have at most 131072 digits before the decimal point and 16383 after; text such as `'1e100000000'` is an error (`value overflows numeric format`) when it is stored. |
+| `numeric(P,S)` | blob | `precision`, `scale` | Fixed-point decimal with P total digits and S decimal places. `+ - * / %` with another numeric, an integer (also a `smallint` or `bigint`) or a decimal number written in the statement compute exactly (`n * 0.005` is not rounded to S places first) and give a numeric. A decimal number stays exact inside a subquery, CTE, `coalesce`, `abs` or CASE: `n + (SELECT 0.2)` is a numeric. Arithmetic on two plain values, such as `0.1 + 0.2`, is a REAL, as SQLite computes it. With a REAL value (a REAL column, a CAST to REAL), `+ - * /` give a REAL, as PostgreSQL gives double precision, and `%` is an error. A blob is not a number, so `n + x'01'` is an error. A product keeps the decimal places of both operands and a sum or difference those of the operand with more, as in PostgreSQL (`1.00 * 3` is `3.00`); a product with more than 16383 decimal places is rounded to 16383. A remainder has the sign of the dividend (`-7.5 % 2` is `-1.5`). `-n` is a numeric with the same decimal places (`-n` is `-4.50` for `4.50`), and `coalesce(n, 0)` is a numeric. ORDER BY puts values that are not numbers, such as `'x'` from a UNION, after all numbers. As in PostgreSQL, a value may have at most 131072 digits before the decimal point and 16383 after; text such as `'1e100000000'` is an error (`value overflows numeric format`), whether it is stored, compared or used in arithmetic. |
 | `uuid` | blob | -- | UUID stored as 16-byte blob, displayed as string. Default: `uuid4_str()`. |
 | `inet` | text | -- | Validated IP address (IPv4 or IPv6). |
 | `cidr` | text | -- | Network address in CIDR notation. Stored as given; no validation yet. |
@@ -300,6 +296,8 @@ Turso provides the following built-in custom types in STRICT tables:
 | `bytea` | blob | -- | Binary data (PostgreSQL-compatible alias). |
 | `json` | text | -- | Validated JSON text. |
 | `jsonb` | blob | -- | JSON stored in binary format, returned as JSON text on read. |
+
+Other operators on built-in types fail: `d * 2` on a `date` is `operator does not exist: date * integer`, and `-d` is `operator does not exist: - date`. `-n` on a `numeric` negates exactly, and `~`, `&`, `|`, `<<` and `>>` on a `numeric` fail, as in PostgreSQL. `smallint` and `bigint` use SQLite's operators, including `-`, `~`, `&`, `|`, `<<` and `>>`. Unary `+` gives its operand unchanged for every type.
 
 <Info>
 The `uuid`, `json`, and `jsonb` types require their respective extensions to be compiled in. They are available by default in standard Turso builds.
@@ -556,13 +554,12 @@ CREATE TABLE notes (
 
 ### Monetary Values as Cents
 
-Store dollar amounts as integer cents for exact arithmetic, present them as the original value:
+Store dollar amounts as integer cents, and present them as the original value:
 
 ```sql
 CREATE TYPE cents BASE integer
     ENCODE value * 100
-    DECODE value / 100
-    OPERATOR '<';
+    DECODE value / 100;
 
 CREATE TABLE invoices (
     id INTEGER PRIMARY KEY,
@@ -597,9 +594,9 @@ INSERT INTO configs VALUES (2, 'not json');
 -- Error: malformed JSON
 ```
 
-### Unsigned Integer with Operators
+### Unsigned Integer
 
-A non-negative integer type with arithmetic and comparison operators:
+A non-negative integer type. The stored value is the integer itself, so it sorts in the same order and the type can declare `OPERATOR '<'`:
 
 ```sql
 CREATE TYPE uint BASE integer
@@ -608,8 +605,7 @@ CREATE TYPE uint BASE integer
         ELSE RAISE(ABORT, 'uint must be non-negative')
     END
     DECODE value
-    OPERATOR '<'
-    OPERATOR '=';
+    OPERATOR '<';
 
 CREATE TABLE counters (
     id INTEGER PRIMARY KEY,

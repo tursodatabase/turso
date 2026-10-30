@@ -2,7 +2,7 @@
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
     catalog::{CatalogContext, DatabaseScopeContext},
-    collate::CollationSeq,
+    collate::{CollationSeq, TextCollation},
     compound_select::emit_program_for_compound_select,
     emitter::{
         delete::emit_program_for_delete, select::emit_program_for_select,
@@ -31,11 +31,14 @@ use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
     Table, EXPR_INDEX_SENTINEL,
 };
+use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
 use crate::translate::fkeys::FkActionCompileStack;
 use crate::translate::plan::{Aggregate, ColumnMask};
 use crate::vdbe::{
     affinity::Affinity,
-    builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, SelfTableContext},
+    builder::{
+        CursorKey, CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder, SelfTableContext,
+    },
     insn::{to_u32, ConstraintInfo, InsertFlags, Insn},
     BranchOffset, CursorID,
 };
@@ -49,6 +52,7 @@ use crate::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::rc::Rc;
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
@@ -145,10 +149,8 @@ pub struct Resolver<'a> {
     /// operates as a side-channel since limbo rewrites the AST rather than
     /// redirecting column reads at codegen time.
     pub register_columns: HashMap<usize, RegisterColumn>,
-    /// Affinity metadata for planned scalar subqueries keyed by their internal ID.
-    /// This lets comparison affinity follow SQLite rules for expressions like
-    /// `(SELECT text_col FROM ...) > some_numeric_expr`.
-    pub(crate) subquery_affinities: RefCell<HashMap<TableInternalId, Affinity>>,
+    /// Each planned subquery that gives one row, keyed by its internal ID.
+    pub(crate) row_value_subqueries: Rc<RowValueSubqueries>,
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
@@ -177,26 +179,30 @@ pub struct Resolver<'a> {
 }
 
 /// The column a register stands for in [Resolver::register_columns].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RegisterColumn {
     pub affinity: Affinity,
     /// None for the rowid, which has no collation.
-    pub collation: Option<CollationSeq>,
+    pub collation: Option<TextCollation>,
+    /// The column's declared type, such as `integer[]` or `numeric(10, 2)`.
+    pub(crate) column_type: ExprType,
 }
 
 impl RegisterColumn {
-    /// A column of the table being written, with its affinity and collation.
-    pub fn table_column(column: &Column) -> Self {
+    /// A column of the table being written, with its affinity, collation and
+    /// type.
+    pub fn table_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
         Self {
             affinity: column.affinity(),
             collation: crate::translate::collate::column_collation(column),
+            column_type: column_type(column, is_strict, schema),
         }
     }
 
-    /// NEW.x or OLD.x in a trigger. It has the collation of column x but, as
-    /// in SQLite, no affinity unless x is the rowid alias.
+    /// NEW.x or OLD.x in a trigger. It has the collation and type of column x
+    /// but, as in SQLite, no affinity unless x is the rowid alias.
     /// See https://www.sqlite.org/forum/forumpost/819f2d6627
-    pub fn trigger_row_column(column: &Column) -> Self {
+    pub fn trigger_row_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
         Self {
             affinity: if column.is_rowid_alias() {
                 Affinity::Integer
@@ -204,6 +210,7 @@ impl RegisterColumn {
                 Affinity::None
             },
             collation: crate::translate::collate::column_collation(column),
+            column_type: column_type(column, is_strict, schema),
         }
     }
 
@@ -211,7 +218,66 @@ impl RegisterColumn {
         Self {
             affinity: Affinity::Integer,
             collation: None,
+            column_type: ExprType::Builtin(BuiltinType::Integer),
         }
+    }
+}
+
+/// The subqueries that give one row which a resolver has planned. A forked
+/// resolver starts a new, empty layer on top of its parent's layer instead of
+/// copying it: deeply nested subqueries fork thousands of times, and copying
+/// every entry on each fork made planning them quadratic. What a fork adds
+/// stays out of its parent, because a fork can compile a separate program
+/// (a trigger or a foreign key action) whose internal IDs repeat the parent's.
+#[derive(Default)]
+pub(crate) struct RowValueSubqueries {
+    parent: Option<Rc<RowValueSubqueries>>,
+    own: RefCell<HashMap<TableInternalId, Rc<RowValueSubquery>>>,
+}
+
+impl RowValueSubqueries {
+    pub(crate) fn insert(&self, subquery_id: TableInternalId, subquery: RowValueSubquery) {
+        self.own.borrow_mut().insert(subquery_id, Rc::new(subquery));
+    }
+
+    pub(crate) fn get(&self, subquery_id: TableInternalId) -> Option<Rc<RowValueSubquery>> {
+        if let Some(subquery) = self.own.borrow().get(&subquery_id) {
+            return Some(subquery.clone());
+        }
+        self.parent.as_ref()?.get(subquery_id)
+    }
+
+    fn fork(self: &Rc<Self>) -> Rc<Self> {
+        Rc::new(Self {
+            parent: Some(self.clone()),
+            own: RefCell::default(),
+        })
+    }
+}
+
+/// What the outer query knows about the result columns of a subquery that
+/// gives one row, such as `(SELECT e FROM u)` or `(SELECT x, y FROM v)`.
+pub(crate) struct RowValueSubquery {
+    /// The register of the first result column.
+    pub(crate) result_reg_start: usize,
+    pub(crate) columns: Vec<RowValueSubqueryColumn>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RowValueSubqueryColumn {
+    /// Lets comparisons follow SQLite's affinity rules, as in
+    /// `(SELECT text_col FROM ...) > some_numeric_expr`.
+    pub(crate) affinity: Affinity,
+    /// The column's type, which decides custom-type operators: in
+    /// `d - (SELECT e FROM u)` with `e` a date, the result is a number of days.
+    pub(crate) expr_type: ExprType,
+}
+
+impl RowValueSubquery {
+    /// The column whose value is in `result_reg`.
+    pub(crate) fn column(&self, result_reg: usize) -> Option<&RowValueSubqueryColumn> {
+        self.columns
+            .get(result_reg.checked_sub(self.result_reg_start)?)
     }
 }
 
@@ -313,7 +379,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_columns: HashMap::default(),
-            subquery_affinities: RefCell::new(HashMap::default()),
+            row_value_subqueries: Rc::default(),
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml,
@@ -347,7 +413,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: false,
             expr_to_reg_cache: Vec::new(),
             register_columns: HashMap::default(),
-            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
+            row_value_subqueries: self.row_value_subqueries.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
@@ -363,7 +429,7 @@ impl<'a> Resolver<'a> {
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_columns: self.register_columns.clone(),
-            subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
+            row_value_subqueries: self.row_value_subqueries.fork(),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
@@ -384,15 +450,18 @@ impl<'a> Resolver<'a> {
         f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> Result<T>,
     ) -> Result<T> {
         match ctx {
-            Some(ctx) => {
-                let scope = SelfTableScope::new(ctx.clone());
-                let prev = self.self_table_scope.borrow_mut().replace(scope);
-                let result = f(program, Some(ctx));
-                *self.self_table_scope.borrow_mut() = prev;
-                result
-            }
+            Some(ctx) => self.with_self_table(ctx, || f(program, Some(ctx))),
             None => f(program, None),
         }
+    }
+
+    /// Runs `f` with `SELF_TABLE` column references referring to `ctx`.
+    pub(crate) fn with_self_table<T>(&self, ctx: &SelfTableContext, f: impl FnOnce() -> T) -> T {
+        let scope = SelfTableScope::new(ctx.clone());
+        let prev = self.self_table_scope.borrow_mut().replace(scope);
+        let result = f();
+        *self.self_table_scope.borrow_mut() = prev;
+        result
     }
 
     pub(crate) fn with_existing_self_table_context<T>(
@@ -425,17 +494,6 @@ impl<'a> Resolver<'a> {
                 .find_table_by_internal_id(*table_ref_id)?
                 .1
                 .btree(),
-        }
-    }
-
-    pub(crate) fn self_table_with_custom_type_operators(&self) -> Option<Arc<BTreeTable>> {
-        match &self.self_table_scope.borrow().as_ref()?.context {
-            SelfTableContext::ForDML {
-                table,
-                uses_custom_type_operators: true,
-                ..
-            } => Some(Arc::clone(table)),
-            _ => None,
         }
     }
 
@@ -566,7 +624,7 @@ impl<'a> Resolver<'a> {
         });
     }
 
-    pub fn resolve_collation(&self, name: &str) -> Result<CollationSeq> {
+    pub fn resolve_collation(&self, name: &str) -> Result<TextCollation> {
         self.catalog.resolve_collation(name)
     }
 
@@ -1328,7 +1386,7 @@ fn emit_cdc_insns_v1(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
 
     program.emit_insn(Insn::Function {
@@ -1440,7 +1498,7 @@ fn emit_cdc_insns_v2(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1458,7 +1516,7 @@ fn emit_cdc_insns_v2(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1564,7 +1622,7 @@ pub fn emit_cdc_commit_insns(
     let unixepoch_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1580,7 +1638,7 @@ pub fn emit_cdc_commit_insns(
     let conn_txn_id_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1651,7 +1709,7 @@ pub fn emit_cdc_autocommit_commit(
     let is_autocommit_fn_ctx = crate::function::FuncCtx {
         func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
         arg_count: 0,
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     };
     let autocommit_reg = program.alloc_register();
     program.emit_insn(Insn::Function {
@@ -1684,7 +1742,7 @@ pub fn emit_cdc_autocommit_commit(
                 func: crate::function::FuncCtx {
                     func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
                     arg_count: 1,
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                 },
             });
             program.emit_insn(Insn::Eq {
@@ -1692,7 +1750,7 @@ pub fn emit_cdc_autocommit_commit(
                 rhs: minus_one_reg,
                 target_pc: skip_label,
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
             });
             let (cursor_id, _) =
                 prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
@@ -1739,7 +1797,7 @@ pub fn emit_cdc_explicit_commit_insns(
         func: crate::function::FuncCtx {
             func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
             arg_count: 1,
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::BINARY,
         },
     });
 
@@ -1752,7 +1810,7 @@ pub fn emit_cdc_explicit_commit_insns(
         rhs: minus_one_reg,
         target_pc: skip_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
     });
 
     // The CDC record write needs a transaction; joins the open one (keeping its mode) if any.
@@ -1967,7 +2025,7 @@ pub(crate) fn emit_columns_and_dependencies(
         };
         pairs.push((col, reg));
     }
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs.into_iter());
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs.into_iter(), DmlRowForm::Stored);
     if targets
         .iter()
         .all(|&idx| !table.columns()[idx].is_rowid_alias())
@@ -2123,7 +2181,7 @@ fn emit_index_column_value_new_image(
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
         let expr = expr.as_ref().clone();
-        let mut column_regs: Vec<usize> = columns
+        let column_regs: Vec<usize> = columns
             .iter()
             .enumerate()
             .map(|(i, col)| {
@@ -2139,10 +2197,9 @@ fn emit_index_column_value_new_image(
             resolver,
             expr,
             columns,
-            &mut column_regs,
+            &column_regs,
             table,
             dest_reg,
-            idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
         )?;
     } else {
         let col_in_table = columns
@@ -2188,6 +2245,7 @@ fn emit_check_constraint_bytecode(
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
     or_conflict: ResolveType,
+    halt_on_error: Option<ResolveType>,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
     table_name: &str,
@@ -2270,7 +2328,7 @@ fn emit_check_constraint_bytecode(
                     ))),
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
-                    on_error: program.constraint_halt_on_error(or_conflict),
+                    on_error: halt_on_error,
                     description_reg: None,
                 });
             }
@@ -2293,6 +2351,7 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
 /// Takes column-to-register mappings as an iterator to avoid heap allocation.
+/// `halt_on_error` is the resolve type carried by the Halt of a failed CHECK.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
@@ -2303,6 +2362,7 @@ pub(crate) fn emit_check_constraints<'a>(
     column_mappings: impl Iterator<Item = (&'a str, usize)>,
     connection: &Arc<Connection>,
     or_conflict: ResolveType,
+    halt_on_error: Option<ResolveType>,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
 ) -> Result<()> {
@@ -2375,6 +2435,7 @@ pub(crate) fn emit_check_constraints<'a>(
         check_constraints,
         resolver,
         or_conflict,
+        halt_on_error,
         skip_row_label,
         referenced_tables,
         table_name,

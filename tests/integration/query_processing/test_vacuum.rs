@@ -209,16 +209,16 @@ fn custom_type_sql_snapshot(conn: &Arc<Connection>) -> Vec<(String, String)> {
 
 fn create_custom_type_ordering_fixture(conn: &Arc<Connection>) -> anyhow::Result<()> {
     conn.execute(
-        "CREATE TYPE rev_cmp \
+        "CREATE TYPE rev \
          BASE text \
          ENCODE string_reverse(value) \
          DECODE string_reverse(value) \
-         OPERATOR '<' string_reverse",
+         OPERATOR '<'",
     )?;
     conn.execute(
         "CREATE TABLE words(
             id INTEGER PRIMARY KEY,
-            word rev_cmp NOT NULL DEFAULT 'banana'
+            word rev NOT NULL DEFAULT 'banana'
         ) STRICT",
     )?;
     conn.execute("CREATE INDEX words_word_idx ON words(word)")?;
@@ -241,18 +241,19 @@ fn assert_custom_type_ordering_fixture(conn: &Arc<Connection>) {
         ],
     );
 
+    // The index sorts the stored (reversed) text: ananab < elppa < yrrehc.
     let ordered: Vec<(i64, String)> = conn.exec_rows(
         "SELECT id, word FROM words INDEXED BY words_word_idx ORDER BY word ASC, id ASC",
     );
     assert_eq!(
         ordered,
         vec![
-            (2, "apple".to_string()),
             (3, "banana".to_string()),
             (4, "banana".to_string()),
+            (2, "apple".to_string()),
             (1, "cherry".to_string()),
         ],
-        "custom comparator order should survive when scanning the custom-type index",
+        "the stored-value order should survive when scanning the custom-type index",
     );
 
     let desc: Vec<(i64, String)> = conn.exec_rows(
@@ -262,11 +263,11 @@ fn assert_custom_type_ordering_fixture(conn: &Arc<Connection>) {
         desc,
         vec![
             (1, "cherry".to_string()),
+            (2, "apple".to_string()),
             (4, "banana".to_string()),
             (3, "banana".to_string()),
-            (2, "apple".to_string()),
         ],
-        "descending scans over the custom-type index should preserve comparator semantics",
+        "descending scans over the custom-type index should use the stored-value order",
     );
 }
 
@@ -274,7 +275,7 @@ fn assert_custom_type_reusable_for_new_schema(conn: &Arc<Connection>) -> anyhow:
     conn.execute(
         "CREATE TABLE extra_words(
             id INTEGER PRIMARY KEY,
-            word rev_cmp NOT NULL DEFAULT 'kiwi'
+            word rev NOT NULL DEFAULT 'kiwi'
         ) STRICT",
     )?;
     conn.execute("CREATE INDEX extra_words_word_idx ON extra_words(word)")?;
@@ -282,15 +283,16 @@ fn assert_custom_type_reusable_for_new_schema(conn: &Arc<Connection>) -> anyhow:
     conn.execute("INSERT INTO extra_words(id, word) VALUES (2, 'apricot')")?;
     conn.execute("INSERT INTO extra_words(id, word) VALUES (3, 'pear')")?;
 
+    // Stored (reversed) text: iwik < raep < tocirpa.
     let rows: Vec<(i64, String)> = conn.exec_rows(
         "SELECT id, word FROM extra_words INDEXED BY extra_words_word_idx ORDER BY word ASC, id ASC",
     );
     assert_eq!(
         rows,
         vec![
-            (2, "apricot".to_string()),
             (1, "kiwi".to_string()),
             (3, "pear".to_string()),
+            (2, "apricot".to_string()),
         ],
         "the preserved custom type should remain usable in new tables and indexes after VACUUM",
     );
@@ -3955,8 +3957,8 @@ fn test_vacuum_into_preserves_custom_types() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// VACUUM INTO must preserve custom types that carry non-monotonic encoders,
-/// custom comparators, and indexes. The copied destination must still order
+/// VACUUM INTO must preserve custom types that carry non-monotonic encoders
+/// and indexes on them. The copied destination must still order
 /// through the preserved index and remain usable for new schema objects that
 /// reference the copied type.
 #[test]
@@ -4368,7 +4370,7 @@ fn test_plain_vacuum_preserves_array_values() -> anyhow::Result<()> {
 }
 
 /// Plain VACUUM reparses the live schema on the same connection. Custom types
-/// that rely on a comparator-backed index must still order correctly after the
+/// with an index on a non-monotonic encoding must still order correctly after the
 /// rewrite, and the same connection must remain able to use that type in new
 /// DDL immediately afterward.
 #[test]
@@ -4784,6 +4786,39 @@ fn test_plain_vacuum_preserves_indexes(tmp_db: TempDatabase) -> anyhow::Result<(
         conn.exec_rows("SELECT a, b FROM t1 INDEXED BY idx_t1_b WHERE b = 'gamma'");
     assert_eq!(rows, vec![(3, "gamma".to_string())]);
 
+    Ok(())
+}
+
+/// Earlier Turso versions accepted `CREATE INDEX i ON t(t.a + 1)`, which new
+/// `CREATE INDEX` statements reject. VACUUM replays the stored index SQL, so it
+/// must still copy such an index.
+#[test]
+fn test_vacuum_keeps_index_with_qualified_column() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("qualified-index.db");
+    let sqlite_conn = SqliteConnection::open(&db_path)?;
+    sqlite_conn.execute_batch(
+        "CREATE TABLE t(a, b);
+         CREATE INDEX i ON t(a + 1);
+         INSERT INTO t VALUES (1, 2), (5, 6);
+         PRAGMA writable_schema = ON;
+         UPDATE sqlite_schema SET sql = 'CREATE INDEX i ON t(t.a + 1)' WHERE name = 'i';",
+    )?;
+    drop(sqlite_conn);
+    let tmp_db = TempDatabase::new_with_existent(&db_path);
+    let conn = tmp_db.connect_limbo();
+
+    let dest_path = temp_dir.path().join("qualified-index-dest.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+    conn.execute("VACUUM")?;
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    for conn in [&conn, &dest_conn] {
+        assert_eq!(run_integrity_check(conn), "ok");
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT b FROM t INDEXED BY i WHERE a + 1 = 6");
+        assert_eq!(rows, vec![(6,)]);
+    }
     Ok(())
 }
 
@@ -5222,7 +5257,7 @@ fn test_plain_vacuum_rejects_active_statement(tmp_db: TempDatabase) -> anyhow::R
     let err = conn.execute("VACUUM").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Transaction error: cannot VACUUM - SQL statements in progress",
+        "cannot VACUUM - SQL statements in progress",
         "unexpected error: {err}"
     );
 
@@ -6281,7 +6316,7 @@ fn test_mvcc_plain_vacuum_requires_checkpointed_image() -> anyhow::Result<()> {
     let err = conn.execute("VACUUM").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Transaction error: cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first",
+        "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first",
         "MVCC VACUUM must reject uncheckpointed logical changes"
     );
 

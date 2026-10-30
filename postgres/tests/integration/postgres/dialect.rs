@@ -42,10 +42,9 @@ fn test_postgres_access_share_lock_is_noop(db: TempDatabase) {
     let mut lock = conn
         .prepare("LOCK TABLE public.lock_items, ONLY public.lock_other IN ACCESS SHARE MODE")
         .unwrap();
-    conn.execute("BEGIN").unwrap();
-    assert!(lock.run_collect_rows().unwrap().is_empty());
-    drop(lock);
-    assert!(!conn.inner().get_auto_commit());
+    // Lock modes other than ACCESS SHARE are rejected. Check them in
+    // autocommit: inside a transaction block the rejection would abort the
+    // block, as any error does in PostgreSQL.
     for sql in [
         "LOCK TABLE lock_items IN ROW EXCLUSIVE MODE",
         "LOCK TABLE lock_items IN EXCLUSIVE MODE",
@@ -53,8 +52,12 @@ fn test_postgres_access_share_lock_is_noop(db: TempDatabase) {
         "LOCK TABLE lock_items",
     ] {
         assert!(conn.prepare(sql).is_err(), "{sql}");
-        assert!(!conn.inner().get_auto_commit());
+        assert!(conn.inner().get_auto_commit());
     }
+    conn.execute("BEGIN").unwrap();
+    assert!(lock.run_collect_rows().unwrap().is_empty());
+    drop(lock);
+    assert!(!conn.inner().get_auto_commit());
     writer
         .execute("INSERT INTO lock_items VALUES (29)")
         .unwrap();

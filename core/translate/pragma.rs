@@ -362,10 +362,8 @@ fn update_pragma(
     match pragma {
         PragmaName::ApplicationId => {
             let data = parse_signed_number(&value)?;
-            let app_id_value = match data {
-                Value::Numeric(Numeric::Integer(i)) => i as i32,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
-                _ => bail_parse_error!("expected integer, got {:?}", data),
+            let Some(app_id_value) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("expected integer, got {:?}", data);
             };
 
             program.emit_insn(Insn::SetCookie {
@@ -378,22 +376,29 @@ fn update_pragma(
         }
         PragmaName::BusyTimeout => {
             let data = parse_signed_number(&value)?;
-            let busy_timeout_ms = match data {
-                Value::Numeric(Numeric::Integer(i)) => i as i32,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
-                _ => bail_parse_error!("expected integer, got {:?}", data),
+            let Some(busy_timeout_ms) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("expected integer, got {:?}", data);
             };
             let busy_timeout_ms = busy_timeout_ms.max(0);
             connection.set_busy_timeout(std::time::Duration::from_millis(busy_timeout_ms as u64));
-            Ok(TransactionMode::None)
+            // Like SQLite, the setter also returns the new busy timeout.
+            query_pragma(
+                PragmaName::BusyTimeout,
+                resolver,
+                None,
+                pager,
+                connection,
+                namespace,
+                schema_was_explicit,
+                program,
+            )
         }
         PragmaName::CacheSize => {
-            let cache_size = match parse_signed_number(&value)? {
-                Value::Numeric(Numeric::Integer(size)) => size,
-                Value::Numeric(Numeric::Float(size)) => f64::from(size) as i64,
-                _ => bail_parse_error!("Invalid value for cache size pragma"),
+            let data = parse_signed_number(&value)?;
+            let Some(cache_size) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("Invalid value for cache size pragma");
             };
-            update_cache_size(cache_size, pager, connection)?;
+            update_cache_size(i64::from(cache_size), pager, connection)?;
             Ok(TransactionMode::None)
         }
         PragmaName::CacheSpill => {
@@ -463,15 +468,10 @@ fn update_pragma(
         }
         PragmaName::WalAutocheckpoint => {
             let data = parse_signed_number(&value)?;
-            let frames = match data {
-                Value::Numeric(Numeric::Integer(i)) => i,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i64,
-                _ => bail_parse_error!("expected integer, got {:?}", data),
+            let Some(frames) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("expected integer, got {:?}", data);
             };
-            let frames = i32::try_from(frames)
-                .ok()
-                .and_then(|frames| u32::try_from(frames).ok())
-                .unwrap_or(0);
+            let frames = u32::try_from(frames).unwrap_or(0);
             connection.set_wal_autocheckpoint(frames);
             query_pragma(
                 PragmaName::WalAutocheckpoint,
@@ -525,10 +525,8 @@ fn update_pragma(
         }
         PragmaName::UserVersion => {
             let data = parse_signed_number(&value)?;
-            let version_value = match data {
-                Value::Numeric(Numeric::Integer(i)) => i as i32,
-                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
-                _ => unreachable!(),
+            let Some(version_value) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("expected integer, got {:?}", data);
             };
 
             program.emit_insn(Insn::SetCookie {
@@ -558,24 +556,11 @@ fn update_pragma(
             unreachable!();
         }
         PragmaName::PageSize => {
-            let page_size = match parse_signed_number(&value)? {
-                Value::Numeric(Numeric::Integer(size)) => size,
-                // SQLite's sqlite3Atoi reads only the leading digits of the literal,
-                // so 1024.5 is 1024 but 8.192e3 is 8. Negative sizes are invalid anyway.
-                Value::Numeric(Numeric::Float(size)) if f64::from(size) >= 0.0 => {
-                    let literal = match &value {
-                        Expr::Unary(_, inner) => inner.as_ref(),
-                        literal => literal,
-                    };
-                    let Expr::Literal(Literal::Numeric(digits)) = literal else {
-                        unreachable!("parse_signed_number only reads numeric literals");
-                    };
-                    crate::numeric::str_to_i64(digits).unwrap_or(0)
-                }
-                Value::Numeric(Numeric::Float(_)) => 0,
-                _ => bail_parse_error!("Invalid value for page size pragma"),
+            let data = parse_signed_number(&value)?;
+            let Some(page_size) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("Invalid value for page size pragma");
             };
-            // Like SQLite's sqlite3Atoi, a value outside the 32-bit range reads as 0.
+            // A negative size is invalid, so it reads as 0 like an out-of-range one.
             update_page_size(
                 connection,
                 database_id,
@@ -2057,6 +2042,34 @@ fn emit_columns_for_table_info(
 
         program.emit_result_row(base_reg, 6 + if extended { 1 } else { 0 });
     }
+}
+
+/// Reads the value of an integer PRAGMA the way SQLite's `sqlite3Atoi` does:
+/// only the leading digits of a float literal count, so `8.192e3` is 8, and a
+/// value outside the 32-bit range reads as 0. Returns `None` for a value that
+/// is not a number.
+fn pragma_int_value(expr: &ast::Expr, data: &Value) -> Option<i32> {
+    let value = match data {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        Value::Numeric(Numeric::Float(_)) => {
+            let (negative, literal) = match expr {
+                Expr::Unary(ast::UnaryOperator::Negative, inner) => (true, inner.as_ref()),
+                Expr::Unary(_, inner) => (false, inner.as_ref()),
+                literal => (false, literal),
+            };
+            let Expr::Literal(Literal::Numeric(digits)) = literal else {
+                return None;
+            };
+            let leading = crate::numeric::str_to_i64(digits).unwrap_or(0);
+            if negative {
+                leading.checked_neg().unwrap_or(0)
+            } else {
+                leading
+            }
+        }
+        _ => return None,
+    };
+    Some(i32::try_from(value).unwrap_or(0))
 }
 
 fn update_cache_size(

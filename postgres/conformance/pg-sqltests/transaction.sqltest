@@ -1,4 +1,9 @@
 # Transaction control through the PostgreSQL frontend.
+#
+# Aborted-transaction (25P02) behavior lives in Rust tests
+# (postgres/frontend/tests/embedded_errors.rs): a test here ends at its first
+# error, so a flow that continues past the triggering error — error → 25P02 →
+# ROLLBACK recovers — cannot be expressed in this file yet.
 
 @database :memory:
 

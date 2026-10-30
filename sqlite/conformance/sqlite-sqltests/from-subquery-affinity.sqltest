@@ -142,3 +142,14 @@ test derived-table-compound-select-real-blob-leading-arm-not-skipped {
 }
 expect {
 }
+
+# Each level refers to the inner column four times. Working out a column's
+# type must not walk the inner subqueries again for each reference, or
+# preparing this query takes 4^16 steps.
+@skip-if sqlite "SQLite flattens these subqueries into one expression with 4^16 terms"
+test deeply-nested-subquery-with-repeated-column-references {
+    SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT x+x+x+x AS x FROM (SELECT 1 AS x))))))))))))))));
+}
+expect {
+    4294967296
+}

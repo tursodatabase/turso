@@ -1,5 +1,19 @@
 @database :memory:
 
+test analyze-replaces-legacy-mixed-case-table-statistics {
+    CREATE TABLE "MyT"(a);
+    CREATE INDEX i ON MyT(a);
+    INSERT INTO MyT VALUES(1),(2);
+    ANALYZE;
+    UPDATE sqlite_stat1 SET tbl = 'myt';
+    INSERT INTO MyT VALUES(3);
+    ANALYZE;
+    SELECT * FROM sqlite_stat1;
+}
+expect {
+    myt|i|3 1
+}
+
 # Things that do work:
 test empty-table {
     CREATE TABLE tbl (a integer);

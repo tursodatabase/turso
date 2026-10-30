@@ -7420,6 +7420,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(tx.value().release_named_savepoint(name))
     }
 
+    /// Number of distinct rows in the transaction's write set, or None when
+    /// the transaction no longer exists. Only the owning connection writes
+    /// the set, so comparing two reads from that connection is race-free.
+    pub fn tx_write_set_len(&self, tx_id: TxID) -> Option<usize> {
+        Some(self.txs.get(&tx_id)?.value().write_set.lock().len())
+    }
+
     /// Rolls back a savepoint within a transaction.
     /// Returns true if a savepoint was rolled back, false if no savepoint was active.
     pub fn rollback_first_savepoint(&self, tx_id: u64) -> Result<bool> {
@@ -9518,8 +9525,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection.dialect().as_ref(),
             )?;
         }
-        fresh.populate_materialized_views_then_indices(
+        fresh.populate_types_views_then_indices(
             &syms,
+            &[],
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
@@ -10455,8 +10463,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 connection.dialect().as_ref(),
             )?;
         }
-        fresh.populate_materialized_views_then_indices(
+        fresh.populate_types_views_then_indices(
             &syms,
+            &[],
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,

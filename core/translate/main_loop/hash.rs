@@ -3,6 +3,7 @@ use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
 use crate::translate::expr::{comparison_affinity, maybe_apply_affinity};
+use crate::translate::expr_context::{ExprContext, TableMetadata};
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
@@ -97,8 +98,11 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
         for join_key in &self.hash_join_op.join_keys {
             let build_expr = join_key.get_build_expr(self.predicates);
             let probe_expr = join_key.get_probe_expr(self.predicates);
-            let affinity =
-                comparison_affinity(build_expr, probe_expr, Some(self.table_references), None);
+            let affinity = comparison_affinity(
+                build_expr,
+                probe_expr,
+                &TableMetadata::new(Some(self.table_references)),
+            );
             key_affinities.push(affinity.aff_mask());
         }
 
@@ -120,14 +124,13 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                 comparison_collation(
                     original_lhs,
                     original_rhs,
-                    Some(self.table_references),
-                    &self.t_ctx.resolver,
+                    &ExprContext::new(Some(self.table_references), &self.t_ctx.resolver),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
 
         let use_bloom_filter = self.hash_join_op.use_bloom_filter
-            && collations.iter().all(|c| *c == CollationSeq::Binary);
+            && collations.iter().all(|c| *c == CollationSeq::BINARY);
 
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let (payload_columns, payload_signature_columns, uses_materialized_keys_and_payload) =

@@ -1,8 +1,11 @@
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+
 use bigdecimal::{BigDecimal, Zero};
 use num_bigint::{BigInt, Sign};
 
 use crate::alloc::TursoVecExt;
-use crate::{LimboError, Numeric, Value, ValueBlob};
+use crate::{LimboError, Numeric, Value, ValueBlob, ValueRef};
 
 const NUMERIC_BLOB_VERSION: u8 = 0x01;
 const FLAG_NEGATIVE: u8 = 0x01;
@@ -13,15 +16,20 @@ const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 const MAX_INTEGER_DIGITS: i64 = 131_072;
 pub(crate) const MAX_FRACTION_DIGITS: i64 = 16_383;
 
-/// The numeric value of `val`: an integer, a real, text such as `1.5` or `1e5`,
-/// or a stored numeric blob. Every numeric function reads its arguments with
-/// this, so they all accept the same values within the same limits.
+/// The numeric value of `val`: an integer, a real, or text such as `1.5` or
+/// `1e5`. Every numeric function reads its arguments with this, so they all
+/// accept the same values within the same limits. A blob is not a number, even
+/// one that holds a stored numeric: `n + x` with a blob in `x` is an error.
 pub fn numeric_from_value(val: &Value) -> crate::Result<BigDecimal> {
     let value = match val {
         Value::Numeric(Numeric::Integer(i)) => return Ok(BigDecimal::from(*i)),
         Value::Numeric(Numeric::Float(f)) => parse_numeric(&f.to_string())?,
         Value::Text(t) => parse_numeric(t.as_str())?,
-        Value::Blob(b) => blob_to_bigdecimal(b)?,
+        Value::Blob(_) => {
+            return Err(LimboError::Constraint(
+                "invalid input syntax for type numeric: a blob is not a number".to_string(),
+            ))
+        }
         _ => {
             return Err(LimboError::Constraint(format!(
                 "invalid input syntax for type numeric: \"{val}\""
@@ -88,6 +96,144 @@ pub fn check_numeric_limits(value: &BigDecimal) -> crate::Result<()> {
 
 fn numeric_overflow() -> LimboError {
     LimboError::Constraint("value overflows numeric format".to_string())
+}
+
+/// The numeric type's order. Indexes and sorts use it, so unlike the numeric
+/// functions it never fails: every value has a place. NULL comes first, then
+/// numbers by value (integers, reals, numeric text and stored numeric blobs,
+/// with -infinity and +infinity at the ends), then any other text by bytes,
+/// then any other blob by bytes. Numbers that differ only in trailing zeros,
+/// such as 1.5 and 1.50, are equal.
+pub fn numeric_compare(left: ValueRef, right: ValueRef) -> Ordering {
+    compare_sort_keys(NumericSortKey::of(left), NumericSortKey::of(right))
+}
+
+/// [numeric_compare] for the two sides of a comparison operator, such as
+/// `n = 'abc'`. A text that is not a number, or a blob that is not a stored
+/// numeric, is an error instead of a value after every number, as PostgreSQL
+/// fails to read 'abc' as a numeric.
+pub fn numeric_compare_operands(left: ValueRef, right: ValueRef) -> crate::Result<Ordering> {
+    let (left, right) = (NumericSortKey::of(left), NumericSortKey::of(right));
+    left.check_is_number()?;
+    right.check_is_number()?;
+    Ok(compare_sort_keys(left, right))
+}
+
+fn compare_sort_keys(left: NumericSortKey, right: NumericSortKey) -> Ordering {
+    match (left, right) {
+        (NumericSortKey::Number(l), NumericSortKey::Number(r)) => compare_numbers(&l, &r),
+        (NumericSortKey::Text(l), NumericSortKey::Text(r)) => l.cmp(r),
+        (NumericSortKey::Blob(l), NumericSortKey::Blob(r)) => l.cmp(r),
+        (l, r) => l.rank().cmp(&r.rank()),
+    }
+}
+
+/// Hashes `value` so that values `numeric_compare` finds equal hash alike.
+pub fn numeric_hash<H: Hasher>(value: ValueRef, state: &mut H) {
+    let key = NumericSortKey::of(value);
+    key.rank().hash(state);
+    match key {
+        NumericSortKey::Number(number) => {
+            let (digits, scale) = number.normalized().into_bigint_and_exponent();
+            digits.hash(state);
+            scale.hash(state);
+        }
+        NumericSortKey::Text(text) => text.hash(state),
+        NumericSortKey::Blob(blob) => blob.hash(state),
+        NumericSortKey::Null | NumericSortKey::NegativeInfinity | NumericSortKey::Infinity => {}
+    }
+}
+
+/// Where a value falls in the numeric type's order.
+enum NumericSortKey<'a> {
+    Null,
+    NegativeInfinity,
+    Number(BigDecimal),
+    Infinity,
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+impl<'a> NumericSortKey<'a> {
+    fn of(value: ValueRef<'a>) -> Self {
+        match value {
+            ValueRef::Null => Self::Null,
+            ValueRef::Numeric(Numeric::Integer(i)) => Self::Number(BigDecimal::from(i)),
+            ValueRef::Numeric(Numeric::Float(f)) => {
+                let f = f64::from(f);
+                if f == f64::INFINITY {
+                    Self::Infinity
+                } else if f == f64::NEG_INFINITY {
+                    Self::NegativeInfinity
+                } else {
+                    // Every finite real is within the limits once written out.
+                    Self::Number(
+                        parse_numeric(&f.to_string()).expect("a finite real is a valid numeric"),
+                    )
+                }
+            }
+            ValueRef::Text(text) => {
+                let text = text.as_str();
+                match parse_numeric(text) {
+                    Ok(number) if check_numeric_limits(&number).is_ok() => Self::Number(number),
+                    _ => Self::Text(text),
+                }
+            }
+            ValueRef::Blob(blob) => match blob_to_bigdecimal(blob) {
+                Ok(number) => Self::Number(number),
+                Err(_) => Self::Blob(blob),
+            },
+        }
+    }
+
+    /// The error reading the value as a numeric gives, if it is not one.
+    fn check_is_number(&self) -> crate::Result<()> {
+        match self {
+            Self::Text(text) => {
+                parse_numeric(text).and_then(|number| check_numeric_limits(&number))?;
+                unreachable!("a text that reads as a numeric within the limits is a number")
+            }
+            Self::Blob(blob) => {
+                blob_to_bigdecimal(blob)?;
+                unreachable!("a blob that reads as a numeric is a number")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::NegativeInfinity => 1,
+            Self::Number(_) => 2,
+            Self::Infinity => 3,
+            Self::Text(_) => 4,
+            Self::Blob(_) => 5,
+        }
+    }
+}
+
+/// Compares two numbers without lining up their scales unless they have the
+/// same sign and the same number of digits before the decimal point, so
+/// 1e131071 against 1e-16383 does not write out 147,000 digits.
+fn compare_numbers(left: &BigDecimal, right: &BigDecimal) -> Ordering {
+    let by_sign = left.sign().cmp(&right.sign());
+    if by_sign != Ordering::Equal || left.is_zero() {
+        return by_sign;
+    }
+    let by_magnitude = leading_digit_position(left).cmp(&leading_digit_position(right));
+    let by_magnitude = if left.sign() == Sign::Minus {
+        by_magnitude.reverse()
+    } else {
+        by_magnitude
+    };
+    by_magnitude.then_with(|| left.cmp(right))
+}
+
+/// The power of ten just above the first digit: 3 for 123.4, -1 for 0.012.
+/// Trailing zeros do not change it, so 1.5 and 1.50 have the same position.
+fn leading_digit_position(number: &BigDecimal) -> i128 {
+    i128::from(number.digits()) - i128::from(number.fractional_digit_count())
 }
 
 /// Serialize a BigDecimal to our portable blob format.
@@ -298,6 +444,7 @@ pub fn validate_precision_scale(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AsValueRef;
     use std::str::FromStr;
 
     #[test]
@@ -467,5 +614,82 @@ mod tests {
         let decoded_b = blob_to_bigdecimal(&blob_b).unwrap();
         // The ordering of decoded values must match the ordering of originals
         a.0.cmp(&b.0) == decoded_a.cmp(&decoded_b)
+    }
+
+    fn sort_key_values() -> Vec<Value> {
+        // In the numeric type's order; values on one line are equal.
+        vec![
+            Value::Null,
+            Value::from_f64(f64::NEG_INFINITY),
+            Value::from_text("-1e131071"),
+            Value::Numeric(Numeric::Integer(-2)),
+            Value::from_text("-1.5"),
+            Value::from_text("-1e-16383"),
+            Value::Numeric(Numeric::Integer(0)),
+            Value::from_text("1e-16383"),
+            Value::from_text("1.5"),
+            Value::from_f64(2.5),
+            Value::from_text("10"),
+            Value::from_text("1e131071"),
+            Value::from_f64(f64::INFINITY),
+            Value::from_text("abc"),
+            Value::from_text("abd"),
+            Value::from_blob(crate::alloc::vec![0x00]),
+            Value::from_blob(crate::alloc::vec![0x01]),
+        ]
+    }
+
+    #[test]
+    fn numeric_compare_orders_every_kind_of_value() {
+        let values = sort_key_values();
+        for (i, l) in values.iter().enumerate() {
+            for (j, r) in values.iter().enumerate() {
+                assert_eq!(
+                    numeric_compare(l.as_value_ref(), r.as_value_ref()),
+                    i.cmp(&j),
+                    "{l:?} vs {r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_equal_values_compare_and_hash_alike() {
+        let blob = Value::Blob(bigdecimal_to_blob(&BigDecimal::from_str("1.500").unwrap()));
+        let equal = [
+            Value::from_text("1.5"),
+            Value::from_text("1.50"),
+            Value::from_text(" 15e-1\n"),
+            Value::from_f64(1.5),
+            blob,
+        ];
+        for l in &equal {
+            for r in &equal {
+                assert_eq!(
+                    numeric_compare(l.as_value_ref(), r.as_value_ref()),
+                    Ordering::Equal,
+                    "{l:?} vs {r:?}"
+                );
+                assert_eq!(hash_of(l), hash_of(r), "{l:?} vs {r:?}");
+            }
+        }
+        let zeros = [
+            Value::Numeric(Numeric::Integer(0)),
+            Value::from_f64(-0.0),
+            Value::from_text("0.000"),
+        ];
+        for z in &zeros {
+            assert_eq!(
+                numeric_compare(z.as_value_ref(), zeros[0].as_value_ref()),
+                Ordering::Equal
+            );
+            assert_eq!(hash_of(z), hash_of(&zeros[0]));
+        }
+    }
+
+    fn hash_of(value: &Value) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        numeric_hash(value.as_value_ref(), &mut hasher);
+        hasher.finish()
     }
 }

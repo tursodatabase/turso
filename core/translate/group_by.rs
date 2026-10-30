@@ -1,4 +1,5 @@
 use crate::alloc::TursoIteratorExt;
+use crate::translate::expr_context::ExprContext;
 use turso_parser::ast::{self, SortOrder};
 
 use super::{
@@ -10,7 +11,7 @@ use super::{
 use crate::translate::{
     aggregation::{emit_aggregate_final, emit_aggregate_step, AggArgumentSource},
     expression_index::selected_expression_index,
-    order_by::{custom_type_comparator, EmitOrderBy},
+    order_by::EmitOrderBy,
     plan::{Aggregate, NonFromClauseSubquery},
     subquery::emit_non_from_clause_subqueries_for_phase,
 };
@@ -22,7 +23,7 @@ use crate::translate::{
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{expr_collation, CollationSeq},
+    translate::collate::CollationSeq,
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -170,25 +171,17 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation =
-                        expr_collation(expr, Some(&plan.table_references), &t_ctx.resolver)?;
+                    let collation = ExprContext::new(Some(&plan.table_references), &t_ctx.resolver)
+                        .expr_collation(expr)?;
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
-
-            // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
-            let comparators = group_by
-                .exprs
-                .iter()
-                .map(|expr| custom_type_comparator(expr, &plan.table_references, &t_ctx.resolver))
-                .try_collect()?;
 
             program.emit_insn(Insn::SorterOpen {
                 data: Box::new(SorterOpenData {
                     cursor_id: sort_cursor,
                     columns: column_count,
                     order_collations_nulls,
-                    comparators,
                 }),
             });
             emit_explain!(
@@ -701,7 +694,8 @@ pub fn group_by_process_single_group(
         .map(|expr| {
             Ok(KeyInfo {
                 sort_order: SortOrder::Asc,
-                collation: expr_collation(expr, Some(&plan.table_references), &t_ctx.resolver)?,
+                collation: ExprContext::new(Some(&plan.table_references), &t_ctx.resolver)
+                    .expr_collation(expr)?,
                 nulls_order: None,
             })
         })

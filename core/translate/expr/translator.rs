@@ -250,7 +250,7 @@ fn translate_expr_by_kind(
             translate_unary_expr(program, referenced_tables, expr, target_register, resolver)
         }
         ast::Expr::Variable(_) => translate_variable_expr(program, expr, target_register),
-        ast::Expr::Register(_) => translate_register_expr(program, expr, target_register),
+        ast::Expr::Register { .. } => translate_register_expr(program, expr, target_register),
         ast::Expr::Default => {
             crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
         }
@@ -472,7 +472,8 @@ fn translate_subquery_result_expr(
                     rhs: column_check_reg,
                     target_pc: label_null_checks_next,
                     flags: CmpInsFlags::default().with_affinity(affinity),
-                    collation: expr_collation(lhs_columns[i], referenced_tables, resolver)?,
+                    collation: ExprContext::new(referenced_tables, resolver)
+                        .expr_collation(lhs_columns[i])?,
                 });
             }
             // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
@@ -561,15 +562,15 @@ fn translate_binary_expr(
         }
     }
 
-    if try_translate_custom_type_operator(
-        program,
-        referenced_tables,
-        e1,
-        op,
-        e2,
-        target_register,
-        resolver,
-    )? {
+    if let Some(result_reg) = emit_custom_type_operator(program, referenced_tables, expr, resolver)?
+    {
+        if result_reg != target_register {
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+        }
         return Ok(target_register);
     }
 
@@ -607,33 +608,6 @@ fn translate_truth_test_expr(
         invert: is_not == is_true_literal,
     });
     Ok(target_register)
-}
-
-/// Translates the binary expression with the operator of a custom type, if
-/// either operand has a custom type that defines one. Returns false otherwise.
-#[inline(never)]
-fn try_translate_custom_type_operator(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    e1: &ast::Expr,
-    op: &ast::Operator,
-    e2: &ast::Expr,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<bool> {
-    let Some(resolved) = find_custom_type_operator(e1, e2, op, referenced_tables, resolver) else {
-        return Ok(false);
-    };
-    let result_reg =
-        emit_custom_type_operator(program, referenced_tables, e1, e2, &resolved, resolver)?;
-    if result_reg != target_register {
-        program.emit_insn(Insn::Copy {
-            src_reg: result_reg,
-            dst_reg: target_register,
-            extra_amount: 0,
-        });
-    }
-    Ok(true)
 }
 
 #[inline(never)]
@@ -697,15 +671,13 @@ fn translate_case_expr(
                         base.as_deref()
                             .expect("base_reg is set only with a base expression"),
                         when_expr.as_ref(),
-                        referenced_tables,
-                        Some(resolver),
+                        &ExprContext::new(referenced_tables, resolver),
                     )),
                 collation: comparison_collation(
                     base.as_deref()
                         .expect("base_reg is set only with a base expression"),
                     when_expr,
-                    referenced_tables,
-                    resolver,
+                    &ExprContext::new(referenced_tables, resolver),
                 )?,
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
@@ -772,6 +744,7 @@ fn translate_cast_expr(
 
     if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
         if tn.array_dimensions > 0 {
+            resolver.schema().check_array_element_type(cast_type_name)?;
             let mut column = Column::new(
                 None,
                 cast_type_name.clone(),
@@ -890,11 +863,11 @@ fn translate_function_call_expr(
     let func = func_type.unwrap();
     let collation = if func.needs_collation() {
         first_collation(
-            args.iter().map(|arg| (arg.as_ref(), referenced_tables)),
-            resolver,
+            args.iter()
+                .map(|arg| (arg.as_ref(), ExprContext::new(referenced_tables, resolver))),
         )?
     } else {
-        CollationSeq::Binary
+        CollationSeq::BINARY
     };
     let func_ctx = FuncCtx {
         func,
@@ -1907,12 +1880,6 @@ fn translate_function_call_expr(
                 }
                 ScalarFunc::TestUintEncode
                 | ScalarFunc::TestUintDecode
-                | ScalarFunc::TestUintAdd
-                | ScalarFunc::TestUintSub
-                | ScalarFunc::TestUintMul
-                | ScalarFunc::TestUintDiv
-                | ScalarFunc::TestUintLt
-                | ScalarFunc::TestUintEq
                 | ScalarFunc::StringReverse
                 | ScalarFunc::Gcd
                 | ScalarFunc::Lcm
@@ -1930,10 +1897,10 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericMul
                 | ScalarFunc::NumericDiv
                 | ScalarFunc::NumericMod
-                | ScalarFunc::NumericLt
-                | ScalarFunc::NumericEq
+                | ScalarFunc::NumericNeg
                 | ScalarFunc::DatePlus
-                | ScalarFunc::DateMinus => translate_function(
+                | ScalarFunc::DateMinus
+                | ScalarFunc::DateDiff => translate_function(
                     program,
                     args,
                     referenced_tables,
@@ -2370,11 +2337,23 @@ fn translate_self_table_column_expr(
                     crate::bail_parse_error!("column index out of bounds");
                 }
                 let src_reg = dml_ctx.to_column_reg(*column);
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: target_register,
-                    extra_amount: 0,
-                });
+                let table_column = &table.columns()[*column];
+                if dml_ctx.holds_stored_value(*column, table_column) {
+                    emit_user_facing_column_value(
+                        program,
+                        src_reg,
+                        target_register,
+                        table_column,
+                        table.is_strict,
+                        resolver,
+                    )?;
+                } else {
+                    program.emit_insn(Insn::Copy {
+                        src_reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                }
                 Ok(target_register)
             }
             None => {
@@ -3173,6 +3152,17 @@ fn translate_unary_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    if let Some(result_reg) = emit_custom_type_operator(program, referenced_tables, expr, resolver)?
+    {
+        if result_reg != target_register {
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+        }
+        return Ok(target_register);
+    }
     let ast::Expr::Unary(op, expr) = expr else {
         unreachable!("translate_unary_expr expects Expr::Unary");
     };
@@ -3200,25 +3190,6 @@ fn translate_unary_expr(
             Ok(target_register)
         }
         (UnaryOperator::Negative, _) => {
-            let zero = ast::Expr::Literal(ast::Literal::Numeric("0".to_string()));
-            if let Some(resolved) =
-                find_custom_type_negation(&zero, expr, referenced_tables, resolver)
-            {
-                let result_reg = emit_custom_type_operator(
-                    program,
-                    referenced_tables,
-                    &zero,
-                    expr,
-                    &resolved,
-                    resolver,
-                )?;
-                program.emit_insn(Insn::Copy {
-                    src_reg: result_reg,
-                    dst_reg: target_register,
-                    extra_amount: 0,
-                });
-                return Ok(target_register);
-            }
             let value = 0;
 
             let reg = program.alloc_register();
@@ -3305,7 +3276,10 @@ fn translate_register_expr(
     expr: &ast::Expr,
     target_register: usize,
 ) -> Result<usize> {
-    let ast::Expr::Register(src_reg) = expr else {
+    let ast::Expr::Register {
+        register: src_reg, ..
+    } = expr
+    else {
         unreachable!("translate_register_expr expects Expr::Register");
     };
     // For DBSP expression compilation: copy from source register to target

@@ -18,6 +18,7 @@ pub(crate) mod display;
 pub(crate) mod emitter;
 pub mod eqp;
 pub(crate) mod expr;
+pub(crate) mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
@@ -176,6 +177,24 @@ pub fn translate(
 /// Translate SQL statement into bytecode program.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
 pub fn translate_inner(
+    stmt: ast::Stmt,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    input: &str,
+) -> Result<()> {
+    // Subqueries are numbered per program, and a trigger body or foreign-key
+    // action is compiled into a program of its own with the resolver of the
+    // statement that fires it. So the same number can name a subquery of
+    // each, and the statement's row-value subqueries are set aside while
+    // another statement is compiled.
+    let callers_row_value_subqueries = std::mem::take(&mut resolver.row_value_subqueries);
+    let result = translate_statement(stmt, resolver, program, connection, input);
+    resolver.row_value_subqueries = callers_row_value_subqueries;
+    result
+}
+
+fn translate_statement(
     stmt: ast::Stmt,
     resolver: &mut Resolver,
     program: &mut ProgramBuilder,
