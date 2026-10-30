@@ -5,6 +5,26 @@
 
 @database :memory:
 
+test order-by-using-builtin-operators {
+    CREATE TABLE order_using_values (x int);
+    INSERT INTO order_using_values VALUES (1), (NULL), (2);
+    SELECT coalesce(x::text, 'N') FROM order_using_values ORDER BY x USING >;
+    SELECT coalesce(x::text, 'N') FROM order_using_values ORDER BY x USING OPERATOR(pg_catalog.<);
+    SELECT coalesce(x::text, 'N') FROM order_using_values ORDER BY x USING > NULLS LAST;
+    DROP TABLE order_using_values;
+}
+expect {
+    N
+    2
+    1
+    1
+    2
+    N
+    2
+    1
+    N
+}
+
 test cast-text-to-integer-array {
     SELECT '{10,20,30}'::integer[];
     SELECT array_length('{10,20,30}'::integer[], 1);
