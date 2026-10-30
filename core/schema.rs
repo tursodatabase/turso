@@ -430,7 +430,23 @@ impl ResolvedType {
     /// the type a domain is based on. None for a domain over a plain SQLite
     /// type, such as `CREATE DOMAIN pos AS integer`.
     pub fn base_type(&self) -> Option<&Arc<TypeDef>> {
-        self.chain.iter().find(|type_def| !type_def.is_domain)
+        self.base_type_position().map(|base| &self.chain[base])
+    }
+
+    /// The type without its domains: a domain stores its values as its base
+    /// type does. None when the chain has only domains.
+    pub fn without_domains(&self) -> crate::Result<Option<ResolvedType>> {
+        let Some(base) = self.base_type_position() else {
+            return Ok(None);
+        };
+        Ok(Some(ResolvedType {
+            primitive: self.primitive.clone(),
+            chain: self.chain[base..].try_to_vec()?,
+        }))
+    }
+
+    fn base_type_position(&self) -> Option<usize> {
+        self.chain.iter().position(|type_def| !type_def.is_domain)
     }
 
     pub fn reads_stored_values_unchanged(&self) -> bool {

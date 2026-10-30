@@ -1,5 +1,4 @@
 use super::*;
-use crate::alloc::TursoSliceExt;
 use crate::schema::{ResolvedType, Schema};
 use crate::translate::expr::expr_type::compound_column_type;
 use crate::translate::expr_context::ExprContext;
@@ -674,7 +673,7 @@ pub(crate) fn column_stored_form(
     let Some(resolved) = schema.resolve_type(ty_str, is_strict)? else {
         return Ok(None);
     };
-    let Some(stored) = without_domains(resolved)? else {
+    let Some(stored) = resolved.without_domains()? else {
         return Ok(None);
     };
     if stored.chain.iter().all(|td| td.encode().is_none()) {
@@ -711,25 +710,13 @@ fn stored_form_type(ty: &ExprType, schema: &Schema) -> Result<Option<ResolvedTyp
     let Some(resolved) = schema.resolve_type_unchecked(&type_def.name)? else {
         return Ok(None);
     };
-    let Some(stored) = without_domains(resolved)? else {
+    let Some(stored) = resolved.without_domains()? else {
         return Ok(None);
     };
     if stored.chain.iter().all(|td| td.encode().is_none()) {
         return Ok(None);
     }
     Ok(Some(stored))
-}
-
-/// `resolved` without its domains: a domain stores its values as its base type
-/// does. None when the chain has only domains.
-fn without_domains(resolved: ResolvedType) -> Result<Option<ResolvedType>> {
-    let Some(base) = resolved.chain.iter().position(|td| !td.is_domain) else {
-        return Ok(None);
-    };
-    Ok(Some(ResolvedType {
-        primitive: resolved.primitive,
-        chain: resolved.chain[base..].try_to_vec()?,
-    }))
 }
 
 /// Whether `expr` reads a table column that [translate_expr] DECODEs only
