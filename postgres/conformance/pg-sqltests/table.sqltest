@@ -300,6 +300,32 @@ expect {
     1.50
 }
 
+test table-numeric-column-compared-with-literal-not-rounded {
+    CREATE TABLE nm (v numeric(10,2));
+    INSERT INTO nm VALUES (1.50);
+    SELECT count(*) FROM nm WHERE v = 1.501;
+    SELECT count(*) FROM nm WHERE 1.501 = v;
+    SELECT count(*) FROM nm WHERE v < 1.501;
+    SELECT count(*) FROM nm WHERE v >= 1.501;
+    SELECT count(*) FROM nm WHERE v <> 1.501;
+    SELECT count(*) FROM nm WHERE v = 123456789012.5;
+    CREATE INDEX nm_v ON nm (v);
+    SELECT count(*) FROM nm WHERE v = 1.501;
+    SELECT count(*) FROM nm WHERE v = 1.50;
+    SELECT count(*) FROM nm WHERE v = 1.5;
+}
+expect {
+    0
+    0
+    1
+    0
+    1
+    0
+    0
+    1
+    1
+}
+
 test table-uuid-column-omitted-from-insert-is-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
     INSERT INTO t (id) VALUES (1);
