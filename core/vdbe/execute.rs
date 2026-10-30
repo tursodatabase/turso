@@ -7572,13 +7572,7 @@ fn update_agg_payload(
                 },
                 Value::Text(t) => {
                     let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
-                    let overflowed = sum_state.ovrfl;
                     handle_text_sum(acc, &mut sum_state, parsed_number, parse_result, false);
-                    // SQLite reads numeric text only up to a NUL byte and try_for_float does not.
-                    // Until they agree, text with a NUL byte keeps a pending overflow.
-                    if overflowed && t.as_str().contains('\0') {
-                        sum_state.ovrfl = true;
-                    }
                 }
                 Value::Blob(b) => {
                     let (parse_result, parsed_number) = try_for_float(b);

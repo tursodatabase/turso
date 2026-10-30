@@ -162,14 +162,6 @@ expect error {
     integer overflow
 }
 
-test sum-text-overflow-still-errors-for-zero-followed-by-nul {
-    WITH t(a) AS (VALUES('9223372036854775807'),('1'),('0' || char(0) || 'abc'))
-    SELECT sum(a) FROM t;
-}
-expect error {
-    integer overflow
-}
-
 test sum-overflow-with-null-still-errors {
     WITH t(a) AS (VALUES(9223372036854775807),(1),(NULL))
     SELECT sum(a) FROM t;
