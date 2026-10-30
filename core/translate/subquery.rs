@@ -989,12 +989,7 @@ fn get_subquery_parser<'a>(
                     QueryDestination::Unset,
                     connection,
                 )?;
-                cast_in_subquery_operands(
-                    &mut lhs,
-                    Some(referenced_tables),
-                    &mut plan,
-                    resolver,
-                )?;
+                cast_in_subquery_operands(&mut lhs, Some(referenced_tables), &mut plan, resolver)?;
                 let correlated = plan_has_outer_scope_dependency(&plan);
                 handle_unsupported_correlation(correlated, position, allow_correlated)?;
                 if !correlated || origin.is_write_statement() {
