@@ -2605,6 +2605,9 @@ pub fn parse_where(
     resolver: &Resolver,
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
+        if !resolver.catalog.dialect.allows_numeric_constants_in_where() {
+            reject_numeric_constant_where(where_expr)?;
+        }
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
@@ -2646,6 +2649,36 @@ pub fn parse_where(
         Ok(())
     } else {
         Ok(())
+    }
+}
+
+/// PostgreSQL requires WHERE to be a boolean expression and rejects a
+/// numeric constant like WHERE 1 after it has resolved the names in the
+/// statement. Only constants are checked: anything deeper needs expression
+/// types.
+fn reject_numeric_constant_where(where_expr: &Expr) -> Result<()> {
+    let mut expr = where_expr;
+    while let Expr::Parenthesized(inner) = expr {
+        if inner.len() != 1 {
+            return Ok(());
+        }
+        expr = &inner[0];
+    }
+    let Expr::Literal(ast::Literal::Numeric(text)) = expr else {
+        return Ok(());
+    };
+    crate::bail_parse_error!(
+        "argument of WHERE must be type boolean, not type {}",
+        numeric_constant_type_name(text)
+    );
+}
+
+/// The type PostgreSQL gives a numeric constant, for error messages.
+fn numeric_constant_type_name(text: &str) -> &'static str {
+    match text.parse::<i64>() {
+        Ok(value) if i32::try_from(value).is_ok() => "integer",
+        Ok(_) => "bigint",
+        Err(_) => "numeric",
     }
 }
 

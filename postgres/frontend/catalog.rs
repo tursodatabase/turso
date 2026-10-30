@@ -178,7 +178,28 @@ impl Dialect for PostgresDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        if matches!(
+            (name, arg_count),
+            ("exp", 1)
+                | ("sqrt", 1)
+                | ("ln", 1)
+                | ("log", 1)
+                | ("power", 2)
+                | ("mod", 2)
+                | ("chr", 1)
+        ) {
+            return Ok(Some(Func::Dialect(name.to_string())));
+        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
+    }
+
+    fn exec_scalar_function(
+        &self,
+        _conn: &Connection,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value> {
+        crate::functions::exec_math_with_range_errors(name, args)
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -212,6 +233,22 @@ impl Dialect for PostgresDialect {
 
     fn errors_on_zero_divisor(&self) -> bool {
         true
+    }
+
+    fn errors_on_integer_overflow(&self) -> bool {
+        true
+    }
+
+    fn allows_bare_columns_in_aggregate_queries(&self) -> bool {
+        false
+    }
+
+    fn allows_numeric_constants_in_where(&self) -> bool {
+        false
+    }
+
+    fn allows_non_integer_sort_constants(&self) -> bool {
+        false
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {

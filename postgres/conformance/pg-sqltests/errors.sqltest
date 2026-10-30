@@ -60,3 +60,477 @@ test error-drop-domain-used-by-table-in-other-schema {
 }
 @sqlstate 2BP01
 expect error {}
+
+test error-create-table-duplicate-column {
+    CREATE TABLE dupcol (x int, x int);
+}
+@sqlstate 42701
+expect error {
+}
+
+test error-add-column-duplicate {
+    CREATE TABLE adddup (x int);
+    ALTER TABLE adddup ADD COLUMN x int;
+}
+@sqlstate 42701
+expect error {
+}
+
+test error-drop-missing-view {
+    DROP VIEW no_such_view;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test error-drop-missing-index {
+    DROP INDEX no_such_index;
+}
+@sqlstate 42704
+expect error {
+}
+
+test error-foreign-key-enforced-by-default {
+    CREATE TABLE fkparent (id int PRIMARY KEY);
+    CREATE TABLE fkchild (pid int REFERENCES fkparent(id));
+    INSERT INTO fkchild VALUES (999);
+}
+@sqlstate 23503
+expect error {
+}
+
+test error-foreign-key-delete-enforced-by-default {
+    CREATE TABLE delparent (id int PRIMARY KEY);
+    CREATE TABLE delchild (pid int REFERENCES delparent(id));
+    INSERT INTO delparent VALUES (1);
+    INSERT INTO delchild VALUES (1);
+    DELETE FROM delparent WHERE id = 1;
+}
+@sqlstate 23503
+expect error {
+}
+
+test error-cast-junk-to-int {
+    SELECT 'x9q'::int;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-empty-to-int {
+    SELECT ''::int;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-spaced-digits-to-int {
+    SELECT ' 7 7'::int;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-junk-to-float8 {
+    SELECT '12ab'::float8;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-overflowing-text-to-float8 {
+    SELECT '1e999'::float8;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-junk-to-numeric {
+    SELECT 'x9q'::numeric;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-junk-to-boolean {
+    SELECT 'x9q'::boolean;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-junk-to-json {
+    SELECT 'x9q'::json;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-int2-out-of-range {
+    SELECT 99999::int2;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-int4-out-of-range {
+    SELECT 9999999999::int4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-text-out-of-range-smallint {
+    SELECT '99999'::int2;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-text-out-of-range-bigint {
+    SELECT '99999999999999999999'::bigint;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-float8-out-of-range-real {
+    SELECT 1e300::float4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-accepts-valid-text-inputs {
+    SELECT ' 42 '::int, '-7'::int2, '+5'::int8, '1.5'::float8, 'true'::boolean, 'f'::boolean;
+}
+expect {
+    42|-7|5|1.5|t|f
+}
+
+test cast-json-preserves-text {
+    SELECT '{"a" : 1}'::json;
+}
+expect {
+    {"a" : 1}
+}
+
+test cast-float-to-int-rounds {
+    SELECT 1.7::int, (-1.7)::int;
+}
+expect {
+    2|-2
+}
+
+test error-bigint-overflow-add {
+    SELECT 9223372036854775807 + 1;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-bigint-overflow-subtract {
+    SELECT -9223372036854775807 - 2;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-bigint-overflow-multiply {
+    SELECT 4611686018427387904 * 4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-bigint-overflow-divide {
+    SELECT (-9223372036854775808) / (-1);
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-where-integer {
+    SELECT 1 WHERE 1;
+}
+@sqlstate 42804
+expect error {
+}
+
+test error-where-numeric {
+    SELECT 1 WHERE 1.5;
+}
+@sqlstate 42804
+expect error {
+}
+
+test error-where-integer-update {
+    CREATE TABLE wupd (x int);
+    UPDATE wupd SET x = 1 WHERE 1;
+}
+@sqlstate 42804
+expect error {
+}
+
+test error-where-integer-delete {
+    CREATE TABLE wdel (x int);
+    DELETE FROM wdel WHERE 1;
+}
+@sqlstate 42804
+expect error {
+}
+
+test error-bare-column-with-aggregate {
+    CREATE TABLE gagg (x int, y int);
+    SELECT x, count(*) FROM gagg;
+}
+@sqlstate 42803
+expect error {
+}
+
+test error-bare-column-in-expression-with-aggregate {
+    CREATE TABLE gexpr (x int);
+    SELECT x + 1, count(*) FROM gexpr;
+}
+@sqlstate 42803
+expect error {
+}
+
+test aggregate-with-constant-column {
+    CREATE TABLE gconst (x int);
+    SELECT 1, count(*) FROM gconst;
+}
+expect {
+    1|0
+}
+
+test error-cast-trailing-junk-numeric {
+    SELECT '1e999x'::numeric;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-numeric-accepts-values-beyond-float8 {
+    SELECT CASE WHEN '1e400'::numeric > 0 THEN 'positive' ELSE 'other' END;
+}
+expect {
+    positive
+}
+
+test cast-json-accepts-numbers-beyond-float8 {
+    SELECT '[1e400]'::json;
+}
+expect {
+    [1e400]
+}
+
+test error-negate-boolean-is-undefined-operator {
+    SELECT - TRUE;
+}
+@sqlstate 42883
+expect error {
+}
+
+test ascii-returns-code-points {
+    SELECT ascii('A'), ascii(''), ascii('ツ');
+}
+expect {
+    65|0|12484
+}
+
+test cast-accepts-non-decimal-integers {
+    SELECT '0x10'::int4, '0o17'::int2, '0b101'::int8, '1_000'::int4,
+           CASE WHEN '0x10'::numeric = 16 THEN 'ok' ELSE 'no' END;
+}
+expect {
+    16|15|5|1000|ok
+}
+
+test error-cast-invalid-hex-digit {
+    SELECT '0x1g'::int4;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-exp-overflow {
+    SELECT exp(1000::float8);
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-exp-underflow {
+    SELECT exp((-1000)::float8);
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-power-overflow {
+    SELECT power('1e200'::float8, 2);
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-power-zero-to-negative {
+    SELECT power(0, -1);
+}
+@sqlstate 2201F
+expect error {
+}
+
+test error-power-negative-to-fraction {
+    SELECT power(-2, 0.5);
+}
+@sqlstate 2201F
+expect error {
+}
+
+test error-sqrt-of-negative {
+    SELECT sqrt(-1);
+}
+@sqlstate 2201F
+expect error {
+}
+
+test error-ln-of-zero {
+    SELECT ln(0);
+}
+@sqlstate 2201E
+expect error {
+}
+
+test error-log-of-negative {
+    SELECT log(-5);
+}
+@sqlstate 2201E
+expect error {
+}
+
+test cast-nonzero-integer-to-boolean {
+    SELECT 5::boolean, 0::boolean, (-3)::boolean;
+}
+expect {
+    t|f|t
+}
+
+test chr-of-null-is-null {
+    SELECT CASE WHEN chr(NULL) IS NULL THEN 'null' ELSE 'text' END;
+}
+expect {
+    null
+}
+
+test error-chr-of-zero {
+    SELECT chr(0);
+}
+@sqlstate 54000
+expect error {
+}
+
+test math-functions-accept-nan-and-infinity-words {
+    SELECT 'ok' FROM (SELECT ln('NaN') AS a, exp('inf') AS b, mod(1e308, 'NaN') AS c) s;
+}
+expect {
+    ok
+}
+
+test error-missing-table-reported-before-where-type {
+    SELECT 1 FROM no_such_table_here WHERE 1;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test error-insert-junk-text-into-integer-column {
+    CREATE TABLE ins1 (a int4);
+    INSERT INTO ins1 VALUES ('x9q');
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-insert-out-of-range-into-integer-column {
+    CREATE TABLE ins2 (a int4);
+    INSERT INTO ins2 VALUES (2147483648);
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-insert-overflowing-text-into-float-column {
+    CREATE TABLE ins3 (a float8);
+    INSERT INTO ins3 VALUES ('1e999');
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-update-junk-text-into-integer-column {
+    CREATE TABLE upd1 (a int4);
+    INSERT INTO upd1 VALUES (1);
+    UPDATE upd1 SET a = 'zz';
+}
+@sqlstate 22P02
+expect error {
+}
+
+test insert-rounds-float-into-integer-column {
+    CREATE TABLE ins4 (a bigint);
+    INSERT INTO ins4 VALUES (2.5), (-2.5);
+    SELECT a FROM ins4 ORDER BY a;
+}
+expect {
+    -3
+    3
+}
+
+test insert-fills-missing-trailing-columns {
+    CREATE TABLE ins5 (a int4, b text, c int4);
+    INSERT INTO ins5 VALUES (1);
+    SELECT count(*) FROM ins5 WHERE a = 1 AND b IS NULL AND c IS NULL;
+}
+expect {
+    1
+}
+
+test error-short-insert-violates-not-null {
+    CREATE TABLE ins6 (a int4, b int4 NOT NULL);
+    INSERT INTO ins6 VALUES (1);
+}
+@sqlstate 23502
+expect error {
+}
+
+test error-order-by-string-constant {
+    SELECT 1 ORDER BY 'a';
+}
+@sqlstate 42601
+expect error {
+}
+
+test error-group-by-numeric-constant {
+    CREATE TABLE gc1 (a int4);
+    SELECT a FROM gc1 GROUP BY 1.5;
+}
+@sqlstate 42601
+expect error {
+}
+
+test error-create-index-missing-column {
+    CREATE TABLE cim (a int4);
+    CREATE INDEX cim_idx ON cim (nope);
+}
+@sqlstate 42703
+expect error {
+}
+
+test error-missing-table-reported-before-order-by-constant {
+    SELECT 1 FROM no_such_sort_table ORDER BY 'a';
+}
+@sqlstate 42P01
+expect error {
+}

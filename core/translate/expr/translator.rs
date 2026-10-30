@@ -803,6 +803,13 @@ fn translate_cast_expr(
             // SQLite's CAST: CAST(x AS NUMERIC) is a common SQLite idiom.
             let user_param_count = resolved.leaf().user_params().count();
             if user_param_count == 0 || ty_params.len() == user_param_count {
+                if resolved
+                    .chain
+                    .iter()
+                    .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
+                {
+                    emit_integer_to_boolean_cast(program, target_register);
+                }
                 emit_store_value(
                     program,
                     &resolved.chain[..1],

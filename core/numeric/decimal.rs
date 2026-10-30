@@ -58,6 +58,9 @@ fn parse_numeric(text: &str) -> crate::Result<BigDecimal> {
         Some(unsigned) => (&number[..1], unsigned),
         None => ("", number),
     };
+    if let Some(value) = parse_non_decimal_integer(text, sign == "-", unsigned)? {
+        return Ok(value);
+    }
     let significant = unsigned.trim_start_matches('0');
     if significant.len() > MAX_TEXT_LEN {
         return Err(numeric_overflow());
@@ -73,6 +76,44 @@ fn parse_numeric(text: &str) -> crate::Result<BigDecimal> {
     BigDecimal::from_str(&number).map_err(|_| {
         LimboError::Constraint(format!("invalid input syntax for type numeric: \"{text}\""))
     })
+}
+
+/// PostgreSQL accepts the non-decimal integer forms 0x, 0o, and 0b as
+/// numeric input, with single underscores allowed between the digits.
+/// Returns None when `unsigned` has no such prefix.
+fn parse_non_decimal_integer(
+    text: &str,
+    negative: bool,
+    unsigned: &str,
+) -> crate::Result<Option<BigDecimal>> {
+    let lower = unsigned.to_ascii_lowercase();
+    let (radix, digits) = match (lower.strip_prefix("0x"), lower.strip_prefix("0o")) {
+        (Some(digits), _) => (16, digits),
+        (_, Some(digits)) => (8, digits),
+        _ => match lower.strip_prefix("0b") {
+            Some(digits) => (2, digits),
+            None => return Ok(None),
+        },
+    };
+    let invalid =
+        || LimboError::Constraint(format!("invalid input syntax for type numeric: \"{text}\""));
+    if digits.is_empty()
+        || digits.starts_with('_')
+        || digits.ends_with('_')
+        || digits.contains("__")
+    {
+        return Err(invalid());
+    }
+    let digits = digits.replace('_', "");
+    if digits.len() > MAX_INTEGER_DIGITS as usize {
+        return Err(numeric_overflow());
+    }
+    let magnitude = BigInt::parse_bytes(digits.as_bytes(), radix).ok_or_else(invalid)?;
+    Ok(Some(BigDecimal::from(if negative {
+        -magnitude
+    } else {
+        magnitude
+    })))
 }
 
 /// An error when `value` has more digits than PostgreSQL allows. Text such as
