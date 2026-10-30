@@ -5865,12 +5865,7 @@ fn is_current_time_expr(expr: &Expr) -> bool {
     matches!(
         expr,
         Expr::Literal(ast::Literal::String(value)) if string_literal_eq(value, "now")
-    ) || matches!(
-        expr,
-        Expr::Literal(
-            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
-        )
-    )
+    ) || matches!(expr, Expr::Literal(literal) if is_current_time_literal(literal))
 }
 
 fn is_unsafe_datetime_modifier(expr: &Expr) -> bool {
@@ -6013,9 +6008,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
         // different value on every read; SQLite rejects them like any other
         // non-deterministic function (an index on such a column goes stale
         // as soon as the value is recomputed).
-        Expr::Literal(
-            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp,
-        ) => {
+        Expr::Literal(literal) if is_current_time_literal(literal) => {
             bail_parse_error!("non-deterministic functions prohibited in generated columns");
         }
         _ => {}
@@ -7763,6 +7756,9 @@ impl Index {
                 return Ok(WalkControl::SkipChildren);
             }
             match e {
+                Expr::Literal(literal) if is_current_time_literal(literal) => {
+                    ok = false;
+                }
                 Expr::Literal(_) | Expr::RowId { .. } => {}
                 // Unqualified identifier: must be a column of the target table or ROWID
                 Expr::Id(n) => {
@@ -7884,6 +7880,13 @@ impl Index {
         )?;
         Ok(Some(*expr))
     }
+}
+
+pub(crate) fn is_current_time_literal(literal: &ast::Literal) -> bool {
+    matches!(
+        literal,
+        ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
+    )
 }
 
 #[cfg(test)]

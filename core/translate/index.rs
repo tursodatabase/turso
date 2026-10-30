@@ -25,8 +25,8 @@ use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
-        is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn, PseudoCursorType,
-        SchemaObjectType,
+        is_current_time_literal, is_deterministic_schema_function_call, BTreeTable, Index,
+        IndexColumn, PseudoCursorType, SchemaObjectType,
     },
     storage::pager::CreateBTreeFlags,
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
@@ -1166,11 +1166,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             // String literals inside expressions are allowed (e.g., `c0 || 'suffix'`).
             // Standalone string literals are handled by resolve_index_column() which interprets
             // them as column names (SQLite backwards compat quirk).
-            Expr::Literal(
-                ast::Literal::CurrentDate
-                | ast::Literal::CurrentTime
-                | ast::Literal::CurrentTimestamp,
-            ) => {
+            Expr::Literal(literal) if is_current_time_literal(literal) => {
                 ok = false;
             }
             Expr::Literal(_) | Expr::RowId { .. } => {}
