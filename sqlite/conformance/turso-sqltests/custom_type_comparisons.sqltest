@@ -1357,6 +1357,20 @@ expect {
     date()|2024-01-02
 }
 
+# The cast runs the date's ENCODE, so a text value that is not a date is an
+# error, as with CAST(t.s AS date), instead of a row that silently doesn't match.
+@requires strict "uses STRICT tables"
+test cmp-date-with-text-that-is-not-a-date-is-an-error {
+    CREATE TABLE d(x date) STRICT;
+    INSERT INTO d VALUES ('2024-01-01');
+    CREATE TABLE t(s text) STRICT;
+    INSERT INTO t VALUES ('2024-01-01'), ('not a date');
+    SELECT count(*) FROM d JOIN t ON d.x = t.s;
+}
+expect error {
+    invalid date value
+}
+
 # A comparison, NOT, IS, IN or BETWEEN gives a boolean, as in PostgreSQL, so it
 # compares with a boolean column without a cast.
 @requires strict "uses STRICT tables"
