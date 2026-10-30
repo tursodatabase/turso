@@ -844,7 +844,7 @@ test nextval-stops-at-a-table-in-an-earlier-schema {
 }
 @sqlstate 42809
 expect error {
-    "sq" is not a sequence
+    cannot open relation "sq"
 }
 
 test select-stops-at-an-index-in-an-earlier-schema {
@@ -857,7 +857,9 @@ test select-stops-at-an-index-in-an-earlier-schema {
     SELECT y FROM t;
 }
 @sqlstate 42809
-expect error {}
+expect error {
+    cannot open relation "t"
+}
 
 test insert-stops-at-an-index-in-an-earlier-schema {
     CREATE SCHEMA sp_dk_a;
@@ -869,7 +871,9 @@ test insert-stops-at-an-index-in-an-earlier-schema {
     INSERT INTO t VALUES (1);
 }
 @sqlstate 42809
-expect error {}
+expect error {
+    cannot open relation "t"
+}
 
 test view-reads-a-table-of-a-later-schema {
     CREATE SCHEMA sp_vw;

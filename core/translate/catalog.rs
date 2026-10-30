@@ -352,23 +352,16 @@ impl<'a> CatalogContext<'a> {
             return Ok(());
         }
         let name = normalize_ident(name);
-        let kind = self.with_schema(namespace.database_id, |schema| {
-            if Self::namespace_has_table_like_object(schema, namespace.id, &name) {
-                None
-            } else if Self::namespace_has_index(schema, namespace.id, &name) {
-                Some("an index")
-            } else if schema.has_sequence(namespace.id, &name) {
-                Some("a sequence")
-            } else {
-                None
-            }
+        let is_other_relation = self.with_schema(namespace.database_id, |schema| {
+            !Self::namespace_has_table_like_object(schema, namespace.id, &name)
+                && Self::namespace_has_relation(schema, namespace.id, &name)
         });
-        match kind {
-            Some(kind) => Err(self
+        if is_other_relation {
+            return Err(self
                 .dialect
-                .wrong_relation_kind_error(format!("\"{name}\" is {kind}"))),
-            None => Ok(()),
+                .wrong_relation_kind_error(format!("cannot open relation \"{name}\"")));
         }
+        Ok(())
     }
 
     pub(crate) fn resolve_existing_table_named(&self, table_name: &str) -> Result<NamespaceRef> {
@@ -557,7 +550,7 @@ impl<'a> CatalogContext<'a> {
         if is_other_relation {
             return Err(self
                 .dialect
-                .wrong_relation_kind_error(format!("\"{seq_name}\" is not a sequence")));
+                .wrong_relation_kind_error(format!("cannot open relation \"{seq_name}\"")));
         }
         Ok(namespace)
     }
