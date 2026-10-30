@@ -1650,3 +1650,32 @@ expect {
     indexed|2024-01-01,2024-01-03
     indexed-lt|3
 }
+
+test compare-date-timestamp-subquery-and-case {
+    CREATE TABLE b (id int, ts timestamp, tz timestamptz, d date);
+    INSERT INTO b VALUES (1, '2024-01-01 00:00:00', '2024-01-01 00:00:00+00:00', '2024-01-01'),
+        (2, '2024-01-02 12:00:00', '2024-01-03 00:00:00+00:00', '2024-01-02');
+    SELECT 'ts-in-tz', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts IN (SELECT tz FROM b);
+    SELECT 'tz-in-ts', string_agg(id::text, ',' ORDER BY id) FROM b WHERE tz IN (SELECT ts FROM b);
+    SELECT 'd-in-ts', string_agg(id::text, ',' ORDER BY id) FROM b WHERE d IN (SELECT ts FROM b);
+    SELECT 'ts-not-in-d', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts NOT IN (SELECT d FROM b);
+    SELECT 'ts-in-union', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts IN (SELECT d FROM b UNION SELECT d FROM b);
+    SELECT 'ts-eq-scalar', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts = (SELECT min(d) FROM b);
+    SELECT 'ts-lt-scalar', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts < (SELECT max(d) FROM b);
+    SELECT 'case', string_agg(CASE ts WHEN d THEN 'same' ELSE 'other' END, ',' ORDER BY id) FROM b;
+    CREATE INDEX b_ts ON b (ts);
+    SELECT 'indexed-ts-in-tz', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts IN (SELECT tz FROM b);
+    SELECT 'indexed-ts-eq-scalar', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts = (SELECT min(d) FROM b);
+}
+expect {
+    ts-in-tz|1
+    tz-in-ts|1
+    d-in-ts|1
+    ts-not-in-d|2
+    ts-in-union|1
+    ts-eq-scalar|1
+    ts-lt-scalar|1
+    case|same,other
+    indexed-ts-in-tz|1
+    indexed-ts-eq-scalar|1
+}
