@@ -541,3 +541,58 @@ expect {
 	2|second
 	a"b|2
 }
+
+# A sqlite_sequence row with a NULL name belongs to no table: INSERT,
+# ALTER TABLE RENAME and DROP TABLE must leave it alone.
+@cross-check-integrity
+test autoinc-insert-skips-null-name-sequence-row {
+	CREATE TABLE t1(i INTEGER PRIMARY KEY AUTOINCREMENT);
+	CREATE TABLE t2(i INTEGER PRIMARY KEY AUTOINCREMENT);
+	CREATE TABLE t3(i INTEGER PRIMARY KEY AUTOINCREMENT);
+	INSERT INTO t1 VALUES(NULL);
+	INSERT INTO t2 VALUES(NULL);
+	INSERT INTO t3 VALUES(NULL);
+	UPDATE sqlite_sequence SET name=NULL WHERE name='t2';
+	INSERT INTO t3 VALUES(NULL);
+	SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+	1|t1|1
+	2||1
+	3|t3|2
+}
+
+@cross-check-integrity
+test autoinc-rename-skips-null-name-sequence-row {
+	CREATE TABLE t1(i INTEGER PRIMARY KEY AUTOINCREMENT);
+	CREATE TABLE t2(i INTEGER PRIMARY KEY AUTOINCREMENT);
+	CREATE TABLE t3(i INTEGER PRIMARY KEY AUTOINCREMENT);
+	INSERT INTO t1 VALUES(NULL);
+	INSERT INTO t2 VALUES(NULL);
+	INSERT INTO t3 VALUES(NULL);
+	UPDATE sqlite_sequence SET name=NULL WHERE name='t2';
+	ALTER TABLE t3 RENAME TO t4;
+	SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+	1|t1|1
+	2||1
+	3|t4|1
+}
+
+@cross-check-integrity
+test autoinc-drop-skips-null-name-sequence-row {
+	CREATE TABLE t1(i INTEGER PRIMARY KEY AUTOINCREMENT);
+	CREATE TABLE t2(i INTEGER PRIMARY KEY AUTOINCREMENT);
+	CREATE TABLE t3(i INTEGER PRIMARY KEY AUTOINCREMENT);
+	INSERT INTO t1 VALUES(NULL);
+	INSERT INTO t2 VALUES(NULL);
+	INSERT INTO t3 VALUES(NULL);
+	UPDATE sqlite_sequence SET name=NULL WHERE name='t2';
+	DROP TABLE t3;
+	SELECT rowid, name, seq FROM sqlite_sequence ORDER BY rowid;
+}
+expect {
+	1|t1|1
+	2||1
+}
