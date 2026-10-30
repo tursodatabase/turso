@@ -1,10 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -40,6 +42,8 @@ const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
 const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const QUEUED_CONNECTIONS_PER_WORKER: usize = 4;
 
 pub struct OpenConfig {
     pub vfs: Option<String>,
@@ -54,8 +58,16 @@ struct DbHandle {
 }
 
 struct OpenHandles {
-    handles: HashMap<String, Arc<DbHandle>>,
+    state: Mutex<HandleState>,
+    opened: Condvar,
     capacity: usize,
+    #[cfg(test)]
+    opens: AtomicUsize,
+}
+
+struct HandleState {
+    handles: HashMap<String, Arc<DbHandle>>,
+    opening: HashSet<String>,
 }
 
 enum DbSource {
@@ -63,7 +75,7 @@ enum DbSource {
     Dir {
         base: PathBuf,
         config: OpenConfig,
-        open_handles: Mutex<OpenHandles>,
+        open_handles: Box<OpenHandles>,
     },
 }
 
@@ -71,6 +83,19 @@ pub struct TursoSyncServer {
     address: String,
     source: DbSource,
     interrupt_count: Arc<AtomicUsize>,
+    workers: usize,
+}
+
+struct ConnectionQueue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+    capacity: usize,
+}
+
+#[derive(Default)]
+struct QueueState {
+    streams: VecDeque<TcpStream>,
+    closed: bool,
 }
 
 impl TursoSyncServer {
@@ -79,6 +104,7 @@ impl TursoSyncServer {
         db_path: String,
         conn: Arc<Connection>,
         interrupt_count: Arc<AtomicUsize>,
+        workers: usize,
     ) -> Result<Self> {
         conn.wal_auto_actions_disable();
 
@@ -89,6 +115,7 @@ impl TursoSyncServer {
                 path: db_path,
             })),
             interrupt_count,
+            workers,
         })
     }
 
@@ -97,6 +124,7 @@ impl TursoSyncServer {
         base: PathBuf,
         interrupt_count: Arc<AtomicUsize>,
         config: OpenConfig,
+        workers: usize,
     ) -> Result<Self> {
         if !base.is_dir() {
             return Err(anyhow!(
@@ -104,7 +132,7 @@ impl TursoSyncServer {
                 base.display()
             ));
         }
-        let open_handles = Mutex::new(OpenHandles::new(config.max_open));
+        let open_handles = Box::new(OpenHandles::new(config.max_open));
         Ok(Self {
             address,
             source: DbSource::Dir {
@@ -113,6 +141,7 @@ impl TursoSyncServer {
                 open_handles,
             },
             interrupt_count,
+            workers,
         })
     }
 
@@ -135,47 +164,62 @@ impl TursoSyncServer {
                 if !validate_db_name(name) {
                     return Err(text_response(400, "Invalid database name"));
                 }
-                let mut open_handles = open_handles.lock().unwrap();
-                open_handles.get_or_open(name, || {
-                    let path = db_path_for(base, name);
-                    let dir = path.parent().expect("database path has a parent directory");
-                    if !config.flags.contains(OpenFlags::ReadOnly) {
-                        if let Err(err) = std::fs::create_dir_all(dir) {
-                            error!("failed to create directory for database {name}: {err}");
-                            return Err(text_response(
-                                500,
-                                &format!("Internal Server Error: {err}"),
-                            ));
-                        }
+                let slot = match open_handles.reserve(name) {
+                    SlotRequest::AlreadyOpen(handle) => return Ok(handle),
+                    SlotRequest::Reserved(slot) => slot,
+                    SlotRequest::Full => {
+                        error!(
+                            "refusing to open {name}: {} databases are open or opening",
+                            config.max_open
+                        );
+                        return Err(text_response(503, "Too many open databases"));
                     }
-                    if !dir.canonicalize().is_ok_and(|dir| dir.starts_with(base)) {
-                        return Err(text_response(404, "Not Found"));
+                };
+                let path = db_path_for(base, name);
+                let dir = path.parent().expect("database path has a parent directory");
+                if !config.flags.contains(OpenFlags::ReadOnly) {
+                    if let Err(err) = std::fs::create_dir_all(dir) {
+                        error!("failed to create directory for database {name}: {err}");
+                        return Err(text_response(500, &format!("Internal Server Error: {err}")));
                     }
-                    match open_db_handle(&path, config) {
-                        Ok(handle) => Ok(handle),
-                        // Sync clients retry a 500 forever but can act on a 404.
-                        Err(err) if path.exists() => {
-                            error!("failed to open database {name}: {err}");
-                            Err(text_response(500, &format!("Internal Server Error: {err}")))
-                        }
-                        Err(err) => {
-                            debug!("no database named {name}: {err}");
-                            Err(text_response(404, "Not Found"))
-                        }
+                }
+                if !dir.canonicalize().is_ok_and(|dir| dir.starts_with(base)) {
+                    return Err(text_response(404, "Not Found"));
+                }
+                #[cfg(test)]
+                open_handles.opens.fetch_add(1, Ordering::SeqCst);
+                match open_db_handle(&path, config) {
+                    Ok(handle) => Ok(slot.fill(handle)),
+                    // Sync clients retry a 500 forever but can act on a 404.
+                    Err(err) if path.exists() => {
+                        error!("failed to open database {name}: {err}");
+                        Err(text_response(500, &format!("Internal Server Error: {err}")))
                     }
-                })
+                    Err(err) => {
+                        debug!("no database named {name}: {err}");
+                        Err(text_response(404, "Not Found"))
+                    }
+                }
             }
         }
     }
 
-    pub fn run(&self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
+        let listener = self.bind()?;
+        Arc::new(self).serve(listener)
+    }
+
+    fn bind(&self) -> Result<TcpListener> {
         info!("Starting TursoSyncServer on {}", self.address);
 
         let listener = TcpListener::bind(&self.address)?;
         listener.set_nonblocking(true)?;
+        Ok(listener)
+    }
 
+    fn serve(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         let interrupt_count = self.interrupt_count.clone();
-        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
         let shutdown_flag_clone = shutdown_flag.clone();
 
         let monitor_handle = thread::spawn(move || loop {
@@ -184,24 +228,36 @@ impl TursoSyncServer {
                 shutdown_flag_clone.store(true, Ordering::SeqCst);
                 break;
             }
-            thread::sleep(std::time::Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
         });
+
+        let queue = Arc::new(ConnectionQueue::new(
+            self.workers * QUEUED_CONNECTIONS_PER_WORKER,
+        ));
+        let mut workers = Vec::with_capacity(self.workers);
+        for _ in 0..self.workers {
+            let server = self.clone();
+            let queue = queue.clone();
+            workers.push(thread::spawn(move || server.work(&queue)));
+        }
 
         loop {
             if shutdown_flag.load(Ordering::SeqCst) {
                 info!("Shutdown signal received, stopping server");
                 break;
             }
+            if queue.is_full() {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
 
             match listener.accept() {
                 Ok((stream, addr)) => {
                     info!("Accepted connection from {}", addr);
-                    if let Err(e) = self.handle_connection(stream) {
-                        error!("Error handling connection: {}", e);
-                    }
+                    queue.push(stream);
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(std::time::Duration::from_millis(10));
+                    thread::sleep(Duration::from_millis(10));
                     continue;
                 }
                 Err(e) => {
@@ -210,14 +266,34 @@ impl TursoSyncServer {
             }
         }
 
+        queue.close();
+        for worker in workers {
+            let _ = worker.join();
+        }
         let _ = monitor_handle.join();
         info!("TursoSyncServer stopped");
         Ok(())
     }
 
+    fn work(self: Arc<Self>, queue: &ConnectionQueue) {
+        while let Some(stream) = queue.next() {
+            let handled =
+                std::panic::catch_unwind(AssertUnwindSafe(|| self.handle_connection(stream)));
+            match handled {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("Error handling connection: {}", e),
+                Err(_) => {
+                    error!("a request panicked, aborting rather than reusing a database connection left mid-statement");
+                    std::process::abort();
+                }
+            }
+        }
+    }
+
     fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
 
         let mut buffer = [0u8; 8192];
         let mut request_data = Vec::new();
@@ -304,7 +380,7 @@ impl TursoSyncServer {
 
         debug!("Pipeline request: {:?}", req);
 
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn.lock().expect("database connection lock poisoned");
 
         let mut results = Vec::new();
 
@@ -617,7 +693,7 @@ impl TursoSyncServer {
         req: &PullUpdatesReqProtoBody,
         apply_mode: PullUpdatesApplyMode,
     ) -> Result<HttpResponse> {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn.lock().expect("database connection lock poisoned");
 
         let wal_state = conn.wal_state()?;
         debug!("WAL state: max_frame={}", wal_state.max_frame);
@@ -753,7 +829,7 @@ impl TursoSyncServer {
         req: &PullUpdatesReqProtoBody,
     ) -> Result<HttpResponse> {
         let (db_size, fallback_revision, legacy_current_revision) = {
-            let conn = db.conn.lock().unwrap();
+            let conn = db.conn.lock().expect("database connection lock poisoned");
             let wal_state = conn.wal_state()?;
             (
                 current_db_size_pages(&conn, wal_state.max_frame)?,
@@ -959,7 +1035,7 @@ impl TursoSyncServer {
 
     #[allow(clippy::type_complexity)]
     fn read_replace_base_pages(&self, db: &DbHandle) -> Result<(u64, Vec<(u64, Vec<u8>)>)> {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn.lock().expect("database connection lock poisoned");
         let wal_state = conn.wal_state()?;
         let frame_watermark = Some(wal_state.max_frame);
         let db_size = current_snapshot_db_size_pages(&conn, wal_state.max_frame)?;
@@ -1391,29 +1467,134 @@ fn db_path_for(base: &Path, name: &str) -> PathBuf {
 impl OpenHandles {
     fn new(capacity: usize) -> Self {
         Self {
-            handles: HashMap::new(),
+            state: Mutex::new(HandleState {
+                handles: HashMap::new(),
+                opening: HashSet::new(),
+            }),
+            opened: Condvar::new(),
+            capacity,
+            #[cfg(test)]
+            opens: AtomicUsize::new(0),
+        }
+    }
+
+    fn reserve<'a>(&'a self, name: &'a str) -> SlotRequest<'a> {
+        let mut state = self.state.lock().expect("open handles lock poisoned");
+        loop {
+            if let Some(handle) = state.handles.get(name) {
+                return SlotRequest::AlreadyOpen(handle.clone());
+            }
+            if !state.opening.contains(name) {
+                break;
+            }
+            state = self.opened.wait(state).expect("open handles lock poisoned");
+        }
+        if state.handles.len() + state.opening.len() >= self.capacity {
+            return SlotRequest::Full;
+        }
+        state.opening.insert(name.to_string());
+        SlotRequest::Reserved(OpenSlot {
+            open_handles: self,
+            name,
+            filled: false,
+        })
+    }
+}
+
+enum SlotRequest<'a> {
+    AlreadyOpen(Arc<DbHandle>),
+    Reserved(OpenSlot<'a>),
+    Full,
+}
+
+struct OpenSlot<'a> {
+    open_handles: &'a OpenHandles,
+    name: &'a str,
+    filled: bool,
+}
+
+impl OpenSlot<'_> {
+    fn fill(mut self, handle: Arc<DbHandle>) -> Arc<DbHandle> {
+        let mut state = self
+            .open_handles
+            .state
+            .lock()
+            .expect("open handles lock poisoned");
+        let replaced = state.handles.insert(self.name.to_string(), handle.clone());
+        assert!(
+            replaced.is_none(),
+            "database {} was opened twice",
+            self.name
+        );
+        state.opening.remove(self.name);
+        self.filled = true;
+        self.open_handles.opened.notify_all();
+        handle
+    }
+}
+
+impl Drop for OpenSlot<'_> {
+    fn drop(&mut self) {
+        if self.filled {
+            return;
+        }
+        let mut state = self
+            .open_handles
+            .state
+            .lock()
+            .expect("open handles lock poisoned");
+        state.opening.remove(self.name);
+        self.open_handles.opened.notify_all();
+    }
+}
+
+impl ConnectionQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
             capacity,
         }
     }
 
-    fn get_or_open(
-        &mut self,
-        name: &str,
-        open: impl FnOnce() -> std::result::Result<Arc<DbHandle>, HttpResponse>,
-    ) -> std::result::Result<Arc<DbHandle>, HttpResponse> {
-        if let Some(handle) = self.handles.get(name) {
-            return Ok(handle.clone());
+    fn is_full(&self) -> bool {
+        self.locked().streams.len() >= self.capacity
+    }
+
+    fn push(&self, stream: TcpStream) {
+        let mut state = self.locked();
+        assert!(
+            state.streams.len() < self.capacity,
+            "connection queue accepted past its capacity of {}",
+            self.capacity
+        );
+        state.streams.push_back(stream);
+        self.ready.notify_one();
+    }
+
+    fn close(&self) {
+        self.locked().closed = true;
+        self.ready.notify_all();
+    }
+
+    fn next(&self) -> Option<TcpStream> {
+        let mut state = self.locked();
+        loop {
+            if let Some(stream) = state.streams.pop_front() {
+                return Some(stream);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .expect("connection queue lock poisoned");
         }
-        if self.handles.len() >= self.capacity {
-            error!(
-                "refusing to open {name}: {} databases are open",
-                self.capacity
-            );
-            return Err(text_response(503, "Too many open databases"));
-        }
-        let handle = open()?;
-        self.handles.insert(name.to_string(), handle.clone());
-        Ok(handle)
+    }
+
+    fn locked(&self) -> MutexGuard<'_, QueueState> {
+        self.state.lock().expect("connection queue lock poisoned")
     }
 }
 
@@ -1575,6 +1756,7 @@ mod tests {
     }
 
     const TEST_MAX_OPEN: usize = 4;
+    const TEST_WORKERS: usize = 4;
 
     fn dir_server(base: &Path) -> TursoSyncServer {
         TursoSyncServer::new_dir(
@@ -1587,6 +1769,7 @@ mod tests {
                 db_opts: DatabaseOpts::new(),
                 max_open: TEST_MAX_OPEN,
             },
+            TEST_WORKERS,
         )
         .unwrap()
     }
@@ -1637,6 +1820,154 @@ mod tests {
         assert!(
             !outside.path().join("data").exists(),
             "a refused name must not create files outside the served tree"
+        );
+    }
+
+    fn open_db(server: &TursoSyncServer, name: &str) -> Arc<DbHandle> {
+        match server.resolve_db(Some(name)) {
+            Ok(handle) => handle,
+            Err(refused) => panic!("{name} must open, got status {}", refused.status),
+        }
+    }
+
+    const RESPONSE_WAIT: Duration = Duration::from_secs(20);
+    const SELECT_ONE_PIPELINE: &str =
+        r#"{"requests":[{"type":"execute","stmt":{"sql":"SELECT 1"}}]}"#;
+
+    #[test]
+    fn a_request_to_one_database_does_not_wait_for_a_busy_one() {
+        let base = tempfile::TempDir::new().unwrap();
+        let server = Arc::new(dir_server(base.path()));
+        let listener = server.bind().unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let busy = open_db(&server, "busy");
+        open_db(&server, "free");
+
+        let serving = {
+            let server = server.clone();
+            thread::spawn(move || server.serve(listener).unwrap())
+        };
+
+        let busy_conn = busy.conn.lock().expect("database connection lock poisoned");
+        let mut busy_request = send_pipeline_request(address, "busy");
+        let mut free_request = send_pipeline_request(address, "free");
+
+        assert_eq!(
+            read_status(&mut free_request),
+            200,
+            "a request to an idle database must not wait for a busy one"
+        );
+
+        drop(busy_conn);
+        assert_eq!(read_status(&mut busy_request), 200);
+
+        server.interrupt_count.fetch_add(1, Ordering::SeqCst);
+        serving.join().unwrap();
+    }
+
+    fn send_pipeline_request(address: std::net::SocketAddr, db: &str) -> TcpStream {
+        let head = format!(
+            "POST /db/{db}/v2/pipeline HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            SELECT_ONE_PIPELINE.len()
+        );
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(SELECT_ONE_PIPELINE.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        stream
+    }
+
+    fn read_status(stream: &mut TcpStream) -> u16 {
+        stream.set_read_timeout(Some(RESPONSE_WAIT)).unwrap();
+        let mut response = Vec::new();
+        if let Err(err) = stream.read_to_end(&mut response) {
+            panic!("no response within {RESPONSE_WAIT:?}: {err}");
+        }
+        String::from_utf8_lossy(&response[..response.len().min(64)])
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .unwrap_or_else(|| panic!("response has no status line: {response:?}"))
+    }
+
+    #[test]
+    fn threads_racing_to_open_one_new_database_open_it_once() {
+        let base = tempfile::TempDir::new().unwrap();
+        let server = Arc::new(dir_server(base.path()));
+
+        let racers = 8;
+        let start = Arc::new(std::sync::Barrier::new(racers));
+        let opened: Vec<Arc<DbHandle>> = (0..racers)
+            .map(|_| {
+                let server = server.clone();
+                let start = start.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    open_db(&server, "shared")
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|racer| racer.join().unwrap())
+            .collect();
+
+        for handle in &opened {
+            assert!(
+                Arc::ptr_eq(handle, &opened[0]),
+                "every thread must get the same handle for one name"
+            );
+        }
+        assert_eq!(
+            databases_opened(&server),
+            1,
+            "opening one database twice would take a second file lock that the loser releases for both"
+        );
+
+        for i in 1..TEST_MAX_OPEN {
+            let name = format!("db{i}");
+            assert!(
+                server.resolve_db(Some(&name)).is_ok(),
+                "the race must leave {} free slots, {name} failed",
+                TEST_MAX_OPEN - 1
+            );
+        }
+        let Err(refused) = server.resolve_db(Some("overflow")) else {
+            panic!("a full open map must refuse an unknown database");
+        };
+        assert_eq!(refused.status, 503);
+    }
+
+    fn databases_opened(server: &TursoSyncServer) -> usize {
+        match &server.source {
+            DbSource::Dir { open_handles, .. } => open_handles.opens.load(Ordering::SeqCst),
+            DbSource::Single(_) => panic!("only a directory server opens databases by name"),
+        }
+    }
+
+    #[test]
+    fn the_accept_loop_stops_taking_connections_when_the_queue_is_full() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let queue = ConnectionQueue::new(2);
+
+        for _ in 0..2 {
+            let _client = TcpStream::connect(address).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            assert!(!queue.is_full());
+            queue.push(stream);
+        }
+        assert!(
+            queue.is_full(),
+            "two queued connections fill a queue of two"
+        );
+
+        assert!(queue.next().is_some());
+        assert!(
+            !queue.is_full(),
+            "a worker taking a connection makes room for the accept loop"
         );
     }
 }
