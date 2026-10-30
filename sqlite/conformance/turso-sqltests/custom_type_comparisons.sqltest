@@ -421,6 +421,26 @@ expect {
     trigger|grew
 }
 
+# ALTER TABLE ADD COLUMN accepts varchar without its length, so a register
+# that holds such a column's value has a type without arguments too.
+@requires strict "uses STRICT tables"
+test cmp-registers-of-type-without-arguments {
+    CREATE TABLE w(k int PRIMARY KEY) STRICT;
+    ALTER TABLE w ADD COLUMN v varchar;
+    CREATE TABLE log(msg text) STRICT;
+    CREATE TRIGGER w_grew AFTER UPDATE ON w WHEN NEW.v > OLD.v BEGIN
+        INSERT INTO log VALUES ('grew');
+    END;
+    INSERT INTO w VALUES (1, 'ab');
+    INSERT INTO w VALUES (1, 'cd') ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE excluded.v > w.v;
+    SELECT 'upsert', v FROM w;
+    SELECT 'trigger', msg FROM log;
+}
+expect {
+    upsert|cd
+    trigger|grew
+}
+
 @requires strict "uses STRICT tables"
 test cmp-foreign-key-finds-parent-by-type-order {
     -- The parent key is looked up through the PRIMARY KEY index, which is

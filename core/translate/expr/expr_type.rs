@@ -400,11 +400,15 @@ impl ColumnCustomType {
     }
 
     /// The inverse of [Self::type_name]. The name was written from a column's
-    /// type, so the type exists.
+    /// type, so the type exists. Like the column, it may leave out the type's
+    /// arguments, as `varchar` does for `varchar(maxlen)`, which a CAST can't.
     fn from_type_name(type_name: &ast::Type, schema: &Schema) -> Self {
-        match custom_cast_target(&type_name.name, type_name, schema) {
-            Some(ExprType::Custom { type_def, params }) => Self { type_def, params },
-            _ => panic!("custom type {} must exist", type_name.name),
+        let type_def = schema
+            .get_type_def_unchecked(&type_name.name)
+            .unwrap_or_else(|| panic!("custom type {} must exist", type_name.name));
+        Self {
+            type_def: Arc::clone(type_def),
+            params: written_type_params(type_name),
         }
     }
 }
@@ -601,11 +605,7 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
 /// `CAST(x AS numeric)` for `numeric(precision, scale)`, is a plain SQLite CAST.
 fn custom_cast_target(name: &str, type_name: &ast::Type, schema: &Schema) -> Option<ExprType> {
     let type_def = schema.get_type_def_unchecked(name)?;
-    let params: Vec<Box<ast::Expr>> = match &type_name.size {
-        Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
-        Some(ast::TypeSize::TypeSize(e1, e2)) => vec![e1.clone(), e2.clone()],
-        None => Vec::new(),
-    };
+    let params = written_type_params(type_name);
     let needed_params = type_def.user_params().count();
     if !type_def.is_domain && needed_params != 0 && params.len() != needed_params {
         return None;
@@ -614,6 +614,16 @@ fn custom_cast_target(name: &str, type_name: &ast::Type, schema: &Schema) -> Opt
         type_def: Arc::clone(type_def),
         params,
     })
+}
+
+/// The arguments written after a type name: `10, 2` in `numeric(10, 2)`.
+#[allow(clippy::vec_box)]
+fn written_type_params(type_name: &ast::Type) -> Vec<Box<ast::Expr>> {
+    match &type_name.size {
+        Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
+        Some(ast::TypeSize::TypeSize(e1, e2)) => vec![e1.clone(), e2.clone()],
+        None => Vec::new(),
+    }
 }
 
 fn binary_type(
