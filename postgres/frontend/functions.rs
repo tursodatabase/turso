@@ -1,7 +1,7 @@
 use crate::catalog::PG_DATABASE_OWNER_OID;
 use crate::error::sqlstate_error;
 use crate::settings::SettingScope;
-use chrono::Utc;
+use chrono::{DateTime, Datelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
@@ -9,7 +9,7 @@ use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
@@ -77,6 +77,7 @@ scalar_functions! {
     ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
     ToChar(FunctionArity::Exact(2), true),
+    ToTimestamp(FunctionArity::Exact(1), true),
     PgInputIsValid(FunctionArity::Exact(2), true),
     Textlike(FunctionArity::Exact(2), true),
     LikeEscape(FunctionArity::Exact(2), true),
@@ -137,6 +138,7 @@ impl ScalarCall for PgScalarFunction {
             }
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
+            Self::ToTimestamp => exec_to_timestamp(args[0].get_value())?,
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
             Self::Textlike => exec_textlike(args)?,
             Self::LikeEscape => exec_like_escape(args)?,
@@ -877,6 +879,46 @@ fn exec_to_char(value: &Value, format: &str) -> Value {
 
     let result = pg_to_char_numeric(num, format);
     Value::build_text(result)
+}
+
+/// `to_timestamp(double precision)`: the timestamptz that is this many seconds
+/// after 1970-01-01 00:00:00 UTC, in the text form of a stored timestamptz.
+fn exec_to_timestamp(value: &Value) -> Result<Value> {
+    let seconds = match value {
+        Value::Null => return Ok(Value::Null),
+        Value::Numeric(Numeric::Integer(i)) => *i as f64,
+        Value::Numeric(Numeric::Float(f)) => f64::from(*f),
+        // Numeric columns reach functions as text.
+        Value::Text(text) => text.as_str().trim().parse::<f64>().map_err(|_| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type double precision: \"{}\"",
+                    text.as_str()
+                ),
+            )
+        })?,
+        Value::Blob(_) => return Err(undefined_function("to_timestamp", &["bytea"])),
+    };
+    if seconds.is_nan() {
+        return Err(sqlstate_error(
+            SQLSTATE_DATETIME_FIELD_OVERFLOW,
+            "timestamp cannot be NaN".to_string(),
+        ));
+    }
+    let timestamp =
+        DateTime::from_timestamp_micros((seconds * 1_000_000.0).round_ties_even() as i64)
+            .filter(|timestamp| (1..=9999).contains(&timestamp.year()))
+            .ok_or_else(|| {
+                sqlstate_error(
+                    SQLSTATE_DATETIME_FIELD_OVERFLOW,
+                    format!("timestamp out of range: \"{seconds}\""),
+                )
+            })?;
+    let text = timestamp.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    Ok(Value::build_text(
+        text.trim_end_matches('0').trim_end_matches('.').to_string(),
+    ))
 }
 
 /// pg_input_is_valid(text, type) → boolean
