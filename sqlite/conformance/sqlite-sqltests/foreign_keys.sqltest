@@ -4891,3 +4891,17 @@ expect {
     1|2
     3|2
 }
+
+test fk-deferred-upsert-rowid-alias-child-change-creates-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(k INTEGER PRIMARY KEY REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED, a UNIQUE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c(k, a) VALUES(1, 7);
+    BEGIN;
+    INSERT INTO c(k, a) VALUES(3, 7) ON CONFLICT DO UPDATE SET k=9;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

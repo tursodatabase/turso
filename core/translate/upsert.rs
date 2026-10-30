@@ -1044,7 +1044,10 @@ pub fn emit_upsert(
             if resolver.with_schema(upsert_database_id, |s| {
                 s.has_child_fks(ctx.namespace.id, bt.name.as_str())
             }) {
-                let affected_cols = bt.columns_affected_by_update(&directly_changed_cols)?;
+                let rowid_alias_if_changed = rowid_alias_idx.filter(|_| rowid_changed);
+                let affected_cols = bt.columns_affected_by_update(
+                    directly_changed_cols.iter().chain(rowid_alias_if_changed),
+                )?;
                 emit_fk_child_update_counters(
                     program,
                     &bt,

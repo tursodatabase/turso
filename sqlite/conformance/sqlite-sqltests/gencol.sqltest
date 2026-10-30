@@ -4722,6 +4722,21 @@ expect error {
     FOREIGN KEY constraint failed
 }
 
+test fk-deferred-upsert-rowid-alias-change-fixes-virtual-col-child-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(k INTEGER PRIMARY KEY, a UNIQUE, g AS (k) REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(2);
+    BEGIN;
+    INSERT INTO c(k, a) VALUES(1, 7);
+    INSERT INTO c(k, a) VALUES(3, 7) ON CONFLICT DO UPDATE SET k=2;
+    COMMIT;
+    SELECT k, a, g FROM c;
+}
+expect {
+    2|7|2
+}
+
 test fk-upsert-virtual-col-child-of-virtual-col-without-parent {
     PRAGMA foreign_keys=ON;
     CREATE TABLE p(id PRIMARY KEY);
