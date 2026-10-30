@@ -2,12 +2,16 @@ use chumsky::{error::EmptyErr, prelude::*};
 use std::borrow::Cow;
 use std::num::NonZero;
 use std::str;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crate::catalog::{self, PostgresDialect};
-use crate::error::sqlstate_error;
+use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
 use crate::functions::{find_parameter, ConfigParameter, Parameter};
 use crate::settings::{ConnectionSettings, PgSessionState, SettingScope};
+use crate::statement::TxRole;
 use turso_core::schema::{Table, SEQ_BACKING_TABLE_PREFIX};
 use turso_core::{Connection, LimboError, Qualifier, Result, Statement, Value};
 use turso_parser::ast::{self};
@@ -20,10 +24,10 @@ use turso_pg_parser::sqlstate::{
 };
 use turso_pg_parser::translator::{
     check_set_transaction, is_comment_on, is_discard_all, is_drop_matview, is_refresh_matview,
-    is_reset_all, try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema,
-    try_extract_set, try_extract_show, unnamed_index_name, unqualified_create_table_name_location,
-    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo, PgSetValue,
-    PgShowStmt, PostgreSQLTranslator,
+    is_reset_all, is_tx_exit_stmt, try_extract_copy_from, try_extract_create_schema,
+    try_extract_drop_schema, try_extract_set, try_extract_show, unnamed_index_name,
+    unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
+    PgSetStmt, PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 use turso_pg_parser::ParseError;
 
@@ -36,6 +40,17 @@ pub struct PgConnection {
 
 struct PgConnectionInner {
     conn: Arc<Connection>,
+    tx_aborted: Arc<AtomicBool>,
+}
+
+/// The transaction state of a session as PostgreSQL reports it in
+/// ReadyForQuery: idle, inside a transaction block, or inside a failed
+/// transaction block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransactionState {
+    Idle,
+    Active,
+    Aborted,
 }
 
 const SEARCH_PATH_SETTING: &str = "search_path";
@@ -66,24 +81,22 @@ pub fn open_database_with_io(
     flags: turso_core::OpenFlags,
     opts: turso_core::DatabaseOpts,
 ) -> crate::Result<Arc<turso_core::Database>> {
-    let is_new = turso_core::is_memory_like(path) || io.open_file(path, flags, true)?.size()? == 0;
-    if !is_new {
+    let is_empty =
+        turso_core::is_memory_like(path) || io.open_file(path, flags, true)?.size()? == 0;
+    if !is_empty {
         refuse_a_file_with_tables_in_no_schema(&io, path, flags, opts)?;
     }
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    let db = turso_core::Database::open(
+    turso_core::Database::open(
         io,
         path,
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
             .db_opts(opts.with_mvcc(true)),
-    )?;
-    if is_new {
-        set_up_new_database(&db)?;
-    }
-    Ok(db)
+    )
+    .map_err(Into::into)
 }
 
 /// Refuses an existing file whose tables are in no schema before it is
@@ -111,23 +124,6 @@ fn refuse_a_file_with_tables_in_no_schema(
     Ok(())
 }
 
-/// Sets up a database that was just made: creates the schema `public`, as
-/// PostgreSQL does when a database is created. `public` is a stored
-/// namespace like any other schema, so once dropped it stays dropped, and
-/// the root namespace holds only the engine's own tables. A read-only
-/// database is left as it is.
-pub fn set_up_new_database(db: &Arc<turso_core::Database>) -> crate::Result<()> {
-    let conn = db.connect(turso_core::ConnectOpts::new())?;
-    if conn.qualifier("public").is_some() || conn.is_readonly(turso_core::MAIN_DB_ID) {
-        return Ok(());
-    }
-    match conn.create_namespace("public") {
-        Ok(_) => Ok(()),
-        Err(_) if conn.qualifier("public").is_some() => Ok(()),
-        Err(error) => Err(error.into()),
-    }
-}
-
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
         Self::connect_with(db, turso_core::ConnectOpts::new())
@@ -143,12 +139,35 @@ impl PgConnection {
         refuse_tables_in_no_schema(&conn)?;
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
-            inner: Arc::new(PgConnectionInner { conn }),
+            inner: Arc::new(PgConnectionInner {
+                conn,
+                tx_aborted: Arc::new(AtomicBool::new(false)),
+            }),
         })
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    /// Record an error the caller raised on this session's behalf before
+    /// reaching prepare — the wire server failing to parse a query string,
+    /// for example. In PostgreSQL any error inside a transaction block
+    /// aborts the block.
+    pub fn abort_transaction_block_on_error(&self) {
+        if !self.inner.conn.get_auto_commit() {
+            self.inner.tx_aborted.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn transaction_state(&self) -> TransactionState {
+        if self.inner.tx_aborted.load(Ordering::Relaxed) {
+            TransactionState::Aborted
+        } else if !self.inner.conn.get_auto_commit() {
+            TransactionState::Active
+        } else {
+            TransactionState::Idle
+        }
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> crate::Result<crate::Statement> {
@@ -159,8 +178,24 @@ impl PgConnection {
         &self,
         spec: &turso_pg_parser::copy::CopyToStdout,
     ) -> crate::Result<crate::Statement> {
-        crate::copy::prepare_copy_to_stdout(&self.inner.conn, spec)
-            .map(crate::Statement::new)
+        // Same aborted-block rules as prepare_statement: COPY is rejected
+        // with 25P02 while the block is aborted, and a prepare error inside
+        // a transaction block aborts it.
+        if self.inner.tx_aborted.load(Ordering::Relaxed) {
+            return Err(in_failed_sql_transaction_error().into());
+        }
+        let result = crate::copy::prepare_copy_to_stdout(&self.inner.conn, spec);
+        if result.is_err() && !self.inner.conn.get_auto_commit() {
+            self.inner.tx_aborted.store(true, Ordering::Relaxed);
+        }
+        result
+            .map(|stmt| {
+                crate::Statement::new(stmt).with_tx_tracking(
+                    Arc::clone(&self.inner.conn),
+                    Arc::clone(&self.inner.tx_aborted),
+                    TxRole::Other,
+                )
+            })
             .map_err(Into::into)
     }
 
@@ -244,16 +279,9 @@ pub fn split_statements(sql: &str) -> crate::Result<Vec<String>> {
 /// A database whose tables are in the root namespace, in no schema, was
 /// made by an earlier version of tursopg or by SQLite. This version keeps
 /// every table in a schema and would hide those, so it refuses the
-/// database instead. A database that has a schema, or none and no tables,
-/// is opened as it is: a dropped `public` is not recreated.
+/// database instead.
 fn refuse_tables_in_no_schema(conn: &Arc<Connection>) -> Result<()> {
-    if conn.qualifier("public").is_some() {
-        return Ok(());
-    }
     let schema = conn.current_schema();
-    if schema.namespaces().next().is_some() {
-        return Ok(());
-    }
     let has_tables_in_no_schema = schema
         .tables(turso_core::NamespaceId::ROOT)
         .any(|table| table.btree().is_some() && !catalog::is_system_table_name(table.get_name()))
@@ -275,11 +303,38 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
             "The supplied SQL string contains no statements".to_string(),
         ));
     }
+    let result = prepare_statement_inner(pg_conn, sql);
+    // In PostgreSQL any error inside a transaction block aborts the block,
+    // including errors raised before execution: syntax errors, unknown
+    // objects, unsupported statements.
+    if result.is_err() && !pg_conn.conn.get_auto_commit() {
+        pg_conn.tx_aborted.store(true, Ordering::Relaxed);
+    }
+    result
+}
+
+fn prepare_statement_inner(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+) -> Result<crate::Statement> {
+    // In an aborted transaction block PostgreSQL accepts only the statements
+    // that end it and rejects everything else with 25P02.
+    if pg_conn.tx_aborted.load(Ordering::Relaxed) {
+        let parse_result =
+            turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        if !is_tx_exit_stmt(&parse_result) {
+            return Err(in_failed_sql_transaction_error());
+        }
+    }
 
     reject_sqlite_catalog_access(sql)?;
 
     if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
-        return Ok(stmt);
+        return Ok(stmt.with_tx_tracking(
+            Arc::clone(&pg_conn.conn),
+            Arc::clone(&pg_conn.tx_aborted),
+            TxRole::Other,
+        ));
     }
 
     let parse_result =
@@ -314,12 +369,16 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
 
+    let conn = Arc::clone(&pg_conn.conn);
+    let tx_aborted = Arc::clone(&pg_conn.tx_aborted);
+    let role = tx_role(translated.cmd.stmt());
+
     if translated.prereqs.is_empty() {
         return pg_conn
             .conn
             .prepare_translated_cmd(translated.cmd, &sql)
             .map_err(schema_error)
-            .map(crate::Statement::new);
+            .map(|s| crate::Statement::new(s).with_tx_tracking(conn, tx_aborted, role));
     }
 
     // Validate prerequisites and the target command during prepare without
@@ -345,7 +404,21 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<crat
         Box::new(move |inner| {
             execute_cmd_with_prereqs(&pg_conn, &prereqs, &cmd, &sql_owned, inner)
         }),
-    ))
+    )
+    .with_tx_tracking(conn, tx_aborted, role))
+}
+
+fn tx_role(stmt: &ast::Stmt) -> TxRole {
+    match stmt {
+        ast::Stmt::Begin { .. } => TxRole::Begin,
+        ast::Stmt::Commit { .. } => TxRole::Commit,
+        ast::Stmt::Rollback {
+            savepoint_name: Some(_),
+            ..
+        } => TxRole::RollbackToSavepoint,
+        ast::Stmt::Rollback { .. } => TxRole::Rollback,
+        _ => TxRole::Other,
+    }
 }
 
 const PG_STMT_SAVEPOINT: &str = "__turso_pg_stmt";
@@ -1395,7 +1468,6 @@ fn get_table_columns(
 #[cfg(test)]
 mod tests {
     use super::{open_database_with_io, search_path_parser, PgConnection};
-    use crate::session::set_up_new_database;
     use crate::PostgresDialect;
     use chumsky::Parser;
     use std::sync::Arc;
@@ -1410,7 +1482,6 @@ mod tests {
                 .db_opts(DatabaseOpts::new().with_views(true)),
         )
         .unwrap();
-        set_up_new_database(&db).unwrap();
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute(
             "CREATE SCHEMA app; \
@@ -1450,7 +1521,6 @@ mod tests {
                 .db_opts(DatabaseOpts::new().with_views(true)),
         )
         .unwrap();
-        set_up_new_database(&db).unwrap();
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute(
             "CREATE VIEW aliased AS SELECT a.nspname FROM pg_namespace a JOIN pg_namespace b ON a.oid = b.oid; \
@@ -1484,7 +1554,6 @@ mod tests {
                 .db_opts(DatabaseOpts::new().with_views(true)),
         )
         .unwrap();
-        set_up_new_database(&db).unwrap();
         let conn = PgConnection::connect(&db).unwrap();
         conn.execute(
             "CREATE TABLE t (a int); \
@@ -1532,7 +1601,6 @@ mod tests {
                     .db_opts(DatabaseOpts::new().with_attach(true)),
             )
             .unwrap();
-            set_up_new_database(&db).unwrap();
             let conn = PgConnection::connect(&db).unwrap();
             conn.execute("CREATE SCHEMA s").unwrap();
             assert!(

@@ -572,11 +572,22 @@ impl Limbo {
         };
 
         let conn = self.conn.clone();
-        let runner = conn.query_runner(input.as_bytes());
         let had_error_before = self.had_query_error;
         let capture_stats = self.opts.stats;
         let mut last_stmt_metrics = None;
-        for mut output in runner {
+        let mut remaining = input;
+        loop {
+            let mut output = match conn.consume_stmt(remaining) {
+                Ok(Some((stmt, offset))) => {
+                    remaining = &remaining[offset..];
+                    Ok(Some(stmt))
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    remaining = "";
+                    Err(err)
+                }
+            };
             if let Ok(Some(ref mut stmt)) = output {
                 if let Err(err) = self.apply_parameter_bindings(stmt) {
                     output = Err(err);

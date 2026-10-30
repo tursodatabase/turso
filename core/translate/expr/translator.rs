@@ -472,7 +472,8 @@ fn translate_subquery_result_expr(
                     rhs: column_check_reg,
                     target_pc: label_null_checks_next,
                     flags: CmpInsFlags::default().with_affinity(affinity),
-                    collation: expr_collation(lhs_columns[i], referenced_tables, resolver)?,
+                    collation: ExprContext::new(referenced_tables, resolver)
+                        .expr_collation(lhs_columns[i])?,
                 });
             }
             // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
@@ -697,15 +698,14 @@ fn translate_case_expr(
                         base.as_deref()
                             .expect("base_reg is set only with a base expression"),
                         when_expr.as_ref(),
-                        referenced_tables,
-                        Some(resolver),
+                        &ExprContext::new(referenced_tables, resolver),
                     )),
                 collation: comparison_collation(
                     base.as_deref()
                         .expect("base_reg is set only with a base expression"),
                     when_expr,
-                    referenced_tables,
-                    resolver,
+                    &ExprContext::new(referenced_tables, resolver),
+                    &resolver.catalog,
                 )?,
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
@@ -796,49 +796,37 @@ fn translate_cast_expr(
                 None => Vec::new(),
             };
 
-            // Domains: apply parent encode chain, then validate constraints
-            // on the encoded value (domain CHECK sees the stored representation).
+            // Domains: store the value as a column of the domain does, which
+            // runs the ENCODE and COERCE of the types under it, then check
+            // the domain's constraints on the stored value.
             if resolved.is_domain() {
-                // Apply encode from parent custom types (domain itself has encode: None)
-                for td in &resolved.chain {
-                    if let Some(encode_expr) = td.encode() {
-                        emit_type_expr(
-                            program,
-                            encode_expr,
-                            target_register,
-                            target_register,
-                            &[],
-                            td,
-                            resolver,
-                        )?;
-                    }
-                }
+                emit_store_value(
+                    program,
+                    &resolved.chain,
+                    target_register,
+                    &ty_params,
+                    resolver,
+                )?;
 
                 // Validate domain constraints on the encoded value
                 emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
                 return Ok(target_register);
             }
 
-            let type_def = resolved.leaf();
-            // If the custom type requires parameters but the CAST
-            // doesn't provide them (e.g. CAST(x AS NUMERIC) vs
-            // CAST(x AS numeric(10,2))), fall through to regular CAST.
-            let user_param_count = type_def.user_params().count();
+            // CAST gives the stored form: CAST(42 AS cents) → 4200. With type
+            // arguments it applies their limits too, as storing in a column
+            // of that type does: CAST('3.504' AS numeric(10,2)) is 3.50. A
+            // type that takes arguments, named without all of them, is
+            // SQLite's CAST: CAST(x AS NUMERIC) is a common SQLite idiom.
+            let user_param_count = resolved.leaf().user_params().count();
             if user_param_count == 0 || ty_params.len() == user_param_count {
-                // CAST to custom type applies only the encode function,
-                // producing the stored representation.
-                // e.g. CAST(42 AS cents) → 4200
-                if let Some(encode_expr) = type_def.encode() {
-                    emit_type_expr(
-                        program,
-                        encode_expr,
-                        target_register,
-                        target_register,
-                        &ty_params,
-                        type_def,
-                        resolver,
-                    )?;
-                }
+                emit_store_value(
+                    program,
+                    &resolved.chain[..1],
+                    target_register,
+                    &ty_params,
+                    resolver,
+                )?;
                 return Ok(target_register);
             }
         }
@@ -902,8 +890,9 @@ fn translate_function_call_expr(
     let func = func_type.unwrap();
     let collation = if func.needs_collation() {
         first_collation(
-            args.iter().map(|arg| (arg.as_ref(), referenced_tables)),
-            resolver,
+            args.iter()
+                .map(|arg| (arg.as_ref(), ExprContext::new(referenced_tables, resolver))),
+            &resolver.catalog,
         )?
     } else {
         CollationSeq::Binary
@@ -1935,6 +1924,7 @@ fn translate_function_call_expr(
                 | ScalarFunc::IntToBoolean
                 | ScalarFunc::ValidateIpAddr
                 | ScalarFunc::NumericEncode
+                | ScalarFunc::NumericFit
                 | ScalarFunc::NumericDecode
                 | ScalarFunc::NumericAdd
                 | ScalarFunc::NumericSub
@@ -2323,7 +2313,9 @@ fn translate_id_expr(
         });
         return Ok(target_register);
     }
-    if !resolver.dqs_dml.is_enabled() {
+    // As in SQLite, only a double-quoted name may be read as a string, so in a
+    // custom type's `ENCODE value * f` an unknown `f` is an error, not 'f'.
+    if !resolver.dqs_dml.is_enabled() || !id.quoted_with('"') {
         crate::bail_parse_error!("no such column: {}", id.as_str());
     }
     // DQS enabled: treat double-quoted identifiers as string literals (SQLite compatibility)

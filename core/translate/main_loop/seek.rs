@@ -51,28 +51,24 @@ fn encode_seek_keys_for_custom_types(
         else {
             continue;
         };
-        if resolved.chain.iter().all(|td| td.encode().is_none()) {
+        if resolved.chain.iter().all(|td| !td.has_encode_or_coerce()) {
             continue;
         }
+        // The index holds stored values, so the key goes through the same
+        // ENCODE and COERCE steps as a stored value.
         let reg = start_reg + i;
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IsNull {
             reg,
             target_pc: skip_label,
         });
-        for td in &resolved.chain {
-            if let Some(encode_expr) = td.encode() {
-                crate::translate::expr::emit_type_expr(
-                    program,
-                    encode_expr,
-                    reg,
-                    reg,
-                    &table_col.ty_params,
-                    td,
-                    resolver,
-                )?;
-            }
-        }
+        crate::translate::expr::emit_store_value(
+            program,
+            &resolved.chain,
+            reg,
+            &table_col.ty_params,
+            resolver,
+        )?;
         program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())

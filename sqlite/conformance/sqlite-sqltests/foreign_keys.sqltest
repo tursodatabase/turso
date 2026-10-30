@@ -4835,3 +4835,19 @@ snapshot fk-upsert-column-no-child-points-at {
 snapshot fk-upsert-parent-key-with-cascade-child {
     INSERT INTO parent(id, k, v) VALUES (1, 10, 2) ON CONFLICT(id) DO UPDATE SET k = excluded.k;
 }
+
+test fk-delete-mixed-case-parent {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE "Mixed Parent" (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (parent_id INTEGER REFERENCES "Mixed Parent" (id) ON DELETE CASCADE);
+    INSERT INTO "Mixed Parent" VALUES (1), (2);
+    INSERT INTO child VALUES (1), (2);
+    DELETE FROM "Mixed Parent" WHERE id = 1;
+    SELECT parent_id FROM child;
+    DELETE FROM "Mixed Parent";
+    SELECT count(*) FROM child;
+}
+expect {
+    2
+    0
+}

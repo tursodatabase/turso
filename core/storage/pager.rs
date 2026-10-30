@@ -1634,6 +1634,10 @@ pub struct Pager {
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
+    /// Counts every `add_dirty` call, monotonically: the dirty-page set
+    /// itself cannot tell whether a page was dirtied in a time window,
+    /// because spills shrink it.
+    pages_dirtied_count: AtomicU64,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
@@ -1942,6 +1946,7 @@ impl Pager {
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
+            pages_dirtied_count: AtomicU64::new(0),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
@@ -3903,6 +3908,7 @@ impl Pager {
             { "page_id": page.get().id() }
         );
         self.subjournal_page_if_required(page)?;
+        self.pages_dirtied_count.fetch_add(1, Ordering::Relaxed);
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id() as u32);
         // Notify cache before marking dirty (page was evictable, now it won't be)
@@ -3917,6 +3923,10 @@ impl Pager {
         }
         page.set_dirty();
         Ok(())
+    }
+
+    pub(crate) fn pages_dirtied_count(&self) -> u64 {
+        self.pages_dirtied_count.load(Ordering::Relaxed)
     }
 
     pub fn wal_state(&self) -> Result<WalState> {

@@ -292,12 +292,99 @@ fn open_without_mvcc(path: &Path) -> Arc<Connection> {
     db.connect(turso_core::ConnectOpts::new()).unwrap()
 }
 
+/// Opens `path` with the PostgreSQL dialect through the engine alone, as a
+/// program that embeds it does, without the frontend's open functions.
+fn open_through_the_engine(path: &Path, mvcc: bool) -> Arc<Connection> {
+    let db = turso_core::Database::open(
+        Arc::new(turso_core::PlatformIO::new().unwrap()),
+        path.to_str().unwrap(),
+        turso_core::OpenOptions::new(Arc::new(turso_pg::PostgresDialect))
+            .db_opts(turso_core::DatabaseOpts::new().with_mvcc(mvcc)),
+    )
+    .unwrap();
+    db.connect(turso_core::ConnectOpts::new()).unwrap()
+}
+
+fn has_namespaces_table(conn: &Arc<Connection>) -> bool {
+    query_i64(
+        conn,
+        "SELECT count(*) FROM sqlite_schema WHERE name = '__turso_internal_namespaces'",
+    ) == 1
+}
+
+#[test]
+fn a_new_database_has_public_without_storing_it() {
+    for mvcc in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("main.db");
+        let conn = open_through_the_engine(&path, mvcc);
+        let public = Some(Qualifier::in_main("public", NamespaceId::new(1)));
+        assert_eq!(conn.qualifier("public"), public, "mvcc={mvcc}");
+        conn.execute("CREATE TABLE public.t(x INTEGER); INSERT INTO public.t VALUES(7)")
+            .unwrap();
+        assert!(!has_namespaces_table(&conn), "mvcc={mvcc}");
+        drop(conn);
+
+        let conn = open_through_the_engine(&path, mvcc);
+        assert_eq!(conn.qualifier("public"), public, "mvcc={mvcc}");
+        assert_eq!(query_i64(&conn, "SELECT x FROM public.t"), 7, "mvcc={mvcc}");
+    }
+}
+
+#[test]
+fn dropping_public_in_a_new_database_stores_that_it_is_gone() {
+    for mvcc in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("main.db");
+        let conn = open_through_the_engine(&path, mvcc);
+        conn.drop_namespace("public").unwrap();
+        assert_eq!(conn.qualifier("public"), None, "mvcc={mvcc}");
+        drop(conn);
+
+        let conn = open_through_the_engine(&path, mvcc);
+        assert_eq!(conn.qualifier("public"), None, "mvcc={mvcc}");
+        assert!(has_namespaces_table(&conn), "mvcc={mvcc}");
+        assert_eq!(
+            query_i64(&conn, "SELECT count(*) FROM __turso_internal_namespaces"),
+            0,
+            "mvcc={mvcc}"
+        );
+    }
+}
+
+#[test]
+fn the_first_schema_of_a_new_database_stores_public_with_it() {
+    for mvcc in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("main.db");
+        let conn = open_through_the_engine(&path, mvcc);
+        conn.create_namespace("app").unwrap();
+        drop(conn);
+
+        let conn = open_through_the_engine(&path, mvcc);
+        assert_eq!(
+            conn.qualifier("public"),
+            Some(Qualifier::in_main("public", NamespaceId::new(1))),
+            "mvcc={mvcc}"
+        );
+        assert_eq!(
+            conn.qualifier("app"),
+            Some(Qualifier::in_main("app", NamespaceId::new(2))),
+            "mvcc={mvcc}"
+        );
+        assert_eq!(
+            query_i64(&conn, "SELECT count(*) FROM __turso_internal_namespaces"),
+            2,
+            "mvcc={mvcc}"
+        );
+    }
+}
+
 #[test]
 fn a_materialized_view_of_a_namespace_is_maintained_and_survives_reopening() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("main.db");
     let conn = open_without_mvcc(&path);
-    conn.create_namespace("public").unwrap();
     conn.create_namespace("app").unwrap();
     conn.execute("CREATE TABLE public.t(x INTEGER); CREATE TABLE app.t(x INTEGER)")
         .unwrap();

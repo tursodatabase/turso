@@ -1,5 +1,6 @@
+use crate::functions::printf::exec_printf_values;
 use crate::io::clock::Clock;
-use crate::numeric::Numeric;
+use crate::numeric::{format_float, Numeric};
 use crate::types::AsValueRef;
 use crate::types::{TextRef, TextSubtype, Value};
 use crate::vdbe::affinity::is_space;
@@ -1274,6 +1275,7 @@ where
     let fmt_str = match arg_as_text(fmt_val.as_value_ref()) {
         ValueRef::Text(s) => Cow::Borrowed(s.as_str()),
         ValueRef::Null => return Value::Null,
+        ValueRef::Numeric(Numeric::Float(f)) => Cow::Owned(format_float(f64::from(f))),
         val => Cow::Owned(val.to_string()),
     };
 
@@ -1412,14 +1414,10 @@ where
                 write!(res, "{:03}", days_after_jan1(&p) + 1).unwrap();
             }
             Some('J') => {
-                let val = p.i_jd as f64 / 86400000.0;
-                if val.abs() >= 1_000_000.0 && val.abs() < 10_000_000.0 {
-                    let s = format!("{val:.9}");
-                    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-                    write!(res, "{trimmed}").unwrap();
-                } else {
-                    write!(res, "{val}").unwrap();
-                }
+                let val = Value::from_f64(p.i_jd as f64 / 86400000.0);
+                let julian_day = exec_printf_values(&Value::build_text("%.16g"), &[&val])
+                    .expect("%.16g of a float cannot fail");
+                write!(res, "{julian_day}").unwrap();
             }
             Some('k') => write!(res, "{:2}", p.h).unwrap(),
             Some('l') => {

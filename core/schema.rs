@@ -241,6 +241,7 @@ pub enum TypeDefKind {
         params: std::vec::Vec<ast::TypeParam>,
         base: String,
         encode: Option<Box<ast::Expr>>,
+        coerce: Option<Box<ast::Expr>>,
         decode: Option<Box<ast::Expr>>,
         operators: std::vec::Vec<TypeOperator>,
         default: Option<Box<ast::Expr>>,
@@ -335,6 +336,19 @@ impl TypeDef {
         }
     }
 
+    /// Returns the coerce expression (Custom types only).
+    pub fn coerce(&self) -> Option<&ast::Expr> {
+        match &self.kind {
+            TypeDefKind::Custom { coerce, .. } => coerce.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Whether storing a value of this type may change it.
+    pub fn has_encode_or_coerce(&self) -> bool {
+        self.encode().is_some() || self.coerce().is_some()
+    }
+
     /// Returns the decode expression (Custom types only).
     pub fn decode(&self) -> Option<&ast::Expr> {
         match &self.kind {
@@ -420,25 +434,32 @@ impl TypeDef {
                 params,
                 base,
                 encode,
+                coerce,
                 decode,
                 operators,
                 default,
-            } => Self {
-                name: type_name.to_string(),
-                is_builtin,
-                not_null: false,
-                is_domain: false,
-                sql,
-                domain_checks: std::vec::Vec::new(),
-                kind: TypeDefKind::Custom {
-                    params: params.clone(),
-                    base: base.clone(),
-                    encode: encode.clone(),
-                    decode: decode.clone(),
-                    operators: operators.clone(),
-                    default: default.clone(),
-                },
-            },
+            } => {
+                // CREATE TYPE checks where type parameters are used. A type
+                // already stored by an earlier version is loaded unchecked, so
+                // the database still opens and DROP TYPE can remove it.
+                Self {
+                    name: type_name.to_string(),
+                    is_builtin,
+                    not_null: false,
+                    is_domain: false,
+                    sql,
+                    domain_checks: std::vec::Vec::new(),
+                    kind: TypeDefKind::Custom {
+                        params: params.clone(),
+                        base: base.clone(),
+                        encode: encode.clone(),
+                        coerce: coerce.clone(),
+                        decode: decode.clone(),
+                        operators: operators.clone(),
+                        default: default.clone(),
+                    },
+                }
+            }
             ast::CreateTypeBody::Struct(fields) => {
                 let struct_fields: Vec<StructFieldDef> = fields
                     .iter()
@@ -522,6 +543,7 @@ impl TypeDef {
                 params: std::vec::Vec::new(),
                 base: base_type.to_string(),
                 encode: None,
+                coerce: None,
                 decode: None,
                 operators: std::vec::Vec::new(),
                 default,
@@ -552,6 +574,39 @@ impl TypeDef {
     pub fn to_sql(&self) -> &str {
         &self.sql
     }
+}
+
+/// The type parameters, such as numeric's precision and scale, limit what a
+/// column may store, so only COERCE may read them. ENCODE also converts index
+/// seek keys and operator arguments, which are compared and never limited: on a
+/// numeric(10,2) column `n = 3.504` matches no row instead of matching 3.50.
+pub(crate) fn check_type_param_use(
+    params: &[ast::TypeParam],
+    encode: &Option<Box<ast::Expr>>,
+    decode: &Option<Box<ast::Expr>>,
+) -> crate::Result<()> {
+    let type_params: std::vec::Vec<String> = params
+        .iter()
+        .map(|p| normalize_ident(&p.name))
+        .filter(|name| name != "value")
+        .collect();
+    for (clause, expr) in [("ENCODE", encode), ("DECODE", decode)] {
+        let Some(expr) = expr else {
+            continue;
+        };
+        walk_expr(expr, &mut |e| {
+            if let Expr::Id(name) | Expr::Name(name) = e {
+                let name = normalize_ident(name.as_str());
+                if type_params.contains(&name) {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "{clause} cannot use type parameter \"{name}\": only COERCE can"
+                    )));
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(())
 }
 
 /// A materialized view the loader met, before it is built: its namespace,
@@ -798,6 +853,10 @@ pub struct Schema {
     /// under their mangled names, as the dialect of the database says.
     supports_namespaces: bool,
 
+    /// The namespaces of a database without a namespaces table, as the
+    /// dialect of the database says.
+    default_namespaces: &'static [&'static str],
+
     /// Whether the names of the namespaces are loaded. They come from the
     /// namespaces table, which is read after the schema rows.
     namespace_names_loaded: bool,
@@ -893,7 +952,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
+        "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
         "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '+' date_plus OPERATOR '-' date_minus OPERATOR '<'",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
@@ -906,14 +965,14 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
         "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
         "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
+        "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'",
         "CREATE TYPE bigint(value integer) BASE integer",
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
         "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
-        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
     ];
 
     for sql in type_sqls {
@@ -997,6 +1056,7 @@ impl Schema {
             dropped_root_pages: HashSet::default(),
             type_registry,
             supports_namespaces: dialect.supports_namespaces(),
+            default_namespaces: dialect.default_namespaces(),
             namespace_names_loaded: !dialect.supports_namespaces(),
             pending_materialized_views: None,
         };
@@ -1084,10 +1144,18 @@ impl Schema {
 
     /// Records the names of the namespaces from the `(id, name)` rows of the
     /// namespaces table, and builds the materialized views that waited for
-    /// them. A schema that does not support namespaces has none.
+    /// them. A database without a namespaces table has the default
+    /// namespaces. A schema that does not support namespaces has none.
     pub fn load_namespace_names(&mut self, rows: &[(i64, String)]) -> Result<()> {
         if !self.supports_namespaces {
             return Ok(());
+        }
+        if !self.has_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME) {
+            turso_assert!(rows.is_empty(), "namespace rows without a namespaces table");
+            for (index, name) in self.default_namespaces.iter().enumerate() {
+                let id = u32::try_from(index + 1).expect("few default namespaces");
+                self.name_namespace(NamespaceId::new(id), name);
+            }
         }
         for (id, name) in rows {
             let id = u32::try_from(*id)
@@ -3044,6 +3112,7 @@ impl Schema {
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
+                declared_name: view_name.clone(),
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
@@ -3334,6 +3403,8 @@ impl Schema {
                     let (namespace, table_name) = self.demangle_name(&table.name);
                     if !namespace.is_root() {
                         table.name = table_name.to_string();
+                        table.declared_name =
+                            self.demangle_name(&table.declared_name).1.to_string();
                         self.add_namespace_of_object(namespace);
                     }
                     // Detect sequence-backing tables by name prefix.
@@ -3995,6 +4066,7 @@ impl TryClone for BTreeTable {
         Ok(Self {
             root_page: self.root_page,
             name: self.name.clone(),
+            declared_name: self.declared_name.clone(),
             primary_key_columns: self.primary_key_columns.try_clone()?,
             primary_key_is_inline: self.primary_key_is_inline,
             columns: self.columns.try_clone()?,
@@ -4097,6 +4169,7 @@ impl TryClone for Schema {
             schema_version: self.schema_version,
             analyze_stats: self.analyze_stats.clone(),
             supports_namespaces: self.supports_namespaces,
+            default_namespaces: self.default_namespaces,
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
@@ -4629,6 +4702,7 @@ impl GeneratedColGraph {
 pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
+    pub declared_name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     pub primary_key_is_inline: bool,
     columns: Vec<Column>,
@@ -4707,6 +4781,7 @@ impl BTreeTable {
             );
         Self {
             root_page,
+            declared_name: name.clone(),
             name,
             primary_key_columns,
             primary_key_is_inline,
@@ -6054,7 +6129,7 @@ pub fn create_table(
                         is_primary_key: true,
                         is_inline: false,
                         conflict_clause: *conflict_clause,
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     })?;
                 } else if let ast::TableConstraint::Unique {
                     columns,
@@ -6087,7 +6162,7 @@ pub fn create_table(
                         is_primary_key: false,
                         is_inline: false,
                         conflict_clause: *conflict_clause,
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     };
                     unique_sets_constraints.try_push(unique_set)?;
                 } else if let ast::TableConstraint::ForeignKey {
@@ -6132,7 +6207,7 @@ pub fn create_table(
                         None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
                     };
                     let fk = ForeignKey {
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                         parent_table,
                         parent_namespace,
                         parent_columns,
@@ -6280,10 +6355,7 @@ pub fn create_table(
                                 is_primary_key: true,
                                 is_inline: true,
                                 conflict_clause: *conflict_clause,
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
                         }
                         ast::ColumnConstraint::NotNull {
@@ -6313,10 +6385,7 @@ pub fn create_table(
                                 is_primary_key: false,
                                 is_inline: true,
                                 conflict_clause: *conflict,
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
@@ -6343,10 +6412,7 @@ pub fn create_table(
                             let (parent_namespace, parent_table) =
                                 demangle_name(supports_namespaces, &mangled_parent_table);
                             let fk = ForeignKey {
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                                 parent_table: parent_table.to_string(),
                                 parent_namespace,
                                 parent_columns: clause
@@ -6546,6 +6612,7 @@ pub fn create_table(
     let mut table = BTreeTable {
         root_page,
         name: table_name,
+        declared_name: tbl_name.to_owned(),
         has_rowid,
         primary_key_columns,
         primary_key_is_inline,
@@ -7317,6 +7384,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
     Ok(BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
+        declared_name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
         has_autoincrement: false,
@@ -8778,6 +8846,7 @@ mod tests {
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
+            declared_name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
@@ -9617,7 +9686,7 @@ mod tests {
 
     #[test]
     fn test_named_unique_constraint_stores_constraint_name() {
-        let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT t_u_code_uq UNIQUE);"#;
+        let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT "T_U Code UQ" UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0).unwrap();
         let unique_set = table
             .unique_sets
@@ -9626,7 +9695,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             unique_set.constraint_name,
-            Some("t_u_code_uq".to_string()),
+            Some("T_U Code UQ".to_string()),
             "named UNIQUE constraint must store the constraint name"
         );
 
@@ -9641,7 +9710,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             index.constraint_name,
-            Some("t_u_code_uq".to_string()),
+            Some("T_U Code UQ".to_string()),
             "index built from named UNIQUE constraint must carry the constraint name"
         );
     }
@@ -9649,14 +9718,14 @@ mod tests {
     #[test]
     fn named_primary_and_foreign_keys_survive_sql_reconstruction() {
         for original_sql in [
-            "CREATE TABLE child (id INTEGER CONSTRAINT custom_pk PRIMARY KEY, pid INTEGER CONSTRAINT custom_fk REFERENCES parent(id))",
-            "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT custom_pk PRIMARY KEY (id, pid), CONSTRAINT custom_fk FOREIGN KEY (pid) REFERENCES parent(id))",
+            "CREATE TABLE child (id INTEGER CONSTRAINT \"Custom PK\" PRIMARY KEY, pid INTEGER CONSTRAINT \"Custom FK\" REFERENCES parent(id))",
+            "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT \"Custom PK\" PRIMARY KEY (id, pid), CONSTRAINT \"Custom FK\" FOREIGN KEY (pid) REFERENCES parent(id))",
         ] {
             let table = BTreeTable::from_sql(original_sql, 1).unwrap();
             let sql = table.to_sql();
             let restored = BTreeTable::from_sql(&sql, 1).unwrap();
-            assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("custom_pk"), "{sql}");
-            assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("custom_fk"), "{sql}");
+            assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("Custom PK"), "{sql}");
+            assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("Custom FK"), "{sql}");
         }
     }
 

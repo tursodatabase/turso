@@ -924,7 +924,9 @@ fn emit_update_column_values<'a>(
                                 .resolve_type_unchecked(&table_column.ty_str)
                                 .ok()
                                 .flatten()
-                                .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
+                                .is_some_and(|r| {
+                                    r.chain.iter().any(|td| td.has_encode_or_coerce())
+                                });
                             let translate_result = if has_custom_encode {
                                 translate_expr_no_constant_opt(
                                     program,
@@ -1820,6 +1822,7 @@ fn emit_update_insns<'a>(
 
             let check_constraint_tables =
                 TableReferences::new(vec![target_table.as_ref().clone()], vec![]);
+            let check_halt_on_error = program.constraint_halt_on_error(or_conflict);
             emit_check_constraints(
                 program,
                 &relevant_checks,
@@ -1842,6 +1845,7 @@ fn emit_update_insns<'a>(
                     }),
                 connection,
                 or_conflict,
+                check_halt_on_error,
                 skip_row_label,
                 Some(&check_constraint_tables),
             )?;

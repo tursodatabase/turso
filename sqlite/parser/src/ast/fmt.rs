@@ -716,6 +716,7 @@ impl ToTokens for Stmt {
                         params,
                         base,
                         encode,
+                        coerce,
                         decode,
                         operators,
                         default,
@@ -741,6 +742,11 @@ impl ToTokens for Stmt {
                         if let Some(ref encode) = encode {
                             s.append(TK_ID, Some("ENCODE"))?;
                             encode.to_tokens(s, context)?;
+                        }
+                        // COERCE
+                        if let Some(ref coerce) = coerce {
+                            s.append(TK_ID, Some("COERCE"))?;
+                            coerce.to_tokens(s, context)?;
                         }
                         // DECODE
                         if let Some(ref decode) = decode {

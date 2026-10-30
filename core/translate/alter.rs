@@ -437,6 +437,13 @@ pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
         ast::Expr::Literal(literal) => literal_default_value(literal),
         ast::Expr::Id(name) => Ok(Value::from_text(name.as_str().to_string())),
         ast::Expr::Unary(op, inner) => {
+            if let (ast::UnaryOperator::Negative, ast::Expr::Literal(ast::Literal::Numeric(text))) =
+                (op, inner.as_ref())
+            {
+                if !text.starts_with("0x") && !text.starts_with("0X") {
+                    return parse_numeric_literal(&format!("-{text}"));
+                }
+            }
             let value = eval_constant_default_value(inner)?;
             match (op, value) {
                 (ast::UnaryOperator::Positive, value) => Ok(value),
@@ -677,6 +684,7 @@ fn emit_column_constraints_validation(
         );
         let mut check_resolver = resolver.fork();
         let skip_row_label = program.allocate_label();
+        let check_halt_on_error = program.constraint_halt_on_error(ast::ResolveType::Abort);
         emit_check_constraints(
             program,
             &check_constraints,
@@ -695,6 +703,7 @@ fn emit_column_constraints_validation(
                 }),
             connection,
             ast::ResolveType::Abort,
+            check_halt_on_error,
             skip_row_label,
             Some(&table_references),
         )?;
@@ -1043,7 +1052,9 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&btree.to_sql_as(&mangled_table_name));
+            let sql = escape_sql_string_literal(
+                &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)),
+            );
 
             let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
             let stmt = format!(
@@ -1339,7 +1350,9 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&btree.to_sql_as(&mangled_table_name));
+            let escaped = escape_sql_string_literal(
+                &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)),
+            );
             let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
             let stmt = format!(
                 r#"
@@ -1779,6 +1792,21 @@ pub fn translate_alter_table(
                     "duplicate column name: \"{col_name}\""
                 )));
             };
+
+            // Built here so a name an index method cannot use fails before anything is written
+            let old_column_name = btree.columns()[column_index]
+                .name
+                .as_deref()
+                .expect("column being ALTERed should be named");
+            let mut renamed_index_methods = Vec::new();
+            for index in &table_indexes {
+                let Some(index_method) = &index.index_method else {
+                    continue;
+                };
+                if let Some(attachment) = index_method.rename_column(old_column_name, col_name)? {
+                    renamed_index_methods.push((index.name.clone(), attachment));
+                }
+            }
 
             if definition
                 .constraints
@@ -2318,6 +2346,7 @@ pub fn translate_alter_table(
                     definition,
                     rename,
                     rewritten_triggers: triggers_to_rewrite,
+                    renamed_index_methods,
                 }),
             });
         }

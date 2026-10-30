@@ -78,6 +78,16 @@ pub(crate) fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>)
     }))
 }
 
+/// The error PostgreSQL returns for every statement in an aborted
+/// transaction block, until COMMIT, ROLLBACK, or ROLLBACK TO SAVEPOINT
+/// ends it.
+pub(crate) fn in_failed_sql_transaction_error() -> LimboError {
+    sqlstate_error(
+        turso_pg_parser::sqlstate::SQLSTATE_IN_FAILED_SQL_TRANSACTION,
+        "current transaction is aborted, commands ignored until end of transaction block",
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct ErrorReport {
     pub sqlstate: &'static str,
@@ -276,12 +286,16 @@ fn sqlstate(error: &LimboError) -> &'static str {
 /// at the start of the message cannot match a name in the message, for
 /// example a column named "no such object". The checks for dependent objects
 /// come first, because their messages end with the error that the dependent
-/// object gives, for example "no such column".
+/// object gives, for example "no such column". A duplicate object is checked
+/// before the "no such ..." rules, because its name sits inside the message, for
+/// example a table named "no such table".
 fn parse_error_sqlstate(msg: &str) -> &'static str {
     if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
         || msg.starts_with("cannot drop type")
     {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
+    } else if is_duplicate_object_error(msg) {
+        SQLSTATE_DUPLICATE_TABLE
     } else if msg.contains("no such table")
         || msg.contains("table not found")
         || msg.starts_with("no such object")
@@ -314,6 +328,28 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
     } else {
         SQLSTATE_SYNTAX_ERROR
     }
+}
+
+/// Whether a parse error reports that an object already exists, for example
+/// `table t already exists`. The kind at the start and the suffix are checked,
+/// so the name in between can contain the "no such ..." phrases. The message
+/// for a missing INSERT column (`table t has no column named c`) has the same
+/// start and can end with ` already exists` when the column name does, so it
+/// is excluded.
+fn is_duplicate_object_error(msg: &str) -> bool {
+    const KINDS: [&str; 8] = [
+        "table ",
+        "view ",
+        "View ",
+        "index ",
+        "trigger ",
+        "schema ",
+        "type ",
+        "sequence ",
+    ];
+    msg.ends_with(" already exists")
+        && KINDS.iter().any(|kind| msg.starts_with(kind))
+        && !msg.contains(" has no column named ")
 }
 
 fn invalid_argument_sqlstate(msg: &str) -> &'static str {
@@ -419,6 +455,27 @@ mod tests {
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
+            (
+                "table no such table already exists",
+                SQLSTATE_DUPLICATE_TABLE,
+            ),
+            (
+                "table \"table not found\" already exists",
+                SQLSTATE_DUPLICATE_TABLE,
+            ),
+            (
+                "index no such column already exists",
+                SQLSTATE_DUPLICATE_TABLE,
+            ),
+            (
+                "view no such function already exists",
+                SQLSTATE_DUPLICATE_TABLE,
+            ),
+            ("no such table: already exists", SQLSTATE_UNDEFINED_TABLE),
+            (
+                "table plain has no column named no such column already exists",
+                SQLSTATE_UNDEFINED_COLUMN,
+            ),
             ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
             ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
             ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),

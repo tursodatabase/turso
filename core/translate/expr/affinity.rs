@@ -1,6 +1,10 @@
-use super::*;
-use crate::{translate::alter::literal_default_value, types::ValueType};
+use crate::{
+    translate::{alter::literal_default_value, expr_context::ExprProperties},
+    types::ValueType,
+    vdbe::affinity::Affinity,
+};
 use bitflags::bitflags;
+use turso_parser::ast;
 
 bitflags! {
     /// Storage class flags that represent the possible storage classes an expression can yield.
@@ -44,29 +48,11 @@ impl StorageClassMask {
     }
 }
 
-pub(crate) fn get_expr_affinity(
-    expr: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
-) -> Affinity {
+pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprProperties) -> Affinity {
     match expr {
-        ast::Expr::Column { table, column, .. } => {
-            if table.is_self_table() {
-                if let Some(resolver) = resolver {
-                    if let Some(aff) = resolver.self_table_affinity(*column) {
-                        return aff;
-                    }
-                }
-            }
-            if let Some(tables) = referenced_tables {
-                if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
-                    if let Some(col) = table_ref.get_column_at(*column) {
-                        return col.affinity();
-                    }
-                }
-            }
-            Affinity::None
-        }
+        ast::Expr::Column { table, column, .. } => metadata
+            .column_affinity(*table, *column)
+            .unwrap_or(Affinity::None),
         ast::Expr::RowId { .. } => Affinity::Integer,
         ast::Expr::Cast { type_name, .. } => {
             if let Some(type_name) = type_name {
@@ -76,9 +62,9 @@ pub(crate) fn get_expr_affinity(
             }
         }
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            get_expr_affinity(exprs.first().unwrap(), referenced_tables, resolver)
+            get_expr_affinity(exprs.first().unwrap(), metadata)
         }
-        ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables, resolver),
+        ast::Expr::Collate(expr, _) => get_expr_affinity(expr, metadata),
         ast::Expr::MergedColumn(columns) => {
             // A merged USING column takes the affinity of its first column, as
             // that column would. With t1.a INTEGER, `a = 7` converts a text '7'
@@ -86,33 +72,18 @@ pub(crate) fn get_expr_affinity(
             let first_column = columns
                 .first()
                 .expect("a merged column must have at least two source columns");
-            get_expr_affinity(first_column, referenced_tables, resolver)
+            get_expr_affinity(first_column, metadata)
         }
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => Affinity::None,
-        ast::Expr::Register(reg) => {
-            // During UPDATE expression index evaluation, column references are
-            // rewritten to Expr::Register. Look up the original column affinity
-            // from the resolver's register_affinities map.
-            if let Some(resolver) = resolver {
-                if let Some(column) = resolver.register_columns.get(reg) {
-                    return column.affinity;
-                }
-            }
-            Affinity::None
-        }
+        ast::Expr::Register(reg) => metadata.register_affinity(*reg).unwrap_or(Affinity::None),
         ast::Expr::SubqueryResult {
             subquery_id,
             query_type: ast::SubqueryType::RowValue { num_regs, .. },
             ..
-        } if *num_regs == 1 => {
-            if let Some(resolver) = resolver {
-                if let Some(aff) = resolver.subquery_affinities.borrow().get(subquery_id) {
-                    return *aff;
-                }
-            }
-            Affinity::None
-        }
+        } if *num_regs == 1 => metadata
+            .subquery_affinity(*subquery_id)
+            .unwrap_or(Affinity::None),
         _ => Affinity::None,
     }
 }
@@ -120,16 +91,13 @@ pub(crate) fn get_expr_affinity(
 /// Mirrors SQLite's `sqlite3ExprDataType()` (expr.c): a bitmask of the storage
 /// classes an expression could yield. Used to combine column affinities across
 /// the arms of a compound (UNION/INTERSECT/EXCEPT) subquery.
-pub(crate) fn expr_data_type(
-    expr: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-) -> StorageClassMask {
+pub(crate) fn expr_data_type(expr: &ast::Expr, metadata: &impl ExprProperties) -> StorageClassMask {
     match expr {
         ast::Expr::Collate(inner, _) | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
-            expr_data_type(inner, referenced_tables)
+            expr_data_type(inner, metadata)
         }
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            expr_data_type(exprs.first().unwrap(), referenced_tables)
+            expr_data_type(exprs.first().unwrap(), metadata)
         }
         // A literal's storage class is its data type; reuse the literal->Value
         // inference rather than re-deriving the class from the AST here.
@@ -151,7 +119,7 @@ pub(crate) fn expr_data_type(
         | ast::Expr::RowId { .. }
         | ast::Expr::Cast { .. }
         | ast::Expr::Subquery(_) => {
-            let aff = get_expr_affinity(expr, referenced_tables, None);
+            let aff = get_expr_affinity(expr, metadata);
             if aff.is_numeric() {
                 StorageClassMask::NUMERIC | StorageClassMask::BLOB
             } else if matches!(aff, Affinity::Text) {
@@ -167,10 +135,10 @@ pub(crate) fn expr_data_type(
         } => {
             let mut res = StorageClassMask::from_null();
             for (_, then) in when_then_pairs {
-                res |= expr_data_type(then, referenced_tables);
+                res |= expr_data_type(then, metadata);
             }
             if let Some(else_expr) = else_expr {
-                res |= expr_data_type(else_expr, referenced_tables);
+                res |= expr_data_type(else_expr, metadata);
             }
             res
         }
@@ -208,38 +176,25 @@ pub(crate) fn do_comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
 pub fn comparison_affinity(
     lhs: impl HasComparableAffinity,
     rhs: impl HasComparableAffinity,
-    referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
+    metadata: &impl ExprProperties,
 ) -> Affinity {
-    let lhs = lhs.comparison_affinity(referenced_tables, resolver);
-    let rhs = rhs.comparison_affinity(referenced_tables, resolver);
+    let lhs = lhs.comparison_affinity(metadata);
+    let rhs = rhs.comparison_affinity(metadata);
     do_comparison_affinity(lhs, rhs)
 }
 
 pub(crate) trait HasComparableAffinity {
-    fn comparison_affinity(
-        &self,
-        referenced_tables: Option<&TableReferences>,
-        resolver: Option<&Resolver>,
-    ) -> Affinity;
+    fn comparison_affinity(&self, metadata: &impl ExprProperties) -> Affinity;
 }
 
 impl HasComparableAffinity for &ast::Expr {
-    fn comparison_affinity(
-        &self,
-        referenced_tables: Option<&TableReferences>,
-        resolver: Option<&Resolver>,
-    ) -> Affinity {
-        get_expr_affinity(self, referenced_tables, resolver)
+    fn comparison_affinity(&self, metadata: &impl ExprProperties) -> Affinity {
+        get_expr_affinity(self, metadata)
     }
 }
 
 impl HasComparableAffinity for Affinity {
-    fn comparison_affinity(
-        &self,
-        _referenced_tables: Option<&TableReferences>,
-        _resolver: Option<&Resolver>,
-    ) -> Affinity {
+    fn comparison_affinity(&self, _metadata: &impl ExprProperties) -> Affinity {
         *self
     }
 }

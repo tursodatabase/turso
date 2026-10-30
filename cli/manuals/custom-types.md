@@ -20,14 +20,16 @@ Without this flag, `CREATE TYPE`, `DROP TYPE`, the `sqlite_turso_types` virtual 
 
 ```sql
 CREATE TYPE type_name BASE base_type
-    ENCODE encode_expr
-    DECODE decode_expr
+    [ENCODE encode_expr]
+    [COERCE coerce_expr]
+    [DECODE decode_expr]
     [OPERATOR 'op' [function_name] ...]
     [DEFAULT default_expr];
 ```
 
 - **BASE** — The underlying SQLite storage type (`text`, `integer`, `real`, `blob`).
 - **ENCODE** — Expression applied to `value` before writing to disk.
+- **COERCE** — (Optional) Expression that fits the encoded `value` to the column's type parameters, such as a maximum length. See [Parametric Types](#parametric-types).
 - **DECODE** — Expression applied to `value` when reading from disk.
 - **OPERATOR** — (Optional) Custom operator overloads for the type. If `function_name` is omitted, the base type's built-in comparison is used (see [Ordering](#ordering) below).
 - **DEFAULT** — (Optional) Default value for columns of this type when no value is supplied.
@@ -171,7 +173,8 @@ For types where the base type comparison on encoded values is not suitable, prov
 -- numeric stores values as blobs; standard blob comparison is wrong.
 -- numeric_lt knows how to compare encoded blobs numerically.
 CREATE TYPE numeric(precision, scale) BASE blob
-    ENCODE numeric_encode(value, precision, scale)
+    ENCODE numeric_encode(value)
+    COERCE numeric_fit(value, precision, scale)
     DECODE numeric_decode(value)
     OPERATOR '<' numeric_lt;
 ```
@@ -284,9 +287,9 @@ INSERT INTO t1 VALUES (-1);   -- Error: value must be positive
 This pattern is how built-in types like `varchar` and `smallint` enforce their constraints:
 
 ```sql
--- varchar checks length against the maxlen parameter
+-- varchar checks length against the maxlen parameter, in COERCE
 CREATE TYPE varchar(maxlen) BASE text
-    ENCODE CASE WHEN length(value) <= maxlen THEN value
+    COERCE CASE WHEN length(value) <= maxlen THEN value
                 ELSE RAISE(ABORT, 'value too long for varchar') END
     DECODE value;
 
@@ -299,11 +302,11 @@ CREATE TYPE smallint BASE integer
 
 ## Parametric Types
 
-Types can declare parameters that are substituted into ENCODE/DECODE expressions. Parameters are specified in parentheses after the type name:
+Types can declare parameters, which only the COERCE expression can use. Parameters are specified in parentheses after the type name:
 
 ```sql
 CREATE TYPE varchar(maxlen) BASE text
-    ENCODE CASE WHEN length(value) <= maxlen THEN value
+    COERCE CASE WHEN length(value) <= maxlen THEN value
                 ELSE RAISE(ABORT, 'value too long for varchar') END
     DECODE value;
 
@@ -312,7 +315,14 @@ INSERT INTO t1 VALUES ('hello');      -- OK (length 5 <= 10)
 INSERT INTO t1 VALUES ('toolongname'); -- Error: value too long for varchar
 ```
 
-When a column is declared as `varchar(10)`, the parameter `maxlen` is replaced with `10` in the ENCODE expression.
+When a column is declared as `varchar(10)`, `maxlen` is `10` in the COERCE expression. An ENCODE or DECODE that names a parameter is rejected: `ENCODE cannot use type parameter "maxlen": only COERCE can`.
+
+COERCE runs after ENCODE, on the encoded value, and should only round the value or reject it:
+
+- It runs on INSERT, UPDATE, column defaults, and `CAST(x AS varchar(10))`.
+- It does not run on `CAST(x AS varchar)` without arguments (that is SQLite's CAST), on a column declared without arguments, or on NULL.
+- It does not run on a constant compared with a column: the constant is encoded only. For a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. An index lookup follows the same rule, so it finds the same rows as a table scan.
+- DECODE never sees the parameters.
 
 ## Encode Validation
 
@@ -373,7 +383,7 @@ SELECT COALESCE(val, 'IS_NULL') FROM t1;
 
 ## CAST Support
 
-You can cast values to a custom type, which applies the encode function:
+You can cast values to a custom type, which applies the encode function, and the COERCE expression when the CAST gives the type's arguments:
 
 ```sql
 CREATE TYPE reversed BASE text
@@ -391,13 +401,13 @@ List all available types (built-in and custom) with their metadata:
 
 ```sql
 PRAGMA list_types;
--- type      | parent | encode                | decode                | default | operators
--- INTEGER   |        |                       |                       |         |
--- REAL      |        |                       |                       |         |
--- TEXT      |        |                       |                       |         |
--- BLOB      |        |                       |                       |         |
--- ANY       |        |                       |                       |         |
--- uint      | text   | test_uint_encode(...) | test_uint_decode(...) | 0       | +(uint) -> test_uint_add
+-- type      | parent | encode                | coerce | decode                | default | operators
+-- INTEGER   |        |                       |        |                       |         |
+-- REAL      |        |                       |        |                       |         |
+-- TEXT      |        |                       |        |                       |         |
+-- BLOB      |        |                       |        |                       |         |
+-- ANY       |        |                       |        |                       |         |
+-- uint      | text   | test_uint_encode(...) |        | test_uint_decode(...) | 0       | '+' test_uint_add
 ```
 
 ### sqlite_turso_types

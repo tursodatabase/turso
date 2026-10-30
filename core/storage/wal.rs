@@ -3585,8 +3585,15 @@ impl Wal for WalFile {
             if !self.coordination.try_begin_write_tx() {
                 return Err(LimboError::Busy);
             }
-            let db_changed =
-                self.db_changed_against(self.load_coordination_snapshot(), self.connection_state());
+            // A checkpoint that only advanced nbackfills leaves our snapshot current: the
+            // backfilled frames stay in the WAL while we hold our read lock, and commits do
+            // not publish nbackfills. SQLite also leaves nBackfill out of this comparison.
+            let local_state = self.connection_state();
+            let shared_snapshot = WalSnapshot {
+                nbackfills: local_state.snapshot.nbackfills,
+                ..self.load_coordination_snapshot()
+            };
+            let db_changed = self.db_changed_against(shared_snapshot, local_state);
             if db_changed {
                 // Snapshot is stale, give up and let caller retry from scratch.
                 // Return BusySnapshot instead of Busy so the caller knows it must
@@ -3595,7 +3602,7 @@ impl Wal for WalFile {
                 tracing::debug!(
                     "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
                     self.max_frame.load(Ordering::Acquire),
-                    self.load_coordination_snapshot().max_frame
+                    shared_snapshot.max_frame
                 );
                 self.coordination.end_write_tx();
                 return Err(LimboError::BusySnapshot);
