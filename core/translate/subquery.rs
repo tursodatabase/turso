@@ -28,7 +28,10 @@ use crate::{
             eqp_detail_for_rowid_search, eqp_detail_for_table_op, eqp_details_for_right_join,
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
-        expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
+        expr::{
+            bind_and_rewrite_expr, expr_vector_size, get_expr_affinity, translate_expr,
+            unwrap_parens, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+        },
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
@@ -553,6 +556,51 @@ pub fn plan_subqueries_from_returning(
     )?;
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
+    Ok(())
+}
+
+/// Translate an expression that has no FROM clause and must give one value,
+/// such as a VACUUM INTO path. Its subqueries are evaluated once, before the value.
+pub fn translate_expr_without_from_clause(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    expr: &ast::Expr,
+    target_register: usize,
+) -> Result<()> {
+    let mut expr = expr.clone();
+    bind_and_rewrite_expr(
+        &mut expr,
+        Some(&mut TableReferences::new(vec![], vec![])),
+        None,
+        resolver,
+        BindingBehavior::ResultColumnsNotAllowed,
+    )?;
+    let mut subqueries = Vec::new();
+    plan_subqueries_in_expr_without_from_clause(
+        program,
+        &mut subqueries,
+        &mut expr,
+        resolver,
+        connection,
+    )?;
+    match &expr {
+        ast::Expr::SubqueryResult {
+            query_type: SubqueryType::RowValue { num_regs, .. },
+            ..
+        } if *num_regs != 1 => {
+            crate::bail_parse_error!("sub-select returns {num_regs} columns - expected 1");
+        }
+        _ if expr_vector_size(&expr)? != 1 => {
+            crate::bail_parse_error!("row value misused");
+        }
+        _ => {}
+    }
+    for subquery in &mut subqueries {
+        let plan = subquery.consume_plan(EvalAt::BeforeLoop);
+        emit_non_from_clause_subquery(program, resolver, *plan, &subquery.query_type, false)?;
+    }
+    translate_expr(program, None, &expr, target_register, resolver)?;
     Ok(())
 }
 
