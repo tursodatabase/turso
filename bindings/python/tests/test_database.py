@@ -1448,6 +1448,17 @@ def test_custom_row_factory_callable(provider):
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_iteration_continues_past_row_factory_returning_none(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (x)")
+    conn.executemany("INSERT INTO t VALUES (?)", [(1,), (None,), (3,)])
+    conn.row_factory = lambda cursor, row: row[0]
+    assert [x for x in conn.execute("SELECT x FROM t ORDER BY rowid")] == [1, None, 3]
+    assert conn.execute("SELECT x FROM t ORDER BY rowid").fetchall() == [1, None, 3]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_in_transaction_toggle_with_commit(provider):
     conn = connect(provider, ":memory:")
     cur = conn.cursor()

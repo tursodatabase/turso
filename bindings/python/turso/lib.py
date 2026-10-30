@@ -1131,10 +1131,11 @@ class Cursor:
         return self
 
     def __next__(self) -> Any:
-        row = self.fetchone()
+        self._ensure_open()
+        row = self._fetchone_tuple()
         if row is None:
             raise StopIteration
-        return row
+        return self._apply_row_factory(row)
 
 
 # Row goes THIRD
