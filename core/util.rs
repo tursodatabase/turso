@@ -1,7 +1,8 @@
 use crate::alloc::TursoIteratorExt;
+use crate::namespace::NamespaceId;
 use crate::numeric::StrToF64;
 use crate::schema::{ColDef, FromDefinitionFlags};
-use crate::translate::emitter::TransactionMode;
+use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{
     left_using_column_sources, star_column_uses_merged_value, unqualified_column_sources, BitSet,
@@ -263,7 +264,7 @@ struct ParseSchemaRowsInner {
     automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: HashMap<String, i64>,
     dbsp_state_index_roots: HashMap<String, i64>,
-    materialized_view_info: HashMap<String, (String, i64)>,
+    materialized_view_info: HashMap<String, crate::schema::StoredMaterializedView>,
 }
 
 impl ParseSchemaRowsState {
@@ -1766,7 +1767,9 @@ where
         | ast::Stmt::Savepoint { .. }
         | ast::Stmt::Optimize { .. }
         | ast::Stmt::CreateSequence { .. }
-        | ast::Stmt::DropSequence { .. } => {}
+        | ast::Stmt::DropSequence { .. }
+        | ast::Stmt::CreateSchema { .. }
+        | ast::Stmt::DropSchema { .. } => {}
     }
     Ok(())
 }
@@ -1968,18 +1971,19 @@ where
 
 fn validate_no_cross_db_references(
     select_stmt: &ast::Select,
-    view_db_name: Option<&ast::Name>,
+    resolver: &Resolver,
+    view_database_id: usize,
 ) -> Result<()> {
     if let Some(with_clause) = &select_stmt.with {
         for cte in &with_clause.ctes {
-            validate_no_cross_db_references(&cte.select, view_db_name)?;
+            validate_no_cross_db_references(&cte.select, resolver, view_database_id)?;
         }
     }
 
-    validate_one_select_no_cross_db(&select_stmt.body.select, view_db_name)?;
+    validate_one_select_no_cross_db(&select_stmt.body.select, resolver, view_database_id)?;
 
     for compound in &select_stmt.body.compounds {
-        validate_one_select_no_cross_db(&compound.select, view_db_name)?;
+        validate_one_select_no_cross_db(&compound.select, resolver, view_database_id)?;
     }
 
     Ok(())
@@ -1987,12 +1991,13 @@ fn validate_no_cross_db_references(
 
 fn validate_one_select_no_cross_db(
     one_select: &ast::OneSelect,
-    view_db_name: Option<&ast::Name>,
+    resolver: &Resolver,
+    view_database_id: usize,
 ) -> Result<()> {
     match one_select {
         ast::OneSelect::Select { from, .. } => {
             if let Some(from_clause) = from {
-                validate_from_clause_no_cross_db(from_clause, view_db_name)?;
+                validate_from_clause_no_cross_db(from_clause, resolver, view_database_id)?;
             }
         }
         ast::OneSelect::Values(_) => {}
@@ -2002,26 +2007,32 @@ fn validate_one_select_no_cross_db(
 
 fn validate_from_clause_no_cross_db(
     from_clause: &ast::FromClause,
-    view_db_name: Option<&ast::Name>,
+    resolver: &Resolver,
+    view_database_id: usize,
 ) -> Result<()> {
-    validate_select_table_no_cross_db(&from_clause.select, view_db_name)?;
+    validate_select_table_no_cross_db(&from_clause.select, resolver, view_database_id)?;
     for join in &from_clause.joins {
-        validate_select_table_no_cross_db(&join.table, view_db_name)?;
+        validate_select_table_no_cross_db(&join.table, resolver, view_database_id)?;
     }
     Ok(())
 }
 
+/// A view may read any namespace of the database it is in, so a name is
+/// cross-database when its namespace is of another database. A temp view
+/// may read any database, as in SQLite.
 fn reject_cross_db_qualified_name(
     qualified_name: &ast::QualifiedName,
-    view_db_name: Option<&ast::Name>,
+    resolver: &Resolver,
+    view_database_id: usize,
 ) -> Result<()> {
+    if view_database_id == crate::TEMP_DB_ID {
+        return Ok(());
+    }
     if let Some(table_db_name) = &qualified_name.namespace {
-        let is_cross_db = match view_db_name {
-            Some(view_db) => !view_db
-                .as_str()
-                .eq_ignore_ascii_case(table_db_name.as_str()),
-            None => !table_db_name.as_str().eq_ignore_ascii_case("main"),
-        };
+        let is_cross_db = resolver
+            .catalog
+            .namespace_database_id(&normalize_ident(table_db_name.as_str()))
+            != Some(view_database_id);
         if is_cross_db {
             return Err(crate::LimboError::ParseError(format!(
                 "view cannot reference table in attached database: {qualified_name}"
@@ -2033,17 +2044,18 @@ fn reject_cross_db_qualified_name(
 
 fn validate_select_table_no_cross_db(
     select_table: &ast::SelectTable,
-    view_db_name: Option<&ast::Name>,
+    resolver: &Resolver,
+    view_database_id: usize,
 ) -> Result<()> {
     match select_table {
         ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
-            reject_cross_db_qualified_name(name, view_db_name)?;
+            reject_cross_db_qualified_name(name, resolver, view_database_id)?;
         }
         ast::SelectTable::Select { select, .. } => {
-            validate_no_cross_db_references(select, view_db_name)?;
+            validate_no_cross_db_references(select, resolver, view_database_id)?;
         }
         ast::SelectTable::Sub(from_clause, _) => {
-            validate_from_clause_no_cross_db(from_clause, view_db_name)?;
+            validate_from_clause_no_cross_db(from_clause, resolver, view_database_id)?;
         }
     }
     Ok(())
@@ -2051,9 +2063,10 @@ fn validate_select_table_no_cross_db(
 
 pub fn validate_select_for_views(
     select_stmt: &ast::Select,
-    view_db_name: Option<&ast::Name>,
+    resolver: &Resolver,
+    view_database_id: usize,
 ) -> Result<()> {
-    validate_no_cross_db_references(select_stmt, view_db_name)?;
+    validate_no_cross_db_references(select_stmt, resolver, view_database_id)?;
 
     walk_select_expressions(select_stmt, &mut |expr| {
         match expr {
@@ -2069,10 +2082,10 @@ pub fn validate_select_for_views(
                 );
             }
             ast::Expr::Subquery(subquery_select) | ast::Expr::Exists(subquery_select) => {
-                validate_no_cross_db_references(subquery_select, view_db_name)?;
+                validate_no_cross_db_references(subquery_select, resolver, view_database_id)?;
             }
             ast::Expr::InSelect { rhs, .. } => {
-                validate_no_cross_db_references(rhs, view_db_name)?;
+                validate_no_cross_db_references(rhs, resolver, view_database_id)?;
             }
             _ => {}
         }
@@ -2110,6 +2123,7 @@ fn append_view_column_schema(
 }
 
 fn view_source_from_select_table(
+    namespace: NamespaceId,
     select_table: &ast::SelectTable,
     schema: &Schema,
     ctes: &HashMap<String, ViewColumnSchema>,
@@ -2142,11 +2156,23 @@ fn view_source_from_select_table(
                     .map(|db| normalize_ident(db.as_str())),
                 alias: table_alias,
             });
-            let table = schema.get_table(&table_name);
-            let view = table
+            let table_namespace = view_source_namespace(schema, namespace, name);
+            let mut table = schema.get_table(table_namespace, &table_name);
+            let mut view = table
                 .is_none()
-                .then(|| schema.get_view(&table_name))
+                .then(|| schema.get_view(table_namespace, &table_name))
                 .flatten();
+            // The engine's virtual tables are found from every namespace,
+            // as the resolver finds them.
+            if table.is_none() && view.is_none() && name.namespace.is_none() {
+                if let Some(root_table) = schema
+                    .get_table(NamespaceId::ROOT, &table_name)
+                    .filter(|root_table| matches!(root_table.as_ref(), Table::Virtual(_)))
+                {
+                    table = Some(root_table);
+                    view = None;
+                }
+            }
             let source_columns: &[Column] = match (&table, &view) {
                 (Some(table), _) => table.columns(),
                 (None, Some(view)) => &view.columns,
@@ -2167,7 +2193,7 @@ fn view_source_from_select_table(
             })
         }
         ast::SelectTable::Select { select, alias, .. } => {
-            let derived = extract_view_columns_inner(select, schema, ctes)?;
+            let derived = extract_view_columns_inner(namespace, select, schema, ctes)?;
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
@@ -2188,10 +2214,10 @@ fn view_source_from_select_table(
                 }
                 | ast::SelectTable::Sub(_, source_alias) => source_alias.clone_from(alias),
             }
-            view_source_from_select_table(&source_table, schema, ctes, tables)
+            view_source_from_select_table(namespace, &source_table, schema, ctes, tables)
         }
         ast::SelectTable::Sub(from, alias) => {
-            let sources = view_sources_from_clause(from, schema, ctes, tables)?;
+            let sources = view_sources_from_clause(namespace, from, schema, ctes, tables)?;
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
@@ -2217,7 +2243,7 @@ fn view_source_from_select_table(
                 alias: table_alias,
             });
             let columns = schema
-                .get_table(&table_name)
+                .get_table(namespace, &table_name)
                 .map(|table| {
                     table
                         .columns()
@@ -2237,6 +2263,23 @@ fn view_source_from_select_table(
             })
         }
     }
+}
+
+/// The namespace a FROM item of a view body is looked up in: the one it
+/// is written with, else the view's own. A namespace is named by
+/// its name. Any other qualifier names a database, and since a view only
+/// reads its own database, that is the root namespace of this schema.
+fn view_source_namespace(
+    schema: &Schema,
+    view_namespace: NamespaceId,
+    name: &ast::QualifiedName,
+) -> NamespaceId {
+    let Some(qualifier) = name.namespace.as_ref() else {
+        return view_namespace;
+    };
+    schema
+        .namespace_named(&normalize_ident(qualifier.as_str()))
+        .unwrap_or(NamespaceId::ROOT)
 }
 
 fn view_column_name(column: &ViewColumn) -> Option<&str> {
@@ -2262,12 +2305,13 @@ fn view_output_column(source: &ViewColumn) -> ViewColumn {
 ///
 /// Stored view metadata must use the same join-column rules as normal name binding.
 fn view_sources_from_clause(
+    namespace: NamespaceId,
     from: &ast::FromClause,
     schema: &Schema,
     ctes: &HashMap<String, ViewColumnSchema>,
     tables: &mut Vec<ViewTable>,
 ) -> Result<Vec<ViewSource>> {
-    let first = view_source_from_select_table(&from.select, schema, ctes, tables)?;
+    let first = view_source_from_select_table(namespace, &from.select, schema, ctes, tables)?;
     let mut sources = vec![first];
     // SQLite enables strict USING checks for the full list when any join keeps right rows.
     let has_right_or_full_join = from
@@ -2276,7 +2320,7 @@ fn view_sources_from_clause(
         .any(|join| JoinType::from_join_operator(&join.operator).keeps_right_rows());
 
     for join in &from.joins {
-        let right = view_source_from_select_table(&join.table, schema, ctes, tables)?;
+        let right = view_source_from_select_table(namespace, &join.table, schema, ctes, tables)?;
         let natural = matches!(
             join.operator,
             ast::JoinOperator::TypedJoin(Some(join_type))
@@ -2485,11 +2529,12 @@ fn deduplicate_view_column_name(column: &mut ViewColumn, counts: &mut HashMap<St
 }
 
 fn extract_view_columns_inner(
+    namespace: NamespaceId,
     select_stmt: &ast::Select,
     schema: &Schema,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<ViewColumnSchema> {
-    let ctes = extract_cte_columns(&select_stmt.with, schema, outer_ctes)?;
+    let ctes = extract_cte_columns(namespace, &select_stmt.with, schema, outer_ctes)?;
 
     let mut tables = Vec::new();
     let mut columns = Vec::new();
@@ -2506,7 +2551,7 @@ fn extract_view_columns_inner(
 
     let sources = from
         .as_ref()
-        .map(|from| view_sources_from_clause(from, schema, &ctes, &mut tables))
+        .map(|from| view_sources_from_clause(namespace, from, schema, &ctes, &mut tables))
         .transpose()?
         .unwrap_or_default();
 
@@ -2567,13 +2612,14 @@ fn extract_view_columns_inner(
 }
 
 pub(crate) fn extract_cte_columns(
+    namespace: NamespaceId,
     with: &Option<ast::With>,
     schema: &Schema,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<HashMap<String, ViewColumnSchema>> {
     let mut ctes = outer_ctes.clone();
     for cte in with.iter().flat_map(|with| &with.ctes) {
-        let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes)?;
+        let mut derived = extract_view_columns_inner(namespace, &cte.select, schema, &ctes)?;
         for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
             column.column.name = Some(explicit_name.col_name.as_str().to_string());
         }
@@ -2583,11 +2629,13 @@ pub(crate) fn extract_cte_columns(
 }
 
 pub(crate) fn select_table_column_names(
+    namespace: NamespaceId,
     select_table: &ast::SelectTable,
     schema: &Schema,
     ctes: &HashMap<String, ViewColumnSchema>,
 ) -> Result<Vec<String>> {
-    let source = view_source_from_select_table(select_table, schema, ctes, &mut Vec::new())?;
+    let source =
+        view_source_from_select_table(namespace, select_table, schema, ctes, &mut Vec::new())?;
     Ok(source
         .columns
         .iter()
@@ -2674,11 +2722,15 @@ fn view_affinity_type_name(affinity: Affinity) -> &'static str {
 /// by NATURAL or USING appear once, while `table.*` still includes every
 /// column from that particular source. A later RIGHT or FULL JOIN can change
 /// which source supplies a merged column.
+///
+/// `namespace` is the namespace of the view, where the names of its body
+/// that have no qualifier are looked up.
 pub fn extract_view_columns(
+    namespace: NamespaceId,
     select_stmt: &ast::Select,
     schema: &Schema,
 ) -> Result<ViewColumnSchema> {
-    extract_view_columns_inner(select_stmt, schema, &HashMap::default())
+    extract_view_columns_inner(namespace, select_stmt, schema, &HashMap::default())
 }
 
 pub fn rewrite_fk_parent_cols_if_self_ref(
@@ -2763,9 +2815,11 @@ mod rename_column_view {
         pub columns: crate::alloc::Vec<Column>,
     }
 
+    /// `namespace` is the namespace of the view, where its names resolve.
     pub fn rewrite_view_sql_for_column_rename(
         view_sql: &str,
         schema: &Schema,
+        namespace: NamespaceId,
         target_table: &str,
         target_db_name: &str,
         old_column: &str,
@@ -2775,6 +2829,7 @@ mod rename_column_view {
         rewrite_view_sql_for_column_rename_inner(
             view_sql,
             schema,
+            namespace,
             target_table,
             target_db_name,
             old_column,
@@ -2783,9 +2838,11 @@ mod rename_column_view {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rewrite_view_sql_for_column_rename_inner(
         view_sql: &str,
         schema: &Schema,
+        namespace: NamespaceId,
         target_table: &str,
         target_db_name: &str,
         old_column: &str,
@@ -2817,14 +2874,20 @@ mod rename_column_view {
         let rewrite_result = (|| -> Result<Option<RewrittenView>> {
             let original_select = select.clone();
             let original_columns =
-                view_columns_from_select(&original_select, schema, &view_columns)?;
+                view_columns_from_select(&original_select, schema, namespace, &view_columns)?;
 
-            let ctx =
-                ViewRewriteCtx::new(schema, target_table, target_db_name, old_column, new_column);
+            let ctx = ViewRewriteCtx::new(
+                schema,
+                namespace,
+                target_table,
+                target_db_name,
+                old_column,
+                new_column,
+            );
             let sql_changed =
                 rewrite_view_select_for_column_rename(&mut select, &ctx, &[], visiting_views)?;
 
-            let view_column_schema = extract_view_columns(&select, schema)?;
+            let view_column_schema = extract_view_columns(namespace, &select, schema)?;
             let mut final_columns = apply_view_column_rename(view_column_schema, &ctx);
 
             for (i, indexed_col) in view_columns.iter().enumerate() {
@@ -2878,7 +2941,7 @@ mod rename_column_view {
                 &table.name,
                 table.db_name.as_deref(),
                 target_norm,
-                &ctx.target_db_norm,
+                &ctx.local_qualifiers,
             ) {
                 if let Some(ref mut name) = view_column.column.name {
                     if name.as_str().eq_ignore_ascii_case(ctx.old_column) {
@@ -2898,9 +2961,10 @@ mod rename_column_view {
     fn view_columns_from_select(
         select: &ast::Select,
         schema: &Schema,
+        namespace: NamespaceId,
         explicit: &[ast::IndexedColumn],
     ) -> Result<crate::alloc::Vec<Column>> {
-        let view_column_schema = extract_view_columns(select, schema)?;
+        let view_column_schema = extract_view_columns(namespace, select, schema)?;
         let mut columns = view_column_schema.flat_columns()?;
         for (i, indexed_col) in explicit.iter().enumerate() {
             if let Some(col) = columns.get_mut(i) {
@@ -2948,9 +3012,15 @@ mod rename_column_view {
 
     struct ViewRewriteCtx<'a> {
         schema: &'a Schema,
+        /// The namespace of the view being rewritten.
+        namespace: NamespaceId,
         target_table: &'a str,
         target_table_norm: String,
         target_db_norm: String,
+        /// The qualifiers that name this database in the view body: the
+        /// database's name, and the name of the view's namespace when the
+        /// namespace is stored, since a bound body qualifies tables with it.
+        local_qualifiers: Vec<String>,
         old_column: &'a str,
         old_column_norm: String,
         new_column: &'a str,
@@ -2959,6 +3029,7 @@ mod rename_column_view {
     impl<'a> ViewRewriteCtx<'a> {
         fn new(
             schema: &'a Schema,
+            namespace: NamespaceId,
             target_table: &'a str,
             target_db_name: &'a str,
             old_column: &'a str,
@@ -2966,9 +3037,13 @@ mod rename_column_view {
         ) -> Self {
             Self {
                 schema,
+                namespace,
                 target_table,
                 target_table_norm: normalize_ident(target_table),
                 target_db_norm: normalize_ident(target_db_name),
+                local_qualifiers: std::iter::once(normalize_ident(target_db_name))
+                    .chain(schema.namespace_name(namespace).map(normalize_ident))
+                    .collect(),
                 old_column,
                 old_column_norm: normalize_ident(old_column),
                 new_column,
@@ -3288,10 +3363,10 @@ mod rename_column_view {
 
                 let is_local = table_db_norm
                     .as_deref()
-                    .is_none_or(|db| db == ctx.target_db_norm);
+                    .is_none_or(|db| ctx.local_qualifiers.iter().any(|qualifier| qualifier == db));
 
                 if is_local {
-                    if let Some(view) = ctx.schema.views.get(&table_name_norm) {
+                    if let Some(view) = ctx.schema.get_view(ctx.namespace, &table_name_norm) {
                         let columns_before = view
                             .columns
                             .iter()
@@ -3303,6 +3378,7 @@ mod rename_column_view {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename_inner(
                             &view.sql,
                             ctx.schema,
+                            ctx.namespace,
                             ctx.target_table,
                             &ctx.target_db_norm,
                             ctx.old_column,
@@ -3329,10 +3405,10 @@ mod rename_column_view {
                     &table_name_norm,
                     table_db_norm.as_deref(),
                     &ctx.target_table_norm,
-                    &ctx.target_db_norm,
+                    &ctx.local_qualifiers,
                 );
                 let columns_before = if is_local {
-                    table_source_columns(ctx.schema, &table_name_norm)
+                    table_source_columns(ctx.schema, ctx.namespace, &table_name_norm)
                         .unwrap_or_default()
                         .into_iter()
                         .map(|c| normalize_ident(&c))
@@ -3457,7 +3533,7 @@ mod rename_column_view {
                 e,
                 sources,
                 outer_scopes,
-                &ctx.target_db_norm,
+                &ctx.local_qualifiers,
                 &ctx.old_column_norm,
                 ctx.new_column,
             ) {
@@ -3495,7 +3571,7 @@ mod rename_column_view {
         expr: &mut ast::Expr,
         sources: &[ViewSourceInfo],
         outer_scopes: &[&[ViewSourceInfo]],
-        target_db_norm: &str,
+        local_qualifiers: &[String],
         old_column_norm: &str,
         new_column: &str,
     ) -> bool {
@@ -3518,7 +3594,7 @@ mod rename_column_view {
                     return false;
                 }
                 let (source, local_ambiguous) =
-                    resolve_qualified(sources, &ns_norm, target_db_norm);
+                    resolve_qualified(sources, &ns_norm, local_qualifiers);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
                         *col = ast::Name::exact(name);
@@ -3528,7 +3604,7 @@ mod rename_column_view {
                     return false;
                 }
                 for scope in outer_scopes {
-                    let (source, ambiguous) = resolve_qualified(scope, &ns_norm, target_db_norm);
+                    let (source, ambiguous) = resolve_qualified(scope, &ns_norm, local_qualifiers);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
                             *col = ast::Name::exact(name);
@@ -3541,14 +3617,15 @@ mod rename_column_view {
             }
             ast::Expr::DoublyQualified(schema, ns, col) => {
                 let schema_norm = normalize_ident(schema.as_str());
-                if schema_norm != target_db_norm {
+                if !local_qualifiers.contains(&schema_norm) {
                     return false;
                 }
                 let ns_norm = normalize_ident(ns.as_str());
                 if !col.as_str().eq_ignore_ascii_case(old_column_norm) {
                     return false;
                 }
-                let (source, local_ambiguous) = resolve_qualified(sources, &ns_norm, &schema_norm);
+                let (source, local_ambiguous) =
+                    resolve_qualified(sources, &ns_norm, std::slice::from_ref(&schema_norm));
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
                         *col = ast::Name::exact(name);
@@ -3558,7 +3635,8 @@ mod rename_column_view {
                     return false;
                 }
                 for scope in outer_scopes {
-                    let (source, ambiguous) = resolve_qualified(scope, &ns_norm, &schema_norm);
+                    let (source, ambiguous) =
+                        resolve_qualified(scope, &ns_norm, std::slice::from_ref(&schema_norm));
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
                             *col = ast::Name::exact(name);
@@ -3619,11 +3697,13 @@ mod rename_column_view {
     fn resolve_qualified<'a>(
         candidates: &'a [ViewSourceInfo],
         qualifier: &str,
-        target_db_norm: &str,
+        local_qualifiers: &[String],
     ) -> (Option<&'a ViewSourceInfo>, bool) {
         let mut matches = candidates.iter().filter(|s| {
             s.matches_qualifier(qualifier)
-                && s.db_name.as_deref().is_none_or(|db| db == target_db_norm)
+                && s.db_name
+                    .as_deref()
+                    .is_none_or(|db| local_qualifiers.iter().any(|qualifier| qualifier == db))
         });
         let Some(first) = matches.next() else {
             return (None, false);
@@ -3671,7 +3751,7 @@ mod rename_column_view {
         ctx: &ViewRewriteCtx,
         apply_rename: bool,
     ) -> Result<Vec<String>> {
-        let view_columns = extract_view_columns(select, ctx.schema)?;
+        let view_columns = extract_view_columns(ctx.namespace, select, ctx.schema)?;
         let mut columns = view_columns.columns;
         if apply_rename {
             let target_norm = ctx.target_table_norm.as_str();
@@ -3684,7 +3764,7 @@ mod rename_column_view {
                     &table.name,
                     table.db_name.as_deref(),
                     target_norm,
-                    &ctx.target_db_norm,
+                    &ctx.local_qualifiers,
                 ) {
                     if let Some(ref mut name) = view_column.column.name {
                         if name.as_str().eq_ignore_ascii_case(ctx.old_column) {
@@ -3780,19 +3860,25 @@ mod rename_column_view {
         table_name: &str,
         table_db: Option<&str>,
         target_table_norm: &str,
-        target_db_norm: &str,
+        local_qualifiers: &[String],
     ) -> bool {
         if !table_name.eq_ignore_ascii_case(target_table_norm) {
             return false;
         }
         match table_db {
             None => true,
-            Some(db) => db.eq_ignore_ascii_case(target_db_norm),
+            Some(db) => local_qualifiers
+                .iter()
+                .any(|qualifier| qualifier.eq_ignore_ascii_case(db)),
         }
     }
 
-    fn table_source_columns(schema: &Schema, table_name: &str) -> Option<Vec<String>> {
-        if let Some(table) = schema.get_table(table_name) {
+    fn table_source_columns(
+        schema: &Schema,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> Option<Vec<String>> {
+        if let Some(table) = schema.get_table(namespace, table_name) {
             return Some(
                 table
                     .columns()
@@ -3802,7 +3888,7 @@ mod rename_column_view {
             );
         }
         let table_norm = normalize_ident(table_name);
-        if let Some(view) = schema.views.get(&table_norm) {
+        if let Some(view) = schema.get_view(namespace, &table_norm) {
             return Some(
                 view.columns
                     .iter()
@@ -3821,32 +3907,7 @@ pub use rename_column_view::{rewrite_view_sql_for_column_rename, RewrittenView};
 /// `t2.a > 0` when renaming t1 to t2. This matches SQLite 3.49.1+ behavior which
 /// rewrites qualified refs during ALTER TABLE RENAME instead of rejecting them.
 pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str) {
-    let _ = walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                ast::Expr::Qualified(tbl, col) => {
-                    if tbl.as_str().eq_ignore_ascii_case(from) {
-                        let col = col.clone();
-                        *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
-                    }
-                }
-                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
-                    rewrite_select_table_refs(select, from, to);
-                }
-                ast::Expr::InSelect { rhs, .. } => {
-                    rewrite_select_table_refs(rhs, from, to);
-                }
-                ast::Expr::InTable { rhs, .. } => {
-                    if rhs.name.as_str().eq_ignore_ascii_case(from) {
-                        rhs.name = ast::Name::exact(to.to_owned());
-                    }
-                }
-                _ => {}
-            }
-            Ok(WalkControl::Continue)
-        },
-    );
+    rewrite_expr_table_refs(expr, TableRenameScope::new(from, to));
 }
 
 /// Update a column-level REFERENCES <tbl>(col,...) constraint
@@ -3939,14 +4000,18 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
                 *tbl_name = ast::Name::exact(new_tbl.to_owned());
             }
+            let scope = TableRenameScope::new(old_tbl, new_tbl);
+            let expr_scope = from
+                .as_ref()
+                .map_or(scope, |from| scope.inside_from_clause(from));
             for set in sets {
-                rewrite_check_expr_table_refs(&mut set.expr, old_tbl, new_tbl);
+                rewrite_expr_table_refs(&mut set.expr, expr_scope);
             }
             if let Some(ref mut from) = from {
-                rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
+                rewrite_from_clause_table_refs(from, scope);
             }
             if let Some(ref mut wc) = where_clause {
-                rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
+                rewrite_expr_table_refs(wc, expr_scope);
             }
         }
         ast::TriggerCmd::Insert {
@@ -4048,44 +4113,203 @@ fn one_select_has_explicit_alias(one_select: &ast::OneSelect, name: &str) -> boo
     })
 }
 
-fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
-    if let Some(with_clause) = &mut select.with {
-        for cte in &mut with_clause.ctes {
-            rewrite_select_table_refs(&mut cte.select, old_tbl, new_tbl);
+pub fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
+    rewrite_select_in_scope(select, TableRenameScope::new(old_tbl, new_tbl));
+}
+
+/// Renames the table `old_tbl` of a namespace to `new_tbl` in `select`, the
+/// body of a view. A name written without a qualifier is the table only when
+/// `unqualified_names_table`, that is, when the view is in the table's
+/// namespace; a qualified name is the table only when its qualifier is one
+/// of `table_qualifiers`, the names of the table's namespace.
+pub fn rewrite_select_namespace_table_refs(
+    select: &mut ast::Select,
+    old_tbl: &str,
+    new_tbl: &str,
+    unqualified_names_table: bool,
+    table_qualifiers: &[String],
+) {
+    rewrite_select_in_scope(
+        select,
+        TableRenameScope {
+            unqualified_names_table,
+            table_qualifiers: Some(table_qualifiers),
+            ..TableRenameScope::new(old_tbl, new_tbl)
+        },
+    );
+}
+
+#[derive(Clone, Copy)]
+struct TableRenameScope<'a> {
+    old_tbl: &'a str,
+    new_tbl: &'a str,
+    table_is_visible: bool,
+    qualifier_is_table: bool,
+    /// Whether a name written without a qualifier can be the table.
+    unqualified_names_table: bool,
+    /// The qualifiers that name the table's namespace; None takes any.
+    table_qualifiers: Option<&'a [String]>,
+}
+
+impl<'a> TableRenameScope<'a> {
+    fn new(old_tbl: &'a str, new_tbl: &'a str) -> Self {
+        Self {
+            old_tbl,
+            new_tbl,
+            table_is_visible: true,
+            qualifier_is_table: true,
+            unqualified_names_table: true,
+            table_qualifiers: None,
         }
     }
-    rewrite_one_select_table_refs(&mut select.body.select, old_tbl, new_tbl);
-    for compound in &mut select.body.compounds {
-        rewrite_one_select_table_refs(&mut compound.select, old_tbl, new_tbl);
+
+    fn inside_with_clause(self, with: &ast::With) -> Self {
+        if with.ctes.iter().any(|cte| self.is_old_name(&cte.tbl_name)) {
+            Self {
+                table_is_visible: false,
+                qualifier_is_table: false,
+                ..self
+            }
+        } else {
+            self
+        }
     }
-    for col in &mut select.order_by {
-        rewrite_check_expr_table_refs(&mut col.expr, old_tbl, new_tbl);
+
+    fn inside_one_select(self, one: &ast::OneSelect) -> Self {
+        match one {
+            ast::OneSelect::Select {
+                from: Some(from), ..
+            } => self.inside_from_clause(from),
+            _ => self,
+        }
+    }
+
+    fn inside_from_clause(self, from: &ast::FromClause) -> Self {
+        match self.qualifier_target_in_from_clause(from) {
+            Some(qualifier_is_table) => Self {
+                qualifier_is_table,
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    fn qualifier_target_in_from_clause(&self, from: &ast::FromClause) -> Option<bool> {
+        std::iter::once(from.select.as_ref())
+            .chain(from.joins.iter().map(|join| join.table.as_ref()))
+            .find_map(|table| self.qualifier_target(table))
+    }
+
+    fn qualifier_target(&self, table: &ast::SelectTable) -> Option<bool> {
+        match table {
+            ast::SelectTable::Table(_, Some(alias), _)
+            | ast::SelectTable::TableCall(_, _, Some(alias))
+            | ast::SelectTable::Select {
+                alias: Some(alias), ..
+            }
+            | ast::SelectTable::Sub(_, Some(alias)) => {
+                self.is_old_name(alias.name()).then_some(false)
+            }
+            ast::SelectTable::Table(name, None, _) | ast::SelectTable::TableCall(name, _, None) => {
+                self.is_old_name(&name.name)
+                    .then(|| self.renames_table(name))
+            }
+            ast::SelectTable::Select { alias: None, .. } => None,
+            ast::SelectTable::Sub(from, None) => self.qualifier_target_in_from_clause(from),
+        }
+    }
+
+    fn renames_table(&self, name: &ast::QualifiedName) -> bool {
+        let names_table = match &name.namespace {
+            Some(qualifier) => self.qualifier_names_table_namespace(qualifier),
+            None => self.table_is_visible && self.unqualified_names_table,
+        };
+        names_table && self.is_old_name(&name.name)
+    }
+
+    fn qualifier_names_table_namespace(&self, qualifier: &ast::Name) -> bool {
+        self.table_qualifiers.is_none_or(|qualifiers| {
+            let qualifier = normalize_ident(qualifier.as_str());
+            qualifiers.contains(&qualifier)
+        })
+    }
+
+    fn renames_qualifier(&self, name: &ast::Name) -> bool {
+        self.qualifier_is_table && self.is_old_name(name)
+    }
+
+    fn is_old_name(&self, name: &ast::Name) -> bool {
+        name.as_str().eq_ignore_ascii_case(self.old_tbl)
+    }
+
+    fn new_name(&self) -> ast::Name {
+        ast::Name::exact(self.new_tbl.to_owned())
     }
 }
 
-fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, old_tbl: &str, new_tbl: &str) {
+fn rewrite_select_in_scope(select: &mut ast::Select, scope: TableRenameScope) {
+    let scope = select
+        .with
+        .as_ref()
+        .map_or(scope, |with| scope.inside_with_clause(with));
+    if let Some(with_clause) = &mut select.with {
+        for cte in &mut with_clause.ctes {
+            rewrite_select_in_scope(&mut cte.select, scope);
+        }
+    }
+    let order_by_scope = if select.body.compounds.is_empty() {
+        scope.inside_one_select(&select.body.select)
+    } else {
+        scope
+    };
+    rewrite_one_select_table_refs(&mut select.body.select, scope);
+    for compound in &mut select.body.compounds {
+        rewrite_one_select_table_refs(&mut compound.select, scope);
+    }
+    for col in &mut select.order_by {
+        rewrite_expr_table_refs(&mut col.expr, order_by_scope);
+    }
+    if let Some(ref mut limit) = select.limit {
+        rewrite_expr_table_refs(&mut limit.expr, scope);
+        if let Some(ref mut offset) = limit.offset {
+            rewrite_expr_table_refs(offset, scope);
+        }
+    }
+}
+
+fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, scope: TableRenameScope) {
+    let inner_scope = scope.inside_one_select(one);
     match one {
         ast::OneSelect::Select {
             from,
             where_clause,
             columns,
             group_by,
+            window_clause,
             ..
         } => {
             if let Some(ref mut from) = from {
-                rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
+                rewrite_from_clause_table_refs(from, scope);
+            }
+            for window_def in window_clause {
+                for expr in &mut window_def.window.partition_by {
+                    rewrite_expr_table_refs(expr, inner_scope);
+                }
+                for col in &mut window_def.window.order_by {
+                    rewrite_expr_table_refs(&mut col.expr, inner_scope);
+                }
             }
             if let Some(ref mut wc) = where_clause {
-                rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
+                rewrite_expr_table_refs(wc, inner_scope);
             }
             for col in columns {
                 match col {
                     ast::ResultColumn::Expr(ref mut expr, _) => {
-                        rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+                        rewrite_expr_table_refs(expr, inner_scope);
                     }
                     ast::ResultColumn::TableStar(ref mut name) => {
-                        if name.as_str().eq_ignore_ascii_case(old_tbl) {
-                            *name = ast::Name::exact(new_tbl.to_owned());
+                        if inner_scope.renames_qualifier(name) {
+                            *name = inner_scope.new_name();
                         }
                     }
                     ast::ResultColumn::Star => {}
@@ -4093,55 +4317,93 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, old_tbl: &str, new_tb
             }
             if let Some(ref mut gb) = group_by {
                 for expr in &mut gb.exprs {
-                    rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+                    rewrite_expr_table_refs(expr, inner_scope);
                 }
                 if let Some(ref mut having) = gb.having {
-                    rewrite_check_expr_table_refs(having, old_tbl, new_tbl);
+                    rewrite_expr_table_refs(having, inner_scope);
                 }
             }
         }
         ast::OneSelect::Values(rows) => {
             for row in rows {
                 for expr in row {
-                    rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+                    rewrite_expr_table_refs(expr, inner_scope);
                 }
             }
         }
     }
 }
 
-fn rewrite_from_clause_table_refs(from: &mut ast::FromClause, old_tbl: &str, new_tbl: &str) {
-    rewrite_select_table_entry_table_refs(&mut from.select, old_tbl, new_tbl);
+fn rewrite_from_clause_table_refs(from: &mut ast::FromClause, scope: TableRenameScope) {
+    let from_scope = scope.inside_from_clause(from);
+    rewrite_select_table_entry_table_refs(&mut from.select, scope, from_scope);
     for join in &mut from.joins {
-        rewrite_select_table_entry_table_refs(&mut join.table, old_tbl, new_tbl);
+        rewrite_select_table_entry_table_refs(&mut join.table, scope, from_scope);
         if let Some(ast::JoinConstraint::On(ref mut expr)) = join.constraint {
-            rewrite_check_expr_table_refs(expr, old_tbl, new_tbl);
+            rewrite_expr_table_refs(expr, from_scope);
         }
     }
 }
 
-fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &str, new_tbl: &str) {
+fn rewrite_select_table_entry_table_refs(
+    st: &mut ast::SelectTable,
+    scope: TableRenameScope,
+    from_scope: TableRenameScope,
+) {
     match st {
         ast::SelectTable::Table(ref mut name, _, _) => {
-            if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
-                name.name = ast::Name::exact(new_tbl.to_owned());
+            if scope.renames_table(name) {
+                name.name = scope.new_name();
             }
         }
         ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
-            if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
-                name.name = ast::Name::exact(new_tbl.to_owned());
+            if scope.renames_table(name) {
+                name.name = scope.new_name();
             }
             for arg in args {
-                rewrite_check_expr_table_refs(arg, old_tbl, new_tbl);
+                rewrite_expr_table_refs(arg, from_scope);
             }
         }
-        ast::SelectTable::Select { ref mut select, .. } => {
-            rewrite_select_table_refs(select, old_tbl, new_tbl);
+        ast::SelectTable::Select {
+            ref mut select,
+            lateral,
+            ..
+        } => {
+            rewrite_select_in_scope(select, if *lateral { from_scope } else { scope });
         }
         ast::SelectTable::Sub(ref mut from, _) => {
-            rewrite_from_clause_table_refs(from, old_tbl, new_tbl);
+            rewrite_from_clause_table_refs(from, scope);
         }
     }
+}
+
+fn rewrite_expr_table_refs(expr: &mut ast::Expr, scope: TableRenameScope) {
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                ast::Expr::Qualified(tbl, col) => {
+                    if scope.renames_qualifier(tbl) {
+                        let col = col.clone();
+                        *e = ast::Expr::Qualified(scope.new_name(), col);
+                    }
+                }
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+                    rewrite_select_in_scope(select, scope);
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    rewrite_select_in_scope(rhs, scope);
+                }
+                ast::Expr::InTable { rhs, .. } => {
+                    if scope.renames_table(rhs) {
+                        rhs.name = scope.new_name();
+                    }
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
 }
 
 fn rewrite_upsert_table_refs(upsert: &mut ast::Upsert, old_tbl: &str, new_tbl: &str) {
@@ -4190,7 +4452,7 @@ pub mod tests {
             let table = BTreeTable::from_sql(create_table_sql, root_page)
                 .expect("test CREATE TABLE should parse");
             schema
-                .add_btree_table(std::sync::Arc::new(table))
+                .add_btree_table(NamespaceId::ROOT, std::sync::Arc::new(table))
                 .expect("test table should be added to schema");
         }
 
@@ -4201,15 +4463,87 @@ pub mod tests {
         schema_with_tables(&[create_table_sql])
     }
 
+    /// A schema with table `t (a)` in the root namespace and table
+    /// `t (b, c)` in namespace 1.
+    fn schema_with_a_table_t_in_two_namespaces() -> (Schema, NamespaceId) {
+        let mut schema = schema_with_table("CREATE TABLE t (a)");
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other, "other");
+        let table = BTreeTable::from_sql("CREATE TABLE t (b, c)", 3)
+            .expect("test CREATE TABLE should parse");
+        schema
+            .add_btree_table(other, std::sync::Arc::new(table))
+            .expect("test table should be added to schema");
+        (schema, other)
+    }
+
+    fn select(sql: &str) -> ast::Select {
+        let mut parser = Parser::new(sql.as_bytes());
+        let Some(ast::Cmd::Stmt(ast::Stmt::Select(select))) = parser.next_cmd().unwrap() else {
+            panic!("expected SELECT: {sql}");
+        };
+        select
+    }
+
+    fn column_names(columns: &ViewColumnSchema) -> Vec<String> {
+        columns
+            .flat_columns()
+            .unwrap()
+            .iter()
+            .map(|column| column.name.clone().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_view_body_reads_the_tables_of_the_view_namespace() {
+        let (schema, other) = schema_with_a_table_t_in_two_namespaces();
+        let body = select("SELECT * FROM t");
+        assert_eq!(
+            column_names(&extract_view_columns(other, &body, &schema).unwrap()),
+            ["b", "c"]
+        );
+        assert_eq!(
+            column_names(&extract_view_columns(NamespaceId::ROOT, &body, &schema).unwrap()),
+            ["a"]
+        );
+        let qualified = select("SELECT * FROM main.t");
+        assert_eq!(
+            column_names(&extract_view_columns(other, &qualified, &schema).unwrap()),
+            ["a"]
+        );
+    }
+
+    #[test]
+    fn rename_column_rewrites_a_view_against_the_table_of_its_namespace() {
+        let (schema, other) = schema_with_a_table_t_in_two_namespaces();
+        let view_sql = "CREATE VIEW v AS SELECT b FROM t";
+        let rewritten =
+            rewrite_view_sql_for_column_rename(view_sql, &schema, other, "t", "main", "b", "x")
+                .unwrap()
+                .expect("view should be rewritten");
+        assert!(
+            rewritten.sql.contains("SELECT x FROM t"),
+            "{}",
+            rewritten.sql
+        );
+    }
+
     #[test]
     fn test_rewrite_view_sql_select_table_branch() {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT s.x FROM (SELECT b AS x FROM t) AS s";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(rewritten.sql.contains("SELECT c AS x FROM t"));
     }
@@ -4219,10 +4553,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT s.b FROM (t) AS s";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(!rewritten.sql.contains("s.b"), "{}", rewritten.sql);
     }
@@ -4233,10 +4574,17 @@ pub mod tests {
         let view_sql =
             "CREATE VIEW v AS SELECT j.value FROM t JOIN json_each(json_array(t.b)) AS j";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(!rewritten.sql.contains("t.b"), "{}", rewritten.sql);
     }
@@ -4246,10 +4594,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT b FROM t UNION ALL SELECT b FROM t ORDER BY b";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert_eq!(rewritten.sql.matches("SELECT c FROM t").count(), 2);
         assert!(!rewritten.sql.contains("ORDER BY b"), "{}", rewritten.sql);
@@ -4261,10 +4616,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS WITH cte AS (SELECT b FROM t) SELECT b FROM cte";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(
             rewritten.sql.contains("WITH cte AS (SELECT c FROM t)"),
@@ -4283,10 +4645,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS WITH cte(x) AS (SELECT b FROM t) SELECT x FROM cte";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(
             rewritten.sql.contains("WITH cte(x)") || rewritten.sql.contains("WITH cte (x)"),
@@ -4392,10 +4761,17 @@ pub mod tests {
         let schema = schema_with_tables(&["CREATE TABLE t (a, b)", "CREATE TABLE u (b)"]);
         let view_sql = "CREATE VIEW v AS SELECT t.a FROM t JOIN u ON t.b = u.b";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(!rewritten.sql.contains("t.b"), "{}", rewritten.sql);
         assert!(rewritten.sql.contains("t.c = u.b"), "{}", rewritten.sql);
@@ -4410,8 +4786,16 @@ pub mod tests {
         // after the rename t has no b. SQLite refuses the ALTER, so the
         // rewrite must error rather than emit a view that can never be
         // queried again.
-        let err = rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-            .unwrap_err();
+        let err = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("cannot join using column"),
             "{err}"
@@ -4423,10 +4807,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT b FROM t GROUP BY b HAVING b > 0";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(
             rewritten
@@ -4442,10 +4833,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT sum(a) OVER (PARTITION BY b ORDER BY b) FROM t";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(
             !rewritten.sql.contains("PARTITION BY b"),
@@ -4466,10 +4864,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT a FROM t LIMIT b OFFSET b";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(!rewritten.sql.contains("LIMIT b"), "{}", rewritten.sql);
         assert!(!rewritten.sql.contains("OFFSET b"), "{}", rewritten.sql);
@@ -4482,10 +4887,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS VALUES ((SELECT b FROM t LIMIT 1))";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            NamespaceId::ROOT,
+            "t",
+            "main",
+            "b",
+            "c",
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(
             rewritten.sql.contains("VALUES ((SELECT c FROM t LIMIT 1))"),

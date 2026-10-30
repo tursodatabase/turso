@@ -1,4 +1,5 @@
-use turso_core::{ConstraintKind, ConstraintViolation, LimboError, Value};
+use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
+use turso_pg_parser::sqlstate::*;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -14,6 +15,10 @@ struct ErrorData {
 impl Error {
     pub fn core_error(&self) -> &LimboError {
         &self.0.source
+    }
+
+    pub(crate) fn into_core_error(self) -> LimboError {
+        self.0.source
     }
 }
 
@@ -46,6 +51,26 @@ impl From<LimboError> for Error {
     }
 }
 
+/// An engine error with the message `message`, which reports SQLSTATE
+/// `sqlstate` to the client. Use it for errors that the PostgreSQL frontend
+/// raises itself, also in the PostgreSQL functions that the engine runs.
+pub(crate) fn sqlstate_error(sqlstate: &'static str, message: impl Into<String>) -> LimboError {
+    LimboError::Dialect(Box::new(DialectError {
+        code: sqlstate,
+        message: message.into(),
+    }))
+}
+
+/// The error PostgreSQL returns for every statement in an aborted
+/// transaction block, until COMMIT, ROLLBACK, or ROLLBACK TO SAVEPOINT
+/// ends it.
+pub(crate) fn in_failed_sql_transaction_error() -> LimboError {
+    sqlstate_error(
+        turso_pg_parser::sqlstate::SQLSTATE_IN_FAILED_SQL_TRANSACTION,
+        "current transaction is aborted, commands ignored until end of transaction block",
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct ErrorReport {
     pub sqlstate: &'static str,
@@ -68,7 +93,10 @@ impl From<&LimboError> for ErrorReport {
         };
         if let LimboError::ConstraintViolation(violation) = error {
             if let Some(table) = &violation.table_name {
-                report.table_name = Some(table.clone());
+                // Core names the table as it is stored; the user knows it by
+                // its bare name.
+                let table = turso_core::namespace::demangle_name(true, table).1;
+                report.table_name = Some(table.to_string());
                 report.constraint_name = constraint_name(violation, table);
                 if violation.kind == ConstraintKind::NotNull {
                     report.column_name = violation.column_names.first().cloned();
@@ -180,41 +208,6 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-const SQLSTATE_UNIQUE_VIOLATION: &str = "23505";
-const SQLSTATE_FK_VIOLATION: &str = "23503";
-const SQLSTATE_CHECK_VIOLATION: &str = "23514";
-const SQLSTATE_NOT_NULL_VIOLATION: &str = "23502";
-const SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION: &str = "23000";
-const SQLSTATE_SYNTAX_ERROR: &str = "42601";
-const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
-const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
-const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
-const SQLSTATE_DUPLICATE_TABLE: &str = "42P07";
-const SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION: &str = "42000";
-const SQLSTATE_DATATYPE_MISMATCH: &str = "42804";
-const SQLSTATE_DATA_EXCEPTION: &str = "22000";
-const SQLSTATE_STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
-const SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
-const SQLSTATE_NULL_VALUE_NOT_ALLOWED: &str = "22004";
-const SQLSTATE_INVALID_DATETIME_FORMAT: &str = "22007";
-const SQLSTATE_DIVISION_BY_ZERO: &str = "22012";
-const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
-const SQLSTATE_SEQUENCE_LIMIT_EXCEEDED: &str = "2200H";
-const SQLSTATE_INVALID_TRANSACTION_STATE: &str = "25000";
-const SQLSTATE_ACTIVE_SQL_TRANSACTION: &str = "25001";
-const SQLSTATE_READ_ONLY_SQL_TRANSACTION: &str = "25006";
-const SQLSTATE_NO_ACTIVE_SQL_TRANSACTION: &str = "25P01";
-const SQLSTATE_INVALID_SAVEPOINT_SPECIFICATION: &str = "3B001";
-const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
-const SQLSTATE_DISK_FULL: &str = "53100";
-const SQLSTATE_OUT_OF_MEMORY: &str = "53200";
-const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
-const SQLSTATE_QUERY_CANCELED: &str = "57014";
-const SQLSTATE_RAISE_EXCEPTION: &str = "P0001";
-const SQLSTATE_ASSERT_FAILURE: &str = "P0004";
-const SQLSTATE_DATA_CORRUPTED: &str = "XX001";
-const SQLSTATE_INTERNAL_ERROR: &str = "XX000";
-
 fn sqlstate(error: &LimboError) -> &'static str {
     match error {
         LimboError::ConstraintViolation(cv) => match cv.kind {
@@ -228,9 +221,8 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::Constraint(_) => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
         LimboError::LexerError(_) => SQLSTATE_SYNTAX_ERROR,
         LimboError::ParseError(msg) => parse_error_sqlstate(msg),
-        LimboError::SqlError(_) | LimboError::PlanningError(_) => {
-            SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION
-        }
+        LimboError::SqlError(msg) => sql_error_sqlstate(msg),
+        LimboError::PlanningError(_) => SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION,
         LimboError::DivisionByZero => SQLSTATE_DIVISION_BY_ZERO,
         LimboError::InvalidTextRepresentation(_) => SQLSTATE_INVALID_TEXT_REPRESENTATION,
         LimboError::IntegerOverflow => SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
@@ -238,9 +230,8 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::InvalidDate(_)
         | LimboError::InvalidTime(_)
         | LimboError::InvalidModifier(_) => SQLSTATE_INVALID_DATETIME_FORMAT,
-        LimboError::ConversionError(_)
-        | LimboError::InvalidArgument(_)
-        | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,
+        LimboError::InvalidArgument(msg) => invalid_argument_sqlstate(msg),
+        LimboError::ConversionError(_) | LimboError::InvalidFormatter(_) => SQLSTATE_DATA_EXCEPTION,
         LimboError::ParseIntError(_) | LimboError::ParseFloatError(_) => {
             SQLSTATE_INVALID_TEXT_REPRESENTATION
         }
@@ -264,15 +255,32 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::OutOfMemory => SQLSTATE_OUT_OF_MEMORY,
         LimboError::TableLocked | LimboError::Busy => SQLSTATE_LOCK_NOT_AVAILABLE,
         LimboError::Interrupt => SQLSTATE_QUERY_CANCELED,
-        LimboError::Raise(_, _) => SQLSTATE_RAISE_EXCEPTION,
+        LimboError::Raise(_, msg) => raise_sqlstate(msg),
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
+        LimboError::Dialect(error) => error.code,
         _ => SQLSTATE_INTERNAL_ERROR,
     }
 }
 
+/// The SQLSTATE of a parse error that the engine raised. The rules that look
+/// at the start of the message cannot match a name in the message, for
+/// example a column named "no such object". The checks for dependent objects
+/// come first, because their messages end with the error that the dependent
+/// object gives, for example "no such column". A duplicate object is checked
+/// before the "no such ..." rules, because its name sits inside the message, for
+/// example a table named "no such table".
 fn parse_error_sqlstate(msg: &str) -> &'static str {
-    if msg.contains("no such table") || msg.contains("table not found") {
+    if (msg.starts_with("cannot drop column") && msg.contains(": referenced in VIEW "))
+        || msg.starts_with("cannot drop type")
+    {
+        SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
+    } else if is_duplicate_object_error(msg) {
+        SQLSTATE_DUPLICATE_TABLE
+    } else if msg.contains("no such table")
+        || msg.contains("table not found")
+        || msg.starts_with("no such object")
+    {
         SQLSTATE_UNDEFINED_TABLE
     } else if msg.contains("no such column") || msg.contains("column not found") {
         SQLSTATE_UNDEFINED_COLUMN
@@ -280,8 +288,79 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
+    } else if msg.starts_with("ambiguous column name") {
+        SQLSTATE_AMBIGUOUS_COLUMN
+    } else if msg.starts_with("misuse of aggregate")
+        || msg.starts_with("aggregate functions are not allowed")
+    {
+        SQLSTATE_GROUPING_ERROR
+    } else if msg.starts_with("misuse of window function") {
+        SQLSTATE_WINDOWING_ERROR
+    } else if msg.starts_with("invalid reference to FROM-clause entry") {
+        SQLSTATE_INVALID_COLUMN_REFERENCE
+    } else if msg == "malformed JSON" {
+        SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg.starts_with("sequence \"") && msg.ends_with("\" does not exist") {
+        SQLSTATE_UNDEFINED_TABLE
+    } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
+        || msg == "no schema has been selected to create in"
+    {
+        SQLSTATE_INVALID_SCHEMA_NAME
     } else {
         SQLSTATE_SYNTAX_ERROR
+    }
+}
+
+/// Whether a parse error reports that an object already exists, for example
+/// `table t already exists`. The kind at the start and the suffix are checked,
+/// so the name in between can contain the "no such ..." phrases. The message
+/// for a missing INSERT column (`table t has no column named c`) has the same
+/// start and can end with ` already exists` when the column name does, so it
+/// is excluded.
+fn is_duplicate_object_error(msg: &str) -> bool {
+    const KINDS: [&str; 8] = [
+        "table ",
+        "view ",
+        "View ",
+        "index ",
+        "trigger ",
+        "schema ",
+        "type ",
+        "sequence ",
+    ];
+    msg.ends_with(" already exists")
+        && KINDS.iter().any(|kind| msg.starts_with(kind))
+        && !msg.contains(" has no column named ")
+}
+
+fn invalid_argument_sqlstate(msg: &str) -> &'static str {
+    if msg.starts_with("no such database") {
+        SQLSTATE_INVALID_SCHEMA_NAME
+    } else {
+        SQLSTATE_DATA_EXCEPTION
+    }
+}
+
+/// The SQLSTATE of an error that a statement of the engine raised when it ran.
+fn sql_error_sqlstate(msg: &str) -> &'static str {
+    if msg.contains("ON CONFLICT DO UPDATE command cannot affect row a second time") {
+        SQLSTATE_CARDINALITY_VIOLATION
+    } else {
+        SQLSTATE_SYNTAX_OR_ACCESS_VIOLATION
+    }
+}
+
+/// The SQLSTATE of a RAISE. The translator and the types of the engine check
+/// values with RAISE, and PostgreSQL gives these checks their own SQLSTATE.
+fn raise_sqlstate(msg: &str) -> &'static str {
+    if msg == "invalid date value" || msg == "invalid timestamp value" {
+        SQLSTATE_INVALID_DATETIME_FORMAT
+    } else if msg.starts_with("invalid input value for enum ") {
+        SQLSTATE_INVALID_TEXT_REPRESENTATION
+    } else if msg.starts_with("cannot call ") || msg.ends_with(" must be an array of objects") {
+        SQLSTATE_INVALID_PARAMETER_VALUE
+    } else {
+        SQLSTATE_RAISE_EXCEPTION
     }
 }
 
@@ -357,6 +436,38 @@ mod tests {
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
+            (
+                "table no such table already exists",
+                SQLSTATE_DUPLICATE_TABLE,
+            ),
+            (
+                "table \"table not found\" already exists",
+                SQLSTATE_DUPLICATE_TABLE,
+            ),
+            (
+                "index no such column already exists",
+                SQLSTATE_DUPLICATE_TABLE,
+            ),
+            (
+                "view no such function already exists",
+                SQLSTATE_DUPLICATE_TABLE,
+            ),
+            ("no such table: already exists", SQLSTATE_UNDEFINED_TABLE),
+            (
+                "table plain has no column named no such column already exists",
+                SQLSTATE_UNDEFINED_COLUMN,
+            ),
+            ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
+            ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
+            (
+                "no schema has been selected to create in",
+                SQLSTATE_INVALID_SCHEMA_NAME,
+            ),
+            (
+                "Invalid statement: syntax error at or near \"'malformed JSON'\"",
+                SQLSTATE_SYNTAX_ERROR,
+            ),
             ("unexpected token", SQLSTATE_SYNTAX_ERROR),
         ] {
             let e = LimboError::ParseError(msg.to_string());

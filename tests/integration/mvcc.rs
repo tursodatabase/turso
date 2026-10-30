@@ -54,11 +54,12 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
     fn serialize_row_version(
         &self,
         log_record: &mut turso_core::mvcc::database::LogRecord,
+        row_id: &turso_core::mvcc::database::RowID,
         row_version: &turso_core::mvcc::database::RowVersion,
         portable_extension: Option<&[u8]>,
     ) -> turso_core::Result<()> {
         self.inner
-            .serialize_row_version(log_record, row_version, portable_extension)
+            .serialize_row_version(log_record, row_id, row_version, portable_extension)
     }
 
     fn serialize_database_header(
@@ -1522,6 +1523,38 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
 
     let rows: Vec<(String, i64)> = conn.exec_rows("SELECT key, length(value) FROM quint_corrupt");
     assert_eq!(rows, vec![("k0".to_string(), 32)]);
+
+    Ok(())
+}
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/8067
+///
+/// Under MVCC, an UPSERT (`ON CONFLICT(v) DO UPDATE SET id = excluded.id`) on a
+/// checkpointed row probes the new `INTEGER PRIMARY KEY` with `NotExists` on the
+/// table cursor before re-seeking to the conflicting rowid and deleting it.
+/// `MvccLazyCursor::exists` moved the underlying B-tree cursor during a miss
+/// without clearing `current_pos`, causing the subsequent `SeekRowid` equality
+/// fast-path to short-circuit and `Delete` to fail with a false corruption error.
+#[turso_macros::test]
+fn test_mvcc_checkpointed_upsert_changing_ipk(db: TempDatabase) -> anyhow::Result<()> {
+    let conn = db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two')")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    conn.execute("INSERT INTO t VALUES (3, 'one') ON CONFLICT(v) DO UPDATE SET id = excluded.id")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+    let by_pk: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(by_pk, vec![(2, "two".to_string()), (3, "one".to_string())]);
+
+    let by_idx: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, v FROM t INDEXED BY sqlite_autoindex_t_1 ORDER BY v");
+    assert_eq!(by_idx, vec![(3, "one".to_string()), (2, "two".to_string())]);
 
     Ok(())
 }

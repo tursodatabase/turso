@@ -62,6 +62,21 @@ expect error {
     wrong number of arguments to function concat_ws()
 }
 
+test concat-ws-blob-arguments {
+    SELECT quote(concat_ws(',', 'a', x'62', 'c'));
+    SELECT quote(concat_ws(x'2c', 'a', 'b'));
+    SELECT quote(concat_ws(x'', NULL));
+    SELECT quote(concat_ws(NULL, 'a', 'b'));
+    SELECT quote(concat_ws('-', 'a', NULL, x'63', 1, 2.5));
+}
+expect {
+    'a,b,c'
+    'a,b'
+    ''
+    NULL
+    'a-c-1-2.5'
+}
+
 # `||` converts each side to text. Only a TEXT value is already in that form;
 # every other type is rendered first, so each one needs its own case.
 test concat-value-types {

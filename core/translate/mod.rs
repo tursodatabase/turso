@@ -10,6 +10,7 @@
 pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
+pub(crate) mod catalog;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
@@ -17,6 +18,7 @@ pub(crate) mod display;
 pub(crate) mod emitter;
 pub mod eqp;
 pub(crate) mod expr;
+pub(crate) mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
@@ -30,6 +32,7 @@ pub(crate) mod plan;
 pub(crate) mod planner;
 pub(crate) mod pragma;
 pub(crate) mod recursive_cte;
+pub(crate) mod result_column_types;
 pub(crate) mod result_row;
 pub(crate) mod rollback;
 pub(crate) mod schema;
@@ -105,6 +108,10 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.flags.set_keep_array_results_as_blobs(matches!(
+        origin,
+        crate::statement::StatementOrigin::InternalHelper
+    ));
 
     program.prologue();
     // Engine-generated helper statements are always SQLite text and
@@ -118,12 +125,13 @@ pub fn translate(
     } else {
         connection.search_path()
     };
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -199,6 +207,8 @@ pub fn translate_inner(
             | ast::Stmt::Insert { .. }
             | ast::Stmt::CreateSequence { .. }
             | ast::Stmt::DropSequence { .. }
+            | ast::Stmt::CreateSchema { .. }
+            | ast::Stmt::DropSchema { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -280,32 +290,20 @@ pub fn translate_inner(
             for_each_row,
             when_clause,
             commands,
-        } => {
-            // Reconstruct SQL for storage
-            let sql = trigger::create_trigger_to_sql(
-                temporary,
-                if_not_exists,
-                &trigger_name,
-                time,
-                &event,
-                &tbl_name,
-                for_each_row,
-                when_clause.as_deref(),
-                &commands,
-            );
-            trigger::translate_create_trigger(
-                trigger_name,
-                resolver,
-                temporary,
-                if_not_exists,
-                time,
-                tbl_name,
-                program,
-                sql,
-                &commands,
-                when_clause.as_deref(),
-            )?
-        }
+        } => trigger::translate_create_trigger(
+            trigger_name,
+            resolver,
+            temporary,
+            if_not_exists,
+            time,
+            &event,
+            tbl_name,
+            for_each_row,
+            connection,
+            program,
+            &commands,
+            when_clause.as_deref(),
+        )?,
         ast::Stmt::CreateView {
             view_name,
             select,
@@ -319,6 +317,7 @@ pub fn translate_inner(
             &columns,
             temporary,
             if_not_exists,
+            connection,
             program,
         )?,
         ast::Stmt::CreateMaterializedView {
@@ -506,6 +505,7 @@ pub fn translate_inner(
                 &max_value,
                 cycle,
                 resolver,
+                connection,
                 program,
             )?;
         }
@@ -514,6 +514,12 @@ pub fn translate_inner(
             seq_name,
         } => {
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+        }
+        ast::Stmt::CreateSchema { name } => {
+            schema::translate_create_schema(&name, resolver, program)?;
+        }
+        ast::Stmt::DropSchema { name } => {
+            schema::translate_drop_schema(&name, resolver, program)?;
         }
     };
 
@@ -543,6 +549,14 @@ pub fn translate_inner(
             program.emit_result_row(reg, 1);
             program.add_pragma_result_column(column_name.to_string());
         }
+    }
+
+    if connection.experimental_custom_types_enabled() {
+        program.result_column_types = result_column_types::result_column_types(
+            &program.result_columns,
+            &program.table_references,
+            resolver,
+        );
     }
 
     Ok(())
@@ -583,6 +597,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Optimize { .. } => "optimize",
         ast::Stmt::CreateSequence { .. } => "create_sequence",
         ast::Stmt::DropSequence { .. } => "drop_sequence",
+        ast::Stmt::CreateSchema { .. } => "create_schema",
+        ast::Stmt::DropSchema { .. } => "drop_schema",
     }
 }
 
@@ -591,6 +607,7 @@ mod tests {
     use super::*;
     use crate::alloc::TryClone;
     use crate::io::MemoryIO;
+    use crate::namespace::NamespaceId;
     use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
     use crate::vdbe::insn::{ClearBtreeCount, Insn};
     use crate::ConnectOpts;
@@ -856,13 +873,14 @@ mod tests {
 
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
         let seq_root_page = schema
-            .get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
             .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
             .root_page;
         let malformed_seq =
             BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
                 .expect("malformed sqlite_sequence SQL should parse");
-        schema.tables.insert(
+        schema.insert_table(
+            NamespaceId::ROOT,
             SQLITE_SEQUENCE_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(Arc::new(malformed_seq))),
         );
@@ -908,7 +926,7 @@ mod tests {
             .unwrap();
 
         let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        schema.tables.remove(SQLITE_SEQUENCE_TABLE_NAME);
+        schema.take_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME);
 
         let pager = conn.pager.load().clone();
         let syms = SymbolTable::new();

@@ -106,7 +106,7 @@ pub(super) fn open_in_seek_source_cursor(
             let collation = index
                 .as_ref()
                 .and_then(|idx| idx.columns.first())
-                .and_then(|c| c.collation);
+                .map_or(CollationSeq::Binary, |c| c.collation);
             let ephemeral_index = Arc::new(Index {
                 name: String::new(),
                 table_name: String::new(),

@@ -555,10 +555,8 @@ fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backen
 }
 
 #[turso_macros::test]
-fn test_attach_inherits_generated_columns_flag_on_reattach(
-    _tmp_db: TempDatabase,
-) -> anyhow::Result<()> {
-    let db = attach_enabled_db(DatabaseOpts::new().with_generated_columns(true));
+fn test_attach_supports_generated_columns_on_reattach(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
     let conn = db.connect_limbo();
 
     let aux_path = db.path.with_extension("attach_generated_columns.db");

@@ -17,7 +17,7 @@ Scalar functions accept one or more arguments and return a single value. They ca
 | `abs(X)` | Absolute value of X. Returns INTEGER if X is INTEGER, REAL if X is REAL, NULL if X is NULL |
 | `max(X, Y, ...)` | Returns the argument with the maximum value |
 | `min(X, Y, ...)` | Returns the argument with the minimum value |
-| `random()` | Returns a random 64-bit signed integer |
+| `random()` | Returns a random 64-bit signed integer in SQLite; returns a `double precision` value in `[0, 1)` in PostgreSQL |
 | `round(X)` | Rounds X to the nearest integer |
 | `round(X, Y)` | Rounds X to Y decimal places |
 | `sign(X)` | Returns -1, 0, or 1 for negative, zero, or positive X |
@@ -350,6 +350,8 @@ SELECT quote(x'CAFE');       -- 'X''CAFE'''
 
 `random` returns a pseudo-random 64-bit signed integer. Each call is evaluated independently, including multiple calls in the same expression. `randomblob` returns a blob of N pseudo-random bytes.
 
+In the PostgreSQL dialect, `random()` returns a `double precision` value in the range `[0, 1)`.
+
 ```sql
 SELECT random();           -- e.g., -4520312828827489743
 SELECT hex(randomblob(4)); -- e.g., 'A1B2C3D4' (4 random bytes)
@@ -557,3 +559,22 @@ Extension loading must be enabled on the database connection. See the [Extension
 - [Expressions](/docs/sql-reference/expressions) for operator syntax, CAST, CASE, and subqueries
 - [Data Types](/docs/sql-reference/data-types) for storage classes and type affinity
 - [SELECT](/docs/sql-reference/statements/select) for using functions in queries
+
+## PostgreSQL session functions
+
+### current_schemas(include_implicit)
+
+In the PostgreSQL frontend, returns the existing schemas in the session's
+`search_path`, in search order. Missing schemas and duplicate entries are omitted.
+When `include_implicit` is true, `pg_catalog` is added at the beginning unless it
+already appears explicitly in the path. A NULL argument returns NULL.
+
+```sql
+SELECT current_schemas(false); -- {public} with the default search_path
+SELECT current_schemas(true);  -- {pg_catalog,public}
+```
+
+The result uses PostgreSQL array text syntax and can be read with
+`SELECT * FROM unnest(current_schemas(false))`. It follows changes to the session's
+search path, including transaction rollback. Temporary PostgreSQL schemas and
+per-user schema privileges are not currently modeled.

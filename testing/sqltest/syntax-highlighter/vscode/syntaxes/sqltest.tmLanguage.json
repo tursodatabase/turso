@@ -8,6 +8,7 @@
     { "include": "#file-directive" },
     { "include": "#setup-block" },
     { "include": "#test-decorator" },
+    { "include": "#sqlstate-directive" },
     { "include": "#test-block" },
     { "include": "#snapshot-block" },
     { "include": "#expect-block" }
@@ -192,6 +193,14 @@
       "captures": {
         "1": { "name": "keyword.control.directive.sqltest" },
         "2": { "name": "constant.language.sqltest" }
+      }
+    },
+    "sqlstate-directive": {
+      "name": "meta.directive.sqlstate.sqltest",
+      "match": "(@sqlstate)\\s+([0-9A-Z]{5})",
+      "captures": {
+        "1": { "name": "keyword.control.directive.sqltest" },
+        "2": { "name": "constant.numeric.sqltest" }
       }
     },
     "decorator-requires": {

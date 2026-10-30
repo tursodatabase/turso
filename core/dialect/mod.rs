@@ -132,6 +132,10 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
+    fn random_value(&self, bits: i64) -> crate::Value {
+        crate::Value::from_i64(bits) // SQLite default
+    }
+
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
@@ -190,6 +194,27 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a database of this dialect supports namespaces: the objects of
+    /// a namespace are kept in the schema rows of the main database
+    /// under names that encode the namespace's id, which the loader decodes
+    /// and which no user object may be named.
+    ///
+    /// PostgreSQL stores its schemas this way. SQLite has no namespaces, so
+    /// a name that looks like a mangled name is an ordinary name.
+    fn supports_namespaces(&self) -> bool {
+        false
+    }
+
+    /// The namespaces of a database that has never created or dropped one.
+    /// They have ids from 1 in this order and no rows until the first
+    /// CREATE SCHEMA or DROP SCHEMA creates the namespaces table, which then
+    /// stores them with the change.
+    ///
+    /// PostgreSQL has the schema public. SQLite has no namespaces.
+    fn default_namespaces(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Whether `INSERT ... ON CONFLICT DO UPDATE` fails when the conflicting
     /// row was already inserted or updated by the same statement.
     ///
@@ -203,6 +228,22 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
     fn errors_on_zero_divisor(&self) -> bool {
+        false
+    }
+
+    /// Whether `mod` of two integers returns an integer.
+    ///
+    /// PostgreSQL returns an integer. SQLite always returns a REAL.
+    fn mod_of_integers_is_integer(&self) -> bool {
+        false
+    }
+
+    /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
+    /// a table that has rows.
+    ///
+    /// PostgreSQL rewrites the table and computes the default for each
+    /// existing row. SQLite raises an error unless the table is empty.
+    fn add_column_computes_default_for_existing_rows(&self) -> bool {
         false
     }
 }
@@ -516,29 +557,12 @@ mod tests {
     }
 
     #[test]
-    fn query_runner_reports_invalid_utf8_once() {
+    fn consume_stmt_reports_parse_error() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "query-runner-invalid-utf8.db", Arc::new(SqliteDialect)).unwrap();
+        let db = open_db(&io, "consume-stmt-parse-error.db", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
-        let mut runner = conn.query_runner(b"SELECT 1;\xff");
 
-        let Some(Err(crate::LimboError::ParseError(message))) = runner.next() else {
-            panic!("invalid UTF-8 must produce a parse error");
-        };
-        assert!(message.contains("invalid UTF-8"));
-        assert!(runner.next().is_none());
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn query_runner_reports_parse_error_once() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "query-runner-parse-error.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        let mut runner = conn.query_runner(b"SELECT * FROM");
-
-        assert!(runner.next().is_some_and(|result| result.is_err()));
-        assert!(runner.next().is_none());
+        assert!(conn.consume_stmt("SELECT * FROM").is_err());
         conn.close().unwrap();
     }
 

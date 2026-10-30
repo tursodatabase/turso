@@ -39,7 +39,7 @@ PRAGMA page_count;
 
 ### page_size
 
-Returns or sets the page size of the database. The page size can only be set before any tables are created.
+Returns or sets the page size of the database. The page size can only be set before any tables are created. On an existing database, the new size is not applied to it, but later [`VACUUM INTO`](/docs/sql-reference/statements/vacuum#vacuum-into) statements on the same connection use it for the destination.
 
 ```sql
 PRAGMA page_size;
@@ -177,6 +177,8 @@ PRAGMA index_info(index-name);
 -- seqno | cid | name
 -- 0     | 2   | email
 ```
+
+An expression column (for example `CREATE INDEX i ON t(lower(name))`) has `cid` -2 and a NULL `name`.
 
 The PRIMARY KEY of a `WITHOUT ROWID` table is reported as an index named `sqlite_autoindex_<table>_1`. Passing the table's name to `index_info` or `index_xinfo` also describes that index.
 
@@ -554,6 +556,9 @@ PRAGMA integrity_check(N);    -- check only the first N errors
 
 Returns `ok` if no problems are found, otherwise returns one row per error.
 
+For custom index methods, this checks the structure of their backing B-trees.
+It does not compare their custom records with table rows as it does for ordinary indexes.
+
 ### quick_check
 
 Performs a faster but less thorough integrity check than `integrity_check`.
@@ -592,6 +597,8 @@ PRAGMA wal_checkpoint;
 ```
 
 A checkpoint writes pages from the WAL file back to the database file.
+
+Inside a transaction, the checkpoint fails with `database table is locked` once the transaction has read or written the database. Right after `BEGIN`, before any read, it runs normally.
 
 ### wal_autocheckpoint
 
@@ -780,12 +787,12 @@ Lists all available types (built-in and custom) with their metadata.
 
 ```sql
 PRAGMA list_types;
--- type    | parent | encode | decode | default | operators
--- INTEGER |        |        |        |         |
--- REAL    |        |        |        |         |
--- TEXT    |        |        |        |         |
--- BLOB    |        |        |        |         |
--- ANY     |        |        |        |         |
+-- type    | parent | encode | coerce | decode | default | operators
+-- INTEGER |        |        |        |        |         |
+-- REAL    |        |        |        |        |         |
+-- TEXT    |        |        |        |        |         |
+-- BLOB    |        |        |        |        |         |
+-- ANY     |        |        |        |        |         |
 ```
 
 See [CREATE TYPE](/docs/sql-reference/statements/create-type) for creating custom types.

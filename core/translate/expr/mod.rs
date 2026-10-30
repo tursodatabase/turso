@@ -4,15 +4,16 @@ use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
-use super::collate::{resolve_comparison_collseq_with_resolver, CollationSeq};
+use super::collate::{comparison_collation, first_collation, CollationSeq};
 use super::emitter::Resolver;
+use super::expr_context::{ExprContext, ExprProperties};
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
-use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
+use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::schema::{
     BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, ParenthesizedJoinColumn,
     ParenthesizedJoinColumnVisibility, Table, Type, TypeDef,
@@ -43,6 +44,7 @@ mod columns;
 mod condition;
 mod custom_types;
 mod emission;
+pub(crate) mod expr_type;
 pub(crate) mod functions;
 mod translator;
 mod utils;
@@ -66,6 +68,8 @@ use custom_types::*;
 #[allow(unused_imports)]
 use emission::*;
 #[allow(unused_imports)]
+use expr_type::*;
+#[allow(unused_imports)]
 use functions::*;
 #[allow(unused_imports)]
 use metadata::*;
@@ -79,18 +83,18 @@ use vectors::*;
 use walk::*;
 
 pub(crate) use affinity::{
-    comparison_affinity, expr_data_type, get_expr_affinity, StorageClassMask,
+    comparison_affinity, do_comparison_affinity, expr_data_type, get_expr_affinity,
+    StorageClassMask,
 };
 pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
 };
-pub(crate) use binary::expr_is_array;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{
-    emit_dml_expr_index_value, emit_trigger_decode_registers, emit_type_expr,
+    emit_dml_expr_index_value, emit_store_value, emit_trigger_decode_registers, emit_type_expr,
     emit_user_facing_column_value,
 };
 pub use emission::{
@@ -110,6 +114,7 @@ pub use utils::{
 };
 pub use vectors::expr_vector_size;
 pub use walk::{
+    expr_contains_function_that_changes_within_statement,
     expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
     expr_references_outer_query, expr_references_subquery_id, expression_can_fail_on_input,
     walk_expr, walk_expr_mut, WalkControl,

@@ -42,7 +42,7 @@ Basics not enumerated by the official feature matrix.
 | SELECT (projections, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET) | ✅ Supported | |
 | JOINs (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL, USING) | ✅ Supported | |
 | UNION / UNION ALL / INTERSECT / EXCEPT | 🟡 Partial | Including ORDER BY/LIMIT on compounds; INTERSECT ALL / EXCEPT ALL, a set operation nested on the right (`A UNION B INTERSECT C`, `A EXCEPT (B UNION C)`) and ORDER BY/LIMIT/WITH on a parenthesized branch are rejected |
-| Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error |
+| Subqueries (FROM, IN, EXISTS, scalar) | ✅ Supported | `= ANY(array)` and `<> ALL(array)` work, including bound text-array parameters; other ANY/ALL array operators are rejected; `ALL`/row comparison subqueries error; an EXISTS subquery may select no columns (`EXISTS (SELECT FROM t)`), but a SELECT with no columns anywhere else is rejected |
 | INSERT (column lists, multi-row VALUES, DEFAULT, INSERT ... SELECT) | ✅ Supported | Duplicate target columns, DEFAULT without a column list, array-element/field targets and OVERRIDING are rejected |
 | UPDATE (incl. FROM clause) | ✅ Supported | Multi-column `SET (a,b) = (...)` not supported; duplicate assignments and array-element/field targets rejected |
 | DELETE | 🟡 Partial | `USING` clause rejected |
@@ -52,8 +52,8 @@ Basics not enumerated by the official feature matrix.
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported when they name every select-list column; TEMP, UNLOGGED, OR REPLACE, WITH (options) and WITH CHECK OPTION rejected |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
-| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | Schemas are ATTACHed databases; DROP ... CASCADE; `public` is special-cased; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block |
-| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
+| CREATE SCHEMA / DROP SCHEMA | ✅ Supported | A schema is stored in the main database under an id; its objects are stored under names that start with `__turso_ns<id>_`, which no user object may be named; an object qualified with `main` or `temp` is an error, since PostgreSQL has no such schemas; `public` is a schema like any other, created when a new database is made, and once dropped it stays dropped until CREATE SCHEMA public; DROP ... CASCADE; AUTHORIZATION rejected; CREATE TABLE without a schema creates the table in the first schema of `search_path` that exists; CREATE SCHEMA can contain CREATE TABLE, VIEW, INDEX and SEQUENCE statements, which create their objects in the new schema, but not inside a transaction block. Databases with schemas in `turso-postgres-schema-*.db` files from earlier versions are not supported; their schemas must be recreated. A database made by an earlier version, whose tables are in no schema, is refused when a session connects. |
+| CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes the parameters of the sequences of every schema (bigint, cache 1); pg_class lists the sequences of every schema with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
 | TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
@@ -61,27 +61,33 @@ Basics not enumerated by the official feature matrix.
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
 | Parameters (`$1`, `$2`, ...) | 🟡 Partial | Work through the extended wire protocol; text-format values only |
-| Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO, `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC, SIMILAR TO ... ESCAPE and non-literal SIMILAR TO patterns are rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE |
+| Operators: `\|\|`, `%`, bitwise, LIKE/ILIKE [ESCAPE], SIMILAR TO [ESCAPE], `~`/`~*`/`!~`/`!~*`, IS [NOT] DISTINCT FROM, BETWEEN | ✅ Supported | BETWEEN SYMMETRIC is rejected. Regex operators lower to REGEXP; `~*`/`!~*` add the `(?i)` flag. SIMILAR TO converts its pattern to a regex the way `similar_to_escape()` does. LIKE is case-sensitive with `\` as the default escape; ILIKE applies LOWER() to both sides, then matches like LIKE. In CREATE INDEX, LIKE and ILIKE need a string-literal pattern without ESCAPE, and SIMILAR TO needs a string-literal pattern and ESCAPE |
 | Dollar-quoted strings, escape strings (`E'...'`), bit/hex string literals | ✅ Supported | |
 | generate_series | ✅ Supported | In FROM and with joins; table aliases name the output column (`AS g` gives `g`), explicit column aliases take precedence (`AS g(x)` gives `x`), and without an alias the column is named `generate_series`; qualified and unqualified calls resolve even with an empty search_path |
 | pg_catalog emulation | 🟡 Partial | See Backend section |
-| SET / SHOW | 🟡 Partial | Only search_path (`SET`, `SHOW`, `set_config`, `current_setting`). SET of a few parameters to the value Turso already behaves as (e.g. `statement_timeout = 0`, `DateStyle = ISO`, `extra_float_digits = 3`, as sent by pg_dump) is accepted as a no-op; anything else is rejected |
+| SET / SHOW / RESET | 🟡 Partial | Only search_path and custom parameters such as `app.user_id` (`SET [LOCAL]`, `SET ... TO DEFAULT`, `SET ... FROM CURRENT`, `RESET`, `RESET ALL`, `SHOW`, `set_config`, `current_setting`). SET of a few parameters to the value Turso already behaves as (e.g. `statement_timeout = 0`, `DateStyle = ISO`, `extra_float_digits = 3`, as sent by pg_dump) is accepted as a no-op; anything else is rejected |
 
 ## Backend
 
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
-`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequences`,
-`pg_database`, `pg_roles` (single hardcoded `turso` role), `pg_proc`, `pg_am`,
+`pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequence`, `pg_sequences`,
+`pg_database`, `pg_roles` (hardcoded `turso` and `pg_database_owner` roles), `pg_proc`, `pg_am`,
 plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
-`pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,
-`pg_publication*`. `pg_statistic_ext` exposes the hidden system column
+`pg_foreign_table`, `pg_partitioned_table`, `pg_collation`,
+`pg_publication*`, `pg_seclabels` (security labels are not supported).
+`pg_description` contains the default `standard public schema` comment for
+`public`, so pg_dump does not emit a command to clear that comment on restore.
+User-defined comments are not persisted. The public schema reports
+`pg_database_owner` as its owner, with CREATE and USAGE for that role and USAGE
+for PUBLIC. These are catalog defaults; role management is not implemented.
+`pg_statistic_ext` exposes the hidden system column
 `tableoid` for pg_dump discovery. `pg_trigger` exposes `tgparentid` for
 parent-trigger lookup and hidden `tableoid` during dump discovery.
 `pg_rewrite` also exposes hidden `tableoid` for rule discovery, and `pg_policy`
-exposes it for policy discovery. `pg_publication` and `pg_publication_rel`
-expose hidden `tableoid` for publication discovery.
+exposes it for policy discovery. `pg_publication`, `pg_publication_rel`, and
+`pg_publication_namespace` expose hidden `tableoid` for publication discovery.
 `pg_get_triggerdef(oid)` and `pg_get_triggerdef(oid, pretty)` return NULL:
 PostgreSQL triggers are not supported and `pg_trigger` is empty.
 Catalog introspection functions: `format_type`,
@@ -92,7 +98,8 @@ stored SQL; relation oid and pretty printing do not change the output),
 `transaction_timestamp`/`statement_timestamp`.
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
-forms; the first schema of `search_path` that exists), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
+forms; the first schema of `search_path` that exists), `current_schemas(boolean)`
+(existing schemas in search order, optionally including implicit `pg_catalog`), `pg_backend_pid()`, `quote_ident()`, `quote_literal()`;
 `obj_description()`/`col_description()` always return NULL because COMMENT ON
 is not persisted. DML against pg_catalog is rejected. `pg_typeof` is not
 implemented.
@@ -362,18 +369,20 @@ Upgrade is not supported.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER (one character), NULL string, HEADER (not HEADER MATCH), column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows); other options rejected |
-| COPY from/to STDIN/STDOUT | ❌ Not supported | Rejected with an error; no wire-level COPY sub-protocol |
+| COPY table TO STDOUT | ✅ Supported | Simple query protocol, text format; column lists, search_path lookup, COPY text escaping; excludes generated columns by default and rejects them in explicit lists; database reads use blocking helpers, rows are sent one at a time |
+| COPY FROM STDIN | ❌ Not supported | Rejected with an error |
 | COPY FROM ... WHERE | ❌ Not supported | Rejected |
 | COPY ... ON_ERROR | ❌ Not supported | Rejected |
-| COPY with arbitrary SELECT | ❌ Not supported | COPY TO is not supported at all |
+| COPY with arbitrary SELECT | ❌ Not supported | COPY TO requires a plain table |
 | CSV support for COPY | ❌ Not supported | `FORMAT csv` and `FORMAT binary` rejected with an error |
 
 ## Configuration Management
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| SET / SHOW configuration parameters | 🟡 Partial | Only search_path; other parameters are rejected, except SET to a value matching existing behaviour (see SET / SHOW above) |
-| Custom configuration parameters (`app.user_id`) | 🟡 Partial | `set_config()` and `current_setting()` only, not SET or SHOW; in server mode, all clients share the values |
+| SET / SHOW configuration parameters | 🟡 Partial | Only search_path and custom parameters; other parameters are rejected, except SET to a value matching existing behaviour (see SET / SHOW / RESET above) |
+| Custom configuration parameters (`app.user_id`) | 🟡 Partial | In server mode, all clients share the values |
+| DISCARD | 🟡 Partial | Only `DISCARD ALL`, which resets every parameter and forgets `currval` values. In server mode it does not drop the client's protocol-level prepared statements, and it resets the parameters of all clients |
 | ALTER SYSTEM | ❌ Not supported | |
 | Fractional input for "integer" values | ❌ Not supported | |
 | Include directives for pg_hba.conf and pg_ident.conf | ❌ Not supported | |
@@ -407,7 +416,7 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | ❌ Not supported | pg_roles exposes a single hardcoded `turso` role |
+| ROLES | ❌ Not supported | pg_roles exposes hardcoded `turso` and `pg_database_owner` roles |
 | Row-level security | ❌ Not supported | |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
@@ -610,7 +619,7 @@ Upgrade is not supported.
 | Full SSL support | ❌ Not supported | SSLRequest answered with "SSL not available"; plaintext only |
 | IPv6 support | 🟡 Partial | Server binds whatever address it is given, including IPv6 literals; no dual-stack handling |
 | V2 client protocol | ❌ Not supported | |
-| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Execute/Describe/Sync) protocols; trust auth only; parameter values must be text-format; Execute row limits ignored (no portal suspension); no COPY sub-protocol, CancelRequest, or NotificationResponse |
+| V3 client protocol | 🟡 Partial | Via pgwire: simple query and extended query (Parse/Bind/Execute/Describe/Sync) protocols; trust auth only; parameter values must be text-format; Execute row limits ignored (no portal suspension); text COPY TO STDOUT in simple queries; no COPY FROM STDIN, CancelRequest, or NotificationResponse; a simple query with several statements runs each statement in its own transaction, not in one implicit transaction block |
 
 ## Platforms
 

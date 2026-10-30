@@ -1,5 +1,33 @@
 @database :memory:
 
+# A child row matches a parent key the way `parent_col = child_col` compares,
+# with affinity, also when the child column has no index.
+@cross-check-integrity
+test fk-delete-parent-finds-child-of-other-affinity {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(a));
+    INSERT INTO p VALUES ('1');
+    INSERT INTO c VALUES ('1');
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-delete-rowid-parent-finds-text-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(a));
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (1);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
 @cross-check-integrity
 test fk-basic-ok {
     PRAGMA foreign_keys=ON;
@@ -721,6 +749,23 @@ test fk-deferred-self-unique-parent-affinity-does-not-coerce-same-row-child {
         k INTEGER UNIQUE,
         pk TEXT REFERENCES t(k) DEFERRABLE INITIALLY DEFERRED
     );
+    BEGIN;
+    INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
+    COMMIT;
+}
+expect error {
+}
+
+# The same with an index on the child key: the new row is not its own child.
+@cross-check-integrity
+test fk-deferred-self-unique-parent-affinity-with-child-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k INTEGER UNIQUE,
+        pk TEXT REFERENCES t(k) DEFERRABLE INITIALLY DEFERRED
+    );
+    CREATE INDEX t_pk ON t(pk);
     BEGIN;
     INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
     COMMIT;
@@ -4865,4 +4910,20 @@ test fk-delete-cascade-siblings-do-not-cancel-unrelated-violation {
     DELETE FROM p WHERE id IN (1,2);
 }
 expect error {
+}
+
+test fk-delete-mixed-case-parent {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE "Mixed Parent" (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (parent_id INTEGER REFERENCES "Mixed Parent" (id) ON DELETE CASCADE);
+    INSERT INTO "Mixed Parent" VALUES (1), (2);
+    INSERT INTO child VALUES (1), (2);
+    DELETE FROM "Mixed Parent" WHERE id = 1;
+    SELECT parent_id FROM child;
+    DELETE FROM "Mixed Parent";
+    SELECT count(*) FROM child;
+}
+expect {
+    2
+    0
 }

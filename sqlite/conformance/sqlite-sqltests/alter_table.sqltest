@@ -1,6 +1,21 @@
 @database :memory:
 
 @cross-check-integrity
+test alter-table-rename-mixed-case-autoincrement {
+    CREATE TABLE "Foo"(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO foo(v) VALUES(1),(2),(3);
+    ALTER TABLE FOO RENAME TO bar;
+    DELETE FROM bar;
+    INSERT INTO bar(v) VALUES(9);
+    SELECT * FROM bar;
+    SELECT * FROM sqlite_sequence;
+}
+expect {
+    4|9
+    bar|4
+}
+
+@cross-check-integrity
 test alter-table-rename-table {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY, u);
     ALTER TABLE t1 RENAME TO t2;
@@ -3385,6 +3400,24 @@ expect error {
     Cannot add a column with non-constant default
 }
 
+# A default that names a column is rejected even on an empty table, as in
+# CREATE TABLE. A bare name is a string literal.
+test alter-table-add-column-default-with-column-name-errors {
+    CREATE TABLE t_cnd(x INTEGER);
+    ALTER TABLE t_cnd ADD COLUMN b DEFAULT (x * 0 + 4);
+}
+expect error {
+    is not constant
+}
+
+test alter-table-add-column-parenthesized-column-name-default-errors {
+    CREATE TABLE t_cnd2(x INTEGER);
+    ALTER TABLE t_cnd2 ADD COLUMN b DEFAULT (x);
+}
+expect error {
+    is not constant
+}
+
 # The following preserve-schema-collate tests ensure that alter table
 # preserve the original collation defined on table creation.
 # https://github.com/tursodatabase/turso/issues/8254
@@ -3467,4 +3500,115 @@ test alter-table-drop-view-column-rejected {
 }
 expect error {
     cannot drop column from view "v"
+}
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-updates-views {
+    CREATE TABLE t(x);
+    CREATE TABLE o(y);
+    INSERT INTO t VALUES (1);
+    INSERT INTO o VALUES (1);
+    CREATE VIEW v1 AS SELECT x FROM t;
+    CREATE VIEW v2 AS SELECT t.x, o.y FROM t JOIN o ON t.x = o.y;
+    CREATE VIEW v3 AS SELECT y FROM o WHERE y IN (SELECT x FROM t);
+    ALTER TABLE t RENAME TO t2;
+    SELECT * FROM v1;
+    SELECT * FROM v2;
+    SELECT * FROM v3;
+}
+expect {
+    1
+    1|1
+    1
+}
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-keeps-view-cte-and-alias-with-same-name {
+    CREATE TABLE t(x);
+    CREATE TABLE o(x);
+    INSERT INTO t VALUES (1);
+    INSERT INTO o VALUES (2);
+    CREATE VIEW v1 AS WITH t AS (SELECT 5 AS x) SELECT x FROM t;
+    CREATE VIEW v2 AS SELECT t.x FROM o AS t;
+    ALTER TABLE t RENAME TO t2;
+    SELECT * FROM v1;
+    SELECT * FROM v2;
+}
+expect {
+    5
+    2
+}
+
+@cross-check-integrity
+test alter-table-rename-table-keeps-trigger-alias-with-same-name {
+    CREATE TABLE t(x);
+    CREATE TABLE o(x);
+    CREATE TABLE log(v);
+    INSERT INTO o VALUES (2);
+    CREATE TRIGGER tr AFTER INSERT ON log WHEN new.v = 0 BEGIN
+        INSERT INTO log SELECT t.x FROM o AS t;
+    END;
+    ALTER TABLE t RENAME TO t2;
+    INSERT INTO log VALUES (0);
+    SELECT v FROM log ORDER BY v;
+}
+expect {
+    0
+    2
+}
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-resolves-view-names-like-sqlite {
+    CREATE TABLE t(x);
+    CREATE TABLE o(x);
+    INSERT INTO t VALUES (1);
+    INSERT INTO o VALUES ('[2]');
+    CREATE VIEW v1 AS SELECT j.value FROM o AS t, json_each(t.x) AS j;
+    CREATE VIEW v2 AS WITH t AS (SELECT 7 AS x) SELECT x FROM main.t;
+    CREATE VIEW v3 AS SELECT t.x FROM t AS t;
+    ALTER TABLE t RENAME TO t2;
+    SELECT * FROM v1;
+    SELECT * FROM v2;
+    SELECT * FROM v3;
+}
+expect {
+    2
+    1
+    1
+}
+
+@cross-check-integrity
+test alter-table-rename-table-renames-schema-qualified-trigger-ref-under-cte {
+    CREATE TABLE t(x);
+    CREATE TABLE log(v);
+    INSERT INTO t VALUES (1);
+    CREATE TRIGGER tr AFTER INSERT ON log WHEN new.v = 0 BEGIN
+        INSERT INTO log WITH t AS (SELECT 7 AS x) SELECT x FROM main.t;
+    END;
+    ALTER TABLE t RENAME TO t2;
+    INSERT INTO log VALUES (0);
+    SELECT v FROM log ORDER BY v;
+}
+expect {
+    0
+    1
+}
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-updates-view-limit-and-window {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW v1 AS SELECT 1 LIMIT (SELECT count(*) FROM t) OFFSET (SELECT count(*) - 1 FROM t);
+    CREATE VIEW v2 AS SELECT sum(x) OVER w FROM t WINDOW w AS (PARTITION BY t.x ORDER BY t.x);
+    ALTER TABLE t RENAME TO t2;
+    SELECT * FROM v1;
+    SELECT * FROM v2;
+}
+expect {
+    1
+    1
 }

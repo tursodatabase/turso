@@ -7,6 +7,7 @@ use crate::incremental::view::{
     create_dbsp_state_index, dbsp_version_marker_table_name, DBSP_CIRCUIT_VERSION,
 };
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
+use crate::namespace::{demangle_name, mangle_name, NamespaceId};
 use crate::return_if_io;
 use crate::stats::AnalyzeStats;
 use crate::sync::RwLock;
@@ -143,6 +144,9 @@ pub const TEMP_SCHEMA_TABLE_NAME: &str = "sqlite_temp_schema";
 pub const TEMP_SCHEMA_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
+/// The table of the main database that keeps the id and name of each
+/// namespace.
+pub const TURSO_NAMESPACES_TABLE_NAME: &str = "__turso_internal_namespaces";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 /// Hidden per-view value-multiset table backing MIN/MAX and DISTINCT
 /// aggregates.
@@ -237,6 +241,7 @@ pub enum TypeDefKind {
         params: std::vec::Vec<ast::TypeParam>,
         base: String,
         encode: Option<Box<ast::Expr>>,
+        coerce: Option<Box<ast::Expr>>,
         decode: Option<Box<ast::Expr>>,
         operators: std::vec::Vec<TypeOperator>,
         default: Option<Box<ast::Expr>>,
@@ -331,6 +336,19 @@ impl TypeDef {
         }
     }
 
+    /// Returns the coerce expression (Custom types only).
+    pub fn coerce(&self) -> Option<&ast::Expr> {
+        match &self.kind {
+            TypeDefKind::Custom { coerce, .. } => coerce.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Whether storing a value of this type may change it.
+    pub fn has_encode_or_coerce(&self) -> bool {
+        self.encode().is_some() || self.coerce().is_some()
+    }
+
     /// Returns the decode expression (Custom types only).
     pub fn decode(&self) -> Option<&ast::Expr> {
         match &self.kind {
@@ -416,25 +434,32 @@ impl TypeDef {
                 params,
                 base,
                 encode,
+                coerce,
                 decode,
                 operators,
                 default,
-            } => Self {
-                name: type_name.to_string(),
-                is_builtin,
-                not_null: false,
-                is_domain: false,
-                sql,
-                domain_checks: std::vec::Vec::new(),
-                kind: TypeDefKind::Custom {
-                    params: params.clone(),
-                    base: base.clone(),
-                    encode: encode.clone(),
-                    decode: decode.clone(),
-                    operators: operators.clone(),
-                    default: default.clone(),
-                },
-            },
+            } => {
+                // CREATE TYPE checks where type parameters are used. A type
+                // already stored by an earlier version is loaded unchecked, so
+                // the database still opens and DROP TYPE can remove it.
+                Self {
+                    name: type_name.to_string(),
+                    is_builtin,
+                    not_null: false,
+                    is_domain: false,
+                    sql,
+                    domain_checks: std::vec::Vec::new(),
+                    kind: TypeDefKind::Custom {
+                        params: params.clone(),
+                        base: base.clone(),
+                        encode: encode.clone(),
+                        coerce: coerce.clone(),
+                        decode: decode.clone(),
+                        operators: operators.clone(),
+                        default: default.clone(),
+                    },
+                }
+            }
             ast::CreateTypeBody::Struct(fields) => {
                 let struct_fields: Vec<StructFieldDef> = fields
                     .iter()
@@ -518,6 +543,7 @@ impl TypeDef {
                 params: std::vec::Vec::new(),
                 base: base_type.to_string(),
                 encode: None,
+                coerce: None,
                 decode: None,
                 operators: std::vec::Vec::new(),
                 default,
@@ -550,6 +576,43 @@ impl TypeDef {
     }
 }
 
+/// The type parameters, such as numeric's precision and scale, limit what a
+/// column may store, so only COERCE may read them. ENCODE also converts index
+/// seek keys and operator arguments, which are compared and never limited: on a
+/// numeric(10,2) column `n = 3.504` matches no row instead of matching 3.50.
+pub(crate) fn check_type_param_use(
+    params: &[ast::TypeParam],
+    encode: &Option<Box<ast::Expr>>,
+    decode: &Option<Box<ast::Expr>>,
+) -> crate::Result<()> {
+    let type_params: std::vec::Vec<String> = params
+        .iter()
+        .map(|p| normalize_ident(&p.name))
+        .filter(|name| name != "value")
+        .collect();
+    for (clause, expr) in [("ENCODE", encode), ("DECODE", decode)] {
+        let Some(expr) = expr else {
+            continue;
+        };
+        walk_expr(expr, &mut |e| {
+            if let Expr::Id(name) | Expr::Name(name) = e {
+                let name = normalize_ident(name.as_str());
+                if type_params.contains(&name) {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "{clause} cannot use type parameter \"{name}\": only COERCE can"
+                    )));
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(())
+}
+
+/// A materialized view the loader met, before it is built: its namespace,
+/// its SQL text and its root page.
+pub type StoredMaterializedView = (NamespaceId, String, i64);
+
 /// Accumulators for schema loading - kept separate to avoid moving through state variants
 struct MakeFromBtreeAccumulators {
     from_sql_indexes: Vec<UnparsedFromSqlIndex>,
@@ -558,8 +621,8 @@ struct MakeFromBtreeAccumulators {
     dbsp_state_roots: HashMap<String, i64>,
     /// Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
     dbsp_state_index_roots: HashMap<String, i64>,
-    /// Store materialized view info (SQL and root page) for later creation
-    materialized_view_info: HashMap<String, (String, i64)>,
+    /// The materialized views met, by view key: namespace, SQL and root page
+    materialized_view_info: HashMap<String, StoredMaterializedView>,
 }
 
 /// Phase tracking for async schema loading
@@ -767,46 +830,16 @@ pub enum SchemaObjectType {
     Index,
 }
 
+/// The objects of one database: the root namespace, which every database
+/// has, and the namespaces stored in it, each with its own objects.
 #[derive(Debug)]
 pub struct Schema {
-    pub tables: HashMap<String, Arc<Table>>,
+    namespaces: HashMap<NamespaceId, NamespaceSchema>,
     #[cfg(feature = "conn_raw_api")]
     pub(crate) table_names_by_root_page: HashMap<i64, String>,
-
-    /// Track which tables are actually materialized views
-    pub materialized_view_names: HashSet<String>,
-    /// Store original SQL for materialized views (for .schema command)
-    pub materialized_view_sql: HashMap<String, String>,
-    /// Materialized-view definitions consumed by compiled IVM programs.
-    pub incremental_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
-
-    pub views: ViewsMap,
-
-    /// table_name to list of triggers
-    pub triggers: HashMap<String, VecDeque<Arc<Trigger>>>,
-
-    /// table_name to list of indexes for the table
-    pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
-    pub has_indexes: HashSet<String>,
     pub schema_version: u32,
     /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
     pub analyze_stats: AnalyzeStats,
-
-    /// Mapping from table names to the materialized views that depend on them
-    pub table_to_materialized_views: HashMap<String, Vec<String>>,
-
-    /// Track views that exist but have incompatible versions
-    pub incompatible_views: HashSet<String>,
-    /// Main btree roots for incompatible materialized views. Their logical
-    /// descriptors cannot be loaded, but DROP VIEW must still destroy their
-    /// storage so the documented recreate path remains possible.
-    pub incompatible_materialized_view_roots: HashMap<String, i64>,
-
-    /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
-    /// older versions wrote view column lists without identifier quoting).
-    /// The rows are tolerated at load time so the database stays usable;
-    /// tracking the names lets DROP VIEW remove them.
-    pub broken_views: HashSet<String>,
 
     /// Root pages of tables/indexes that have been dropped but not yet checkpointed.
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
@@ -816,9 +849,89 @@ pub struct Schema {
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
 
-    pub generated_columns_enabled: bool,
+    /// Whether the schema rows may hold the objects of namespaces
+    /// under their mangled names, as the dialect of the database says.
+    supports_namespaces: bool,
+
+    /// The namespaces of a database without a namespaces table, as the
+    /// dialect of the database says.
+    default_namespaces: &'static [&'static str],
+
+    /// Whether the names of the namespaces are loaded. They come from the
+    /// namespaces table, which is read after the schema rows.
+    namespace_names_loaded: bool,
+
+    /// The materialized views met before the names of the namespaces were
+    /// loaded, built once they are.
+    pending_materialized_views: Option<PendingMaterializedViews>,
+}
+
+/// Materialized views the loader read before the names of the namespaces,
+/// with the roots of their state tables. A view body names tables by their
+/// namespace, so a view cannot be built until the names are known.
+#[derive(Debug, Clone, Default)]
+struct PendingMaterializedViews {
+    materialized_view_info: HashMap<String, StoredMaterializedView>,
+    dbsp_state_roots: HashMap<String, i64>,
+    dbsp_state_index_roots: HashMap<String, i64>,
+}
+
+/// The objects of one namespace, by name.
+#[derive(Debug, Default)]
+pub struct NamespaceSchema {
+    /// The name of a namespace. The root namespace has none: it is
+    /// named by its database.
+    name: Option<String>,
+    tables: HashMap<String, Arc<Table>>,
+
+    /// Track which tables are actually materialized views
+    materialized_view_names: HashSet<String>,
+    /// Store original SQL for materialized views (for .schema command)
+    materialized_view_sql: HashMap<String, String>,
+    /// Materialized-view definitions consumed by compiled IVM programs.
+    incremental_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+
+    views: ViewsMap,
+
+    /// table_name to list of triggers
+    triggers: HashMap<String, VecDeque<Arc<Trigger>>>,
+
+    /// table_name to list of indexes for the table
+    indexes: HashMap<String, VecDeque<Arc<Index>>>,
+    has_indexes: HashSet<String>,
+
+    /// Mapping from table names to the materialized views that depend on them
+    table_to_materialized_views: HashMap<String, Vec<String>>,
+
+    /// Track views that exist but have incompatible versions
+    incompatible_views: HashSet<String>,
+    /// Main btree roots for incompatible materialized views. Their logical
+    /// descriptors cannot be loaded, but DROP VIEW must still destroy their
+    /// storage so the documented recreate path remains possible.
+    incompatible_materialized_view_roots: HashMap<String, i64>,
+
+    /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
+    /// older versions wrote view column lists without identifier quoting).
+    /// The rows are tolerated at load time so the database stays usable;
+    /// tracking the names lets DROP VIEW remove them.
+    broken_views: HashSet<String>,
+
     /// Named sequences (CREATE SEQUENCE)
-    pub sequences: HashMap<String, Arc<Sequence>>,
+    sequences: HashMap<String, Arc<Sequence>>,
+}
+
+impl NamespaceSchema {
+    /// Whether any object is stored under the namespace.
+    fn has_objects(&self) -> bool {
+        !self.tables.is_empty()
+            || !self.views.is_empty()
+            || !self.materialized_view_names.is_empty()
+            || !self.triggers.is_empty()
+            || !self.indexes.is_empty()
+            || !self.sequences.is_empty()
+            || !self.incompatible_views.is_empty()
+            || !self.broken_views.is_empty()
+    }
 }
 
 impl Default for Schema {
@@ -839,7 +952,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
+        "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
         "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '+' date_plus OPERATOR '-' date_minus OPERATOR '<'",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
@@ -852,14 +965,14 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
         "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
         "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
+        "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'",
         "CREATE TYPE bigint(value integer) BASE integer",
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
         "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
-        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
     ];
 
     for sql in type_sqls {
@@ -918,54 +1031,519 @@ impl Schema {
         enable_custom_types: bool,
         dialect: &dyn crate::dialect::Dialect,
     ) -> crate::Result<Self> {
-        let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
+        let mut root = NamespaceSchema::default();
         #[cfg(feature = "conn_raw_api")]
         let mut table_names_by_root_page = HashMap::default();
-        let has_indexes = HashSet::default();
-        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
-        tables.insert(
+        root.tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
             Arc::new(Table::BTree(sqlite_schema_table()?.into())),
         );
         #[cfg(feature = "conn_raw_api")]
         table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
-        let materialized_view_names = HashSet::default();
-        let materialized_view_sql = HashMap::default();
-        let incremental_views = HashMap::default();
-        let views: ViewsMap = HashMap::default();
-        let triggers = HashMap::default();
-        let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
-        let incompatible_views = HashSet::default();
-        let incompatible_materialized_view_roots = HashMap::default();
         let mut type_registry = HashMap::default();
         if enable_custom_types {
             bootstrap_builtin_types(&mut type_registry)?;
         }
+        let mut namespaces = HashMap::default();
+        namespaces.insert(NamespaceId::ROOT, root);
         let mut schema = Self {
-            tables,
+            namespaces,
             #[cfg(feature = "conn_raw_api")]
             table_names_by_root_page,
-            materialized_view_names,
-            materialized_view_sql,
-            incremental_views,
-            views,
-            triggers,
-            indexes,
-            has_indexes,
             schema_version: 0,
             analyze_stats: AnalyzeStats::default(),
-            table_to_materialized_views,
-            incompatible_views,
-            incompatible_materialized_view_roots,
-            broken_views: HashSet::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
-            generated_columns_enabled: false,
-            sequences: HashMap::default(),
+            supports_namespaces: dialect.supports_namespaces(),
+            default_namespaces: dialect.default_namespaces(),
+            namespace_names_loaded: !dialect.supports_namespaces(),
+            pending_materialized_views: None,
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
+    }
+
+    /// The ids of the namespaces of the schema.
+    pub fn namespace_ids(&self) -> impl Iterator<Item = NamespaceId> + '_ {
+        self.namespaces.keys().copied()
+    }
+
+    pub fn has_namespace(&self, id: NamespaceId) -> bool {
+        self.namespaces.contains_key(&id)
+    }
+
+    /// Adds the empty namespace `id` called `name`, which must not be
+    /// the root and must not exist yet.
+    pub fn add_namespace(&mut self, id: NamespaceId, name: &str) {
+        turso_assert!(!id.is_root(), "the root namespace always exists");
+        let previous = self.namespaces.insert(
+            id,
+            NamespaceSchema {
+                name: Some(name.to_string()),
+                ..NamespaceSchema::default()
+            },
+        );
+        turso_assert!(previous.is_none(), "namespace already exists", { "id": id.as_u32() });
+    }
+
+    /// Removes namespace `id` with all its objects. The root cannot be
+    /// removed.
+    pub fn remove_namespace(&mut self, id: NamespaceId) -> bool {
+        turso_assert!(!id.is_root(), "the root namespace always exists");
+        self.namespaces.remove(&id).is_some()
+    }
+
+    /// The namespaces of the schema, with their names: the ones
+    /// that have a row in the namespaces table.
+    pub fn namespaces(&self) -> impl Iterator<Item = (NamespaceId, &str)> {
+        self.namespaces
+            .iter()
+            .filter_map(|(id, objects)| Some((*id, objects.name.as_deref()?)))
+    }
+
+    /// The name of namespace `id`. None for the root and for a
+    /// namespace that has objects but no row in the namespaces table.
+    pub fn namespace_name(&self, id: NamespaceId) -> Option<&str> {
+        self.namespaces.get(&id)?.name.as_deref()
+    }
+
+    /// The id of the namespace called `name`.
+    pub fn namespace_named(&self, name: &str) -> Option<NamespaceId> {
+        self.namespaces()
+            .find(|(_, namespace_name)| *namespace_name == name)
+            .map(|(id, _)| id)
+    }
+
+    /// The namespace and name of the object whose mangled name is
+    /// `mangled`, decoded only when the schema supports namespaces.
+    pub fn demangle_name<'a>(&self, mangled: &'a str) -> (NamespaceId, &'a str) {
+        demangle_name(self.supports_namespaces, mangled)
+    }
+
+    /// The id for the next namespace: one more than the largest id
+    /// that a namespace or any object stored under a namespace has,
+    /// so that an id whose objects are still stored is not given out again.
+    pub fn next_namespace_id(&self) -> NamespaceId {
+        let largest = self
+            .namespaces
+            .iter()
+            .filter(|(_, objects)| objects.name.is_some() || objects.has_objects())
+            .map(|(id, _)| id.as_u32())
+            .max()
+            .unwrap_or(0);
+        NamespaceId::new(largest + 1)
+    }
+
+    /// Makes sure namespace `id` exists before an object stored under it is
+    /// added, since the schema rows of a namespace's objects are read
+    /// before the namespaces table.
+    fn add_namespace_of_object(&mut self, id: NamespaceId) {
+        self.namespaces.entry(id).or_default();
+    }
+
+    /// Records the names of the namespaces from the `(id, name)` rows of the
+    /// namespaces table, and builds the materialized views that waited for
+    /// them. A database without a namespaces table has the default
+    /// namespaces. A schema that does not support namespaces has none.
+    pub fn load_namespace_names(&mut self, rows: &[(i64, String)]) -> Result<()> {
+        if !self.supports_namespaces {
+            return Ok(());
+        }
+        if !self.has_table(NamespaceId::ROOT, TURSO_NAMESPACES_TABLE_NAME) {
+            turso_assert!(rows.is_empty(), "namespace rows without a namespaces table");
+            for (index, name) in self.default_namespaces.iter().enumerate() {
+                let id = u32::try_from(index + 1).expect("few default namespaces");
+                self.name_namespace(NamespaceId::new(id), name);
+            }
+        }
+        for (id, name) in rows {
+            let id = u32::try_from(*id)
+                .ok()
+                .filter(|id| *id != 0)
+                .ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "{TURSO_NAMESPACES_TABLE_NAME} row of '{name}' has an invalid id: {id}"
+                    ))
+                })?;
+            self.name_namespace(NamespaceId::new(id), name);
+        }
+        self.namespace_names_loaded = true;
+        if let Some(pending) = self.pending_materialized_views.take() {
+            self.populate_materialized_views(
+                pending.materialized_view_info,
+                pending.dbsp_state_roots,
+                pending.dbsp_state_index_roots,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether the schema rows may hold the objects of namespaces, as the
+    /// dialect of the database says.
+    pub fn supports_namespaces(&self) -> bool {
+        self.supports_namespaces
+    }
+
+    /// Whether the names of the namespaces are loaded.
+    pub fn namespace_names_loaded(&self) -> bool {
+        self.namespace_names_loaded
+    }
+
+    /// Records that the namespace `id` is called `name`.
+    pub(crate) fn name_namespace(&mut self, id: NamespaceId, name: &str) {
+        self.namespaces.entry(id).or_default().name = Some(name.to_string());
+    }
+
+    /// Forgets the name of namespace `id` when its row is deleted from the
+    /// namespaces table. Its objects, if any are left, stay until they are removed.
+    pub(crate) fn unname_namespace(&mut self, id: NamespaceId) {
+        if let Some(objects) = self.namespaces.get_mut(&id) {
+            objects.name = None;
+        }
+    }
+
+    pub fn tables(&self, namespace: NamespaceId) -> impl Iterator<Item = &Arc<Table>> {
+        self.namespace(namespace).tables.values()
+    }
+
+    /// The tables of every namespace of the schema.
+    pub fn all_tables(&self) -> impl Iterator<Item = &Arc<Table>> {
+        self.namespaces
+            .values()
+            .flat_map(|objects| objects.tables.values())
+    }
+
+    /// The tables of every namespace of the schema, to change, with the
+    /// namespace and lookup name of each.
+    pub fn all_tables_mut(&mut self) -> impl Iterator<Item = (NamespaceId, &str, &mut Arc<Table>)> {
+        self.namespaces.iter_mut().flat_map(|(namespace, objects)| {
+            objects
+                .tables
+                .iter_mut()
+                .map(move |(name, table)| (*namespace, name.as_str(), table))
+        })
+    }
+
+    /// The indexes of every namespace of the schema, backing B-tree indexes
+    /// included.
+    pub fn all_indexes(&self) -> impl Iterator<Item = &Arc<Index>> {
+        self.namespaces
+            .values()
+            .flat_map(|objects| objects.indexes.values().flatten())
+    }
+
+    /// The indexes of every namespace of the schema, to change.
+    pub fn all_indexes_mut(&mut self) -> impl Iterator<Item = &mut Arc<Index>> {
+        self.namespaces
+            .values_mut()
+            .flat_map(|objects| objects.indexes.values_mut().flatten())
+    }
+
+    /// The sequences of every namespace of the schema, with the namespace
+    /// each is in.
+    pub fn all_sequences(&self) -> impl Iterator<Item = (NamespaceId, &Arc<Sequence>)> {
+        self.namespaces.iter().flat_map(|(namespace, objects)| {
+            objects
+                .sequences
+                .values()
+                .map(move |sequence| (*namespace, sequence))
+        })
+    }
+
+    pub fn table_names(&self, namespace: NamespaceId) -> impl Iterator<Item = &str> {
+        self.namespace(namespace).tables.keys().map(String::as_str)
+    }
+
+    pub fn tables_mut(
+        &mut self,
+        namespace: NamespaceId,
+    ) -> impl Iterator<Item = (&str, &mut Arc<Table>)> {
+        self.namespace_mut(namespace)
+            .tables
+            .iter_mut()
+            .map(|(name, table)| (name.as_str(), table))
+    }
+
+    pub fn has_table(&self, namespace: NamespaceId, name: &str) -> bool {
+        self.namespace(namespace).tables.contains_key(name)
+    }
+
+    pub fn table_mut(&mut self, namespace: NamespaceId, name: &str) -> Option<&mut Arc<Table>> {
+        let name = self.normalize_table_lookup_name(name);
+        self.namespace_mut(namespace).tables.get_mut(&name)
+    }
+
+    /// The table named `name` and its indexes, to change together.
+    pub fn table_with_indices_mut(
+        &mut self,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<(&mut Arc<Table>, impl Iterator<Item = &mut Arc<Index>>)> {
+        let name = self.normalize_table_lookup_name(name);
+        let objects = self.namespace_mut(namespace);
+        let table = objects.tables.get_mut(&name)?;
+        let indexes = objects
+            .indexes
+            .get_mut(&name)
+            .map(|v| v.iter_mut())
+            .unwrap_or_default();
+        Some((table, indexes))
+    }
+
+    /// Puts `table` in the namespace under `name`, replacing a table of
+    /// that name.
+    pub fn insert_table(&mut self, namespace: NamespaceId, name: String, table: Arc<Table>) {
+        self.namespace_mut(namespace).tables.insert(name, table);
+    }
+
+    /// Takes the table named `name` out of the namespace.
+    pub fn take_table(&mut self, namespace: NamespaceId, name: &str) -> Option<Arc<Table>> {
+        let name = normalize_ident(name);
+        self.namespace_mut(namespace).tables.remove(&name)
+    }
+
+    /// The views of the namespace, as the names they are looked up by and the views.
+    pub fn views(&self, namespace: NamespaceId) -> impl Iterator<Item = (&str, &Arc<View>)> {
+        self.namespace(namespace)
+            .views
+            .iter()
+            .map(|(name, view)| (name.as_str(), view))
+    }
+
+    pub fn view_mut(&mut self, namespace: NamespaceId, name: &str) -> Option<&mut Arc<View>> {
+        let name = normalize_ident(name);
+        self.namespace_mut(namespace).views.get_mut(&name)
+    }
+
+    pub fn is_incompatible_view(&self, namespace: NamespaceId, name: &str) -> bool {
+        self.namespace(namespace)
+            .incompatible_views
+            .contains(&normalize_ident(name))
+    }
+
+    pub fn is_broken_view(&self, namespace: NamespaceId, name: &str) -> bool {
+        self.namespace(namespace).broken_views.contains(name)
+    }
+
+    pub fn remove_broken_view(&mut self, namespace: NamespaceId, name: &str) -> bool {
+        self.namespace_mut(namespace).broken_views.remove(name)
+    }
+
+    /// The root pages of the materialized views of the namespace that were
+    /// written by an incompatible storage version.
+    pub fn incompatible_materialized_view_roots(
+        &self,
+        namespace: NamespaceId,
+    ) -> impl Iterator<Item = i64> + '_ {
+        self.namespace(namespace)
+            .incompatible_materialized_view_roots
+            .values()
+            .copied()
+    }
+
+    /// Whether any table of any namespace feeds a materialized view.
+    pub fn has_materialized_views(&self) -> bool {
+        self.namespaces
+            .values()
+            .any(|objects| !objects.table_to_materialized_views.is_empty())
+    }
+
+    /// The namespace and definition of the B-tree table called `name`
+    /// whose root page is `root_page`, in whichever namespace it is. With
+    /// a root page of 0 the table is the one of that name, if exactly one
+    /// namespace has it.
+    pub fn btree_table_with_root(
+        &self,
+        name: &str,
+        root_page: i64,
+    ) -> Option<(NamespaceId, Arc<BTreeTable>)> {
+        let name = normalize_ident(name);
+        let mut found = None;
+        for (namespace, objects) in &self.namespaces {
+            let Some(table) = objects.tables.get(&name).and_then(|table| table.btree()) else {
+                continue;
+            };
+            if root_page != 0 && table.root_page != root_page {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some((*namespace, table));
+        }
+        found
+    }
+
+    /// Every index of the namespace, backing B-tree indexes included.
+    pub fn indexes(&self, namespace: NamespaceId) -> impl Iterator<Item = &Arc<Index>> {
+        self.namespace(namespace).indexes.values().flatten()
+    }
+
+    pub fn indexes_mut(&mut self, namespace: NamespaceId) -> impl Iterator<Item = &mut Arc<Index>> {
+        self.namespace_mut(namespace).indexes.values_mut().flatten()
+    }
+
+    /// The indexes stored for `table_name`, backing B-tree indexes included.
+    /// `table_name` is the stored name; it is not normalized.
+    pub fn indices_including_backing(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Index>> {
+        self.namespace(namespace)
+            .indexes
+            .get(table_name)
+            .map(|v| v.iter())
+            .unwrap_or_default()
+    }
+
+    pub fn indices_of_table_mut(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> impl Iterator<Item = &mut Arc<Index>> {
+        let name = normalize_ident(table_name);
+        self.namespace_mut(namespace)
+            .indexes
+            .get_mut(&name)
+            .map(|v| v.iter_mut())
+            .unwrap_or_default()
+    }
+
+    /// Takes every index of `table_name` out of the namespace.
+    pub fn take_indices(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> Option<VecDeque<Arc<Index>>> {
+        let name = normalize_ident(table_name);
+        self.namespace_mut(namespace).indexes.remove(&name)
+    }
+
+    /// Puts `indexes` in the namespace as the indexes of `table_name`.
+    pub fn insert_indices(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: String,
+        indexes: VecDeque<Arc<Index>>,
+    ) {
+        self.namespace_mut(namespace)
+            .indexes
+            .insert(table_name, indexes);
+    }
+
+    pub fn triggers(&self, namespace: NamespaceId) -> impl Iterator<Item = &Arc<Trigger>> {
+        self.namespace(namespace).triggers.values().flatten()
+    }
+
+    pub fn triggers_mut(
+        &mut self,
+        namespace: NamespaceId,
+    ) -> impl Iterator<Item = &mut Arc<Trigger>> {
+        self.namespace_mut(namespace)
+            .triggers
+            .values_mut()
+            .flatten()
+    }
+
+    pub fn trigger_mut(&mut self, namespace: NamespaceId, name: &str) -> Option<&mut Arc<Trigger>> {
+        self.triggers_mut(namespace)
+            .find(|trigger| trigger.name == name)
+    }
+
+    /// Takes every trigger of `table_name` out of the namespace.
+    pub fn take_triggers(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> Option<VecDeque<Arc<Trigger>>> {
+        let name = normalize_ident(table_name);
+        self.namespace_mut(namespace).triggers.remove(&name)
+    }
+
+    /// Replaces the triggers of `table_name` with `triggers`.
+    pub fn insert_triggers(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: String,
+        triggers: VecDeque<Arc<Trigger>>,
+    ) {
+        self.namespace_mut(namespace)
+            .triggers
+            .insert(table_name, triggers);
+    }
+
+    /// Adds `triggers` after the triggers `table_name` already has.
+    pub fn append_triggers(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: String,
+        triggers: VecDeque<Arc<Trigger>>,
+    ) {
+        self.namespace_mut(namespace)
+            .triggers
+            .entry(table_name)
+            .or_default()
+            .extend(triggers);
+    }
+
+    pub fn sequences(&self, namespace: NamespaceId) -> impl Iterator<Item = &Arc<Sequence>> {
+        self.namespace(namespace).sequences.values()
+    }
+
+    /// The sequences of the namespace by their normalized name.
+    pub fn sequences_by_name(&self, namespace: NamespaceId) -> &HashMap<String, Arc<Sequence>> {
+        &self.namespace(namespace).sequences
+    }
+
+    /// Replaces the sequences of the namespace with `sequences`, by
+    /// normalized name.
+    pub fn set_sequences(
+        &mut self,
+        namespace: NamespaceId,
+        sequences: HashMap<String, Arc<Sequence>>,
+    ) {
+        self.namespace_mut(namespace).sequences = sequences;
+    }
+
+    pub fn add_sequence(&mut self, namespace: NamespaceId, sequence: Sequence) {
+        let name = normalize_ident(&sequence.name);
+        self.namespace_mut(namespace)
+            .sequences
+            .insert(name, Arc::new(sequence));
+    }
+
+    /// Puts `sequence`, read from the backing table of the sequence stored
+    /// as `mangled_name`, in the namespace the mangled name says.
+    pub(crate) fn insert_sequence_under_mangled_name(
+        &mut self,
+        mangled_name: &str,
+        sequence: Arc<Sequence>,
+    ) {
+        let (namespace, name) = self.demangle_name(mangled_name);
+        self.add_namespace_of_object(namespace);
+        self.namespace_mut(namespace)
+            .sequences
+            .insert(name.to_string(), sequence);
+    }
+
+    /// Takes the sequence named `name` out of the namespace.
+    pub fn take_sequence(&mut self, namespace: NamespaceId, name: &str) -> Option<Arc<Sequence>> {
+        let name = normalize_ident(name);
+        self.namespace_mut(namespace).sequences.remove(&name)
+    }
+
+    /// Puts `sequence` in the namespace under `name`.
+    pub fn insert_sequence(
+        &mut self,
+        namespace: NamespaceId,
+        name: String,
+        sequence: Arc<Sequence>,
+    ) {
+        self.namespace_mut(namespace)
+            .sequences
+            .insert(name, sequence);
     }
 
     /// Add an `InternalVirtualTable` to the schema's catalog. The wrapped
@@ -979,10 +1557,11 @@ impl Schema {
     where
         T: crate::vtab::InternalVirtualTable + 'static,
     {
+        let objects = self.namespace_mut(NamespaceId::ROOT);
         let vtab = crate::vtab::VirtualTable::wrap_internal_table(table)?;
         let name = vtab.name.clone();
         let lookup_name = normalize_ident(&name);
-        self.tables.insert(
+        objects.tables.insert(
             lookup_name,
             Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
         );
@@ -997,6 +1576,12 @@ impl Schema {
             return None;
         }
         self.type_registry.get(&type_registry_key(type_name))
+    }
+
+    /// Whether the column's values are encoded before they are stored: an array column, or a
+    /// column whose type is a custom type of a STRICT table.
+    pub fn column_has_custom_type(&self, column: &Column, is_strict: bool) -> bool {
+        column.is_array() || self.get_type_def(&column.ty_str, is_strict).is_some()
     }
 
     /// Look up a custom type definition by name without a strictness check.
@@ -1161,70 +1746,110 @@ impl Schema {
     /// Call this after loading user-defined types from __turso_internal_types
     /// so that columns declared with custom types use the BASE type's affinity.
     pub fn resolve_all_custom_type_affinities(&mut self) -> Result<()> {
-        let mut tables: SmallVec<[(String, Arc<Table>); 8]> = SmallVec::with_capacity(8);
-        for (name, table) in self.tables.iter().filter(|(_, t)| {
-            t.is_strict()
-                && t.btree().is_some_and(|bt| {
-                    bt.columns
-                        .iter()
-                        .any(|c| self.get_type_def_unchecked(&c.ty_str).is_some())
-                })
-        }) {
+        let mut tables: SmallVec<[(NamespaceId, String, Arc<Table>); 8]> =
+            SmallVec::with_capacity(8);
+        for (namespace, name, table) in self
+            .namespaces
+            .iter()
+            .flat_map(|(namespace, objects)| {
+                objects
+                    .tables
+                    .iter()
+                    .map(move |(name, table)| (*namespace, name, table))
+            })
+            .filter(|(_, _, t)| {
+                t.is_strict()
+                    && t.btree().is_some_and(|bt| {
+                        bt.columns
+                            .iter()
+                            .any(|c| self.get_type_def_unchecked(&c.ty_str).is_some())
+                    })
+            })
+        {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
             modified.resolve_custom_type_affinities(self);
             modified.propagate_domain_constraints(self)?;
-            tables.push((name.clone(), Arc::new(Table::BTree(Arc::new(modified)))));
+            tables.push((
+                namespace,
+                name.clone(),
+                Arc::new(Table::BTree(Arc::new(modified))),
+            ));
         }
-        for (name, table) in tables {
-            self.tables.insert(name, table);
+        for (namespace, name, table) in tables {
+            self.namespace_mut(namespace).tables.insert(name, table);
         }
         Ok(())
     }
 
-    pub fn is_unique_idx_name(&self, name: &str) -> bool {
-        !self
+    pub fn is_unique_idx_name(&self, namespace: NamespaceId, name: &str) -> bool {
+        let objects = self.namespace(namespace);
+        !objects
             .indexes
             .iter()
             .any(|idx| idx.1.iter().any(|i| i.name == name))
     }
 
-    pub fn add_materialized_view(&mut self, view: IncrementalView, table: Arc<Table>, sql: String) {
+    pub fn add_materialized_view(
+        &mut self,
+        namespace: NamespaceId,
+        view: IncrementalView,
+        table: Arc<Table>,
+        sql: String,
+    ) {
         let name = normalize_ident(view.name());
 
         // Add to tables (so it appears as a regular table)
         #[cfg(feature = "conn_raw_api")]
         self.register_table_root_page(&name, table.as_ref());
-        self.tables.insert(name.clone(), table);
+        let objects = self.namespace_mut(namespace);
+        objects.tables.insert(name.clone(), table);
 
         // Track that this is a materialized view
-        self.materialized_view_names.insert(name.clone());
-        self.materialized_view_sql.insert(name.clone(), sql);
+        objects.materialized_view_names.insert(name.clone());
+        objects.materialized_view_sql.insert(name.clone(), sql);
 
         // Store the definition used to compile maintenance programs.
-        self.incremental_views
+        objects
+            .incremental_views
             .insert(name, Arc::new(Mutex::new(view)));
     }
 
-    pub fn get_materialized_view(&self, name: &str) -> Option<Arc<Mutex<IncrementalView>>> {
+    pub fn get_materialized_view(
+        &self,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<Arc<Mutex<IncrementalView>>> {
+        let objects = self.namespace(namespace);
         let name = normalize_ident(name);
-        self.incremental_views.get(&name).cloned()
+        objects.incremental_views.get(&name).cloned()
     }
 
     /// Whether the view has its current storage marker and no hidden operator
     /// storage from an incompatible version.
-    pub fn has_compatible_materialized_view_storage(&self, view_name: &str) -> bool {
+    pub fn has_compatible_materialized_view_storage(
+        &self,
+        namespace: NamespaceId,
+        view_name: &str,
+    ) -> bool {
+        let objects = self.namespace(namespace);
         let view_name = normalize_ident(view_name);
-        self.tables
+        objects
+            .tables
             .contains_key(&dbsp_version_marker_table_name(&view_name))
-            && !self.dbsp_storage_version_mismatch(&view_name)
+            && !self.dbsp_storage_version_mismatch(namespace, &view_name)
     }
 
     /// True when a metadata marker or operator table for this view exists
     /// under a different storage version than the current one.
-    pub(crate) fn dbsp_storage_version_mismatch(&self, view_name: &str) -> bool {
+    pub(crate) fn dbsp_storage_version_mismatch(
+        &self,
+        namespace: NamespaceId,
+        view_name: &str,
+    ) -> bool {
+        let objects = self.namespace(namespace);
         let view_name = normalize_ident(view_name);
-        self.tables.keys().any(|table_name| {
+        objects.tables.keys().any(|table_name| {
             if let Some((version_str, stored_view_name)) = table_name
                 .strip_prefix(DBSP_METADATA_TABLE_PREFIX)
                 .and_then(|suffix| suffix.split_once('_'))
@@ -1250,79 +1875,107 @@ impl Schema {
         })
     }
 
-    pub fn is_materialized_view(&self, name: &str) -> bool {
+    pub fn is_materialized_view(&self, namespace: NamespaceId, name: &str) -> bool {
+        let objects = self.namespace(namespace);
         let name = normalize_ident(name);
-        self.materialized_view_names.contains(&name)
+        objects.materialized_view_names.contains(&name)
     }
 
-    pub fn incompatible_materialized_view_root(&self, name: &str) -> Option<i64> {
-        self.incompatible_materialized_view_roots
+    pub fn incompatible_materialized_view_root(
+        &self,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<i64> {
+        let objects = self.namespace(namespace);
+        objects
+            .incompatible_materialized_view_roots
             .get(&normalize_ident(name))
             .copied()
     }
 
-    pub fn materialized_view_exists(&self, name: &str) -> bool {
-        self.is_materialized_view(name) || self.incompatible_materialized_view_root(name).is_some()
+    pub fn materialized_view_exists(&self, namespace: NamespaceId, name: &str) -> bool {
+        self.is_materialized_view(namespace, name)
+            || self
+                .incompatible_materialized_view_root(namespace, name)
+                .is_some()
     }
 
     /// Apply a function to a table's incompatible dependent materialized views
-    pub fn with_incompatible_dependent_views<F, T>(&self, table_name: &str, f: F) -> T
+    pub fn with_incompatible_dependent_views<F, T>(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+        f: F,
+    ) -> T
     where
         F: FnOnce(&[&String]) -> T,
     {
+        let objects = self.namespace(namespace);
         let table_name = normalize_ident(table_name);
         let mut views: SmallVec<[&String; 8]> = SmallVec::with_capacity(8);
 
         // Get all materialized views that depend on this table
-        if let Some(v) = self.table_to_materialized_views.get(&table_name) {
+        if let Some(v) = objects.table_to_materialized_views.get(&table_name) {
             v.iter()
-                .filter(|name| self.incompatible_views.contains(&**name))
+                .filter(|key| {
+                    let (view_namespace, view_name) = self.demangle_name(key);
+                    self.namespace(view_namespace)
+                        .incompatible_views
+                        .contains(view_name)
+                })
                 .for_each(|n| views.push(n));
         }
         f(&views)
     }
 
-    pub fn remove_view(&mut self, name: &str) -> Result<()> {
+    pub fn remove_view(&mut self, namespace: NamespaceId, name: &str) -> Result<()> {
         let name = normalize_ident(name);
+        let objects = self.namespace_mut(namespace);
 
-        if self.views.contains_key(&name) {
-            self.views.remove(&name);
+        if objects.views.contains_key(&name) {
+            objects.views.remove(&name);
             Ok(())
-        } else if self.materialized_view_names.contains(&name)
-            || self
+        } else if objects.materialized_view_names.contains(&name)
+            || objects
                 .incompatible_materialized_view_roots
                 .contains_key(&name)
         {
-            // Remove from tables
-            self.remove_table(&name);
-
             // Remove every version marker and hidden operator table of this
-            // view, including incompatible older storage versions.
+            // view, including incompatible older storage versions. They are
+            // tables of the root namespace named after the view's key.
+            let view_key = mangle_name(namespace, &name);
             let hidden_tables: Vec<String> = self
+                .namespace(NamespaceId::ROOT)
                 .tables
                 .keys()
                 .filter(|table_name| {
-                    crate::incremental::view::state_table_belongs_to_view(table_name, &name)
+                    crate::incremental::view::state_table_belongs_to_view(table_name, &view_key)
                 })
                 .cloned()
                 .try_collect()?;
+            // Remove from tables
+            self.remove_table(namespace, &name);
             for table in hidden_tables {
-                self.remove_table(&table);
-                self.remove_indices_for_table(&table);
+                self.remove_table(NamespaceId::ROOT, &table);
+                self.remove_indices_for_table(NamespaceId::ROOT, &table);
             }
 
             // Remove from materialized view tracking
-            self.materialized_view_names.remove(&name);
-            self.materialized_view_sql.remove(&name);
-            self.incremental_views.remove(&name);
-            self.incompatible_views.remove(&name);
-            self.incompatible_materialized_view_roots.remove(&name);
+            let objects = self.namespace_mut(namespace);
+            objects.materialized_view_names.remove(&name);
+            objects.materialized_view_sql.remove(&name);
+            objects.incremental_views.remove(&name);
+            objects.incompatible_views.remove(&name);
+            objects.incompatible_materialized_view_roots.remove(&name);
 
-            // Remove from table_to_materialized_views dependencies
-            for views in self.table_to_materialized_views.values_mut() {
-                views.retain(|v| v != &name);
+            // Remove from table_to_materialized_views dependencies, which
+            // live with the tables the view reads, in any namespace
+            objects.table_to_materialized_views.remove(&name);
+            for objects in self.namespaces.values_mut() {
+                for views in objects.table_to_materialized_views.values_mut() {
+                    views.retain(|v| v != &view_key);
+                }
             }
-            self.table_to_materialized_views.remove(&name);
 
             Ok(())
         } else {
@@ -1333,11 +1986,22 @@ impl Schema {
     }
 
     /// Register that a materialized view depends on a table
-    pub fn add_materialized_view_dependency(&mut self, table_name: &str, view_name: &str) {
+    /// Records that the materialized view known by `view_key` reads
+    /// `table_name` of `namespace`. A view key is the view's mangled name:
+    /// its bare name in the root namespace, `__turso_ns<id>_<name>` in a
+    /// namespace. The maintenance machinery, the change log and the
+    /// view's hidden state tables all know a view by its key.
+    pub fn add_materialized_view_dependency(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: &str,
+        view_key: &str,
+    ) {
+        let objects = self.namespace_mut(namespace);
         let table_name = normalize_ident(table_name);
-        let view_name = normalize_ident(view_name);
+        let view_name = view_key.to_string();
 
-        let views = self
+        let views = objects
             .table_to_materialized_views
             .entry(table_name)
             .or_insert_with(|| vec![]);
@@ -1348,12 +2012,20 @@ impl Schema {
     }
 
     /// Get all materialized views that depend on a given table
-    pub fn get_dependent_materialized_views(&self, table_name: &str) -> Vec<String> {
-        if self.table_to_materialized_views.is_empty() {
+    /// The keys of the materialized views that read `table_name` of
+    /// `namespace`.
+    pub fn get_dependent_materialized_views(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> Vec<String> {
+        let objects = self.namespace(namespace);
+        if objects.table_to_materialized_views.is_empty() {
             return vec![];
         }
         let table_name = normalize_ident(table_name);
-        self.table_to_materialized_views
+        objects
+            .table_to_materialized_views
             .get(&table_name)
             .cloned()
             .unwrap_or_else(|| vec![])
@@ -1367,91 +2039,103 @@ impl Schema {
     /// reachable schedule up front ensures those newly captured deltas are
     /// consumed later in the same commit instead of being omitted from a
     /// snapshot of the initially touched state map.
+    /// The keys of the materialized views to maintain after the views in
+    /// `initially_touched` changed, in dependency order: a view before the
+    /// views that read it.
     pub fn materialized_view_maintenance_order(
         &self,
         initially_touched: Vec<String>,
     ) -> Result<Vec<String>> {
+        let dependents_of = |view_key: &str| -> Vec<String> {
+            let (namespace, view_name) = self.demangle_name(view_key);
+            self.namespace(namespace)
+                .table_to_materialized_views
+                .get(view_name)
+                .cloned()
+                .unwrap_or_else(|| vec![])
+        };
         let mut reachable = HashSet::default();
-        let mut pending = initially_touched
-            .into_iter()
-            .map(|name| normalize_ident(&name))
-            .try_collect::<Vec<_>>()?;
-        while let Some(view_name) = pending.pop() {
-            if !self.is_materialized_view(&view_name) || !reachable.insert(view_name.clone()) {
+        let mut pending = initially_touched;
+        while let Some(view_key) = pending.pop() {
+            let (namespace, view_name) = self.demangle_name(&view_key);
+            if !self.is_materialized_view(namespace, view_name)
+                || !reachable.insert(view_key.clone())
+            {
                 continue;
             }
-            if let Some(dependents) = self.table_to_materialized_views.get(&view_name) {
-                pending.try_extend(dependents.iter().cloned())?;
-            }
+            pending.try_extend(dependents_of(&view_key))?;
         }
 
         let mut indegree = reachable
             .iter()
-            .map(|name| (name.clone(), 0usize))
+            .map(|key| (key.clone(), 0usize))
             .collect::<HashMap<_, _>>();
         for source in &reachable {
-            if let Some(dependents) = self.table_to_materialized_views.get(source) {
-                for dependent in dependents {
-                    let dependent = normalize_ident(dependent);
-                    if let Some(degree) = indegree.get_mut(&dependent) {
-                        *degree += 1;
-                    }
+            for dependent in dependents_of(source) {
+                if let Some(degree) = indegree.get_mut(&dependent) {
+                    *degree += 1;
                 }
             }
         }
 
         let mut ready = indegree
             .iter()
-            .filter_map(|(name, degree)| (*degree == 0).then_some(name.clone()))
+            .filter_map(|(key, degree)| (*degree == 0).then_some(key.clone()))
             .try_collect::<Vec<_>>()?;
         ready.sort_by(|left, right| right.cmp(left));
-        let mut ordered = Vec::try_with_capacity_ext(reachable.len())?;
-        while let Some(view_name) = ready.pop() {
-            ordered.push(view_name.clone());
-            if let Some(dependents) = self.table_to_materialized_views.get(&view_name) {
-                for dependent in dependents {
-                    let dependent = normalize_ident(dependent);
-                    let Some(degree) = indegree.get_mut(&dependent) else {
-                        continue;
-                    };
-                    *degree -= 1;
-                    if *degree == 0 {
-                        ready.push(dependent);
-                        ready.sort_by(|left, right| right.cmp(left));
-                    }
+        let mut order = Vec::try_with_capacity_ext(reachable.len())?;
+        while let Some(view_key) = ready.pop() {
+            order.push(view_key.clone());
+            for dependent in dependents_of(&view_key) {
+                let Some(degree) = indegree.get_mut(&dependent) else {
+                    continue;
+                };
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push(dependent);
+                    ready.sort_by(|left, right| right.cmp(left));
                 }
             }
         }
-
-        if ordered.len() != reachable.len() {
-            return Err(LimboError::ParseError(
+        if order.len() != reachable.len() {
+            return Err(LimboError::InternalError(
                 "circular materialized-view dependency".to_string(),
             ));
         }
-        Ok(ordered)
+        Ok(order)
     }
 
     /// Add a regular (non-materialized) view
-    pub fn add_view(&mut self, view: View) -> Result<()> {
-        self.check_object_name_conflict(&view.name, SchemaObjectType::View)?;
+    pub fn add_view(&mut self, namespace: NamespaceId, view: View) -> Result<()> {
+        self.check_object_name_conflict(namespace, &view.name, SchemaObjectType::View)?;
         let name = normalize_ident(&view.name);
-        self.views.insert(name, Arc::new(view));
+        self.namespace_mut(namespace)
+            .views
+            .insert(name, Arc::new(view));
         Ok(())
     }
 
     /// Get a regular view by name
-    pub fn get_view(&self, name: &str) -> Option<Arc<View>> {
+    pub fn get_view(&self, namespace: NamespaceId, name: &str) -> Option<Arc<View>> {
+        let objects = self.namespace(namespace);
         let name = normalize_ident(name);
-        self.views.get(&name).cloned()
+        objects.views.get(&name).cloned()
     }
 
-    pub fn add_trigger(&mut self, trigger: Trigger, table_name: &str) -> Result<()> {
+    pub fn add_trigger(
+        &mut self,
+        namespace: NamespaceId,
+        trigger: Trigger,
+        table_name: &str,
+    ) -> Result<()> {
+        let objects = self.namespace_mut(namespace);
         // Triggers have their own namespace and duplicate trigger names
         // are checked in `translate_create_trigger`
         let table_name = normalize_ident(table_name);
 
         // See [Schema::add_index] for why we push to the front of the deque.
-        self.triggers
+        objects
+            .triggers
             .entry(table_name)
             .or_default()
             .push_front(Arc::new(trigger));
@@ -1459,11 +2143,12 @@ impl Schema {
         Ok(())
     }
 
-    pub fn remove_trigger(&mut self, name: &str) -> Result<()> {
+    pub fn remove_trigger(&mut self, namespace: NamespaceId, name: &str) -> Result<()> {
+        let objects = self.namespace_mut(namespace);
         let name = normalize_ident(name);
 
         let mut removed = false;
-        for triggers_list in self.triggers.values_mut() {
+        for triggers_list in objects.triggers.values_mut() {
             for i in 0..triggers_list.len() {
                 let trigger = &triggers_list[i];
                 if normalize_ident(&trigger.name) == name {
@@ -1483,18 +2168,21 @@ impl Schema {
         }
         Ok(())
     }
-    pub fn remove_triggers_for_table(&mut self, table_name: &str) {
+    pub fn remove_triggers_for_table(&mut self, namespace: NamespaceId, table_name: &str) {
+        let objects = self.namespace_mut(namespace);
         let table_name = normalize_ident(table_name);
-        self.triggers.remove(&table_name);
+        objects.triggers.remove(&table_name);
     }
 
     pub fn set_trigger_target_database_id(
         &mut self,
+        namespace: NamespaceId,
         trigger_name: &str,
         target_database_id: usize,
     ) -> Result<()> {
+        let objects = self.namespace_mut(namespace);
         let trigger_name = normalize_ident(trigger_name);
-        let trigger = self
+        let trigger = objects
             .triggers
             .values_mut()
             .flatten()
@@ -1515,15 +2203,21 @@ impl Schema {
     /// without accidentally removing ones that target `temp.t` or
     /// `aux.t` (the plain `remove_triggers_for_table` keys only on
     /// table name).
-    pub fn remove_triggers_for_table_with_db(&mut self, table_name: &str, target_db: usize) {
+    pub fn remove_triggers_for_table_with_db(
+        &mut self,
+        namespace: NamespaceId,
+        table_name: &str,
+        target_db: usize,
+    ) {
+        let objects = self.namespace_mut(namespace);
         let table_name = normalize_ident(table_name);
-        let Some(bucket) = self.triggers.get_mut(&table_name) else {
+        let Some(bucket) = objects.triggers.get_mut(&table_name) else {
             return;
         };
         // Check once whether this schema has a table with the same name.
         // If it does, unqualified triggers resolve to that local table,
         // not to the one being dropped in `target_db`.
-        let has_shadow_table = self.tables.contains_key(&table_name);
+        let has_shadow_table = objects.tables.contains_key(&table_name);
         bucket.retain(|trigger| {
             match trigger.target_database_id {
                 Some(db) => db != target_db,
@@ -1533,32 +2227,43 @@ impl Schema {
             }
         });
         if bucket.is_empty() {
-            self.triggers.remove(&table_name);
+            objects.triggers.remove(&table_name);
         }
     }
 
-    pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
+    pub fn get_trigger_for_table(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+        name: &str,
+    ) -> Option<Arc<Trigger>> {
+        let objects = self.namespace(namespace);
         let table_name = normalize_ident(table_name);
         let name = normalize_ident(name);
-        self.triggers
+        objects
+            .triggers
             .get(&table_name)
             .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
     }
 
     pub fn get_triggers_for_table(
         &self,
+        namespace: NamespaceId,
         table_name: &str,
     ) -> impl Iterator<Item = &Arc<Trigger>> + Clone {
         let table_name = normalize_ident(table_name);
-        self.triggers
+        self.namespace(namespace)
+            .triggers
             .get(&table_name)
             .map(|triggers| triggers.iter())
             .unwrap_or_default()
     }
 
-    pub fn get_trigger(&self, name: &str) -> Option<Arc<Trigger>> {
+    pub fn get_trigger(&self, namespace: NamespaceId, name: &str) -> Option<Arc<Trigger>> {
+        let objects = self.namespace(namespace);
         let name = normalize_ident(name);
-        self.triggers
+        objects
+            .triggers
             .values()
             .flatten()
             .find(|t| t.name == name)
@@ -1566,37 +2271,52 @@ impl Schema {
     }
 
     pub(crate) fn copy_table_valued_functions(&mut self, source: &Schema) {
+        let source = source.namespace(NamespaceId::ROOT);
+        let objects = self.namespace_mut(NamespaceId::ROOT);
         for (name, table) in &source.tables {
             if matches!(table.as_ref(), Table::Virtual(vtab)
                 if vtab.kind == turso_ext::VTabKind::TableValuedFunction)
             {
-                self.tables
+                objects
+                    .tables
                     .entry(name.clone())
                     .or_insert_with(|| table.clone());
             }
         }
     }
 
-    pub fn add_btree_table(&mut self, table: Arc<BTreeTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
+    pub fn add_btree_table(
+        &mut self,
+        namespace: NamespaceId,
+        table: Arc<BTreeTable>,
+    ) -> Result<()> {
+        self.check_object_name_conflict(namespace, &table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
         #[cfg(feature = "conn_raw_api")]
         self.table_names_by_root_page
             .insert(table.root_page, name.clone());
-        self.tables.insert(name, Table::BTree(table).into());
+        self.namespace_mut(namespace)
+            .tables
+            .insert(name, Table::BTree(table).into());
         Ok(())
     }
 
-    pub fn add_virtual_table(&mut self, table: Arc<VirtualTable>) -> Result<()> {
-        self.check_object_name_conflict(&table.name, SchemaObjectType::Table)?;
+    pub fn add_virtual_table(
+        &mut self,
+        namespace: NamespaceId,
+        table: Arc<VirtualTable>,
+    ) -> Result<()> {
+        self.check_object_name_conflict(namespace, &table.name, SchemaObjectType::Table)?;
         let name = normalize_ident(&table.name);
-        self.tables.insert(name, Table::Virtual(table).into());
+        self.namespace_mut(namespace)
+            .tables
+            .insert(name, Table::Virtual(table).into());
         Ok(())
     }
 
-    pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
+    pub fn get_table(&self, namespace: NamespaceId, name: &str) -> Option<Arc<Table>> {
         let name = self.normalize_table_lookup_name(name);
-        self.tables.get(&name).cloned()
+        self.namespace(namespace).tables.get(&name).cloned()
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -1606,25 +2326,24 @@ impl Schema {
             .map(String::as_str)
     }
 
-    pub fn remove_table(&mut self, table_name: &str) {
+    pub fn remove_table(&mut self, namespace: NamespaceId, table_name: &str) {
         let name = normalize_ident(table_name);
+        let objects = self.namespace_mut(namespace);
         #[cfg(feature = "conn_raw_api")]
-        {
-            if let Some(table) = self.tables.remove(&name) {
-                self.unregister_table_root_page(&table);
-            }
-        }
+        let removed = objects.tables.remove(&name);
         #[cfg(not(feature = "conn_raw_api"))]
-        {
-            self.tables.remove(&name);
-        }
-        self.analyze_stats.remove_table(&name);
+        objects.tables.remove(&name);
 
         // If this was a materialized view, also clean up the metadata
-        if self.materialized_view_names.remove(&name) {
-            self.incremental_views.remove(&name);
-            self.materialized_view_sql.remove(&name);
+        if objects.materialized_view_names.remove(&name) {
+            objects.incremental_views.remove(&name);
+            objects.materialized_view_sql.remove(&name);
         }
+        #[cfg(feature = "conn_raw_api")]
+        if let Some(table) = removed {
+            self.unregister_table_root_page(&table);
+        }
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -1642,17 +2361,17 @@ impl Schema {
         }
     }
 
-    pub fn get_btree_table(&self, name: &str) -> Option<Arc<BTreeTable>> {
+    pub fn get_btree_table(&self, namespace: NamespaceId, name: &str) -> Option<Arc<BTreeTable>> {
         let name = self.normalize_table_lookup_name(name);
-        if let Some(table) = self.tables.get(&name) {
+        if let Some(table) = self.namespace(namespace).tables.get(&name) {
             table.btree()
         } else {
             None
         }
     }
 
-    pub fn add_index(&mut self, index: Arc<Index>) -> Result<()> {
-        self.check_object_name_conflict(&index.name, SchemaObjectType::Index)?;
+    pub fn add_index(&mut self, namespace: NamespaceId, index: Arc<Index>) -> Result<()> {
+        self.check_object_name_conflict(namespace, &index.name, SchemaObjectType::Index)?;
         let table_name = normalize_ident(&index.table_name);
         // We must add the new index to the front of the deque, because SQLite stores index definitions as a linked list
         // where the newest parsed index entry is at the head of list. If we would add it to the back of a regular Vec for example,
@@ -1661,7 +2380,11 @@ impl Schema {
         // non-mutating conflict resolutions all happen before mutating ones, ensuring that
         // no half-committed state is left behind.
         let is_replace = index.on_conflict == Some(ResolveType::Replace);
-        let indexes_for_table = self.indexes.entry(table_name).or_default();
+        let indexes_for_table = self
+            .namespace_mut(namespace)
+            .indexes
+            .entry(table_name)
+            .or_default();
         if is_replace {
             // REPLACE indexes sort newest-first among themselves.
             let first_replace = indexes_for_table
@@ -1688,9 +2411,14 @@ impl Schema {
         Ok(())
     }
 
-    pub fn get_indices(&self, table_name: &str) -> impl Iterator<Item = &Arc<Index>> {
+    pub fn get_indices(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Index>> {
         let name = normalize_ident(table_name);
-        self.indexes
+        self.namespace(namespace)
+            .indexes
             .get(&name)
             .map(|v| v.iter())
             .unwrap_or_default()
@@ -1699,18 +2427,24 @@ impl Schema {
 
     pub fn get_unowned_backing_btrees(
         &self,
+        namespace: NamespaceId,
         table_name: &str,
     ) -> impl Iterator<Item = &Arc<Index>> {
         let name = normalize_ident(table_name);
-        self.indexes
+        self.namespace(namespace)
+            .indexes
             .get(&name)
             .map(|v| v.iter())
             .unwrap_or_default()
-            .filter(|i| i.is_backing_btree_index() && !self.backing_btree_has_owner(i))
+            .filter(move |i| {
+                i.is_backing_btree_index() && !self.backing_btree_has_owner(namespace, i)
+            })
     }
 
-    fn backing_btree_has_owner(&self, backing_btree: &Index) -> bool {
-        self.indexes
+    fn backing_btree_has_owner(&self, namespace: NamespaceId, backing_btree: &Index) -> bool {
+        let objects = self.namespace(namespace);
+        objects
+            .indexes
             .values()
             .flatten()
             .filter_map(|index| index.index_method.as_ref())
@@ -1723,44 +2457,53 @@ impl Schema {
     }
 
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-    pub fn has_fts_index(&self, table_name: &str) -> bool {
-        self.get_indices(table_name).any(|idx| {
+    pub fn has_fts_index(&self, namespace: NamespaceId, table_name: &str) -> bool {
+        self.get_indices(namespace, table_name).any(|idx| {
             idx.index_method.as_ref().is_some_and(|m| {
                 m.definition().method_name == crate::index_method::fts::FTS_INDEX_METHOD_NAME
             })
         })
     }
 
-    pub fn get_index(&self, table_name: &str, index_name: &str) -> Option<&Arc<Index>> {
+    pub fn get_index(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+        index_name: &str,
+    ) -> Option<&Arc<Index>> {
         let name = normalize_ident(table_name);
-        self.indexes
+        self.namespace(namespace)
+            .indexes
             .get(&name)?
             .iter()
             .find(|index| index.name == index_name)
     }
 
-    pub fn remove_indices_for_table(&mut self, table_name: &str) {
+    pub fn remove_indices_for_table(&mut self, namespace: NamespaceId, table_name: &str) {
         let name = normalize_ident(table_name);
-        self.indexes.remove(&name);
-        self.analyze_stats.remove_table(&name);
+        self.namespace_mut(namespace).indexes.remove(&name);
+        self.analyze_stats.remove_table(namespace, &name);
     }
 
-    pub fn remove_index(&mut self, idx: &Index) {
+    pub fn remove_index(&mut self, namespace: NamespaceId, idx: &Index) {
         let name = normalize_ident(&idx.table_name);
-        self.indexes
+        self.namespace_mut(namespace)
+            .indexes
             .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
-        self.analyze_stats.remove_index(&name, &idx.name);
+        self.analyze_stats.remove_index(namespace, &name, &idx.name);
     }
 
-    pub fn table_has_indexes(&self, table_name: &str) -> bool {
+    pub fn table_has_indexes(&self, namespace: NamespaceId, table_name: &str) -> bool {
+        let objects = self.namespace(namespace);
         let name = normalize_ident(table_name);
-        self.has_indexes.contains(&name)
+        objects.has_indexes.contains(&name)
     }
 
-    pub fn table_set_has_index(&mut self, table_name: &str) {
-        self.has_indexes.insert(table_name.to_string());
+    pub fn table_set_has_index(&mut self, namespace: NamespaceId, table_name: &str) {
+        let objects = self.namespace_mut(namespace);
+        objects.has_indexes.insert(table_name.to_string());
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
@@ -2019,23 +2762,25 @@ impl Schema {
         mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
-            let table = self
-                .get_btree_table(&unparsed_sql_from_index.table_name)
-                .ok_or_else(|| {
-                    LimboError::Corrupt(format!(
-                        "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
-                        unparsed_sql_from_index.table_name,
-                        unparsed_sql_from_index.root_page,
-                        unparsed_sql_from_index.sql
-                    ))
-                })?;
-            let index = Index::from_sql(
+            let (namespace, table_name) = self.demangle_name(&unparsed_sql_from_index.table_name);
+            let table = self.get_btree_table(namespace, table_name).ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
+                    unparsed_sql_from_index.table_name,
+                    unparsed_sql_from_index.root_page,
+                    unparsed_sql_from_index.sql
+                ))
+            })?;
+            let mut index = Index::from_sql(
                 syms,
                 &unparsed_sql_from_index.sql,
                 unparsed_sql_from_index.root_page,
                 table.as_ref(),
             )?;
-            self.add_index(Arc::new(index))?;
+            let index_name = self.demangle_name(&index.name).1.to_string();
+            index.name = index_name;
+            index.table_name.clone_from(&table.name);
+            self.add_index(namespace, Arc::new(index))?;
         }
 
         for automatic_index in automatic_indices {
@@ -2043,7 +2788,8 @@ impl Schema {
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
             // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
-            let table = self.get_btree_table(&automatic_index.0).ok_or_else(|| {
+            let (namespace, table_name) = self.demangle_name(&automatic_index.0);
+            let table = self.get_btree_table(namespace, table_name).ok_or_else(|| {
                 LimboError::Corrupt(format!(
                     "sqlite_schema contains automatic index for missing table '{}': indexes={:?}",
                     automatic_index.0, automatic_index.1
@@ -2086,14 +2832,17 @@ impl Schema {
                     }
 
                     if let Some(index_entry) = automatic_indexes.pop() {
-                        self.add_index(Arc::new(Index::automatic_from_primary_key(
-                            table.as_ref(),
-                            index_entry,
-                            unique_set.columns.len(),
-                            unique_set.conflict_clause,
-                            &unique_set.columns,
-                            unique_set.constraint_name.clone(),
-                        )?))?;
+                        self.add_index(
+                            namespace,
+                            Arc::new(Index::automatic_from_primary_key(
+                                table.as_ref(),
+                                index_entry,
+                                unique_set.columns.len(),
+                                unique_set.conflict_clause,
+                                &unique_set.columns,
+                                unique_set.constraint_name.clone(),
+                            )?),
+                        )?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
                         // Skip creating this index - it will be added later when its schema row is processed
@@ -2120,14 +2869,17 @@ impl Schema {
                             .expect("unique columns vector was preallocated to its input length");
                     }
                     if let Some(index_entry) = automatic_indexes.pop() {
-                        self.add_index(Arc::new(Index::automatic_from_unique(
-                            table.as_ref(),
-                            index_entry,
-                            column_indices_and_sort_orders,
-                            unique_set.conflict_clause,
-                            &unique_set.columns,
-                            unique_set.constraint_name.clone(),
-                        )?))?;
+                        self.add_index(
+                            namespace,
+                            Arc::new(Index::automatic_from_unique(
+                                table.as_ref(),
+                                index_entry,
+                                column_indices_and_sort_orders,
+                                unique_set.conflict_clause,
+                                &unique_set.columns,
+                                unique_set.constraint_name.clone(),
+                            )?),
+                        )?;
                     } else if mvcc_enabled {
                         // In MVCC mode, automatic indices might not be fully populated yet during recovery
                         // Skip creating this index - it will be added later when its schema row is processed
@@ -2155,55 +2907,55 @@ impl Schema {
     }
 
     fn order_persisted_materialized_views(
-        view_info: HashMap<String, (String, i64)>,
-    ) -> Result<Vec<(String, (String, i64))>> {
-        let mut view_info = view_info
-            .into_iter()
-            .map(|(name, info)| (normalize_ident(&name), info))
-            .collect::<HashMap<_, _>>();
-        let names = view_info.keys().cloned().collect::<HashSet<_>>();
-        let mut indegree = names
+        &self,
+        view_info: HashMap<String, StoredMaterializedView>,
+    ) -> Result<Vec<(String, StoredMaterializedView)>> {
+        let mut view_info = view_info;
+        let keys = view_info.keys().cloned().collect::<HashSet<_>>();
+        let mut indegree = keys
             .iter()
-            .map(|name| (name.clone(), 0usize))
+            .map(|key| (key.clone(), 0usize))
             .collect::<HashMap<_, _>>();
         let mut dependents: HashMap<String, Vec<String>> = HashMap::default();
 
-        for (view_name, (sql, _)) in &view_info {
+        for (view_key, (namespace, sql, _)) in &view_info {
             let cmd = Parser::new(sql.as_bytes()).next_cmd()?.ok_or_else(|| {
                 LimboError::Corrupt(format!(
-                    "materialized view {view_name} has an empty schema definition"
+                    "materialized view {view_key} has an empty schema definition"
                 ))
             })?;
             let Cmd::Stmt(Stmt::CreateMaterializedView { select, .. }) = cmd else {
                 return Err(LimboError::Corrupt(format!(
-                    "materialized view {view_name} has a non-view schema definition"
+                    "materialized view {view_key} has a non-view schema definition"
                 )));
             };
-            let view_name = normalize_ident(view_name);
-            for dependency in IncrementalView::referenced_table_names(&select) {
-                if names.contains(&dependency) {
-                    *indegree.get_mut(&view_name).ok_or_else(|| {
+            for (table_namespace, table_name) in
+                self.materialized_view_dependencies(*namespace, &select)
+            {
+                let dependency = mangle_name(table_namespace, &table_name);
+                if keys.contains(&dependency) {
+                    *indegree.get_mut(view_key).ok_or_else(|| {
                         LimboError::Corrupt(format!(
-                            "materialized view {view_name} disappeared while ordering schema"
+                            "materialized view {view_key} disappeared while ordering schema"
                         ))
                     })? += 1;
                     dependents
                         .entry(dependency)
                         .or_insert_with(|| vec![])
-                        .push(view_name.clone());
+                        .push(view_key.clone());
                 }
             }
         }
 
         let mut ready = indegree
             .iter()
-            .filter_map(|(name, degree)| (*degree == 0).then_some(name.clone()))
+            .filter_map(|(key, degree)| (*degree == 0).then_some(key.clone()))
             .try_collect::<Vec<_>>()?;
         ready.sort_by(|left, right| right.cmp(left));
-        let mut order = Vec::try_with_capacity_ext(names.len())?;
-        while let Some(view_name) = ready.pop() {
-            order.push(view_name.clone());
-            if let Some(children) = dependents.get(&view_name) {
+        let mut order = Vec::try_with_capacity_ext(keys.len())?;
+        while let Some(view_key) = ready.pop() {
+            order.push(view_key.clone());
+            if let Some(children) = dependents.get(&view_key) {
                 for child in children {
                     let degree = indegree.get_mut(child).ok_or_else(|| {
                         LimboError::Corrupt(format!(
@@ -2218,7 +2970,7 @@ impl Schema {
                 }
             }
         }
-        if order.len() != names.len() {
+        if order.len() != keys.len() {
             return Err(LimboError::Corrupt(
                 "circular materialized-view dependency in schema".to_string(),
             ));
@@ -2226,13 +2978,13 @@ impl Schema {
 
         order
             .into_iter()
-            .map(|name| {
+            .map(|key| {
                 view_info
-                    .remove(&name)
-                    .map(|info| (name.clone(), info))
+                    .remove(&key)
+                    .map(|info| (key.clone(), info))
                     .ok_or_else(|| {
                         LimboError::Corrupt(format!(
-                            "materialized view {name} disappeared while ordering schema"
+                            "materialized view {key} disappeared while ordering schema"
                         ))
                     })
             })
@@ -2240,25 +2992,30 @@ impl Schema {
     }
 
     /// Populate materialized views parsed from the schema.
+    /// Builds the materialized views the loader met, keyed by their view
+    /// keys, with the namespace, SQL text and root page of each.
     pub fn populate_materialized_views(
         &mut self,
-        materialized_view_info: HashMap<String, (String, i64)>,
+        materialized_view_info: HashMap<String, StoredMaterializedView>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
-        for (view_name, (sql, main_root)) in
-            Self::order_persisted_materialized_views(materialized_view_info)?
+        for (view_key, (namespace, sql, main_root)) in
+            self.order_persisted_materialized_views(materialized_view_info)?
         {
+            let view_name = self.demangle_name(&view_key).1.to_string();
             // The marker is mandatory even when the circuit has no stateful
             // operators, so absence and mismatched operator storage are both
             // incompatible.
-            if !self.has_compatible_materialized_view_storage(&view_name) {
+            if !self.has_compatible_materialized_view_storage(NamespaceId::ROOT, &view_key) {
                 tracing::warn!(
                     "Materialized view '{}' was created with an incompatible storage version; \
                      DROP and recreate it",
                     view_name
                 );
-                self.incompatible_views.insert(view_name.clone());
+                self.namespace_mut(namespace)
+                    .incompatible_views
+                    .insert(view_name.clone());
             }
             // Register each DBSP state table's primary-key index so lookups
             // and integrity check can use it; its columns (and collations)
@@ -2268,7 +3025,7 @@ impl Schema {
             // owns a real btree that integrity_check and DROP VIEW must see.
             let state_keys: Vec<String> = dbsp_state_index_roots
                 .keys()
-                .filter(|k| crate::incremental::view::state_key_belongs_to_view(k, &view_name))
+                .filter(|k| crate::incremental::view::state_key_belongs_to_view(k, &view_key))
                 .cloned()
                 .try_collect()?;
             for key in state_keys {
@@ -2282,13 +3039,14 @@ impl Schema {
                 // an older, incompatible version is named with its own
                 // (different) version number.
                 let state_table = self
+                    .namespace(NamespaceId::ROOT)
                     .tables
                     .values()
                     .find_map(|t| t.btree().filter(|bt| bt.root_page == table_root));
                 if let Some(state_table) = state_table {
                     let mut index = create_dbsp_state_index(index_root, &state_table)?;
                     index.name = format!("sqlite_autoindex_{}_1", state_table.name);
-                    if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
+                    if let Err(e) = self.add_index(NamespaceId::ROOT, std::sync::Arc::new(index)) {
                         if !e.to_string().contains("already exists") {
                             return Err(e);
                         }
@@ -2306,36 +3064,47 @@ impl Schema {
                     "materialized view {view_name} has a non-view schema definition"
                 )));
             };
-            let referenced_tables = self.materialized_view_dependencies(&select);
+            let referenced_tables = self.materialized_view_dependencies(namespace, &select);
             let incompatible_dependency = referenced_tables
                 .iter()
-                .find(|table_name| self.incompatible_views.contains(*table_name))
+                .find(|(table_namespace, table_name)| {
+                    self.namespace(*table_namespace)
+                        .incompatible_views
+                        .contains(table_name)
+                })
                 .cloned();
-            if let Some(dependency) = incompatible_dependency {
+            if let Some((_, dependency)) = incompatible_dependency {
                 tracing::warn!(
                     "Materialized view '{}' depends on incompatible materialized view '{}'; \
                      DROP and recreate both views",
                     view_name,
                     dependency
                 );
-                self.incompatible_views.insert(view_name.clone());
+                self.namespace_mut(namespace)
+                    .incompatible_views
+                    .insert(view_name.clone());
             }
 
             // An incompatible view has no live table descriptor, but its
             // dependency metadata must remain so DML is rejected with the
             // actionable DROP-and-recreate error rather than silently losing
             // maintenance.
-            if self.incompatible_views.contains(&view_name) {
-                self.incompatible_materialized_view_roots
+            if self
+                .namespace(namespace)
+                .incompatible_views
+                .contains(&view_name)
+            {
+                self.namespace_mut(namespace)
+                    .incompatible_materialized_view_roots
                     .insert(view_name.clone(), main_root);
-                for table_name in &referenced_tables {
-                    self.add_materialized_view_dependency(table_name, &view_name);
+                for (table_namespace, table_name) in &referenced_tables {
+                    self.add_materialized_view_dependency(*table_namespace, table_name, &view_key);
                 }
                 continue;
             }
 
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(&sql, self, main_root)?;
+            let incremental_view = IncrementalView::from_sql(&sql, self, main_root, namespace)?;
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns()?;
@@ -2343,9 +3112,11 @@ impl Schema {
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
+                declared_name: view_name.clone(),
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
+                primary_key_is_inline: false,
                 has_rowid: true,
                 is_strict: false,
                 has_autoincrement: false,
@@ -2359,11 +3130,11 @@ impl Schema {
                 column_dependencies: Default::default(),
             })));
 
-            self.add_materialized_view(incremental_view, table, sql);
+            self.add_materialized_view(namespace, incremental_view, table, sql);
 
             // Register dependencies regardless of compatibility
-            for table_name in &referenced_tables {
-                self.add_materialized_view_dependency(table_name, &view_name);
+            for (table_namespace, table_name) in &referenced_tables {
+                self.add_materialized_view_dependency(*table_namespace, table_name, &view_key);
             }
         }
         Ok(())
@@ -2384,27 +3155,64 @@ impl Schema {
     /// reject since a view's target need not exist yet) stop expanding
     /// rather than recursing forever; a materialized view actually built on
     /// top of such views would already fail earlier, when its query runs.
-    fn materialized_view_dependencies(&self, select: &ast::Select) -> Vec<String> {
-        fn expand(schema: &Schema, name: &str, seen: &mut HashSet<String>, out: &mut Vec<String>) {
+    /// The tables that a materialized view of `namespace` with body
+    /// `select` reads, with their namespaces, through the regular views it
+    /// reads. A name written without a namespace is in `namespace`; `main`
+    /// names the root namespace; another name names a namespace.
+    fn materialized_view_dependencies(
+        &self,
+        namespace: NamespaceId,
+        select: &ast::Select,
+    ) -> Vec<(NamespaceId, String)> {
+        fn expand(
+            schema: &Schema,
+            namespace: NamespaceId,
+            name: &str,
+            seen: &mut HashSet<(NamespaceId, String)>,
+            out: &mut Vec<(NamespaceId, String)>,
+        ) {
             let name = normalize_ident(name);
-            if !seen.insert(name.clone()) {
+            if !seen.insert((namespace, name.clone())) {
                 return;
             }
-            if let Some(view) = schema.get_view(&name) {
-                for dependency in IncrementalView::referenced_table_names(&view.select_stmt) {
-                    expand(schema, &dependency, seen, out);
+            if let Some(view) = schema.get_view(namespace, &name) {
+                for (dependency_namespace, dependency) in
+                    schema.referenced_tables_of(namespace, &view.select_stmt)
+                {
+                    expand(schema, dependency_namespace, &dependency, seen, out);
                 }
             }
-            // Record the plain view's own name alongside the real tables it
-            // resolves to, not instead of them.
-            out.push(name);
+            out.push((namespace, name));
         }
         let mut seen = HashSet::default();
         let mut out = vec![];
-        for table_name in IncrementalView::referenced_table_names(select) {
-            expand(self, &table_name, &mut seen, &mut out);
+        for (table_namespace, table_name) in self.referenced_tables_of(namespace, select) {
+            expand(self, table_namespace, &table_name, &mut seen, &mut out);
         }
         out
+    }
+
+    /// The tables `select` reads, with the namespace each resolves to when
+    /// the select is the body of a view of `namespace`. A table of a
+    /// namespace the schema does not know is left out.
+    fn referenced_tables_of(
+        &self,
+        namespace: NamespaceId,
+        select: &ast::Select,
+    ) -> Vec<(NamespaceId, String)> {
+        let mut tables = vec![];
+        for (qualifier, name) in IncrementalView::referenced_tables(select) {
+            let table_namespace = match qualifier.as_deref() {
+                None => namespace,
+                Some("main") => NamespaceId::ROOT,
+                Some(qualifier) => match self.namespace_named(qualifier) {
+                    Some(table_namespace) => table_namespace,
+                    None => continue,
+                },
+            };
+            tables.push((table_namespace, name));
+        }
+        tables
     }
 
     /// Populate materialized views and then indices from rows collected
@@ -2419,13 +3227,29 @@ impl Schema {
     pub fn populate_materialized_views_then_indices(
         &mut self,
         syms: &SymbolTable,
-        materialized_view_info: HashMap<String, (String, i64)>,
+        materialized_view_info: HashMap<String, StoredMaterializedView>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
+        if !self.namespace_names_loaded && !materialized_view_info.is_empty() {
+            // A view body names tables by their namespace, so the views wait
+            // for the names of the namespaces. No index is on a view: CREATE
+            // INDEX refuses views.
+            let pending = self
+                .pending_materialized_views
+                .get_or_insert_with(PendingMaterializedViews::default);
+            pending
+                .materialized_view_info
+                .extend(materialized_view_info);
+            pending.dbsp_state_roots.extend(dbsp_state_roots);
+            pending
+                .dbsp_state_index_roots
+                .extend(dbsp_state_index_roots);
+            return self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled);
+        }
         self.populate_materialized_views(
             materialized_view_info,
             dbsp_state_roots,
@@ -2438,7 +3262,8 @@ impl Schema {
     /// currently in the schema. Shared shape for the SQL-based descriptor
     /// loader in `Connection` so the prefix-strip lives in one place.
     pub fn sequence_backing_table_names(&self) -> Vec<(String, String)> {
-        self.tables
+        self.namespace(NamespaceId::ROOT)
+            .tables
             .keys()
             .filter_map(|name| {
                 let seq_name = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX)?;
@@ -2449,7 +3274,8 @@ impl Schema {
     }
 
     fn sequence_backing_tables(&self) -> Vec<SequenceBackingTableSource> {
-        self.tables
+        self.namespace(NamespaceId::ROOT)
+            .tables
             .iter()
             .filter_map(|(name, table)| {
                 let bt = table.btree()?;
@@ -2489,8 +3315,10 @@ impl Schema {
         sequence_name: &str,
         metadata: SequenceMetadata,
     ) -> crate::Result<()> {
+        let normalized_name = normalize_ident(sequence_name);
+        let (namespace, name) = self.demangle_name(&normalized_name);
         let seq = Sequence::new(
-            sequence_name.to_string(),
+            name.to_string(),
             Some(metadata.start),
             Some(metadata.increment),
             Some(metadata.min),
@@ -2505,8 +3333,10 @@ impl Schema {
                 metadata.start, metadata.increment, metadata.min, metadata.max, metadata.cycle,
             ))
         })?;
-        self.sequences
-            .insert(normalize_ident(sequence_name), std::sync::Arc::new(seq));
+        self.add_namespace_of_object(namespace);
+        self.namespace_mut(namespace)
+            .sequences
+            .insert(name.to_string(), std::sync::Arc::new(seq));
         Ok(())
     }
 
@@ -2523,7 +3353,7 @@ impl Schema {
         automatic_indices: &mut HashMap<String, Vec<(String, i64)>>,
         dbsp_state_roots: &mut HashMap<String, i64>,
         dbsp_state_index_roots: &mut HashMap<String, i64>,
-        materialized_view_info: &mut HashMap<String, (String, i64)>,
+        materialized_view_info: &mut HashMap<String, StoredMaterializedView>,
         // Resolves an attached database name (case-insensitive) to its
         // connection-local database id. Used when reparsing temp trigger
         // SQL that qualifies its target with an attached db name like
@@ -2567,22 +3397,21 @@ impl Schema {
                             syms,
                         )?
                     };
-                    self.add_virtual_table(vtab)?;
+                    self.add_virtual_table(NamespaceId::ROOT, vtab)?;
                 } else {
-                    let table = dialect.parse_table_sql(sql, root_page)?;
-
-                    if table.has_virtual_columns && !self.generated_columns_enabled {
-                        return Err(LimboError::ParseError(format!(
-                            "table '{}' uses generated columns but the generated_columns feature is not enabled",
-                            table.name
-                        )));
+                    let mut table = dialect.parse_table_sql(sql, root_page)?;
+                    let (namespace, table_name) = self.demangle_name(&table.name);
+                    if !namespace.is_root() {
+                        table.name = table_name.to_string();
+                        table.declared_name =
+                            self.demangle_name(&table.declared_name).1.to_string();
+                        self.add_namespace_of_object(namespace);
                     }
-
                     // Detect sequence-backing tables by name prefix.
                     // Just add the table (for B-tree access); sequences are created by
                     // AddSequence at CREATE time or initialize_sequences at open time.
                     if table.name.starts_with(SEQ_BACKING_TABLE_PREFIX) {
-                        self.add_btree_table(Arc::new(table))?;
+                        self.add_btree_table(NamespaceId::ROOT, Arc::new(table))?;
                         return Ok(());
                     }
 
@@ -2616,12 +3445,11 @@ impl Schema {
                         }
                     }
 
-                    let mut table = table;
                     table.resolve_custom_type_affinities(self);
                     table.propagate_domain_constraints(self)?;
                     let has_autoinc = table.has_autoincrement;
-                    let tbl_name = table.name.clone();
-                    self.add_btree_table(Arc::new(table))?;
+                    let tbl_name = name.to_string();
+                    self.add_btree_table(namespace, Arc::new(table))?;
 
                     // Create the hidden sequence object owned by this
                     // AUTOINCREMENT table. The `__turso_internal_autoincrement_`
@@ -2630,8 +3458,10 @@ impl Schema {
                     // `__turso_internal_seq_<sequence-name>` backing table.
                     if has_autoinc {
                         let seq_name = autoincrement_sequence_name(&tbl_name);
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            self.sequences.entry(normalize_ident(&seq_name))
+                        if let std::collections::hash_map::Entry::Vacant(e) = self
+                            .namespace_mut(NamespaceId::ROOT)
+                            .sequences
+                            .entry(normalize_ident(&seq_name))
                         {
                             let seq = Sequence::new(
                                 seq_name.clone(),
@@ -2697,7 +3527,11 @@ impl Schema {
                 use turso_parser::parser::Parser;
 
                 let sql = maybe_sql.expect("sql should be present for view");
-                let view_name = name.to_string();
+                let (namespace, view_name) = self.demangle_name(name);
+                let view_name = view_name.to_string();
+                if !namespace.is_root() {
+                    self.add_namespace_of_object(namespace);
+                }
 
                 // Parse the SQL to determine if it's a regular or materialized view
                 let mut parser = Parser::new(sql.as_bytes());
@@ -2711,20 +3545,15 @@ impl Schema {
                         "view '{view_name}' has unparseable SQL in sqlite_schema; \
                          it is unavailable but can be removed with DROP VIEW: {sql}"
                     );
-                    self.broken_views.insert(view_name);
+                    self.namespace_mut(namespace).broken_views.insert(view_name);
                 } else if let Ok(Some(Cmd::Stmt(stmt))) = parsed {
                     match stmt {
                         Stmt::CreateMaterializedView { .. } => {
-                            // Store materialized view info for later creation
-                            // We'll handle reuse logic and create the actual IncrementalView
-                            // in a later pass when we have both the main root page and DBSP state root
+                            // The view is built in a later pass, when the
+                            // root pages of its hidden state tables are known.
+                            // Its key is the row's name, namespace and all.
                             materialized_view_info
-                                .insert(view_name.clone(), (sql.to_string(), root_page));
-
-                            // Mark the existing view for potential reuse
-                            if self.incremental_views.contains_key(&view_name) {
-                                // We'll check for reuse in the third pass
-                            }
+                                .insert(name.to_string(), (namespace, sql.to_string(), root_page));
                         }
                         Stmt::CreateView {
                             view_name: _,
@@ -2733,10 +3562,10 @@ impl Schema {
                             ..
                         } => {
                             let mut view_column_schema =
-                                crate::util::extract_view_columns(&select, self)?;
+                                crate::util::extract_view_columns(namespace, &select, self)?;
                             view_column_schema.rename_columns(&column_names);
                             let view = View::new(
-                                name.to_string(),
+                                view_name,
                                 sql.to_string(),
                                 select,
                                 view_column_schema.flat_columns()?,
@@ -2745,7 +3574,7 @@ impl Schema {
                                     .map(|column| column.col_name.as_str().to_string())
                                     .try_collect()?,
                             );
-                            self.add_view(view)?;
+                            self.add_view(namespace, view)?;
                         }
                         _ => {}
                     }
@@ -2756,7 +3585,11 @@ impl Schema {
                 use turso_parser::parser::Parser;
 
                 let sql = maybe_sql.expect("sql should be present for trigger");
-                let trigger_name = name.to_string();
+                let (namespace, trigger_name) = self.demangle_name(name);
+                let trigger_name = trigger_name.to_string();
+                if !namespace.is_root() {
+                    self.add_namespace_of_object(namespace);
+                }
 
                 let mut parser = Parser::new(sql.as_bytes());
                 let Ok(Some(Cmd::Stmt(Stmt::CreateTrigger {
@@ -2795,7 +3628,9 @@ impl Schema {
                         resolve_attached_db(db).unwrap_or(crate::INVALID_DB_ID)
                     }
                 });
+                let (_, table_name) = self.demangle_name(tbl_name.name.as_str());
                 self.add_trigger(
+                    namespace,
                     Trigger::new(
                         trigger_name,
                         sql.to_string(),
@@ -2803,7 +3638,7 @@ impl Schema {
                         // renders the quoted form (`"t1"`), which then fails every
                         // schema lookup since `normalize_ident` does not strip quotes.
                         // This must match the bucket key used in `add_trigger` below.
-                        tbl_name.name.as_str().to_string(),
+                        table_name.to_string(),
                         time,
                         event,
                         for_each_row,
@@ -2812,7 +3647,7 @@ impl Schema {
                         temporary,
                         target_database_id,
                     ),
-                    tbl_name.name.as_str(),
+                    table_name,
                 )?;
             }
             // Types are stored in sqlite_turso_types, not sqlite_schema
@@ -2825,27 +3660,36 @@ impl Schema {
     /// Compute all resolved FKs *referencing* `table_name` (arg: `table_name` is the parent).
     /// Each item contains the child table, normalized columns/positions, and the parent lookup
     /// strategy (rowid vs. UNIQUE index or PK).
-    pub fn resolved_fks_referencing(&self, table_name: &str) -> Result<Vec<ResolvedFkRef>> {
+    pub fn resolved_fks_referencing(
+        &self,
+        namespace: NamespaceId,
+        table_name: &str,
+    ) -> Result<Vec<ResolvedFkRef>> {
         let target = normalize_ident(table_name);
         let parent_tbl = self
-            .get_btree_table(&target)
+            .get_btree_table(namespace, &target)
             .ok_or_else(|| fk_mismatch_err("<unknown>", &target))?;
 
         let mut out = Vec::try_with_capacity_ext(4)?; // arbitrary estimate
-        for t in self.tables.values() {
-            let Some(child) = t.btree() else {
-                continue;
-            };
-            for fk in &child.foreign_keys {
-                if !fk.parent_table.eq_ignore_ascii_case(&target) {
+        for (child_namespace, objects) in &self.namespaces {
+            for t in objects.tables.values() {
+                let Some(child) = t.btree() else {
                     continue;
+                };
+                for fk in &child.foreign_keys {
+                    if fk.parent_namespace != namespace
+                        || !fk.parent_table.eq_ignore_ascii_case(&target)
+                    {
+                        continue;
+                    }
+                    out.try_push(self.resolve_fk(
+                        *child_namespace,
+                        fk,
+                        &child,
+                        &parent_tbl,
+                        /*require_unique=*/ false,
+                    )?)?;
                 }
-                out.try_push(self.resolve_fk(
-                    fk,
-                    &child,
-                    &parent_tbl,
-                    /*require_unique=*/ false,
-                )?)?;
             }
         }
         Ok(out)
@@ -2856,27 +3700,30 @@ impl Schema {
     /// to be backed by a non-partial UNIQUE index on exactly those columns.
     pub fn resolved_fks_for_child(
         &self,
+        namespace: NamespaceId,
         child_table: &str,
         updated_cols: Option<&ColumnMask>,
     ) -> crate::Result<Vec<ResolvedFkRef>> {
         let child_name = normalize_ident(child_table);
         let child = self
-            .get_btree_table(&child_name)
+            .get_btree_table(namespace, &child_name)
             .ok_or_else(|| fk_mismatch_err(&child_name, "<unknown>"))?;
 
         let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
             if let Some(updated_cols) = updated_cols {
-                let is_self_ref = fk.parent_table.eq_ignore_ascii_case(&child.name);
+                let is_self_ref = fk.parent_namespace == namespace
+                    && fk.parent_table.eq_ignore_ascii_case(&child.name);
                 if !is_self_ref && !fk.child_key_assigned(&child, updated_cols) {
                     continue;
                 }
             }
             let parent_name = normalize_ident(&fk.parent_table);
             let parent_tbl = self
-                .get_btree_table(&parent_name)
+                .get_btree_table(fk.parent_namespace, &parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
             out.push_within_capacity(self.resolve_fk(
+                namespace,
                 fk,
                 &child,
                 &parent_tbl,
@@ -2892,6 +3739,7 @@ impl Schema {
     /// a non-partial UNIQUE index on exactly those columns.
     fn resolve_fk(
         &self,
+        child_namespace: NamespaceId,
         fk: &Arc<ForeignKey>,
         child: &Arc<BTreeTable>,
         parent_tbl: &Arc<BTreeTable>,
@@ -2932,19 +3780,34 @@ impl Schema {
         }
 
         let mut parent_pos: Vec<usize> = Vec::try_with_capacity_ext(parent_cols.len())?;
-        for pc in parent_cols.iter() {
-            let pos = parent_tbl.get_column(pc).map(|(i, _)| i).or_else(|| {
-                ROWID_STRS
-                    .iter()
-                    .any(|r| pc.eq_ignore_ascii_case(r))
-                    .then_some(0)
-            });
-            let Some(p) = pos else {
-                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+        let mut parent_collations: Vec<CollationSeq> =
+            Vec::try_with_capacity_ext(parent_cols.len())?;
+        let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
+        for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
+            let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
+                Some((i, column)) => (
+                    i,
+                    crate::translate::collate::column_collation(column)
+                        .unwrap_or(CollationSeq::Binary),
+                    column.affinity(),
+                ),
+                None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
+                    (0, CollationSeq::Binary, Affinity::Integer)
+                }
+                None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
+            key_affinities
+                .push_within_capacity(crate::translate::expr::do_comparison_affinity(
+                    parent_affinity,
+                    child.columns[cpos].affinity(),
+                ))
+                .expect("FK key affinity vector was preallocated to parent_cols.len()");
             parent_pos
                 .push_within_capacity(p)
                 .expect("parent FK position vector was preallocated to parent_cols.len()");
+            parent_collations
+                .push_within_capacity(collation)
+                .expect("parent FK collation vector was preallocated to parent_cols.len()");
         }
 
         // A single-column parent key is the rowid when it names rowid/_rowid_/oid
@@ -2965,7 +3828,7 @@ impl Schema {
             None
         } else {
             let found = self
-                .get_indices(&parent_tbl.name)
+                .get_indices(fk.parent_namespace, &parent_tbl.name)
                 .find(|idx| {
                     idx.unique
                         && idx.where_clause.is_none()
@@ -2974,7 +3837,10 @@ impl Schema {
                             .columns
                             .iter()
                             .zip(parent_cols.iter())
-                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                            .zip(parent_collations.iter())
+                            .all(|((ic, pc), collation)| {
+                                ic.name.eq_ignore_ascii_case(pc) && ic.collation == *collation
+                            })
                 })
                 .cloned();
             if require_unique && found.is_none() {
@@ -2985,37 +3851,47 @@ impl Schema {
 
         fk.validate()?;
         Ok(ResolvedFkRef {
+            child_namespace,
             child_table: Arc::clone(child),
             fk: Arc::clone(fk),
             parent_cols,
             child_pos: child_pos.into_boxed_slice(),
             parent_pos: parent_pos.into_boxed_slice(),
+            parent_collations: parent_collations.into_boxed_slice(),
+            key_affinities: key_affinities.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
         })
     }
 
     /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
-    pub fn any_resolved_fks_referencing(&self, table_name: &str) -> bool {
-        self.tables.values().any(|t| {
-            let Some(bt) = t.btree() else {
-                return false;
-            };
-            bt.foreign_keys
-                .iter()
-                .any(|fk| fk.parent_table == table_name)
+    pub fn any_resolved_fks_referencing(&self, namespace: NamespaceId, table_name: &str) -> bool {
+        self.namespaces.values().any(|objects| {
+            objects.tables.values().any(|t| {
+                let Some(bt) = t.btree() else {
+                    return false;
+                };
+                bt.foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent_namespace == namespace && fk.parent_table == table_name)
+            })
         })
     }
 
     /// Returns true if `table_name` declares any FOREIGN KEYs
-    pub fn has_child_fks(&self, table_name: &str) -> bool {
-        self.get_table(table_name)
+    pub fn has_child_fks(&self, namespace: NamespaceId, table_name: &str) -> bool {
+        self.get_table(namespace, table_name)
             .and_then(|t| t.btree())
             .is_some_and(|t| !t.foreign_keys.is_empty())
     }
 
-    fn check_object_name_conflict(&self, name: &str, creating: SchemaObjectType) -> Result<()> {
-        if let Some(existing) = self.get_object_type(name) {
+    fn check_object_name_conflict(
+        &self,
+        namespace: NamespaceId,
+        name: &str,
+        creating: SchemaObjectType,
+    ) -> Result<()> {
+        if let Some(existing) = self.get_object_type(namespace, name) {
             // Match SQLite's message shapes: indexes and tables/views live in
             // different namespaces, so a cross-namespace clash names the other
             // side ("there is already a ...") instead of "already exists".
@@ -3035,45 +3911,79 @@ impl Schema {
         Ok(())
     }
 
-    pub fn get_sequence(&self, name: &str) -> Option<&Arc<Sequence>> {
-        self.sequences.get(&normalize_ident(name))
+    pub fn get_sequence(&self, namespace: NamespaceId, name: &str) -> Option<&Arc<Sequence>> {
+        self.namespace(namespace)
+            .sequences
+            .get(&normalize_ident(name))
+    }
+
+    /// Whether namespace `namespace` has the sequence `name`. Unlike
+    /// [`Self::get_sequence`], the namespace need not exist: the backing
+    /// table of a sequence is in the root namespace, so a loader can meet it
+    /// before anything has added the sequence's namespace.
+    pub fn has_sequence(&self, namespace: NamespaceId, name: &str) -> bool {
+        self.namespaces
+            .get(&namespace)
+            .is_some_and(|objects| objects.sequences.contains_key(&normalize_ident(name)))
     }
 
     /// Remove a sequence and its backing table from the in-memory schema.
-    pub fn remove_sequence(&mut self, name: &str) {
+    pub fn remove_sequence(&mut self, namespace: NamespaceId, name: &str) {
         let normalized = normalize_ident(name);
-        self.sequences.remove(&normalized);
-        let backing_table = crate::translate::sequence::sequence_backing_table_name(&normalized);
-        self.tables.remove(&backing_table);
+        self.namespace_mut(namespace).sequences.remove(&normalized);
+        let backing_table = crate::translate::sequence::sequence_backing_table_name(&mangle_name(
+            namespace,
+            &normalized,
+        ));
+        self.namespace_mut(NamespaceId::ROOT)
+            .tables
+            .remove(&backing_table);
     }
 
     /// Returns the type of schema object with the given name, if one exists.
     /// Checks tables, views, and indexes.
-    pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
+    pub fn get_object_type(&self, namespace: NamespaceId, name: &str) -> Option<SchemaObjectType> {
         let normalized_name = self.normalize_table_lookup_name(name);
+        let objects = self.namespace(namespace);
 
-        if self.tables.contains_key(&normalized_name) {
+        if objects.tables.contains_key(&normalized_name) {
             return Some(SchemaObjectType::Table);
         }
 
-        if self.views.contains_key(&normalized_name) {
+        if objects.views.contains_key(&normalized_name) {
             return Some(SchemaObjectType::View);
         }
 
-        if self
+        if objects
             .incompatible_materialized_view_roots
             .contains_key(&normalized_name)
         {
             return Some(SchemaObjectType::View);
         }
 
-        for index_list in self.indexes.values() {
+        for index_list in objects.indexes.values() {
             if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
                 return Some(SchemaObjectType::Index);
             }
         }
 
         None
+    }
+
+    /// The objects of namespace `id`. The namespace must exist: the root
+    /// always does, and any other id comes from this schema.
+    fn namespace(&self, id: NamespaceId) -> &NamespaceSchema {
+        self.namespaces
+            .get(&id)
+            .expect("the schema has the namespace whose objects are read")
+    }
+
+    /// The objects of namespace `id`, to change. The namespace must exist:
+    /// the root always does, and any other id comes from this schema.
+    fn namespace_mut(&mut self, id: NamespaceId) -> &mut NamespaceSchema {
+        self.namespaces
+            .get_mut(&id)
+            .expect("the schema has the namespace whose objects are changed")
     }
 }
 
@@ -3090,6 +4000,7 @@ impl TryClone for UniqueSet {
         Ok(Self {
             columns: self.columns.try_clone()?,
             is_primary_key: self.is_primary_key,
+            is_inline: self.is_inline,
             conflict_clause: self.conflict_clause,
             constraint_name: self.constraint_name.clone(),
         })
@@ -3155,7 +4066,9 @@ impl TryClone for BTreeTable {
         Ok(Self {
             root_page: self.root_page,
             name: self.name.clone(),
+            declared_name: self.declared_name.clone(),
             primary_key_columns: self.primary_key_columns.try_clone()?,
+            primary_key_is_inline: self.primary_key_is_inline,
             columns: self.columns.try_clone()?,
             has_rowid: self.has_rowid,
             is_strict: self.is_strict,
@@ -3244,6 +4157,31 @@ impl TryClone for Schema {
     type Error = TryReserveError;
 
     fn try_clone(&self) -> Result<Self, Self::Error> {
+        let namespaces = self
+            .namespaces
+            .iter()
+            .map(|(id, objects)| Ok::<_, TryReserveError>((*id, objects.try_clone()?)))
+            .try_collect::<Result<_, TryReserveError>>()??;
+        Ok(Self {
+            namespaces,
+            #[cfg(feature = "conn_raw_api")]
+            table_names_by_root_page: self.table_names_by_root_page.try_clone()?,
+            schema_version: self.schema_version,
+            analyze_stats: self.analyze_stats.clone(),
+            supports_namespaces: self.supports_namespaces,
+            default_namespaces: self.default_namespaces,
+            namespace_names_loaded: self.namespace_names_loaded,
+            pending_materialized_views: self.pending_materialized_views.clone(),
+            dropped_root_pages: self.dropped_root_pages.try_clone()?,
+            type_registry: self.type_registry.try_clone()?,
+        })
+    }
+}
+
+impl TryClone for NamespaceSchema {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
         let tables = self
             .tables
             .iter()
@@ -3293,9 +4231,8 @@ impl TryClone for Schema {
         let incompatible_materialized_view_roots =
             self.incompatible_materialized_view_roots.try_clone()?;
         Ok(Self {
+            name: self.name.clone(),
             tables,
-            #[cfg(feature = "conn_raw_api")]
-            table_names_by_root_page: self.table_names_by_root_page.try_clone()?,
             materialized_view_names,
             materialized_view_sql,
             incremental_views,
@@ -3303,15 +4240,10 @@ impl TryClone for Schema {
             triggers,
             indexes,
             has_indexes: self.has_indexes.try_clone()?,
-            schema_version: self.schema_version,
-            analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.try_clone()?,
             incompatible_views,
             incompatible_materialized_view_roots,
             broken_views: self.broken_views.try_clone()?,
-            dropped_root_pages: self.dropped_root_pages.try_clone()?,
-            type_registry: self.type_registry.try_clone()?,
-            generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
         })
     }
@@ -3592,6 +4524,8 @@ impl PartialEq for Table {
 pub struct UniqueSet {
     pub columns: Vec<UniqueSetColumn>,
     pub is_primary_key: bool,
+    /// True if declared as an inline column constraint rather than a table-level constraint.
+    pub is_inline: bool,
     pub conflict_clause: Option<ResolveType>,
     /// Explicit constraint name from `CONSTRAINT name UNIQUE/PRIMARY KEY`, if given.
     pub constraint_name: Option<String>,
@@ -3768,7 +4702,9 @@ impl GeneratedColGraph {
 pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
+    pub declared_name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
+    pub primary_key_is_inline: bool,
     columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
@@ -3836,10 +4772,19 @@ impl BTreeTable {
             .iter()
             .find(|set| set.is_primary_key)
             .and_then(|set| set.constraint_name.clone());
+        let primary_key_is_inline = unique_sets
+            .iter()
+            .find(|set| set.is_primary_key)
+            .map_or_else(
+                || primary_key_columns.len() == 1 && columns.iter().any(|c| c.primary_key()),
+                |set| set.is_inline,
+            );
         Self {
             root_page,
+            declared_name: name.clone(),
             name,
             primary_key_columns,
+            primary_key_is_inline,
             columns,
             has_rowid,
             is_strict: characteristics.contains(BTreeCharacteristics::STRICT),
@@ -3871,7 +4816,7 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+            .any(|c| schema.column_has_custom_type(c, table.is_strict));
         if !has_custom {
             return Arc::clone(table);
         }
@@ -3901,7 +4846,7 @@ impl BTreeTable {
         let has_custom = table
             .columns
             .iter()
-            .any(|c| c.is_array() || schema.get_type_def(&c.ty_str, table.is_strict).is_some());
+            .any(|c| schema.column_has_custom_type(c, table.is_strict));
         if !has_custom {
             return Ok(Arc::clone(table));
         }
@@ -3997,12 +4942,25 @@ impl BTreeTable {
         })
     }
 
+    /// Builds a table from the SQLite text of its `CREATE TABLE`, as a
+    /// database that does not support namespaces holds it.
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
+        Self::from_stored_sql(sql, root_page, false)
+    }
+
+    /// Builds a table from the SQLite text of its `CREATE TABLE`.
+    /// `supports_namespaces` says whether the database supports namespaces, so
+    /// that a foreign key may name the mangled name of a table of one.
+    pub fn from_stored_sql(
+        sql: &str,
+        root_page: i64,
+        supports_namespaces: bool,
+    ) -> Result<BTreeTable> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                Self::from_create_table_ast(&tbl_name, &body, root_page)
+                Self::from_create_table_ast(&tbl_name, &body, root_page, supports_namespaces)
             }
             Some(Cmd::Stmt(Stmt::CreateVirtualTable(vtab))) => Err(LimboError::Corrupt(format!(
                 "sqlite_schema root_page must be 0 for virtual table {}, got {root_page}",
@@ -4021,8 +4979,9 @@ impl BTreeTable {
         tbl_name: &ast::QualifiedName,
         body: &CreateTableBody,
         root_page: i64,
+        supports_namespaces: bool,
     ) -> Result<BTreeTable> {
-        create_table(tbl_name.name.as_str(), body, root_page)
+        create_table(tbl_name.name.as_str(), body, root_page, supports_namespaces)
     }
 
     /// Reconstruct the SQL for the table.
@@ -4031,8 +4990,18 @@ impl BTreeTable {
     /// For example, if a user creates a table like: `CREATE TABLE t              (x)`, we store it as
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
-        let needs_pk_inline = self.primary_key_columns.len() == 1
+        self.to_sql_as(&self.name)
+    }
+
+    /// The `CREATE TABLE` text of the table under `name`: the mangled name
+    /// when the text is written into a schema row of a namespace.
+    pub fn to_sql_as(&self, name: &str) -> String {
+        let mut sql = format!("CREATE TABLE {} (", quote_ident(name));
+        let needs_pk_inline = self.primary_key_is_inline
+            && self.primary_key_columns.len() == 1
+            && self
+                .get_column(&self.primary_key_columns[0].0)
+                .is_some_and(|(_, col)| col.primary_key())
             && self
                 .primary_key_constraint_collation(&self.primary_key_columns[0].0)
                 .is_none();
@@ -4121,8 +5090,7 @@ impl BTreeTable {
         }
 
         let has_table_pk = !self.primary_key_columns.is_empty();
-        // Add table-level PRIMARY KEY constraint if exists
-        if !needs_pk_inline && has_table_pk {
+        let push_table_pk = |sql: &mut String| {
             sql.push_str(", ");
             if let Some(name) = &self.primary_key_constraint_name {
                 sql.push_str("CONSTRAINT ");
@@ -4135,13 +5103,65 @@ impl BTreeTable {
                     sql.push_str(", ");
                 }
                 sql.push_str(&quote_ident(&col.0));
-                push_collation(&mut sql, self.primary_key_constraint_collation(&col.0));
+                push_collation(sql, self.primary_key_constraint_collation(&col.0));
                 if col.1 == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
+                if self.has_autoincrement && self.primary_key_columns.len() == 1 {
+                    sql.push_str(" AUTOINCREMENT");
+                }
+            }
+            sql.push(')');
+            push_on_conflict_clause(sql, self.primary_key_conflict_clause());
+        };
+
+        // Emit table-level PRIMARY KEY and UNIQUE constraints in `unique_sets` order so
+        // `sqlite_autoindex_<table>_<N>` numbering matches the original schema on reopen.
+        let mut emitted_table_pk = false;
+        for unique_set in &self.unique_sets {
+            if unique_set.is_primary_key {
+                if !needs_pk_inline && has_table_pk {
+                    push_table_pk(&mut sql);
+                    emitted_table_pk = true;
+                }
+                continue;
+            }
+            // Skip inline unique constraints only when their column still carries `UNIQUE`
+            // (if an earlier `ALTER COLUMN` cleared `column.unique()` while keeping the
+            // `UniqueSet` and its autoindex, emit `UNIQUE (...)` so reopen consumes it).
+            if unique_set.is_inline
+                && unique_set.columns.len() == 1
+                && self
+                    .get_column(&unique_set.columns[0].name)
+                    .is_some_and(|(_, col)| col.unique())
+            {
+                continue;
+            }
+            sql.push_str(", ");
+            if let Some(name) = &unique_set.constraint_name {
+                sql.push_str("CONSTRAINT ");
+                sql.push_str(&quote_ident(name));
+                sql.push(' ');
+            }
+            sql.push_str("UNIQUE (");
+            for (i, unique_column) in unique_set.columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&quote_ident(&unique_column.name));
+                push_collation(&mut sql, unique_column.collation);
+                if unique_column.sort_order == SortOrder::Desc {
                     sql.push_str(" DESC");
                 }
             }
             sql.push(')');
-            push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
+            push_on_conflict_clause(&mut sql, unique_set.conflict_clause);
+        }
+
+        // Table-level PRIMARY KEYs that did not retain their own UniqueSet entry (e.g. a
+        // rowid-alias `PRIMARY KEY(id)` or a duplicate `UNIQUE(a), PRIMARY KEY(a)`).
+        if !needs_pk_inline && has_table_pk && !emitted_table_pk {
+            push_table_pk(&mut sql);
         }
 
         for fk in &self.foreign_keys {
@@ -4211,36 +5231,6 @@ impl BTreeTable {
             sql.push_str(&check_constraint.sql());
         }
 
-        // Add table-level UNIQUE constraints
-        for unique_set in &self.unique_sets {
-            // Skip primary key (handled above)
-            if unique_set.is_primary_key {
-                continue;
-            }
-            // Skip single-column unique constraints that were already emitted inline
-            if unique_set.columns.len() == 1 {
-                let col_name = &unique_set.columns[0].name;
-                if let Some((_, col)) = self.get_column(col_name) {
-                    if col.unique() {
-                        continue;
-                    }
-                }
-            }
-            sql.push_str(", UNIQUE (");
-            for (i, unique_column) in unique_set.columns.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&quote_ident(&unique_column.name));
-                push_collation(&mut sql, unique_column.collation);
-                if unique_column.sort_order == SortOrder::Desc {
-                    sql.push_str(" DESC");
-                }
-            }
-            sql.push(')');
-            push_on_conflict_clause(&mut sql, unique_set.conflict_clause);
-        }
-
         sql.push(')');
 
         // Add STRICT keyword if this is a STRICT table
@@ -4295,7 +5285,9 @@ impl BTreeTable {
 
     fn primary_key_implies_not_null(&self, column: &Column) -> bool {
         column.primary_key()
-            && (self.is_strict || (!self.has_rowid && self.primary_key_columns.len() == 1))
+            && (column.is_rowid_alias()
+                || self.is_strict
+                || (!self.has_rowid && self.primary_key_columns.len() == 1))
     }
 
     pub fn column_collations(&self) -> Result<Vec<CollationSeq>> {
@@ -4506,8 +5498,7 @@ fn push_collation(sql: &mut String, collation: Option<CollationSeq>) {
             sql.push_str(" COLLATE ");
             sql.push_str(&quote_ident(&collation.name()));
         }
-        CollationSeq::Unset | CollationSeq::Custom(_) => {
-            // Unset should not be reachable -- ignore it
+        CollationSeq::Custom(_) => {
             // Custom collation is not allowed in schema definitions
         }
     };
@@ -5050,12 +6041,20 @@ fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<CollationSe
     }
 }
 
-pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
+/// `supports_namespaces` says whether the database supports namespaces, so that
+/// a foreign key may name the mangled name of a table of one.
+pub fn create_table(
+    tbl_name: &str,
+    body: &CreateTableBody,
+    root_page: i64,
+    supports_namespaces: bool,
+) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let has_rowid;
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
+    let mut primary_key_is_inline = false;
     let mut foreign_keys = vec![];
     let mut check_constraints = vec![];
     let mut cols: Vec<Column> = vec![];
@@ -5128,8 +6127,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     unique_sets_constraints.try_push(UniqueSet {
                         columns: pk_unique_set_columns,
                         is_primary_key: true,
+                        is_inline: false,
                         conflict_clause: *conflict_clause,
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     })?;
                 } else if let ast::TableConstraint::Unique {
                     columns,
@@ -5160,8 +6160,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let unique_set = UniqueSet {
                         columns: unique_columns,
                         is_primary_key: false,
+                        is_inline: false,
                         conflict_clause: *conflict_clause,
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     };
                     unique_sets_constraints.try_push(unique_set)?;
                 } else if let ast::TableConstraint::ForeignKey {
@@ -5175,7 +6176,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         .map(|ic| normalize_ident(ic.col_name.as_str()))
                         .try_collect()?;
                     // derive parent columns: explicit or default to parent PK
-                    let parent_table = normalize_ident(clause.tbl_name.as_str());
+                    let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+                    let (parent_namespace, parent_table) =
+                        demangle_name(supports_namespaces, &mangled_parent_table);
+                    let parent_table = parent_table.to_string();
                     let parent_columns: Box<[String]> = clause
                         .columns
                         .iter()
@@ -5203,8 +6207,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
                     };
                     let fk = ForeignKey {
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                         parent_table,
+                        parent_namespace,
                         parent_columns,
                         child_columns,
                         on_delete: clause
@@ -5333,6 +6338,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 );
                             }
                             primary_key = true;
+                            primary_key_is_inline = true;
                             if *auto_increment {
                                 has_autoincrement = true;
                             }
@@ -5347,11 +6353,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     nulls_order: None,
                                 }]?,
                                 is_primary_key: true,
+                                is_inline: true,
                                 conflict_clause: *conflict_clause,
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
                         }
                         ast::ColumnConstraint::NotNull {
@@ -5379,11 +6383,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     nulls_order: None,
                                 }]?,
                                 is_primary_key: false,
+                                is_inline: true,
                                 conflict_clause: *conflict,
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
@@ -5406,12 +6408,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                     clause.tbl_name.as_str()
                                 );
                             }
+                            let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+                            let (parent_namespace, parent_table) =
+                                demangle_name(supports_namespaces, &mangled_parent_table);
                             let fk = ForeignKey {
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
-                                parent_table: normalize_ident(clause.tbl_name.as_str()),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
+                                parent_table: parent_table.to_string(),
+                                parent_namespace,
                                 parent_columns: clause
                                     .columns
                                     .iter()
@@ -5609,8 +6612,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut table = BTreeTable {
         root_page,
         name: table_name,
+        declared_name: tbl_name.to_owned(),
         has_rowid,
         primary_key_columns,
+        primary_key_is_inline,
         has_autoincrement,
         columns: cols,
         is_strict,
@@ -5734,6 +6739,8 @@ pub struct ForeignKey {
     pub child_columns: Box<[String]>,
     /// Referenced (parent) table
     pub parent_table: String,
+    /// The namespace of the parent table, within the child's database.
+    pub parent_namespace: NamespaceId,
     /// Parent-side referenced columns. Empty means "use parent's PRIMARY KEY".
     pub parent_columns: Box<[String]>,
     pub on_delete: RefAct,
@@ -5781,6 +6788,8 @@ impl ForeignKey {
 /// Child column names live in `fk.child_columns` — not duplicated here.
 #[derive(Clone, Debug)]
 pub struct ResolvedFkRef {
+    /// The namespace of the child table.
+    pub child_namespace: NamespaceId,
     /// Child table that owns the FK.
     pub child_table: Arc<BTreeTable>,
     /// The FK as declared on the child table.
@@ -5792,6 +6801,15 @@ pub struct ResolvedFkRef {
     /// Column positions in the child/parent tables (pos_in_table)
     pub child_pos: BoxedSlice<usize>,
     pub parent_pos: BoxedSlice<usize>,
+    /// The collation of each parent key column, BINARY for the rowid. A child
+    /// key matches a parent key when they compare equal under these
+    /// collations (SQLite's `fkScanChildren` and `fkActionTrigger` compare
+    /// with the parent column's collation), and only an index with these
+    /// collations can enforce the parent key or find the child rows.
+    pub parent_collations: BoxedSlice<CollationSeq>,
+    /// The affinity applied when a child key is compared with a parent key,
+    /// as SQLite compares `parent_col = child_col`.
+    pub key_affinities: BoxedSlice<Affinity>,
 
     /// If the parent key is rowid or a rowid-alias (single-column only)
     pub parent_uses_rowid: bool,
@@ -5884,6 +6902,10 @@ pub struct Column {
     generated_type: GeneratedType,
     generated_always: bool,
     info: ColumnInfo,
+    /// The declared collation, or for a column of a subquery, view or CTE the
+    /// collation of its expression. None means BINARY. Kept apart from
+    /// `info` because a custom collation does not fit in its bits.
+    collation: Option<CollationSeq>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -6022,7 +7044,6 @@ impl Column {
         };
         let mut info = ColumnInfo::new(NewColumnInfoParams {
             ty,
-            collation: col,
             coldef: &coldef,
         });
         if coldef.flags.contains(ColDefFlags::InStrictTable) && ty_str.eq_ignore_ascii_case("ANY") {
@@ -6040,6 +7061,7 @@ impl Column {
             generated_type,
             generated_always: false,
             info,
+            collation: col,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -6248,15 +7270,15 @@ impl Column {
     }
     #[inline]
     pub fn collation(&self) -> CollationSeq {
-        self.info.collation()
+        self.collation.unwrap_or(CollationSeq::Binary)
     }
     #[inline]
     pub fn has_explicit_collation(&self) -> bool {
-        self.info.has_explicit_collation()
+        self.collation.is_some()
     }
     #[inline]
     pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-        self.info.set_collation(c)
+        self.collation = c;
     }
     #[inline]
     pub fn primary_key(&self) -> bool {
@@ -6268,7 +7290,7 @@ impl Column {
     }
     #[inline]
     pub fn notnull(&self) -> bool {
-        self.info.notnull()
+        self.info.notnull() || self.is_rowid_alias()
     }
     #[inline]
     pub fn set_notnull(&mut self, v: bool) {
@@ -6362,10 +7384,12 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
     Ok(BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
+        declared_name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
         has_autoincrement: false,
         primary_key_columns: try_vec![]?,
+        primary_key_is_inline: false,
         columns,
         foreign_keys: try_vec![]?,
         check_constraints: try_vec![]?,
@@ -6413,7 +7437,7 @@ pub struct IndexColumn {
     /// CREATE INDEX idx ON t(b)
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
-    pub collation: Option<CollationSeq>,
+    pub collation: CollationSeq,
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
     pub expr: Option<Box<Expr>>,
@@ -6449,19 +7473,20 @@ pub(crate) use impl_effective_nulls_order;
 impl_effective_nulls_order!(IndexColumn);
 
 impl IndexColumn {
-    /// Returns a default column with the given name and position.
-    pub fn new(name: impl ToString, pos_in_table: usize) -> Self {
+    /// An ascending key column with the given name, position and collation.
+    pub fn new(name: impl ToString, pos_in_table: usize, collation: CollationSeq) -> Self {
         Self {
             name: name.to_string(),
             order: SortOrder::Asc,
             nulls_order: None,
             pos_in_table,
-            collation: None,
+            collation,
             default: None,
             expr: None,
         }
     }
 
+    /// Ascending BINARY key columns with the given names, in order.
     pub fn new_many<I>(names: I) -> Vec<Self>
     where
         I: IntoIterator,
@@ -6477,7 +7502,7 @@ impl IndexColumn {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: None,
+                collation: CollationSeq::Binary,
                 default: None,
                 expr: None,
             })
@@ -6608,7 +7633,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .or_else(|| column.collation_opt()),
+                        .unwrap_or_else(|| column.collation()),
                     default: column.default.clone(),
                     expr: None,
                 })
@@ -6664,7 +7689,7 @@ impl Index {
                     collation: constraint_columns
                         .get(i)
                         .and_then(|c| c.collation)
-                        .or_else(|| col.collation_opt()),
+                        .unwrap_or_else(|| col.collation()),
                     default: col.default.clone(),
                     expr: None,
                 })
@@ -6865,12 +7890,185 @@ impl Index {
 mod tests {
     use super::*;
 
+    fn table(sql: &str, root_page: i64) -> Arc<BTreeTable> {
+        Arc::new(BTreeTable::from_sql(sql, root_page).unwrap())
+    }
+
+    #[test]
+    fn a_new_schema_has_only_the_root_namespace_with_the_schema_table() {
+        let schema = Schema::new();
+        let ids: std::vec::Vec<NamespaceId> = schema.namespace_ids().collect();
+        assert_eq!(ids, vec![NamespaceId::ROOT]);
+        assert!(schema
+            .get_table(NamespaceId::ROOT, SCHEMA_TABLE_NAME)
+            .is_some());
+    }
+
+    #[test]
+    fn a_namespace_holds_only_its_own_objects() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other, "other");
+        schema
+            .add_btree_table(NamespaceId::ROOT, table("CREATE TABLE t (x)", 2))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x, y)", 3))
+            .unwrap();
+
+        let root_t = schema.get_btree_table(NamespaceId::ROOT, "t").unwrap();
+        let other_t = schema.get_btree_table(other, "t").unwrap();
+        assert_eq!(root_t.root_page, 2);
+        assert_eq!(other_t.root_page, 3);
+        assert_eq!(
+            schema.get_object_type(other, "t"),
+            Some(SchemaObjectType::Table)
+        );
+        assert!(schema.get_table(other, SCHEMA_TABLE_NAME).is_none());
+
+        schema.remove_table(other, "t");
+        assert!(schema.get_table(other, "t").is_none());
+        assert!(schema.get_table(NamespaceId::ROOT, "t").is_some());
+    }
+
+    #[test]
+    fn removing_a_namespace_removes_its_objects() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(7);
+        schema.add_namespace(other, "other");
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x)", 3))
+            .unwrap();
+        assert!(schema.has_namespace(other));
+
+        assert!(schema.remove_namespace(other));
+        assert!(!schema.has_namespace(other));
+        let ids: std::vec::Vec<NamespaceId> = schema.namespace_ids().collect();
+        assert_eq!(ids, vec![NamespaceId::ROOT]);
+    }
+
+    #[test]
+    fn a_cloned_schema_keeps_every_namespace() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(2);
+        schema.add_namespace(other, "other");
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x)", 3))
+            .unwrap();
+        let clone = schema.try_clone().unwrap();
+        assert_eq!(clone.get_btree_table(other, "t").unwrap().root_page, 3);
+    }
+
+    #[test]
+    fn a_foreign_key_finds_its_parent_in_the_parent_namespace() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other, "other");
+        schema
+            .add_btree_table(
+                NamespaceId::ROOT,
+                table("CREATE TABLE p (id INTEGER PRIMARY KEY)", 2),
+            )
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE p (id INTEGER PRIMARY KEY)", 3))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE c (x REFERENCES p(id))", 4))
+            .unwrap();
+
+        let children = schema
+            .resolved_fks_referencing(NamespaceId::ROOT, "p")
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].child_namespace, other);
+        assert_eq!(children[0].child_table.name, "c");
+        assert!(schema.any_resolved_fks_referencing(NamespaceId::ROOT, "p"));
+
+        assert!(schema
+            .resolved_fks_referencing(other, "p")
+            .unwrap()
+            .is_empty());
+        assert!(!schema.any_resolved_fks_referencing(other, "p"));
+
+        let parents = schema.resolved_fks_for_child(other, "c", None).unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].fk.parent_namespace, NamespaceId::ROOT);
+    }
+
+    #[test]
+    fn schema_wide_scans_see_every_namespace() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other, "other");
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x UNIQUE)", 3))
+            .unwrap();
+        let t = schema.get_btree_table(other, "t").unwrap();
+        schema
+            .add_index(
+                other,
+                Arc::new(
+                    Index::from_sql(
+                        &SymbolTable::new(),
+                        "CREATE INDEX i ON t (x)",
+                        4,
+                        t.as_ref(),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+
+        assert!(schema.all_tables().any(|table| table.get_name() == "t"));
+        assert!(schema.all_indexes().any(|index| index.name == "i"));
+        assert!(schema
+            .all_tables_mut()
+            .any(|(namespace, name, _)| namespace == other && name == "t"));
+
+        assert!(!schema.has_materialized_views());
+        schema.add_materialized_view_dependency(other, "t", "v");
+        assert!(schema.has_materialized_views());
+    }
+
+    #[test]
+    fn tables_of_the_same_name_in_two_namespaces_keep_their_own_statistics() {
+        let mut schema = Schema::new();
+        let other = NamespaceId::new(1);
+        schema.add_namespace(other, "other");
+        schema
+            .add_btree_table(NamespaceId::ROOT, table("CREATE TABLE t (x)", 2))
+            .unwrap();
+        schema
+            .add_btree_table(other, table("CREATE TABLE t (x)", 3))
+            .unwrap();
+        schema
+            .analyze_stats
+            .table_stats_mut(NamespaceId::ROOT, "t")
+            .row_count = Some(10);
+        schema.analyze_stats.table_stats_mut(other, "t").row_count = Some(20);
+
+        let row_count = |schema: &Schema, namespace| {
+            schema
+                .analyze_stats
+                .table_stats(namespace, "t")
+                .and_then(|stats| stats.row_count)
+        };
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+        assert_eq!(row_count(&schema, other), Some(20));
+
+        schema.remove_table(other, "t");
+        assert_eq!(row_count(&schema, other), None);
+        assert_eq!(row_count(&schema, NamespaceId::ROOT), Some(10));
+    }
+
     #[test]
     fn persisted_materialized_views_are_loaded_in_dependency_order() {
         let mut views = HashMap::default();
         views.insert(
             "third".to_string(),
             (
+                NamespaceId::ROOT,
                 "CREATE MATERIALIZED VIEW third AS SELECT * FROM second".to_string(),
                 5,
             ),
@@ -6878,6 +8076,7 @@ mod tests {
         views.insert(
             "first".to_string(),
             (
+                NamespaceId::ROOT,
                 "CREATE MATERIALIZED VIEW first AS SELECT * FROM base".to_string(),
                 3,
             ),
@@ -6885,12 +8084,15 @@ mod tests {
         views.insert(
             "second".to_string(),
             (
+                NamespaceId::ROOT,
                 "CREATE MATERIALIZED VIEW second AS SELECT * FROM first".to_string(),
                 4,
             ),
         );
 
-        let ordered = Schema::order_persisted_materialized_views(views).unwrap();
+        let ordered = Schema::new()
+            .order_persisted_materialized_views(views)
+            .unwrap();
         assert_eq!(
             ordered
                 .into_iter()
@@ -6906,6 +8108,7 @@ mod tests {
         views.insert(
             "left_view".to_string(),
             (
+                NamespaceId::ROOT,
                 "CREATE MATERIALIZED VIEW left_view AS SELECT * FROM right_view".to_string(),
                 3,
             ),
@@ -6913,35 +8116,39 @@ mod tests {
         views.insert(
             "right_view".to_string(),
             (
+                NamespaceId::ROOT,
                 "CREATE MATERIALIZED VIEW right_view AS SELECT * FROM left_view".to_string(),
                 4,
             ),
         );
 
-        let error = Schema::order_persisted_materialized_views(views).unwrap_err();
+        let error = Schema::new()
+            .order_persisted_materialized_views(views)
+            .unwrap_err();
         assert!(matches!(error, LimboError::Corrupt(_)));
     }
 
     #[test]
     fn incompatible_materialized_view_can_be_removed() {
         let mut schema = Schema::new();
-        schema.incompatible_views.insert("old_view".to_string());
-        schema
-            .incompatible_materialized_view_roots
+        let root = schema.namespace_mut(NamespaceId::ROOT);
+        root.incompatible_views.insert("old_view".to_string());
+        root.incompatible_materialized_view_roots
             .insert("old_view".to_string(), 42);
-        schema
-            .table_to_materialized_views
+        root.table_to_materialized_views
             .insert("base".to_string(), vec!["old_view".to_string()]);
 
-        assert!(schema.materialized_view_exists("old_view"));
+        assert!(schema.materialized_view_exists(NamespaceId::ROOT, "old_view"));
         assert_eq!(
-            schema.incompatible_materialized_view_root("old_view"),
+            schema.incompatible_materialized_view_root(NamespaceId::ROOT, "old_view"),
             Some(42)
         );
-        schema.remove_view("old_view").unwrap();
-        assert!(!schema.materialized_view_exists("old_view"));
-        assert!(!schema.incompatible_views.contains("old_view"));
-        assert!(schema.get_dependent_materialized_views("base").is_empty());
+        schema.remove_view(NamespaceId::ROOT, "old_view").unwrap();
+        assert!(!schema.materialized_view_exists(NamespaceId::ROOT, "old_view"));
+        assert!(!schema.is_incompatible_view(NamespaceId::ROOT, "old_view"));
+        assert!(schema
+            .get_dependent_materialized_views(NamespaceId::ROOT, "base")
+            .is_empty());
     }
 
     #[test]
@@ -6951,27 +8158,30 @@ mod tests {
                 "CREATE TABLE {} (version INTEGER)",
                 crate::util::quote_identifier(name)
             );
-            schema.add_btree_table(Arc::new(BTreeTable::from_sql(&sql, root_page)?))
+            schema.add_btree_table(
+                NamespaceId::ROOT,
+                Arc::new(BTreeTable::from_sql(&sql, root_page)?),
+            )
         }
 
         let mut schema = Schema::new();
-        assert!(!schema.has_compatible_materialized_view_storage("stateless"));
+        assert!(!schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
 
         let old_version = DBSP_CIRCUIT_VERSION - 1;
         let other_view_marker = format!("{DBSP_METADATA_TABLE_PREFIX}{old_version}_stateless__n1");
         add_marker(&mut schema, &other_view_marker, 2)?;
         assert!(
-            !schema.dbsp_storage_version_mismatch("stateless"),
+            !schema.dbsp_storage_version_mismatch(NamespaceId::ROOT, "stateless"),
             "a similarly prefixed view must not own this view's version marker"
         );
 
         let current_marker = dbsp_version_marker_table_name("stateless");
         add_marker(&mut schema, &current_marker, 3)?;
-        assert!(schema.has_compatible_materialized_view_storage("stateless"));
+        assert!(schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
 
         let old_marker = format!("{DBSP_METADATA_TABLE_PREFIX}{old_version}_stateless");
         add_marker(&mut schema, &old_marker, 4)?;
-        assert!(!schema.has_compatible_materialized_view_storage("stateless"));
+        assert!(!schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
         Ok(())
     }
 
@@ -7053,13 +8263,17 @@ mod tests {
             for (actual, flag) in [
                 (column.primary_key(), ColDefFlags::PrimaryKey),
                 (column.is_rowid_alias(), ColDefFlags::RowIdAlias),
-                (column.notnull(), ColDefFlags::NotNull),
                 (column.explicit_notnull(), ColDefFlags::ExplicitNotNull),
                 (column.unique(), ColDefFlags::Unique),
                 (column.hidden(), ColDefFlags::Hidden),
             ] {
                 assert_eq!(actual, flags.contains(flag), "{flags:?}: {flag:?}");
             }
+            assert_eq!(
+                column.notnull(),
+                flags.intersects(ColDefFlags::NotNull | ColDefFlags::RowIdAlias),
+                "{flags:?}"
+            );
             assert_eq!(column.ty(), Type::Numeric, "{flags:?}");
             assert_eq!(
                 column.collation_opt(),
@@ -7108,7 +8322,7 @@ mod tests {
             else {
                 panic!("expected CREATE TABLE: {sql}");
             };
-            let table = create_table("t", &body, 0)?;
+            let table = create_table("t", &body, 0, false)?;
             let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
                 panic!("expected column definitions: {sql}");
             };
@@ -7453,6 +8667,21 @@ mod tests {
     }
 
     #[test]
+    fn rowid_alias_is_not_nullable() {
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE t(id INTEGER, PRIMARY KEY(id))",
+        ] {
+            let table = BTreeTable::from_sql(sql, 2).unwrap();
+            let column = table.get_column("id").unwrap().1;
+            assert!(column.notnull(), "{sql}");
+            assert!(!column.explicit_notnull(), "{sql}");
+        }
+        let table = BTreeTable::from_sql("CREATE TABLE t(id INTEGER PRIMARY KEY DESC)", 2).unwrap();
+        assert!(!table.get_column("id").unwrap().1.notnull());
+    }
+
+    #[test]
     pub fn test_col_notnull_negative() -> Result<()> {
         let sql = r#"CREATE TABLE t1 (a INTEGER);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
@@ -7617,10 +8846,12 @@ mod tests {
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
+            declared_name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
+            primary_key_is_inline: false,
             columns,
             unique_sets: vec![],
             foreign_keys: vec![],
@@ -7974,29 +9205,29 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_loading_rejects_gencol_without_flag() {
+    fn test_schema_loading_accepts_generated_columns() {
         let mut schema = Schema::new();
-        schema.generated_columns_enabled = false;
 
-        let result = schema.handle_schema_row(
-            "table",
-            "t1",
-            "t1",
-            2,
-            Some("CREATE TABLE t1(a INTEGER, b AS (a*2))"),
-            &SymbolTable::default(),
-            &mut vec![],
-            &mut HashMap::default(),
-            &mut HashMap::default(),
-            &mut HashMap::default(),
-            &mut HashMap::default(),
-            &|_| None,
-            &crate::dialect::SqliteDialect,
-        );
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("generated columns"));
+        schema
+            .handle_schema_row(
+                "table",
+                "t1",
+                "t1",
+                2,
+                Some("CREATE TABLE t1(a INTEGER, b AS (a*2))"),
+                &SymbolTable::default(),
+                &mut vec![],
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &mut HashMap::default(),
+                &|_| None,
+                &crate::dialect::SqliteDialect,
+            )
+            .unwrap();
+
+        let table = schema.get_btree_table(NamespaceId::ROOT, "t1").unwrap();
+        assert!(table.has_virtual_columns);
     }
 
     #[test]
@@ -8047,7 +9278,7 @@ mod tests {
             &crate::dialect::SqliteDialect,
         );
         assert!(result.is_err());
-        assert!(schema.get_table("v1").is_none());
+        assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
     }
 
     #[test]
@@ -8070,7 +9301,7 @@ mod tests {
             &crate::dialect::SqliteDialect,
         );
         assert!(result.is_err());
-        assert!(schema.get_table("v1").is_none());
+        assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
     }
 
     #[test]
@@ -8096,7 +9327,7 @@ mod tests {
                 &crate::dialect::SqliteDialect,
             )
             .unwrap();
-        let table = schema.get_btree_table("t1").unwrap();
+        let table = schema.get_btree_table(NamespaceId::ROOT, "t1").unwrap();
         assert_eq!(table.root_page, 2);
     }
 
@@ -8384,7 +9615,9 @@ mod tests {
             "expected Corrupt error for unreadable internal backing table, got: {err:?}",
         );
         assert!(
-            !schema.sequences.contains_key("broken_seq"),
+            schema
+                .get_sequence(NamespaceId::ROOT, "broken_seq")
+                .is_none(),
             "rejected descriptor must not land in the sequences map",
         );
     }
@@ -8453,7 +9686,7 @@ mod tests {
 
     #[test]
     fn test_named_unique_constraint_stores_constraint_name() {
-        let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT t_u_code_uq UNIQUE);"#;
+        let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT "T_U Code UQ" UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0).unwrap();
         let unique_set = table
             .unique_sets
@@ -8462,7 +9695,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             unique_set.constraint_name,
-            Some("t_u_code_uq".to_string()),
+            Some("T_U Code UQ".to_string()),
             "named UNIQUE constraint must store the constraint name"
         );
 
@@ -8477,7 +9710,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             index.constraint_name,
-            Some("t_u_code_uq".to_string()),
+            Some("T_U Code UQ".to_string()),
             "index built from named UNIQUE constraint must carry the constraint name"
         );
     }
@@ -8485,14 +9718,42 @@ mod tests {
     #[test]
     fn named_primary_and_foreign_keys_survive_sql_reconstruction() {
         for original_sql in [
-            "CREATE TABLE child (id INTEGER CONSTRAINT custom_pk PRIMARY KEY, pid INTEGER CONSTRAINT custom_fk REFERENCES parent(id))",
-            "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT custom_pk PRIMARY KEY (id, pid), CONSTRAINT custom_fk FOREIGN KEY (pid) REFERENCES parent(id))",
+            "CREATE TABLE child (id INTEGER CONSTRAINT \"Custom PK\" PRIMARY KEY, pid INTEGER CONSTRAINT \"Custom FK\" REFERENCES parent(id))",
+            "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT \"Custom PK\" PRIMARY KEY (id, pid), CONSTRAINT \"Custom FK\" FOREIGN KEY (pid) REFERENCES parent(id))",
         ] {
             let table = BTreeTable::from_sql(original_sql, 1).unwrap();
             let sql = table.to_sql();
             let restored = BTreeTable::from_sql(&sql, 1).unwrap();
-            assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("custom_pk"), "{sql}");
-            assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("custom_fk"), "{sql}");
+            assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("Custom PK"), "{sql}");
+            assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("Custom FK"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn table_level_pk_and_unique_order_survives_to_sql() {
+        for (original_sql, expected_sql) in [
+            (
+                "CREATE TABLE t (a TEXT, b TEXT, UNIQUE (a), PRIMARY KEY (b))",
+                "CREATE TABLE t (a TEXT, b TEXT, UNIQUE (a), PRIMARY KEY (b))",
+            ),
+            (
+                "CREATE TABLE u (a TEXT, b TEXT, PRIMARY KEY (b), UNIQUE (a))",
+                "CREATE TABLE u (a TEXT, b TEXT, PRIMARY KEY (b), UNIQUE (a))",
+            ),
+            (
+                "CREATE TABLE v (a TEXT, b TEXT, x TEXT, UNIQUE (a), PRIMARY KEY (b, x))",
+                "CREATE TABLE v (a TEXT, b TEXT, x TEXT, UNIQUE (a), PRIMARY KEY (b, x))",
+            ),
+            (
+                "CREATE TABLE w (a TEXT UNIQUE, b TEXT, PRIMARY KEY (b))",
+                "CREATE TABLE w (a TEXT UNIQUE, b TEXT, PRIMARY KEY (b))",
+            ),
+        ] {
+            let table = BTreeTable::from_sql(original_sql, 2).unwrap();
+            let sql = table.to_sql();
+            assert_eq!(sql, expected_sql);
+            let restored = BTreeTable::from_sql(&sql, 2).unwrap();
+            assert_eq!(restored.unique_sets, table.unique_sets, "{sql}");
         }
     }
 
@@ -8533,7 +9794,7 @@ mod tests {
             .populate_indices(&SymbolTable::default(), vec![], automatic_indices, false)
             .unwrap();
 
-        let indexes: std::vec::Vec<_> = schema.get_indices("t_u").collect();
+        let indexes: std::vec::Vec<_> = schema.get_indices(NamespaceId::ROOT, "t_u").collect();
         let unique_idx = indexes
             .iter()
             .find(|idx| !idx.columns.iter().any(|c| c.name == "id"))
@@ -8549,7 +9810,6 @@ mod tests {
 mod column_info {
     use crate::schema::{ColDef, ColDefFlags, Type};
     use crate::vdbe::affinity::Affinity;
-    use crate::vdbe::CollationSeq;
 
     // flags
     const F_PRIMARY_KEY: u32 = 1;
@@ -8558,18 +9818,16 @@ mod column_info {
     const F_UNIQUE: u32 = 8;
     const F_HIDDEN: u32 = 16;
 
-    // pack Type and Collation in the remaining bits
+    // pack Type in the remaining bits
     const TYPE_SHIFT: u32 = 5;
     const TYPE_MASK: u32 = 0b111 << TYPE_SHIFT;
-    const COLL_SHIFT: u32 = TYPE_SHIFT + 3;
-    const COLL_MASK: u32 = 0b1111_1111_1111 << COLL_SHIFT;
 
-    // Bits 20-22: base type affinity. Column affinity will resolve to this
+    // Bits 8-10: base type affinity. Column affinity will resolve to this
     // value only if it is > 0, else it uses ty_str.
-    const BASE_AFF_SHIFT: u32 = COLL_SHIFT + 12;
+    const BASE_AFF_SHIFT: u32 = TYPE_SHIFT + 3;
     const BASE_AFF_MASK: u32 = 0b111 << BASE_AFF_SHIFT;
 
-    // Bits 23-25: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
+    // Bits 11-13: array dimensions (0 = scalar, 1-7 = number of [] dimensions)
     const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
     const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
@@ -8579,7 +9837,6 @@ mod column_info {
 
     pub struct NewColumnInfoParams<'a> {
         pub ty: Type,
-        pub collation: Option<CollationSeq>,
         pub coldef: &'a ColDef,
     }
 
@@ -8589,9 +9846,6 @@ mod column_info {
             let mut raw: u32 = 0;
 
             raw |= (params.ty as u32) << TYPE_SHIFT;
-            if let Some(c) = params.collation {
-                raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
-            }
             if params.coldef.flags.contains(ColDefFlags::PrimaryKey) {
                 raw |= F_PRIMARY_KEY
             }
@@ -8677,7 +9931,11 @@ mod column_info {
 
         #[inline]
         pub fn set_array_dimensions(&mut self, dims: u32) {
-            assert!(dims <= 7, "array dimensions must be <= 7");
+            assert!(
+                dims <= turso_parser::ast::MAX_ARRAY_DIMENSIONS,
+                "array dimensions must be <= {}",
+                turso_parser::ast::MAX_ARRAY_DIMENSIONS
+            );
             self.0 = (self.0 & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
         }
 
@@ -8690,30 +9948,6 @@ mod column_info {
         #[inline]
         pub fn set_ty(&mut self, ty: Type) {
             self.0 = (self.0 & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
-        }
-
-        #[inline]
-        pub fn collation(&self) -> CollationSeq {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            if v == CollationSeq::Unset.to_bits() {
-                CollationSeq::Binary
-            } else {
-                CollationSeq::from_storage_bits(v)
-            }
-        }
-
-        #[inline]
-        pub fn has_explicit_collation(&self) -> bool {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
-            v != CollationSeq::Unset.to_bits()
-        }
-
-        #[inline]
-        pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-            self.0 &= !COLL_MASK;
-            if let Some(c) = c {
-                self.0 |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK;
-            }
         }
 
         #[inline]

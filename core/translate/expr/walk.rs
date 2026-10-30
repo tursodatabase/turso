@@ -286,28 +286,52 @@ pub fn expr_contains_nondeterministic_scalar_function(
     expr: &ast::Expr,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
-    fn is_nondeterministic_scalar_like_function(func: &Func) -> bool {
-        match func {
-            // Aggregate and window function calls themselves are not flagged
-            // at any nesting depth — their outputs are deterministic given the
-            // same input rows. The walker still descends into their args,
-            // FILTER, and OVER subexprs, so nondet scalars buried inside
-            // (e.g. `sum(random())`) are still caught. Note also that
-            // `AggFunc::is_deterministic` returns `false`, so the catch-all
-            // below would otherwise flag every aggregate call.
-            Func::Agg(_) | Func::Window(_) => false,
+    expr_contains_function(expr, resolver, is_nondeterministic_scalar_like_function)
+}
 
-            // User-defined scalar functions can do anything, so treat them
-            // like `random()`. User-defined aggregates are treated like
-            // built-in aggregates: two copies of `myagg(x) OVER w` should
-            // share one window entry when `x` and the FILTER/OVER clauses are
-            // stable.
-            Func::External(external) if external.func.is_aggregate() => false,
+/// Returns true if this expression calls a scalar function that can give a
+/// different value each time it runs within one statement, such as `random()`.
+///
+/// Unlike [expr_contains_nondeterministic_scalar_function], the date and time
+/// functions do not count. Like SQLite's SQLITE_FUNC_SLOCHNG functions, they
+/// give the same value for the whole statement.
+pub fn expr_contains_function_that_changes_within_statement(
+    expr: &ast::Expr,
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
+    expr_contains_function(expr, resolver, |func| {
+        is_nondeterministic_scalar_like_function(func)
+            && !matches!(func, Func::Scalar(f) if f.is_date_time_function())
+    })
+}
 
-            _ => !func.is_deterministic(),
-        }
+fn is_nondeterministic_scalar_like_function(func: &Func) -> bool {
+    match func {
+        // Aggregate and window function calls themselves are not flagged
+        // at any nesting depth — their outputs are deterministic given the
+        // same input rows. The walker still descends into their args,
+        // FILTER, and OVER subexprs, so nondet scalars buried inside
+        // (e.g. `sum(random())`) are still caught. Note also that
+        // `AggFunc::is_deterministic` returns `false`, so the catch-all
+        // below would otherwise flag every aggregate call.
+        Func::Agg(_) | Func::Window(_) => false,
+
+        // User-defined scalar functions can do anything, so treat them
+        // like `random()`. User-defined aggregates are treated like
+        // built-in aggregates: two copies of `myagg(x) OVER w` should
+        // share one window entry when `x` and the FILTER/OVER clauses are
+        // stable.
+        Func::External(external) if external.func.is_aggregate() => false,
+
+        _ => !func.is_deterministic(),
     }
+}
 
+fn expr_contains_function(
+    expr: &ast::Expr,
+    resolver: &Resolver<'_>,
+    matches_function: impl Fn(&Func) -> bool,
+) -> Result<bool> {
     let mut found = false;
     crate::util::walk_expr_with_subqueries(expr, &mut |e| -> Result<WalkControl> {
         if found {
@@ -325,11 +349,7 @@ pub fn expr_contains_nondeterministic_scalar_function(
         };
 
         // If the name is unknown here, leave the error to the normal resolver.
-        // This helper only answers "may repeated copies share work?"
-        if func
-            .as_ref()
-            .is_some_and(is_nondeterministic_scalar_like_function)
-        {
+        if func.as_ref().is_some_and(&matches_function) {
             found = true;
             return Ok(WalkControl::SkipChildren);
         }
