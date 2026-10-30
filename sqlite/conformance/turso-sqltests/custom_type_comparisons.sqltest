@@ -1352,6 +1352,40 @@ expect error {
     cannot compare type date with text: cast it to date first
 }
 
+# A comparison, NOT, IS, IN or BETWEEN gives a boolean, as in PostgreSQL, so it
+# compares with a boolean column without a cast.
+@requires strict "uses STRICT tables"
+test cmp-boolean-with-truth-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b boolean, u integer) STRICT;
+    INSERT INTO t VALUES (1, 1, 1), (2, 0, 1), (3, 0, 0), (4, NULL, NULL);
+    SELECT 'cmp', group_concat(id) FROM t WHERE b = (u > 0);
+    SELECT 'is', group_concat(id) FROM t WHERE b IS (u > 0);
+    SELECT 'not', group_concat(id) FROM t WHERE b = NOT u;
+    SELECT 'isnull', group_concat(id) FROM t WHERE b = (u IS NULL);
+    SELECT 'in', group_concat(id) FROM t WHERE b = (u IN (1, 2));
+    SELECT 'between', group_concat(id) FROM t WHERE b = (u BETWEEN 1 AND 2);
+    SELECT 'join', group_concat(a.id) FROM t a JOIN t c ON a.b = (c.u = 1) WHERE c.id = 1;
+}
+expect {
+    cmp|1,3
+    is|1,3,4
+    not|2
+    isnull|2,3
+    in|1,3
+    between|1,3
+    join|1
+}
+
+# An integer column is not a truth value, so it needs a cast.
+@requires strict "uses STRICT tables"
+test cmp-boolean-with-integer-column-is-an-error {
+    CREATE TABLE t(b boolean, u integer) STRICT;
+    SELECT count(*) FROM t WHERE b = u;
+}
+expect error {
+    cannot compare type boolean with integer: cast it to boolean first
+}
+
 # A value cast to a type compares the same in a nested loop, a hash join and
 # an IN subquery.
 @requires strict "uses STRICT tables"
