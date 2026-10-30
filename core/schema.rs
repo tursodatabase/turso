@@ -4928,11 +4928,19 @@ impl PartialEq for Table {
 pub struct UniqueSet {
     pub columns: Vec<UniqueSetColumn>,
     pub is_primary_key: bool,
-    /// True if declared as an inline column constraint rather than a table-level constraint.
+    /// True if declared only as an inline column constraint, not also as a
+    /// table-level constraint on the same column.
     pub is_inline: bool,
     pub conflict_clause: Option<ResolveType>,
     /// Explicit constraint name from `CONSTRAINT name UNIQUE/PRIMARY KEY`, if given.
     pub constraint_name: Option<String>,
+}
+
+impl UniqueSet {
+    /// Whether this constraint is declared only in the definition of the column `column_name`.
+    pub fn is_column_constraint_of(&self, column_name: &str) -> bool {
+        self.is_inline && self.columns[0].name.eq_ignore_ascii_case(column_name)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -5514,22 +5522,17 @@ impl BTreeTable {
         // `sqlite_autoindex_<table>_<N>` numbering matches the original schema on reopen.
         let mut emitted_table_pk = false;
         for unique_set in &self.unique_sets {
-            if unique_set.is_primary_key {
-                if !needs_pk_inline && has_table_pk {
+            if unique_set.is_primary_key && !needs_pk_inline {
+                if has_table_pk {
                     push_table_pk(&mut sql);
                     emitted_table_pk = true;
                 }
                 continue;
             }
-            // Skip inline unique constraints only when their column still carries `UNIQUE`
-            // (if an earlier `ALTER COLUMN` cleared `column.unique()` while keeping the
-            // `UniqueSet` and its autoindex, emit `UNIQUE (...)` so reopen consumes it).
-            if unique_set.is_inline
-                && unique_set.columns.len() == 1
-                && self
-                    .get_column(&unique_set.columns[0].name)
-                    .is_some_and(|(_, col)| col.unique())
-            {
+            // The column definition already declares inline constraints. An inline
+            // PRIMARY KEY with `is_inline == false` was also declared as a table-level
+            // UNIQUE on the same column, which is written here.
+            if unique_set.is_inline {
                 continue;
             }
             sql.push_str(", ");
@@ -7053,6 +7056,9 @@ pub fn create_table(
                                     "conflicting ON CONFLICT clauses specified"
                                 );
                             }
+                        }
+                        if !unique_sets[j].is_inline {
+                            unique_sets[i].is_inline = false;
                         }
                         unique_sets.remove(j);
                     } else {
