@@ -80,6 +80,7 @@ scalar_functions! {
     PgInputIsValid(FunctionArity::Exact(2), true),
     Textlike(FunctionArity::Exact(2), true),
     LikeEscape(FunctionArity::Exact(2), true),
+    SimilarToEscape(FunctionArity::OneOf(&[1, 2]), true),
     Booleq(FunctionArity::Exact(2), true),
     Boolne(FunctionArity::Exact(2), true),
     ColDescription(FunctionArity::Exact(2), true),
@@ -139,6 +140,7 @@ impl ScalarCall for PgScalarFunction {
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
             Self::Textlike => exec_textlike(args)?,
             Self::LikeEscape => exec_like_escape(args)?,
+            Self::SimilarToEscape => exec_similar_to_escape(args)?,
             Self::Booleq => Value::from_i64((args[0].get_value() == args[1].get_value()) as i64),
             Self::Boolne => Value::from_i64((args[0].get_value() != args[1].get_value()) as i64),
             Self::SetConfig => exec_set_config(connection, args)?,
@@ -757,6 +759,28 @@ fn exec_like_escape(args: &[Register]) -> Result<Value> {
         }
     };
     Ok(Value::build_text(result))
+}
+
+/// Converts a SIMILAR TO pattern to a regular expression, as PostgreSQL's
+/// similar_to_escape() does. Without an ESCAPE argument, `\` is the escape.
+fn exec_similar_to_escape(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let pattern = args[0].get_value().to_string();
+    let escape = args
+        .get(1)
+        .map_or_else(|| "\\".to_string(), |arg| arg.get_value().to_string());
+    match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
+        Ok(regex) => Ok(Value::build_text(regex)),
+        Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
+            Err(sqlstate_error(sqlstate, message))
+        }
+        Err(error) => Err(LimboError::ParseError(error.to_string())),
+    }
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> Value {

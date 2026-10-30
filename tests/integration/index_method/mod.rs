@@ -496,6 +496,45 @@ fn test_vector_sparse_ivf_mvcc_sql(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn vector_index_rejected_update_rollback(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e)")
+        .unwrap();
+    conn.execute("CREATE INDEX vi ON v USING toy_vector_sparse_ivf (e)")
+        .unwrap();
+    conn.execute("INSERT INTO v VALUES(1, vector32_sparse('[1,0,0]'))")
+        .unwrap();
+
+    let mut integrity_results = Vec::new();
+    for explicit_transaction in [false, true] {
+        if explicit_transaction {
+            conn.execute("BEGIN").unwrap();
+        }
+        let error = conn.execute("UPDATE v SET e='zz' WHERE id=1").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("first value must be sparse vector"));
+        assert_eq!(conn.get_auto_commit(), !explicit_transaction);
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT id, vector_extract(e) FROM v"),
+            vec![row![1, "[1,0,0]"]]
+        );
+        integrity_results.push(limbo_exec_rows(&conn, "PRAGMA integrity_check"));
+        assert_eq!(
+            limbo_exec_rows(
+                &conn,
+                "SELECT id FROM v ORDER BY vector_distance_jaccard(e, vector32_sparse('[1,0,0]')) LIMIT 1"
+            ),
+            vec![row![1]]
+        );
+        if explicit_transaction {
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+    assert_eq!(integrity_results, vec![vec![row!["ok"]]; 2]);
+}
+
+#[turso_macros::test]
 fn vector_argument_dependencies_own_row(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     for sql in [
@@ -7278,4 +7317,39 @@ fn run_in_concurrent_transaction(
         let _ = conn.execute("ROLLBACK");
     }
     result
+}
+
+#[turso_macros::test]
+fn rejected_index_method_value_keeps_row_and_index_consistent(tmp_db: TempDatabase) {
+    // The index method rejects the new value after the UPDATE already
+    // removed the row's old index entries, so the statement needs a
+    // statement savepoint: on error the entries come back, the transaction
+    // survives, and the index still finds the row.
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding)")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute("INSERT INTO vectors VALUES (1, vector32_sparse('[1,0,0]'))")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert!(conn
+        .execute("UPDATE vectors SET embedding = 'zz' WHERE id = 1")
+        .is_err());
+    assert!(!conn.get_auto_commit(), "the transaction must survive");
+    conn.execute("COMMIT").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows(
+        "SELECT id FROM vectors \
+         ORDER BY vector_distance_jaccard(embedding, vector32_sparse('[1,0,0]')) LIMIT 5",
+    );
+    assert_eq!(
+        rows,
+        vec![(1,)],
+        "the query must still find the row through the index"
+    );
+    // integrity_check still reports the row missing from the backing
+    // B-trees: index-method writes survive transaction rollback, a
+    // pre-existing bug (main corrupts the same way through plain ROLLBACK
+    // and autocommit error rollback). Once that is fixed, assert
+    // integrity_check here too.
 }

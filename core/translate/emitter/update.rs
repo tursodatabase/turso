@@ -1816,6 +1816,7 @@ fn emit_update_insns<'a>(
 
             let check_constraint_tables =
                 TableReferences::new(vec![target_table.as_ref().clone()], vec![]);
+            let check_halt_on_error = program.constraint_halt_on_error(or_conflict);
             emit_check_constraints(
                 program,
                 &relevant_checks,
@@ -1837,6 +1838,7 @@ fn emit_update_insns<'a>(
                     }),
                 connection,
                 or_conflict,
+                check_halt_on_error,
                 skip_row_label,
                 Some(&check_constraint_tables),
             )?;

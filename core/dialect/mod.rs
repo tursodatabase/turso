@@ -259,6 +259,14 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> Option<crate::Value> {
         None
     }
+
+    /// Whether `CREATE INDEX` accepts qualified column names such as `t.a`
+    /// in its indexed terms.
+    ///
+    /// PostgreSQL accepts them. SQLite raises an error.
+    fn allows_qualified_columns_in_index_terms(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

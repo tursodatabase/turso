@@ -124,13 +124,13 @@ use turso_parser::ast::{
     self, Expr, FunctionTail, Name, SortOrder, TableInternalId, UnaryOperator,
 };
 
+use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::Plan;
 
 use crate::function::AggFunc;
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::{
-    collate::expr_collation,
     emitter::Resolver,
     expr::{
         expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
@@ -1127,14 +1127,16 @@ fn column_pair_compares_the_same(
     tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<bool> {
-    if get_expr_affinity(&pair.inner, Some(tables), None)
-        != get_expr_affinity(&pair.outer, Some(tables), None)
+    let affinity_metadata = TableMetadata::new(Some(tables));
+    if get_expr_affinity(&pair.inner, &affinity_metadata)
+        != get_expr_affinity(&pair.outer, &affinity_metadata)
     {
         return Ok(false);
     }
 
-    let inner_collation = expr_collation(&pair.inner, Some(tables), resolver)?;
-    let outer_collation = expr_collation(&pair.outer, Some(tables), resolver)?;
+    let collation_metadata = super::ExprContext::new(Some(tables), resolver);
+    let inner_collation = collation_metadata.expr_collation(&pair.inner)?;
+    let outer_collation = collation_metadata.expr_collation(&pair.outer)?;
     Ok(inner_collation == outer_collation)
 }
 

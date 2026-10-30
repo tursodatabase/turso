@@ -1,6 +1,6 @@
 use super::{
-    collate::expr_collation,
     emitter::Resolver,
+    expr_context::ExprContext,
     plan::{
         DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
         JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
@@ -925,7 +925,8 @@ fn detect_simple_aggregate(
             } else {
                 SortOrder::Desc
             };
-            let collation = expr_collation(&argument, Some(&plan.table_references), resolver)?;
+            let collation = ExprContext::new(Some(&plan.table_references), resolver)
+                .expr_collation(&argument)?;
             Some(SimpleAggregate::MinMax(Box::new(MinMaxDef {
                 func: agg.func.clone(),
                 argument,

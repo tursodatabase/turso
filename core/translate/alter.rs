@@ -684,6 +684,7 @@ fn emit_column_constraints_validation(
         );
         let mut check_resolver = resolver.fork();
         let skip_row_label = program.allocate_label();
+        let check_halt_on_error = program.constraint_halt_on_error(ast::ResolveType::Abort);
         emit_check_constraints(
             program,
             &check_constraints,
@@ -701,6 +702,7 @@ fn emit_column_constraints_validation(
                 }),
             connection,
             ast::ResolveType::Abort,
+            check_halt_on_error,
             skip_row_label,
             Some(&table_references),
         )?;
@@ -1049,7 +1051,9 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&btree.to_sql_as(&mangled_table_name));
+            let sql = escape_sql_string_literal(
+                &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)),
+            );
 
             let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
             let stmt = format!(
@@ -1345,7 +1349,9 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&btree.to_sql_as(&mangled_table_name));
+            let escaped = escape_sql_string_literal(
+                &btree.to_sql_as(&resolver.mangle_name(namespace, &btree.declared_name)),
+            );
             let escaped_table_name = escape_sql_string_literal(&mangled_table_name);
             let stmt = format!(
                 r#"

@@ -1,6 +1,6 @@
 use crate::functions::validate_pg_input;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
@@ -13,7 +13,7 @@ use turso_core::{
     Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::RefAct;
+use turso_parser::ast::{RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -233,6 +233,10 @@ impl Dialect for PostgresDialect {
             _ => None,
         }
     }
+
+    fn allows_qualified_columns_in_index_terms(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -426,7 +430,7 @@ impl SnapshotRows for PgClassTable {
         let indexes = catalog_indexes(&schema);
         let relkind: &'static str = RelationKind::Table.into();
 
-        for (i, (namespace, table_name, table)) in tables.iter().enumerate() {
+        for (i, (namespace, _, table)) in tables.iter().enumerate() {
             let btree = match table.as_ref() {
                 Table::BTree(bt) => bt,
                 _ => continue,
@@ -438,7 +442,7 @@ impl SnapshotRows for PgClassTable {
 
             rows.push(vec![
                 Value::from_i64(table_oid),                          // oid
-                Value::Text((*table_name).to_string().into()),       // relname
+                Value::Text(btree.declared_name.clone().into()),     // relname
                 Value::from_i64(namespace_oid(&schema, *namespace)), // relnamespace
                 Value::from_i64(0),                                  // reltype
                 Value::from_i64(0),                                  // reloftype
@@ -1179,10 +1183,11 @@ impl SnapshotRows for PgTablesTable {
         let mut rows = Vec::new();
         let tables = user_tables_sorted(&schema);
 
-        for (namespace, table_name, _) in tables {
+        for (namespace, _, table) in tables {
+            let btree = table.btree().expect("user tables are B-trees");
             rows.push(vec![
                 Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
-                Value::Text(table_name.to_string().into()),                        // tablename
+                Value::Text(btree.declared_name.clone().into()),                   // tablename
                 Value::Text("turso".into()),                                       // tableowner
                 Value::Null,                                                       // tablespace
                 Value::from_i64(0),                                                // hasindexes
@@ -1821,6 +1826,7 @@ impl SnapshotRows for PgConstraintTable {
                 .copied()
                 .unwrap_or(0);
 
+            let table_name = &btree.declared_name;
             if btree.get_rowid_alias_column().is_some() {
                 let index = indexes
                     .iter()
@@ -1887,8 +1893,10 @@ impl SnapshotRows for PgConstraintTable {
                         .clone()
                         .unwrap_or_else(|| format!("{table_name}_pkey"))
                 } else {
-                    let cols_str = col_names.join("_");
-                    format!("{table_name}_{cols_str}_key")
+                    us.constraint_name.clone().unwrap_or_else(|| {
+                        let cols_str = col_names.join("_");
+                        format!("{table_name}_{cols_str}_key")
+                    })
                 };
 
                 // Build conkey: space-separated 1-based attnums
@@ -1964,7 +1972,10 @@ impl SnapshotRows for PgConstraintTable {
             // FK constraints from foreign_keys
             for fk in &btree.foreign_keys {
                 let child_cols = fk.child_columns.join("_");
-                let conname = format!("{table_name}_{child_cols}_fkey");
+                let conname = fk
+                    .constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{table_name}_{child_cols}_fkey"));
 
                 let conkey: String = fk
                     .child_columns
@@ -3450,14 +3461,18 @@ impl PgGetTableDefCursor {
 
             let postgres_ddl = match self.sql_map.get(&mangle_name(namespace, table_name)) {
                 Some(schema_sql) => decode_stored_pg_schema_sql(schema_sql)
-                    .map(|sql| ddl_with_user_names(&schema, namespace, table_name, sql))
+                    .map(|sql| {
+                        ddl_with_user_names(&schema, namespace, &btree_table.declared_name, sql)
+                    })
                     .unwrap_or_else(|| self.convert_to_postgres_ddl(schema_sql)),
-                None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
+                None => {
+                    self.convert_to_postgres_ddl(&btree_table.to_sql_as(&btree_table.declared_name))
+                }
             };
 
             self.rows.push(vec![
                 Value::Text(schema_name_of(&schema, namespace).to_string().into()),
-                Value::Text(table_name.to_string().into()),
+                Value::Text(btree_table.declared_name.clone().into()),
                 Value::Text(postgres_ddl.into()),
             ]);
         }
@@ -3654,7 +3669,16 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
                 let cols: Vec<String> = btree
                     .primary_key_columns
                     .iter()
-                    .map(|(name, _)| quote_identifier(name))
+                    .map(|(name, _)| {
+                        let (_, column) =
+                            btree.get_column(name).expect("primary key columns exist");
+                        quote_identifier(
+                            column
+                                .name
+                                .as_deref()
+                                .expect("primary key columns have names"),
+                        )
+                    })
                     .collect();
                 return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
             }
@@ -3667,7 +3691,17 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
                 let col_names: Vec<String> = us
                     .columns
                     .iter()
-                    .map(|column| quote_identifier(&column.name))
+                    .map(|column| {
+                        let (_, column) = btree
+                            .get_column(&column.name)
+                            .expect("constraint columns exist");
+                        quote_identifier(
+                            column
+                                .name
+                                .as_deref()
+                                .expect("constraint columns have names"),
+                        )
+                    })
                     .collect();
                 let kw = if unique_set_is_primary_key(btree, us) {
                     "PRIMARY KEY"
@@ -3682,12 +3716,60 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // FK constraints
         for fk in &btree.foreign_keys {
             if constraint_oid == target_oid {
-                let child_cols = fk.child_columns.join(", ");
-                let parent_cols = fk.parent_columns.join(", ");
-                let mut def = format!(
-                    "FOREIGN KEY ({child_cols}) REFERENCES {}({parent_cols})",
-                    fk.parent_table
+                let parent = schema.get_btree_table(fk.parent_namespace, &fk.parent_table);
+                let child_cols = constraint_column_list(
+                    Some(btree),
+                    fk.child_columns.iter().map(String::as_str),
                 );
+                let parent_cols = if fk.parent_columns.is_empty() {
+                    parent.as_ref().map_or_else(String::new, |parent| {
+                        constraint_column_list(
+                            Some(parent),
+                            parent
+                                .primary_key_columns
+                                .iter()
+                                .map(|(name, _)| name.as_str()),
+                        )
+                    })
+                } else {
+                    constraint_column_list(
+                        parent.as_deref(),
+                        fk.parent_columns.iter().map(String::as_str),
+                    )
+                };
+                let parent_name = parent.as_ref().map_or(fk.parent_table.as_str(), |parent| {
+                    parent.declared_name.as_str()
+                });
+                let visible = conn
+                    .search_order()
+                    .into_iter()
+                    .find(|namespace| {
+                        schema
+                            .get_table(namespace.target.id, &fk.parent_table)
+                            .is_some()
+                            || schema
+                                .get_view(namespace.target.id, &fk.parent_table)
+                                .is_some()
+                            || schema
+                                .get_sequence(namespace.target.id, &fk.parent_table)
+                                .is_some()
+                            || indexes.iter().any(|index| {
+                                index.namespace == namespace.target.id
+                                    && index.name == fk.parent_table
+                            })
+                    })
+                    .is_some_and(|namespace| namespace.target.id == fk.parent_namespace);
+                let parent_name = if visible {
+                    quote_identifier(parent_name)
+                } else {
+                    format!(
+                        "{}.{}",
+                        quote_identifier(schema_name_of(&schema, fk.parent_namespace)),
+                        quote_identifier(parent_name),
+                    )
+                };
+                let mut def =
+                    format!("FOREIGN KEY ({child_cols}) REFERENCES {parent_name}({parent_cols})");
                 let on_update = ref_act_to_char(&fk.on_update);
                 let on_delete = ref_act_to_char(&fk.on_delete);
                 if on_update != "a" {
@@ -3713,6 +3795,23 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
     None
 }
 
+fn constraint_column_list<'a>(
+    table: Option<&BTreeTable>,
+    names: impl IntoIterator<Item = &'a str>,
+) -> String {
+    names
+        .into_iter()
+        .map(|name| {
+            let declared_name = table
+                .and_then(|table| table.get_column(name))
+                .and_then(|(_, column)| column.name.as_deref())
+                .unwrap_or(name);
+            quote_identifier(declared_name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
 /// Uses the same OID assignment as [PgIndexTable] / [PgClassTable].
 pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
@@ -3724,28 +3823,58 @@ pub(crate) fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<Stri
 }
 
 fn index_definition(schema: &Schema, index: &CatalogIndex) -> String {
-    let unique = if index.unique { "UNIQUE " } else { "" };
-    let cols: Vec<String> = index
-        .columns
-        .iter()
-        .map(|column| {
-            column
-                .expression
-                .clone()
-                .unwrap_or_else(|| quote_identifier(&column.name))
-        })
-        .collect();
-    let mut def = format!(
-        "CREATE {unique}INDEX {} ON {}.{} USING btree ({})",
-        quote_identifier(&index.name),
-        quote_identifier(schema_name_of(schema, index.namespace)),
-        quote_identifier(&index.table_name),
-        cols.join(", ")
-    );
-    if let Some(where_clause) = &index.where_clause {
-        def.push_str(&format!(" WHERE {where_clause}"));
+    IndexDefinition {
+        name: &index.name,
+        schema_name: schema_name_of(schema, index.namespace),
+        table_name: &index.table_name,
+        unique: index.unique,
+        columns: &index.columns,
+        where_clause: index.where_clause.as_deref(),
     }
-    def
+    .to_string()
+}
+
+struct IndexDefinition<'a> {
+    name: &'a str,
+    schema_name: &'a str,
+    table_name: &'a str,
+    unique: bool,
+    columns: &'a [CatalogIndexColumn],
+    where_clause: Option<&'a str>,
+}
+
+impl Display for IndexDefinition<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("CREATE ")?;
+        if self.unique {
+            f.write_str("UNIQUE ")?;
+        }
+        write!(
+            f,
+            "INDEX {} ON {}.{} USING btree (",
+            quote_identifier(self.name),
+            quote_identifier(self.schema_name),
+            quote_identifier(self.table_name),
+        )?;
+        for (position, column) in self.columns.iter().enumerate() {
+            if position != 0 {
+                f.write_str(", ")?;
+            }
+            match column.expression.as_deref() {
+                Some(expression) => f.write_str(expression)?,
+                None => f.write_str(&quote_identifier(&column.name))?,
+            }
+            match column.order {
+                SortOrder::Asc => {}
+                SortOrder::Desc => f.write_str(" DESC")?,
+            }
+        }
+        f.write_str(")")?;
+        if let Some(where_clause) = self.where_clause {
+            write!(f, " WHERE {where_clause}")?;
+        }
+        Ok(())
+    }
 }
 
 struct CatalogIndex {
@@ -3792,12 +3921,13 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                 oid,
                 table_oid,
                 namespace,
-                table_name: table_name.to_string(),
+                table_name: btree.declared_name.clone(),
                 name,
                 columns: vec![CatalogIndexColumn {
                     name: column.name.clone().expect("primary key columns have names"),
                     position,
                     expression: None,
+                    order: SortOrder::Asc,
                 }],
                 unique: true,
                 primary: true,
@@ -3824,15 +3954,23 @@ fn catalog_indexes(schema: &Schema) -> Vec<CatalogIndex> {
                 oid,
                 table_oid,
                 namespace,
-                table_name: table_name.to_string(),
+                table_name: btree.declared_name.clone(),
                 name: index.name.clone(),
                 columns: index
                     .columns
                     .iter()
                     .map(|column| CatalogIndexColumn {
-                        name: column.name.clone(),
+                        name: if column.expr.is_some() {
+                            column.name.clone()
+                        } else {
+                            btree.columns()[column.pos_in_table]
+                                .name
+                                .clone()
+                                .expect("index columns have names")
+                        },
                         position: column.pos_in_table,
                         expression: column.expr.as_ref().map(ToString::to_string),
+                        order: column.order,
                     })
                     .collect(),
                 unique: index.unique,
@@ -3849,6 +3987,7 @@ struct CatalogIndexColumn {
     name: String,
     position: usize,
     expression: Option<String>,
+    order: SortOrder,
 }
 
 fn unique_set_is_primary_key(table: &BTreeTable, set: &UniqueSet) -> bool {

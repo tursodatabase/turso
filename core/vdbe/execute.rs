@@ -57,7 +57,7 @@ use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
-    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
+    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState, WriteBaseline,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -5288,6 +5288,13 @@ pub fn op_transaction_inner(
                             "write statement started with view changes left by an earlier statement"
                         );
                         state.is_active_write = true;
+                        if is_main_db {
+                            state.write_baseline = WriteBaseline::capture(
+                                mv_store.as_deref(),
+                                &program.connection,
+                                &pager,
+                            );
+                        }
                     }
                     if is_main_db && in_explicit_txn && state.has_stmt_transaction {
                         state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
@@ -10768,13 +10775,14 @@ pub fn op_function(
             }
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => {
-                // Test-only: process-global atomic counter that increments on
-                // every evaluation. Used in sqltests to verify that the
-                // planner does not deduplicate equivalent SQL calls that
-                // contain nondeterministic functions.
-                static TEST_NONDET_COUNTER: std::sync::atomic::AtomicI64 =
-                    std::sync::atomic::AtomicI64::new(0);
-                let value = TEST_NONDET_COUNTER.fetch_add(1, Ordering::Relaxed);
+                // Test-only: per-connection counter that increments on every
+                // evaluation. Used in sqltests to verify that the planner does
+                // not deduplicate equivalent SQL calls that contain
+                // nondeterministic functions.
+                let value = program
+                    .connection
+                    .test_nondet_counter
+                    .fetch_add(1, Ordering::Relaxed);
                 state.registers[*dest].set_int(value);
             }
             ScalarFunc::Trim => {
@@ -17809,6 +17817,7 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
+                normalized_to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
@@ -17884,7 +17893,9 @@ pub fn op_rename_table(
             if let Some(mut backing_arc) = schema.take_table(NamespaceId::ROOT, &old_backing_table)
             {
                 if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
-                    Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
+                    let btree = Arc::make_mut(btree_arc);
+                    btree.name.clone_from(&new_backing_table);
+                    btree.declared_name.clone_from(&new_backing_table);
                 }
                 schema.insert_table(NamespaceId::ROOT, new_backing_table, backing_arc);
             }
