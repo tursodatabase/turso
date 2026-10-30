@@ -31,7 +31,7 @@ CREATE TYPE type_name BASE base_type
 - **ENCODE** — Expression applied to `value` before writing to disk.
 - **COERCE** — (Optional) Expression that fits the encoded `value` to the column's type parameters, such as a maximum length. See [Parametric Types](#parametric-types).
 - **DECODE** — Expression applied to `value` when reading from disk.
-- **OPERATOR** — (Optional) Function to call for an arithmetic operator (`+`, `-`, `*`, `/`, `%`) on values of the type. See [Operators](#operators).
+- **OPERATOR** — (Optional) Function to call for an arithmetic operator (`+`, `-`, `*`, `/`, `%`) on values of the type. See [Operators](#operators). A plain `OPERATOR '<'` lets ORDER BY and CREATE INDEX sort the type; see [Ordering](#ordering).
 - **DEFAULT** — (Optional) Default value for columns of this type when no value is supplied.
 
 The special identifier `value` refers to the input being encoded or decoded.
@@ -117,15 +117,15 @@ SELECT val + val FROM t1;
 
 The function runs when both operands are of the type, or one is of the type and the other is a literal (encoded first). Otherwise SQLite's operator runs on the values the columns read as. The built-in `date` type declares `+` and `-`, and `numeric` declares `+`, `-`, `*` and `/`.
 
-Comparison operators can't be declared: `OPERATOR '<'` fails with `OPERATOR '<' is not supported: values of a custom type sort and compare by their stored value`.
+`OPERATOR '<'` takes no function; see [Ordering](#ordering). Other comparison operators can't be declared: `OPERATOR '='` fails with `OPERATOR '=' is not supported: values of a custom type compare by their decoded value`.
 
 ## Ordering
 
-Every custom type sorts, compares in `min`/`max`, and is indexed by its **encoded (on-disk) value**, using the base type's comparison. DECODE only controls how values appear in query results. When the encoding keeps the order of its input, the sort order matches the decoded values:
+ORDER BY and indexes sort a custom type by its **encoded (on-disk) value**, using the base type's comparison, while `=`, `<` and the other operators compare decoded values. So a type with a DECODE must declare `OPERATOR '<'` (no function) to say that its encoding keeps the order of its input. Without it, ORDER BY and CREATE INDEX on its columns fail with `type does not declare OPERATOR '<'`. When the encoding keeps the order, the sort order matches the decoded values:
 
 ```sql
 -- ENCODE value * 100 keeps the order: 10→1000, 20→2000, 30→3000.
-CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
 CREATE TABLE prices(id INTEGER PRIMARY KEY, amount cents) STRICT;
 INSERT INTO prices VALUES (1, 30), (2, 10), (3, 20);
 SELECT amount FROM prices ORDER BY amount;
@@ -134,14 +134,15 @@ SELECT amount FROM prices ORDER BY amount;
 -- 30
 ```
 
-If the encoding does **not** keep the order, the sort follows the encoded form:
+If a type declares `OPERATOR '<'` but its encoding does **not** keep the order, the sort follows the encoded form:
 
 ```sql
 -- Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
 -- Encoded text sort: ananab < elppa < yrrehc → display: banana, apple, cherry.
 CREATE TYPE reversed BASE text
     ENCODE string_reverse(value)
-    DECODE string_reverse(value);
+    DECODE string_reverse(value)
+    OPERATOR '<';
 
 CREATE TABLE t(id INTEGER PRIMARY KEY, val reversed) STRICT;
 INSERT INTO t VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry');

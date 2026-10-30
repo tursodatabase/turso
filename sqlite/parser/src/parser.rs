@@ -5065,10 +5065,10 @@ impl<'a> Parser<'a> {
                                 .and_then(|s| s.strip_suffix('\''))
                                 .unwrap_or(&op_raw)
                                 .to_owned();
-                            if matches!(op.as_str(), "<" | "<=" | ">" | ">=" | "=" | "!=") {
+                            if matches!(op.as_str(), "<=" | ">" | ">=" | "=" | "!=") {
                                 return Err(Error::ParseError(format!(
                                     "OPERATOR '{op}' is not supported: values of a custom type \
-                                     sort and compare by their stored value"
+                                     compare by their decoded value"
                                 )));
                             }
                             // Three syntaxes:
@@ -5122,6 +5122,15 @@ impl<'a> Parser<'a> {
                                 // End of statement or semicolon: naked operator
                                 None
                             };
+                            // A plain OPERATOR '<' lets the type be sorted, by its
+                            // stored value. A function for it would never be called.
+                            if op == "<" && func_name.is_some() {
+                                return Err(Error::ParseError(
+                                    "OPERATOR '<' takes no function: a type that declares it \
+                                     sorts by its stored value"
+                                        .to_owned(),
+                                ));
+                            }
                             operators.push(TypeOperator { op, func_name });
                         }
                         _ => break,

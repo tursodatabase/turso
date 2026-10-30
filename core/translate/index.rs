@@ -220,7 +220,7 @@ pub fn translate_create_index(
         )
     })?;
 
-    // Block CREATE INDEX on STRUCT/UNION columns
+    // Block CREATE INDEX on STRUCT/UNION columns and on types that can't be sorted
     for col in &columns {
         if col.expr.is_none() {
             // Simple column reference (not expression index)
@@ -233,6 +233,13 @@ pub fn translate_create_index(
                         bail_parse_error!(
                             "cannot create index on STRUCT/UNION column '{}'",
                             col.name
+                        );
+                    }
+                    if column.type_ordering().is_none() && !type_def.is_sortable() {
+                        bail_parse_error!(
+                            "cannot create index on column '{}' of type '{}': type does not declare OPERATOR '<'",
+                            col.name,
+                            type_def.name
                         );
                     }
                 }
