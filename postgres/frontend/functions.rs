@@ -9,9 +9,11 @@ use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
-    SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
-    SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    SQLSTATE_DIVISION_BY_ZERO, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ARGUMENT_FOR_LOG,
+    SQLSTATE_INVALID_ARGUMENT_FOR_POWER_FUNCTION, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
+    SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
 };
 
@@ -78,6 +80,18 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "age"(FunctionArity::OneOf(&[1, 2]), false) => exec_age(args)?,
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
+        },
+        "pg_cast_input"(FunctionArity::Exact(2), true) => {
+            exec_pg_cast_input(args[0].get_value(), &text_arg(args, 1))?
+        },
+        "ascii"(FunctionArity::Exact(1), true) => match args[0].get_value() {
+            Value::Null => None::<i64>,
+            _ => Some(
+                text_arg(args, 0)
+                    .chars()
+                    .next()
+                    .map_or(0, |c| i64::from(u32::from(c))),
+            ),
         },
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
@@ -984,6 +998,505 @@ fn format_interval(months: i64, days: i64, micros: i64) -> String {
     parts.join(" ")
 }
 
+/// PostgreSQL's float math raises errors where SQLite returns NULL or lets
+/// the float saturate: logarithms and square roots of invalid inputs, and
+/// exp and power results that overflow or underflow float8. The dialect
+/// resolves these functions here instead of to the engine builtins.
+pub(crate) fn exec_math_with_range_errors(name: &str, args: &[Value]) -> Result<Value> {
+    if name == "chr" {
+        return exec_pg_chr(&args[0]);
+    }
+    let Some(x) = float_argument(&args[0])? else {
+        return Ok(Value::Null);
+    };
+    let result = match name {
+        "exp" => {
+            let result = x.exp();
+            if x.is_finite() {
+                if result.is_infinite() {
+                    return Err(float_out_of_range("overflow"));
+                }
+                if result == 0.0 {
+                    return Err(float_out_of_range("underflow"));
+                }
+            }
+            result
+        }
+        "sqrt" => {
+            if x < 0.0 {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+                    "cannot take square root of a negative number",
+                ));
+            }
+            x.sqrt()
+        }
+        "ln" => checked_ln(x)?,
+        "log" if args.len() == 1 => {
+            checked_ln(x)?;
+            x.log10()
+        }
+        "log" => {
+            let Some(y) = float_argument(&args[1])? else {
+                return Ok(Value::Null);
+            };
+            let ln_base = checked_ln(x)?;
+            let ln_value = checked_ln(y)?;
+            if ln_base == 0.0 {
+                return Err(sqlstate_error(
+                    SQLSTATE_DIVISION_BY_ZERO,
+                    "division by zero",
+                ));
+            }
+            ln_value / ln_base
+        }
+        "power" | "pow" => {
+            let Some(y) = float_argument(&args[1])? else {
+                return Ok(Value::Null);
+            };
+            if x == 0.0 && y < 0.0 {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+                    "zero raised to a negative power is undefined",
+                ));
+            }
+            if x < 0.0 && y.is_finite() && y.fract() != 0.0 {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_ARGUMENT_FOR_POWER_FUNCTION,
+                    "a negative number raised to a non-integer power yields a complex result",
+                ));
+            }
+            let result = x.powf(y);
+            if x.is_finite() && y.is_finite() {
+                if result.is_infinite() {
+                    return Err(float_out_of_range("overflow"));
+                }
+                if result == 0.0 && x != 0.0 {
+                    return Err(float_out_of_range("underflow"));
+                }
+            }
+            result
+        }
+        _ => {
+            return Err(sqlstate_error(
+                SQLSTATE_UNDEFINED_FUNCTION,
+                format!("no such function: {name}"),
+            ))
+        }
+    };
+    Ok(Value::from_f64(result))
+}
+
+fn checked_ln(x: f64) -> Result<f64> {
+    if x == 0.0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_ARGUMENT_FOR_LOG,
+            "cannot take logarithm of zero",
+        ));
+    }
+    if x < 0.0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_ARGUMENT_FOR_LOG,
+            "cannot take logarithm of a negative number",
+        ));
+    }
+    Ok(x.ln())
+}
+
+/// PostgreSQL's chr is strict and rejects code points its text cannot
+/// hold; the engine's own chr turns NULL into an empty string.
+fn exec_pg_chr(value: &Value) -> Result<Value> {
+    let code = match value {
+        Value::Null => return Ok(Value::Null),
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        other => match strict_numeric_argument(other) {
+            Some(Numeric::Integer(i)) => i,
+            _ => {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                    format!("invalid input syntax for type integer: \"{other}\""),
+                ))
+            }
+        },
+    };
+    if code < 0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "character number must be positive",
+        ));
+    }
+    if code == 0 {
+        return Err(sqlstate_error(
+            SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+            "null character not permitted",
+        ));
+    }
+    let character = u32::try_from(code).ok().and_then(char::from_u32);
+    let Some(character) = character else {
+        return Err(sqlstate_error(
+            SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+            format!("requested character too large for encoding: {code}"),
+        ));
+    };
+    Ok(Value::build_text(character.to_string()))
+}
+
+/// The float value of a math function argument, coerced the way
+/// PostgreSQL coerces an unknown literal to double precision: NULL stays
+/// NULL, and text must be a number or an Infinity or NaN word.
+fn float_argument(value: &Value) -> Result<Option<f64>> {
+    if let Value::Text(t) = value {
+        let trimmed = t.as_str().trim();
+        if let Some(f) = float_word(trimmed) {
+            return Ok(Some(f));
+        }
+        return match strict_numeric_argument(value) {
+            Some(n) => Ok(Some(n.to_f64())),
+            None => Err(sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type double precision: \"{}\"",
+                    t.as_str()
+                ),
+            )),
+        };
+    }
+    Ok(Option::<Numeric>::from(value).map(|n| n.to_f64()))
+}
+
+/// The numeric value of an argument PostgreSQL would coerce strictly:
+/// non-decimal integer text is accepted, other text must parse fully.
+fn strict_numeric_argument(value: &Value) -> Option<Numeric> {
+    if let Value::Text(t) = value {
+        let trimmed = t.as_str().trim();
+        if has_non_decimal_prefix(trimmed) {
+            return match parse_integer_input(trimmed) {
+                IntegerInput::Value(v) => Some(Numeric::Integer(v)),
+                IntegerInput::OutOfRange | IntegerInput::Invalid => None,
+            };
+        }
+    }
+    Numeric::from_value_strict(value)
+}
+
+/// The special float words PostgreSQL accepts, which the engine's numeric
+/// type cannot hold: NaN, and Infinity in each spelling and sign.
+fn float_word(trimmed: &str) -> Option<f64> {
+    let negative = trimmed.starts_with('-');
+    let word = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    match word.to_ascii_lowercase().as_str() {
+        "inf" | "infinity" if negative => Some(f64::NEG_INFINITY),
+        "inf" | "infinity" => Some(f64::INFINITY),
+        "nan" => Some(f64::NAN),
+        _ => None,
+    }
+}
+
+fn float_out_of_range(direction: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+        format!("value out of range: {direction}"),
+    )
+}
+
+/// pg_cast_input(value, type) validates and converts a cast's input with
+/// PostgreSQL's input rules, where SQLite's CAST would accept anything. The
+/// translator wraps casts to the numeric, json, and jsonb types with it; the
+/// SQLite CAST that follows sees only values it keeps unchanged.
+fn exec_pg_cast_input(value: &Value, cast_type: &str) -> Result<Value> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    match cast_type {
+        "smallint" => integer_cast_input(value, cast_type, i16::MIN as i64, i16::MAX as i64),
+        "integer" => integer_cast_input(value, cast_type, i32::MIN as i64, i32::MAX as i64),
+        "bigint" => integer_cast_input(value, cast_type, i64::MIN, i64::MAX),
+        "real" | "double precision" | "numeric" => float_cast_input(value, cast_type),
+        "json" | "jsonb" => json_cast_input(value),
+        _ => Err(LimboError::InternalError(format!(
+            "pg_cast_input does not handle type {cast_type}"
+        ))),
+    }
+}
+
+fn integer_cast_input(value: &Value, cast_type: &str, min: i64, max: i64) -> Result<Value> {
+    match value {
+        Value::Numeric(Numeric::Integer(i)) => {
+            if *i < min || *i > max {
+                return Err(cast_out_of_range(cast_type));
+            }
+            Ok(value.clone())
+        }
+        Value::Numeric(Numeric::Float(f)) => {
+            let rounded = f64::from(*f).round();
+            // max + 1 is -min, a power of two that f64 holds exactly; max itself
+            // rounds up to 2^63 for bigint.
+            if !rounded.is_finite() || rounded < min as f64 || rounded >= -(min as f64) {
+                return Err(cast_out_of_range(cast_type));
+            }
+            Ok(Value::from_i64(rounded as i64))
+        }
+        Value::Text(t) => match parse_integer_input(t.as_str().trim()) {
+            IntegerInput::Value(v) if v >= min && v <= max => Ok(Value::from_i64(v)),
+            IntegerInput::Value(_) | IntegerInput::OutOfRange => {
+                Err(text_out_of_range(cast_type, t.as_str()))
+            }
+            IntegerInput::Invalid => Err(invalid_cast_input(cast_type, t.as_str())),
+        },
+        _ => Ok(value.clone()),
+    }
+}
+
+enum IntegerInput {
+    Value(i64),
+    OutOfRange,
+    Invalid,
+}
+
+/// Parses integer text the way PostgreSQL's integer input does: an optional
+/// sign, then decimal digits or a 0x/0o/0b prefix with digits of that base,
+/// with single underscores allowed between digits.
+fn parse_integer_input(text: &str) -> IntegerInput {
+    let negative = text.starts_with('-');
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let lower = unsigned.to_ascii_lowercase();
+    let (radix, digits) = match lower.strip_prefix("0x") {
+        Some(digits) => (16, digits),
+        None => match lower.strip_prefix("0o") {
+            Some(digits) => (8, digits),
+            None => match lower.strip_prefix("0b") {
+                Some(digits) => (2, digits),
+                None => (10, lower.as_str()),
+            },
+        },
+    };
+    if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') {
+        return IntegerInput::Invalid;
+    }
+    let mut magnitude: u64 = 0;
+    let mut out_of_range = false;
+    let mut previous_was_underscore = false;
+    for c in digits.chars() {
+        if c == '_' {
+            if previous_was_underscore {
+                return IntegerInput::Invalid;
+            }
+            previous_was_underscore = true;
+            continue;
+        }
+        previous_was_underscore = false;
+        let Some(digit) = c.to_digit(radix) else {
+            return IntegerInput::Invalid;
+        };
+        match magnitude
+            .checked_mul(radix as u64)
+            .and_then(|m| m.checked_add(digit as u64))
+        {
+            Some(m) => magnitude = m,
+            None => out_of_range = true,
+        }
+    }
+    if out_of_range {
+        return IntegerInput::OutOfRange;
+    }
+    let limit = if negative {
+        i64::MIN.unsigned_abs()
+    } else {
+        i64::MAX as u64
+    };
+    if magnitude > limit {
+        return IntegerInput::OutOfRange;
+    }
+    IntegerInput::Value(if negative {
+        (magnitude as i128).wrapping_neg() as i64
+    } else {
+        magnitude as i64
+    })
+}
+
+fn float_cast_input(value: &Value, cast_type: &str) -> Result<Value> {
+    let overflows_real = |f: f64| cast_type == "real" && f.is_finite() && (f as f32).is_infinite();
+    let underflows_real =
+        |f: f64| cast_type == "real" && f != 0.0 && f.is_finite() && (f as f32) == 0.0;
+    match value {
+        Value::Numeric(Numeric::Integer(_)) => Ok(value.clone()),
+        Value::Numeric(Numeric::Float(f)) => {
+            let f = f64::from(*f);
+            if overflows_real(f) || underflows_real(f) {
+                return Err(cast_out_of_range(cast_type));
+            }
+            Ok(value.clone())
+        }
+        Value::Text(t) => {
+            let mut trimmed = t.as_str().trim();
+            // Every numeric input of PostgreSQL takes the non-decimal
+            // integer forms: numeric by rule, the float types through
+            // strtod. Underscores between digits are numeric-only.
+            if has_non_decimal_prefix(trimmed) {
+                return match parse_integer_input(trimmed) {
+                    IntegerInput::Value(v) => Ok(Value::from_i64(v)),
+                    IntegerInput::OutOfRange => Err(text_out_of_range(cast_type, t.as_str())),
+                    IntegerInput::Invalid => Err(invalid_cast_input(cast_type, t.as_str())),
+                };
+            }
+            let without_underscores;
+            if cast_type == "numeric" && trimmed.contains('_') {
+                match strip_digit_group_underscores(trimmed) {
+                    Some(stripped) => {
+                        without_underscores = stripped;
+                        trimmed = &without_underscores;
+                    }
+                    None => return Err(invalid_cast_input(cast_type, t.as_str())),
+                }
+            }
+            let spells_infinity = trimmed.to_ascii_lowercase().contains("inf");
+            // PostgreSQL's numeric has a far larger range than float8, so a
+            // value like '1e400' is valid numeric input; this engine stores
+            // it as the float it parsed to. The float types report values
+            // beyond their range in either direction.
+            let out_of_range = |f: f64| {
+                (cast_type != "numeric" && f.is_infinite() && !spells_infinity)
+                    || (cast_type != "numeric" && f == 0.0 && has_nonzero_mantissa(trimmed))
+                    || overflows_real(f)
+                    || underflows_real(f)
+            };
+            match trimmed.parse::<f64>() {
+                Ok(f) if out_of_range(f) => Err(text_out_of_range(cast_type, trimmed)),
+                Ok(f) => Ok(Value::from_f64(f)),
+                // PostgreSQL's numeric rejects trailing junk as invalid
+                // syntax; only the float types parse like strtod and report
+                // the overflow of a prefix like '1e999' first.
+                Err(_) if cast_type == "numeric" => Err(invalid_cast_input(cast_type, t.as_str())),
+                Err(_) => match overflowing_float_prefix(trimmed) {
+                    Some(prefix) => Err(text_out_of_range(cast_type, prefix)),
+                    None => Err(invalid_cast_input(cast_type, t.as_str())),
+                },
+            }
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+/// Removes PostgreSQL's digit-group underscores: each must sit between
+/// two digits. Returns None when one does not.
+fn strip_digit_group_underscores(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'_'
+            && !(i > 0
+                && bytes[i - 1].is_ascii_digit()
+                && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+        {
+            return None;
+        }
+    }
+    Some(text.replace('_', ""))
+}
+
+/// Whether the digits before the exponent are not all zero, so a parse
+/// that came back exactly zero lost the value to underflow.
+fn has_nonzero_mantissa(text: &str) -> bool {
+    text.split(['e', 'E'])
+        .next()
+        .is_some_and(|mantissa| mantissa.bytes().any(|b| b.is_ascii_digit() && b != b'0'))
+}
+
+fn has_non_decimal_prefix(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let mut prefix = unsigned.chars().take(2).map(|c| c.to_ascii_lowercase());
+    prefix.next() == Some('0') && matches!(prefix.next(), Some('x' | 'o' | 'b'))
+}
+
+/// PostgreSQL parses float text like strtod, so '1e999x' reports the
+/// overflow of '1e999' rather than the trailing junk.
+fn overflowing_float_prefix(text: &str) -> Option<&str> {
+    let prefix = &text[..float_syntax_prefix_len(text)];
+    match prefix.parse::<f64>() {
+        Ok(f) if f.is_infinite() => Some(prefix),
+        _ => None,
+    }
+}
+
+/// The length of the longest leading substring with number syntax:
+/// an optional sign, digits with an optional fraction, and an optional
+/// exponent. Infinity and NaN words never overflow, so they are not part
+/// of this scan.
+fn float_syntax_prefix_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let integer_start = i;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    let mut has_digits = i > integer_start;
+    if bytes.get(i) == Some(&b'.') {
+        let fraction_start = i + 1;
+        let mut j = fraction_start;
+        while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+            j += 1;
+        }
+        if has_digits || j > fraction_start {
+            i = j;
+            has_digits = true;
+        }
+    }
+    if !has_digits {
+        return 0;
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        let mut j = i + 1;
+        if matches!(bytes.get(j), Some(b'+' | b'-')) {
+            j += 1;
+        }
+        let exponent_start = j;
+        while bytes.get(j).is_some_and(u8::is_ascii_digit) {
+            j += 1;
+        }
+        if j > exponent_start {
+            i = j;
+        }
+    }
+    i
+}
+
+fn json_cast_input(value: &Value) -> Result<Value> {
+    if let Value::Text(t) = value {
+        // RawValue checks the syntax without building a value, so numbers
+        // beyond f64's range stay valid like they are in PostgreSQL.
+        if serde_json::from_str::<&serde_json::value::RawValue>(t.as_str()).is_err() {
+            return Err(sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                "invalid input syntax for type json",
+            ));
+        }
+    }
+    Ok(value.clone())
+}
+
+fn invalid_cast_input(cast_type: &str, input: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_INVALID_TEXT_REPRESENTATION,
+        format!("invalid input syntax for type {cast_type}: \"{input}\""),
+    )
+}
+
+fn text_out_of_range(cast_type: &str, input: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+        format!("value \"{input}\" is out of range for type {cast_type}"),
+    )
+}
+
+fn cast_out_of_range(cast_type: &str) -> LimboError {
+    sqlstate_error(
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+        format!("{cast_type} out of range"),
+    )
+}
+
 /// pg_input_is_valid(text, type) → boolean
 /// Returns true if the text is valid input for the given type.
 fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Option<Boolean> {
@@ -1037,6 +1550,16 @@ fn pg_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// The message and SQLSTATE of a failed cast-input check, in the shape
+/// validate_pg_input reports.
+fn cast_input_error(result: Result<Value>) -> Option<(String, String)> {
+    match result {
+        Ok(_) => None,
+        Err(LimboError::Dialect(error)) => Some((error.message, error.code.to_string())),
+        Err(other) => Some((other.to_string(), "22P02".to_string())),
+    }
+}
+
 /// Validate input for a PostgreSQL type, returning error info if invalid.
 ///
 /// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
@@ -1066,77 +1589,33 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 ))
             }
         }
-        "int2" | "smallint" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type smallint"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type smallint: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int4" | "integer" | "int" => match trimmed.parse::<i64>() {
-            Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Some((
-                format!("value \"{input}\" is out of range for type integer"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type integer: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "int8" | "bigint" => match trimmed.parse::<i64>() {
-            Ok(_) => None,
-            Err(_) => {
-                if trimmed.parse::<i128>().is_ok() {
-                    Some((
-                        format!("value \"{input}\" is out of range for type bigint"),
-                        "22003".to_string(),
-                    ))
-                } else {
-                    Some((
-                        format!("invalid input syntax for type bigint: \"{input}\""),
-                        "22P02".to_string(),
-                    ))
-                }
-            }
-        },
-        "float4" | "real" => match trimmed.parse::<f32>() {
-            Ok(v) if v.is_infinite() => Some((
-                format!("value \"{input}\" is out of range for type real"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type real: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "float8" | "double precision" => match trimmed.parse::<f64>() {
-            Ok(v) if v.is_infinite() => Some((
-                format!("value \"{input}\" is out of range for type double precision"),
-                "22003".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type double precision: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
-        "numeric" | "decimal" => match trimmed.parse::<f64>() {
-            Ok(v) if v.is_nan() || v.is_infinite() => Some((
-                format!("invalid input syntax for type numeric: \"{input}\""),
-                "22P02".to_string(),
-            )),
-            Ok(_) => None,
-            Err(_) => Some((
-                format!("invalid input syntax for type numeric: \"{input}\""),
-                "22P02".to_string(),
-            )),
-        },
+        // The numeric types validate with the same parsers as casts and
+        // column assignments, so pg_input_is_valid cannot disagree with
+        // what a cast accepts.
+        "int2" | "smallint" => cast_input_error(exec_pg_cast_input(
+            &Value::build_text(input.to_string()),
+            "smallint",
+        )),
+        "int4" | "integer" | "int" => cast_input_error(exec_pg_cast_input(
+            &Value::build_text(input.to_string()),
+            "integer",
+        )),
+        "int8" | "bigint" => cast_input_error(exec_pg_cast_input(
+            &Value::build_text(input.to_string()),
+            "bigint",
+        )),
+        "float4" | "real" => cast_input_error(exec_pg_cast_input(
+            &Value::build_text(input.to_string()),
+            "real",
+        )),
+        "float8" | "double precision" => cast_input_error(exec_pg_cast_input(
+            &Value::build_text(input.to_string()),
+            "double precision",
+        )),
+        "numeric" | "decimal" => cast_input_error(exec_pg_cast_input(
+            &Value::build_text(input.to_string()),
+            "numeric",
+        )),
         "text" => None,
         "varchar" | "character varying" => {
             if let Some(max_len) = type_mod {

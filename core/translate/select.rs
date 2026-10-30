@@ -596,6 +596,9 @@ fn prepare_one_select_plan(
                     if !group_by.exprs.is_empty() {
                         // Normal GROUP BY with expressions
                         for expr in group_by.exprs.iter_mut() {
+                            if !resolver.catalog.dialect.allows_non_integer_sort_constants() {
+                                reject_non_integer_sort_constant(expr, "GROUP BY")?;
+                            }
                             replace_column_number_with_copy_of_column_expr(
                                 expr,
                                 &plan.result_columns,
@@ -658,6 +661,31 @@ fn prepare_one_select_plan(
                     && resolver.move_aggregate_to_enclosing_query(agg.clone()))
             });
 
+            if !plan.aggregates.is_empty()
+                && plan
+                    .group_by
+                    .as_ref()
+                    .is_none_or(|group_by| group_by.exprs.is_empty())
+                && !resolver
+                    .catalog
+                    .dialect
+                    .allows_bare_columns_in_aggregate_queries()
+            {
+                for result_column in plan
+                    .result_columns
+                    .iter()
+                    .filter(|rc| !rc.contains_aggregates)
+                {
+                    if let Some(column) =
+                        first_column_reference(&result_column.expr, &plan.table_references)?
+                    {
+                        crate::bail_parse_error!(
+                            "column \"{column}\" must appear in the GROUP BY clause or be used in an aggregate function"
+                        );
+                    }
+                }
+            }
+
             // HAVING without GROUP BY requires aggregates in the SELECT
             if let Some(ref group_by) = plan.group_by {
                 if group_by.exprs.is_empty()
@@ -677,6 +705,9 @@ fn prepare_one_select_plan(
                 .is_some_and(|gb| !gb.exprs.is_empty());
 
             for mut o in order_by {
+                if !resolver.catalog.dialect.allows_non_integer_sort_constants() {
+                    reject_non_integer_sort_constant(&o.expr, "ORDER BY")?;
+                }
                 replace_column_number_with_copy_of_column_expr(
                     &mut o.expr,
                     &plan.result_columns,
@@ -925,6 +956,34 @@ fn prepare_one_select_plan(
             Ok(plan)
         }
     }
+}
+
+/// The first column that `expr` references, as "table.column", for the
+/// bare-column error of dialects that reject bare columns in aggregate
+/// queries.
+fn first_column_reference(expr: &ast::Expr, tables: &TableReferences) -> Result<Option<String>> {
+    let mut found = None;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if found.is_none() {
+            if let ast::Expr::Column { table, column, .. } = e {
+                if let Some(joined) = tables
+                    .joined_tables()
+                    .iter()
+                    .find(|t| t.internal_id == *table)
+                {
+                    if let Some(name) = joined
+                        .table
+                        .get_column_at(*column)
+                        .and_then(|c| c.name.as_deref())
+                    {
+                        found = Some(format!("{}.{}", joined.identifier, name));
+                    }
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
 }
 
 fn first_aggregate_without_over_clause<'a>(
@@ -1271,6 +1330,29 @@ fn replace_column_number_with_copy_of_column_expr(
             *order_by_or_group_by_expr = expr.clone();
         }
         // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
+    }
+    Ok(())
+}
+
+/// PostgreSQL reads an integer constant in ORDER BY or GROUP BY as a
+/// select-list position and rejects any other bare constant as a syntax
+/// error. A constant inside an expression — a COLLATE clause, a cast —
+/// is fine.
+fn reject_non_integer_sort_constant(expr: &ast::Expr, clause_name: &str) -> Result<()> {
+    let mut expr = expr;
+    while let ast::Expr::Parenthesized(inner) = expr {
+        if inner.len() != 1 {
+            return Ok(());
+        }
+        expr = &inner[0];
+    }
+    let non_integer = match expr {
+        ast::Expr::Literal(ast::Literal::String(_) | ast::Literal::Null) => true,
+        ast::Expr::Literal(ast::Literal::Numeric(num)) => num.parse::<i32>().is_err(),
+        _ => false,
+    };
+    if non_integer {
+        crate::bail_parse_error!("non-integer constant in {}", clause_name);
     }
     Ok(())
 }
@@ -1715,6 +1797,9 @@ fn process_having_clause(
     resolver: &Resolver,
     aggregate_expressions: &mut Vec<super::plan::Aggregate>,
 ) -> Result<Vec<ast::Expr>> {
+    if !resolver.catalog.dialect.allows_numeric_constants_in_where() {
+        super::planner::reject_numeric_constant_condition(&having, "HAVING")?;
+    }
     let mut predicates = vec![];
     break_predicate_at_and_boundaries(&having, &mut predicates);
 

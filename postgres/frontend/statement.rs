@@ -29,8 +29,26 @@ pub(crate) enum TxRole {
     Commit,
     /// Ends an aborted block by rolling back.
     Rollback,
+    /// Rejected with 25P01 outside a transaction block.
+    Savepoint,
+    /// Rejected with 25P01 outside a transaction block.
+    Release,
     /// Allowed while aborted; success returns the block to normal.
+    /// Rejected with 25P01 outside a transaction block.
     RollbackToSavepoint,
+}
+
+impl TxRole {
+    /// The command name PostgreSQL uses when rejecting this statement
+    /// outside a transaction block, for the roles it rejects.
+    fn needs_tx_block(self) -> Option<&'static str> {
+        match self {
+            TxRole::Savepoint => Some("SAVEPOINT"),
+            TxRole::Release => Some("RELEASE SAVEPOINT"),
+            TxRole::RollbackToSavepoint => Some("ROLLBACK TO SAVEPOINT"),
+            TxRole::Other | TxRole::Begin | TxRole::Commit | TxRole::Rollback => None,
+        }
+    }
 }
 
 /// Per-session transaction state that PostgreSQL keeps and Turso's core
@@ -230,9 +248,16 @@ impl Statement {
         let Some(t) = &self.tx_tracking else {
             return Ok(Some(false));
         };
+        if let (Some(command), true) = (t.role.needs_tx_block(), t.conn.get_auto_commit()) {
+            return Err(crate::error::sqlstate_error(
+                turso_pg_parser::sqlstate::SQLSTATE_NO_ACTIVE_SQL_TRANSACTION,
+                format!("{command} can only be used in transaction blocks"),
+            )
+            .into());
+        }
         if t.tx.is_aborted() {
             match t.role {
-                TxRole::Other | TxRole::Begin => {
+                TxRole::Other | TxRole::Begin | TxRole::Savepoint | TxRole::Release => {
                     return Err(in_failed_sql_transaction_error().into());
                 }
                 TxRole::Commit | TxRole::Rollback => {
@@ -263,7 +288,11 @@ impl Statement {
             // replaced it with success before this runs; a BEGIN error that
             // survives post_run, like a rejected access-mode change, aborts
             // the block like any other error.
-            TxRole::Begin | TxRole::Other | TxRole::RollbackToSavepoint => {
+            TxRole::Begin
+            | TxRole::Other
+            | TxRole::Savepoint
+            | TxRole::Release
+            | TxRole::RollbackToSavepoint => {
                 if was_in_tx {
                     t.tx.abort();
                 }
@@ -278,7 +307,7 @@ impl Statement {
         match t.role {
             TxRole::RollbackToSavepoint => t.tx.aborted.store(false, Ordering::Relaxed),
             TxRole::Commit | TxRole::Rollback => t.tx.transaction_ended(),
-            TxRole::Begin | TxRole::Other => {}
+            TxRole::Begin | TxRole::Other | TxRole::Savepoint | TxRole::Release => {}
         }
     }
 

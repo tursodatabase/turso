@@ -693,3 +693,24 @@ expect {
     -1
     1
 }
+
+test txn-savepoint-outside-block {
+    SAVEPOINT sp;
+}
+@sqlstate 25P01
+expect error {
+}
+
+test txn-release-savepoint-outside-block {
+    RELEASE SAVEPOINT sp;
+}
+@sqlstate 25P01
+expect error {
+}
+
+test txn-rollback-to-savepoint-outside-block {
+    ROLLBACK TO SAVEPOINT sp;
+}
+@sqlstate 25P01
+expect error {
+}

@@ -60,3 +60,639 @@ test error-drop-domain-used-by-table-in-other-schema {
 }
 @sqlstate 2BP01
 expect error {}
+
+test error-create-table-duplicate-column {
+    CREATE TABLE dupcol (x int, x int);
+}
+@sqlstate 42701
+expect error {
+}
+
+test error-add-column-duplicate {
+    CREATE TABLE adddup (x int);
+    ALTER TABLE adddup ADD COLUMN x int;
+}
+@sqlstate 42701
+expect error {
+}
+
+test error-drop-missing-view {
+    DROP VIEW no_such_view;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test error-drop-missing-index {
+    DROP INDEX no_such_index;
+}
+@sqlstate 42704
+expect error {
+}
+
+test error-cast-junk-to-int {
+    SELECT 'x9q'::int;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-empty-to-int {
+    SELECT ''::int;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-spaced-digits-to-int {
+    SELECT ' 7 7'::int;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-junk-to-float8 {
+    SELECT '12ab'::float8;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-overflowing-text-to-float8 {
+    SELECT '1e999'::float8;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-junk-to-numeric {
+    SELECT 'x9q'::numeric;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-junk-to-boolean {
+    SELECT 'x9q'::boolean;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-junk-to-json {
+    SELECT 'x9q'::json;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-int2-out-of-range {
+    SELECT 99999::int2;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-int4-out-of-range {
+    SELECT 9999999999::int4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-text-out-of-range-smallint {
+    SELECT '99999'::int2;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-text-out-of-range-bigint {
+    SELECT '99999999999999999999'::bigint;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-float8-out-of-range-real {
+    SELECT 1e300::float4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-accepts-valid-text-inputs {
+    SELECT ' 42 '::int, '-7'::int2, '+5'::int8, '1.5'::float8, 'true'::boolean, 'f'::boolean;
+}
+expect {
+    42|-7|5|1.5|t|f
+}
+
+test cast-json-preserves-text {
+    SELECT '{"a" : 1}'::json;
+}
+expect {
+    {"a" : 1}
+}
+
+test cast-float-to-int-rounds {
+    SELECT 1.7::int, (-1.7)::int;
+}
+expect {
+    2|-2
+}
+
+test error-where-integer {
+    SELECT 1 WHERE 1;
+}
+@sqlstate 42804
+expect error {
+}
+
+test error-where-numeric {
+    SELECT 1 WHERE 1.5;
+}
+@sqlstate 42804
+expect error {
+}
+
+test error-where-integer-update {
+    CREATE TABLE wupd (x int);
+    UPDATE wupd SET x = 1 WHERE 1;
+}
+@sqlstate 42804
+expect error {
+}
+
+test error-where-integer-delete {
+    CREATE TABLE wdel (x int);
+    DELETE FROM wdel WHERE 1;
+}
+@sqlstate 42804
+expect error {
+}
+
+test error-bare-column-with-aggregate {
+    CREATE TABLE gagg (x int, y int);
+    SELECT x, count(*) FROM gagg;
+}
+@sqlstate 42803
+expect error {
+}
+
+test error-bare-column-in-expression-with-aggregate {
+    CREATE TABLE gexpr (x int);
+    SELECT x + 1, count(*) FROM gexpr;
+}
+@sqlstate 42803
+expect error {
+}
+
+test aggregate-with-constant-column {
+    CREATE TABLE gconst (x int);
+    SELECT 1, count(*) FROM gconst;
+}
+expect {
+    1|0
+}
+
+test error-cast-trailing-junk-numeric {
+    SELECT '1e999x'::numeric;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test cast-numeric-accepts-values-beyond-float8 {
+    SELECT CASE WHEN '1e400'::numeric > 0 THEN 'positive' ELSE 'other' END;
+}
+expect {
+    positive
+}
+
+test cast-json-accepts-numbers-beyond-float8 {
+    SELECT '[1e400]'::json;
+}
+expect {
+    [1e400]
+}
+
+test error-negate-boolean-is-undefined-operator {
+    SELECT - TRUE;
+}
+@sqlstate 42883
+expect error {
+}
+
+test ascii-returns-code-points {
+    SELECT ascii('A'), ascii(''), ascii('ツ');
+}
+expect {
+    65|0|12484
+}
+
+test cast-accepts-non-decimal-integers {
+    SELECT '0x10'::int4, '0o17'::int2, '0b101'::int8, '1_000'::int4,
+           CASE WHEN '0x10'::numeric = 16 THEN 'ok' ELSE 'no' END;
+}
+expect {
+    16|15|5|1000|ok
+}
+
+test error-cast-invalid-hex-digit {
+    SELECT '0x1g'::int4;
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-exp-overflow {
+    SELECT exp(1000::float8);
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-exp-underflow {
+    SELECT exp((-1000)::float8);
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-power-overflow {
+    SELECT power('1e200'::float8, 2);
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-power-zero-to-negative {
+    SELECT power(0, -1);
+}
+@sqlstate 2201F
+expect error {
+}
+
+test error-power-negative-to-fraction {
+    SELECT power(-2, 0.5);
+}
+@sqlstate 2201F
+expect error {
+}
+
+test error-sqrt-of-negative {
+    SELECT sqrt(-1);
+}
+@sqlstate 2201F
+expect error {
+}
+
+test error-ln-of-zero {
+    SELECT ln(0);
+}
+@sqlstate 2201E
+expect error {
+}
+
+test error-log-of-negative {
+    SELECT log(-5);
+}
+@sqlstate 2201E
+expect error {
+}
+
+test cast-nonzero-integer-to-boolean {
+    SELECT 5::boolean, 0::boolean, (-3)::boolean;
+}
+expect {
+    t|f|t
+}
+
+test chr-of-null-is-null {
+    SELECT CASE WHEN chr(NULL) IS NULL THEN 'null' ELSE 'text' END;
+}
+expect {
+    null
+}
+
+test error-chr-of-zero {
+    SELECT chr(0);
+}
+@sqlstate 54000
+expect error {
+}
+
+test math-functions-accept-nan-and-infinity-words {
+    SELECT 'ok' FROM (SELECT ln('NaN') AS a, exp('inf') AS b, sqrt('NaN') AS c) s;
+}
+expect {
+    ok
+}
+
+test error-missing-table-reported-before-where-type {
+    SELECT 1 FROM no_such_table_here WHERE 1;
+}
+@sqlstate 42P01
+expect error {
+}
+
+test error-order-by-string-constant {
+    SELECT 1 ORDER BY 'a';
+}
+@sqlstate 42601
+expect error {
+}
+
+test error-group-by-numeric-constant {
+    CREATE TABLE gc1 (a int4);
+    SELECT a FROM gc1 GROUP BY 1.5;
+}
+@sqlstate 42601
+expect error {
+}
+
+test error-create-index-missing-column {
+    CREATE TABLE cim (a int4);
+    CREATE INDEX cim_idx ON cim (nope);
+}
+@sqlstate 42703
+expect error {
+}
+
+test error-missing-table-reported-before-order-by-constant {
+    SELECT 1 FROM no_such_sort_table ORDER BY 'a';
+}
+@sqlstate 42P01
+expect error {
+}
+
+test order-by-collated-constant-is-an-expression {
+    CREATE TABLE obc (x int4);
+    INSERT INTO obc VALUES (1), (3);
+    SELECT x FROM obc ORDER BY 'a' COLLATE "C";
+}
+expect {
+    1
+    3
+}
+
+test order-by-boolean-cast-is-an-expression {
+    CREATE TABLE obb (x int4);
+    INSERT INTO obb VALUES (1), (3);
+    SELECT x FROM obb ORDER BY 1::boolean;
+}
+expect {
+    1
+    3
+}
+
+test error-exp-of-junk-text {
+    SELECT exp('abc');
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-sqrt-of-junk-text {
+    SELECT sqrt('abc');
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-cast-underflowing-text-to-float8 {
+    SELECT '1e-400'::float8;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-underflowing-value-to-real {
+    SELECT (1e-300)::float4;
+}
+@sqlstate 22003
+expect error {
+}
+
+test cast-numeric-accepts-digit-group-underscores {
+    SELECT CASE WHEN '1_000'::numeric = 1000 THEN 'ok' ELSE 'no' END;
+}
+expect {
+    ok
+}
+
+test cast-float8-accepts-hex-text {
+    SELECT CASE WHEN '0x10'::float8 = 16 THEN 'ok' ELSE 'no' END;
+}
+expect {
+    ok
+}
+
+test pg-input-is-valid-matches-cast-input {
+    SELECT CASE WHEN pg_input_is_valid('0x10', 'integer') THEN 'ok' ELSE 'no' END;
+}
+expect {
+    ok
+}
+
+test create-table-if-not-exists-skips-existing-with-dup-columns {
+    CREATE TABLE ine (a int4);
+    CREATE TABLE IF NOT EXISTS ine (x int4, x int4);
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+test error-create-table-if-not-exists-new-table-dup-columns {
+    CREATE TABLE IF NOT EXISTS inedup (x int4, x int4);
+}
+@sqlstate 42701
+expect error {
+}
+
+test error-insert-values-rows-of-different-lengths {
+    CREATE TABLE vlen (a int, b int, c text DEFAULT 'zz');
+    INSERT INTO vlen VALUES (1, 2), (3);
+}
+@sqlstate 42601
+expect error {
+}
+
+test error-insert-values-with-column-list-rows-of-different-lengths {
+    CREATE TABLE vlen (a int, b int, c text DEFAULT 'zz');
+    INSERT INTO vlen (a, b) VALUES (7, 8), (9);
+}
+@sqlstate 42601
+expect error {
+}
+
+test error-select-values-rows-of-different-lengths {
+    SELECT * FROM (VALUES (1, 2), (3)) t;
+}
+@sqlstate 42601
+expect error {
+}
+
+test error-cast-float-just-beyond-bigint {
+    SELECT '9223372036854775807'::float8::int8;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-cast-integer-literal-beyond-bigint {
+    SELECT 9223372036854775808::bigint;
+}
+@sqlstate 22003
+expect error {
+}
+
+test error-chr-of-negative-code {
+    SELECT chr(-1);
+}
+@sqlstate 22023
+expect error {
+}
+
+test error-chr-of-junk-text {
+    SELECT chr('abc');
+}
+@sqlstate 22P02
+expect error {
+}
+
+test error-pow-of-zero-to-negative-power {
+    SELECT pow(0, -1);
+}
+@sqlstate 2201F
+expect error {
+}
+
+test error-log-with-zero-base {
+    SELECT log(0, 8);
+}
+@sqlstate 2201E
+expect error {
+}
+
+test error-log-of-negative-number-with-base {
+    SELECT log(2, -8);
+}
+@sqlstate 2201E
+expect error {
+}
+
+test error-log-with-base-one {
+    SELECT log(1, 8);
+}
+@sqlstate 22012
+expect error {
+}
+
+test log-with-base {
+    SELECT CASE WHEN log(2, 8) = 3 THEN 'ok' ELSE 'no' END;
+}
+expect {
+    ok
+}
+
+test error-order-by-null {
+    SELECT 1 ORDER BY NULL;
+}
+@sqlstate 42601
+expect error {
+}
+
+test error-order-by-integer-beyond-int4 {
+    SELECT 1 ORDER BY 9999999999;
+}
+@sqlstate 42601
+expect error {
+}
+
+test error-group-by-null {
+    SELECT 1 GROUP BY NULL;
+}
+@sqlstate 42601
+expect error {
+}
+
+test error-having-numeric-constant {
+    CREATE TABLE hv (a int);
+    SELECT count(*) FROM hv HAVING 1;
+}
+@sqlstate 42804
+expect error {
+}
+
+test error-join-on-numeric-constant {
+    CREATE TABLE ja (a int);
+    CREATE TABLE jb (b int);
+    SELECT * FROM ja JOIN jb ON 1;
+}
+@sqlstate 42804
+expect error {
+}
+
+test error-unknown-operator {
+    SELECT 1 === 2;
+}
+@sqlstate 42883
+expect error {
+}
+
+test error-drop-index-of-table {
+    CREATE TABLE di (a int);
+    DROP INDEX di;
+}
+@sqlstate 42809
+expect error {
+}
+
+test error-create-index-expression-missing-column {
+    CREATE TABLE ie (a int);
+    CREATE INDEX ie_idx ON ie ((missing + 1));
+}
+@sqlstate 42703
+expect error {
+}
+
+test error-drop-index-of-view {
+    CREATE VIEW div AS SELECT 1;
+    DROP INDEX div;
+}
+@sqlstate 42809
+expect error {
+}
+
+test error-prefix-only-operator-used-as-infix {
+    SELECT 1 @ 2;
+}
+@sqlstate 42883
+expect error {
+}
+
+test error-unknown-prefix-operator {
+    SELECT !! 5;
+}
+@sqlstate 42883
+expect error {
+}
+
+test error-order-by-position-not-in-select-list {
+    CREATE TABLE obp (a int);
+    SELECT a FROM obp ORDER BY 2;
+}
+@sqlstate 42P10
+expect error {
+}
+
+test error-group-by-position-not-in-select-list {
+    CREATE TABLE gbp (a int);
+    SELECT a FROM gbp GROUP BY 5;
+}
+@sqlstate 42P10
+expect error {
+}

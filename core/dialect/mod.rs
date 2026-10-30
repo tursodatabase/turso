@@ -227,6 +227,34 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a constant that is not an integer may appear in ORDER BY
+    /// or GROUP BY.
+    ///
+    /// SQLite sorts and groups by the constant, which does nothing.
+    /// PostgreSQL reads integer constants as select-list positions and
+    /// rejects every other constant as a syntax error.
+    fn allows_non_integer_sort_constants(&self) -> bool {
+        true
+    }
+
+    /// Whether a numeric constant is a valid WHERE, HAVING, or JOIN/ON
+    /// condition.
+    ///
+    /// SQLite treats any nonzero number as true. PostgreSQL requires a
+    /// boolean and raises SQLSTATE 42804.
+    fn allows_numeric_constants_in_where(&self) -> bool {
+        true
+    }
+
+    /// Whether a result column outside any aggregate may reference a
+    /// column in an aggregate query that has no GROUP BY clause.
+    ///
+    /// SQLite allows these bare columns and takes their value from an
+    /// arbitrary row. PostgreSQL raises SQLSTATE 42803.
+    fn allows_bare_columns_in_aggregate_queries(&self) -> bool {
+        true
+    }
+
     /// Whether `mod` of two integers returns an integer.
     ///
     /// PostgreSQL returns an integer. SQLite always returns a REAL.
@@ -338,9 +366,10 @@ mod tests {
                 return sqlite::resolve_builtin_function("coalesce", arg_count);
             }
             if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
-                return Ok(Some(crate::function::Func::Dialect(
-                    "test_add_one".to_string(),
-                )));
+                return Ok(Some(crate::function::Func::Dialect {
+                    name: "test_add_one".to_string(),
+                    return_type: None,
+                }));
             }
             sqlite::resolve_builtin_function(name, arg_count)
         }

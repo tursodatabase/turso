@@ -1084,6 +1084,9 @@ fn resolve_sorted_columns_with_catalog(
                 expr,
             }
         } else {
+            if let Some(col_name) = first_unknown_column(unwrapped_expr, table) {
+                crate::bail_parse_error!("no such column: {}", col_name);
+            }
             if !validate_index_expression(unwrapped_expr, table) {
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
@@ -1225,6 +1228,22 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
+fn first_unknown_column(expr: &Expr, table: &BTreeTable) -> Option<String> {
+    let mut unknown = None;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
+        if unknown.is_some() {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if let Expr::Id(name) | Expr::Name(name) = e {
+            if table.get_column(name.as_str()).is_none() {
+                unknown = Some(name.as_str().to_string());
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    unknown
+}
+
 fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
