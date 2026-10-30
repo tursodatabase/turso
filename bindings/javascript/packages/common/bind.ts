@@ -30,7 +30,7 @@ export function bindParams(stmt, params) {
 
 // Check if object is plain (no prototype chain)
 function isPlainObject(obj) {
-  if (!obj || typeof obj !== 'object') return false;
+  if (!obj || typeof obj !== 'object' || ArrayBuffer.isView(obj)) return false;
   const proto = Object.getPrototypeOf(obj);
   return proto === Object.prototype || proto === null;
 }
