@@ -1414,3 +1414,57 @@ test update-or-replace-before-trigger-generated-column-reads-replaced-default {
 expect {
     d|d
 }
+
+@cross-check-integrity
+test update-or-ignore-strict-generated-column-skips-null-primary-key {
+    CREATE TABLE t(id INT PRIMARY KEY, a INT, c INT AS (a)) STRICT;
+    INSERT INTO t(id, a) VALUES (1, 1);
+    UPDATE OR IGNORE t SET id = NULL;
+    SELECT * FROM t;
+}
+expect {
+    1|1|1
+}
+
+@cross-check-integrity
+test update-or-replace-strict-generated-column-uses-primary-key-default {
+    CREATE TABLE t(id INT PRIMARY KEY DEFAULT 7, a INT, c INT AS (a)) STRICT;
+    INSERT INTO t(id, a) VALUES (1, 1);
+    UPDATE OR REPLACE t SET id = NULL;
+    SELECT * FROM t;
+}
+expect {
+    7|1|1
+}
+
+@cross-check-integrity
+test update-or-ignore-strict-before-trigger-skips-null-primary-key {
+    CREATE TABLE t(id INT PRIMARY KEY, a INT) STRICT;
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN SELECT 1; END;
+    INSERT INTO t(id, a) VALUES (1, 1);
+    UPDATE OR IGNORE t SET id = NULL;
+    SELECT * FROM t;
+}
+expect {
+    1|1
+}
+
+@cross-check-integrity
+test update-or-ignore-strict-generated-column-type-error-wins-over-null-primary-key {
+    CREATE TABLE t(id INT PRIMARY KEY, a INT, c INT AS (a)) STRICT;
+    INSERT INTO t(id, a) VALUES (1, 1);
+    UPDATE OR IGNORE t SET id = NULL, a = 'x';
+}
+expect error {
+    cannot store TEXT value in INT column t.a
+}
+
+@cross-check-integrity
+test update-strict-generated-column-null-primary-key-still-fails {
+    CREATE TABLE t(id INT PRIMARY KEY, a INT, c INT AS (a)) STRICT;
+    INSERT INTO t(id, a) VALUES (1, 1);
+    UPDATE t SET id = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.id
+}
