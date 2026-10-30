@@ -1957,8 +1957,8 @@ pub(crate) fn init_limit(
 /// DML row context. This takes into account stored columns, and any stored columns
 /// required by virtual columns in `target_columns`.
 ///
-/// Non-rowid target columns are allocated in target order. Rowid-alias columns resolve
-/// to `rowid_reg`, so callers that need an unpacked contiguous key or record must
+/// Non-rowid target columns are allocated in target order, once per distinct column.
+/// Rowid-alias columns resolve to `rowid_reg`, so callers that need an unpacked contiguous key or record must
 /// materialize one from `DmlColumnContext::to_column_reg`.
 pub(crate) fn emit_columns_and_dependencies(
     program: &mut ProgramBuilder,
@@ -1968,7 +1968,13 @@ pub(crate) fn emit_columns_and_dependencies(
     target_columns: impl IntoIterator<Item = usize>,
     resolver: &Resolver,
 ) -> Result<DmlColumnContext> {
-    let targets: Vec<usize> = target_columns.into_iter().collect();
+    // A foreign key may name the same column twice, e.g. FOREIGN KEY(a,a).
+    let mut targets: Vec<usize> = Vec::new();
+    for idx in target_columns {
+        if !targets.contains(&idx) {
+            targets.push(idx);
+        }
+    }
     let target_mask: ColumnMask = targets.iter().copied().try_collect()?;
     let non_rowid_targets: Vec<usize> = targets
         .iter()
