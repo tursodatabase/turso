@@ -1,3 +1,4 @@
+use crate::error::sqlstate_error;
 use crate::functions::validate_pg_input;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
@@ -14,6 +15,7 @@ use turso_core::{
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
+use turso_pg_parser::sqlstate::SQLSTATE_WRONG_OBJECT_TYPE;
 
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
 
@@ -196,6 +198,14 @@ impl Dialect for PostgresDialect {
 
     fn binds_names_at_create(&self) -> bool {
         true
+    }
+
+    fn relations_share_names(&self) -> bool {
+        true
+    }
+
+    fn wrong_relation_kind_error(&self, message: String) -> LimboError {
+        sqlstate_error(SQLSTATE_WRONG_OBJECT_TYPE, message)
     }
 
     fn supports_namespaces(&self) -> bool {

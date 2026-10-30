@@ -721,3 +721,152 @@ test cte-hides-table-of-search-path {
 expect {
     2
 }
+
+test drop-table-stops-at-a-view-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE VIEW sp_dk_a.t AS SELECT 1 AS c;
+    CREATE TABLE sp_dk_b.t (x int);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP TABLE t;
+}
+@sqlstate 42809
+expect error {
+    "t" is not a table
+}
+
+test drop-table-if-exists-stops-at-a-view-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE VIEW sp_dk_a.t AS SELECT 1 AS c;
+    CREATE TABLE sp_dk_b.t (x int);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP TABLE IF EXISTS t;
+}
+@sqlstate 42809
+expect error {
+    "t" is not a table
+}
+
+test drop-index-stops-at-a-table-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_a.i (x int);
+    CREATE TABLE sp_dk_b.u (x int);
+    CREATE INDEX i ON sp_dk_b.u (x);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP INDEX IF EXISTS i;
+}
+@sqlstate 42809
+expect error {
+    "i" is not an index
+}
+
+test drop-sequence-stops-at-a-table-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_a.sq (x int);
+    CREATE SEQUENCE sp_dk_b.sq;
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP SEQUENCE sq;
+}
+@sqlstate 42809
+expect error {
+    "sq" is not a sequence
+}
+
+test drop-table-stops-at-a-sequence-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE SEQUENCE sp_dk_a.t;
+    CREATE TABLE sp_dk_b.t (x int);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP TABLE t;
+}
+@sqlstate 42809
+expect error {
+    "t" is not a table
+}
+
+test drop-of-another-kind-named-with-a-schema-fails {
+    CREATE SCHEMA sp_dk_a;
+    CREATE VIEW sp_dk_a.v AS SELECT 1 AS c;
+    DROP TABLE sp_dk_a.v;
+}
+@sqlstate 42809
+expect error {
+    "v" is not a table
+}
+
+test drop-finds-the-first-relation-of-its-kind-through-search-path {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_b.t (x int);
+    CREATE INDEX i ON sp_dk_b.t (x);
+    CREATE SEQUENCE sp_dk_b.sq;
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP INDEX i;
+    DROP SEQUENCE sq;
+    DROP TABLE t;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'sp_dk_b';
+}
+expect {
+    0
+}
+
+test drop-if-exists-with-missing-schema-does-nothing {
+    DROP TABLE IF EXISTS sp_missing_ds.t;
+    DROP VIEW IF EXISTS sp_missing_ds.v;
+    DROP MATERIALIZED VIEW IF EXISTS sp_missing_ds.m;
+    DROP INDEX IF EXISTS sp_missing_ds.i;
+    DROP SEQUENCE IF EXISTS sp_missing_ds.s;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-with-missing-schema-fails {
+    DROP TABLE sp_missing_ds.t;
+}
+@sqlstate 3F000
+expect error {
+    schema "sp_missing_ds" does not exist
+}
+
+test nextval-stops-at-a-table-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_a.sq (x int);
+    CREATE SEQUENCE sp_dk_b.sq;
+    SET search_path TO sp_dk_a, sp_dk_b;
+    SELECT nextval('sq');
+}
+@sqlstate 42809
+expect error {
+    "sq" is not a sequence
+}
+
+test select-stops-at-an-index-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_a.u (x int);
+    CREATE INDEX t ON sp_dk_a.u (x);
+    CREATE TABLE sp_dk_b.t (y int);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    SELECT y FROM t;
+}
+@sqlstate 42809
+expect error {}
+
+test insert-stops-at-an-index-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_a.u (x int);
+    CREATE INDEX t ON sp_dk_a.u (x);
+    CREATE TABLE sp_dk_b.t (y int);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    INSERT INTO t VALUES (1);
+}
+@sqlstate 42809
+expect error {}
