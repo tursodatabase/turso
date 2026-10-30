@@ -531,7 +531,7 @@ mod columns {
         fn key_representation(&self) -> Value {
             match self {
                 Key::Integer(ref i) => Value::from_i64(*i),
-                Key::String(ref s) => Value::Text(Text::new(s.to_owned().replace("\\\"", "\""))),
+                Key::String(ref s) => Value::Text(Text::new(s.to_owned())),
                 Key::None => Value::Null,
             }
         }
@@ -715,7 +715,7 @@ impl InPlaceJsonPath {
             }
         };
         let unquoted_if_necessary = if needs_quotes { key } else { inner };
-        self.last_element = Key::String(inner.to_owned());
+        self.last_element = Key::String(jsonb::unescape_string(inner));
         self.push(format!(".{unquoted_if_necessary}"));
         Ok(())
     }

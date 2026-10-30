@@ -263,3 +263,45 @@ test json-tree-id-with-two-byte-container-header {
 expect {
     1891|501
 }
+
+test json-each-decoded-object-keys {
+    SELECT hex(key) FROM json_each('{"a\\nb":1,"e\\\\f":2,"c\\td":3,"\\u00e9":4,"\\ud83d\\ude00":5,"\\b\\f\\r\\/":6,"\\\\n":7,"c\\"d":8}') WHERE type = 'integer';
+}
+expect {
+    610A62
+    655C66
+    630964
+    C3A9
+    F09F9880
+    080C0D2F
+    5C6E
+    632264
+}
+
+test json-each-decoded-object-keys-jsonb {
+    SELECT hex(key) FROM json_each(jsonb('{"a\\nb":1,"e\\\\f":2,"c\\td":3,"\\u00e9":4,"\\ud83d\\ude00":5,"\\b\\f\\r\\/":6,"\\\\n":7,"c\\"d":8}')) WHERE type = 'integer';
+}
+expect {
+    610A62
+    655C66
+    630964
+    C3A9
+    F09F9880
+    080C0D2F
+    5C6E
+    632264
+}
+
+test json-tree-decoded-object-keys-keep-escaped-paths {
+    SELECT hex(key), fullkey, path FROM json_tree('{"p\\nq":{"a\\nb":1,"e\\\\f":2}}') WHERE key IS NOT NULL;
+    WITH d(j) AS (VALUES('{"p\\nq":{"a\\nb":1,"e\\\\f":2,"c\\"d":3}}'))
+    SELECT hex(key), json_extract(j, fullkey) = value FROM d, json_tree(j) WHERE type = 'integer';
+}
+expect {
+    700A71|$."p\\nq"|$
+    610A62|$."p\\nq"."a\\nb"|$."p\\nq"
+    655C66|$."p\\nq"."e\\\\f"|$."p\\nq"
+    610A62|1
+    655C66|1
+    632264|1
+}
