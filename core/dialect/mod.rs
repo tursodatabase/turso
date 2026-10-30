@@ -263,6 +263,15 @@ pub trait Dialect: Send + Sync + 'static {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         false
     }
+
+    /// Checks a call like `f(*)` to a function that is neither an aggregate
+    /// nor a window function.
+    ///
+    /// SQLite runs `f(*)` as `f()`. PostgreSQL accepts `*` only for
+    /// aggregates and raises an error.
+    fn check_star_call_of_plain_function(&self, _name: &str) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

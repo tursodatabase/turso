@@ -120,6 +120,9 @@ pub(crate) fn validate_check_expr(
                     if matches!(func, Func::Window(..)) {
                         bail_parse_error!("misuse of window function {}()", name.as_str());
                     }
+                    resolver
+                        .dialect
+                        .check_star_call_of_plain_function(name.as_str())?;
                 } else {
                     bail_parse_error!("no such function: {}", name.as_str());
                 }

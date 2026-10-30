@@ -1487,6 +1487,17 @@ expect {
     hello
 }
 
+# A plain function called with (*) runs as a call with no arguments
+@cross-check-integrity
+test check_constraint_star_call_of_plain_function {
+    CREATE TABLE t(a INTEGER CHECK(random(*) IS NOT NULL));
+    INSERT INTO t VALUES(1);
+    SELECT * FROM t;
+}
+expect {
+    1
+}
+
 # Bug fix: CHECK on INTEGER PRIMARY KEY enforced during UPDATE
 @cross-check-integrity
 test check_constraint_ipk_update_violation {
