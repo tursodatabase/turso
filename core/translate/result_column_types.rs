@@ -96,7 +96,7 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
 
 fn builtin_primitive(ty: BuiltinType) -> Option<&'static str> {
     match ty {
-        BuiltinType::Integer => Some("INTEGER"),
+        BuiltinType::Integer | BuiltinType::Boolean => Some("INTEGER"),
         BuiltinType::Real | BuiltinType::Decimal => Some("REAL"),
         BuiltinType::Numeric => Some("NUMERIC"),
         BuiltinType::Text => Some("TEXT"),
