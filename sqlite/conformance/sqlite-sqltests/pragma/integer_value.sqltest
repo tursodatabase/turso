@@ -85,3 +85,11 @@ expect {
     2
     2
 }
+
+test pragma-cache-size-float-reads-leading-digits {
+    PRAGMA cache_size=1000.5e3;
+    PRAGMA cache_size;
+}
+expect {
+    1000
+}

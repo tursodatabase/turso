@@ -556,24 +556,11 @@ fn update_pragma(
             unreachable!();
         }
         PragmaName::PageSize => {
-            let page_size = match parse_signed_number(&value)? {
-                Value::Numeric(Numeric::Integer(size)) => size,
-                // SQLite's sqlite3Atoi reads only the leading digits of the literal,
-                // so 1024.5 is 1024 but 8.192e3 is 8. Negative sizes are invalid anyway.
-                Value::Numeric(Numeric::Float(size)) if f64::from(size) >= 0.0 => {
-                    let literal = match &value {
-                        Expr::Unary(_, inner) => inner.as_ref(),
-                        literal => literal,
-                    };
-                    let Expr::Literal(Literal::Numeric(digits)) = literal else {
-                        unreachable!("parse_signed_number only reads numeric literals");
-                    };
-                    crate::numeric::str_to_i64(digits).unwrap_or(0)
-                }
-                Value::Numeric(Numeric::Float(_)) => 0,
-                _ => bail_parse_error!("Invalid value for page size pragma"),
+            let data = parse_signed_number(&value)?;
+            let Some(page_size) = pragma_int_value(&value, &data) else {
+                bail_parse_error!("Invalid value for page size pragma");
             };
-            // Like SQLite's sqlite3Atoi, a value outside the 32-bit range reads as 0.
+            // A negative size is invalid, so it reads as 0 like an out-of-range one.
             update_page_size(
                 connection,
                 database_id,
