@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::error::sqlstate_error;
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
-use turso_core::{Connection, ExternalFunc, IOResult, OpenOptions, Register, Result, Value};
+use turso_core::{Connection, ExternalFunc, IOResult, OpenOptions, Register, Result};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
@@ -43,7 +43,13 @@ impl ScalarFunction for AuthFunction {
 }
 
 impl ScalarCall for AuthFunction {
-    fn step(&mut self, connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
+    type Output = Option<String>;
+
+    fn step(
+        &mut self,
+        connection: &Arc<Connection>,
+        _args: &[Register],
+    ) -> IOResultOr<Self::Output> {
         let value = match self {
             Self::Uid => claim(connection, "request.jwt.claim.sub", "sub")?
                 .map(|sub| canonical_uuid(&sub))
@@ -51,7 +57,7 @@ impl ScalarCall for AuthFunction {
             Self::Email => claim(connection, "request.jwt.claim.email", "email")?,
             Self::Jwt => jwt(connection)?,
         };
-        Ok(IOResult::Done(value.map_or(Value::Null, Value::build_text)))
+        Ok(IOResult::Done(value))
     }
 }
 

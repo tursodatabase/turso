@@ -4,6 +4,7 @@ use crate::LimboError;
 
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
+use crate::native_ext::ReturnType;
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
@@ -412,14 +413,20 @@ fn resolve_func_return_type(
         #[cfg(feature = "json")]
         Func::Json(jf) => resolve_json_func_return_type(jf),
         Func::Agg(_) => bail_parse_error!("misuse of aggregate function {}()", name),
-        Func::External(_) => {
-            bail_parse_error!(
-                "cannot determine return type of function {}() in CHECK constraint; \
-                 wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
-                name,
-                name
-            );
-        }
+        Func::External(func) => match func.func.return_type() {
+            Some(ReturnType::Integer) => Ok(CheckExprType::Integer),
+            Some(ReturnType::Real) => Ok(CheckExprType::Real),
+            Some(ReturnType::Text) => Ok(CheckExprType::Text),
+            Some(ReturnType::Blob) => Ok(CheckExprType::Blob),
+            None => {
+                bail_parse_error!(
+                    "cannot determine return type of function {}() in CHECK constraint; \
+                     wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
+                    name,
+                    name
+                );
+            }
+        },
         _ => Ok(CheckExprType::Any),
     }
 }

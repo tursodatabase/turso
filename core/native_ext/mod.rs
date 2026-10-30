@@ -1,13 +1,16 @@
 mod function;
 mod vtab;
 
-pub use function::{Aggregate, AggregateFunction, FunctionArity, ScalarCall, ScalarFunction};
+pub use function::{
+    Aggregate, AggregateFunction, FunctionArity, ReturnType, ScalarCall, ScalarFunction,
+    ScalarReturn,
+};
 pub use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, VTabKind};
 pub use vtab::{TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
 
 pub use function::AggregateState;
 pub(crate) use function::{
-    finalize_aggregate, step_aggregate, step_scalar, AggregateFactory, ScalarFactory,
+    finalize_aggregate, step_aggregate, step_scalar, AggregateFactory, ScalarFactory, ScalarStep,
 };
 pub(crate) use vtab::{ModuleFactory, NativeCursor, NativeTable};
 
@@ -18,7 +21,7 @@ use crate::{Database, OpenOptions, Result};
 
 pub(crate) enum ExtensionState {
     None,
-    ScalarCall(Box<dyn ScalarCall>),
+    ScalarCall(Box<dyn ScalarStep>),
     TableUpdate(Box<dyn TableUpdate>),
 }
 
