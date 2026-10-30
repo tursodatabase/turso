@@ -2480,7 +2480,7 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
-            rewrite_between_exprs(&mut expr.expr)?;
+            rewrite_between_exprs(&mut expr.expr, Some(resolver))?;
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
         // considered independently by constraint extraction and range planning.
@@ -2514,7 +2514,7 @@ pub fn parse_where(
     }
 }
 
-pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
+pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -> Result<()> {
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         if let Expr::Between {
             lhs,
@@ -2523,8 +2523,7 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
             end,
         } = e
         {
-            if matches!(start.as_ref(), Expr::Literal(_))
-                && matches!(end.as_ref(), Expr::Literal(_))
+            if is_literal_between_bound(start) && is_literal_between_bound(end)
             {
                 let mut lhs_has_subquery = false;
                 walk_expr(lhs, &mut |expr| {
@@ -2540,7 +2539,11 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
                     }
                     Ok(WalkControl::Continue)
                 })?;
-                if lhs_has_subquery {
+                let lhs_is_nondeterministic = match resolver {
+                    Some(resolver) => expr_contains_nondeterministic_scalar_function(lhs, resolver)?,
+                    None => false,
+                };
+                if lhs_has_subquery || lhs_is_nondeterministic {
                     return Ok(WalkControl::Continue);
                 }
             }
@@ -2583,6 +2586,15 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+fn is_literal_between_bound(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Unary(_, inner) => is_literal_between_bound(inner),
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_literal_between_bound(&exprs[0]),
+        _ => false,
+    }
 }
 
 /**

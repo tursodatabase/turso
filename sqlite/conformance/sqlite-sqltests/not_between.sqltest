@@ -158,3 +158,83 @@ test not-between-subquery-bound-orderby-offset {
 expect {
     0
 }
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test between-subquery-negative-literals {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE (SELECT test_nondet_counter() % 2 - 1 + t.a * 0) BETWEEN -1 AND -1;
+}
+expect {
+    2
+}
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test not-between-subquery-negative-literals {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE (SELECT test_nondet_counter() % 2 - 1 + t.a * 0) NOT BETWEEN -1 AND -1;
+}
+expect {
+    2
+}
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test between-subquery-parenthesized-literals {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE (SELECT test_nondet_counter() % 2 + t.a * 0) BETWEEN (0) AND (+0);
+}
+expect {
+    2
+}
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test between-nondeterministic-lhs-once {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE test_nondet_counter() % 2 + t.a * 0 BETWEEN 0 AND 0;
+}
+expect {
+    2
+}
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test not-between-nondeterministic-lhs-once {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE abs(test_nondet_counter() % 2 + t.a * 0) NOT BETWEEN -0 AND 0;
+}
+expect {
+    2
+}
+
+@backend cli
+@skip-if sqlite "uses the Turso test-only counter"
+test between-nondeterministic-negative-literals-delete {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    DELETE FROM t WHERE test_nondet_counter() % 2 - 1 + t.a * 0 BETWEEN -1 AND -1;
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    2
+    4
+}
+
+@cross-check-integrity
+test between-deterministic-partial-index-predicate {
+    CREATE TABLE t(a TEXT);
+    INSERT INTO t VALUES ('a'), ('bb'), ('ccc');
+    CREATE INDEX i ON t(a) WHERE length(a) BETWEEN 1 AND 2;
+    SELECT a FROM t INDEXED BY i WHERE length(a) BETWEEN 1 AND 2 ORDER BY a;
+}
+expect {
+    a
+    bb
+}
