@@ -1368,3 +1368,49 @@ expect {
     1|x|2
     fired
 }
+
+@cross-check-integrity
+test update-or-replace-strict-generated-column-reads-replaced-default {
+    CREATE TABLE t(b TEXT NOT NULL DEFAULT 'd', c TEXT AS (b) NOT NULL) STRICT;
+    INSERT INTO t(b) VALUES ('x');
+    UPDATE OR REPLACE t SET b = NULL;
+    SELECT * FROM t;
+}
+expect {
+    d|d
+}
+
+@cross-check-integrity
+test update-strict-generated-column-check-reads-replaced-default {
+    CREATE TABLE t(b TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'd', c TEXT AS (b), CHECK (c IS NOT NULL)) STRICT;
+    INSERT INTO t(b) VALUES ('x');
+    UPDATE t SET b = NULL;
+    SELECT * FROM t;
+}
+expect {
+    d|d
+}
+
+@cross-check-integrity
+test update-or-replace-strict-before-trigger-generated-column-reads-replaced-default {
+    CREATE TABLE t(b TEXT NOT NULL DEFAULT 'd', c TEXT AS (b) NOT NULL) STRICT;
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN SELECT 1; END;
+    INSERT INTO t(b) VALUES ('x');
+    UPDATE OR REPLACE t SET b = NULL;
+    SELECT * FROM t;
+}
+expect {
+    d|d
+}
+
+@cross-check-integrity
+test update-or-replace-before-trigger-generated-column-reads-replaced-default {
+    CREATE TABLE t(b TEXT NOT NULL DEFAULT 'd', c TEXT AS (b) NOT NULL);
+    CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN SELECT 1; END;
+    INSERT INTO t(b) VALUES ('x');
+    UPDATE OR REPLACE t SET b = NULL;
+    SELECT * FROM t;
+}
+expect {
+    d|d
+}

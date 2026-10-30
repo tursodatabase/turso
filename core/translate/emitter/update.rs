@@ -1060,6 +1060,11 @@ fn notnull_conflict_resolution(program: &ProgramBuilder, table_column: &Column) 
 /// Emit NOT NULL constraint checks for the columns the UPDATE changes, for the cases
 /// where they must run later than the first `emit_update_column_values` call:
 /// after BEFORE triggers have fired, or after the STRICT type check.
+///
+/// The checks run in two passes, as in INSERT: first the columns the SET clauses
+/// change, because OR REPLACE puts a column's DEFAULT in place of a NULL there,
+/// then the generated columns, once they are computed again from those values.
+/// `include_column` picks the columns of the pass.
 fn emit_deferred_notnull_checks<'a>(
     program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
@@ -1067,12 +1072,13 @@ fn emit_deferred_notnull_checks<'a>(
     column_ctx: &UpdateColumnCtx<'_>,
     skip_row_label: BranchOffset,
     t_ctx: &mut TranslateCtx<'a>,
+    include_column: impl Fn(&Column) -> bool,
 ) -> crate::Result<()> {
     for (idx, table_column) in target_table.table.columns().iter().enumerate() {
         if !table_column.notnull() || table_column.is_rowid_alias() {
             continue;
         }
-        if !column_ctx.affected_columns.get(idx) {
+        if !column_ctx.affected_columns.get(idx) || !include_column(table_column) {
             continue;
         }
         let target_reg = column_ctx.layout.to_register(column_ctx.start, idx);
@@ -1602,7 +1608,8 @@ fn emit_update_insns<'a>(
 
         // Now emit NOT NULL checks for SET clause columns that were deferred
         // from the first emit_update_column_values call. In SQLite, NOT NULL
-        // constraint checks happen after BEFORE triggers fire.
+        // constraint checks happen after BEFORE triggers fire. The generated
+        // columns are checked below, after they are computed again.
         emit_deferred_notnull_checks(
             program,
             table_references,
@@ -1610,6 +1617,7 @@ fn emit_update_insns<'a>(
             &column_ctx,
             skip_row_label,
             t_ctx,
+            |column| !column.is_virtual_generated(),
         )?;
     }
 
@@ -1666,6 +1674,19 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
             )?;
         }
+        if notnull_checks_follow_type_check {
+            // Before the generated columns are computed again below, so that
+            // they read the DEFAULT that OR REPLACE put in place of a NULL.
+            emit_deferred_notnull_checks(
+                program,
+                table_references,
+                &target_table,
+                &column_ctx,
+                skip_row_label,
+                t_ctx,
+                |column| !column.is_virtual_generated(),
+            )?;
+        }
         let has_check_constraints = !btree.check_constraints.is_empty();
         let cols = btree.columns();
         let virtual_col_names: HashSet<String> = cols
@@ -1711,7 +1732,9 @@ fn emit_update_insns<'a>(
         }
     }
 
-    if notnull_checks_follow_type_check {
+    if has_before_triggers || notnull_checks_follow_type_check {
+        // The generated columns were computed again above, from the values the
+        // deferred checks may have replaced with a DEFAULT.
         emit_deferred_notnull_checks(
             program,
             table_references,
@@ -1719,6 +1742,7 @@ fn emit_update_insns<'a>(
             &column_ctx,
             skip_row_label,
             t_ctx,
+            Column::is_virtual_generated,
         )?;
     }
 
