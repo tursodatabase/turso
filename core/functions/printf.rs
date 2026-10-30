@@ -1083,11 +1083,6 @@ fn format_char(output: &mut String, value: &Value, spec: &FormatSpec) {
         }
     };
 
-    // NUL character produces no output (matches SQLite behavior)
-    if c == '\0' {
-        return;
-    }
-
     // Precision on %c repeats the character that many times (default 1)
     let repeat = spec.precision.unwrap_or(1).max(1);
     let s: String = repeat_n(c, repeat).collect();
