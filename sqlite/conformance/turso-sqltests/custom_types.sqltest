@@ -519,6 +519,217 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test drop-type-in-use-by-expression-index {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer) STRICT;
+    CREATE INDEX ji ON j(CAST(z AS cents));
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by index ji
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-partial-index {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer) STRICT;
+    CREATE INDEX ji ON j(z) WHERE CAST(z AS cents) IS NOT NULL;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by index ji
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-check {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer, CHECK (CAST(z AS cents) IS NOT NULL)) STRICT;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by a CHECK constraint in table j
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-generated-column {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer, g integer GENERATED ALWAYS AS (CAST(z AS cents))) STRICT;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by generated column g in table j
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer DEFAULT (CAST(1 AS cents))) STRICT;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by the default of column z in table j
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-view {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer) STRICT;
+    CREATE VIEW v AS SELECT CAST(z AS cents) AS c FROM j;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by view v
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-view-subquery {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer) STRICT;
+    CREATE VIEW v AS SELECT 1 FROM j WHERE z IN (SELECT CAST(z AS "CENTS") FROM j);
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by view v
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test drop-type-in-use-by-trigger-when {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON j WHEN CAST(new.z AS cents) IS NOT NULL BEGIN SELECT 1; END;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by trigger tr
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test drop-type-in-use-by-trigger-update {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON j BEGIN UPDATE j SET z = CAST(new.z AS cents); END;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by trigger tr
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test drop-type-in-use-by-trigger-upsert {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer PRIMARY KEY) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON j BEGIN INSERT INTO j VALUES (1) ON CONFLICT DO UPDATE SET z = CAST(1 AS cents); END;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by trigger tr
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-temp-view {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer) STRICT;
+    CREATE TEMP VIEW v AS SELECT CAST(z AS cents) AS c FROM j;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by view v
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-type-encode {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE o BASE integer ENCODE CAST(value AS cents) DECODE value;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: type o depends on it
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-domain-check {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN o AS integer CHECK (CAST(value AS cents) IS NOT NULL);
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: type o depends on it
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use-by-struct-field {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE o AS STRUCT(a cents);
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: type o depends on it
+}
+
+@requires strict "uses STRICT tables"
+@requires materialized_views "uses MATERIALIZED VIEW"
+@skip-if mvcc "materialized views are not supported in MVCC"
+test drop-type-in-use-by-materialized-view {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer) STRICT;
+    CREATE MATERIALIZED VIEW mv AS SELECT CAST(z AS cents) AS c FROM j;
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by materialized view mv
+}
+
+@requires strict "uses STRICT tables"
+@skip-if mvcc "attach is not supported for mvcc"
+test drop-type-in-use-by-attached-index {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.j(z integer) STRICT;
+    CREATE INDEX aux.ji ON j(CAST(z AS cents));
+    DROP TYPE cents;
+}
+expect error {
+    cannot drop type cents: used by index ji
+}
+
+@requires strict "uses STRICT tables"
+test drop-domain-in-use-by-view {
+    CREATE DOMAIN d AS integer;
+    CREATE TABLE j(z integer) STRICT;
+    CREATE VIEW v AS SELECT CAST(z AS d) AS c FROM j;
+    DROP DOMAIN d;
+}
+expect error {
+    cannot drop type d: used by view v
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-after-its-last-use-is-dropped {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE j(z integer) STRICT;
+    CREATE INDEX ji ON j(CAST(z AS cents));
+    DROP INDEX ji;
+    DROP TYPE cents;
+    SELECT count(*) FROM sqlite_turso_types WHERE name LIKE 'cents%';
+}
+expect {
+    0
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-that-casts-to-itself {
+    CREATE TYPE o BASE integer ENCODE CAST(value AS o) DECODE value;
+    DROP TYPE o;
+    SELECT count(*) FROM sqlite_turso_types WHERE name LIKE 'o%';
+}
+expect {
+    0
+}
+
+@requires strict "uses STRICT tables"
 test add-column-custom-type {
     CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
