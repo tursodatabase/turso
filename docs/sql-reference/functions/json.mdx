@@ -614,6 +614,12 @@ SELECT * FROM json_tree(json_text, path);
 
 **Output columns:** Same as `json_each`.
 
+When the root path ends in a nonzero array index, the first row's `path` is
+`$`, matching SQLite. `fullkey` still gives the selected element's full path,
+and descendants keep their normal paths. For example,
+`json_tree('[[0,5]]', '$[0][1]')` returns `$` for `path` and `$[0][1]` for
+`fullkey`.
+
 ```sql
 SELECT key, value, type, path FROM json_tree('{"a": [1, 2]}');
 -- NULL | {"a":[1,2]} | object  | $

@@ -257,6 +257,50 @@ expect {
     12|3
 }
 
+test json-tree-scalar-array-root-path {
+    SELECT path, fullkey FROM json_tree('[[0,5]]', '$[0][1]')
+    UNION ALL
+    SELECT path, fullkey FROM json_tree('{"a":[{"b":[0,5]}]}', '$.a[0].b[1]')
+    UNION ALL
+    SELECT path, fullkey FROM json_tree('{"é.b":[null,null]}', '$."é.b"[1]');
+}
+expect {
+    $|$[0][1]
+    $|$.a[0].b[1]
+    $|$."é.b"[1]
+}
+
+test json-tree-zero-array-root-path {
+    SELECT path, fullkey FROM json_tree('{"é.b":[null]}', '$."é.b"[0]')
+    UNION ALL
+    SELECT path, fullkey FROM json_tree('{"a":[[0,5],[2,7]]}', '$.a[1][0]');
+}
+expect {
+    $."é.b"|$."é.b"[0]
+    $.a[1]|$.a[1][0]
+}
+
+test json-tree-scalar-object-root-path {
+    SELECT path, fullkey FROM json_tree('{"a":{"b":5}}', '$.a.b');
+}
+expect {
+    $.a|$.a.b
+}
+
+test json-tree-container-array-root-path {
+    SELECT path, fullkey FROM json_tree('{"a":[[0,5],[2,7]]}', '$.a[0]')
+    UNION ALL
+    SELECT path, fullkey FROM json_tree('{"a":[[0,5],[2,7]]}', '$.a[1]');
+}
+expect {
+    $.a|$.a[0]
+    $.a[0]|$.a[0][0]
+    $.a[0]|$.a[0][1]
+    $|$.a[1]
+    $.a[1]|$.a[1][0]
+    $.a[1]|$.a[1][1]
+}
+
 test json-tree-id-with-two-byte-container-header {
     SELECT max(id), count(*) FROM json_tree((SELECT json_group_array(value) FROM generate_series(1, 500)));
 }

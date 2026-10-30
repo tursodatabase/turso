@@ -284,11 +284,15 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         self.id = root_id;
         self.path_to_current_value =
             InPlaceJsonPath::from_json_path(root_path.to_string(), json_path(&root_path)?);
+        let root_parent_cursor = match self.path_to_current_value.key() {
+            Key::Integer(index) if *index != 0 => "$".len(),
+            _ => self.path_to_current_value.cursor_before_last_element(),
+        };
         let iterator_state = json_iterator_from(&self.json)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))
         {
-            self.path_to_current_value.cursor_before_last_element()
+            root_parent_cursor
         } else {
             self.path_to_current_value.cursor()
         };
@@ -310,7 +314,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                         self.path_to_current_value.string.clone(),
                         None,
                         self.path_to_current_value
-                            .read(self.path_to_current_value.cursor_before_last_element())
+                            .read(root_parent_cursor)
                             .to_owned(),
                     );
                     Ok(true)
