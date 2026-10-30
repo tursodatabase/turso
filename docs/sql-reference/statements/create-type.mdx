@@ -20,7 +20,6 @@ CREATE TYPE [IF NOT EXISTS] type-name [(parameters)]
     [ENCODE encode-expr]
     [COERCE coerce-expr]
     [DECODE decode-expr]
-    [OPERATOR '<']
     [DEFAULT default-expr];
 ```
 
@@ -125,13 +124,12 @@ The built-in `numeric` type uses both clauses: `ENCODE numeric_encode(value)` tu
 
 ### Sorting and comparing
 
-ORDER BY and indexes sort a custom type by its stored value, using SQLite's comparison for the base type. Comparison operators, MIN and MAX use the value DECODE returns. The two orders agree only when ENCODE keeps the order of its input, so a type with a DECODE must declare `OPERATOR '<'` to say that it does. Without it, ORDER BY and CREATE INDEX on a column of the type fail with `type does not declare OPERATOR '<'`. When ENCODE does not keep the order, ORDER BY follows the stored form:
+A custom type sorts and compares by its stored value, using SQLite's comparison for the base type. This holds for ORDER BY, MIN, MAX, GROUP BY, DISTINCT and indexes. For a type whose ENCODE does not keep the order of its input, the order follows the stored form:
 
 ```sql
 CREATE TYPE reversed_text BASE text
     ENCODE turso_reverse(value)
-    DECODE turso_reverse(value)
-    OPERATOR '<';
+    DECODE turso_reverse(value);
 CREATE TABLE t(w reversed_text) STRICT;
 INSERT INTO t VALUES ('apple'), ('banana'), ('cherry');
 SELECT w FROM t ORDER BY w;
@@ -160,9 +158,7 @@ The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic op
 - A domain uses the operators of its base type.
 - A column of a subquery, view or CTE has the type of the value it selects. In `SELECT x + 1 FROM (SELECT d AS x FROM t)`, `x` is a date, and `x * 2` fails with `operator does not exist: date * integer`.
 
-### OPERATOR '<'
-
-`OPERATOR '<'`, with no function, says that the type can be sorted by its stored value (see [Sorting and comparing](#sorting-and-comparing)). It takes no function: `OPERATOR '<' f` fails with `OPERATOR '<' takes no function: a type that declares it sorts by its stored value`. It is the only OPERATOR clause CREATE TYPE accepts: `OPERATOR '+' f` fails with `CREATE TYPE does not accept OPERATOR '+': only OPERATOR '<' is supported`, and so do the other operators.
+CREATE TYPE has no OPERATOR clause. `CREATE TYPE t BASE text OPERATOR '<'` fails with `CREATE TYPE does not accept OPERATOR: values of a custom type sort and compare by their stored value, and have no arithmetic`.
 
 ### DEFAULT
 
@@ -172,7 +168,6 @@ The DEFAULT clause sets a type-level default value. When a column of this type d
 CREATE TYPE boolean BASE integer
     ENCODE boolean_to_int(value)
     DECODE CASE WHEN value THEN 1 ELSE 0 END
-    OPERATOR '<'
     DEFAULT 0;
 ```
 
@@ -600,7 +595,7 @@ INSERT INTO configs VALUES (2, 'not json');
 
 ### Unsigned Integer
 
-A non-negative integer type. The stored value is the integer itself, so it sorts in the same order and the type can declare `OPERATOR '<'`:
+A non-negative integer type. Values sort and compare as integers, because the stored value is the integer itself:
 
 ```sql
 CREATE TYPE uint BASE integer
@@ -608,8 +603,7 @@ CREATE TYPE uint BASE integer
         WHEN value >= 0 THEN value
         ELSE RAISE(ABORT, 'uint must be non-negative')
     END
-    DECODE value
-    OPERATOR '<';
+    DECODE value;
 
 CREATE TABLE counters (
     id INTEGER PRIMARY KEY,
