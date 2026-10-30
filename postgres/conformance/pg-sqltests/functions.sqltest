@@ -1576,6 +1576,17 @@ expect @tursopg error {
     operator does not exist: timestamptz \+ integer
 }
 
+test numeric-column-plus-round-and-mod-of-exact-numbers-is-exact {
+    -- round() and mod() of exact numbers give exact numbers, so the sums keep
+    -- the column's scale and are not floating-point.
+    CREATE TABLE prices (amount numeric(10,2));
+    INSERT INTO prices VALUES (0.1);
+    SELECT amount + round(0.2, 1), amount + mod(10, 4) FROM prices;
+}
+expect {
+    0.30|2.10
+}
+
 test check-constraint-compares-a-timestamptz-column-with-now {
     CREATE TABLE past_events (at timestamptz CHECK (at <= now()));
     INSERT INTO past_events VALUES ('2000-01-01 00:00:00+00:00');

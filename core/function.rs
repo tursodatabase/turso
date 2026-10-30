@@ -1228,7 +1228,9 @@ impl ScalarFunc {
             | Self::SetVal => Some(Integer),
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => Some(Integer),
-            Self::Round | Self::JulianDay => Some(Real),
+            Self::JulianDay => Some(Real),
+            // A real for a real argument; see MathFunc::return_type.
+            Self::Round => None,
             Self::Char
             | Self::Concat
             | Self::ConcatWs
@@ -1669,8 +1671,23 @@ impl Deterministic for MathFunc {
 impl MathFunc {
     pub fn return_type(&self) -> Option<ReturnType> {
         match self {
-            // An integer for an integer argument, otherwise a real.
-            Self::Ceil | Self::Ceiling | Self::Floor | Self::Trunc => None,
+            // SQLite returns a real (ceil, floor and trunc an integer for an
+            // integer), but PostgreSQL computes these exactly for an exact
+            // argument: round(0.25, 1) and mod(10, 4) are not floating-point
+            // numbers there. So the result is only known to be a real for a
+            // real argument.
+            Self::Ceil
+            | Self::Ceiling
+            | Self::Floor
+            | Self::Trunc
+            | Self::Exp
+            | Self::Ln
+            | Self::Log
+            | Self::Log10
+            | Self::Mod
+            | Self::Pow
+            | Self::Power
+            | Self::Sqrt => None,
             _ => Some(ReturnType::Real),
         }
     }

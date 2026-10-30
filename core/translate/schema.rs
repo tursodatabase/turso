@@ -447,12 +447,19 @@ fn resolve_func_return_type(
     }
     match func {
         Func::Scalar(sf) => resolve_scalar_func_return_type(sf, args, columns, resolver),
-        // ceil, floor and trunc give an integer for an integer and a real
-        // otherwise.
-        Func::Math(_) => match args.first() {
-            Some(arg) => resolve_check_expr_type(arg, columns, resolver),
-            None => Ok(CheckExprType::Any),
-        },
+        // ceil, floor and trunc give an integer for an integer and a real for
+        // a real. A text argument is first converted to a number, which may
+        // be either. SQLite's other math functions return a real.
+        Func::Math(MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc) => {
+            match args.first() {
+                Some(arg) => Ok(match resolve_check_expr_type(arg, columns, resolver)? {
+                    ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null) => ty,
+                    _ => CheckExprType::Any,
+                }),
+                None => Ok(CheckExprType::Any),
+            }
+        }
+        Func::Math(_) => Ok(CheckExprType::Real),
         Func::External(_) => {
             bail_parse_error!(
                 "cannot determine return type of function {}() in CHECK constraint; \
@@ -474,15 +481,27 @@ fn resolve_scalar_func_return_type(
     resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
     match func {
-        // The type of the first argument: substr returns a blob for a blob,
-        // and likely(x) is x.
+        // substr returns a blob for a blob and text for a number or text.
+        ScalarFunc::Substr | ScalarFunc::Substring => {
+            let Some(arg) = args.first() else {
+                return Ok(CheckExprType::Any);
+            };
+            Ok(match resolve_check_expr_type(arg, columns, resolver)? {
+                ty @ (CheckExprType::Blob | CheckExprType::Any | CheckExprType::Null) => ty,
+                // The stored value of a custom type may be a blob.
+                CheckExprType::CustomType(_) => CheckExprType::Any,
+                CheckExprType::Integer | CheckExprType::Real | CheckExprType::Text => {
+                    CheckExprType::Text
+                }
+            })
+        }
+
+        // The type of the first argument: likely(x) is x.
         ScalarFunc::Abs
         | ScalarFunc::Nullif
         | ScalarFunc::Likely
         | ScalarFunc::Unlikely
-        | ScalarFunc::Likelihood
-        | ScalarFunc::Substr
-        | ScalarFunc::Substring => {
+        | ScalarFunc::Likelihood => {
             if let Some(arg) = args.first() {
                 resolve_check_expr_type(arg, columns, resolver)
             } else {
@@ -499,6 +518,9 @@ fn resolve_scalar_func_return_type(
             }
             Ok(CheckExprType::Null)
         }
+
+        // SQLite's round() always returns a real.
+        ScalarFunc::Round => Ok(CheckExprType::Real),
 
         ScalarFunc::Min | ScalarFunc::Max => {
             if let Some(first) = args.first() {

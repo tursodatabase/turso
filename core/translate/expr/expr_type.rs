@@ -873,6 +873,15 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
             } => ExprType::array(*element, dimensions - 1),
             _ => ExprType::Builtin(BuiltinType::Any),
         },
+        Func::Scalar(ScalarFunc::Round) | Func::Math(_) if func.return_type().is_none() => {
+            let is_real =
+                |arg: &ast::Expr| matches!(type_of(arg, env), ExprType::Builtin(BuiltinType::Real));
+            if args.iter().any(|arg| is_real(arg)) {
+                ExprType::Builtin(BuiltinType::Real)
+            } else {
+                ExprType::Builtin(BuiltinType::Any)
+            }
+        }
         func => match func.return_type() {
             Some(return_type) => declared_return_type(return_type, args, env),
             None => ExprType::Builtin(BuiltinType::Any),
