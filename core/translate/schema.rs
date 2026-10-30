@@ -900,6 +900,20 @@ fn validate(
                     "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
                 );
             }
+        } else if table.has_autoincrement {
+            // SQLite allows AUTOINCREMENT only on a key declared exactly as
+            // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size
+            // such as INTEGER(8) and an inline DESC are not. This is checked
+            // here rather than in `create_table` so that databases where older
+            // Turso versions stored such tables still open.
+            let (pk_name, pk_order) = &table.primary_key_columns[0];
+            let is_integer_primary_key = table.get_column(pk_name).is_some_and(|(_, col)| {
+                col.ty_str.eq_ignore_ascii_case("INTEGER") && col.ty_params.is_empty()
+            }) && !(table.primary_key_is_inline
+                && *pk_order == ast::SortOrder::Desc);
+            if !is_integer_primary_key {
+                bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+            }
         }
     }
     Ok(())
@@ -1191,9 +1205,6 @@ pub fn translate_create_table(
         name: resolver.name_in_sql(namespace, &tbl_name.name),
         alias: None,
     };
-    validate(&body, &normalized_tbl_name, &resolver.catalog)?;
-    let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
-        && bind_default_sequence_names(&mut body, resolver)?;
 
     // Gate array column types behind the experimental custom types flag.
     if !connection.experimental_custom_types_enabled() {
@@ -1263,6 +1274,12 @@ pub fn translate_create_table(
             }
         }
     }
+
+    // Like SQLite, the body is only checked when the table is really created,
+    // so IF NOT EXISTS on an existing table succeeds whatever the body says.
+    validate(&body, &normalized_tbl_name, &resolver.catalog)?;
+    let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
+        && bind_default_sequence_names(&mut body, resolver)?;
 
     let mut has_autoincrement = false;
     if let ast::CreateTableBody::ColumnsAndConstraints {
