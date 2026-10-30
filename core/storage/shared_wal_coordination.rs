@@ -4537,7 +4537,7 @@ mod tests {
         >::new());
         let registered = Arc::new(Mutex::new(None));
         let file = mapped.file.clone();
-        mapped.file = Arc::new(ReaderSlotLockHookFile {
+        mapped.file = Arc::new(ReaderRegistrationDuringProbeFile {
             file,
             before_probe: Mutex::new(Some(Box::new({
                 let mapping = mapping.clone();
@@ -4604,7 +4604,7 @@ mod tests {
 
         let registered = Arc::new(Mutex::new(None));
         let file = releasing.file.clone();
-        releasing.file = Arc::new(ReaderSlotLockHookFile {
+        releasing.file = Arc::new(ReaderRegistrationDuringProbeFile {
             file,
             before_probe: Mutex::new(None),
             after_unlock: Mutex::new(Some(Box::new({
@@ -4635,14 +4635,14 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", not(shuttle)))]
-    struct ReaderSlotLockHookFile {
+    struct ReaderRegistrationDuringProbeFile {
         file: Arc<dyn File>,
         before_probe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         after_unlock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     #[cfg(all(target_os = "linux", not(shuttle)))]
-    impl File for ReaderSlotLockHookFile {
+    impl File for ReaderRegistrationDuringProbeFile {
         fn lock_file(&self, exclusive: bool) -> Result<()> {
             self.file.lock_file(exclusive)
         }
