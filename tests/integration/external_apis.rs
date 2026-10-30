@@ -1053,6 +1053,26 @@ fn pragma_collation_list_lists_registered_collations_first(
 
 #[turso_macros::test]
 #[serial]
+fn pragma_collation_list_lists_a_replaced_builtin_once(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation("NOCASE".to_string(), 0, dotnet_nocase_collation, None);
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("PRAGMA collation_list");
+    assert_eq!(
+        rows,
+        vec![
+            (0, "nocase".to_string()),
+            (1, "RTRIM".to_string()),
+            (2, "BINARY".to_string()),
+        ]
+    );
+
+    conn.unregister_external_collation("NOCASE");
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
 fn custom_collations_cover_dotnet_create_collation_cases(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {

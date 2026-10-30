@@ -213,6 +213,27 @@ PRAGMA main.foreign_key_list(child);
 SELECT * FROM pragma_foreign_key_list('child');
 ```
 
+### collation_list
+
+Returns one row for each collating sequence available on the connection.
+
+```sql
+PRAGMA collation_list;
+-- seq | name
+-- 0   | RTRIM
+-- 1   | NOCASE
+-- 2   | BINARY
+```
+
+`seq` numbers the rows from 0. Collations registered on the connection come first, sorted by
+name, followed by the built-in `RTRIM`, `NOCASE` and `BINARY`. A registered collation with the
+name of a built-in one replaces it, so that name is listed once. The same rows are available as
+the `pragma_collation_list` table-valued function:
+
+```sql
+SELECT name FROM pragma_collation_list;
+```
+
 ### function_list
 
 Returns one row for each SQL function available.

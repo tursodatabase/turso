@@ -1061,12 +1061,17 @@ fn query_pragma(
         PragmaName::CollationList => {
             // 2 columns: seq, name. Like SQLite, collations registered on the
             // connection come first, then the built-in RTRIM, NOCASE and BINARY.
+            // A registered collation with a built-in's name replaces it, so the
+            // built-in is not listed a second time.
             let base_reg = register;
             program.alloc_register();
-            let names = connection
-                .get_syms_collation_names()
+            let registered = connection.get_syms_collation_names();
+            let builtins = ["RTRIM", "NOCASE", "BINARY"]
                 .into_iter()
-                .chain(["RTRIM", "NOCASE", "BINARY"].map(str::to_string));
+                .filter(|b| !registered.iter().any(|r| r.eq_ignore_ascii_case(b)))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let names = registered.into_iter().chain(builtins);
             for (seq, name) in names.enumerate() {
                 program.emit_int(seq as i64, base_reg);
                 program.emit_string8(name, base_reg + 1);
