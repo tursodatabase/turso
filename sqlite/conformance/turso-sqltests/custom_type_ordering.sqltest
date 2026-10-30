@@ -1,36 +1,13 @@
 @database :memory:
 @requires-file custom_types "uses custom types"
 
-# --- ERROR TESTS: types without OPERATOR '<' cannot be sorted or indexed ---
-
-@requires strict "uses STRICT tables"
-test order-by-blocked-for-non-orderable-type {
-    CREATE TYPE noorder BASE text ENCODE value DECODE value;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val noorder) STRICT;
-    INSERT INTO t1 VALUES (1, 'a');
-    SELECT val FROM t1 ORDER BY val;
-}
-expect error {
-    cannot ORDER BY column 'val' of type 'noorder': type does not declare OPERATOR '<'
-}
-
-@requires strict "uses STRICT tables"
-test create-index-blocked-for-non-orderable-type {
-    CREATE TYPE noorder2 BASE text ENCODE value DECODE value;
-    CREATE TABLE t2(id INTEGER PRIMARY KEY, val noorder2) STRICT;
-    CREATE INDEX idx2 ON t2(val);
-}
-expect error {
-    cannot create index on column 'val' of type 'noorder2': type does not declare OPERATOR '<'
-}
-
-# --- A type that declares OPERATOR '<' sorts and is indexed by its stored value ---
+# --- Every custom type sorts, compares and is indexed by its stored value ---
 
 # cents stores 9 as 900 and 10 as 1000. ORDER BY and an index both sort the
 # stored integers, so 9 comes before 10.
 @requires strict "uses STRICT tables"
 test user-type-sorts-by-stored-value-in-order-by {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val cents) STRICT;
     INSERT INTO t1 VALUES (1, 10), (2, 9), (3, 2);
     SELECT val FROM t1 ORDER BY val;
@@ -43,7 +20,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test user-type-sorts-by-stored-value-in-index {
-    CREATE TYPE cents2 BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents2 BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t2(id INTEGER PRIMARY KEY, val cents2) STRICT;
     CREATE INDEX idx2 ON t2(val);
     INSERT INTO t2 VALUES (1, 10), (2, 9), (3, 2);
@@ -55,18 +32,11 @@ expect {
     10
 }
 
-test create-type-rejects-less-than-operator-with-function {
-    CREATE TYPE orderable_lt BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<' string_reverse;
+test create-type-rejects-less-than-operator {
+    CREATE TYPE orderable_lt BASE text ENCODE value DECODE value OPERATOR '<';
 }
 expect error {
-    OPERATOR '<' takes no function: a type that declares it sorts by its stored value
-}
-
-test create-type-rejects-operators-other-than-less-than {
-    CREATE TYPE orderable_eq BASE text ENCODE value DECODE value OPERATOR '=' test_uint_eq;
-}
-expect error {
-    CREATE TYPE does not accept OPERATOR '=': only OPERATOR '<' is supported
+    CREATE TYPE does not accept OPERATOR
 }
 
 @requires strict "uses STRICT tables"
@@ -95,12 +65,12 @@ expect {
     HELLO
 }
 
-# --- OPERATOR '<' sorts the encoded (on-disk) values with the base type's comparison ---
+# --- Sorting uses the encoded (on-disk) values and the base type's comparison ---
 
 # Identity encode/decode: encoded = decoded, so sort order matches alphabetical.
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-identity-encoding {
-    CREATE TYPE orderable BASE text ENCODE value DECODE value OPERATOR '<';
+    CREATE TYPE orderable BASE text ENCODE value DECODE value;
     CREATE TABLE t3(id INTEGER PRIMARY KEY, val orderable) STRICT;
     INSERT INTO t3 VALUES (1, 'banana');
     INSERT INTO t3 VALUES (2, 'apple');
@@ -116,7 +86,7 @@ expect {
 # Same query with an index — must produce identical results.
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-identity-encoding-with-index {
-    CREATE TYPE orderable2 BASE text ENCODE value DECODE value OPERATOR '<';
+    CREATE TYPE orderable2 BASE text ENCODE value DECODE value;
     CREATE TABLE t4(id INTEGER PRIMARY KEY, val orderable2) STRICT;
     CREATE INDEX idx4 ON t4(val);
     INSERT INTO t4 VALUES (1, 'banana');
@@ -134,7 +104,7 @@ expect {
 # Sorting encoded integers preserves numeric order.
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-monotonic-integer {
-    CREATE TYPE myint BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TYPE myint BASE integer ENCODE value * 10 DECODE value / 10;
     CREATE TABLE t5(id INTEGER PRIMARY KEY, val myint) STRICT;
     INSERT INTO t5 VALUES (1, 30);
     INSERT INTO t5 VALUES (2, 10);
@@ -149,7 +119,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-monotonic-integer-with-index {
-    CREATE TYPE myint1b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TYPE myint1b BASE integer ENCODE value * 10 DECODE value / 10;
     CREATE TABLE t5b(id INTEGER PRIMARY KEY, val myint1b) STRICT;
     CREATE INDEX idx5b ON t5b(val);
     INSERT INTO t5b VALUES (1, 30);
@@ -165,7 +135,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-desc-order {
-    CREATE TYPE myint2 BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TYPE myint2 BASE integer ENCODE value * 10 DECODE value / 10;
     CREATE TABLE t6(id INTEGER PRIMARY KEY, val myint2) STRICT;
     INSERT INTO t6 VALUES (1, 30);
     INSERT INTO t6 VALUES (2, 10);
@@ -180,7 +150,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-desc-order-with-index {
-    CREATE TYPE myint2b BASE integer ENCODE value * 10 DECODE value / 10 OPERATOR '<';
+    CREATE TYPE myint2b BASE integer ENCODE value * 10 DECODE value / 10;
     CREATE TABLE t6b(id INTEGER PRIMARY KEY, val myint2b) STRICT;
     CREATE INDEX idx6b ON t6b(val);
     INSERT INTO t6b VALUES (1, 30);
@@ -200,7 +170,7 @@ expect {
 # ORDER BY sorts encoded text: ananab < elppa < yrrehc → display: banana, apple, cherry.
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-non-monotonic-encoding {
-    CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
     CREATE TABLE t_rev(id INTEGER PRIMARY KEY, val rev) STRICT;
     INSERT INTO t_rev VALUES (1, 'apple');
     INSERT INTO t_rev VALUES (2, 'banana');
@@ -216,7 +186,7 @@ expect {
 # Same query with an index — must produce identical results.
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-non-monotonic-encoding-with-index {
-    CREATE TYPE rev2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TYPE rev2 BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
     CREATE TABLE t_rev2(id INTEGER PRIMARY KEY, val rev2) STRICT;
     CREATE INDEX idx_rev2 ON t_rev2(val);
     INSERT INTO t_rev2 VALUES (1, 'apple');
@@ -234,7 +204,7 @@ expect {
 # DESC encoded: yrrehc > elppa > ananab → display: cherry, apple, banana.
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-non-monotonic-desc {
-    CREATE TYPE rev3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TYPE rev3 BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
     CREATE TABLE t_rev3(id INTEGER PRIMARY KEY, val rev3) STRICT;
     INSERT INTO t_rev3 VALUES (1, 'apple');
     INSERT INTO t_rev3 VALUES (2, 'banana');
@@ -249,7 +219,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test sort-by-stored-value-non-monotonic-desc-with-index {
-    CREATE TYPE rev4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TYPE rev4 BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
     CREATE TABLE t_rev4(id INTEGER PRIMARY KEY, val rev4) STRICT;
     CREATE INDEX idx_rev4 ON t_rev4(val);
     INSERT INTO t_rev4 VALUES (1, 'apple');
