@@ -2363,8 +2363,11 @@ pub unsafe extern "C" fn sqlite3_column_decltype(
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
-    if let Some(val) = stmt.stmt.get_column_decltype(idx as usize) {
+    if let Some(val) = stmt.stmt.get_column_decltype(idx) {
         let c_string = CString::new(val).expect("CString::new failed");
         c_string.into_raw()
     } else {
@@ -2377,8 +2380,10 @@ pub unsafe extern "C" fn sqlite3_column_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     let binding = stmt.stmt.get_column_name(idx).into_owned();
     let val = binding.as_str();
@@ -2396,8 +2401,10 @@ pub unsafe extern "C" fn sqlite3_column_table_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     let binding = stmt
         .stmt
@@ -2412,6 +2419,14 @@ pub unsafe extern "C" fn sqlite3_column_table_name(
 
     let c_string = CString::new(val).expect("CString::new failed");
     c_string.into_raw()
+}
+
+/// Converts a C column index to `usize`, or returns None when it is outside
+/// the statement's result columns, as SQLite does for an out-of-range index.
+fn result_column_index(stmt: &sqlite3_stmt, idx: ffi::c_int) -> Option<usize> {
+    usize::try_from(idx)
+        .ok()
+        .filter(|&idx| idx < stmt.stmt.num_columns())
 }
 
 /// Returns the value at column `idx` of the current row, or None when there
