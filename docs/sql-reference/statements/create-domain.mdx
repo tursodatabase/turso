@@ -10,7 +10,7 @@ sidebarTitle: CREATE DOMAIN
 **Turso Extension**: CREATE DOMAIN is a Turso-specific statement not available in standard SQLite. Domains require STRICT tables and the custom types experimental feature. This feature must be [enabled before use](/docs/sql-reference/experimental-features).
 </Info>
 
-The CREATE DOMAIN statement defines a named type alias with optional constraints. Unlike [CREATE TYPE](/docs/sql-reference/statements/create-type), a domain does not specify custom ENCODE/DECODE logic or OPERATORs. Instead, a domain adds NOT NULL and CHECK constraints on top of a base type, and values are stored using the base type's native storage format.
+The CREATE DOMAIN statement defines a named type alias with optional constraints. Unlike [CREATE TYPE](/docs/sql-reference/statements/create-type), a domain does not specify custom ENCODE/DECODE logic. Instead, a domain adds NOT NULL and CHECK constraints on top of a base type. Values are stored in the base type's format, and arithmetic uses the base type's operators.
 
 ## Syntax
 

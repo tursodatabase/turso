@@ -1808,7 +1808,6 @@ fn eval_partial_pred_for_row_image(
         &mut column_regs,
         &bt,
         r,
-        true,
     )?;
     Ok(Some(r))
 }
@@ -1848,7 +1847,6 @@ fn emit_upsert_expr_index_value(
         &mut column_regs,
         &bt,
         dest_reg,
-        idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
     )?;
     Ok(())
 }

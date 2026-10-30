@@ -140,6 +140,57 @@ mod tests {
         }
     }
 
+    /// Indexes on custom-type columns must keep their order after reopening:
+    /// the stored-value order of a user type, and numeric's own order, both for
+    /// column indexes and for expression indexes.
+    #[test]
+    fn test_index_keeps_type_order_after_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("type_order_reopen.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
+                 DECODE string_reverse(value) OPERATOR '<'",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX t_word ON t(word)").unwrap();
+            conn.execute("CREATE INDEX t_n_plus_one ON t((n+1))")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1,'cherry',9), (2,'apple',10.5), (3,'banana',100)")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+        // A new row goes to its place in the stored (reversed) text order:
+        // ananab < elppa < tocirpa < yrrehc.
+        conn.execute("INSERT INTO t VALUES (4,'apricot',0)")
+            .unwrap();
+        let rows: Vec<(String,)> =
+            conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
+        let words = ["banana", "apple", "apricot", "cherry"];
+        assert_eq!(rows, words.map(|w| (w.to_string(),)));
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT id FROM t INDEXED BY t_n_plus_one WHERE n+1 = 11.5");
+        assert_eq!(rows, vec![(2,)]);
+        let rows: Vec<(i64,)> = conn
+            .exec_rows("SELECT id FROM t INDEXED BY t_n_plus_one WHERE n+1 > 10.5 ORDER BY n+1");
+        assert_eq!(rows, vec![(2,), (3,)]);
+    }
+
     #[test]
     fn test_reopen_fails_when_stored_custom_type_does_not_parse() {
         let temp_dir = TempDir::new().unwrap();
@@ -504,11 +555,12 @@ mod tests {
             "WHERE clause should block update when decoded value 99 >= 20"
         );
 
-        // Complex expression: excluded.amount + t1.amount
+        // Complex expression over excluded.amount and t1.amount. cents declares
+        // no '+', so the values are cast to integers first.
         conn.execute("DELETE FROM t1").unwrap();
         conn.execute("INSERT INTO t1 VALUES (1, 42)").unwrap();
         conn.execute(
-            "INSERT INTO t1 VALUES (1, 8) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount + t1.amount",
+            "INSERT INTO t1 VALUES (1, 8) ON CONFLICT(id) DO UPDATE SET amount = CAST(excluded.amount AS INTEGER) + CAST(t1.amount AS INTEGER)",
         )
         .unwrap();
         let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t1 WHERE id = 1");

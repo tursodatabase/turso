@@ -250,11 +250,54 @@ pub enum TypeDefKind {
         /// SQLite does.
         ordering: Option<TypeOrdering>,
         operators: std::vec::Vec<TypeOperator>,
+        /// How operators such as `+` and `-x` run on values of this type.
+        operator_signatures: std::vec::Vec<OperatorSignature>,
         default: Option<Box<ast::Expr>>,
     },
     Struct(StructDef),
     Union(UnionDef),
 }
+
+/// One way an operator runs when an operand has a custom type: `args[0] op
+/// args[1]`, or `op args[0]` for a prefix operator such as `-x`, runs `func`,
+/// or SQLite's operator when `func` is `None`.
+#[derive(Debug, Clone)]
+pub struct OperatorSignature {
+    /// One of [BINARY_OPERATORS] or [PREFIX_OPERATORS].
+    pub op: &'static str,
+    /// One operand for a prefix operator, two for a binary one.
+    pub args: std::vec::Vec<OperatorArg>,
+    pub func: Option<String>,
+    /// The type `func` returns. `None` when SQLite's operator runs.
+    pub result: Option<&'static str>,
+}
+/// An operand that a signature accepts. "This type" is the type that declares
+/// the signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorArg {
+    /// A literal that this type's ENCODE accepts. It is encoded before the call.
+    EncodableLiteral,
+    /// Any value of this type.
+    Value,
+    /// A value SQLite can compute with: anything without a custom type, or a
+    /// value of a type whose only way to run the operator is SQLite's.
+    PlainValue,
+    /// A `PlainValue` that is an integer, or whose type is not known before the
+    /// statement runs, such as a parameter. The function rejects anything else.
+    Integer,
+    /// A `PlainValue` that is neither a `Real` nor a blob.
+    Exact,
+    /// A REAL value: a REAL column, a CAST to REAL, arithmetic on two plain
+    /// values. A decimal written in the statement, such as `0.5`, `-0.5` or
+    /// the `0.5` of `(SELECT 0.5)`, is not one: as in PostgreSQL, it is an
+    /// exact number.
+    Real,
+}
+
+/// The operators whose function an operand's custom type decides. Comparisons
+/// are decided separately, and unary `+` gives its operand unchanged.
+pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<", ">>"];
+pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
 
 /// The order of a built-in type whose stored values do not sort in the type's
 /// order: numeric is stored as a blob. Every other type, and every user type,
@@ -264,6 +307,96 @@ fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
         "numeric" => Some(TypeOrdering::Numeric),
         _ => None,
     }
+}
+
+/// Operators on built-in types. User types have none: `x + 1` on a user type is
+/// an error. The functions read plain values as they are, so nothing is encoded first:
+/// - `numeric op x` and `x op numeric` for `+ - * / %`, and `-numeric`, compute
+///   exactly, and the result is a numeric. Encoding a literal to the column's type would round it
+///   to the column's scale first (`n * 0.005` would be `n * 0.01`). With a REAL
+///   value `+ - * /` are SQLite's operators and give a REAL, as PostgreSQL gives
+///   double precision; `%` with a REAL value does not exist, as in PostgreSQL.
+/// - `date + integer`, `integer + date` and `date - integer` add or subtract
+///   days and give a date. `date - date` gives the number of days between them;
+///   a text literal on either side is encoded to a date first. Each signature
+///   has its own function, so its result type is known before the statement
+///   runs.
+/// - `smallint` and `bigint` store plain integers, so SQLite's operators run,
+///   including `-`, `~`, `&`, `|`, `<<` and `>>`.
+///
+/// Other built-in types have no operators, and these types have no others:
+/// `-date` and `numeric & 1` are errors, as in PostgreSQL.
+fn builtin_signatures(type_name: &str) -> std::vec::Vec<OperatorSignature> {
+    use OperatorArg::{EncodableLiteral, Exact, Integer, Real, Value};
+    let call = |op, args: &[OperatorArg], func: &str, result| OperatorSignature {
+        op,
+        args: args.to_vec(),
+        func: Some(func.to_string()),
+        result,
+    };
+    match type_name {
+        "numeric" => {
+            let mut signatures = std::vec::Vec::new();
+            for (op, func) in [
+                ("+", "numeric_add"),
+                ("-", "numeric_sub"),
+                ("*", "numeric_mul"),
+                ("/", "numeric_div"),
+                ("%", "numeric_mod"),
+            ] {
+                for args in [[Value, Value], [Value, Exact], [Exact, Value]] {
+                    signatures.push(call(op, &args, func, Some("numeric")));
+                }
+                if op != "%" {
+                    signatures.extend(sqlite_operator(op, Real));
+                }
+            }
+            signatures.push(call("-", &[Value], "numeric_neg", Some("numeric")));
+            signatures
+        }
+        "date" => std::vec![
+            call("+", &[Value, Integer], "date_plus", Some("date")),
+            call("+", &[Integer, Value], "date_plus", Some("date")),
+            call("-", &[Value, Value], "date_diff", Some("integer")),
+            call(
+                "-",
+                &[Value, EncodableLiteral],
+                "date_diff",
+                Some("integer")
+            ),
+            call(
+                "-",
+                &[EncodableLiteral, Value],
+                "date_diff",
+                Some("integer")
+            ),
+            call("-", &[Value, Integer], "date_minus", Some("date")),
+        ],
+        "smallint" | "bigint" => {
+            let binary = BINARY_OPERATORS
+                .into_iter()
+                .flat_map(|op| sqlite_operator(op, OperatorArg::PlainValue));
+            let prefix = PREFIX_OPERATORS.into_iter().map(|op| OperatorSignature {
+                op,
+                args: std::vec![Value],
+                func: None,
+                result: None,
+            });
+            binary.chain(prefix).collect()
+        }
+        _ => std::vec::Vec::new(),
+    }
+}
+
+/// SQLite's binary operator `op` on a value of the type and an operand `other`.
+fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
+    use OperatorArg::Value;
+    [[Value, other], [other, Value]].map(|args| OperatorSignature {
+        op,
+        args: args.to_vec(),
+        func: None,
+        result: None,
+    })
 }
 
 /// Custom type definition, loaded from sqlite_turso_types
@@ -291,10 +424,14 @@ impl ResolvedType {
     /// The order values of the type compare in. A domain has the order of the
     /// type it is based on.
     pub fn ordering(&self) -> Option<TypeOrdering> {
-        self.chain
-            .iter()
-            .find(|type_def| !type_def.is_domain)
-            .and_then(|type_def| type_def.ordering())
+        self.base_type().and_then(|type_def| type_def.ordering())
+    }
+
+    /// The first type in the chain that is not a domain: the type itself, or
+    /// the type a domain is based on. None for a domain over a plain SQLite
+    /// type, such as `CREATE DOMAIN pos AS integer`.
+    pub fn base_type(&self) -> Option<&Arc<TypeDef>> {
+        self.chain.iter().find(|type_def| !type_def.is_domain)
     }
 
     pub fn reads_stored_values_unchanged(&self) -> bool {
@@ -431,6 +568,40 @@ impl TypeDef {
         }
     }
 
+    /// Whether arithmetic with an integer or a decimal gives a value of this
+    /// type, as `numeric + 1` gives a numeric.
+    pub fn computes_with_exact_numbers(&self) -> bool {
+        self.all_operator_signatures().iter().any(|signature| {
+            signature.args.contains(&OperatorArg::Exact)
+                && signature
+                    .result
+                    .is_some_and(|result| result.eq_ignore_ascii_case(&self.name))
+        })
+    }
+
+    /// How `op` with `operand_count` operands can run on a value of this type,
+    /// most specific first.
+    pub fn operator_signatures<'a>(
+        &'a self,
+        op: &'a str,
+        operand_count: usize,
+    ) -> impl Iterator<Item = &'a OperatorSignature> {
+        self.all_operator_signatures()
+            .iter()
+            .filter(move |s| s.op == op && s.args.len() == operand_count)
+    }
+
+    /// Every operator signature of the type, declared or built in.
+    pub fn all_operator_signatures(&self) -> &[OperatorSignature] {
+        match &self.kind {
+            TypeDefKind::Custom {
+                operator_signatures,
+                ..
+            } => operator_signatures,
+            _ => &[],
+        }
+    }
+
     /// Returns the default expression (Custom types only).
     pub fn default_expr(&self) -> Option<&ast::Expr> {
         match &self.kind {
@@ -485,10 +656,10 @@ impl TypeDef {
                 // CREATE TYPE checks where type parameters are used. A type
                 // already stored by an earlier version is loaded unchecked, so
                 // the database still opens and DROP TYPE can remove it.
-                let ordering = if is_builtin {
-                    builtin_ordering(type_name)
+                let (ordering, operator_signatures) = if is_builtin {
+                    (builtin_ordering(type_name), builtin_signatures(type_name))
                 } else {
-                    None
+                    (None, std::vec::Vec::new())
                 };
                 Self {
                     name: type_name.to_string(),
@@ -505,6 +676,7 @@ impl TypeDef {
                         decode: decode.clone(),
                         ordering,
                         operators: operators.clone(),
+                        operator_signatures,
                         default: default.clone(),
                     },
                 }
@@ -594,9 +766,10 @@ impl TypeDef {
                 encode: None,
                 coerce: None,
                 decode: None,
-                // A domain has the order of the type it is based on.
+                // A domain has the order and arithmetic of the type it is based on.
                 ordering: None,
                 operators: std::vec::Vec::new(),
+                operator_signatures: std::vec::Vec::new(),
                 default,
             },
         }
@@ -1019,7 +1192,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
         "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '+' date_plus OPERATOR '-' date_minus OPERATOR '<'",
+        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -1038,7 +1211,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
-        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div",
+        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)",
     ];
 
     for sql in type_sqls {
@@ -1709,6 +1882,21 @@ impl Schema {
         }
         let (primitive, chain) = self.resolve_base_type_chain(type_name)?;
         Ok(Some(ResolvedType { primitive, chain }))
+    }
+
+    /// `type_def` itself, or the type a domain is based on: a domain stores,
+    /// sorts and computes with its values as that type does. None for a domain
+    /// over a plain SQLite type, such as `CREATE DOMAIN pos AS integer`.
+    pub fn without_domains(&self, type_def: &Arc<TypeDef>) -> Result<Option<Arc<TypeDef>>> {
+        if !type_def.is_domain {
+            return Ok(Some(type_def.clone()));
+        }
+        let resolved = self
+            .resolve_type_unchecked(&type_def.name)?
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("domain {} is not registered", type_def.name))
+            })?;
+        Ok(resolved.base_type().cloned())
     }
 
     /// Returns whether a domain in the column's type chain has NOT NULL, and the
@@ -7804,7 +7992,7 @@ impl Index {
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let index_columns = resolve_sorted_columns(table, &columns, schema)?;
+                let index_columns = resolve_sorted_columns(table, &columns, schema, syms)?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");

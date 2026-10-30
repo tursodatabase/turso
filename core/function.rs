@@ -946,10 +946,6 @@ pub enum ScalarFunc {
     // Test type functions (for custom type system testing)
     TestUintEncode,
     TestUintDecode,
-    TestUintAdd,
-    TestUintSub,
-    TestUintMul,
-    TestUintDiv,
     /// Test-only: returns a monotonically increasing 64-bit integer on every
     /// evaluation. Used to verify that the planner does not deduplicate
     /// equivalent SQL calls that contain nondeterministic functions.
@@ -974,9 +970,12 @@ pub enum ScalarFunc {
     NumericSub,
     NumericMul,
     NumericDiv,
+    NumericMod,
+    NumericNeg,
     // Date type functions
     DatePlus,
     DateMinus,
+    DateDiff,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,
     ArrayElement,
@@ -1079,13 +1078,9 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::ConnTxnId => false, // depends on connection state
             ScalarFunc::IsAutocommit => false, // depends on connection state
             ScalarFunc::SequenceWatermark => false, // depends on active MVCC transactions
-            ScalarFunc::TestUintEncode
-            | ScalarFunc::TestUintDecode
-            | ScalarFunc::TestUintAdd
-            | ScalarFunc::TestUintSub
-            | ScalarFunc::TestUintMul
-            | ScalarFunc::TestUintDiv
-            | ScalarFunc::StringReverse => true,
+            ScalarFunc::TestUintEncode | ScalarFunc::TestUintDecode | ScalarFunc::StringReverse => {
+                true
+            }
             ScalarFunc::Gcd
             | ScalarFunc::Lcm
             | ScalarFunc::Repeat
@@ -1103,8 +1098,11 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericSub
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
+            | ScalarFunc::NumericMod
+            | ScalarFunc::NumericNeg
             | ScalarFunc::DatePlus
-            | ScalarFunc::DateMinus => true,
+            | ScalarFunc::DateMinus
+            | ScalarFunc::DateDiff => true,
             ScalarFunc::Array
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
@@ -1241,10 +1239,6 @@ impl Display for ScalarFunc {
             Self::SequenceWatermark => "sequence_watermark_experimental",
             Self::TestUintEncode => "test_uint_encode",
             Self::TestUintDecode => "test_uint_decode",
-            Self::TestUintAdd => "test_uint_add",
-            Self::TestUintSub => "test_uint_sub",
-            Self::TestUintMul => "test_uint_mul",
-            Self::TestUintDiv => "test_uint_div",
             #[cfg(feature = "test_helper")]
             Self::TestNondetCounter => "test_nondet_counter",
             Self::StringReverse => "string_reverse",
@@ -1263,8 +1257,11 @@ impl Display for ScalarFunc {
             Self::NumericSub => "numeric_sub",
             Self::NumericMul => "numeric_mul",
             Self::NumericDiv => "numeric_div",
+            Self::NumericMod => "numeric_mod",
+            Self::NumericNeg => "numeric_neg",
             Self::DatePlus => "date_plus",
             Self::DateMinus => "date_minus",
+            Self::DateDiff => "date_diff",
             Self::Array => "array",
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
@@ -1394,21 +1391,23 @@ impl ScalarFunc {
             // SQL-standard string and math extensions
             Self::Gcd | Self::Lcm | Self::Repeat => &[2],
             Self::Lpad | Self::Rpad => &[2, 3],
-            // Test functions for custom types (1-arg encode/decode, 2-arg operators)
+            // Test functions for custom types
             Self::TestUintEncode | Self::TestUintDecode | Self::StringReverse => &[1],
-            Self::TestUintAdd | Self::TestUintSub | Self::TestUintMul | Self::TestUintDiv => &[2],
             // Built-in type functions
             Self::BooleanToInt
             | Self::IntToBoolean
             | Self::ValidateIpAddr
             | Self::NumericEncode
-            | Self::NumericDecode => &[1],
+            | Self::NumericDecode
+            | Self::NumericNeg => &[1],
             Self::NumericAdd
             | Self::NumericSub
             | Self::NumericMul
             | Self::NumericDiv
+            | Self::NumericMod
             | Self::DatePlus
-            | Self::DateMinus => &[2],
+            | Self::DateMinus
+            | Self::DateDiff => &[2],
             Self::NumericFit => &[3],
             // Array construction / element access
             Self::Array => &[-1], // variable arity

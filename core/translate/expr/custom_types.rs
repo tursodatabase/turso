@@ -1,91 +1,5 @@
 use super::*;
 
-/// Map an AST operator to the string representation used in custom type operator definitions.
-pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
-    match op {
-        ast::Operator::Add => Some("+"),
-        ast::Operator::Subtract => Some("-"),
-        ast::Operator::Multiply => Some("*"),
-        ast::Operator::Divide => Some("/"),
-        ast::Operator::Modulus => Some("%"),
-        _ => None,
-    }
-}
-
-/// Emit bytecode for a resolved custom type operator call, encoding a literal
-/// operand first when needed.
-pub(super) fn emit_custom_type_operator(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    e1: &ast::Expr,
-    e2: &ast::Expr,
-    resolved: &ResolvedOperator,
-    resolver: &Resolver,
-) -> Result<usize> {
-    let func = resolver
-        .resolve_function(&resolved.func_name, 2)?
-        .ok_or_else(|| {
-            LimboError::InternalError(format!("function not found: {}", resolved.func_name))
-        })?;
-
-    // When encoding a literal operand, we must use separate registers for the
-    // function call arguments. translate_expr may place literals in preamble
-    // registers (constant optimization), and encoding in-place would clobber
-    // that register — breaking subsequent loop iterations.
-    let func_start = if let Some(ref encode_info) = resolved.encode_info {
-        if let Some(encode_expr) = encode_info.type_def.encode() {
-            // Translate operands into temporary registers first.
-            let tmp1 = program.alloc_register();
-            let tmp2 = program.alloc_register();
-            translate_expr(program, referenced_tables, e1, tmp1, resolver)?;
-            translate_expr(program, referenced_tables, e2, tmp2, resolver)?;
-
-            // Allocate fresh contiguous registers for the function call. The
-            // literal goes in the same position it occupied in the expression.
-            let func_args = program.alloc_registers(2);
-            let (lit_tmp, col_tmp, lit_dst, col_dst) = match encode_info.which {
-                EncodeArg::First => (tmp1, tmp2, func_args, func_args + 1),
-                EncodeArg::Second => (tmp2, tmp1, func_args + 1, func_args),
-            };
-
-            // Copy column value as-is.
-            program.emit_insn(Insn::Copy {
-                src_reg: col_tmp,
-                dst_reg: col_dst,
-                extra_amount: 0,
-            });
-            // Encode the literal into the fresh function arg slot.
-            emit_type_expr(program, encode_expr, lit_tmp, lit_dst, resolver)?;
-            func_args
-        } else {
-            // Type has no encode expression; translate directly into arg slots.
-            let arg_reg = program.alloc_registers(2);
-            translate_expr(program, referenced_tables, e1, arg_reg, resolver)?;
-            translate_expr(program, referenced_tables, e2, arg_reg + 1, resolver)?;
-            arg_reg
-        }
-    } else {
-        // No encoding needed; translate directly into arg slots.
-        let arg_reg = program.alloc_registers(2);
-        translate_expr(program, referenced_tables, e1, arg_reg, resolver)?;
-        translate_expr(program, referenced_tables, e2, arg_reg + 1, resolver)?;
-        arg_reg
-    };
-
-    let result_reg = program.alloc_register();
-    program.emit_insn(Insn::Function {
-        constant_mask: 0,
-        start_reg: func_start,
-        dest: result_reg,
-        func: FuncCtx {
-            func,
-            arg_count: 2,
-            collation: CollationSeq::BINARY,
-        },
-    });
-    Ok(result_reg)
-}
-
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
     match expr {
@@ -116,112 +30,28 @@ pub(super) fn literal_compatible_with_value_type(
         || literal_type.eq_ignore_ascii_case(value_input_type)
 }
 
-/// Which operand of a binary expression needs encoding before the operator call.
-pub(super) enum EncodeArg {
-    /// Encode the first argument (e1 is a literal, e2 is the custom type column)
-    First,
-    /// Encode the second argument (e1 is the custom type column, e2 is a literal)
-    Second,
+/// Whether a custom type's function runs the operator expression `expr`, such
+/// as `a < b` or `-a`. An operator that does not exist, such as `date * 2`,
+/// counts too: emitting it fails.
+pub(crate) fn runs_custom_type_function(expr: &ast::Expr, env: &TypeEnv) -> bool {
+    !matches!(custom_operator_call(expr, env), Ok(None))
 }
 
-/// Info needed to encode a literal argument for an operator call.
-pub(super) struct OperatorEncodeInfo {
-    type_def: Arc<TypeDef>,
-    which: EncodeArg,
-}
-
-/// Result of resolving a custom type operator.
-pub(super) struct ResolvedOperator {
-    func_name: String,
-    /// If a literal operand needs encoding before the operator call.
-    encode_info: Option<OperatorEncodeInfo>,
-}
-
-/// Find a custom type operator function for a binary expression.
-///
-/// Operators fire when:
-/// 1. Both operands are columns of the same custom type, OR
-/// 2. One operand is a custom type column and the other is a literal whose type
-///    is compatible with the custom type's `value` input type, OR
-/// 3. One operand is a column of the type, the other is anything except a column
-///    of a different custom type, and the type reads stored values back
-///    unchanged. This lets `date + 1`, `date + int_col` and `date + ?` add days.
-///
-/// When case 2 applies, the literal is encoded before being passed to the operator
-/// function so both arguments are in the same (encoded) representation. In case 3
-/// the other operand is passed as is, which is only safe when encoded and decoded
-/// values look the same.
-pub(super) fn find_custom_type_operator(
-    e1: &ast::Expr,
-    e2: &ast::Expr,
-    op: &ast::Operator,
+/// Emits the operator expression `expr` with a custom type's function, if one
+/// runs it, and returns the register holding the result. `None` means SQLite's
+/// operator runs.
+pub(super) fn emit_custom_type_operator(
+    program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
-) -> Option<ResolvedOperator> {
-    let op_str = operator_to_str(op)?;
-    let env = TypeEnv::new(referenced_tables, resolver);
-    let lhs_info = operand_custom_type(e1, &env, resolver);
-    let rhs_info = operand_custom_type(e2, &env, resolver);
-
-    let find_in_type_def = |type_def: &TypeDef| -> Option<String> {
-        let op_def = type_def.operators().iter().find(|o| o.op == op_str)?;
-        // Naked operator (func_name = None): fall through to the standard operator
-        op_def.func_name.clone()
-    };
-
-    // Case 1: Both operands are custom type columns of the SAME type.
-    if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
-        if same_type_def(&lhs.type_def, &rhs.type_def) {
-            if let Some(func_name) = find_in_type_def(&lhs.type_def) {
-                return Some(ResolvedOperator {
-                    func_name,
-                    encode_info: None,
-                });
-            }
-        }
-        // Different custom types: fall through to standard operator.
-        return None;
-    }
-
-    let resolve_one_custom_operand =
-        |info: &ColumnCustomType, other: &ast::Expr, which: EncodeArg| {
-            let encode_other = literal_type_name(other).is_some_and(|lit_type| {
-                literal_compatible_with_value_type(lit_type, info.type_def.value_input_type())
-            });
-            let pass_other_unencoded = info.type_def.decode_returns_value_unchanged();
-            if !encode_other && !pass_other_unencoded {
-                return None;
-            }
-            let func_name = find_in_type_def(&info.type_def)?;
-            Some(ResolvedOperator {
-                func_name,
-                encode_info: encode_other.then(|| OperatorEncodeInfo {
-                    type_def: info.type_def.clone(),
-                    which,
-                }),
-            })
-        };
-
-    match (&lhs_info, &rhs_info) {
-        (Some(lhs), None) => resolve_one_custom_operand(lhs, e2, EncodeArg::Second),
-        (None, Some(rhs)) => resolve_one_custom_operand(rhs, e1, EncodeArg::First),
-        _ => None,
-    }
-}
-
-/// The custom type whose operators apply to an operand. Generated column
-/// expressions use the standard operators, see `SelfTableContext::ForDML`.
-fn operand_custom_type(
     expr: &ast::Expr,
-    env: &TypeEnv,
     resolver: &Resolver,
-) -> Option<ColumnCustomType> {
-    if let ast::Expr::Column { table, .. } = expr {
-        if table.is_self_table() && resolver.self_table_with_custom_type_operators().is_none() {
-            return None;
-        }
-    }
-    column_custom_type(expr, env)
+) -> Result<Option<usize>> {
+    let env = TypeEnv::new(referenced_tables, resolver);
+    let Some(call) = custom_operator_call(expr, &env)? else {
+        return Ok(None);
+    };
+    let result_reg = emit_operator_call(program, referenced_tables, expr, &call, resolver)?;
+    Ok(Some(result_reg))
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
@@ -236,9 +66,6 @@ fn operand_custom_type(
 ///
 /// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
 /// columns are decoded in-place in `column_regs`.
-///
-/// `uses_custom_type_operators` must be false when `expr` is the expression of a
-/// virtual generated column, see `SelfTableContext::ForDML`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
@@ -248,7 +75,6 @@ pub(crate) fn emit_dml_expr_index_value(
     column_regs: &mut [usize],
     table: &Arc<BTreeTable>,
     dest_reg: usize,
-    uses_custom_type_operators: bool,
 ) -> Result<()> {
     crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
 
@@ -271,7 +97,6 @@ pub(crate) fn emit_dml_expr_index_value(
     let ctx = SelfTableContext::ForDML {
         dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
         table: Arc::clone(table),
-        uses_custom_type_operators,
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         translate_expr(program, None, &expr, dest_reg, resolver)?;

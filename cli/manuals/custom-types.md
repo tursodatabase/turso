@@ -6,7 +6,7 @@ display_name: "custom types"
 
 ## Overview
 
-Turso extends SQLite's STRICT table type system with user-defined custom types. Custom types let you define how values are encoded before storage and decoded when read, enforce domain constraints at the storage layer, attach operators, and provide defaults — all declared in pure SQL.
+Turso extends SQLite's STRICT table type system with user-defined custom types. Custom types let you define how values are encoded before storage and decoded when read, enforce domain constraints at the storage layer, and provide defaults — all declared in pure SQL.
 
 Custom types work only with **STRICT** tables (which are always enabled):
 
@@ -23,7 +23,7 @@ CREATE TYPE type_name BASE base_type
     [ENCODE encode_expr]
     [COERCE coerce_expr]
     [DECODE decode_expr]
-    [OPERATOR 'op' [function_name] ...]
+    [OPERATOR '<']
     [DEFAULT default_expr];
 ```
 
@@ -31,7 +31,7 @@ CREATE TYPE type_name BASE base_type
 - **ENCODE** — Expression applied to `value` before writing to disk.
 - **COERCE** — (Optional) Expression that fits the encoded `value` to the column's type parameters, such as a maximum length. See [Parametric Types](#parametric-types).
 - **DECODE** — Expression applied to `value` when reading from disk.
-- **OPERATOR** — (Optional) Function to call for an arithmetic operator (`+`, `-`, `*`, `/`, `%`) on values of the type. See [Operators](#operators). A plain `OPERATOR '<'` lets ORDER BY and CREATE INDEX sort the type; see [Ordering](#ordering).
+- **OPERATOR '<'** — (Optional) Lets ORDER BY and CREATE INDEX sort the type; see [Ordering](#ordering). Arithmetic operators can't be declared; see [Operators](#operators).
 - **DEFAULT** — (Optional) Default value for columns of this type when no value is supplied.
 
 The special identifier `value` refers to the input being encoded or decoded.
@@ -98,26 +98,16 @@ INSERT INTO t1 VALUES ('not json');    -- Error: malformed JSON
 
 ## Operators
 
-Custom types can map arithmetic operators to functions, so expressions like `val + val` call a user-defined function:
+A user-defined type has no arithmetic operators. `val + 1` on a column of the type fails:
 
 ```sql
-CREATE TYPE uint BASE text
-    ENCODE test_uint_encode(value)
-    DECODE test_uint_decode(value)
-    OPERATOR '+' test_uint_add;
-
-CREATE TABLE t1(val uint) STRICT;
-INSERT INTO t1 VALUES (20);
-INSERT INTO t1 VALUES (30);
-
-SELECT val + val FROM t1;
--- 40
--- 60
+CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+CREATE TABLE prices(amount cents) STRICT;
+SELECT amount + 1 FROM prices;
+-- Error: operator does not exist: cents + integer
 ```
 
-The function runs when both operands are of the type, or one is of the type and the other is a literal (encoded first). Otherwise SQLite's operator runs on the values the columns read as. The built-in `date` type declares `+` and `-`, and `numeric` declares `+`, `-`, `*` and `/`.
-
-`OPERATOR '<'` takes no function; see [Ordering](#ordering). Other comparison operators can't be declared: `OPERATOR '='` fails with `OPERATOR '=' is not supported: values of a custom type compare by their decoded value`.
+The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic operators. The only OPERATOR clause `CREATE TYPE` accepts is a plain `OPERATOR '<'`; see [Ordering](#ordering). Any other fails: `OPERATOR '+' f` fails with `CREATE TYPE does not accept OPERATOR '+': only OPERATOR '<' is supported`.
 
 ## Ordering
 
@@ -154,17 +144,20 @@ SELECT val FROM t ORDER BY val;
 
 ### Types with Their Own Order
 
-The built-in `numeric` type and arrays have their own order, set by Turso. It is used in every comparison of their values: `=`, `<` and the other operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins and indexes. The same query returns the same rows with and without an index:
+The built-in `numeric` type and arrays have their own order, set by Turso. It is used in every comparison of their values: `=`, `<` and the other operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins and indexes. The same query returns the same rows with and without an index, and expressions of the type compare the same way:
 
 ```sql
-CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
-INSERT INTO t VALUES (1, 4.50), (2, 9.50), (3, 10);
-SELECT max(n) FROM t;                    -- 10.00, not '9.50'
-SELECT id FROM t WHERE n IN (4.5, 10);   -- 1, 3
-SELECT id FROM t WHERE n = 4.504;        -- nothing: the constant is not rounded to 2 places
+CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), i integer) STRICT;
+INSERT INTO t VALUES (1, 4.50, 6), (2, 9.50, 0);
+SELECT max(n + i) FROM t;            -- 10.50, not '9.50'
+SELECT id FROM t WHERE n + i IN (10.5);  -- 1
+SELECT id FROM t WHERE n = 4.504;    -- nothing: the constant is not rounded to 2 places
+SELECT n FROM t UNION SELECT 4.5;    -- two rows: 4.5 equals 4.50
 ```
 
 A COLLATE on a value of such a type is an error (`collations are not supported by type numeric`).
+
+A window `RANGE` frame with an offset (`RANGE 1 PRECEDING`) computes its bounds with numeric's `+` and `-` when the `ORDER BY` value is a numeric. For arrays, such a frame is an error.
 
 Other types compare the values the column reads as in `=`, `<` and the other operators, with SQLite's rules. An index on such a column serves `=` lookups only, since it is ordered by the encoded form.
 
@@ -351,7 +344,7 @@ PRAGMA list_types;
 -- TEXT      |        |                       |        |                       |         |
 -- BLOB      |        |                       |        |                       |         |
 -- ANY       |        |                       |        |                       |         |
--- uint      | text   | test_uint_encode(...) |        | test_uint_decode(...) | 0       | '+' test_uint_add
+-- uint      | text   | test_uint_encode(...) |        | test_uint_decode(...) | 0       |
 ```
 
 ### sqlite_turso_types

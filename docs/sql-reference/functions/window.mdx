@@ -62,7 +62,7 @@ where `<start>` and `<end>` (or the shorthand `<bound>`) are one of:
 | `UNBOUNDED FOLLOWING` | The last row of the partition |
 
 - `ROWS` counts individual physical rows.
-- `RANGE` compares the `ORDER BY` value: `<n> PRECEDING` includes every row whose ordering value is at least the current value minus `n`.
+- `RANGE` compares the `ORDER BY` value: `<n> PRECEDING` includes every row whose ordering value is at least the current value minus `n`. When the `ORDER BY` value is a `numeric`, the bounds are computed with numeric arithmetic. An offset on a value of another custom type with an order, such as an array, is an error.
 - `GROUPS` counts peer groups (sets of rows that are equal on the `ORDER BY` expression).
 
 Example — a three-row moving window:

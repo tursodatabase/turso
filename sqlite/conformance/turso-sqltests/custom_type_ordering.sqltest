@@ -62,11 +62,11 @@ expect error {
     OPERATOR '<' takes no function: a type that declares it sorts by its stored value
 }
 
-test create-type-rejects-equals-operator {
+test create-type-rejects-operators-other-than-less-than {
     CREATE TYPE orderable_eq BASE text ENCODE value DECODE value OPERATOR '=' test_uint_eq;
 }
 expect error {
-    OPERATOR '=' is not supported: values of a custom type compare by their decoded value
+    CREATE TYPE does not accept OPERATOR '=': only OPERATOR '<' is supported
 }
 
 @requires strict "uses STRICT tables"

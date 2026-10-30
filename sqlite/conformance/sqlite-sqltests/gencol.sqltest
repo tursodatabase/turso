@@ -5047,25 +5047,25 @@ test gencol-virtual-union-tag-select-resolves-self-table-type {
 
 @skip-if sqlite "SQLite doesn't support custom types"
 @requires custom_types "uses custom types"
-test gencol-virtual-index-key-on-custom-type-column-uses-standard-operators {
+test gencol-virtual-index-key-on-custom-type-column-uses-type-operators {
     CREATE TABLE prices(id INTEGER PRIMARY KEY, val numeric(10,2), doubled ANY AS (val * 2) VIRTUAL) STRICT;
     CREATE INDEX prices_doubled ON prices(doubled);
     INSERT INTO prices(id, val) VALUES (1, 1.50);
-    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = 3.0;
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = (SELECT val * 2 FROM prices);
     PRAGMA integrity_check;
     UPDATE prices SET val = 2.50;
-    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = 5.0;
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = (SELECT val * 2 FROM prices);
     INSERT INTO prices(id, val) VALUES (1, 4.50) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
-    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = 9.0;
+    SELECT typeof(doubled), doubled FROM prices INDEXED BY prices_doubled WHERE doubled = (SELECT val * 2 FROM prices);
     PRAGMA integrity_check;
     DELETE FROM prices WHERE id = 1;
     SELECT count(*) FROM prices;
     PRAGMA integrity_check;
 } expect {
-    real|3.0
+    text|3.00
     ok
-    real|5.0
-    real|9.0
+    text|5.00
+    text|9.00
     ok
     0
     ok

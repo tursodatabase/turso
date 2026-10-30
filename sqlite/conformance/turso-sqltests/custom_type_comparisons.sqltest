@@ -7,6 +7,88 @@
 # operand evaluated once.
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-same-rows-with-and-without-index {
+    -- Every query runs twice: before the indexes exist and after. Both runs
+    -- must return the same rows, so the expected rows are listed twice. The
+    -- literals are chosen so that SQLite's comparison on the stored value, or
+    -- a literal rounded to the column's scale, would give other rows.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 4.50), (2, 1.50), (3, 20.50), (4, -2), (5, NULL), (6, 1.5);
+    SELECT 'eq', id FROM t WHERE n = 1.5 ORDER BY id;
+    SELECT 'eq-unrounded', id FROM t WHERE n = 1.504 ORDER BY id;
+    SELECT 'gt-unrounded', id FROM t WHERE n > 1.504 ORDER BY id;
+    SELECT 'expr', id FROM t WHERE n * 2 = 9 ORDER BY id;
+    SELECT 'in', id FROM t WHERE n IN (1.504, 20.5) ORDER BY id;
+    SELECT 'not-in', id FROM t WHERE n NOT IN (1.504, 20.5) ORDER BY id;
+    SELECT 'between', id FROM t WHERE n BETWEEN 1.504 AND 4.5 ORDER BY id;
+    SELECT 'is', id FROM t WHERE n IS 1.5 ORDER BY id;
+    SELECT 'is-not', id FROM t WHERE n IS NOT 1.5 ORDER BY id;
+    SELECT 'case', id FROM t WHERE CASE n WHEN 1.504 THEN 1 WHEN 4.5 THEN 1 ELSE 0 END ORDER BY id;
+    SELECT 'nullif', id FROM t WHERE nullif(n, 1.5) IS NULL ORDER BY id;
+    SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.n = b.n WHERE a.id < b.id ORDER BY 2, 3;
+    CREATE INDEX t_n ON t(n);
+    CREATE INDEX t_n2 ON t(n * 2);
+    SELECT 'eq', id FROM t WHERE n = 1.5 ORDER BY id;
+    SELECT 'eq-unrounded', id FROM t WHERE n = 1.504 ORDER BY id;
+    SELECT 'gt-unrounded', id FROM t WHERE n > 1.504 ORDER BY id;
+    SELECT 'expr', id FROM t WHERE n * 2 = 9 ORDER BY id;
+    SELECT 'in', id FROM t WHERE n IN (1.504, 20.5) ORDER BY id;
+    SELECT 'not-in', id FROM t WHERE n NOT IN (1.504, 20.5) ORDER BY id;
+    SELECT 'between', id FROM t WHERE n BETWEEN 1.504 AND 4.5 ORDER BY id;
+    SELECT 'is', id FROM t WHERE n IS 1.5 ORDER BY id;
+    SELECT 'is-not', id FROM t WHERE n IS NOT 1.5 ORDER BY id;
+    SELECT 'case', id FROM t WHERE CASE n WHEN 1.504 THEN 1 WHEN 4.5 THEN 1 ELSE 0 END ORDER BY id;
+    SELECT 'nullif', id FROM t WHERE nullif(n, 1.5) IS NULL ORDER BY id;
+    SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.n = b.n WHERE a.id < b.id ORDER BY 2, 3;
+}
+expect {
+    eq|2
+    eq|6
+    gt-unrounded|1
+    gt-unrounded|3
+    expr|1
+    in|3
+    not-in|1
+    not-in|2
+    not-in|4
+    not-in|6
+    between|1
+    is|2
+    is|6
+    is-not|1
+    is-not|3
+    is-not|4
+    is-not|5
+    case|1
+    nullif|2
+    nullif|5
+    nullif|6
+    join|2|6
+    eq|2
+    eq|6
+    gt-unrounded|1
+    gt-unrounded|3
+    expr|1
+    in|3
+    not-in|1
+    not-in|2
+    not-in|4
+    not-in|6
+    between|1
+    is|2
+    is|6
+    is-not|1
+    is-not|3
+    is-not|4
+    is-not|5
+    case|1
+    nullif|2
+    nullif|5
+    nullif|6
+    join|2|6
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-in-select-list {
     -- The same comparisons outside WHERE, where no index is involved.
     CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
@@ -16,6 +98,28 @@ test cmp-numeric-in-select-list {
 expect {
     1|1|0|1|y|1
     2|||0|n|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-order-same-with-and-without-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 4.5), (2, 5), (3, -1), (4, 10);
+    SELECT group_concat(id) FROM (SELECT id FROM t ORDER BY n * 2);
+    SELECT group_concat(id) FROM (SELECT id FROM t WHERE n > 1 ORDER BY n);
+    SELECT min(n * 2), max(n * 2) FROM t;
+    CREATE INDEX t_n ON t(n);
+    CREATE INDEX t_n2 ON t(n * 2);
+    SELECT group_concat(id) FROM (SELECT id FROM t ORDER BY n * 2);
+    SELECT group_concat(id) FROM (SELECT id FROM t WHERE n > 1 ORDER BY n);
+    SELECT min(n * 2), max(n * 2) FROM t;
+}
+expect {
+    3,1,2,4
+    1,2,4
+    -2.00|20.00
+    3,1,2,4
+    1,2,4
+    -2.00|20.00
 }
 
 @requires strict "uses STRICT tables"
@@ -254,6 +358,110 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-arithmetic-results {
+    -- n + i is a numeric, so max, IN and CASE compare it with numeric's order:
+    -- as text '9.50' would sort after '10.50' and not equal 10.5. Every query
+    -- runs before and after the indexes exist.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), i integer) STRICT;
+    INSERT INTO t VALUES (1, 4.50, 6), (2, 9.50, 0), (3, 3.50, 7), (4, NULL, 1), (5, 1.50, 0);
+    SELECT 'max', max(n + i), min(n + i) FROM t;
+    SELECT 'in', id FROM t WHERE n + i IN (10.5) ORDER BY id;
+    SELECT 'case', id, CASE n + i WHEN 10.5 THEN 'y' ELSE 'n' END FROM t ORDER BY id;
+    SELECT 'order', id FROM t WHERE n IS NOT NULL ORDER BY n + i, id;
+    CREATE INDEX t_n ON t(n);
+    CREATE INDEX t_ni ON t(n + i);
+    SELECT 'max', max(n + i), min(n + i) FROM t;
+    SELECT 'in', id FROM t WHERE n + i IN (10.5) ORDER BY id;
+    SELECT 'case', id, CASE n + i WHEN 10.5 THEN 'y' ELSE 'n' END FROM t ORDER BY id;
+    SELECT 'order', id FROM t WHERE n IS NOT NULL ORDER BY n + i, id;
+}
+expect {
+    max|10.50|1.50
+    in|1
+    in|3
+    case|1|y
+    case|2|n
+    case|3|y
+    case|4|n
+    case|5|n
+    order|5
+    order|2
+    order|1
+    order|3
+    max|10.50|1.50
+    in|1
+    in|3
+    case|1|y
+    case|2|n
+    case|3|y
+    case|4|n
+    case|5|n
+    order|5
+    order|2
+    order|1
+    order|3
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-expression-index-same-rows-as-scan {
+    -- An index on n * 2 holds numerics, so a seek on it finds the rows a scan
+    -- finds. For n = 3.5, =, IN and CASE all match 7.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 3.50), (2, 4.50), (3, 9.50), (4, 10.50), (5, 5.00), (6, NULL);
+    CREATE INDEX t_n2 ON t(n * 2);
+    SELECT 'gt', id FROM t WHERE n * 2 > 10 ORDER BY id;
+    SELECT 'gt-scan', id FROM t NOT INDEXED WHERE n * 2 > 10 ORDER BY id;
+    SELECT 'eq', id FROM t WHERE n * 2 = 19.0 ORDER BY id;
+    SELECT 'eq-scan', id FROM t NOT INDEXED WHERE n * 2 = 19.0 ORDER BY id;
+    SELECT 'seven', id FROM t WHERE n * 2 = 7;
+    SELECT 'seven-in', id FROM t WHERE n * 2 IN (7);
+    SELECT 'seven-case', id FROM t WHERE CASE n * 2 WHEN 7 THEN 1 ELSE 0 END;
+    SELECT 'seven-scan', id FROM t NOT INDEXED WHERE n * 2 = 7;
+}
+expect {
+    gt|3
+    gt|4
+    gt-scan|3
+    gt-scan|4
+    eq|3
+    eq-scan|3
+    seven|1
+    seven-in|1
+    seven-case|1
+    seven-scan|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-order-distinct-union {
+    -- ORDER BY puts 9.5 before 10.5, which text order would not. DISTINCT and
+    -- UNION treat 1.50, 1.5 and 1.500 as one value, as = does.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 10.50), (2, 9.50), (3, 1.50);
+    SELECT 'order', n FROM t ORDER BY n;
+    SELECT 'order-expr', n + 0 FROM t ORDER BY n + 0;
+    SELECT 'order-subquery', x FROM (SELECT n + 0 AS x FROM t) ORDER BY x;
+    SELECT 'distinct', count(*) FROM (SELECT DISTINCT x FROM (SELECT n AS x FROM t WHERE id = 3 UNION ALL SELECT n * 1.0 FROM t WHERE id = 3));
+    SELECT 'union', count(*) FROM (SELECT n FROM t WHERE id = 3 UNION SELECT n * 1.0 FROM t WHERE id = 3);
+    SELECT 'union-scales', count(*) FROM (SELECT n FROM t WHERE id = 3 UNION SELECT CAST(1.5 AS numeric(10,1)));
+    SELECT 'equal', (SELECT n FROM t WHERE id = 3) = (SELECT n * 1.0 FROM t WHERE id = 3);
+}
+expect {
+    order|1.50
+    order|9.50
+    order|10.50
+    order-expr|1.50
+    order-expr|9.50
+    order-expr|10.50
+    order-subquery|1.50
+    order-subquery|9.50
+    order-subquery|10.50
+    distinct|1
+    union|1
+    union-scales|1
+    equal|1
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-with-infinite-real {
     -- A numeric compared with a REAL holding infinity: every finite numeric is
     -- below inf and above -inf.
@@ -266,6 +474,32 @@ expect {
     2|0|1|0
     3|0|1|0
     4|0|0|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-negation {
+    -- -n is a numeric and keeps the scale, as numeric_neg computes it.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 4.50), (2, -9.50), (3, 0), (4, NULL);
+    SELECT id, -n FROM t ORDER BY -n;
+}
+expect {
+    4|
+    1|-4.50
+    3|0.00
+    2|9.50
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-coalesce-with-integer {
+    -- coalesce(n, 0) is a numeric, so 0.00 equals 0.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 0), (2, NULL), (3, 1.50);
+    SELECT id FROM t WHERE coalesce(n, 0) = 0 ORDER BY id;
+}
+expect {
+    1
+    2
 }
 
 @requires strict "uses STRICT tables"
@@ -285,6 +519,72 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-window-range-offset {
+    -- A RANGE offset frame adds the offset to a numeric ORDER BY value with
+    -- numeric's + and compares with numeric's order. Expected rows are from
+    -- PostgreSQL.
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (9.5), (10), (10.5), (12), (NULL);
+    SELECT 'p1', n, count(*) OVER (ORDER BY n RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY n IS NULL, n;
+    SELECT 'f1', n, count(*) OVER (ORDER BY n RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t ORDER BY n IS NULL, n;
+    SELECT 'p05', n, count(*) OVER (ORDER BY n RANGE BETWEEN 0.5 PRECEDING AND 0.5 FOLLOWING) FROM t ORDER BY n IS NULL, n;
+    SELECT 'desc', n, count(*) OVER (ORDER BY n DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY n IS NULL, n;
+    SELECT 'expr', n, count(*) OVER (ORDER BY n + 0 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY n IS NULL, n;
+}
+expect {
+    p1|9.50|1
+    p1|10.00|2
+    p1|10.50|3
+    p1|12.00|1
+    p1||1
+    f1|9.50|3
+    f1|10.00|2
+    f1|10.50|1
+    f1|12.00|1
+    f1||1
+    p05|9.50|2
+    p05|10.00|3
+    p05|10.50|2
+    p05|12.00|1
+    p05||1
+    desc|9.50|3
+    desc|10.00|2
+    desc|10.50|1
+    desc|12.00|1
+    desc||1
+    expr|9.50|1
+    expr|10.00|2
+    expr|10.50|3
+    expr|12.00|1
+    expr||1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-window-range-offset {
+    -- A RANGE offset frame on a date ORDER BY value moves by days with
+    -- date's `-` and `+`, as `d - 1` does.
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-01'), ('2024-01-02'), ('2024-01-04'), (NULL);
+    SELECT 'p1', d, count(*) OVER (ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY d IS NULL, d;
+    SELECT 'f1', d, count(*) OVER (ORDER BY d RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t ORDER BY d IS NULL, d;
+    SELECT 'desc', d, count(*) OVER (ORDER BY d DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY d IS NULL, d;
+}
+expect {
+    p1|2024-01-01|1
+    p1|2024-01-02|2
+    p1|2024-01-04|1
+    p1||1
+    f1|2024-01-01|2
+    f1|2024-01-02|1
+    f1|2024-01-04|1
+    f1||1
+    desc|2024-01-01|2
+    desc|2024-01-02|1
+    desc|2024-01-04|1
+    desc||1
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-window-range-null-offset-is-an-error {
     -- A NULL offset has no numeric `+`. It is rejected when the frame is
     -- computed, as in SQLite.
@@ -294,6 +594,18 @@ test cmp-numeric-window-range-null-offset-is-an-error {
 }
 expect error {
     frame ending offset must be a non-negative number
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-window-range-offset-is-an-error {
+    -- An array has an order but no distance, so a RANGE offset on it is an
+    -- error, as in PostgreSQL.
+    CREATE TABLE t(a integer[]) STRICT;
+    INSERT INTO t VALUES ('{1}');
+    SELECT count(*) OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type array
 }
 
 @requires strict "uses STRICT tables"
@@ -319,6 +631,65 @@ expect {
     order|2
     order|3
     order|4
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-in-compound-subquery {
+    -- The column of a compound SELECT is a numeric when any SELECT gives a
+    -- numeric and the others give integers, decimals or NULL, so IN compares
+    -- with numeric's order whichever SELECT comes first. Expected values are
+    -- from PostgreSQL.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    INSERT INTO a VALUES (1.5);
+    SELECT 1.5 IN (SELECT n FROM a UNION SELECT 3);
+    SELECT 1.5 IN (SELECT n FROM a UNION ALL SELECT NULL);
+    SELECT '1.5' IN (SELECT 3 UNION SELECT n FROM a);
+    SELECT 1.50 NOT IN (SELECT n FROM a UNION SELECT 3);
+    SELECT 3 IN (SELECT n FROM a UNION SELECT 3.00);
+}
+expect {
+    1
+    1
+    1
+    0
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-window-value-functions-keep-the-argument-type {
+    -- lag, lead, first_value, last_value and nth_value give a value of their
+    -- argument's type, so it sorts and compares with that type's order.
+    -- Expected rows are from PostgreSQL.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), a integer[]) STRICT;
+    INSERT INTO t VALUES (1, 9.5, '{1,9}'), (2, 10, '{1,10}'), (3, 2, '{2}');
+    SELECT 'lag', id FROM t ORDER BY lag(n) OVER (ORDER BY id), id;
+    SELECT 'lag-default', id FROM t ORDER BY lag(n, 1, 100) OVER (ORDER BY id), id;
+    SELECT 'lead', id FROM t ORDER BY lead(a, 0) OVER (ORDER BY id), id;
+    SELECT 'first', id FROM t ORDER BY first_value(n) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW), id;
+    SELECT 'last', id FROM t ORDER BY last_value(n) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW), id;
+    SELECT 'nth', id FROM t ORDER BY nth_value(a, 1) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW), id;
+    SELECT 'eq', id FROM (SELECT id, lag(n) OVER (ORDER BY id) AS l FROM t) WHERE l = 9.5;
+}
+expect {
+    lag|1
+    lag|2
+    lag|3
+    lag-default|2
+    lag-default|3
+    lag-default|1
+    lead|1
+    lead|2
+    lead|3
+    first|3
+    first|1
+    first|2
+    last|3
+    last|1
+    last|2
+    nth|1
+    nth|2
+    nth|3
+    eq|2
 }
 
 @requires strict "uses STRICT tables"
@@ -439,6 +810,23 @@ test cmp-registers-of-type-without-arguments {
 expect {
     upsert|cd
     trigger|grew
+}
+
+@requires strict "uses STRICT tables"
+test cmp-compound-column-has-one-type {
+    -- A compound SELECT's column has the common type of its SELECTs, whether
+    -- the compound removes duplicates, feeds an IN, or is a subquery in FROM.
+    -- Expected values are from PostgreSQL.
+    CREATE TABLE t(n numeric(10,2), b text[]) STRICT;
+    INSERT INTO t VALUES (10, '{1}');
+    SELECT 'from', x FROM (SELECT 1 AS x UNION SELECT n FROM t) WHERE x = '10.0';
+    SELECT 'in', '{1.0}' IN (SELECT array_append('{}', '1') UNION ALL SELECT b FROM t);
+    SELECT 'from-array', count(*) FROM (SELECT array_append('{}', '1') AS a UNION ALL SELECT b FROM t) WHERE a = '{1.0}';
+}
+expect {
+    from|10.00
+    in|0
+    from-array|0
 }
 
 @requires strict "uses STRICT tables"
