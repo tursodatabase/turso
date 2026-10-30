@@ -2089,6 +2089,13 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
+        let (_, table) = table_references
+            .find_table_by_internal_id(table_internal_id)
+            .expect("the indexed table is in table_references");
+        let table = table.btree().expect("an index belongs to a btree table");
+        crate::translate::expr::emit_expression_index_key(
+            program, dest_reg, idx_col, &table, resolver,
+        )?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
@@ -2206,6 +2213,9 @@ fn emit_index_column_value_new_image(
             &column_regs,
             table,
             dest_reg,
+        )?;
+        crate::translate::expr::emit_expression_index_key(
+            program, dest_reg, idx_col, table, resolver,
         )?;
     } else {
         let col_in_table = columns
