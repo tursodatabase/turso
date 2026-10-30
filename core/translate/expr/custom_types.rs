@@ -488,7 +488,10 @@ pub(crate) fn stored_comparison_type_across_queries<'a, 'c, 's: 'c>(
     // and a hash join or an IN subquery compares it as it is, so the answer
     // would depend on the plan.
     if let Some(compared_as) = &found {
-        if let Some(operand_type) = varying_others.first() {
+        let other_type = varying_others
+            .iter()
+            .find(|operand_type| !is_truth_value_for(operand_type, compared_as.leaf()));
+        if let Some(operand_type) = other_type {
             crate::bail_parse_error!(
                 "cannot compare type {} with {}: cast it to {} first",
                 compared_as.leaf().name,
@@ -498,6 +501,14 @@ pub(crate) fn stored_comparison_type_across_queries<'a, 'c, 's: 'c>(
         }
     }
     Ok(found)
+}
+
+/// Whether `operand_type` is a truth value, such as `u > 0`, compared with the
+/// built-in boolean type. A truth value already is a boolean.
+fn is_truth_value_for(operand_type: &ExprType, compared_as: &TypeDef) -> bool {
+    matches!(operand_type, ExprType::Builtin(BuiltinType::Boolean))
+        && compared_as.is_builtin
+        && compared_as.name.eq_ignore_ascii_case("boolean")
 }
 
 /// Translates `expr`, an operand of a comparison, into `target_register`. When

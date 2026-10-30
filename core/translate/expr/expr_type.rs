@@ -59,6 +59,11 @@ pub(crate) enum BuiltinType {
     Numeric,
     Text,
     Blob,
+    /// A truth value: 1, 0 or NULL, from a comparison, NOT, AND, OR, IN, LIKE,
+    /// BETWEEN or EXISTS. SQLite computes with it as an integer. As in
+    /// PostgreSQL, it is a boolean, so `bool_column = (x > 0)` compares two
+    /// booleans.
+    Boolean,
     /// Any value: a column without a declared type, or a SQLite function that may
     /// return any kind of value.
     Any,
@@ -246,7 +251,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             ..
         } => cast_type(type_name, env.schema()),
         ast::Expr::Unary(op, inner) => match op {
-            ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Integer),
+            ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Boolean),
             ast::UnaryOperator::BitwiseNot => {
                 custom_operator_type(expr, &[type_of(inner, env)], env)
                     .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
@@ -300,8 +305,6 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             resolved: Some(resolution),
             ..
         } => field_type(&type_of(base, env), resolution, env.schema()),
-        // Expressions whose value is never a custom-type value. SQLite's affinity
-        // gives their built-in type.
         ast::Expr::Between { .. }
         | ast::Expr::InList { .. }
         | ast::Expr::InSelect { .. }
@@ -313,9 +316,10 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         | ast::Expr::SubqueryResult {
             query_type: ast::SubqueryType::Exists { .. } | ast::SubqueryType::In { .. },
             ..
-        }
-        | ast::Expr::FunctionCallStar { .. }
-        | ast::Expr::Raise(..) => affinity_type(expr, env),
+        } => ExprType::Builtin(BuiltinType::Boolean),
+        // Expressions whose value is never a custom-type value. SQLite's affinity
+        // gives their built-in type.
+        ast::Expr::FunctionCallStar { .. } | ast::Expr::Raise(..) => affinity_type(expr, env),
         // Not bound or planned yet: names, subqueries, `DEFAULT`, and field
         // access on an unbound base.
         ast::Expr::Id(_)
@@ -726,8 +730,8 @@ fn binary_type(
             custom_operator_type(expr, &[type_of(lhs, env), type_of(rhs, env)], env)
                 .unwrap_or(ExprType::Builtin(BuiltinType::Integer))
         }
-        Operator::BitwiseNot
-        | Operator::Equals
+        Operator::BitwiseNot => ExprType::Builtin(BuiltinType::Integer),
+        Operator::Equals
         | Operator::NotEquals
         | Operator::Less
         | Operator::LessEquals
@@ -738,7 +742,7 @@ fn binary_type(
         | Operator::And
         | Operator::Or
         | Operator::ArrayContains
-        | Operator::ArrayOverlap => ExprType::Builtin(BuiltinType::Integer),
+        | Operator::ArrayOverlap => ExprType::Builtin(BuiltinType::Boolean),
         // `||` joins arrays when either side is an array.
         Operator::Concat => {
             let lhs = type_of(lhs, env);
@@ -774,11 +778,12 @@ pub(super) fn custom_operator_type(
 /// The type an operand has for SQLite's own arithmetic. A custom value that no
 /// function of its type runs goes to SQLite's operator as a value of the type it
 /// is stored as: `smallint * 2` is an integer. A decimal written in the
-/// statement is a REAL to SQLite.
+/// statement is a REAL to SQLite, and a truth value an integer.
 pub(super) fn sqlite_operand_type(ty: ExprType, schema: &Schema) -> ExprType {
     match &ty {
         ExprType::Custom { type_def, .. } => stored_type(type_def, schema),
         ExprType::Builtin(BuiltinType::Decimal) => ExprType::Builtin(BuiltinType::Real),
+        ExprType::Builtin(BuiltinType::Boolean) => ExprType::Builtin(BuiltinType::Integer),
         _ => ty,
     }
 }
@@ -817,14 +822,15 @@ pub(crate) fn stored_type(type_def: &TypeDef, schema: &Schema) -> ExprType {
 /// result is unknown.
 fn arithmetic_type(lhs: &ExprType, rhs: &ExprType) -> ExprType {
     use BuiltinType::{Integer, Numeric, Real};
-    let is_custom_or_decimal = |ty: &ExprType| {
+    let is_not_sqlite_type = |ty: &ExprType| {
         matches!(
             ty,
-            ExprType::Custom { .. } | ExprType::Builtin(BuiltinType::Decimal)
+            ExprType::Custom { .. }
+                | ExprType::Builtin(BuiltinType::Decimal | BuiltinType::Boolean)
         )
     };
     assert!(
-        !is_custom_or_decimal(lhs) && !is_custom_or_decimal(rhs),
+        !is_not_sqlite_type(lhs) && !is_not_sqlite_type(rhs),
         "operands of SQLite arithmetic must be typed as SQLite sees them first"
     );
     let is_array_or_unknown =
@@ -1037,7 +1043,7 @@ fn common_element_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
 }
 
 fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
-    use BuiltinType::{Decimal, Integer, Numeric, Real, Text};
+    use BuiltinType::{Boolean, Decimal, Integer, Numeric, Real, Text};
     match (a, b) {
         (ExprType::Unknown, _) | (_, ExprType::Unknown) => ExprType::Unknown,
         (ExprType::Untyped, ExprType::Untyped) => ExprType::Untyped,
@@ -1049,8 +1055,8 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         (ExprType::Builtin(Decimal), ExprType::Builtin(Integer))
         | (ExprType::Builtin(Integer), ExprType::Builtin(Decimal)) => ExprType::Builtin(Decimal),
         (
-            a @ ExprType::Builtin(Integer | Real | Decimal | Numeric),
-            b @ ExprType::Builtin(Integer | Real | Decimal | Numeric),
+            a @ ExprType::Builtin(Integer | Real | Decimal | Numeric | Boolean),
+            b @ ExprType::Builtin(Integer | Real | Decimal | Numeric | Boolean),
         ) => arithmetic_type(
             &sqlite_operand_type(a, schema),
             &sqlite_operand_type(b, schema),
