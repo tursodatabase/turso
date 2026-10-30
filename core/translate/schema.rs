@@ -1278,6 +1278,10 @@ pub fn translate_create_table(
     // Like SQLite, the body is only checked when the table is really created,
     // so IF NOT EXISTS on an existing table succeeds whatever the body says.
     validate(&body, &normalized_tbl_name, &resolver.catalog)?;
+    // VACUUM creates the tables the database already has as nested statements.
+    if !connection.is_nested_stmt() {
+        check_collates_on_new_table(&body, &normalized_tbl_name, &resolver.catalog)?;
+    }
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
 
@@ -1595,6 +1599,18 @@ pub fn translate_create_table(
     }
 
     Ok(())
+}
+
+/// Rejects a COLLATE on a column of a STRICT table, or on a key of its UNIQUE
+/// or PRIMARY KEY constraints, when the column's type has its own order.
+fn check_collates_on_new_table(
+    body: &ast::CreateTableBody,
+    table_name: &str,
+    resolver: &CatalogContext,
+) -> Result<()> {
+    let mut table = create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
+    table.resolve_custom_types(resolver.schema());
+    table.check_collates_are_allowed()
 }
 
 /// Binds the sequences named in the column defaults of `body` to the

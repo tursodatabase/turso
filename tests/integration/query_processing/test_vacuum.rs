@@ -4364,6 +4364,39 @@ fn test_plain_vacuum_preserves_array_values() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// CREATE TABLE and ALTER TABLE reject a COLLATE on a column whose type has its
+/// own order, but a database written before that check can have one. VACUUM
+/// must keep such a table.
+#[test]
+fn test_vacuum_keeps_a_table_with_collate_on_numeric_column() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("collate_on_numeric.db");
+    let stored_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, n numeric (10, 2) COLLATE NOCASE, UNIQUE (n COLLATE RTRIM)) STRICT";
+    {
+        let sqlite_conn = SqliteConnection::open(&db_path)?;
+        sqlite_conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n numeric (10, 2) COLLATE NOCASE, UNIQUE (n COLLATE RTRIM));
+             PRAGMA writable_schema = ON;",
+        )?;
+        sqlite_conn.execute(
+            "UPDATE sqlite_schema SET sql = ?1 WHERE name = 't'",
+            [stored_sql],
+        )?;
+    }
+    let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1, 9.5), (2, 10.5)")?;
+
+    conn.execute("VACUUM")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t ORDER BY n DESC");
+    assert_eq!(rows, vec![(2,), (1,)]);
+    let schema: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+    assert_eq!(schema, vec![(stored_sql.to_string(),)]);
+    Ok(())
+}
+
 /// Plain VACUUM reparses the live schema on the same connection. Custom types
 /// with an index on a non-monotonic encoding must still order correctly after the
 /// rewrite, and the same connection must remain able to use that type in new

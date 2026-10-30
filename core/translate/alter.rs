@@ -1240,6 +1240,7 @@ pub fn translate_alter_table(
             }
             if btree.is_strict {
                 column.resolve_custom_type(resolver.schema());
+                column.check_collate_is_allowed()?;
             }
 
             // If a column has no explicit DEFAULT but its custom type defines
@@ -1942,6 +1943,7 @@ pub fn translate_alter_table(
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] = replacement_column.clone();
                 table.resolve_custom_types(resolver.schema());
+                table.columns()[column_index].check_collate_is_allowed()?;
                 table.prepare_generated_columns()?;
                 let column_names: Vec<&str> = table
                     .columns()

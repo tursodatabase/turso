@@ -115,7 +115,7 @@ impl Trigger {
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::translate::collate::{CollationSeq, TextCollation};
+use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
 use crate::translate::expr::expr_type::ExprType;
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
@@ -5275,6 +5275,21 @@ impl BTreeTable {
         Ok(Arc::new(modified))
     }
 
+    /// Fails when a column or a key of a UNIQUE or PRIMARY KEY constraint has a
+    /// COLLATE and the column's type has its own order. Call this after
+    /// [Self::resolve_custom_types].
+    pub(crate) fn check_collates_are_allowed(&self) -> Result<()> {
+        for column in &self.columns {
+            column.check_collate_is_allowed()?;
+        }
+        for key in self.unique_sets.iter().flat_map(|set| &set.columns) {
+            if let Some((_, column)) = self.get_column(&key.name) {
+                key_collation(key.collation, column.type_ordering())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Fill in what custom type columns get from their type:
     /// - SQLite's name-based type/affinity rules use the BASE type instead of
     ///   the custom type name (e.g. "doubled" contains "DOUB" which would
@@ -7688,6 +7703,14 @@ impl Column {
     #[inline]
     pub fn type_ordering(&self) -> Option<TypeOrdering> {
         self.type_ordering
+    }
+    /// Fails when the column has a COLLATE and its type has its own order, in
+    /// which case the COLLATE would do nothing. Only new columns are checked:
+    /// a database can already hold such a column, and [Self::collation]
+    /// reads it with the type's order.
+    pub(crate) fn check_collate_is_allowed(&self) -> Result<()> {
+        key_collation(self.collation, self.type_ordering)?;
+        Ok(())
     }
     /// Whether an index on this column is ordered differently from how its
     /// values compare. A custom type without an ordering is indexed by its
