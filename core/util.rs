@@ -1766,6 +1766,48 @@ where
     Ok(())
 }
 
+/// Walk all expressions in a trigger command, including subqueries.
+pub fn walk_trigger_cmd_expressions<F>(cmd: &ast::TriggerCmd, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    match cmd {
+        ast::TriggerCmd::Update {
+            sets,
+            from,
+            where_clause,
+            ..
+        } => {
+            for set in sets {
+                walk_expr_with_subqueries(&set.expr, func)?;
+            }
+            if let Some(from_clause) = from {
+                walk_from_clause_expressions(from_clause, func)?;
+            }
+            if let Some(where_clause) = where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+        }
+        ast::TriggerCmd::Insert {
+            select,
+            upsert,
+            returning,
+            ..
+        } => {
+            walk_select_expressions_inner(select, func)?;
+            walk_upsert_expressions(upsert.as_deref(), func)?;
+            walk_result_column_expressions(returning, func)?;
+        }
+        ast::TriggerCmd::Delete { where_clause, .. } => {
+            if let Some(where_clause) = where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+        }
+        ast::TriggerCmd::Select(select) => walk_select_expressions_inner(select, func)?,
+    }
+    Ok(())
+}
+
 fn walk_upsert_expressions<F>(mut upsert: Option<&ast::Upsert>, func: &mut F) -> Result<()>
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
