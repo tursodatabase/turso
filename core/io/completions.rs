@@ -60,15 +60,17 @@ impl ContextInner {
         Self { waker: None }
     }
 
-    pub fn set_waker(&mut self, waker: &Waker) {
-        if let Some(curr_waker) = self.waker.as_mut() {
-            // only call and change waker if it would awake a different task
-            if !curr_waker.will_wake(waker) {
-                let prev_waker = std::mem::replace(curr_waker, waker.clone());
-                prev_waker.wake();
+    /// Registers `waker` and returns the waker it replaced, if that one would wake a different
+    /// task, for the caller to wake once the lock is free.
+    pub fn set_waker(&mut self, waker: &Waker) -> Option<Waker> {
+        match self.waker.as_mut() {
+            // only change the waker if it would wake a different task
+            Some(curr_waker) if curr_waker.will_wake(waker) => None,
+            Some(curr_waker) => Some(std::mem::replace(curr_waker, waker.clone())),
+            None => {
+                self.waker = Some(waker.clone());
+                None
             }
-        } else {
-            self.waker = Some(waker.clone());
         }
     }
 }
@@ -95,12 +97,17 @@ impl Context {
         }
     }
 
+    /// Registers `waker`, and wakes the waker it replaces once the lock is free: that waker may
+    /// register again on the same completion from its wake.
     pub fn set_waker(&self, waker: &Waker) {
         // Shuttle cannot see the std `OnceLock` holding a completion's result, so yield here to
         // let it run a completion between a test of that result and this store.
         #[cfg(shuttle)]
         crate::thread::yield_now();
-        self.inner.lock().set_waker(waker);
+        let replaced = self.inner.lock().set_waker(waker);
+        if let Some(replaced) = replaced {
+            replaced.wake();
+        }
     }
 }
 
@@ -1337,28 +1344,29 @@ mod tests {
         );
     }
 
+    /// A waker that registers again on its completion from its wake, as polling the completion
+    /// inline does, up to three times.
+    struct Again {
+        completion: Completion,
+        wakes: AtomicUsize,
+    }
+
+    impl std::task::Wake for Again {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            if self.wakes.fetch_add(1, Ordering::SeqCst) < 3 {
+                self.completion.set_waker(&Waker::from(self.clone()));
+            }
+        }
+    }
+
     /// `set_waker` on a finished completion wakes the waker with the completion's lock free: a
     /// waker may register again on that completion from its wake, as polling the completion
     /// inline does.
     #[test]
     fn a_waker_registering_again_from_its_wake_does_not_deadlock() {
-        use std::task::Wake;
-
-        struct Again {
-            completion: Completion,
-            wakes: AtomicUsize,
-        }
-        impl Wake for Again {
-            fn wake(self: Arc<Self>) {
-                self.wake_by_ref();
-            }
-            fn wake_by_ref(self: &Arc<Self>) {
-                if self.wakes.fetch_add(1, Ordering::SeqCst) < 3 {
-                    self.completion.set_waker(&Waker::from(self.clone()));
-                }
-            }
-        }
-
         let (done, waited) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let c = Completion::new_wait();
@@ -1377,5 +1385,27 @@ mod tests {
             wakes, 4,
             "each set_waker on the finished completion wakes once"
         );
+    }
+
+    /// The waker a `set_waker` replaces is woken with the completion's lock free too, so it may
+    /// register again on that completion from its wake.
+    #[test]
+    fn a_replaced_waker_registering_again_from_its_wake_does_not_deadlock() {
+        let (done, waited) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let c = Completion::new_wait();
+            let again = Arc::new(Again {
+                completion: c.clone(),
+                wakes: AtomicUsize::new(0),
+            });
+            c.set_waker(&Waker::from(again.clone()));
+            // Another task's waker replaces it, which wakes it, and it registers again.
+            c.set_waker(Waker::noop());
+            let _ = done.send(again.wakes.load(Ordering::SeqCst));
+        });
+        let wakes = waited
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("set_waker deadlocked waking the waker it replaced, which registers again");
+        assert_eq!(wakes, 1, "the replaced waker is woken once");
     }
 }
