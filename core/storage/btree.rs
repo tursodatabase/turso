@@ -3769,11 +3769,10 @@ impl BTreeCursor {
                             Err(e) => {
                                 mark_unlikely();
                                 tracing::error!("error reading page {}: {}", pgno, e);
-                                // Drain any in-flight reads we accumulated
-                                // across previous iterations / yields so the
-                                // IO scheduler can finalize them before we
-                                // bail out.
-                                self.pager.io.drain_completions(group.completions())?;
+                                // Sibling reads that did start are not waited
+                                // for: their pages are already in the page
+                                // cache and load when the reads finish, which
+                                // may be outside this connection's IO loop.
                                 *sibling_load_group = None;
                                 return Err(e);
                             }
