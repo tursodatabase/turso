@@ -4869,7 +4869,7 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<Completion> {
+    pub fn wal_get_frame(&self, frame_no: u64, frame: Arc<Buffer>) -> Result<Completion> {
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("wal_get_frame() called on database without WAL");
             return Err(LimboError::InternalError(

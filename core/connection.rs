@@ -2265,9 +2265,12 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
+        use crate::Buffer;
 
-        let c = self.pager.load().wal_get_frame(frame_no, frame)?;
+        let buffer = Arc::new(Buffer::new_temporary(frame.len()));
+        let c = self.pager.load().wal_get_frame(frame_no, buffer.clone())?;
         self.db.io.wait_for_completion(c)?;
+        frame.copy_from_slice(buffer.as_slice());
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
             page_no: header.page_number,
