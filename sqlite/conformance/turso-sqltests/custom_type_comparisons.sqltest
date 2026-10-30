@@ -1567,3 +1567,14 @@ test cmp-two-custom-types-is-an-error {
 expect error {
     cannot compare type neg with type neg2
 }
+
+# Only the PostgreSQL frontend converts a date to a timestamp before comparing
+# them. With SQLite's rules they are two different custom types.
+@requires strict "uses STRICT tables"
+test cmp-date-with-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT count(*) FROM t WHERE ts > d;
+}
+expect error {
+    cannot compare type timestamp with type date
+}

@@ -566,6 +566,87 @@ fn is_truth_value_for(operand_type: &ExprType, compared_as: &TypeDef) -> bool {
         && compared_as.name.eq_ignore_ascii_case("boolean")
 }
 
+/// Rewrites the comparison `expr` between values of different built-in types
+/// that the dialect compares as one of them (see `Dialect::comparison_type`):
+/// in PostgreSQL, `ts > d` becomes `ts > CAST(d AS timestamp)`. The cast is in
+/// the expression, so every plan compares the same values: a hash join or an
+/// IN list compares the cast value as a table scan does. Other expressions are
+/// left as they are.
+pub(crate) fn cast_compared_builtin_types(
+    expr: &mut ast::Expr,
+    env: &TypeEnv,
+    resolver: &Resolver,
+) -> Result<()> {
+    let operands: Vec<&mut ast::Expr> = match expr {
+        ast::Expr::Binary(lhs, op, rhs) if op.is_comparison() => vec![lhs, rhs],
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => vec![lhs, start, end],
+        ast::Expr::InList { lhs, rhs, .. } => std::iter::once(lhs)
+            .chain(rhs.iter_mut())
+            .map(|operand| operand.as_mut())
+            .collect(),
+        _ => return Ok(()),
+    };
+    let types = operands
+        .iter()
+        .map(|operand| stored_form_type(&type_of(operand, env), env.schema()))
+        .collect::<Result<Vec<_>>>()?;
+    let Some(target) = builtin_comparison_type(&types, resolver) else {
+        return Ok(());
+    };
+    for (operand, ty) in operands.into_iter().zip(&types) {
+        if ty
+            .as_ref()
+            .is_some_and(|ty| !same_type_def(ty.leaf(), &target))
+        {
+            let value = std::mem::replace(operand, ast::Expr::Literal(ast::Literal::Null));
+            *operand = ast::Expr::Cast {
+                expr: Box::new(value),
+                type_name: Some(ast::Type {
+                    name: target.name.clone(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            };
+        }
+    }
+    Ok(())
+}
+
+/// The type that the dialect compares all the custom types of compared
+/// operands, `types`, as, when they are not all the same. None when they are,
+/// or when some pair of them has no common type. User types never have one.
+fn builtin_comparison_type(
+    types: &[Option<ResolvedType>],
+    resolver: &Resolver,
+) -> Option<crate::sync::Arc<TypeDef>> {
+    let type_defs: Vec<&crate::sync::Arc<TypeDef>> =
+        types.iter().flatten().map(|ty| &ty.chain[0]).collect();
+    if type_defs
+        .windows(2)
+        .all(|pair| same_type_def(pair[0], pair[1]))
+    {
+        return None;
+    }
+    if !type_defs.iter().all(|ty| ty.is_builtin) {
+        return None;
+    }
+    type_defs
+        .iter()
+        .find(|target| {
+            type_defs.iter().all(|ty| {
+                same_type_def(ty, target)
+                    || resolver
+                        .catalog
+                        .dialect
+                        .comparison_type(&ty.name.to_lowercase(), &target.name.to_lowercase())
+                        .is_some_and(|common| target.name.eq_ignore_ascii_case(common))
+            })
+        })
+        .map(|target| crate::sync::Arc::clone(target))
+}
+
 /// Translates `expr`, an operand of a comparison, into `target_register`. When
 /// the comparison is between values of the custom type `compared_as` (see
 /// [stored_comparison_type]), the operand is put in that type's stored form:

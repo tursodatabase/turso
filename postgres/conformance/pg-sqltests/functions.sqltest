@@ -1605,6 +1605,21 @@ expect {
     1
 }
 
+test timestamp-compares-with-timestamptz-and-date {
+    -- A timestamp compared with a timestamptz becomes one, and a date compared
+    -- with a timestamp becomes midnight of that day.
+    CREATE TABLE c (ts timestamp, d date);
+    INSERT INTO c VALUES ('2000-01-01 10:00:00', '2000-01-01'), ('2000-01-02 00:00:00', '2000-01-02');
+    SELECT count(*) FROM c WHERE ts < now() AND ts >= DATE '2000-01-01' AND d < now();
+    SELECT count(*) FROM c WHERE ts = d;
+    SELECT count(*) FROM c WHERE ts > d;
+}
+expect {
+    2
+    1
+    1
+}
+
 test current-date-compares-with-date-columns {
     CREATE TABLE e (d date);
     INSERT INTO e VALUES ('2000-01-01');
