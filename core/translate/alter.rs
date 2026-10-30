@@ -2374,7 +2374,7 @@ pub fn translate_alter_table(
             // parent is this table.
             let child_tables = resolver.with_schema(database_id, |s| {
                 s.tables_referencing(namespace.id, &original_btree.name)
-            });
+            })?;
             for (child_namespace, child_table) in child_tables {
                 let is_altered_table = child_namespace == namespace.id
                     && child_table.name.eq_ignore_ascii_case(&original_btree.name);
@@ -2487,7 +2487,7 @@ fn schema_after_alter(
             0,
             Some(sql),
             resolver.catalog.symbol_table,
-            &mut Default::default(),
+            &mut <crate::alloc::Vec<_> as crate::alloc::TursoAllocExt>::new(),
             &mut Default::default(),
             &mut Default::default(),
             &mut Default::default(),

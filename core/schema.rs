@@ -3734,8 +3734,9 @@ impl Schema {
         &self,
         parent_namespace: NamespaceId,
         parent_table: &str,
-    ) -> Vec<(NamespaceId, Arc<BTreeTable>)> {
-        self.namespaces
+    ) -> Result<Vec<(NamespaceId, Arc<BTreeTable>)>> {
+        let tables = self
+            .namespaces
             .iter()
             .flat_map(|(namespace, objects)| {
                 objects
@@ -3750,7 +3751,8 @@ impl Schema {
                     })
                     .map(move |table| (*namespace, table))
             })
-            .collect()
+            .try_collect()?;
+        Ok(tables)
     }
 
     /// Compute all resolved FKs *declared by* `child_table`.
