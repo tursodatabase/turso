@@ -6870,6 +6870,63 @@ pub fn try_extract_copy_from(
     }))
 }
 
+/// A statement that the PostgreSQL session runs itself instead of
+/// translating it: the translator refuses all of these. One variant per kind,
+/// so that callers which must decide something for each of them (the
+/// session runs them, a server classifies them) match it exhaustively and a
+/// new kind is a compile error there instead of a statement that falls
+/// through.
+pub enum SessionStmt {
+    /// SET, SET ... TO DEFAULT, SET ... FROM CURRENT or RESET of one parameter.
+    Set(PgSetStmt),
+    /// SET TRANSACTION or SET SESSION CHARACTERISTICS AS TRANSACTION.
+    SetTransaction,
+    Show(PgShowStmt),
+    ResetAll,
+    DiscardAll,
+    CreateSchema(PgCreateSchemaStmt),
+    DropSchema(PgDropSchemaStmt),
+    RefreshMatview,
+    CommentOn,
+    CopyFrom(PgCopyFromStmt),
+}
+
+/// The statement of `parse_result` if the session runs it itself, `None` if
+/// it is translated.
+pub fn session_stmt(parse_result: &ParseResult) -> Result<Option<SessionStmt>, ParseError> {
+    if let Some(stmt) = try_extract_set(parse_result) {
+        return Ok(Some(SessionStmt::Set(stmt)));
+    }
+    if check_set_transaction(parse_result)? {
+        return Ok(Some(SessionStmt::SetTransaction));
+    }
+    if let Some(stmt) = try_extract_show(parse_result) {
+        return Ok(Some(SessionStmt::Show(stmt)));
+    }
+    if is_reset_all(parse_result) {
+        return Ok(Some(SessionStmt::ResetAll));
+    }
+    if is_discard_all(parse_result) {
+        return Ok(Some(SessionStmt::DiscardAll));
+    }
+    if let Some(stmt) = try_extract_create_schema(parse_result)? {
+        return Ok(Some(SessionStmt::CreateSchema(stmt)));
+    }
+    if let Some(stmt) = try_extract_drop_schema(parse_result) {
+        return Ok(Some(SessionStmt::DropSchema(stmt)));
+    }
+    if is_refresh_matview(parse_result)? {
+        return Ok(Some(SessionStmt::RefreshMatview));
+    }
+    if is_comment_on(parse_result) {
+        return Ok(Some(SessionStmt::CommentOn));
+    }
+    if let Some(stmt) = try_extract_copy_from(parse_result)? {
+        return Ok(Some(SessionStmt::CopyFrom(stmt)));
+    }
+    Ok(None)
+}
+
 fn copy_string_option(def: &pg_query::protobuf::DefElem) -> Result<String, ParseError> {
     def_elem_string_val(def).ok_or_else(|| {
         ParseError::ParseError(format!(
@@ -7577,6 +7634,46 @@ fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_stmt_names_each_kind_the_session_runs() {
+        let kind = |sql: &str| {
+            let parsed = crate::parse(sql).unwrap();
+            session_stmt(&parsed).unwrap().map(|stmt| match stmt {
+                SessionStmt::Set(_) => "set",
+                SessionStmt::SetTransaction => "set transaction",
+                SessionStmt::Show(_) => "show",
+                SessionStmt::ResetAll => "reset all",
+                SessionStmt::DiscardAll => "discard all",
+                SessionStmt::CreateSchema(_) => "create schema",
+                SessionStmt::DropSchema(_) => "drop schema",
+                SessionStmt::RefreshMatview => "refresh matview",
+                SessionStmt::CommentOn => "comment on",
+                SessionStmt::CopyFrom(_) => "copy from",
+            })
+        };
+        for (sql, want) in [
+            ("SET search_path TO app", "set"),
+            ("RESET search_path", "set"),
+            (
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                "set transaction",
+            ),
+            ("SHOW search_path", "show"),
+            ("RESET ALL", "reset all"),
+            ("DISCARD ALL", "discard all"),
+            ("CREATE SCHEMA IF NOT EXISTS app", "create schema"),
+            ("DROP SCHEMA app CASCADE", "drop schema"),
+            ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
+            ("COMMENT ON TABLE t IS 'x'", "comment on"),
+            ("COPY t FROM '/tmp/t.csv'", "copy from"),
+        ] {
+            assert_eq!(kind(sql), Some(want), "{sql}");
+        }
+        for sql in ["SELECT 1", "CREATE TABLE t (id int)", "DROP TABLE t"] {
+            assert_eq!(kind(sql), None, "{sql}");
+        }
+    }
 
     #[test]
     fn create_sequence_as_type_bounds_the_range() {

@@ -23,11 +23,9 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
-    check_set_transaction, is_comment_on, is_discard_all, is_drop_matview, is_refresh_matview,
-    is_reset_all, is_tx_exit_stmt, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, unnamed_index_name,
+    is_drop_matview, is_tx_exit_stmt, session_stmt, unnamed_index_name,
     unqualified_create_table_name_location, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PgSetStmt, PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    PgSetStmt, PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator, SessionStmt,
 };
 use turso_pg_parser::ParseError;
 
@@ -812,82 +810,58 @@ fn try_prepare_special(
         Err(_) => return Ok(None),
     };
 
-    if let Some(set_stmt) = try_extract_set(&parse_result) {
-        let stmt = handle_pg_set(pg_conn, &set_stmt)?;
-        return Ok(Some(crate::Statement::new(stmt)));
-    }
-
-    if check_set_transaction(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))? {
-        return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
-    }
-
-    if let Some(show_stmt) = try_extract_show(&parse_result) {
-        let stmt = handle_pg_show(pg_conn, &show_stmt)?;
-        return Ok(Some(crate::Statement::new(stmt)));
-    }
-
-    if is_reset_all(&parse_result) {
-        let inner = noop_statement(&pg_conn.conn)?;
-        let conn = Arc::clone(&pg_conn.conn);
-        return Ok(Some(crate::Statement::with_deferred(
-            inner,
-            Box::new(move |_inner| reset_all_settings(&conn)),
-        )));
-    }
-
-    if is_discard_all(&parse_result) {
-        let inner = noop_statement(&pg_conn.conn)?;
-        let conn = Arc::clone(&pg_conn.conn);
-        return Ok(Some(crate::Statement::with_deferred(
-            inner,
-            Box::new(move |_inner| discard_all(&conn)),
-        )));
-    }
-
-    if let Some(stmt) =
-        try_extract_create_schema(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
-    {
-        let inner = noop_statement(&pg_conn.conn)?;
-        let pg_conn = Arc::clone(pg_conn);
-        return Ok(Some(crate::Statement::with_deferred(
-            inner,
-            Box::new(move |_inner| handle_pg_create_schema(&pg_conn, &stmt)),
-        )));
-    }
-
-    if let Some(stmt) = try_extract_drop_schema(&parse_result) {
-        let inner = noop_statement(&pg_conn.conn)?;
-        let conn = Arc::clone(&pg_conn.conn);
-        return Ok(Some(crate::Statement::with_deferred(
-            inner,
-            Box::new(move |_inner| handle_pg_drop_schema(&conn, &stmt)),
-        )));
-    }
-
-    if is_refresh_matview(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))? {
-        return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
-    }
-
-    if is_comment_on(&parse_result) {
-        return Ok(Some(crate::Statement::new(noop_statement(&pg_conn.conn)?)));
-    }
-
-    if let Some(stmt) =
-        try_extract_copy_from(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
-    {
-        let inner = noop_statement(&pg_conn.conn)?;
-        let conn = Arc::clone(&pg_conn.conn);
-        return Ok(Some(crate::Statement::with_deferred(
-            inner,
-            Box::new(move |inner| {
-                let rows_inserted = handle_pg_copy_from(&conn, &stmt)?;
-                inner.set_n_change(rows_inserted as i64);
-                Ok(())
-            }),
-        )));
-    }
-
-    Ok(None)
+    let Some(stmt) =
+        session_stmt(&parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
+    else {
+        return Ok(None);
+    };
+    let stmt = match stmt {
+        SessionStmt::Set(set_stmt) => crate::Statement::new(handle_pg_set(pg_conn, &set_stmt)?),
+        SessionStmt::SetTransaction | SessionStmt::RefreshMatview | SessionStmt::CommentOn => {
+            crate::Statement::new(noop_statement(&pg_conn.conn)?)
+        }
+        SessionStmt::Show(show_stmt) => crate::Statement::new(handle_pg_show(pg_conn, &show_stmt)?),
+        SessionStmt::ResetAll => {
+            let conn = Arc::clone(&pg_conn.conn);
+            crate::Statement::with_deferred(
+                noop_statement(&pg_conn.conn)?,
+                Box::new(move |_inner| reset_all_settings(&conn)),
+            )
+        }
+        SessionStmt::DiscardAll => {
+            let conn = Arc::clone(&pg_conn.conn);
+            crate::Statement::with_deferred(
+                noop_statement(&pg_conn.conn)?,
+                Box::new(move |_inner| discard_all(&conn)),
+            )
+        }
+        SessionStmt::CreateSchema(stmt) => {
+            let pg_conn = Arc::clone(pg_conn);
+            crate::Statement::with_deferred(
+                noop_statement(&pg_conn.conn)?,
+                Box::new(move |_inner| handle_pg_create_schema(&pg_conn, &stmt)),
+            )
+        }
+        SessionStmt::DropSchema(stmt) => {
+            let conn = Arc::clone(&pg_conn.conn);
+            crate::Statement::with_deferred(
+                noop_statement(&pg_conn.conn)?,
+                Box::new(move |_inner| handle_pg_drop_schema(&conn, &stmt)),
+            )
+        }
+        SessionStmt::CopyFrom(stmt) => {
+            let conn = Arc::clone(&pg_conn.conn);
+            crate::Statement::with_deferred(
+                noop_statement(&pg_conn.conn)?,
+                Box::new(move |inner| {
+                    let rows_inserted = handle_pg_copy_from(&conn, &stmt)?;
+                    inner.set_n_change(rows_inserted as i64);
+                    Ok(())
+                }),
+            )
+        }
+    };
+    Ok(Some(stmt))
 }
 
 /// The engine error for an error of the translator.
