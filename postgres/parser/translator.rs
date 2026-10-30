@@ -4261,7 +4261,10 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = Box::new(self.translate_select(select_stmt)?);
+        let select = Box::new(match sub_link.sub_link_type() {
+            SubLinkType::ExistsSublink => self.translate_exists_subquery(select_stmt)?,
+            _ => self.translate_select(select_stmt)?,
+        });
 
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
@@ -4292,6 +4295,39 @@ impl PostgreSQLTranslator {
                 "Unsupported SubLink type: {other:?}",
             ))),
         }
+    }
+
+    /// EXISTS only checks whether its subquery returns a row, and PostgreSQL
+    /// lets that subquery select no columns: `EXISTS (SELECT FROM t)`. A Turso
+    /// SELECT needs a column, so such a subquery selects the constant 1.
+    fn translate_exists_subquery(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<ast::Select, ParseError> {
+        use pg_query::protobuf::{a_const, node::Node, AConst, Integer, ResTarget};
+
+        if !select.target_list.is_empty()
+            || !select.values_lists.is_empty()
+            || is_set_operation(select)
+        {
+            return self.translate_select(select);
+        }
+        reject_positions_in_empty_select_list(select)?;
+        let one = AConst {
+            val: Some(a_const::Val::Ival(Integer { ival: 1 })),
+            ..Default::default()
+        };
+        let target = ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(Node::AConst(one)),
+            })),
+            ..Default::default()
+        };
+        let mut select = select.clone();
+        select.target_list.push(pg_query::protobuf::Node {
+            node: Some(Node::ResTarget(Box::new(target))),
+        });
+        self.translate_select(&select)
     }
 
     fn translate_array_subquery(select: ast::Select) -> ast::Expr {
@@ -7319,6 +7355,38 @@ fn reject_into_clause(
             | pg_query::protobuf::OnCommitAction::OncommitDrop)
     ) {
         return Err(not_supported("ON COMMIT DELETE ROWS / DROP"));
+    }
+    Ok(())
+}
+
+/// ORDER BY and GROUP BY read an integer constant as a position in the select
+/// list, so with no columns PostgreSQL rejects every such position.
+fn reject_positions_in_empty_select_list(
+    select: &pg_query::protobuf::SelectStmt,
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::{a_const, node::Node, AConst};
+
+    let order_by = select
+        .sort_clause
+        .iter()
+        .filter_map(|item| match &item.node {
+            Some(Node::SortBy(sort_by)) => sort_by.node.as_deref(),
+            _ => None,
+        });
+    let items = order_by
+        .map(|item| ("ORDER BY", item))
+        .chain(select.group_clause.iter().map(|item| ("GROUP BY", item)));
+    for (clause, item) in items {
+        if let Some(Node::AConst(AConst {
+            val: Some(a_const::Val::Ival(position)),
+            ..
+        })) = &item.node
+        {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+                message: format!("{clause} position {} is not in select list", position.ival),
+            });
+        }
     }
     Ok(())
 }
