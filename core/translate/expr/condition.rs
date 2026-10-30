@@ -379,7 +379,7 @@ fn translate_leaf_condition_expr(
                 emit_cond_jump(program, condition_metadata, result_reg);
             }
         },
-        ast::Expr::Register(_) => {
+        ast::Expr::Register { .. } => {
             crate::bail_parse_error!(
                 "Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead"
             );

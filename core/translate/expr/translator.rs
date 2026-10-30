@@ -250,7 +250,7 @@ fn translate_expr_by_kind(
             translate_unary_expr(program, referenced_tables, expr, target_register, resolver)
         }
         ast::Expr::Variable(_) => translate_variable_expr(program, expr, target_register),
-        ast::Expr::Register(_) => translate_register_expr(program, expr, target_register),
+        ast::Expr::Register { .. } => translate_register_expr(program, expr, target_register),
         ast::Expr::Default => {
             crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
         }
@@ -3281,7 +3281,10 @@ fn translate_register_expr(
     expr: &ast::Expr,
     target_register: usize,
 ) -> Result<usize> {
-    let ast::Expr::Register(src_reg) = expr else {
+    let ast::Expr::Register {
+        register: src_reg, ..
+    } = expr
+    else {
         unreachable!("translate_register_expr expects Expr::Register");
     };
     // For DBSP expression compilation: copy from source register to target

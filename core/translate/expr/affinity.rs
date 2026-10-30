@@ -76,13 +76,19 @@ pub(crate) fn get_expr_affinity(expr: &ast::Expr, metadata: &impl ExprProperties
         }
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => Affinity::None,
-        ast::Expr::Register(reg) => metadata.register_affinity(*reg).unwrap_or(Affinity::None),
+        ast::Expr::Register { register: reg, .. } => {
+            metadata.register_affinity(*reg).unwrap_or(Affinity::None)
+        }
         ast::Expr::SubqueryResult {
             subquery_id,
-            query_type: ast::SubqueryType::RowValue { num_regs, .. },
+            query_type:
+                ast::SubqueryType::RowValue {
+                    result_reg_start,
+                    num_regs: 1,
+                },
             ..
-        } if *num_regs == 1 => metadata
-            .subquery_affinity(*subquery_id)
+        } => metadata
+            .subquery_affinity(*subquery_id, *result_reg_start)
             .unwrap_or(Affinity::None),
         _ => Affinity::None,
     }

@@ -1,25 +1,26 @@
 use std::sync::Arc;
 
 use crate::alloc::TursoSliceExt;
-use crate::translate::expr_context::{ExprContext, TableMetadata};
+use crate::translate::expr_context::TableMetadata;
 
 use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
-    emitter::{OperationMode, Resolver, TranslateCtx},
+    emitter::{OperationMode, Resolver, RowValueSubquery, RowValueSubqueryColumn, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
 use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::expr_type::{type_of, TypeEnv};
 use crate::turso_assert;
 use crate::{
     alloc::TursoIteratorExt,
     emit_explain,
     schema::{BTreeCharacteristics, BTreeTable, Column, Index, IndexColumn, Table},
     translate::{
-        collate::comparison_collation_across_queries,
+        collate::in_subquery_collation,
         compound_select::emit_program_for_compound_select,
         emitter::select::{
             emit_materialized_build_inputs, emit_program_for_select_with_resolver, emit_query,
@@ -861,18 +862,25 @@ fn get_subquery_parser<'a>(
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
-                if reg_count == 1 {
-                    if let Some(result_col) = plan.result_columns.first() {
-                        let affinity = get_expr_affinity(
+                let env = TypeEnv::new(Some(&plan.table_references), resolver);
+                let columns = plan
+                    .result_columns
+                    .iter()
+                    .map(|result_col| RowValueSubqueryColumn {
+                        affinity: get_expr_affinity(
                             &result_col.expr,
                             &TableMetadata::new(Some(&plan.table_references)),
-                        );
-                        resolver
-                            .subquery_affinities
-                            .borrow_mut()
-                            .insert(subquery_id, affinity);
-                    }
-                }
+                        ),
+                        expr_type: type_of(&result_col.expr, &env),
+                    })
+                    .collect();
+                resolver.row_value_subqueries.insert(
+                    subquery_id,
+                    RowValueSubquery {
+                        result_reg_start: reg_start,
+                        columns,
+                    },
+                );
 
                 plan.query_destination = QueryDestination::RowValueSubqueryResult {
                     result_reg_start: reg_start,
@@ -1025,11 +1033,12 @@ fn get_subquery_parser<'a>(
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
-                        let collation = comparison_collation_across_queries(
+                        let collation = in_subquery_collation(
                             lhs_exprs[i],
-                            &ExprContext::new(Some(referenced_tables), resolver),
-                            &c.expr,
-                            &ExprContext::new(Some(table_references), resolver),
+                            Some(referenced_tables),
+                            &plan,
+                            i,
+                            resolver,
                         )?;
                         Ok::<_, crate::LimboError>(IndexColumn {
                             name: c.name(table_references).unwrap_or("").to_string(),

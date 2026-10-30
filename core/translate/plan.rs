@@ -1,6 +1,6 @@
 use crate::namespace::NamespaceRef;
 use crate::{
-    alloc::{self, TursoIteratorExt, TursoVecExt},
+    alloc::{self, TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
@@ -39,7 +39,7 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{type_of, TypeEnv};
+use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -3070,11 +3070,12 @@ impl Operation {
     }
 }
 
+/// The columns a query gives an outer query, and the type of each.
 pub(super) fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
     resolver: &Resolver,
-) -> Result<alloc::Vec<Column>> {
+) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
         Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
         Plan::CompoundSelect {
@@ -3134,10 +3135,21 @@ pub(super) fn query_output_columns(
         })
         .try_collect::<alloc::Vec<_>>()?;
 
-    let env = TypeEnv::new(Some(table_references), resolver);
+    let context = ExprContext::new(Some(table_references), resolver);
+    let env = context.type_env();
+    let mut column_types = alloc::Vec::try_with_capacity_ext(columns.len())?;
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        let dimensions = type_of(result_expr, &env).array_dimensions();
+        // A compound's column has the common type of every SELECT, but the
+        // text collation of the leftmost SELECT only, as in SQLite. The
+        // compound itself removes duplicates with the collation of
+        // `compound_column_collation`, which looks at every SELECT.
+        let result_type = match &compound_arms {
+            Some(arms) => compound_column_type(arms.iter().copied(), column_index, resolver),
+            None => type_of(result_expr, &env),
+        };
+        let text_collation = expr_text_collation(result_expr, &context, context.catalog())?;
+        let dimensions = result_type.array_dimensions();
         if dimensions > ast::MAX_ARRAY_DIMENSIONS {
             crate::bail_parse_error!(
                 "result column {} is an array with {dimensions} dimensions, but arrays have at most {}",
@@ -3146,24 +3158,21 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        let context = ExprContext::new(Some(table_references), resolver);
-        column.set_collation(Some(expr_text_collation(
-            result_expr,
-            &context,
-            context.catalog(),
-        )?));
+        column.set_collation(Some(text_collation));
+        column.set_type_ordering(type_ordering(&result_type, resolver.schema()));
+        column_types.try_push(result_type)?;
     }
-    Ok(columns)
+    Ok((columns, column_types))
 }
 
 fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
     resolver: &Resolver,
-) -> Result<alloc::Vec<Column>> {
-    let mut columns = query_output_columns(plan, explicit_columns, resolver)?;
+) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
+    let (mut columns, column_types) = query_output_columns(plan, explicit_columns, resolver)?;
     make_column_names_unique(&mut columns);
-    Ok(columns)
+    Ok((columns, column_types))
 }
 
 fn make_column_names_unique(columns: &mut [Column]) {
@@ -3221,12 +3230,13 @@ impl JoinedTable {
         resolver: &Resolver,
     ) -> Result<Self> {
         let plan = Plan::Select(Box::new(plan));
-        let columns = subquery_output_columns(&plan, None, resolver)?;
+        let (columns, column_types) = subquery_output_columns(&plan, None, resolver)?;
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
+            column_types,
             parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -3265,7 +3275,7 @@ impl JoinedTable {
         materialize_hint: bool,
         resolver: &Resolver,
     ) -> Result<Self> {
-        let columns = subquery_output_columns(&plan, explicit_columns, resolver)?;
+        let (columns, column_types) = subquery_output_columns(&plan, explicit_columns, resolver)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -3279,6 +3289,7 @@ impl JoinedTable {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
+            column_types,
             parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -3308,7 +3319,8 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         resolver: &Resolver,
     ) -> Result<Self> {
-        let mut columns = subquery_output_columns(query, explicit_columns, resolver)?;
+        let (mut columns, column_types) =
+            subquery_output_columns(query, explicit_columns, resolver)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the
@@ -3319,6 +3331,7 @@ impl JoinedTable {
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),
             columns,
+            column_types,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),

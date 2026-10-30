@@ -1596,11 +1596,14 @@ fn emit_update_insns<'a>(
     // the end of the function.
     {
         let columns = target_table.table.columns();
+        let is_strict = target_table.table.is_strict();
         for (idx, col) in columns.iter().enumerate() {
-            t_ctx.resolver.register_columns.insert(
-                layout.to_register(start, idx),
-                RegisterColumn::table_column(col),
-            );
+            let register_column =
+                RegisterColumn::table_column(col, is_strict, t_ctx.resolver.schema());
+            t_ctx
+                .resolver
+                .register_columns
+                .insert(layout.to_register(start, idx), register_column);
         }
         t_ctx
             .resolver

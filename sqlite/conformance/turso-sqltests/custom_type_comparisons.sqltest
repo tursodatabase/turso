@@ -19,6 +19,131 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-distinct-group-by-union-agree-with-equals {
+    -- 1.50 and 1.500 are equal, so they are one value everywhere.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    CREATE TABLE b(m numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1.5), (10);
+    INSERT INTO b VALUES (1.5), (2);
+    SELECT count(*) FROM a JOIN b ON a.n = b.m;
+    SELECT count(*) FROM (SELECT n FROM a UNION SELECT m FROM b);
+    SELECT count(*) FROM (SELECT n FROM a INTERSECT SELECT m FROM b);
+    SELECT count(*) FROM (SELECT n FROM a EXCEPT SELECT m FROM b);
+    SELECT count(*) FROM (SELECT DISTINCT x FROM (SELECT n x FROM a UNION ALL SELECT m FROM b));
+    SELECT count(*) FROM (SELECT x FROM (SELECT n x FROM a UNION ALL SELECT m FROM b) GROUP BY x);
+    SELECT count(*) FROM a WHERE n IN (SELECT m FROM b);
+}
+expect {
+    1
+    3
+    1
+    1
+    3
+    3
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-compound-with-integer-compares-as-numeric {
+    -- An integer mixed with numeric is a numeric, so 10 and 10.00 are one value.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    CREATE TABLE i(k integer) STRICT;
+    INSERT INTO a VALUES (1.5), (10);
+    INSERT INTO i VALUES (10);
+    SELECT count(*) FROM (SELECT n FROM a UNION SELECT 10);
+    SELECT count(*) FROM (SELECT 10 AS n UNION SELECT n FROM a);
+    SELECT count(*) FROM (SELECT n FROM a UNION SELECT k FROM i);
+    SELECT count(*) FROM (SELECT n FROM a INTERSECT SELECT 10);
+    SELECT count(*) FROM (SELECT n FROM a EXCEPT SELECT 10);
+    SELECT count(*) FROM (SELECT n FROM a UNION ALL SELECT 9) WHERE n > 9.5;
+}
+expect {
+    2
+    2
+    2
+    1
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-compound-with-bigint-compares-as-numeric {
+    -- bigint is stored as an integer, so mixed with numeric it is a numeric too.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    CREATE TABLE b(k bigint) STRICT;
+    INSERT INTO a VALUES (9.5), (10);
+    INSERT INTO b VALUES (10), (100);
+    SELECT x FROM (SELECT n x FROM a UNION ALL SELECT k FROM b) WHERE x > 9.6 ORDER BY x;
+    SELECT max(x) FROM (SELECT n x FROM a UNION ALL SELECT k FROM b);
+    SELECT count(*) FROM (SELECT n FROM a UNION SELECT k FROM b);
+}
+expect {
+    10.00
+    10
+    100
+    100
+    3
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-compound-with-real-compares-as-numeric {
+    -- A real mixed with numeric is a numeric, so 1.50 and 2.5 are both below 9.5.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    CREATE TABLE r(f real) STRICT;
+    INSERT INTO a VALUES (1.5);
+    INSERT INTO r VALUES (2.5);
+    SELECT x FROM (SELECT n x FROM a UNION ALL SELECT 2.5) WHERE x < 9.5 ORDER BY x;
+    SELECT x FROM (SELECT n x FROM a UNION ALL SELECT f FROM r) WHERE x < 9.5 ORDER BY x;
+    SELECT count(*) FROM (SELECT n FROM a UNION SELECT 1.5);
+}
+expect {
+    1.50
+    2.5
+    1.50
+    2.5
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-through-subquery-cte-and-view-compares-as-numeric {
+    -- A numeric column read through a subquery, CTE or view is still a
+    -- numeric, so 10 is above 9.5 and 1.50 is below it.
+    CREATE TABLE a(n numeric(10,2)) STRICT;
+    INSERT INTO a VALUES (1.5), (10);
+    CREATE VIEW v AS SELECT n FROM a;
+    SELECT n FROM (SELECT n FROM a) WHERE n < 9.5;
+    WITH c AS (SELECT n FROM a) SELECT n FROM c WHERE n < 9.5;
+    SELECT n FROM v WHERE n < 9.5;
+    SELECT n FROM v WHERE n > 9.5;
+}
+expect {
+    1.50
+    1.50
+    1.50
+    10.00
+}
+
+@requires strict "uses STRICT tables"
+test cmp-numeric-domain-mixed-with-number-compares-as-numeric {
+    -- A domain mixed with another type is its base type, numeric, so 9.5 sorts
+    -- before 10 instead of comparing as stored bytes.
+    CREATE DOMAIN money AS numeric;
+    CREATE TABLE a(n money) STRICT;
+    INSERT INTO a VALUES (10), (9.5);
+    SELECT x FROM (SELECT n x FROM a UNION ALL SELECT 2) ORDER BY x;
+    SELECT x FROM (SELECT n x FROM a UNION ALL SELECT 2) WHERE x > 9.6;
+    SELECT coalesce(n, 2) x FROM a ORDER BY x;
+}
+expect {
+    2
+    9.5
+    10
+    10
+    9.5
+    10
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-operands-evaluated-once {
     -- Every n is 0, so each row's left side is 0, 1 or 2, and every
     -- comparison below is true for every row if the left side runs once.
@@ -144,6 +269,22 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-row-value-subquery-components {
+    -- Each column of a row subquery compares with its own type: n compares as
+    -- a numeric even when it is not the first column.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 1.50);
+    SELECT (1, 1.5) = (SELECT id, n FROM t);
+    SELECT (SELECT id, n FROM t) = (1, 1.5);
+    SELECT (SELECT id, n FROM t) < (1, 2.5);
+}
+expect {
+    1
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-window-range-null-offset-is-an-error {
     -- A NULL offset has no numeric `+`. It is rejected when the frame is
     -- computed, as in SQLite.
@@ -153,6 +294,31 @@ test cmp-numeric-window-range-null-offset-is-an-error {
 }
 expect error {
     frame ending offset must be a non-negative number
+}
+
+@requires strict "uses STRICT tables"
+test cmp-text-array-elements-compare-as-text {
+    -- The elements of a text[] are texts, also when an array is read from its
+    -- text form: '{1}' and '{1.0}' are different arrays, and '{b,10}' sorts
+    -- before '{b,9}'. Expected rows are from PostgreSQL.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a text[]) STRICT;
+    INSERT INTO t VALUES (1, '{1}'), (2, '{1.0}'), (3, '{b,10}'), (4, '{b,9}');
+    SELECT 'union', a FROM (SELECT a FROM t UNION SELECT a FROM t) ORDER BY a;
+    SELECT 'distinct', count(*) FROM (SELECT DISTINCT a FROM t);
+    SELECT 'eq', id FROM t WHERE a = '{1}';
+    SELECT 'order', id FROM t ORDER BY a;
+}
+expect {
+    union|{1}
+    union|{1.0}
+    union|{b,10}
+    union|{b,9}
+    distinct|4
+    eq|1
+    order|1
+    order|2
+    order|3
+    order|4
 }
 
 @requires strict "uses STRICT tables"
@@ -233,6 +399,46 @@ test cmp-in-list-with-two-orders-is-an-error {
 }
 expect error {
     cannot compare type text_array with type array
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-registers-keep-the-column-type {
+    -- excluded.a in an upsert and NEW.a in a trigger's WHEN clause are
+    -- integer[] values, so they compare element by element as numbers:
+    -- {100} > {9}.
+    CREATE TABLE t(a integer[], k int PRIMARY KEY) STRICT;
+    CREATE TABLE log(msg text) STRICT;
+    CREATE TRIGGER t_grew AFTER UPDATE ON t WHEN NEW.a > OLD.a BEGIN
+        INSERT INTO log VALUES ('grew');
+    END;
+    INSERT INTO t VALUES ('{9}', 1);
+    INSERT INTO t VALUES ('{100}', 1) ON CONFLICT(k) DO UPDATE SET a = excluded.a WHERE excluded.a > t.a;
+    SELECT 'upsert', a FROM t;
+    SELECT 'trigger', msg FROM log;
+}
+expect {
+    upsert|{100}
+    trigger|grew
+}
+
+# ALTER TABLE ADD COLUMN accepts varchar without its length, so a register
+# that holds such a column's value has a type without arguments too.
+@requires strict "uses STRICT tables"
+test cmp-registers-of-type-without-arguments {
+    CREATE TABLE w(k int PRIMARY KEY) STRICT;
+    ALTER TABLE w ADD COLUMN v varchar;
+    CREATE TABLE log(msg text) STRICT;
+    CREATE TRIGGER w_grew AFTER UPDATE ON w WHEN NEW.v > OLD.v BEGIN
+        INSERT INTO log VALUES ('grew');
+    END;
+    INSERT INTO w VALUES (1, 'ab');
+    INSERT INTO w VALUES (1, 'cd') ON CONFLICT(k) DO UPDATE SET v = excluded.v WHERE excluded.v > w.v;
+    SELECT 'upsert', v FROM w;
+    SELECT 'trigger', msg FROM log;
+}
+expect {
+    upsert|cd
+    trigger|grew
 }
 
 @requires strict "uses STRICT tables"

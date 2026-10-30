@@ -170,7 +170,7 @@ where
                     | ast::Expr::Name(_)
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
-                    | ast::Expr::Register(_)
+                    | ast::Expr::Register { .. }
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));
@@ -525,7 +525,7 @@ where
                     | ast::Expr::Name(_)
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
-                    | ast::Expr::Register(_)
+                    | ast::Expr::Register { .. }
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));
