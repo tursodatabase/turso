@@ -4559,3 +4559,33 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
         ]
     );
 }
+
+/// As in PostgreSQL, a text column is not cast to the date it is compared
+/// with, unlike in the SQLite frontend.
+#[turso_macros::test(mvcc)]
+fn test_postgres_date_compared_with_text_column_is_an_error(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE dates (d date, s text)").unwrap();
+    for sql in [
+        "SELECT count(*) FROM dates WHERE d = s",
+        "SELECT count(*) FROM dates a JOIN dates b ON a.d = b.s",
+        "SELECT count(*) FROM dates WHERE d IN (SELECT s FROM dates)",
+    ] {
+        let Err(error) = conn.prepare(sql) else {
+            panic!("{sql} was accepted");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot compare type date with text"),
+            "{sql}: {error}"
+        );
+    }
+    assert_eq!(
+        conn.prepare("SELECT count(*) FROM dates WHERE d = CAST(s AS date)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(0)]]
+    );
+}

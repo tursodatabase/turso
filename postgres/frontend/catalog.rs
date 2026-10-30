@@ -241,6 +241,12 @@ impl Dialect for PostgresDialect {
             _ => None,
         }
     }
+
+    /// `date_col = text_col` is an error in PostgreSQL. A value whose type
+    /// tursopg doesn't know, such as some function results, is cast instead.
+    fn casts_compared_value_to_custom_type(&self, type_is_known: bool) -> bool {
+        !type_is_known
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

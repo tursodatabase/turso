@@ -538,11 +538,12 @@ pub(crate) fn stored_comparison_type_across_queries<'a, 'c, 's: 'c>(
             None => found = Some(ty),
         }
     }
-    // As in PostgreSQL, only a constant becomes a value of the type it is
-    // compared with. A value of another type that changes per row, as in
-    // `date_col = text_col`, would have to go through ENCODE on every row,
-    // and a hash join or an IN subquery compares it as it is, so the answer
-    // would depend on the plan.
+    // Binding casts a value of no custom type that changes per row, as in
+    // `date_col = text_col`, to the compared type (see
+    // `cast_compared_operands`). One left here is in a comparison that binding
+    // doesn't rewrite, such as min/max or a row value. It would have to go
+    // through ENCODE on every row, but a hash join or an IN subquery compares
+    // it as it is, so the answer would depend on the plan.
     if let Some(compared_as) = &found {
         let other_type = varying_others
             .iter()
@@ -567,19 +568,42 @@ fn is_truth_value_for(operand_type: &ExprType, compared_as: &TypeDef) -> bool {
         && compared_as.name.eq_ignore_ascii_case("boolean")
 }
 
-/// Rewrites the comparison `expr` between values of different built-in types
-/// that the dialect compares as one of them (see `Dialect::comparison_type`):
-/// in PostgreSQL, `ts > d` becomes `ts > CAST(d AS timestamp)`. The cast is in
-/// the expression, so every plan compares the same values: a hash join or an
-/// IN list compares the cast value as a table scan does. Other expressions are
-/// left as they are.
-pub(crate) fn cast_compared_builtin_types(
+/// Rewrites the comparison `expr` so that all its operands that change per row
+/// have the custom type they are compared as:
+/// - a value of no custom type gets a cast: `d = date(s)` becomes
+///   `d = CAST(date(s) AS date)`;
+/// - a value of another built-in type that the dialect compares as this type
+///   (see `Dialect::comparison_type`) gets a cast too: in PostgreSQL, `ts > d`
+///   becomes `ts > CAST(d AS timestamp)`.
+///
+/// The cast is in the expression, so every plan compares the same values: a
+/// hash join or an IN list compares the cast value as a table scan does.
+/// Constants need no cast, since the comparison converts them once. Other
+/// expressions are left as they are.
+pub(crate) fn cast_compared_operands(
     expr: &mut ast::Expr,
     env: &TypeEnv,
     resolver: &Resolver,
 ) -> Result<()> {
     let operands: Vec<&mut ast::Expr> = match expr {
-        ast::Expr::Binary(lhs, op, rhs) if op.is_comparison() => vec![lhs, rhs],
+        // A row value, as in `(a, b) = (c, d)`, is compared column by column.
+        ast::Expr::Binary(lhs, op, rhs) if op.is_comparison() => {
+            if let (ast::Expr::Parenthesized(lhs), ast::Expr::Parenthesized(rhs)) =
+                (lhs.as_mut(), rhs.as_mut())
+            {
+                if lhs.len() > 1 && lhs.len() == rhs.len() {
+                    for (lhs, rhs) in lhs.iter_mut().zip(rhs.iter_mut()) {
+                        cast_compared_operands_in_place(
+                            [lhs.as_mut(), rhs.as_mut()],
+                            env,
+                            resolver,
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
+            vec![lhs, rhs]
+        }
         ast::Expr::Between {
             lhs, start, end, ..
         } => vec![lhs, start, end],
@@ -597,16 +621,51 @@ pub(crate) fn cast_compared_builtin_types(
             .collect(),
         _ => return Ok(()),
     };
-    let operands = operands.into_iter().map(|operand| (operand, env));
-    cast_operands_to_builtin_comparison_type(operands, resolver)
+    cast_compared_operands_in_place(operands, env, resolver)
 }
 
-/// [cast_compared_builtin_types] for `x IN (SELECT y ...)`: when x and y have
-/// different built-in types that the dialect compares as one of them, both are
-/// cast to it. The cast on y is in every SELECT of the subquery, so the values
-/// the subquery writes to its ephemeral index are the cast ones. Row values,
-/// `(x1, x2) IN (SELECT y1, y2 ...)`, are cast column by column.
-pub(crate) fn cast_in_subquery_builtin_types(
+/// Casts `operands` of one comparison, all in the same query, to the custom
+/// type they are compared as.
+fn cast_compared_operands_in_place<'e>(
+    operands: impl IntoIterator<Item = &'e mut ast::Expr>,
+    env: &'e TypeEnv<'e>,
+    resolver: &Resolver,
+) -> Result<()> {
+    let operands: Vec<&mut ast::Expr> = operands.into_iter().collect();
+    // A row value that is not compared with another row value is left as it
+    // is, and a subquery's type is known only once it is planned (see
+    // `plan_subqueries_with_outer_query_access`).
+    if operands.iter().any(|operand| {
+        matches!(operand, ast::Expr::Parenthesized(exprs) if exprs.len() > 1)
+            || matches!(operand, ast::Expr::Subquery(_))
+    }) {
+        return Ok(());
+    }
+    let compared = operands
+        .iter()
+        .map(|operand| ComparedOperand::new(operand, env, resolver))
+        .collect::<Result<Vec<_>>>()?;
+    let stored_types: Vec<_> = compared
+        .iter()
+        .map(|operand| &operand.stored_type)
+        .collect();
+    let Some(target) = comparison_target(&stored_types, resolver) else {
+        return Ok(());
+    };
+    for (operand, compared) in operands.into_iter().zip(&compared) {
+        if compared.needs_cast_to(&target) {
+            cast_to(operand, &target);
+        }
+    }
+    Ok(())
+}
+
+/// [cast_compared_operands] for `x IN (SELECT y ...)`: x and y are cast as the
+/// two operands of `x = y` would be. The cast on y is in every SELECT of the
+/// subquery, so the values the subquery writes to its ephemeral index are the
+/// cast ones. Row values, `(x1, x2) IN (SELECT y1, y2 ...)`, are cast column by
+/// column.
+pub(crate) fn cast_in_subquery_operands(
     lhs: &mut ast::Expr,
     outer_tables: Option<&TableReferences>,
     query: &mut Plan,
@@ -620,20 +679,19 @@ pub(crate) fn cast_in_subquery_builtin_types(
     };
     let outer_env = TypeEnv::new(outer_tables, resolver);
     for (column, lhs_column) in lhs_columns.iter_mut().enumerate() {
-        let column_types = [
-            stored_form_type(&type_of(lhs_column, &outer_env), resolver.schema())?,
-            stored_form_type(
-                &query_column_type(query, column, resolver),
-                resolver.schema(),
-            )?,
-        ];
-        let Some(target) = builtin_comparison_type(&column_types, resolver) else {
+        let lhs = ComparedOperand::new(lhs_column, &outer_env, resolver)?;
+        // A subquery's result is cast as a value that changes per row, even
+        // when it is a constant: a cast constant gives the same answer.
+        let result =
+            ComparedOperand::of_type(query_column_type(query, column, resolver), false, resolver)?;
+        let Some(target) = comparison_target(&[&lhs.stored_type, &result.stored_type], resolver)
+        else {
             continue;
         };
-        if is_other_custom_type(&column_types[1], &target) {
+        if result.needs_cast_to(&target) {
             // A recursive CTE feeds its own rows back into itself, so a cast
             // on its result would change what it computes. The comparison
-            // then fails as one of two different types.
+            // then fails as it would without the cast.
             let Some(selects) = query_selects_mut(query) else {
                 continue;
             };
@@ -641,46 +699,94 @@ pub(crate) fn cast_in_subquery_builtin_types(
                 cast_to(&mut select.result_columns[column].expr, &target);
             }
         }
-        if is_other_custom_type(&column_types[0], &target) {
+        if lhs.needs_cast_to(&target) {
             cast_to(lhs_column, &target);
         }
     }
     Ok(())
 }
 
-/// Casts each of `operands` whose built-in type is not the one the dialect
-/// compares them all as. Each operand comes with the tables its columns
-/// belong to.
-fn cast_operands_to_builtin_comparison_type<'e>(
-    operands: impl IntoIterator<Item = (&'e mut ast::Expr, &'e TypeEnv<'e>)>,
-    resolver: &Resolver,
-) -> Result<()> {
-    let (operands, types): (Vec<_>, Vec<_>) = operands
-        .into_iter()
-        .map(|(operand, env)| {
-            let ty = stored_form_type(&type_of(operand, env), env.schema());
-            (operand, ty)
-        })
-        .unzip();
-    let types = types.into_iter().collect::<Result<Vec<_>>>()?;
-    let Some(target) = builtin_comparison_type(&types, resolver) else {
-        return Ok(());
-    };
-    for (operand, ty) in operands.into_iter().zip(&types) {
-        if is_other_custom_type(ty, &target) {
-            cast_to(operand, &target);
-        }
-    }
-    Ok(())
+/// What a comparison needs to know about one of its operands to cast it.
+struct ComparedOperand {
+    expr_type: ExprType,
+    /// The custom type whose stored form the operand compares in, if any.
+    stored_type: Option<ResolvedType>,
+    /// Whether the operand, if it has no custom type, is cast to the custom
+    /// type it is compared with (see `Dialect::casts_compared_value_to_custom_type`).
+    /// A constant needs no cast: the comparison converts it once.
+    casts_to_compared_type: bool,
 }
 
-/// Whether an operand of type `operand_type` needs a cast to `target`. An
-/// operand of no custom type is a constant, which the comparison converts
-/// anyway.
-fn is_other_custom_type(operand_type: &Option<ResolvedType>, target: &TypeDef) -> bool {
-    operand_type
-        .as_ref()
-        .is_some_and(|ty| !same_type_def(ty.leaf(), target))
+impl ComparedOperand {
+    fn new(operand: &ast::Expr, env: &TypeEnv, resolver: &Resolver) -> Result<Self> {
+        Self::of_type(
+            type_of(operand, env),
+            operand.is_constant(resolver),
+            resolver,
+        )
+    }
+
+    fn of_type(expr_type: ExprType, is_constant: bool, resolver: &Resolver) -> Result<Self> {
+        let type_is_known = !matches!(
+            expr_type,
+            ExprType::Builtin(BuiltinType::Any) | ExprType::Unknown
+        );
+        Ok(Self {
+            stored_type: stored_form_type(&expr_type, resolver.schema())?,
+            casts_to_compared_type: !is_constant
+                && resolver
+                    .catalog
+                    .dialect
+                    .casts_compared_value_to_custom_type(type_is_known),
+            expr_type,
+        })
+    }
+
+    /// Whether the operand needs a cast to `target` to compare in its stored
+    /// form. A truth value, as `u > 0`, already is a boolean.
+    fn needs_cast_to(&self, target: &TypeDef) -> bool {
+        match &self.stored_type {
+            Some(ty) => !same_type_def(ty.leaf(), target),
+            None => self.casts_to_compared_type && !is_truth_value_for(&self.expr_type, target),
+        }
+    }
+}
+
+/// The custom type that operands of custom types `types` all compare as: their
+/// one custom type, or the built-in type the dialect compares them as (see
+/// `Dialect::comparison_type`). None when no operand has a custom type, or
+/// when two of them have different types with no common type, which makes the
+/// comparison an error. User types never have a common type.
+fn comparison_target(
+    types: &[&Option<ResolvedType>],
+    resolver: &Resolver,
+) -> Option<crate::sync::Arc<TypeDef>> {
+    let type_defs: Vec<&crate::sync::Arc<TypeDef>> = types
+        .iter()
+        .copied()
+        .flatten()
+        .map(|ty| &ty.chain[0])
+        .collect();
+    let first = type_defs.first()?;
+    if type_defs.iter().all(|ty| same_type_def(ty, first)) {
+        return Some(crate::sync::Arc::clone(first));
+    }
+    if !type_defs.iter().all(|ty| ty.is_builtin) {
+        return None;
+    }
+    type_defs
+        .iter()
+        .find(|target| {
+            type_defs.iter().all(|ty| {
+                same_type_def(ty, target)
+                    || resolver
+                        .catalog
+                        .dialect
+                        .comparison_type(&ty.name.to_lowercase(), &target.name.to_lowercase())
+                        .is_some_and(|common| target.name.eq_ignore_ascii_case(common))
+            })
+        })
+        .map(|target| crate::sync::Arc::clone(target))
 }
 
 /// Every SELECT of `query` whose result is the query's result: one, or each
@@ -714,39 +820,6 @@ fn cast_to(operand: &mut ast::Expr, target: &TypeDef) {
             array_dimensions: 0,
         }),
     };
-}
-
-/// The type that the dialect compares all the custom types of compared
-/// operands, `types`, as, when they are not all the same. None when they are,
-/// or when some pair of them has no common type. User types never have one.
-fn builtin_comparison_type(
-    types: &[Option<ResolvedType>],
-    resolver: &Resolver,
-) -> Option<crate::sync::Arc<TypeDef>> {
-    let type_defs: Vec<&crate::sync::Arc<TypeDef>> =
-        types.iter().flatten().map(|ty| &ty.chain[0]).collect();
-    if type_defs
-        .windows(2)
-        .all(|pair| same_type_def(pair[0], pair[1]))
-    {
-        return None;
-    }
-    if !type_defs.iter().all(|ty| ty.is_builtin) {
-        return None;
-    }
-    type_defs
-        .iter()
-        .find(|target| {
-            type_defs.iter().all(|ty| {
-                same_type_def(ty, target)
-                    || resolver
-                        .catalog
-                        .dialect
-                        .comparison_type(&ty.name.to_lowercase(), &target.name.to_lowercase())
-                        .is_some_and(|common| target.name.eq_ignore_ascii_case(common))
-            })
-        })
-        .map(|target| crate::sync::Arc::clone(target))
 }
 
 /// Translates `expr`, an operand of a comparison, into `target_register`. When
