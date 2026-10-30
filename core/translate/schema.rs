@@ -105,7 +105,6 @@ pub(crate) fn validate_check_expr(
                     if matches!(func, Func::Window(..)) {
                         bail_parse_error!("misuse of window function {}()", name.as_str());
                     }
-                    reject_value_unlike_stored_columns(&func, name.as_str(), resolver)?;
                 } else {
                     bail_parse_error!("no such function: {}", name.as_str());
                 }
@@ -131,6 +130,23 @@ pub(crate) fn validate_check_expr(
             ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
                 bail_parse_error!("subqueries prohibited in CHECK constraints");
             }
+            ast::Expr::Binary(lhs, op, rhs) if op.is_comparison() => {
+                reject_value_unlike_stored_columns(lhs, resolver)?;
+                reject_value_unlike_stored_columns(rhs, resolver)?;
+            }
+            ast::Expr::InList { lhs, rhs, .. } => {
+                reject_value_unlike_stored_columns(lhs, resolver)?;
+                for value in rhs {
+                    reject_value_unlike_stored_columns(value, resolver)?;
+                }
+            }
+            ast::Expr::Between {
+                lhs, start, end, ..
+            } => {
+                reject_value_unlike_stored_columns(lhs, resolver)?;
+                reject_value_unlike_stored_columns(start, resolver)?;
+                reject_value_unlike_stored_columns(end, resolver)?;
+            }
             _ => {}
         }
         Ok(WalkControl::Continue)
@@ -141,22 +157,32 @@ pub(crate) fn validate_check_expr(
 /// A function that returns a value of a custom type returns it as a column
 /// read gives it, after DECODE, but a CHECK constraint sees the columns as they
 /// are stored. For a type whose DECODE changes the value, such as `uuid`
-/// stored as a blob and read as text, the function's values would never equal
-/// a column's, so the CHECK constraint is refused.
+/// stored as a blob and read as text, comparing the function's value with a
+/// column would never find them equal, so the CHECK constraint is refused.
+/// A CAST of the call, or a call that is not compared, is fine.
 fn reject_value_unlike_stored_columns(
-    func: &Func,
-    name: &str,
+    operand: &ast::Expr,
     resolver: &CatalogContext,
 ) -> Result<()> {
+    let operand = match operand {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => &exprs[0],
+        _ => operand,
+    };
+    let ast::Expr::FunctionCall { name, args, .. } = operand else {
+        return Ok(());
+    };
+    let Some(func) = resolver.resolve_function(name.as_str(), args.len())? else {
+        return Ok(());
+    };
     let Some(ReturnType::Custom(type_name)) = func.return_type() else {
         return Ok(());
     };
     if let Some(resolved) = resolver.schema().resolve_type_unchecked(type_name)? {
         if !resolved.is_domain() && !resolved.reads_stored_values_unchanged() {
             bail_parse_error!(
-                "cannot use {}() in a CHECK constraint: it returns {} values in a \
+                "cannot compare {}() in a CHECK constraint: it returns {} values in a \
                  different form than they are stored",
-                name,
+                name.as_str(),
                 type_name
             );
         }
