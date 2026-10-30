@@ -148,6 +148,17 @@ pub trait Dialect: Send + Sync + 'static {
     /// always resolve with SQLite semantics instead.
     fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::Func>>;
 
+    /// Reject the CHECK constraints of a table that `CREATE TABLE` is about
+    /// to create whose comparisons do not type-check under this dialect's
+    /// rules.
+    fn validate_check_constraint_types(
+        &self,
+        columns: &[turso_parser::ast::ColumnDefinition],
+        constraints: &[turso_parser::ast::NamedTableConstraint],
+        options: &turso_parser::ast::TableOptions,
+        catalog: &crate::CatalogContext,
+    ) -> crate::Result<()>;
+
     /// Execute a dialect scalar function at runtime.
     ///
     /// Receives the connection — unlike extension functions — because
@@ -276,6 +287,16 @@ mod tests {
     }
 
     impl Dialect for TestDialect {
+        fn validate_check_constraint_types(
+            &self,
+            columns: &[turso_parser::ast::ColumnDefinition],
+            constraints: &[turso_parser::ast::NamedTableConstraint],
+            options: &turso_parser::ast::TableOptions,
+            catalog: &crate::CatalogContext,
+        ) -> crate::Result<()> {
+            SqliteDialect.validate_check_constraint_types(columns, constraints, options, catalog)
+        }
+
         fn name(&self) -> &'static str {
             "test"
         }
@@ -374,6 +395,16 @@ mod tests {
     }
 
     impl Dialect for StrictTestDialect {
+        fn validate_check_constraint_types(
+            &self,
+            columns: &[turso_parser::ast::ColumnDefinition],
+            constraints: &[turso_parser::ast::NamedTableConstraint],
+            options: &turso_parser::ast::TableOptions,
+            catalog: &crate::CatalogContext,
+        ) -> crate::Result<()> {
+            SqliteDialect.validate_check_constraint_types(columns, constraints, options, catalog)
+        }
+
         fn name(&self) -> &'static str {
             "strict-test"
         }
@@ -755,6 +786,16 @@ mod tests {
     struct NoFunctionsDialect;
 
     impl Dialect for NoFunctionsDialect {
+        fn validate_check_constraint_types(
+            &self,
+            columns: &[turso_parser::ast::ColumnDefinition],
+            constraints: &[turso_parser::ast::NamedTableConstraint],
+            options: &turso_parser::ast::TableOptions,
+            catalog: &crate::CatalogContext,
+        ) -> crate::Result<()> {
+            SqliteDialect.validate_check_constraint_types(columns, constraints, options, catalog)
+        }
+
         fn name(&self) -> &'static str {
             "nofuncs"
         }

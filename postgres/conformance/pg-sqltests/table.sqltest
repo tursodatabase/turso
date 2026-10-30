@@ -223,6 +223,40 @@ expect {
     1|2|3
 }
 
+test table-check-compares-integer-column-with-quoted-number {
+    CREATE TABLE t (x int CHECK (x > '0'));
+    INSERT INTO t VALUES (5);
+    SELECT x FROM t;
+}
+expect {
+    5
+}
+
+test table-check-compares-integer-column-with-quoted-number-rejects-value {
+    CREATE TABLE t (x int CHECK (x > '0'));
+    INSERT INTO t VALUES (-1);
+}
+@sqlstate 23514
+expect error {}
+
+test table-check-calls-a-function-that-returns-text {
+    CREATE TABLE t (s text CHECK (s = current_schema));
+    INSERT INTO t VALUES ('public');
+    SELECT s FROM t;
+}
+expect {
+    public
+}
+
+test table-check-calls-a-function-that-returns-an-integer {
+    CREATE TABLE t (pid int CHECK (pid = pg_backend_pid()));
+    INSERT INTO t VALUES (pg_backend_pid());
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
 test table-delete-row-with-numeric-expression-index {
     CREATE TABLE prices (id int PRIMARY KEY, val numeric(10,2));
     CREATE INDEX prices_doubled ON prices ((val * 2));

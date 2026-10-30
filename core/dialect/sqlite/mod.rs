@@ -9,6 +9,7 @@
 //! SQLite one namespace per database, are in [`attach`].
 
 pub mod attach;
+mod check_types;
 use crate::namespace::NamespaceId;
 use crate::pragma::PragmaVirtualTable;
 use crate::schema::{BTreeTable, Schema, Table};
@@ -40,6 +41,16 @@ pub struct SqliteDialect;
 impl super::Dialect for SqliteDialect {
     fn name(&self) -> &'static str {
         "sqlite"
+    }
+
+    fn validate_check_constraint_types(
+        &self,
+        columns: &[turso_parser::ast::ColumnDefinition],
+        constraints: &[turso_parser::ast::NamedTableConstraint],
+        options: &turso_parser::ast::TableOptions,
+        catalog: &crate::CatalogContext,
+    ) -> crate::Result<()> {
+        check_types::validate_check_constraint_types(columns, constraints, options, catalog)
     }
 
     fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {

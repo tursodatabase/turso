@@ -177,6 +177,19 @@ impl Dialect for PostgresDialect {
         register_catalog_modules(options)
     }
 
+    fn validate_check_constraint_types(
+        &self,
+        _columns: &[turso_parser::ast::ColumnDefinition],
+        _constraints: &[turso_parser::ast::NamedTableConstraint],
+        _options: &turso_parser::ast::TableOptions,
+        _catalog: &turso_core::CatalogContext,
+    ) -> Result<()> {
+        // PostgreSQL accepts a comparison when its own type rules can convert
+        // the operands, such as `x > '0'` on an integer column. Until those
+        // rules are implemented here, every CHECK constraint is accepted.
+        Ok(())
+    }
+
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
