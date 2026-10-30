@@ -154,7 +154,7 @@ mod tests {
             let conn = db.connect_limbo();
             conn.execute(
                 "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<'",
+                 DECODE string_reverse(value)",
             )
             .unwrap();
             conn.execute(

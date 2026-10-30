@@ -9,8 +9,8 @@ use crate::ast::{
     Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
     ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
     TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
-    TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo,
-    UpsertIndex, Variable, Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
+    TypeField, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo, UpsertIndex, Variable,
+    Window, WindowDef, With, MAX_ARRAY_DIMENSIONS,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -5034,9 +5034,8 @@ impl<'a> Parser<'a> {
         let mut coerce = None;
         let mut decode = None;
         let mut default = None;
-        let mut operators = Vec::new();
 
-        // Parse optional clauses: ENCODE, COERCE, DECODE, DEFAULT, OPERATOR
+        // Parse optional clauses: ENCODE, COERCE, DECODE, DEFAULT
         loop {
             match self.peek()? {
                 Some(tok) if tok.token_type == TK_ID => {
@@ -5058,84 +5057,11 @@ impl<'a> Parser<'a> {
                             decode = Some(expr);
                         }
                         "OPERATOR" => {
-                            eat_assert!(self, TK_ID);
-                            // Parse operator symbol as a string literal: '+'
-                            let op_tok = eat_expect!(self, TK_STRING);
-                            let op_raw = from_bytes(op_tok.as_bytes());
-                            // Strip quotes from string literal
-                            let op = op_raw
-                                .strip_prefix('\'')
-                                .and_then(|s| s.strip_suffix('\''))
-                                .unwrap_or(&op_raw)
-                                .to_owned();
-                            // Only the built-in types have arithmetic operators.
-                            if op != "<" {
-                                return Err(Error::ParseError(format!(
-                                    "CREATE TYPE does not accept OPERATOR '{op}': only \
-                                     OPERATOR '<' is supported"
-                                )));
-                            }
-                            // Three syntaxes:
-                            // 1. OPERATOR 'op' func_name          (named)
-                            // 2. OPERATOR 'op' (type) -> func_name (old named)
-                            // 3. OPERATOR 'op'                     (naked: use base type)
-                            let func_name = if matches!(self.peek()?, Some(t) if t.token_type == TK_LP)
-                            {
-                                // Old syntax: skip (type) ->
-                                eat_assert!(self, TK_LP);
-                                self.eat()?; // consume type name
-                                eat_expect!(self, TK_RP);
-                                eat_expect!(self, TK_PTR);
-                                let func_tok = self.eat()?;
-                                match func_tok {
-                                    Some(t) if t.token_type == TK_ID => {
-                                        Some(from_bytes(t.as_bytes()))
-                                    }
-                                    _ => {
-                                        return Err(Error::ParseError(
-                                            "expected function name in OPERATOR clause".to_owned(),
-                                        ))
-                                    }
-                                }
-                            } else if matches!(self.peek()?, Some(t) if t.token_type == TK_ID) {
-                                // Check if the next ID is a clause keyword (not a function name)
-                                let next_kw = from_bytes_as_str(self.peek()?.unwrap().as_bytes())
-                                    .to_ascii_uppercase();
-                                match next_kw.as_str() {
-                                    "ENCODE" | "COERCE" | "DECODE" | "OPERATOR" | "DEFAULT" => {
-                                        // Naked operator: no function name
-                                        None
-                                    }
-                                    _ => {
-                                        // Named operator: consume function name
-                                        let func_tok = self.eat()?;
-                                        match func_tok {
-                                            Some(t) if t.token_type == TK_ID => {
-                                                Some(from_bytes(t.as_bytes()))
-                                            }
-                                            _ => {
-                                                return Err(Error::ParseError(
-                                                    "expected function name in OPERATOR clause"
-                                                        .to_owned(),
-                                                ))
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
-                                // End of statement or semicolon: naked operator
-                                None
-                            };
-                            // A plain OPERATOR '<' lets the type be sorted, by its
-                            // stored value. A function for it would never be called.
-                            if op == "<" && func_name.is_some() {
-                                return Err(Error::ParseError(
-                                    "OPERATOR '<' takes no function: a type that declares it \
-                                     sorts by its stored value"
-                                        .to_owned(),
-                                ));
-                            }
-                            operators.push(TypeOperator { op, func_name });
+                            return Err(Error::ParseError(
+                                "CREATE TYPE does not accept OPERATOR: values of a custom type \
+                                 sort and compare by their stored value, and have no arithmetic"
+                                    .to_owned(),
+                            ));
                         }
                         _ => break,
                     }
@@ -5158,7 +5084,6 @@ impl<'a> Parser<'a> {
                 encode,
                 coerce,
                 decode,
-                operators,
                 default,
             },
         })
