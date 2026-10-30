@@ -870,3 +870,117 @@ test insert-stops-at-an-index-in-an-earlier-schema {
 }
 @sqlstate 42809
 expect error {}
+
+test view-reads-a-table-of-a-later-schema {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v AS SELECT t.x FROM t;
+    SELECT x FROM v;
+    SELECT x FROM sp_vw.v;
+}
+expect {
+    9
+    9
+}
+
+test view-keeps-its-table-when-search-path-changes {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v AS SELECT x FROM t;
+    CREATE TABLE sp_vw.t (x int);
+    INSERT INTO sp_vw.t VALUES (1);
+    SET search_path TO sp_vw;
+    SELECT x FROM v;
+}
+expect {
+    9
+}
+
+test view-of-a-named-schema-reads-the-table-the-search-path-finds {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    CREATE TABLE sp_vw.t (x int);
+    INSERT INTO sp_vw.t VALUES (1);
+    CREATE VIEW sp_vw.v AS SELECT x FROM t;
+    SELECT x FROM sp_vw.v;
+}
+expect {
+    9
+}
+
+test view-reads-tables-of-different-schemas {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.a (x int);
+    INSERT INTO public.a VALUES (1);
+    CREATE TABLE sp_vw.b (x int);
+    INSERT INTO sp_vw.b VALUES (1);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v AS SELECT a.x FROM a JOIN b ON a.x = b.x;
+    SELECT x FROM v;
+}
+expect {
+    1
+}
+
+test view-reads-a-later-schema-in-subqueries-and-ctes {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v1 AS SELECT x FROM (SELECT x FROM t) AS s;
+    CREATE VIEW v2 AS SELECT 1 AS c WHERE EXISTS (SELECT 1 FROM t);
+    CREATE VIEW v3 AS SELECT 2 AS c WHERE 9 IN (SELECT x FROM t);
+    CREATE VIEW v4 AS WITH c AS (SELECT x FROM t) SELECT x FROM c;
+    CREATE VIEW v5 AS SELECT (SELECT max(x) FROM t) AS m;
+    SELECT x FROM v1;
+    SELECT c FROM v2;
+    SELECT c FROM v3;
+    SELECT x FROM v4;
+    SELECT m FROM v5;
+}
+expect {
+    9
+    1
+    2
+    9
+    9
+}
+
+test view-reads-a-cte-named-like-a-table-of-a-later-schema {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v AS WITH t AS (SELECT 1 AS x) SELECT x FROM t;
+    SELECT x FROM v;
+}
+expect {
+    1
+}
+
+test view-cte-reads-a-table-of-its-own-name {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v AS WITH t AS (SELECT x + 1 AS x FROM t) SELECT x FROM t;
+    SELECT x FROM v;
+}
+expect {
+    10
+}
+
+test view-reads-a-catalog-table-under-search-path {
+    CREATE SCHEMA sp_vw;
+    SET search_path TO sp_vw;
+    CREATE VIEW v AS SELECT count(*) AS c FROM pg_namespace WHERE nspname = 'sp_vw';
+    SELECT c FROM v;
+}
+expect {
+    1
+}

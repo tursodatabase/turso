@@ -184,12 +184,13 @@ pub trait Dialect: Send + Sync + 'static {
     }
 
     /// Whether a sequence named without a schema in a column default or a
-    /// view body is bound to the schema it is found in when the table or
-    /// view is created.
+    /// view body, and a table named without a schema in a view body, are
+    /// bound to the schema they are found in when the table or view is
+    /// created.
     ///
     /// PostgreSQL stores the bound name, so the default or view keeps its
-    /// sequence after the search path changes. SQLite looks the name up
-    /// each time the default or view runs.
+    /// sequence or table after the search path changes. SQLite looks the
+    /// name up each time the default or view runs.
     fn binds_names_at_create(&self) -> bool {
         false
     }
