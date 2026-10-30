@@ -149,7 +149,7 @@ Because the other value goes through ENCODE, a value that ENCODE rejects is an e
 
 In the PostgreSQL frontend, the built-in `date`, `timestamp` and `timestamptz` types are the exception, as in PostgreSQL: comparing two of them converts the narrower value first. A `date` becomes midnight of that day, and a `timestamp` becomes a `timestamptz` in UTC, so `ts > d` works as `ts > CAST(d AS timestamp)`. This holds in `IN` lists and subqueries, `BETWEEN` and `CASE x WHEN y` too. The SQLite frontend does not convert them, so `ts > d` is an error there.
 
-As in PostgreSQL, only a constant becomes a value of the type it is compared with. Comparing a custom type with another expression, such as `d = s` where `d` is a `date` column and `s` a `text` column, fails with `cannot compare type date with text: cast it to date first`. Write `d = CAST(s AS date)` instead. A comparison, `NOT`, `IN`, `LIKE`, `BETWEEN` or `EXISTS` gives a `boolean`, so `b = (x > 0)` on a `boolean` column `b` needs no cast.
+Any other value compared with a custom type is cast to that type first, the way SQLite applies a column's affinity: `d = s`, where `d` is a `date` column and `s` a `text` column, works as `d = CAST(s AS date)`, in joins, `IN` subqueries and row values too. In the PostgreSQL frontend, as in PostgreSQL, only a value of unknown type, such as a string constant or the result of a function whose type is not known, is cast: `d = s` fails with `cannot compare type date with text: cast it to date first`, so write `d = CAST(s AS date)` there. A comparison, `NOT`, `IN`, `LIKE`, `BETWEEN` or `EXISTS` gives a `boolean`, so `b = (x > 0)` on a `boolean` column `b` needs no cast.
 
 The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and so does a COLLATE on a column of such a type in a STRICT table, in `CREATE TABLE` (also in a `UNIQUE` or `PRIMARY KEY` constraint), `ALTER TABLE ADD COLUMN`, `ALTER TABLE ALTER COLUMN` or `CREATE INDEX`. Comparing two types with different orders fails with `cannot compare type x with type y`.
 
@@ -218,7 +218,7 @@ CREATE TYPE email BASE text
 
 ## CAST Support
 
-The CAST expression stores the value as a column of the type would, with the type's ENCODE logic and its COERCE logic when the CAST gives the type's arguments (see [COERCE](#coerce)), and gives the value such a column reads back, after DECODE. A CAST and a column of the type therefore compare equal when they hold the same value, and the type's operators treat them alike:
+The CAST expression stores the value as a column of the type would, with the type's ENCODE logic and its COERCE logic when the CAST gives the type's arguments (see [COERCE](#coerce)), and gives the value such a column reads back, after DECODE. A CAST and a column of the type therefore compare equal when they hold the same value:
 
 ```sql
 CREATE TYPE cents BASE integer
@@ -232,11 +232,11 @@ SELECT -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1;
 -- -1.50|2.50
 ```
 
-A value of type `t` compares with a column of type `t` by stored value. A constant compared with a column of the type is encoded first, so `WHERE c = 42` compares the stored `c` with `42` encoded. A column of another type has to be cast to the custom type first: `d.x = CAST(t.s AS date)`.
+A CAST compares with a column of the type by stored value, as any two values of the type do (see [Sorting and comparing](#sorting-and-comparing)).
 
 ## CHECK Constraints with Custom Types
 
-A CHECK constraint sees a custom-type column as a SELECT reads it, after DECODE. `CHECK (ceil(n) > 4)` on a `numeric` column computes from the number, and `CHECK (length(id) = 36)` on a `uuid` column measures the text form. In a STRICT table, a column of a custom type can be compared with a constant of the type it takes as input, such as `0` or `-5 - 1` for `cents`. Compare it with a column of another type through a CAST, as in `CHECK (price < CAST(lim AS cents))`:
+A CHECK constraint sees a custom-type column as a SELECT reads it, after DECODE. `CHECK (ceil(n) > 4)` on a `numeric` column computes from the number, and `CHECK (length(id) = 36)` on a `uuid` column measures the text form. In a STRICT table, a column of a custom type can be compared with any value of the type it takes as input, such as `0`, `-5 - 1` or an `integer` column for `cents`:
 
 ```sql
 CREATE TYPE cents BASE integer

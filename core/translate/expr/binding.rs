@@ -607,7 +607,7 @@ pub fn bind_and_rewrite_expr<'a>(
     if !resolver.schema().type_registry.is_empty() {
         let env = TypeEnv::new(referenced_tables.as_deref(), resolver);
         walk_expr_mut(top_level_expr, &mut |expr: &mut ast::Expr| {
-            cast_compared_builtin_types(expr, &env, resolver)?;
+            cast_compared_operands(expr, &env, resolver)?;
             Ok(WalkControl::Continue)
         })?;
     }
