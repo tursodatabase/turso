@@ -7,7 +7,8 @@ use crate::translate::emitter::{
     LimitCtx, Resolver, TranslateCtx,
 };
 use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
-use crate::translate::expr::{compound_column_stored_form, emit_stored_form, translate_expr};
+use crate::translate::expr::expr_type::compound_column_type;
+use crate::translate::expr::{emit_stored_form, stored_form_type, translate_expr};
 use crate::translate::order_by::sorter_insert;
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_columns_to_destination;
@@ -885,7 +886,9 @@ fn emit_compound_order_by(
     let key_stored_forms: Vec<Option<ResolvedType>> = order_by
         .iter()
         .map(|(col_idx, _, _, _)| {
-            compound_column_stored_form(arms, *col_idx, &right_most_ctx.resolver)
+            let resolver = &right_most_ctx.resolver;
+            let ty = compound_column_type(arms.iter().copied(), *col_idx, resolver);
+            stored_form_type(&ty, resolver.schema())
         })
         .collect::<crate::Result<_>>()?;
 

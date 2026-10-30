@@ -10,10 +10,9 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TranslateCtx};
 use crate::translate::expr::expr_type::{type_of, ExprType};
 use crate::translate::expr::{
-    custom_operator_call, emit_operator_call_on_registers, emit_presentation_form,
-    emit_stored_form, expr_contains_nondeterministic_scalar_function, translate_compared_expr,
-    translate_expr, translate_expr_no_constant_opt, walk_expr, walk_expr_mut, NoConstantOptReason,
-    WalkControl,
+    custom_operator_call, emit_decode, emit_operator_call_on_registers, emit_stored_form,
+    expr_contains_nondeterministic_scalar_function, translate_compared_expr, translate_expr,
+    translate_expr_no_constant_opt, walk_expr, walk_expr_mut, NoConstantOptReason, WalkControl,
 };
 use crate::translate::expr_context::ExprContext;
 use crate::translate::order_by::EmitOrderBy;
@@ -2310,7 +2309,7 @@ fn emit_window_agg_final(
             });
         }
         if let Some(ty) = &min_max_stored_types[i] {
-            emit_presentation_form(program, result_reg, ty, resolver)?;
+            emit_decode(program, &ty.chain, result_reg, resolver)?;
         }
     }
     Ok(())
