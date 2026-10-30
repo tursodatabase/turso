@@ -1358,6 +1358,15 @@ impl Statement {
         self.state.clear_bindings();
     }
 
+    /// Resets the statement so it can run again.
+    ///
+    /// A write with RETURNING that already returned a row is committed here,
+    /// but only if its commit IO finishes after one step of the IO loop.
+    /// Otherwise the commit is abandoned and an error is returned, because
+    /// `reset` never blocks on IO. The abandoned commit is undone in memory,
+    /// but its outcome is unknown: its log write may already be durable and
+    /// come back on recovery. To be sure the write commits, step the
+    /// statement to `Done` before resetting it.
     pub fn reset(&mut self) -> Result<()> {
         self.reset_internal(None, None, false)
             .map_err(|error| self.format_error(error))
@@ -1505,11 +1514,29 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::IO) => {
-                            // halt() is re-entered until it finishes; the
-                            // IO loop runs once per attempt, as before the
-                            // completion was parked in the state.
-                            drop(self.state.take_suspended_io());
-                            if let Err(e) = self.pager.io.step() {
+                            // The commit moves to its next state before it
+                            // returns IO, so halt() may only run again once
+                            // the IO has finished. reset() must not block
+                            // until then: on some backends the IO is finished
+                            // by code that cannot run while reset() loops
+                            // (the browser event loop, or another task). So
+                            // the IO gets one step, and if it is still
+                            // pending, the commit is abandoned.
+                            let io = self.state.take_suspended_io();
+                            let stepped = self.pager.io.step().and_then(|()| {
+                                if !io.finished() {
+                                    return Err(LimboError::TxError(
+                                        "statement reset abandoned a commit whose IO did not \
+                                         finish; the commit's outcome is unknown"
+                                            .to_string(),
+                                    ));
+                                }
+                                match io.get_error() {
+                                    Some(err) => Err(err.into()),
+                                    None => Ok(()),
+                                }
+                            });
+                            if let Err(e) = stepped {
                                 capture_reset_error(
                                     &mut reset_error,
                                     e,
