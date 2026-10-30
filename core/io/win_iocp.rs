@@ -666,10 +666,11 @@ impl InnerWindowsIOCP {
                     get_unique_key_from_completion(&completion).addr()
                 );
 
-                completion.error(CompletionError::IOError(
-                    error.kind(),
-                    "io-error-completion",
-                ));
+                completion.error(CompletionError::OsError {
+                    kind: error.kind(),
+                    code: error_code,
+                    op: "io-error-completion",
+                });
             }
             (_, _) => unreachable!(),
         }

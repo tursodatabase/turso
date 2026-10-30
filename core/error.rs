@@ -312,6 +312,15 @@ impl From<&'static str> for LimboError {
 pub enum CompletionError {
     #[error("I/O error ({1}): {0}")]
     IOError(std::io::ErrorKind, &'static str),
+    /// An I/O failure the operating system named. The raw code is kept
+    /// because an `io::ErrorKind` does not identify the failure on Windows,
+    /// where almost every code maps to `Other`.
+    #[error("I/O error ({kind}): {op} (os error {code})")]
+    OsError {
+        kind: std::io::ErrorKind,
+        code: u32,
+        op: &'static str,
+    },
     #[cfg(target_family = "unix")]
     #[error("I/O error: {0}")]
     RustixIOError(#[from] rustix::io::Errno),
@@ -485,5 +494,25 @@ impl LimboError {
             Self::ConstraintViolation(violation) => violation.kind == ConstraintKind::ForeignKey,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompletionError;
+
+    /// The raw OS code is the whole reason this variant exists: an
+    /// `io::ErrorKind` cannot tell Windows error 1450 from a genuinely
+    /// failing disk, so it has to survive into the message.
+    #[test]
+    fn os_error_message_keeps_the_os_code() {
+        let error = CompletionError::OsError {
+            kind: std::io::ErrorKind::Other,
+            code: 1450,
+            op: "io-error-completion",
+        };
+        let message = error.to_string();
+        assert!(message.contains("1450"), "{message}");
+        assert!(message.contains("io-error-completion"), "{message}");
     }
 }
