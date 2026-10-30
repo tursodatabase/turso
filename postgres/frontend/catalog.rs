@@ -230,6 +230,18 @@ impl Dialect for PostgresDialect {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
+
+    /// A date becomes midnight of that day, and a timestamp becomes a
+    /// timestamptz in UTC, the only time zone tursopg has.
+    fn comparison_type(&self, lhs_type: &str, rhs_type: &str) -> Option<&'static str> {
+        match (lhs_type, rhs_type) {
+            ("date", "timestamp") | ("timestamp", "date") => Some("timestamp"),
+            ("date" | "timestamp", "timestamptz") | ("timestamptz", "date" | "timestamp") => {
+                Some("timestamptz")
+            }
+            _ => None,
+        }
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
