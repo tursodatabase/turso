@@ -1645,6 +1645,33 @@ test log-int-null {
 expect {
 }
 
+# Only the base of log(B, X) is type-checked: X is read like sqlite3_value_double().
+test log-int-str-numeric-prefix {
+    SELECT log(10, '100abc')
+}
+expect {
+    2.0
+}
+
+test log-int-blob {
+    SELECT log(10, x'313030')
+}
+expect {
+    2.0
+}
+
+test log-int-str-not-numeric {
+    SELECT log(10, 'abc')
+}
+expect {
+}
+
+test log-str-numeric-prefix-int {
+    SELECT log('10abc', 100)
+}
+expect {
+}
+
 test remainder-int-null {
     SELECT 183 % null
 }

@@ -1209,7 +1209,14 @@ impl Value {
     /// the result by 1 ulp relative to SQLite's ratio.
     #[allow(unused_unsafe)]
     pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
-        let Some(f) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
+        // SQLite's logFunc type-checks the base, but reads X of log(B, X) with
+        // sqlite3_value_double(), so log(10, '100abc') and log(10, x'313030') are 2.0.
+        let f = if base.is_some() {
+            Numeric::from_value(self)
+        } else {
+            Numeric::from_value_strict(self)
+        };
+        let Some(f) = f.map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
