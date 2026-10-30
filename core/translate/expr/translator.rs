@@ -1698,7 +1698,7 @@ fn translate_function_call_expr(
                         func: func_ctx,
                     });
                     if let Some(compared_as) = &compared_as {
-                        emit_presentation_form(program, target_register, compared_as, resolver)?;
+                        emit_decode(program, &compared_as.chain, target_register, resolver)?;
                     }
                     Ok(target_register)
                 }

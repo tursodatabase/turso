@@ -18,9 +18,7 @@ use crate::{
 
 use super::{
     emitter::{Resolver, TranslateCtx},
-    expr::{
-        emit_presentation_form, stored_comparison_type, translate_compared_expr, translate_expr,
-    },
+    expr::{emit_decode, stored_comparison_type, translate_compared_expr, translate_expr},
     plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
@@ -312,7 +310,7 @@ impl EmitOrderBy {
                     Some(&plan.table_references),
                     &t_ctx.resolver,
                 )? {
-                    emit_presentation_form(program, reg, &stored_form, &t_ctx.resolver)?;
+                    emit_decode(program, &stored_form.chain, reg, &t_ctx.resolver)?;
                 } else if let Some((_, type_def)) = result_column_custom_type_info(
                     &rc.expr,
                     &plan.table_references,
