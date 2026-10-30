@@ -275,6 +275,8 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         || msg.starts_with("cannot drop type")
     {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
+    } else if is_missing_insert_column_error(msg) {
+        SQLSTATE_UNDEFINED_COLUMN
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.contains("no such table")
@@ -309,6 +311,14 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
     } else {
         SQLSTATE_SYNTAX_ERROR
     }
+}
+
+/// Whether a parse error reports a missing INSERT column, for example
+/// `table t has no column named c`. Both names are user text and can contain
+/// phrases like "no such table" or "already exists", so the message is
+/// matched by its shape before any phrase rule looks at it.
+fn is_missing_insert_column_error(msg: &str) -> bool {
+    msg.starts_with("table ") && msg.contains(" has no column named ")
 }
 
 /// Whether a parse error reports that an object already exists, for example
@@ -455,6 +465,14 @@ mod tests {
             ("no such table: already exists", SQLSTATE_UNDEFINED_TABLE),
             (
                 "table plain has no column named no such column already exists",
+                SQLSTATE_UNDEFINED_COLUMN,
+            ),
+            (
+                "table no such table has no column named b already exists",
+                SQLSTATE_UNDEFINED_COLUMN,
+            ),
+            (
+                "table t has no column named no such table",
                 SQLSTATE_UNDEFINED_COLUMN,
             ),
             ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
