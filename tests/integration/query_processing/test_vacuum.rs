@@ -3297,14 +3297,13 @@ fn test_vacuum_into_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<()
 fn test_vacuum_into_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    conn
-        .execute(
-            "CREATE TABLE settings (
+    conn.execute(
+        "CREATE TABLE settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER
             ) STRICT, WITHOUT ROWID",
-        )?;
+    )?;
 
     conn.execute("INSERT INTO settings VALUES ('theme', 'dark', 1704067200)")?;
     conn.execute("INSERT INTO settings VALUES ('language', 'en', 1704153600)")?;
@@ -4631,14 +4630,13 @@ fn test_plain_vacuum_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<(
 fn test_plain_vacuum_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    conn
-        .execute(
-            "CREATE TABLE settings (
+    conn.execute(
+        "CREATE TABLE settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER
             ) STRICT, WITHOUT ROWID",
-        )?;
+    )?;
 
     conn.execute("INSERT INTO settings VALUES ('theme', 'dark', 1704067200)")?;
     conn.execute("INSERT INTO settings VALUES ('language', 'en', 1704153600)")?;
