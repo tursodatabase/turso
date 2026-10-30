@@ -17,7 +17,7 @@ use crate::{
 use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
     expr::{
-        emit_presentation_form, emit_stored_form, resolve_expr, stored_comparison_type,
+        emit_decode, emit_stored_form, resolve_expr, stored_comparison_type,
         translate_compared_expr, translate_condition_expr, translate_expr,
         translate_expr_no_constant_opt, ConditionMetadata, NoConstantOptReason,
     },
@@ -375,8 +375,7 @@ impl<'a> AggArgumentSource<'a> {
 
 /// The custom type whose stored form the values of a min or max aggregate
 /// compare in. The aggregate keeps the stored value, and its result is decoded
-/// when it is finalized (see [emit_aggregate_result_presentation_form]), so
-/// `max(c)` is the value `ORDER BY c DESC` puts first.
+/// when it is finalized, so `max(c)` is the value `ORDER BY c DESC` puts first.
 pub(crate) fn aggregate_stored_comparison_type(
     func: &AggFunc,
     args: &[ast::Expr],
@@ -389,22 +388,6 @@ pub(crate) fn aggregate_stored_comparison_type(
         }
         _ => Ok(None),
     }
-}
-
-/// Decodes the finalized result in `reg` of an aggregate whose values compare
-/// in a custom type's stored form.
-pub(crate) fn emit_aggregate_result_presentation_form(
-    program: &mut ProgramBuilder,
-    func: &AggFunc,
-    args: &[ast::Expr],
-    referenced_tables: &TableReferences,
-    reg: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    if let Some(ty) = aggregate_stored_comparison_type(func, args, referenced_tables, resolver)? {
-        emit_presentation_form(program, reg, &ty, resolver)?;
-    }
-    Ok(())
 }
 
 pub fn emit_aggregate_step(
@@ -544,14 +527,12 @@ pub fn emit_aggregate_final(
         register: target_register,
         func: AccumulatorFunc::Agg(aggregate.func.clone()),
     });
-    emit_aggregate_result_presentation_form(
-        program,
-        &aggregate.func,
-        &aggregate.args,
-        tables,
-        target_register,
-        resolver,
-    )
+    if let Some(ty) =
+        aggregate_stored_comparison_type(&aggregate.func, &aggregate.args, tables, resolver)?
+    {
+        emit_decode(program, &ty.chain, target_register, resolver)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn open_aggregate_sorter(
