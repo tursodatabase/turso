@@ -679,6 +679,16 @@ fn update_pragma(
             schema_was_explicit,
             program,
         ),
+        PragmaName::DataVersion => query_pragma(
+            PragmaName::DataVersion,
+            resolver,
+            Some(value),
+            pager,
+            connection,
+            namespace,
+            schema_was_explicit,
+            program,
+        ),
         PragmaName::FreelistCount => query_pragma(
             PragmaName::FreelistCount,
             resolver,
@@ -1676,6 +1686,20 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::VdbeTrace => Ok(TransactionMode::None),
+        PragmaName::DataVersion => {
+            // MVCC commits reach the WAL only at checkpoint, so the count would miss them.
+            if connection.mvcc_enabled() {
+                bail_parse_error!("PRAGMA data_version is not supported in MVCC mode");
+            }
+            program.emit_insn(Insn::ReadCookie {
+                db: database_id,
+                dest: register,
+                cookie: Cookie::DataVersion,
+            });
+            program.add_pragma_result_column(pragma.to_string());
+            program.emit_result_row(register, 1);
+            Ok(TransactionMode::Read)
+        }
         PragmaName::FreelistCount => {
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,

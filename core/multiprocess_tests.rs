@@ -3131,3 +3131,45 @@ fn subprocess_idle_begin_sees_table_created_by_other_process() {
     assert_eq!(rows.len(), 1);
     conn.execute("commit").unwrap();
 }
+
+#[test]
+fn subprocess_pragma_data_version_sees_child_process_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-data-version.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    let data_version = || {
+        get_rows(&conn, "pragma data_version")[0][0]
+            .as_int()
+            .unwrap()
+    };
+    let before = data_version();
+
+    conn.execute("insert into test(value) values ('parent')")
+        .unwrap();
+    assert_eq!(data_version(), before, "own commit changed data_version");
+
+    let current_exe = std::env::current_exe().unwrap();
+    let insert_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_INSERT_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        insert_output.status.success(),
+        "child insert process failed: stderr={}",
+        String::from_utf8_lossy(&insert_output.stderr)
+    );
+
+    assert_ne!(
+        data_version(),
+        before,
+        "data_version did not change after the child process committed"
+    );
+}

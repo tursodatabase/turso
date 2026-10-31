@@ -231,7 +231,7 @@ avoid this window.
 | PRAGMA compile_options           | ❌ No         |                                              |
 | PRAGMA count_changes             | ✅ Yes         |                                              |
 | PRAGMA data_store_directory      | Not Needed | deprecated in SQLite                         |
-| PRAGMA data_version              | ❌ No         |                                              |
+| PRAGMA data_version              | 🚧 Partial    | Not yet in MVCC mode                         |
 | PRAGMA database_list             | ✅ Yes        |                                              |
 | PRAGMA default_cache_size        | Not Needed | deprecated in SQLite                         |
 | PRAGMA defer_foreign_keys        | ❌ No         |                                              |

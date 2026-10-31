@@ -644,6 +644,9 @@ pub trait Wal: Debug + Send + Sync {
     fn begin_read_tx(&self) -> Result<bool>;
     /// MVCC helper: check if WAL state changed without starting a read tx.
     fn mvcc_refresh_if_db_changed(&self) -> bool;
+    /// The connection's `PRAGMA data_version`: it changes when the connection's view of the WAL
+    /// moves to one with commits it hadn't seen, and never for its own commits or a checkpoint.
+    fn data_version(&self) -> u64;
 
     /// Begin a write transaction.
     ///
@@ -2871,6 +2874,9 @@ pub struct WalFile {
     last_checksum: AtomicU64,
     checkpoint_seq: AtomicU32,
     transaction_count: AtomicU64,
+    /// Times this connection's view of the WAL moved to one with commits it hadn't seen
+    /// (SQLite's `Pager::iDataVersion`), see [`Wal::data_version`].
+    data_version: AtomicU64,
 
     /// Manages locks needed for checkpointing
     checkpoint_guard: RwLock<Option<CheckpointLocks>>,
@@ -3348,6 +3354,12 @@ impl WalFile {
 
     /// Persist a connection-local WAL snapshot bundle back into the legacy fields on `WalFile`.
     fn install_connection_state(&self, state: WalConnectionState) {
+        // Every commit raises the shared transaction count and a checkpoint keeps it, so a new
+        // count means commits this connection hadn't seen. Its own commits raise its local count
+        // before publishing, so they never count.
+        if state.snapshot.transaction_count != self.transaction_count.load(Ordering::Acquire) {
+            self.data_version.fetch_add(1, Ordering::AcqRel);
+        }
         self.max_frame
             .store(state.snapshot.max_frame, Ordering::Release);
         self.min_frame
@@ -3542,6 +3554,10 @@ impl Wal for WalFile {
 
     fn mvcc_refresh_if_db_changed(&self) -> bool {
         WalFile::mvcc_refresh_if_db_changed(self)
+    }
+
+    fn data_version(&self) -> u64 {
+        self.data_version.load(Ordering::Acquire)
     }
 
     /// End a read transaction.
@@ -4919,6 +4935,7 @@ impl WalFile {
             vacuum_lock_guard: RwLock::new(None),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
+            data_version: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
             last_checksum: AtomicU64::new(pack_checksum(last_checksum)),
             checkpoint_guard: RwLock::new(None),
