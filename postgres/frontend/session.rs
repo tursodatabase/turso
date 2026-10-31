@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use std::num::NonZero;
 use std::str;
 use std::sync::Arc;
+use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
@@ -10,7 +11,9 @@ use crate::functions::{find_parameter, ConfigParameter, Parameter};
 use crate::settings::{ConnectionSettings, PgSessionState, SettingScope};
 use crate::statement::{PgTxState, PostRunFn, TxRole};
 use turso_core::schema::{Table, SEQ_BACKING_TABLE_PREFIX};
-use turso_core::{Connection, LimboError, Qualifier, Result, Statement, Value};
+use turso_core::{
+    Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
+};
 use turso_parser::ast::{self};
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
@@ -447,14 +450,22 @@ fn prepare_statement_inner(
         .conn
         .prepare_translated_cmd(cmd.clone(), &sql)
         .map_err(schema_error)?;
-    let pg_conn = Arc::clone(pg_conn);
-    let prereqs = translated.prereqs;
-    let sql_owned = sql.into_owned();
-    Ok(crate::Statement::with_deferred(
+    Ok(crate::Statement::with_prerequisites(
         inner,
-        Box::new(move |inner| {
-            execute_cmd_with_prereqs(&pg_conn, &prereqs, &cmd, &sql_owned, inner)
-        }),
+        PrerequisiteExecution {
+            pg_conn: Arc::clone(pg_conn),
+            prereqs: translated.prereqs,
+            cmd,
+            sql: sql.into_owned(),
+            phase: PrerequisitePhase::Start,
+            active: None,
+            io_completions: None,
+            was_in_tx: None,
+            savepoint_open: false,
+            target_exists: false,
+            error: None,
+            interrupted: false,
+        },
     )
     .with_tx_tracking(conn, tx, role)
     .with_query_start_marking(marks_query_start)
@@ -559,65 +570,221 @@ fn tx_role(stmt: &ast::Stmt) -> TxRole {
 
 const PG_STMT_SAVEPOINT: &str = "__turso_pg_stmt";
 
-fn execute_cmd_with_prereqs(
-    pg_conn: &Arc<PgConnectionInner>,
-    prereqs: &[ast::Stmt],
-    cmd: &ast::Cmd,
-    sql: &str,
-    inner: &mut Statement,
-) -> Result<()> {
-    let conn = &pg_conn.conn;
-    if create_table_if_not_exists_target_present(conn, cmd)? {
-        *inner = conn
-            .prepare_translated_cmd(cmd.clone(), sql)
-            .map_err(schema_error)?;
-        return inner.run_ignore_rows();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrerequisitePhase {
+    Start,
+    CheckTarget,
+    Savepoint,
+    Prerequisite(usize),
+    Main,
+    Release,
+    Rollback,
+    RollbackRelease,
+    Done,
+}
+
+pub(crate) struct PrerequisiteExecution {
+    pg_conn: Arc<PgConnectionInner>,
+    prereqs: Vec<ast::Stmt>,
+    cmd: ast::Cmd,
+    sql: String,
+    phase: PrerequisitePhase,
+    active: Option<Statement>,
+    pub(crate) io_completions: Option<turso_core::types::IOCompletions>,
+    pub(crate) was_in_tx: Option<bool>,
+    savepoint_open: bool,
+    target_exists: bool,
+    error: Option<LimboError>,
+    pub(crate) interrupted: bool,
+}
+
+impl PrerequisiteExecution {
+    pub(crate) fn step(
+        &mut self,
+        inner: &mut Statement,
+        waker: Option<&Waker>,
+    ) -> Result<StepResult> {
+        self.io_completions = None;
+        loop {
+            if self.phase == PrerequisitePhase::Done {
+                return self.error.clone().map_or(Ok(StepResult::Done), Err);
+            }
+            match self.run_phase_nonblock(inner) {
+                Ok(IOResult::Done(())) => continue,
+                Ok(IOResult::IO(io)) => {
+                    io.set_waker(waker);
+                    let result = if io.is_explicit_yield() {
+                        StepResult::Yield
+                    } else {
+                        StepResult::IO
+                    };
+                    self.io_completions = Some(io);
+                    return Ok(result);
+                }
+                Err(error) => self.fail(error),
+            }
+        }
     }
 
-    let started_in_autocommit = conn.get_auto_commit();
-    let begin_sp = format!("SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-    let release_sp = format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-    execute_sqlite(conn, begin_sp)?;
-    let result = (|| {
-        for prereq in prereqs {
-            let input = prereq.to_string();
-            let mut stmt = conn
-                .prepare_translated_stmt(prereq.clone(), &input)
-                .map_err(schema_error)?;
-            stmt.run_ignore_rows()?;
-        }
-        *inner = conn
-            .prepare_translated_cmd(cmd.clone(), sql)
-            .map_err(schema_error)?;
-        inner.run_ignore_rows()
-    })();
+    fn run_phase_nonblock(&mut self, inner: &mut Statement) -> Result<IOResult<()>> {
+        use PrerequisitePhase::*;
 
-    match result {
-        Ok(()) => execute_sqlite(conn, release_sp),
-        Err(err) => {
-            if started_in_autocommit {
-                let _ = execute_sqlite(conn, "ROLLBACK");
+        let conn = &self.pg_conn.conn;
+        if self.phase == Start {
+            self.was_in_tx = Some(!conn.get_auto_commit());
+            self.active = prepare_create_table_target_check(conn, &self.cmd)?;
+            self.phase = if self.active.is_some() {
+                CheckTarget
             } else {
-                let rollback_sp = format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-                let _ = execute_sqlite(conn, rollback_sp);
-                let _ = execute_sqlite(conn, release_sp);
+                Savepoint
+            };
+        }
+        if self.active.is_none() {
+            self.active = Some(match self.phase {
+                Savepoint => conn.prepare_sqlite(format!("SAVEPOINT \"{PG_STMT_SAVEPOINT}\""))?,
+                Prerequisite(index) => {
+                    let stmt = &self.prereqs[index];
+                    conn.prepare_translated_stmt(stmt.clone(), &stmt.to_string())
+                        .map_err(schema_error)?
+                }
+                Main => conn
+                    .prepare_translated_cmd(self.cmd.clone(), &self.sql)
+                    .map_err(schema_error)?,
+                Release | RollbackRelease => {
+                    conn.prepare_sqlite(format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\""))?
+                }
+                Rollback if self.was_in_tx == Some(true) => {
+                    conn.prepare_sqlite(format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\""))?
+                }
+                Rollback => conn.prepare_sqlite("ROLLBACK")?,
+                Start | CheckTarget | Done => unreachable!(),
+            });
+        }
+        let active = self.active.as_mut().unwrap();
+        if matches!(self.phase, Rollback | RollbackRelease) {
+            active.set_query_timeout_override(Some(None));
+        } else if self.interrupted {
+            active.interrupt();
+        }
+        let result = if self.phase == CheckTarget {
+            active.run_with_row_callback_nonblock(|row| {
+                self.target_exists = row.get_value(0) == &Value::from_i64(1);
+                Ok(())
+            })
+        } else {
+            active.run_ignore_rows_nonblock()
+        }
+        .map_err(|error| *error)?;
+        if let IOResult::IO(io) = result {
+            return Ok(IOResult::IO(io));
+        }
+        if self.interrupted && !matches!(self.phase, Release | Rollback | RollbackRelease) {
+            if self.phase == Savepoint {
+                self.savepoint_open = true;
             }
-            Err(err)
+            return Err(LimboError::Interrupt);
+        }
+        if self.phase == Main {
+            *inner = self.active.take().unwrap();
+        } else {
+            self.active = None;
+        }
+        self.phase = match self.phase {
+            CheckTarget if self.target_exists => Main,
+            CheckTarget => Savepoint,
+            Savepoint => {
+                self.savepoint_open = true;
+                Prerequisite(0)
+            }
+            Prerequisite(index) if index + 1 < self.prereqs.len() => Prerequisite(index + 1),
+            Prerequisite(_) => Main,
+            Main if self.savepoint_open => Release,
+            Main => Done,
+            Rollback if self.was_in_tx == Some(true) => RollbackRelease,
+            Release | Rollback | RollbackRelease => {
+                self.savepoint_open = false;
+                Done
+            }
+            Start | Done => unreachable!(),
+        };
+        Ok(IOResult::Done(()))
+    }
+
+    fn fail(&mut self, error: LimboError) {
+        let cleaning_up = matches!(
+            self.phase,
+            PrerequisitePhase::Rollback | PrerequisitePhase::RollbackRelease
+        );
+        self.active = None;
+        self.error = Some(error);
+        if self.pg_conn.conn.get_auto_commit() {
+            self.savepoint_open = false;
+        }
+        self.phase = if self.savepoint_open && !cleaning_up {
+            PrerequisitePhase::Rollback
+        } else {
+            if self.savepoint_open {
+                self.pg_conn.tx.abort();
+            }
+            PrerequisitePhase::Done
+        };
+    }
+
+    pub(crate) fn reset(&mut self) -> Result<()> {
+        let io_result = match self.io_completions.take() {
+            Some(io) if !io.0.is_wait() => io.wait(self.active.as_ref().unwrap()._io()),
+            _ => Ok(()),
+        };
+        let active_result = self.active.as_mut().map_or(Ok(()), Statement::reset);
+        self.active = None;
+        if self.savepoint_open && !self.pg_conn.conn.get_auto_commit() {
+            let conn = &self.pg_conn.conn;
+            let result = if self.was_in_tx == Some(true) {
+                execute_sqlite(
+                    conn,
+                    format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\""),
+                )
+                .and_then(|()| {
+                    execute_sqlite(conn, format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\""))
+                })
+            } else {
+                execute_sqlite(conn, "ROLLBACK")
+            };
+            if result.is_err() {
+                self.pg_conn.tx.abort();
+            }
+            result?;
+        }
+        self.phase = PrerequisitePhase::Start;
+        self.was_in_tx = None;
+        self.savepoint_open = false;
+        self.target_exists = false;
+        self.error = None;
+        self.interrupted = false;
+        io_result.and(active_result)
+    }
+}
+
+impl Drop for PrerequisiteExecution {
+    fn drop(&mut self) {
+        if let Err(error) = self.reset() {
+            self.pg_conn.tx.abort();
+            tracing::error!("Failed to clean up PostgreSQL prerequisites: {error}");
         }
     }
 }
 
-fn create_table_if_not_exists_target_present(
+fn prepare_create_table_target_check(
     conn: &Arc<Connection>,
     cmd: &ast::Cmd,
-) -> Result<bool> {
+) -> Result<Option<Statement>> {
     let ast::Cmd::Stmt(ast::Stmt::CreateTable {
         if_not_exists: true,
         tbl_name,
         ..
     }) = cmd
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let default_schema;
     let schema = match &tbl_name.namespace {
@@ -628,7 +795,7 @@ fn create_table_if_not_exists_target_present(
         }
     };
     let Some(namespace) = relation_lookup_namespaces(conn, schema).into_iter().next() else {
-        return Ok(false);
+        return Ok(None);
     };
     let database = database_of(conn, &namespace);
     let mut stmt = conn.prepare_sqlite(format!(
@@ -639,11 +806,7 @@ fn create_table_if_not_exists_target_present(
         NonZero::new(1).unwrap(),
         Value::build_text(namespace.mangle_name(tbl_name.name.as_str())),
     )?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(rows
-        .first()
-        .and_then(|row| row.first())
-        .is_some_and(|val| *val == Value::from_i64(1)))
+    Ok(Some(stmt))
 }
 
 /// `sql` with each table that a foreign key names replaced by the name the
