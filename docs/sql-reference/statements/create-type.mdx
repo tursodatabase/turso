@@ -248,7 +248,7 @@ CREATE TABLE products (
 ) STRICT;
 ```
 
-A function can return a value of a custom type. It returns the value as a column read gives it, after DECODE. A CHECK constraint sees the stored values instead, so when the type's DECODE changes the value, a comparison of such a call with another value would be wrong: CREATE TABLE and ALTER TABLE refuse `CHECK (owner = f())` with `cannot compare f() in a CHECK constraint: it returns <type> values in a different form than they are stored`. A CAST of the call, as in `CHECK (owner = CAST(f() AS text))`, or a call that is not compared, is accepted.
+A function can return a value of a custom type. It returns the value as a column read gives it, after DECODE. A comparison, in a CHECK constraint or anywhere else, puts the call's value through the type's ENCODE first, so it is compared with the stored column value in the same form: `CHECK (owner = f())` holds when `f()` returns the same value as `owner` reads.
 
 ## Inspecting Types
 
