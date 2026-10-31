@@ -37,6 +37,7 @@ impl InteractionPlan {
         PlanGenerator {
             plan: self,
             peek: None,
+            commit_before_peek_conn: None,
             iter,
             rng,
         }
@@ -149,6 +150,8 @@ impl InteractionPlan {
 pub struct PlanGenerator<'a, R: rand::Rng> {
     plan: &'a mut InteractionPlan,
     peek: Option<Interaction>,
+    /// Connection of the COMMIT that was last returned ahead of `peek`.
+    commit_before_peek_conn: Option<usize>,
     iter: <Vec<Interaction> as IntoIterator>::IntoIter,
     rng: &'a mut R,
 }
@@ -252,20 +255,28 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                     // exclusive write tx — DDL and setval — would be rejected
                     // there, so commit the open tx first to fall back to
                     // autocommit (which IS exclusive).
-
+                    //
+                    // If the connection we last returned a COMMIT for is still in
+                    // a transaction, the runner did not execute that COMMIT because
+                    // it is skipping the rest of the property. The peeked
+                    // interaction is skipped as well, so return it instead of
+                    // returning the same COMMIT again.
                     if let Some(conn_index) =
                         (0..env.connections.len()).find(|idx| env.conn_in_transaction(*idx))
                     {
-                        return Some(
-                            InteractionBuilder::from_interaction(peek_interaction)
-                                .interaction(InteractionType::Query(Query::Commit(Commit)))
-                                .connection_index(conn_index)
-                                .build()
-                                .unwrap(),
-                        );
+                        let commit = InteractionBuilder::from_interaction(peek_interaction)
+                            .interaction(InteractionType::Query(Query::Commit(Commit)))
+                            .connection_index(conn_index)
+                            .build()
+                            .unwrap();
+                        if self.commit_before_peek_conn != Some(conn_index) {
+                            self.commit_before_peek_conn = Some(conn_index);
+                            return Some(commit);
+                        }
                     }
                 }
 
+                self.commit_before_peek_conn = None;
                 self.peek.take()
             }
             None => {
@@ -417,5 +428,110 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
         };
 
         frequency(choices, rng)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profiles::Profile;
+    use crate::runner::cli::SimulatorCLI;
+    use crate::runner::env::Paths;
+    use crate::runner::execution::execute_interaction;
+    use clap::Parser as _;
+    use rand::SeedableRng as _;
+    use rand_chacha::ChaCha8Rng;
+
+    const PROPERTY_ID: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+
+    fn mvcc_env(output_dir: &tempfile::TempDir) -> SimulatorEnv {
+        let mut env = SimulatorEnv::new(
+            0xB0BA,
+            &SimulatorCLI::parse_from(["limbo_sim", "--io-backend=memory"]),
+            Paths::new(output_dir.path()),
+            SimulationType::Default,
+            &Profile::simple_mvcc(),
+        );
+        env.connect(0);
+        env.connect(1);
+        env
+    }
+
+    fn query_interaction(connection_index: usize, query: Query) -> Interaction {
+        InteractionBuilder::with_interaction(InteractionType::Query(query))
+            .connection_index(connection_index)
+            .id(PROPERTY_ID)
+            .build()
+            .unwrap()
+    }
+
+    fn begin_concurrent(env: &mut SimulatorEnv, connection_index: usize) {
+        let begin = query_interaction(connection_index, Query::Begin(Begin::Concurrent));
+        execute_interaction(env, &begin, &mut Vec::new()).unwrap();
+        assert!(env.conn_in_transaction(connection_index));
+    }
+
+    /// A plan whose only interaction is a CREATE TABLE on connection 1.
+    fn plan_with_create(env: &SimulatorEnv) -> InteractionPlan {
+        let create = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(1));
+        let mut plan = InteractionPlan::new(true);
+        plan.push(query_interaction(1, Query::Create(create)));
+        plan
+    }
+
+    fn assert_commit_on(interaction: &Interaction, connection_index: usize) {
+        assert!(
+            matches!(
+                interaction.interaction,
+                InteractionType::Query(Query::Commit(_))
+            ),
+            "{interaction}"
+        );
+        assert_eq!(interaction.connection_index, connection_index);
+        assert_eq!(interaction.id(), PROPERTY_ID);
+    }
+
+    fn assert_create(interaction: &Interaction) {
+        assert!(
+            matches!(
+                interaction.interaction,
+                InteractionType::Query(Query::Create(_))
+            ),
+            "{interaction}"
+        );
+        assert_eq!(interaction.id(), PROPERTY_ID);
+    }
+
+    #[test]
+    fn ddl_after_an_unexecuted_commit_is_returned_next() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = mvcc_env(&output_dir);
+        begin_concurrent(&mut env, 0);
+        let mut plan = plan_with_create(&env);
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let mut generator = plan.generator(&mut rng);
+
+        // The runner skips the rest of the property, so it does not execute the COMMIT.
+        assert_commit_on(&generator.next(&mut env).unwrap(), 0);
+        assert_create(&generator.next(&mut env).unwrap());
+    }
+
+    #[test]
+    fn ddl_waits_until_every_open_transaction_is_committed() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = mvcc_env(&output_dir);
+        begin_concurrent(&mut env, 0);
+        begin_concurrent(&mut env, 1);
+        let mut plan = plan_with_create(&env);
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        let mut generator = plan.generator(&mut rng);
+
+        for connection_index in [0, 1] {
+            let commit = generator.next(&mut env).unwrap();
+            assert_commit_on(&commit, connection_index);
+            execute_interaction(&mut env, &commit, &mut Vec::new()).unwrap();
+            assert!(!env.conn_in_transaction(connection_index));
+        }
+        assert_create(&generator.next(&mut env).unwrap());
     }
 }
