@@ -3117,22 +3117,39 @@ impl PostgreSQLTranslator {
                         "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
                     ));
                 }
+                // Each result gets the type PostgreSQL gives it, so that
+                // `ts < current_timestamp` compares two timestamps and
+                // `current_date - 1` is a date. CURRENT_TIME is a time with a
+                // time zone, which tursopg doesn't have, so it stays text.
                 match SqlValueFunctionOp::try_from(svf.op) {
-                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
-                        Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
-                    }
+                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => Ok(cast_to(
+                        ast::Expr::Literal(ast::Literal::CurrentDate),
+                        "date",
+                    )),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
-                        | SqlValueFunctionOp::SvfopCurrentTimeN
-                        | SqlValueFunctionOp::SvfopLocaltime
-                        | SqlValueFunctionOp::SvfopLocaltimeN,
+                        | SqlValueFunctionOp::SvfopCurrentTimeN,
                     ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTime)),
                     Ok(
+                        SqlValueFunctionOp::SvfopLocaltime | SqlValueFunctionOp::SvfopLocaltimeN,
+                    ) => Ok(cast_to(
+                        ast::Expr::Literal(ast::Literal::CurrentTime),
+                        "time",
+                    )),
+                    Ok(
                         SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
+                        | SqlValueFunctionOp::SvfopCurrentTimestampN,
+                    ) => Ok(cast_to(
+                        ast::Expr::Literal(ast::Literal::CurrentTimestamp),
+                        "timestamptz",
+                    )),
+                    Ok(
+                        SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                    ) => Ok(cast_to(
+                        ast::Expr::Literal(ast::Literal::CurrentTimestamp),
+                        "timestamp",
+                    )),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentUser
                         | SqlValueFunctionOp::SvfopSessionUser
@@ -7695,6 +7712,17 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
     Ok(name)
 }
 
+fn cast_to(expr: ast::Expr, type_name: &str) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: Some(ast::Type {
+            name: type_name.to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    }
+}
+
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {
     match names {
         [name] => Some(name),
@@ -9402,8 +9430,11 @@ mod tests {
         };
 
         let expected = [
-            ast::Expr::Literal(ast::Literal::CurrentTimestamp),
-            ast::Expr::Literal(ast::Literal::CurrentDate),
+            cast_to(
+                ast::Expr::Literal(ast::Literal::CurrentTimestamp),
+                "timestamptz",
+            ),
+            cast_to(ast::Expr::Literal(ast::Literal::CurrentDate), "date"),
             ast::Expr::Literal(ast::Literal::CurrentTime),
         ];
 
