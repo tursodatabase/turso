@@ -1950,3 +1950,6 @@ test where-variable-predicate {
 }
 expect {
 }
+expect @js error {
+    Too few parameter values were provided
+}
