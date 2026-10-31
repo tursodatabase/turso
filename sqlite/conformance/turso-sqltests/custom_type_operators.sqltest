@@ -562,8 +562,9 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test op-expression-index-on-custom-arithmetic-is-used {
-    -- The query's d + 1 becomes the same date function call as the index's d + 1.
+test op-expression-index-on-custom-arithmetic-is-not-used {
+    -- The comparison runs d + 1 through the date's ENCODE, but the index
+    -- stores the value of d + 1 as it is, so the index can't serve it.
     CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
     CREATE INDEX i ON t(d + 1);
     INSERT INTO t VALUES (1, '2024-01-01'), (2, '2024-03-01');
@@ -571,7 +572,7 @@ test op-expression-index-on-custom-arithmetic-is-used {
     SELECT id FROM t WHERE d + 1 = '2024-01-02';
 }
 expect {
-    1|0|0|SEARCH t USING INDEX i (d + 1=?)
+    1|0|0|SCAN t
     1
 }
 
@@ -1147,7 +1148,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test unchanged-decode-type-compares-literal-as-is-with-and-without-index {
+test unchanged-decode-type-encodes-literal-with-and-without-index {
     CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
     CREATE TABLE plain(x upper_text) STRICT;
     CREATE TABLE indexed(x upper_text PRIMARY KEY) STRICT;
@@ -1162,5 +1163,5 @@ test unchanged-decode-type-compares-literal-as-is-with-and-without-index {
         (SELECT count(*) FROM indexed WHERE x IN ('hello', 'HELLO'));
 }
 expect {
-    0|0|1|1|1|1
+    1|1|1|1|1|1
 }

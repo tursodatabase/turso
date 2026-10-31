@@ -1,9 +1,11 @@
 use super::*;
+use crate::schema::ResolvedType;
 use crate::translate::expr::expr_type::TypeEnv;
+use crate::translate::expr::translate_compared_expr;
 use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
-use turso_parser::ast::NullsOrder;
+use turso_parser::ast::{self, NullsOrder};
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
     // Apply the constraint's resolved comparison affinity to the seek key,
@@ -18,77 +20,6 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
             _ => aff.aff_mask(),
         })
         .collect()
-}
-
-pub(super) fn encode_seek_keys_for_custom_types(
-    program: &mut ProgramBuilder,
-    tables: &TableReferences,
-    seek_index: &Arc<Index>,
-    start_reg: usize,
-    num_keys: usize,
-    idx_col_offset: usize,
-    resolver: &Resolver<'_>,
-) -> crate::Result<()> {
-    let table = tables
-        .find_table_by_identifier(&seek_index.table_name)
-        .or_else(|| tables.find_table_by_table_name(&seek_index.table_name));
-    let table = match table {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-    let columns = table.columns();
-    for i in 0..num_keys {
-        let idx_col_pos = idx_col_offset + i;
-        if idx_col_pos >= seek_index.columns.len() {
-            break;
-        }
-        let idx_col = &seek_index.columns[idx_col_pos];
-        // An expression column holds the expression's value, not the column's.
-        if idx_col.expr.is_some() {
-            continue;
-        }
-        let table_col = match columns.get(idx_col.pos_in_table) {
-            Some(c) => c,
-            None => continue,
-        };
-        let Ok(Some(resolved)) = resolver
-            .schema()
-            .resolve_type(&table_col.ty_str, table.is_strict())
-        else {
-            continue;
-        };
-        // A scan compares the key with the decoded column value. When DECODE
-        // returns the stored value unchanged and the dialect compares strings
-        // as they are, the key is compared as it is, so the seek must not
-        // encode it either. A dialect that converts strings to the column's
-        // type (PostgreSQL: `time_col = '12:00'`) needs the key encoded.
-        let compares_key_as_it_is = !resolver
-            .catalog
-            .dialect
-            .converts_strings_compared_with_custom_types();
-        if (compares_key_as_it_is && resolved.reads_stored_values_unchanged())
-            || resolved.chain.iter().all(|td| td.encode().is_none())
-        {
-            continue;
-        }
-        // The index holds encoded values, so the key is encoded too. COERCE
-        // does not run: the column's limits apply to what it stores, not to
-        // what it is compared with. `n = 3.504` on a numeric(10,2) column
-        // matches no row instead of matching 3.50.
-        let reg = start_reg + i;
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
-        for td in &resolved.chain {
-            if let Some(encode_expr) = td.encode() {
-                crate::translate::expr::emit_type_expr(program, encode_expr, reg, reg, resolver)?;
-            }
-        }
-        program.preassign_label_to_next_insn(skip_label);
-    }
-    Ok(())
 }
 
 /// Seek-based loop setup.
@@ -185,13 +116,14 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             let reg = self.start_reg + i;
             match key {
                 SeekKeyComponent::Expr(expr) => {
-                    translate_expr_no_constant_opt(
+                    translate_seek_key(
                         self.program,
-                        Some(self.tables),
+                        self.tables,
+                        self.seek_index,
+                        i,
                         expr,
                         reg,
                         &self.t_ctx.resolver,
-                        NoConstantOptReason::RegisterReuse,
                     )?;
                     // A NULL key can never satisfy `=`, so the loop is done as
                     // soon as one shows up. `IS` matches NULL instead: keep the
@@ -227,15 +159,6 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let null_matching_mask = NullMatchingMask::from(null_matching_bits);
 
         if let Some(idx) = self.seek_index {
-            encode_seek_keys_for_custom_types(
-                self.program,
-                self.tables,
-                idx,
-                self.start_reg,
-                num_regs,
-                0,
-                &self.t_ctx.resolver,
-            )?;
             let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
             if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                 self.program.emit_insn(Insn::Affinity {
@@ -345,24 +268,16 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let last_reg = self.start_reg + self.seek_def.prefix.len();
         match &self.seek_def.end.last_component {
             SeekKeyComponent::Expr(expr) => {
-                translate_expr_no_constant_opt(
+                translate_seek_key(
                     self.program,
-                    Some(self.tables),
+                    self.tables,
+                    self.seek_index,
+                    self.seek_def.prefix.len(),
                     expr,
                     last_reg,
                     &self.t_ctx.resolver,
-                    NoConstantOptReason::RegisterReuse,
                 )?;
-                if let Some(idx) = self.seek_index {
-                    encode_seek_keys_for_custom_types(
-                        self.program,
-                        self.tables,
-                        idx,
-                        last_reg,
-                        1,
-                        self.seek_def.prefix.len(),
-                        &self.t_ctx.resolver,
-                    )?;
+                if self.seek_index.is_some() {
                     let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
                     if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                         self.program.emit_insn(Insn::Affinity {
@@ -483,4 +398,68 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         self.emit_start_bound(use_bloom_filter)?;
         self.emit_termination(loop_start)
     }
+}
+
+/// Translates seek key `expr` for index column `idx_col_pos` into `reg`, in
+/// the form the index stores (see [translate_compared_expr]).
+fn translate_seek_key(
+    program: &mut ProgramBuilder,
+    tables: &TableReferences,
+    seek_index: Option<&Arc<Index>>,
+    idx_col_pos: usize,
+    expr: &ast::Expr,
+    reg: usize,
+    resolver: &Resolver<'_>,
+) -> crate::Result<()> {
+    let stored_form = match seek_index {
+        Some(index) => index_key_stored_form(tables, index, idx_col_pos, resolver)?,
+        None => None,
+    };
+    // The key register is rewritten on every outer-loop iteration, so the key
+    // can't be hoisted out as a constant.
+    let next_span_idx = program.constant_spans_next_idx();
+    translate_compared_expr(
+        program,
+        Some(tables),
+        expr,
+        reg,
+        resolver,
+        stored_form.as_ref(),
+    )?;
+    program.constant_spans_invalidate_after(next_span_idx);
+    Ok(())
+}
+
+/// The stored form of index column `idx_col_pos` when its table column has a
+/// custom type that encodes values. The index holds encoded values, so a seek
+/// key for the column is put in the same form.
+pub(super) fn index_key_stored_form(
+    tables: &TableReferences,
+    seek_index: &Index,
+    idx_col_pos: usize,
+    resolver: &Resolver<'_>,
+) -> crate::Result<Option<ResolvedType>> {
+    let Some(idx_col) = seek_index.columns.get(idx_col_pos) else {
+        return Ok(None);
+    };
+    // An expression column holds the expression's value, not the column's.
+    if idx_col.expr.is_some() {
+        return Ok(None);
+    }
+    let Some(table) = tables
+        .find_table_by_identifier(&seek_index.table_name)
+        .or_else(|| tables.find_table_by_table_name(&seek_index.table_name))
+    else {
+        return Ok(None);
+    };
+    let Some(table_col) = table.columns().get(idx_col.pos_in_table) else {
+        return Ok(None);
+    };
+    let Some(resolved) = resolver
+        .schema()
+        .resolve_type(&table_col.ty_str, table.is_strict())?
+    else {
+        return Ok(None);
+    };
+    resolved.stored_form()
 }

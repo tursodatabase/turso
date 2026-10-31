@@ -1,4 +1,8 @@
 use super::*;
+use crate::schema::{IndexColumn, ResolvedType, Schema, EXPR_INDEX_SENTINEL};
+use crate::translate::expr_context::ExprContext;
+use crate::translate::plan::{Plan, SelectPlan};
+use std::borrow::Borrow;
 
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
@@ -80,6 +84,63 @@ pub(crate) fn emit_dml_expr_index_value(
     Ok(())
 }
 
+/// Turns the value of index expression `idx_col` in `reg` into the index key.
+/// The key of an expression of a custom type is the expression's stored form,
+/// as the key of a column of the type is the column's stored value. So an
+/// index on `coalesce(c, c)` sorts its rows as `ORDER BY coalesce(c, c)` does.
+/// An index column on a generated column keeps the column's value.
+pub(crate) fn emit_expression_index_key(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    idx_col: &IndexColumn,
+    table: &BTreeTable,
+    resolver: &Resolver,
+) -> Result<()> {
+    if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+        return Ok(());
+    }
+    if let Some(stored) = expression_index_stored_form(idx_col, table, resolver)? {
+        emit_stored_form(program, reg, &stored, resolver)?;
+    }
+    Ok(())
+}
+
+/// Turns the key of index expression `idx_col`, read from the index into
+/// `reg`, into the expression's value (see [emit_expression_index_key]).
+pub(crate) fn emit_expression_index_value(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    idx_col: &IndexColumn,
+    table: &BTreeTable,
+    resolver: &Resolver,
+) -> Result<()> {
+    if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
+        return Ok(());
+    }
+    if let Some(stored) = expression_index_stored_form(idx_col, table, resolver)? {
+        emit_decode(program, &stored.chain, reg, resolver)?;
+    }
+    Ok(())
+}
+
+/// The type whose stored form the index keeps for index expression `idx_col`
+/// over the columns of `table`.
+fn expression_index_stored_form(
+    idx_col: &IndexColumn,
+    table: &BTreeTable,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    let mut expr = idx_col
+        .expr
+        .as_deref()
+        .expect("expression index column must have an expression")
+        .clone();
+    crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
+    let schema = resolver.schema();
+    let env = TypeEnv::over_table(table, schema, resolver.catalog.symbol_table);
+    stored_form_type(&type_of(&expr, &env), schema)
+}
+
 /// Emit bytecode that transforms a stored column value into its user-facing
 /// representation.
 ///
@@ -112,23 +173,7 @@ pub(crate) fn emit_user_facing_column_value(
         return Ok(());
     }
     if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
-        if resolved.chain.iter().all(|td| td.decode().is_none()) {
-            return Ok(());
-        }
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg: dest_reg,
-            target_pc: skip_label,
-        });
-
-        // Apply decode in reverse order (parent/ancestor first, then child)
-        for td in resolved.chain.iter().rev() {
-            if let Some(decode_expr) = td.decode() {
-                emit_type_expr(program, decode_expr, dest_reg, dest_reg, resolver)?;
-            }
-        }
-
-        program.preassign_label_to_next_insn(skip_label);
+        emit_decode(program, &resolved.chain, dest_reg, resolver)?;
     }
     Ok(())
 }
@@ -217,9 +262,7 @@ pub(crate) fn emit_store_value(
     resolver: &Resolver,
 ) -> Result<()> {
     for type_def in chain {
-        if let Some(encode) = type_def.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
-        }
+        emit_encode(program, type_def, reg, resolver)?;
         emit_coerce(program, type_def, reg, type_params, resolver)?;
     }
     Ok(())
@@ -351,4 +394,616 @@ pub(crate) fn emit_trigger_decode_registers(
         })
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
+}
+
+/// [stored_comparison_type] for each component of a row-value comparison, as
+/// in `(c, d) > (1, 0)` or `(c, d) IN ((1, 0), (2, 0))`. A comparison of
+/// single values has one component.
+pub(crate) fn row_value_stored_types(
+    lhs: &ast::Expr,
+    rhs_operands: &[&ast::Expr],
+    arity: usize,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Vec<Option<ResolvedType>>> {
+    (0..arity)
+        .map(|idx| {
+            let components = std::iter::once(lhs)
+                .chain(rhs_operands.iter().copied())
+                .map(|operand| row_value_component_expr(operand, idx))
+                .collect::<Result<Vec<_>>>()?;
+            stored_comparison_type(
+                components.iter().map(|component| component.as_ref()),
+                referenced_tables,
+                resolver,
+            )
+        })
+        .collect()
+}
+
+/// Translates `expr`, one side of a comparison with `compared_as.len()`
+/// components, into consecutive registers from `target_register`, each
+/// component in the form [translate_compared_expr] gives it.
+pub(crate) fn translate_compared_row_value(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+    compared_as: &[Option<ResolvedType>],
+) -> Result<usize> {
+    if let [compared_as] = compared_as {
+        return translate_compared_expr(
+            program,
+            referenced_tables,
+            expr,
+            target_register,
+            resolver,
+            compared_as.as_ref(),
+        );
+    }
+    if compared_as.iter().all(Option::is_none) {
+        return translate_expr(program, referenced_tables, expr, target_register, resolver);
+    }
+    if let ast::Expr::Parenthesized(components) = unwrap_parens(expr)? {
+        for (idx, (component, compared_as)) in components.iter().zip(compared_as).enumerate() {
+            translate_compared_expr(
+                program,
+                referenced_tables,
+                component,
+                target_register + idx,
+                resolver,
+                compared_as.as_ref(),
+            )?;
+        }
+        return Ok(target_register);
+    }
+    // A row subquery outputs its columns decoded, so each component of a
+    // custom type is encoded again.
+    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+    for (idx, compared_as) in compared_as.iter().enumerate() {
+        if let Some(compared_as) = compared_as {
+            emit_stored_form(program, target_register + idx, compared_as, resolver)?;
+        }
+    }
+    Ok(target_register)
+}
+
+/// The custom type whose stored form `operands` compare in, or None when they
+/// compare as SQLite values.
+///
+/// A value of a custom type compares in the form its column stores: the form
+/// an index keeps and ORDER BY sorts. So a table scan, an index search, a sort
+/// and min/max put values in the same order. With `ENCODE -value`, 5 is stored
+/// as -5, so `c > 4` holds for 1 and not for 5 or 10, and ORDER BY c gives
+/// 10, 5, 1.
+///
+/// Types with their own order (numeric, arrays) compare in that order instead
+/// (see `TypeOrdering`). Values of two different custom types can't be
+/// compared: neither type's stored form fits both.
+pub(crate) fn stored_comparison_type<'a>(
+    operands: impl IntoIterator<Item = &'a ast::Expr>,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<Option<ResolvedType>> {
+    let context = ExprContext::new(referenced_tables, resolver);
+    stored_comparison_type_across_queries(operands.into_iter().map(|operand| (operand, context)))
+}
+
+/// [stored_comparison_type] for operands that belong to different queries, as
+/// in `x IN (SELECT y ...)`, so each operand's columns are looked up in its own
+/// tables.
+pub(crate) fn stored_comparison_type_across_queries<'a, 'c, 's: 'c>(
+    operands: impl IntoIterator<Item = (&'a ast::Expr, impl Borrow<ExprContext<'c, 's>>)>,
+) -> Result<Option<ResolvedType>> {
+    let mut found: Option<ResolvedType> = None;
+    // Operands of no custom type whose value changes per row.
+    let mut varying_others = Vec::new();
+    for (operand, context) in operands {
+        let context = context.borrow();
+        let operand_type = type_of(operand, &context.type_env());
+        let Some(ty) = stored_form_type(&operand_type, context.schema())? else {
+            if !operand.is_constant(context.resolver()) {
+                varying_others.push(operand_type);
+            }
+            continue;
+        };
+        match &found {
+            Some(other) if !same_type_def(other.leaf(), ty.leaf()) => {
+                crate::bail_parse_error!(
+                    "cannot compare type {} with type {}",
+                    other.leaf().name,
+                    ty.leaf().name
+                );
+            }
+            Some(_) => {}
+            None => found = Some(ty),
+        }
+    }
+    // Binding casts a value of no custom type that changes per row, as in
+    // `date_col = text_col`, to the compared type (see
+    // `cast_compared_operands`). One left here is in a comparison that binding
+    // doesn't rewrite, such as min/max or a row value. It would have to go
+    // through ENCODE on every row, but a hash join or an IN subquery compares
+    // it as it is, so the answer would depend on the plan.
+    if let Some(compared_as) = &found {
+        let other_type = varying_others
+            .iter()
+            .find(|operand_type| !is_truth_value_for(operand_type, compared_as.leaf()));
+        if let Some(operand_type) = other_type {
+            crate::bail_parse_error!(
+                "cannot compare type {} with {}: cast it to {} first",
+                compared_as.leaf().name,
+                operand_type.name(),
+                compared_as.leaf().name
+            );
+        }
+    }
+    Ok(found)
+}
+
+/// Whether `operand_type` is a truth value, such as `u > 0`, compared with the
+/// built-in boolean type. A truth value already is a boolean.
+fn is_truth_value_for(operand_type: &ExprType, compared_as: &TypeDef) -> bool {
+    matches!(operand_type, ExprType::Builtin(BuiltinType::Boolean))
+        && compared_as.is_builtin
+        && compared_as.name.eq_ignore_ascii_case("boolean")
+}
+
+/// Rewrites the comparison `expr` so that all its operands that change per row
+/// have the custom type they are compared as:
+/// - a value of no custom type gets a cast: `d = date(s)` becomes
+///   `d = CAST(date(s) AS date)`;
+/// - a value of another built-in type that the dialect compares as this type
+///   (see `Dialect::comparison_type`) gets a cast too: in PostgreSQL, `ts > d`
+///   becomes `ts > CAST(d AS timestamp)`.
+///
+/// The cast is in the expression, so every plan compares the same values: a
+/// hash join or an IN list compares the cast value as a table scan does.
+/// Constants need no cast, since the comparison converts them once. Other
+/// expressions are left as they are.
+pub(crate) fn cast_compared_operands(
+    expr: &mut ast::Expr,
+    env: &TypeEnv,
+    resolver: &Resolver,
+) -> Result<()> {
+    let operands: Vec<&mut ast::Expr> = match expr {
+        // A row value, as in `(a, b) = (c, d)`, is compared column by column.
+        ast::Expr::Binary(lhs, op, rhs) if op.is_comparison() => {
+            if let (ast::Expr::Parenthesized(lhs), ast::Expr::Parenthesized(rhs)) =
+                (lhs.as_mut(), rhs.as_mut())
+            {
+                if lhs.len() > 1 && lhs.len() == rhs.len() {
+                    for (lhs, rhs) in lhs.iter_mut().zip(rhs.iter_mut()) {
+                        cast_compared_operands_in_place(
+                            [lhs.as_mut(), rhs.as_mut()],
+                            env,
+                            resolver,
+                        )?;
+                    }
+                    return Ok(());
+                }
+            }
+            vec![lhs, rhs]
+        }
+        ast::Expr::Between {
+            lhs, start, end, ..
+        } => vec![lhs, start, end],
+        ast::Expr::InList { lhs, rhs, .. } => std::iter::once(lhs)
+            .chain(rhs.iter_mut())
+            .map(|operand| operand.as_mut())
+            .collect(),
+        // `CASE x WHEN y ...` compares x with each y.
+        ast::Expr::Case {
+            base: Some(base),
+            when_then_pairs,
+            ..
+        } => std::iter::once(base.as_mut())
+            .chain(when_then_pairs.iter_mut().map(|(when, _)| when.as_mut()))
+            .collect(),
+        _ => return Ok(()),
+    };
+    cast_compared_operands_in_place(operands, env, resolver)
+}
+
+/// Casts `operands` of one comparison, all in the same query, to the custom
+/// type they are compared as.
+fn cast_compared_operands_in_place<'e>(
+    operands: impl IntoIterator<Item = &'e mut ast::Expr>,
+    env: &'e TypeEnv<'e>,
+    resolver: &Resolver,
+) -> Result<()> {
+    let operands: Vec<&mut ast::Expr> = operands.into_iter().collect();
+    // A row value that is not compared with another row value is left as it
+    // is, and a subquery's type is known only once it is planned (see
+    // `plan_subqueries_with_outer_query_access`).
+    if operands.iter().any(|operand| {
+        matches!(operand, ast::Expr::Parenthesized(exprs) if exprs.len() > 1)
+            || matches!(operand, ast::Expr::Subquery(_))
+    }) {
+        return Ok(());
+    }
+    let compared = operands
+        .iter()
+        .map(|operand| ComparedOperand::new(operand, env, resolver))
+        .collect::<Result<Vec<_>>>()?;
+    let stored_types: Vec<_> = compared
+        .iter()
+        .map(|operand| &operand.stored_type)
+        .collect();
+    let Some(target) = comparison_target(&stored_types, resolver) else {
+        return Ok(());
+    };
+    for (operand, compared) in operands.into_iter().zip(&compared) {
+        if compared.needs_cast_to(&target) {
+            cast_to(operand, &target);
+        }
+    }
+    Ok(())
+}
+
+/// [cast_compared_operands] for `x IN (SELECT y ...)`: x and y are cast as the
+/// two operands of `x = y` would be. The cast on y is in every SELECT of the
+/// subquery, so the values the subquery writes to its ephemeral index are the
+/// cast ones. Row values, `(x1, x2) IN (SELECT y1, y2 ...)`, are cast column by
+/// column.
+pub(crate) fn cast_in_subquery_operands(
+    lhs: &mut ast::Expr,
+    outer_tables: Option<&TableReferences>,
+    query: &mut Plan,
+    resolver: &Resolver,
+) -> Result<()> {
+    let mut lhs_columns: Vec<&mut ast::Expr> = match lhs {
+        ast::Expr::Parenthesized(exprs) if exprs.len() > 1 => {
+            exprs.iter_mut().map(|expr| expr.as_mut()).collect()
+        }
+        lhs => vec![lhs],
+    };
+    let outer_env = TypeEnv::new(outer_tables, resolver);
+    for (column, lhs_column) in lhs_columns.iter_mut().enumerate() {
+        let lhs = ComparedOperand::new(lhs_column, &outer_env, resolver)?;
+        // A subquery's result is cast as a value that changes per row, even
+        // when it is a constant: a cast constant gives the same answer.
+        let result =
+            ComparedOperand::of_type(query_column_type(query, column, resolver), false, resolver)?;
+        let Some(target) = comparison_target(&[&lhs.stored_type, &result.stored_type], resolver)
+        else {
+            continue;
+        };
+        if result.needs_cast_to(&target) {
+            // A recursive CTE feeds its own rows back into itself, so a cast
+            // on its result would change what it computes. The comparison
+            // then fails as it would without the cast.
+            let Some(selects) = query_selects_mut(query) else {
+                continue;
+            };
+            for select in selects {
+                cast_to(&mut select.result_columns[column].expr, &target);
+            }
+        }
+        if lhs.needs_cast_to(&target) {
+            cast_to(lhs_column, &target);
+        }
+    }
+    Ok(())
+}
+
+/// What a comparison needs to know about one of its operands to cast it.
+struct ComparedOperand {
+    expr_type: ExprType,
+    /// The custom type whose stored form the operand compares in, if any.
+    stored_type: Option<ResolvedType>,
+    /// Whether the operand, if it has no custom type, is cast to the custom
+    /// type it is compared with (see `Dialect::casts_compared_value_to_custom_type`).
+    /// A constant needs no cast: the comparison converts it once.
+    casts_to_compared_type: bool,
+}
+
+impl ComparedOperand {
+    fn new(operand: &ast::Expr, env: &TypeEnv, resolver: &Resolver) -> Result<Self> {
+        Self::of_type(
+            type_of(operand, env),
+            operand.is_constant(resolver),
+            resolver,
+        )
+    }
+
+    fn of_type(expr_type: ExprType, is_constant: bool, resolver: &Resolver) -> Result<Self> {
+        let type_is_known = !matches!(
+            expr_type,
+            ExprType::Builtin(BuiltinType::Any) | ExprType::Unknown
+        );
+        Ok(Self {
+            stored_type: stored_form_type(&expr_type, resolver.schema())?,
+            casts_to_compared_type: !is_constant
+                && resolver
+                    .catalog
+                    .dialect
+                    .casts_compared_value_to_custom_type(type_is_known),
+            expr_type,
+        })
+    }
+
+    /// Whether the operand needs a cast to `target` to compare in its stored
+    /// form. A truth value, as `u > 0`, already is a boolean.
+    fn needs_cast_to(&self, target: &TypeDef) -> bool {
+        match &self.stored_type {
+            Some(ty) => !same_type_def(ty.leaf(), target),
+            None => self.casts_to_compared_type && !is_truth_value_for(&self.expr_type, target),
+        }
+    }
+}
+
+/// The custom type that operands of custom types `types` all compare as: their
+/// one custom type, or the built-in type the dialect compares them as (see
+/// `Dialect::comparison_type`). None when no operand has a custom type, or
+/// when two of them have different types with no common type, which makes the
+/// comparison an error. User types never have a common type.
+fn comparison_target(
+    types: &[&Option<ResolvedType>],
+    resolver: &Resolver,
+) -> Option<crate::sync::Arc<TypeDef>> {
+    let type_defs: Vec<&crate::sync::Arc<TypeDef>> = types
+        .iter()
+        .copied()
+        .flatten()
+        .map(|ty| &ty.chain[0])
+        .collect();
+    let first = type_defs.first()?;
+    if type_defs.iter().all(|ty| same_type_def(ty, first)) {
+        return Some(crate::sync::Arc::clone(first));
+    }
+    if !type_defs.iter().all(|ty| ty.is_builtin) {
+        return None;
+    }
+    type_defs
+        .iter()
+        .find(|target| {
+            type_defs.iter().all(|ty| {
+                same_type_def(ty, target)
+                    || resolver
+                        .catalog
+                        .dialect
+                        .comparison_type(&ty.name.to_lowercase(), &target.name.to_lowercase())
+                        .is_some_and(|common| target.name.eq_ignore_ascii_case(common))
+            })
+        })
+        .map(|target| crate::sync::Arc::clone(target))
+}
+
+/// Every SELECT of `query` whose result is the query's result: one, or each
+/// SELECT of a compound SELECT. None for a recursive CTE.
+fn query_selects_mut(query: &mut Plan) -> Option<Vec<&mut SelectPlan>> {
+    match query {
+        Plan::Select(select) => Some(vec![select]),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => Some(
+            left.iter_mut()
+                .map(|(select, _)| select)
+                .chain(core::iter::once(right_most.as_mut()))
+                .collect(),
+        ),
+        Plan::RecursiveCte(_) => None,
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE and UPDATE plans have no result columns")
+        }
+    }
+}
+
+/// Replaces `operand` with `CAST(operand AS target)`.
+fn cast_to(operand: &mut ast::Expr, target: &TypeDef) {
+    let value = std::mem::replace(operand, ast::Expr::Literal(ast::Literal::Null));
+    *operand = ast::Expr::Cast {
+        expr: Box::new(value),
+        type_name: Some(ast::Type {
+            name: target.name.clone(),
+            size: None,
+            array_dimensions: 0,
+        }),
+    };
+}
+
+/// Translates `expr`, an operand of a comparison, into `target_register`. When
+/// the comparison is between values of the custom type `compared_as` (see
+/// [stored_comparison_type]), the operand is put in that type's stored form:
+/// a column of the type is read without its DECODE, and any other value goes
+/// through the type's ENCODE, as an index search key does. `c = 42` compares
+/// the stored `c` with `42` encoded.
+pub(crate) fn translate_compared_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+    compared_as: Option<&ResolvedType>,
+) -> Result<usize> {
+    let Some(compared_as) = compared_as else {
+        return translate_expr(program, referenced_tables, expr, target_register, resolver);
+    };
+    match compared_operand_form(expr, referenced_tables, resolver, compared_as)? {
+        ComparedOperandForm::StoredColumn => {
+            let suppressed = program.flags.suppress_custom_type_decode();
+            program.flags.set_suppress_custom_type_decode(true);
+            let result =
+                translate_expr(program, referenced_tables, expr, target_register, resolver);
+            program.flags.set_suppress_custom_type_decode(suppressed);
+            return result;
+        }
+        ComparedOperandForm::Encoded => {}
+    }
+    if !expr.is_constant(resolver) {
+        translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+        emit_stored_form(program, target_register, compared_as, resolver)?;
+        return Ok(target_register);
+    }
+    // A constant may be computed once before the loop, but ENCODE rewrites its
+    // register and runs on every row, so it works on a copy.
+    let value_reg = program.alloc_register();
+    translate_expr(program, referenced_tables, expr, value_reg, resolver)?;
+    program.emit_insn(Insn::Copy {
+        src_reg: value_reg,
+        dst_reg: target_register,
+        extra_amount: 0,
+    });
+    emit_stored_form(program, target_register, compared_as, resolver)?;
+    Ok(target_register)
+}
+
+/// Whether comparing `operand` with `others` runs `operand` through a custom
+/// type's ENCODE (see [translate_compared_expr]). `CAST(text_col AS date) =
+/// date_col` encodes the cast text as a date. An index or rowid holds the
+/// column's own values, not encoded ones, so a seek on it can't find the rows
+/// such a comparison matches.
+pub(crate) fn comparison_encodes_operand<'a>(
+    operand: &'a ast::Expr,
+    others: impl IntoIterator<Item = &'a ast::Expr>,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let Some(compared_as) = stored_comparison_type(
+        std::iter::once(operand).chain(others),
+        referenced_tables,
+        resolver,
+    )?
+    else {
+        return Ok(false);
+    };
+    Ok(
+        compared_operand_form(operand, referenced_tables, resolver, &compared_as)?
+            == ComparedOperandForm::Encoded,
+    )
+}
+
+/// The form [translate_compared_expr] gives an operand of a comparison done in
+/// the stored form of a custom type.
+#[derive(Debug, PartialEq, Eq)]
+enum ComparedOperandForm {
+    /// A table column of the type, read without its DECODE.
+    StoredColumn,
+    /// Any other value, put through the type's ENCODE.
+    Encoded,
+}
+
+fn compared_operand_form(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+    compared_as: &ResolvedType,
+) -> Result<ComparedOperandForm> {
+    let env = TypeEnv::new(referenced_tables, resolver);
+    let has_compared_type = stored_form_type(&type_of(expr, &env), resolver.schema())?
+        .is_some_and(|ty| same_type_def(ty.leaf(), compared_as.leaf()));
+    if !has_compared_type {
+        return Ok(ComparedOperandForm::Encoded);
+    }
+    if reads_stored_column(expr, referenced_tables, resolver) {
+        return Ok(ComparedOperandForm::StoredColumn);
+    }
+    Ok(ComparedOperandForm::Encoded)
+}
+
+/// Turns the value in `reg` into the stored form of `ty` with the type's
+/// ENCODE. COERCE does not run: a column's limits apply to what it stores,
+/// not to what it is compared with, so `n = 3.504` on a numeric(10,2) column
+/// holding 3.50 is false. NULL is left as it is.
+pub(crate) fn emit_stored_form(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    ty: &ResolvedType,
+    resolver: &Resolver,
+) -> Result<()> {
+    if ty.chain.iter().all(|td| td.encode().is_none()) {
+        return Ok(());
+    }
+    let skip_null = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_null,
+    });
+    for td in &ty.chain {
+        emit_encode(program, td, reg, resolver)?;
+    }
+    program.preassign_label_to_next_insn(skip_null);
+    Ok(())
+}
+
+/// Runs the type's own ENCODE on the value in `reg`, if it has one.
+fn emit_encode(
+    program: &mut ProgramBuilder,
+    type_def: &TypeDef,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if let Some(encode) = type_def.encode() {
+        emit_type_expr(program, encode, reg, reg, resolver)?;
+    }
+    Ok(())
+}
+
+/// Runs the DECODE of each type in `chain` on the value in `reg`, the last
+/// type's first. NULL is left as it is.
+pub(crate) fn emit_decode(
+    program: &mut ProgramBuilder,
+    chain: &[crate::sync::Arc<TypeDef>],
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if chain.iter().all(|td| td.decode().is_none()) {
+        return Ok(());
+    }
+    let skip_null = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_null,
+    });
+    for td in chain.iter().rev() {
+        if let Some(decode) = td.decode() {
+            emit_type_expr(program, decode, reg, reg, resolver)?;
+        }
+    }
+    program.preassign_label_to_next_insn(skip_null);
+    Ok(())
+}
+
+/// The type whose stored form a value of type `ty` compares in. A domain
+/// stores its values as its base type does, so it compares as that type. None
+/// for a type with its own order and for a type without ENCODE, such as
+/// `varchar`: it stores the value as it is, so a `varchar` compares with a
+/// `text` like two texts do.
+pub(crate) fn stored_form_type(ty: &ExprType, schema: &Schema) -> Result<Option<ResolvedType>> {
+    let ExprType::Custom { type_def, .. } = ty else {
+        return Ok(None);
+    };
+    if schema.type_ordering(type_def).is_some() {
+        return Ok(None);
+    }
+    let Some(resolved) = schema.resolve_type_unchecked(&type_def.name)? else {
+        return Ok(None);
+    };
+    resolved.stored_form()
+}
+
+/// Whether `expr` reads a table column that [translate_expr] DECODEs only
+/// while `suppress_custom_type_decode` is off, so that reading it with the
+/// flag on gives the stored value. A column of a subquery holds the value its
+/// SELECT returned, which is already decoded.
+fn reads_stored_column(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> bool {
+    let Ok(expr) = unwrap_parens(expr) else {
+        return false;
+    };
+    let ast::Expr::Column { table, .. } = expr else {
+        return false;
+    };
+    let is_table_column = referenced_tables
+        .and_then(|tables| tables.find_table_by_internal_id(*table))
+        .is_some_and(|(_, table)| matches!(table, Table::BTree(_)));
+    // A register the query already computed for the column holds the decoded
+    // value, unless it is a hash join's copy of the stored one.
+    let cached_decoded = matches!(resolver.resolve_cached_expr_reg(expr), Some((_, false)));
+    is_table_column && !cached_decoded
 }

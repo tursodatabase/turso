@@ -35,6 +35,7 @@ pub(super) fn emit_in_seek_start(
         table_references,
         resolver,
         index,
+        source,
         source_cursor_id,
         next_value,
     )?;
@@ -77,12 +78,15 @@ pub(super) fn emit_in_seek_start(
 
 /// Read the current `IN` value into a new register and return it as a seek
 /// key. A NULL value matches nothing, so it jumps to `next_value`. An index
-/// holds encoded values, so the key is encoded as for any other index seek.
+/// holds encoded values. A literal list already holds them encoded (see
+/// [open_in_seek_source_cursor]); a subquery's values are encoded here, as for
+/// any other index seek.
 pub(super) fn emit_in_seek_key(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
     resolver: &Resolver<'_>,
     index: Option<&Arc<Index>>,
+    source: &InSeekSource,
     source_cursor_id: CursorID,
     next_value: BranchOffset,
 ) -> Result<usize> {
@@ -97,16 +101,10 @@ pub(super) fn emit_in_seek_key(
         reg: seek_reg,
         target_pc: next_value,
     });
-    if let Some(index) = index {
-        encode_seek_keys_for_custom_types(
-            program,
-            table_references,
-            index,
-            seek_reg,
-            1,
-            0,
-            resolver,
-        )?;
+    if let (Some(index), InSeekSource::Subquery { .. }) = (index, source) {
+        if let Some(stored_form) = index_key_stored_form(table_references, index, 0, resolver)? {
+            crate::translate::expr::emit_stored_form(program, seek_reg, &stored_form, resolver)?;
+        }
     }
     Ok(seek_reg)
 }
@@ -117,6 +115,11 @@ pub(super) fn emit_in_seek_key(
 /// ordinary `Search::InSeek` and multi-index OR branches can drive repeated
 /// equality seeks from the same bytecode pattern. IN-subqueries already have an
 /// ephemeral cursor from subquery translation, so they are reused directly.
+///
+/// A literal value is put in the index's stored form before it is inserted, so
+/// that values with the same stored form are one entry: with
+/// `ENCODE upper(value)`, `x IN ('a', 'A')` seeks 'A' once and reads each
+/// matching row once.
 pub(super) fn open_in_seek_source_cursor(
     program: &mut ProgramBuilder,
     table_references: &TableReferences,
@@ -169,6 +172,10 @@ pub(super) fn open_in_seek_source_cursor(
             let val_reg = program.alloc_register();
             let record_reg = program.alloc_register();
             let affinity_str = affinity.aff_mask().to_string();
+            let stored_form = match index {
+                Some(index) => index_key_stored_form(table_references, index, 0, resolver)?,
+                None => None,
+            };
             for value in values.iter() {
                 translate_expr_no_constant_opt(
                     program,
@@ -178,6 +185,14 @@ pub(super) fn open_in_seek_source_cursor(
                     resolver,
                     NoConstantOptReason::InListEphemeral,
                 )?;
+                if let Some(stored_form) = &stored_form {
+                    crate::translate::expr::emit_stored_form(
+                        program,
+                        val_reg,
+                        stored_form,
+                        resolver,
+                    )?;
+                }
                 program.emit_insn(Insn::MakeRecord {
                     start_reg: to_u32(val_reg),
                     count: 1,

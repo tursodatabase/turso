@@ -288,8 +288,14 @@ pub(super) fn try_emit_expression_index_value(
     else {
         return Ok(false);
     };
+    let btree = table
+        .table
+        .btree()
+        .expect("an index belongs to a btree table");
+    let idx_col = &index.columns[expression_position];
     if !referenced_tables.index_cursor_may_be_null_row(table.internal_id) {
         program.emit_column_or_rowid(index_cursor, expression_position, target_register);
+        emit_expression_index_value(program, target_register, idx_col, &btree, resolver)?;
         return Ok(true);
     }
 
@@ -301,6 +307,7 @@ pub(super) fn try_emit_expression_index_value(
         dest: target_register,
     });
     program.emit_column_or_rowid(index_cursor, expression_position, target_register);
+    emit_expression_index_value(program, target_register, idx_col, &btree, resolver)?;
     program.emit_insn(Insn::Goto {
         target_pc: expression_done,
     });

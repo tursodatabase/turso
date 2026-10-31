@@ -3609,6 +3609,9 @@ fn emit_index_column_value_for_insert(
             table,
             dest_reg,
         )?;
+        crate::translate::expr::emit_expression_index_key(
+            program, dest_reg, idx_col, table, resolver,
+        )?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {

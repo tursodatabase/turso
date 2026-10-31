@@ -788,12 +788,12 @@ Lists all available types (built-in and custom) with their metadata.
 
 ```sql
 PRAGMA list_types;
--- type    | parent | encode | coerce | decode | default | operators
--- INTEGER |        |        |        |        |         |
--- REAL    |        |        |        |        |         |
--- TEXT    |        |        |        |        |         |
--- BLOB    |        |        |        |        |         |
--- ANY     |        |        |        |        |         |
+-- type    | parent | encode | coerce | decode | default
+-- INTEGER |        |        |        |        |
+-- REAL    |        |        |        |        |
+-- TEXT    |        |        |        |        |
+-- BLOB    |        |        |        |        |
+-- ANY     |        |        |        |        |
 ```
 
 See [CREATE TYPE](/docs/sql-reference/statements/create-type) for creating custom types.

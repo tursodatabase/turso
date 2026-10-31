@@ -975,9 +975,8 @@ expect @tursopg {
     {"a": "x\ny\u0001\"\/\u00e9\t"}
 }
 
-# A CHECK constraint sees a uuid column as the stored blob, but auth.uid()
-# returns the uuid as text, so tursopg refuses the comparison instead of
-# rejecting every row.
+# A CHECK constraint compares a uuid column as it is stored, so auth.uid(),
+# which is declared to return uuid, is put in the same stored form first.
 @setup auth_functions
 test auth-uid-in-a-check-constraint-on-a-uuid-column {
     SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
@@ -989,13 +988,61 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg error {
-    cannot compare auth\.uid\(\) in a CHECK constraint: it returns uuid values in a different form than they are stored
+
+@setup auth_functions
+test auth-uid-check-constraint-rejects-another-uuid {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = auth.uid()));
+    INSERT INTO owned VALUES ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22');
+}
+@sqlstate 23514
+expect error {
+    check constraint
+}
+
+@setup auth_functions
+test auth-uid-check-constraint-accepts-null {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = auth.uid()));
+    INSERT INTO owned VALUES (NULL);
+    SELECT count(*) FROM owned WHERE owner IS NULL;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    1
+}
+
+# Same for UPDATE: the CHECK runs again on the new row.
+@setup auth_functions
+test auth-uid-check-constraint-runs-on-update {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = auth.uid()));
+    INSERT INTO owned VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    UPDATE owned SET owner = 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22';
+}
+@sqlstate 23514
+expect error {
+    check constraint
+}
+
+@setup auth_functions
+test auth-uid-finds-the-rows-of-a-uuid-column {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (id int, owner uuid);
+    INSERT INTO owned VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    INSERT INTO owned VALUES (2, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22');
+    SELECT id FROM owned WHERE owner = auth.uid();
+    CREATE INDEX owned_owner ON owned (owner);
+    SELECT id FROM owned WHERE owner = auth.uid();
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    1
+    1
 }
 
 # coalesce(), nullif() and CASE give auth.uid()'s value unchanged, so comparing
-# them with a uuid column is refused as well. tursopg cannot find the type of
-# the CASE at all, so it refuses that CHECK constraint for that reason.
+# them with a uuid column works like comparing auth.uid() itself.
 @setup auth_functions
 test auth-uid-in-coalesce-in-a-check-constraint-on-a-uuid-column {
     SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
@@ -1006,9 +1053,6 @@ test auth-uid-in-coalesce-in-a-check-constraint-on-a-uuid-column {
 expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
-}
-expect @tursopg error {
-    cannot compare auth\.uid\(\) in a CHECK constraint: it returns uuid values in a different form than they are stored
 }
 
 @setup auth_functions
@@ -1022,9 +1066,6 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
-expect @tursopg error {
-    cannot compare auth\.uid\(\) in a CHECK constraint: it returns uuid values in a different form than they are stored
-}
 
 @setup auth_functions
 test auth-uid-in-case-in-a-check-constraint-on-a-uuid-column {
@@ -1037,8 +1078,33 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
+# tursopg's CHECK type checker does not accept any CASE inside a comparison in a
+# STRICT table, whatever the types: `a text CHECK (a = CASE WHEN true THEN 'x' END)`
+# fails the same way.
 expect @tursopg error {
     cannot determine type of expression in CHECK constraint
+}
+
+@setup auth_functions
+test auth-uid-in-coalesce-in-a-check-constraint-rejects-another-uuid {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = coalesce(auth.uid(), 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')));
+    INSERT INTO owned VALUES ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22');
+}
+@sqlstate 23514
+expect error {
+    check constraint
+}
+
+@setup auth_functions
+test auth-uid-in-nullif-in-a-check-constraint-rejects-another-uuid {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = nullif(auth.uid(), 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')));
+    INSERT INTO owned VALUES ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22');
+}
+@sqlstate 23514
+expect error {
+    check constraint
 }
 
 # A CAST of auth.uid() to text compares text with text, so the CHECK constraint

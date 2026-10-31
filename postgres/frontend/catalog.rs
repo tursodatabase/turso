@@ -219,10 +219,6 @@ impl Dialect for PostgresDialect {
         true
     }
 
-    fn converts_strings_compared_with_custom_types(&self) -> bool {
-        true
-    }
-
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }
@@ -233,6 +229,24 @@ impl Dialect for PostgresDialect {
 
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
+    }
+
+    /// A date becomes midnight of that day, and a timestamp becomes a
+    /// timestamptz in UTC, the only time zone tursopg has.
+    fn comparison_type(&self, lhs_type: &str, rhs_type: &str) -> Option<&'static str> {
+        match (lhs_type, rhs_type) {
+            ("date", "timestamp") | ("timestamp", "date") => Some("timestamp"),
+            ("date" | "timestamp", "timestamptz") | ("timestamptz", "date" | "timestamp") => {
+                Some("timestamptz")
+            }
+            _ => None,
+        }
+    }
+
+    /// `date_col = text_col` is an error in PostgreSQL. A value whose type
+    /// tursopg doesn't know, such as some function results, is cast instead.
+    fn casts_compared_value_to_custom_type(&self, type_is_known: bool) -> bool {
+        !type_is_known
     }
 }
 

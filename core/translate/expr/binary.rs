@@ -66,10 +66,25 @@ fn emit_row_valued_binary_expr(
         crate::bail_parse_error!("row value misused");
     }
 
+    let compared_as = row_value_stored_types(e1, &[e2], lhs_arity, referenced_tables, resolver)?;
     let lhs_reg = program.alloc_registers(lhs_arity);
     let rhs_reg = program.alloc_registers(lhs_arity);
-    translate_expr(program, referenced_tables, e1, lhs_reg, resolver)?;
-    translate_expr(program, referenced_tables, e2, rhs_reg, resolver)?;
+    translate_compared_row_value(
+        program,
+        referenced_tables,
+        e1,
+        lhs_reg,
+        resolver,
+        &compared_as,
+    )?;
+    translate_compared_row_value(
+        program,
+        referenced_tables,
+        e2,
+        rhs_reg,
+        resolver,
+        &compared_as,
+    )?;
 
     emit_binary_expr_row_valued(
         program,
@@ -122,12 +137,25 @@ pub(super) fn emit_binary_expr_scalar(
     resolver: &Resolver,
     emit_mode: BinaryEmitMode,
 ) -> Result<usize> {
+    let compared_as = if op.is_comparison() {
+        stored_comparison_type([e1, e2], referenced_tables, resolver)?
+    } else {
+        None
+    };
+    let compared_as = compared_as.as_ref();
     // Equivalent expressions are reusable only when each occurrence is deterministic.
     if exprs_are_equivalent(e1, e2)
         && !expr_contains_nondeterministic_scalar_function(e1, resolver)?
     {
         let shared_reg = program.alloc_register();
-        translate_expr(program, referenced_tables, e1, shared_reg, resolver)?;
+        translate_compared_expr(
+            program,
+            referenced_tables,
+            e1,
+            shared_reg,
+            resolver,
+            compared_as,
+        )?;
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -159,8 +187,22 @@ pub(super) fn emit_binary_expr_scalar(
         let e1_reg = program.alloc_registers(2);
         let e2_reg = e1_reg + 1;
 
-        translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-        translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
+        translate_compared_expr(
+            program,
+            referenced_tables,
+            e1,
+            e1_reg,
+            resolver,
+            compared_as,
+        )?;
+        translate_compared_expr(
+            program,
+            referenced_tables,
+            e2,
+            e2_reg,
+            resolver,
+            compared_as,
+        )?;
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -416,7 +458,7 @@ pub(super) fn row_component_affinity_collation(
 /// row subquery's result, so each component compares with its own type. A
 /// subquery column does not bring its text collation. Any other expression
 /// stands for itself.
-fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
+pub(super) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
     match unwrap_parens(expr)? {
         Expr::Parenthesized(exprs) if exprs.len() > 1 => {
             Ok(exprs.get(idx).map_or(Cow::Borrowed(expr), |component| {

@@ -2,7 +2,7 @@ use crate::alloc::Arc;
 use crate::namespace::NamespaceRef;
 use crate::schema::Column;
 use crate::translate::collate::CollationSeq;
-use crate::translate::expr::{emit_stored_column, emit_table_column};
+use crate::translate::expr::{emit_expression_index_key, emit_stored_column, emit_table_column};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
@@ -519,6 +519,13 @@ fn translate_integrity_check_for_schema(
                                 )?;
                                 Ok(())
                             },
+                        )?;
+                        emit_expression_index_key(
+                            program,
+                            target,
+                            &bound_index.index.columns[i],
+                            btree_table,
+                            resolver,
                         )?;
                         if let Some(aff) = affinity {
                             program.emit_column_affinity(target, *aff);
