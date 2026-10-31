@@ -79,6 +79,7 @@ scalar_functions! {
     ToChar(FunctionArity::Exact(2), true),
     Age(FunctionArity::OneOf(&[1, 2]), false),
     PgInputIsValid(FunctionArity::Exact(2), true),
+    Int8OutOfRange(FunctionArity::Exact(0), false),
     Textlike(FunctionArity::Exact(2), true),
     LikeEscape(FunctionArity::Exact(2), true),
     SimilarToEscape(FunctionArity::OneOf(&[1, 2]), true),
@@ -140,6 +141,13 @@ impl ScalarCall for PgScalarFunction {
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
             Self::Age => exec_age(args)?,
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
+            Self::Int8OutOfRange => {
+                return Err(sqlstate_error(
+                    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                    "bigint out of range",
+                )
+                .into())
+            }
             Self::Textlike => exec_textlike(args)?,
             Self::LikeEscape => exec_like_escape(args)?,
             Self::SimilarToEscape => exec_similar_to_escape(args)?,
