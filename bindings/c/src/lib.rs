@@ -328,9 +328,12 @@ impl sqlite3_stmt {
         for r in &mut self.text_cache {
             r.clear();
         }
-        // Drop cached ExtValues for the previous row
+        // Free cached ExtValues for the previous row. ExtValue has no Drop, so
+        // its owned text/blob buffer must be released explicitly.
         for v in &mut self.value_cache {
-            *v = None;
+            if let Some(value) = v.take() {
+                unsafe { value.__free_internal_type() };
+            }
         }
     }
 }
@@ -2639,7 +2642,8 @@ pub unsafe extern "C" fn sqlite3_value_free(value: *mut ffi::c_void) {
     if value.is_null() {
         return;
     }
-    let _ = Box::from_raw(value as *mut ExtValue);
+    let value = *Box::from_raw(value as *mut ExtValue);
+    value.__free_internal_type();
 }
 
 #[no_mangle]
@@ -3930,6 +3934,110 @@ mod tests {
     }
     use super::*;
     use std::ptr;
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    static LIVE_BYTES: AtomicIsize = AtomicIsize::new(0);
+
+    struct CountingAlloc;
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let p = System.alloc(layout);
+            if !p.is_null() {
+                LIVE_BYTES.fetch_add(layout.size() as isize, Ordering::Relaxed);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout);
+            LIVE_BYTES.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let p = System.realloc(ptr, layout, new_size);
+            if !p.is_null() {
+                LIVE_BYTES.fetch_add(
+                    new_size as isize - layout.size() as isize,
+                    Ordering::Relaxed,
+                );
+            }
+            p
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAlloc = CountingAlloc;
+
+    /// sqlite3_column_value caches an owned ExtValue per column, and
+    /// sqlite3_value_dup hands out an owned copy. ExtValue has no Drop, so its
+    /// text/blob buffer is freed by hand when the cache is cleared on the next
+    /// step and when sqlite3_value_free runs. Without that, live memory grows
+    /// with every row read and every dup freed.
+    #[test]
+    fn c_api_value_buffers_do_not_leak() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE t(s TEXT, b BLOB); \
+                      WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 5000) \
+                      INSERT INTO t SELECT 'row text value ' || i, X'4142434445' FROM c;"
+                        .as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT s, b FROM t".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let val = sqlite3_column_value(stmt, 0);
+            assert!(!val.is_null());
+
+            let before_dups = LIVE_BYTES.load(Ordering::Relaxed);
+            for _ in 0..5000 {
+                let dup = sqlite3_value_dup(val);
+                assert!(!dup.is_null());
+                sqlite3_value_free(dup);
+            }
+            let dup_growth = LIVE_BYTES.load(Ordering::Relaxed) - before_dups;
+
+            assert!(!sqlite3_column_value(stmt, 1).is_null());
+            let before_rows = LIVE_BYTES.load(Ordering::Relaxed);
+            let mut rows = 0isize;
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                assert!(!sqlite3_column_value(stmt, 0).is_null());
+                assert!(!sqlite3_column_value(stmt, 1).is_null());
+                rows += 1;
+            }
+            let row_growth = LIVE_BYTES.load(Ordering::Relaxed) - before_rows;
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+            assert!(
+                row_growth < rows * 4,
+                "cached column values leaked ~{row_growth} bytes over {rows} rows"
+            );
+            assert!(
+                dup_growth < 5000 * 4,
+                "sqlite3_value_free leaked ~{dup_growth} bytes over 5000 dups"
+            );
+        }
+    }
 
     /// sqlite3_errmsg must return the bare message SQLite produces — no
     /// "Runtime error:" prefix and no "(19)" suffix; those are sqlite3
