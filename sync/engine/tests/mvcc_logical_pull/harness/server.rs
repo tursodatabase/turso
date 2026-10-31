@@ -1,15 +1,21 @@
+use std::borrow::Cow;
+use std::num::NonZero;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use prost::Message;
+use turso_core::types::{Text, TextSubtype};
+use turso_core::{Connection, Numeric, Value as CoreValue};
 use turso_sync_engine::database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo};
 use turso_sync_engine::database_sync_operations::PAGE_SIZE;
 use turso_sync_engine::errors::Error;
 use turso_sync_engine::server_proto::{
-    MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto, PageData, PageSetRawEncodingProto,
-    PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody,
-    PullUpdatesStreamKind,
+    self, BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col,
+    ExecuteStreamReq, ExecuteStreamResp, MvccLogicalLogMetadataProto, MvccLogicalLogRangeProto,
+    PageData, PageSetRawEncodingProto, PipelineReqBody, PipelineRespBody, PullUpdatesApplyMode,
+    PullUpdatesProtocol, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, PullUpdatesStreamKind,
+    Row, StmtResult, StreamRequest, StreamResponse, StreamResult, Value as ProtoValue,
 };
 use turso_sync_engine::types::{DatabaseRowMutation, DatabaseRowTransformResult};
 use turso_sync_engine::Result;
@@ -22,6 +28,7 @@ const FRAME_END_MAGIC: u32 = 0x4554564D;
 pub struct InProcessServer {
     remote: Arc<Remote>,
     bootstrap_base: Arc<Remote>,
+    fail_next_commit_pipeline: AtomicBool,
 }
 
 impl InProcessServer {
@@ -29,6 +36,7 @@ impl InProcessServer {
         Self {
             bootstrap_base: remote.clone(),
             remote,
+            fail_next_commit_pipeline: AtomicBool::new(false),
         }
     }
 
@@ -36,7 +44,16 @@ impl InProcessServer {
         Self {
             remote,
             bootstrap_base,
+            fail_next_commit_pipeline: AtomicBool::new(false),
         }
+    }
+
+    pub fn remote(&self) -> &Arc<Remote> {
+        &self.remote
+    }
+
+    pub fn fail_next_push_after_remote_commit(&self) {
+        self.fail_next_commit_pipeline.store(true, Ordering::SeqCst);
     }
 }
 
@@ -77,6 +94,17 @@ impl SyncEngineIo for InProcessServer {
             ("POST", "/pull-updates") => {
                 Ok(Response::new(self.pull_updates(&body.unwrap_or_default())?))
             }
+            ("POST", "/v2/pipeline") => {
+                let raw = body.unwrap_or_default();
+                let is_commit_batch = String::from_utf8_lossy(&raw).contains("BEGIN IMMEDIATE");
+                let resp = self.pipeline(&raw)?;
+                if is_commit_batch && self.fail_next_commit_pipeline.swap(false, Ordering::SeqCst) {
+                    return Err(Error::DatabaseSyncEngineError(
+                        "simulated network drop after remote push commit".to_string(),
+                    ));
+                }
+                Ok(Response::new(resp))
+            }
             _ => Err(Error::DatabaseSyncEngineError(format!(
                 "the in-process server does not handle {method} {path}"
             ))),
@@ -89,6 +117,31 @@ impl SyncEngineIo for InProcessServer {
 }
 
 impl InProcessServer {
+    fn pipeline(&self, body: &[u8]) -> Result<Vec<u8>> {
+        let req: PipelineReqBody = serde_json::from_slice(body)?;
+        let conn = self.remote.connection();
+        let mut results = Vec::with_capacity(req.requests.len());
+        for request in req.requests {
+            let result = match request {
+                StreamRequest::Execute(exec_req) => execute_stmt(conn, &exec_req),
+                StreamRequest::Batch(batch_req) => execute_batch(conn, &batch_req),
+                StreamRequest::None => StreamResult::Error {
+                    error: server_proto::Error {
+                        message: "unknown stream request".to_string(),
+                        code: "UNKNOWN".to_string(),
+                    },
+                },
+            };
+            results.push(result);
+        }
+        let resp = PipelineRespBody {
+            baton: req.baton,
+            base_url: None,
+            results,
+        };
+        Ok(serde_json::to_vec(&resp)?)
+    }
+
     fn pull_updates(&self, body: &[u8]) -> Result<Vec<u8>> {
         let request = PullUpdatesReqProtoBody::decode(body)
             .map_err(|error| Error::DatabaseSyncEngineError(error.to_string()))?;
@@ -160,6 +213,159 @@ impl InProcessServer {
         let mut response = header.encode_length_delimited_to_vec();
         response.extend_from_slice(new_frames);
         Ok(response)
+    }
+}
+
+fn execute_stmt(conn: &Arc<Connection>, req: &ExecuteStreamReq) -> StreamResult {
+    match run_stmt(conn, &req.stmt) {
+        Ok(result) => StreamResult::Ok {
+            response: StreamResponse::Execute(ExecuteStreamResp { result }),
+        },
+        Err(error) => StreamResult::Error { error },
+    }
+}
+
+fn execute_batch(conn: &Arc<Connection>, req: &BatchStreamReq) -> StreamResult {
+    let mut step_results = Vec::with_capacity(req.batch.steps.len());
+    let mut step_errors = Vec::with_capacity(req.batch.steps.len());
+    for step in &req.batch.steps {
+        let should_run = step
+            .condition
+            .as_ref()
+            .is_none_or(|cond| evaluate_cond(cond, &step_results, &step_errors, conn));
+        if should_run {
+            match run_batch_step(conn, step) {
+                Ok(res) => {
+                    step_results.push(Some(res));
+                    step_errors.push(None);
+                }
+                Err(err) => {
+                    step_results.push(None);
+                    step_errors.push(Some(err));
+                }
+            }
+        } else {
+            step_results.push(None);
+            step_errors.push(None);
+        }
+    }
+    StreamResult::Ok {
+        response: StreamResponse::Batch(BatchStreamResp {
+            result: BatchResult {
+                step_results,
+                step_errors,
+                replication_index: None,
+            },
+        }),
+    }
+}
+
+fn evaluate_cond(
+    cond: &BatchCond,
+    results: &[Option<StmtResult>],
+    errors: &[Option<server_proto::Error>],
+    conn: &Arc<Connection>,
+) -> bool {
+    match cond {
+        BatchCond::None => true,
+        BatchCond::Ok { step } => results.get(*step as usize).is_some_and(Option::is_some),
+        BatchCond::Error { step } => errors.get(*step as usize).is_some_and(Option::is_some),
+        BatchCond::Not { cond } => !evaluate_cond(cond, results, errors, conn),
+        BatchCond::And(list) => list
+            .conds
+            .iter()
+            .all(|c| evaluate_cond(c, results, errors, conn)),
+        BatchCond::Or(list) => list
+            .conds
+            .iter()
+            .any(|c| evaluate_cond(c, results, errors, conn)),
+        BatchCond::IsAutocommit {} => conn.get_auto_commit(),
+    }
+}
+
+fn run_batch_step(
+    conn: &Arc<Connection>,
+    step: &BatchStep,
+) -> std::result::Result<StmtResult, server_proto::Error> {
+    run_stmt(conn, &step.stmt)
+}
+
+fn run_stmt(
+    conn: &Arc<Connection>,
+    stmt_req: &server_proto::Stmt,
+) -> std::result::Result<StmtResult, server_proto::Error> {
+    let sql = stmt_req
+        .sql
+        .as_deref()
+        .ok_or_else(|| proto_error("NO_SQL", "missing sql"))?;
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|err| proto_error("PREPARE_ERROR", err))?;
+    for (idx, arg) in stmt_req.args.iter().enumerate() {
+        stmt.bind_at(NonZero::new(idx + 1).unwrap(), to_core_value(arg))
+            .map_err(|err| proto_error("BIND_ERROR", err))?;
+    }
+    if stmt_req.want_rows.unwrap_or(true) {
+        let rows = stmt
+            .run_collect_rows()
+            .map_err(|err| proto_error("EXEC_ERROR", err))?;
+        let cols = (0..stmt.num_columns())
+            .map(|i| Col {
+                name: Some(stmt.get_column_name(i).to_string()),
+                decltype: stmt.get_column_decltype(i),
+            })
+            .collect();
+        let rows = rows
+            .into_iter()
+            .map(|row| Row {
+                values: row.into_iter().map(from_core_value).collect(),
+            })
+            .collect();
+        Ok(StmtResult {
+            cols,
+            rows,
+            ..Default::default()
+        })
+    } else {
+        stmt.run_ignore_rows()
+            .map_err(|err| proto_error("EXEC_ERROR", err))?;
+        Ok(StmtResult::default())
+    }
+}
+
+fn proto_error(code: &str, message: impl ToString) -> server_proto::Error {
+    server_proto::Error {
+        message: message.to_string(),
+        code: code.to_string(),
+    }
+}
+
+fn to_core_value(value: &ProtoValue) -> CoreValue {
+    match value {
+        ProtoValue::None | ProtoValue::Null => CoreValue::Null,
+        ProtoValue::Integer { value } => CoreValue::from_i64(*value),
+        ProtoValue::Float { value } => CoreValue::from_f64(*value),
+        ProtoValue::Text { value } => CoreValue::Text(Text {
+            value: Cow::Owned(value.clone()),
+            subtype: TextSubtype::Text,
+        }),
+        ProtoValue::Blob { value } => CoreValue::Blob(value.to_vec()),
+    }
+}
+
+fn from_core_value(value: CoreValue) -> ProtoValue {
+    match value {
+        CoreValue::Null => ProtoValue::Null,
+        CoreValue::Numeric(Numeric::Integer(v)) => ProtoValue::Integer { value: v },
+        CoreValue::Numeric(Numeric::Float(v)) => ProtoValue::Float {
+            value: f64::from(v),
+        },
+        CoreValue::Text(t) => ProtoValue::Text {
+            value: t.value.to_string(),
+        },
+        CoreValue::Blob(b) => ProtoValue::Blob {
+            value: Bytes::from(b),
+        },
     }
 }
 

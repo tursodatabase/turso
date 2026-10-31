@@ -34,8 +34,8 @@ use crate::{
         PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
     types::{
-        parse_bin_record, Coro, DatabasePullRevision, DatabaseRowMutation,
-        DatabaseRowTransformResult, DatabaseSchemaKind, DatabaseSchemaReplay,
+        parse_bin_record, Coro, DatabaseMetadata, DatabasePullRevision, DatabasePushWatermark,
+        DatabaseRowMutation, DatabaseRowTransformResult, DatabaseSchemaKind, DatabaseSchemaReplay,
         DatabaseStatementReplay, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
         PartialBootstrapStrategy, PartialSyncOpts, RemotePullProtocol, Secret, SyncEngineIoResult,
@@ -568,6 +568,7 @@ fn logical_txn_to_tape_operations_with_table_map(
 #[derive(Debug, Default)]
 pub struct LogicalReplayApplyStats {
     pub touched_rows: std::collections::BTreeSet<(String, i64)>,
+    pub max_client_watermark: Option<DatabasePushWatermark>,
 }
 
 fn logical_operations_touched_rows(
@@ -608,6 +609,48 @@ fn logical_txn_acknowledges_client(txn: &LogicalTxnData, client_id: &str) -> Res
         }
     }
     Ok(false)
+}
+
+fn logical_txn_client_watermark(
+    txn: &LogicalTxnData,
+    client_id: &str,
+) -> Result<Option<DatabasePushWatermark>> {
+    let mut max_watermark: Option<DatabasePushWatermark> = None;
+    for op in &txn.ops {
+        if LogicalOpType::try_from(op.op_type) != Ok(LogicalOpType::UpsertRow)
+            || op.table_name != TURSO_SYNC_TABLE_NAME
+        {
+            continue;
+        }
+        let values = parse_bin_record(&op.record)?;
+        if values
+            .first()
+            .and_then(|value| value.to_text())
+            .is_none_or(|value| value != client_id)
+        {
+            continue;
+        }
+        let watermark = match (values.get(1), values.get(2)) {
+            (
+                Some(Value::Numeric(turso_core::Numeric::Integer(pull_gen))),
+                Some(Value::Numeric(turso_core::Numeric::Integer(change_id))),
+            ) => Some(DatabasePushWatermark {
+                pull_gen: *pull_gen,
+                change_id: *change_id,
+            }),
+            (Some(Value::Numeric(turso_core::Numeric::Integer(change_id))), None) => {
+                Some(DatabasePushWatermark {
+                    pull_gen: 0,
+                    change_id: *change_id,
+                })
+            }
+            _ => None,
+        };
+        if let Some(watermark) = watermark {
+            max_watermark = Some(max_watermark.map_or(watermark, |prev| prev.max(watermark)));
+        }
+    }
+    Ok(max_watermark)
 }
 
 async fn read_proto_file_chunk<Ctx>(
@@ -672,6 +715,12 @@ async fn replay_logical_transactions_from_file<Ctx>(
             let operations =
                 logical_txn_to_tape_operations_with_table_map(&txn, &mut decoded_table_map)?;
             if let Some(excluded_client_id) = excluded_client_id {
+                if let Some(watermark) = logical_txn_client_watermark(&txn, excluded_client_id)? {
+                    let next = stats
+                        .max_client_watermark
+                        .map_or(watermark, |prev| prev.max(watermark));
+                    stats.max_client_watermark = Some(next);
+                }
                 if logical_txn_acknowledges_client(&txn, excluded_client_id)? {
                     continue;
                 }
@@ -1295,6 +1344,20 @@ fn is_table(row: &DecodedSchemaRow) -> bool {
     row.row_type.eq_ignore_ascii_case("table")
 }
 
+fn is_sync_last_change_id_record(record: &[u8]) -> bool {
+    let Ok(values) = parse_bin_record(record) else {
+        return false;
+    };
+    matches!(
+        values.as_slice(),
+        [
+            Value::Text(client_id),
+            Value::Numeric(turso_core::Numeric::Integer(pull_gen)),
+            Value::Numeric(turso_core::Numeric::Integer(change_id)),
+        ] if !client_id.as_str().is_empty() && *pull_gen >= 0 && *change_id >= 0
+    )
+}
+
 fn decode_update_header_op(payload: &[u8]) -> Result<LogicalOp> {
     if payload.len() < 72 || &payload[..16] != b"SQLite format 3\0" {
         return Err(Error::DatabaseSyncEngineError(
@@ -1392,6 +1455,20 @@ fn decode_recovery_ops_to_logical_txn(
                     row_ops.push(LogicalOp {
                         op_type: LogicalOpType::UpsertRow as i32,
                         table_name: table_name.clone(),
+                        rowid,
+                        record: Bytes::copy_from_slice(record),
+                        sql: String::new(),
+                        user_version: None,
+                        application_id: None,
+                        schema_action: None,
+                        schema_kind: None,
+                        schema_name: String::new(),
+                        stable_table_id: 0,
+                    });
+                } else if is_sync_last_change_id_record(record) {
+                    row_ops.push(LogicalOp {
+                        op_type: LogicalOpType::UpsertRow as i32,
+                        table_name: TURSO_SYNC_TABLE_NAME.to_string(),
                         rowid,
                         record: Bytes::copy_from_slice(record),
                         sql: String::new(),
@@ -2823,11 +2900,46 @@ pub async fn read_last_change_id<Ctx>(
     }
 }
 
+pub fn ensure_remote_watermark_not_ahead_of_local(
+    source_pull_gen: i64,
+    remote_watermark: Option<DatabasePushWatermark>,
+    last_push_attempt: Option<DatabasePushWatermark>,
+    local_cdc_sequence_max: Option<i64>,
+) -> Result<()> {
+    let Some(remote) = remote_watermark else {
+        return Ok(());
+    };
+    if remote.pull_gen > source_pull_gen {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "protocol error: target_pull_gen > source_pull_gen: {} > {source_pull_gen}",
+            remote.pull_gen
+        )));
+    }
+    if let Some(last_attempt) = last_push_attempt.filter(|last| remote > *last) {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "protocol error: remote sync watermark ({}, {}) is ahead of local push history ({}, {}); local database appears restored from an older backup or cloned and must be re-bootstrapped",
+            remote.pull_gen,
+            remote.change_id,
+            last_attempt.pull_gen,
+            last_attempt.change_id,
+        )));
+    }
+    if let Some(seq_max) = local_cdc_sequence_max
+        .filter(|seq_max| remote.pull_gen == source_pull_gen && remote.change_id > *seq_max)
+    {
+        return Err(Error::DatabaseSyncEngineError(format!(
+            "protocol error: remote change_id {} is ahead of local CDC sequence {seq_max}; local database appears restored from an older backup and must be re-bootstrapped",
+            remote.change_id
+        )));
+    }
+    Ok(())
+}
+
 pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     source_conn: &Arc<turso_core::Connection>,
     client_id: &str,
-) -> Result<(i64, Option<i64>)> {
+) -> Result<(i64, Option<DatabasePushWatermark>)> {
     tracing::info!("fetch_last_change_id: client_id={client_id}");
 
     // fetch last_change_id from the target DB in order to guarantee atomic replay of changes and avoid conflicts in case of failure
@@ -2902,12 +3014,60 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
     if target_pull_gen > source_pull_gen {
         return Err(Error::DatabaseSyncEngineError(format!("protocol error: target_pull_gen > source_pull_gen: {target_pull_gen} > {source_pull_gen}")));
     }
-    let last_change_id = if target_pull_gen == source_pull_gen {
-        Some(target_change_id)
-    } else {
-        Some(0)
-    };
-    Ok((source_pull_gen, last_change_id))
+    Ok((
+        source_pull_gen,
+        Some(DatabasePushWatermark {
+            pull_gen: target_pull_gen,
+            change_id: target_change_id,
+        }),
+    ))
+}
+
+pub struct PushAttemptRecorder<'a> {
+    pub meta: &'a Mutex<DatabaseMetadata>,
+    pub io: &'a Arc<dyn turso_core::IO>,
+    pub meta_path: &'a str,
+    pub is_memory: bool,
+}
+
+impl PushAttemptRecorder<'_> {
+    async fn record<IO: SyncEngineIo, Ctx>(
+        &self,
+        ctx: &SyncOperationCtx<'_, IO, Ctx>,
+        watermark: DatabasePushWatermark,
+    ) -> Result<()> {
+        let mut meta = {
+            let guard = self.meta.lock().unwrap();
+            if guard
+                .last_push_attempt
+                .is_some_and(|prev| prev >= watermark)
+            {
+                return Ok(());
+            }
+            guard.clone()
+        };
+        let next = match meta.last_push_attempt {
+            Some(prev) => prev.max(watermark),
+            None => watermark,
+        };
+        meta.last_push_attempt = Some(next);
+        crate::database_sync_engine::full_write(
+            ctx.coro,
+            self.io.clone(),
+            ctx.io.io.clone(),
+            self.meta_path,
+            self.is_memory,
+            meta.dump()?,
+        )
+        .await?;
+        let mut guard = self.meta.lock().unwrap();
+        let merged = match guard.last_push_attempt {
+            Some(prev) => prev.max(watermark),
+            None => watermark,
+        };
+        guard.last_push_attempt = Some(merged);
+        Ok(())
+    }
 }
 
 pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
@@ -2915,12 +3075,21 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     source: &DatabaseTape,
     client_id: &str,
     opts: &DatabaseSyncEngineOpts,
+    last_push_attempt: Option<DatabasePushWatermark>,
+    push_attempt_recorder: Option<&PushAttemptRecorder<'_>>,
 ) -> Result<(i64, i64, i64)> {
     tracing::info!("push_logical_changes: client_id={client_id}");
     let source_conn = connect_untracked(source)?;
 
-    let (source_pull_gen, mut last_change_id) =
+    let (source_pull_gen, remote_watermark) =
         fetch_last_change_id(ctx, &source_conn, client_id).await?;
+    let mut last_change_id = remote_watermark.map(|remote| {
+        if remote.pull_gen == source_pull_gen {
+            remote.change_id
+        } else {
+            0
+        }
+    });
     let replay_floor_change_id = last_change_id.unwrap_or(0);
 
     tracing::debug!("push_logical_changes: last_change_id={:?}", last_change_id);
@@ -2930,14 +3099,25 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
     // commits below the current max after we advance the push watermark. WAL mode
     // keeps its unbounded scan (change ids there come from NewRowid, and the WAL
     // push loop does not rely on the sequence watermark).
-    let max_change_id_exclusive = if source_conn.mvcc_enabled() {
-        let watermark =
-            read_cdc_sequence_watermark(ctx.coro, &source_conn, source.cdc_table()).await?;
-        tracing::debug!("push_logical_changes: cdc sequence watermark={watermark:?}");
-        watermark
+    let (max_change_id_exclusive, local_cdc_sequence_max) = if source_conn.mvcc_enabled() {
+        if has_table(ctx.coro, &source_conn, source.cdc_table()).await? {
+            let watermark =
+                read_cdc_sequence_watermark(ctx.coro, &source_conn, source.cdc_table()).await?;
+            tracing::debug!("push_logical_changes: cdc sequence watermark={watermark:?}");
+            (watermark, watermark.map(|w| w.saturating_sub(1)))
+        } else {
+            (None, Some(0))
+        }
     } else {
-        None
+        (None, None)
     };
+
+    ensure_remote_watermark_not_ahead_of_local(
+        source_pull_gen,
+        remote_watermark,
+        last_push_attempt,
+        local_cdc_sequence_max,
+    )?;
 
     let replay_opts = DatabaseReplaySessionOpts {
         use_implicit_rowid: false,
@@ -2994,6 +3174,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
                     client_id,
                     source_pull_gen,
                     last_change_id,
+                    push_attempt_recorder,
                 )
                 .await?;
                 total_rows_changed += rows_changed;
@@ -3026,6 +3207,7 @@ pub async fn push_logical_changes<IO: SyncEngineIo, Ctx>(
 ///
 /// Returns the count of rows that actually produced SQL steps
 /// (post-transformation, excluding `Skip`).
+#[allow(clippy::too_many_arguments)]
 async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     generator: &DatabaseReplayGenerator,
@@ -3034,6 +3216,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
     client_id: &str,
     source_pull_gen: i64,
     mut last_change_id: Option<i64>,
+    push_attempt_recorder: Option<&PushAttemptRecorder<'_>>,
 ) -> Result<(i64, i64)> {
     let mut transformed = if opts.use_transform {
         Some(apply_transformation(ctx, batch_changes, generator).await?)
@@ -3216,6 +3399,13 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
         tracing::info!("prepare update stmt for turso_sync_last_change_id table with client_id={} and last_change_id={:?}", client_id, last_change_id);
         // update turso_sync_last_change_id table with new value before commit
         let next_change_id = last_change_id.unwrap_or(0);
+        if let Some(recorder) = push_attempt_recorder {
+            let watermark = DatabasePushWatermark {
+                pull_gen: source_pull_gen,
+                change_id: next_change_id,
+            };
+            recorder.record(ctx, watermark).await?;
+        }
         tracing::info!("push_logical_changes: client_id={client_id}, set pull_gen={source_pull_gen}, change_id={next_change_id}, rows_changed={rows_changed}");
         sql_over_http_requests.push(step(
             TURSO_SYNC_UPSERT_LAST_CHANGE_ID.to_string(),

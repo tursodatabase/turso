@@ -18,12 +18,14 @@ use crate::{
     database_sync_operations::{
         acquire_slot,
         apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats,
-        apply_transformation, bootstrap_db_file, connect_untracked, count_local_changes, has_table,
-        is_logically_replayable_table, list_user_tables, max_local_change_id, pull_updates_v1,
-        push_logical_changes, read_last_change_id, read_logical_replay_table_map, read_wal_salt,
-        reset_wal_file, should_replay_local_change, sync_file, update_last_change_id,
-        wait_all_results, wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result,
-        SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        apply_transformation, bootstrap_db_file, connect_untracked, count_local_changes,
+        ensure_remote_watermark_not_ahead_of_local, has_table, is_logically_replayable_table,
+        list_user_tables, max_local_change_id, pull_updates_v1, push_logical_changes,
+        read_cdc_sequence_watermark, read_last_change_id, read_logical_replay_table_map,
+        read_wal_salt, reset_wal_file, should_replay_local_change, sync_file,
+        update_last_change_id, wait_all_results, wal_apply_from_file, wal_pull_to_file,
+        PullUpdatesV1Result, PushAttemptRecorder, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE,
+        WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         run_stmt_ignore_rows, try_wal_watermark_read_page, DatabaseChangesIteratorMode,
@@ -33,11 +35,11 @@ use crate::{
     errors::Error,
     io_operations::IoOperations,
     types::{
-        Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
-        DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
-        DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbChangesStatus, DbChangesStreamKind,
-        PartialSyncOpts, RemotePullProtocol, Secret, SyncEngineIoResult, SyncEngineStats,
-        DATABASE_METADATA_VERSION,
+        Coro, DatabaseMetadata, DatabasePullRevision, DatabasePushWatermark,
+        DatabaseRowTransformResult, DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion,
+        DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbChangesStatus,
+        DbChangesStreamKind, PartialSyncOpts, RemotePullProtocol, Secret, SyncEngineIoResult,
+        SyncEngineStats, DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
@@ -281,7 +283,7 @@ async fn full_read<Ctx, IO: SyncEngineIo>(
 /// caller has no access to the memory io - so we handle it here implicitly
 /// ideally, we should add necessary methods to the turso_core::IO trait - but so far I am struggling with nice interface to do that
 /// so, I decided to keep a little bit of mess in sync-engine for a little bit longer
-async fn full_write<Ctx, IO: SyncEngineIo>(
+pub(crate) async fn full_write<Ctx, IO: SyncEngineIo>(
     coro: &Coro<Ctx>,
     io: Arc<dyn turso_core::IO>,
     sync_engine_io: Arc<IO>,
@@ -1037,6 +1039,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
                     last_pushed_replay_floor_change_id_hint: 0,
+                    last_push_attempt: Some(DatabasePushWatermark {
+                        pull_gen: 0,
+                        change_id: 0,
+                    }),
                     last_pull_unix_time: Some(io.current_time_wall_clock().secs),
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: if partial {
@@ -1089,6 +1095,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
                     last_pushed_replay_floor_change_id_hint: 0,
+                    last_push_attempt: Some(DatabasePushWatermark {
+                        pull_gen: 0,
+                        change_id: 0,
+                    }),
                     last_pull_unix_time: None,
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: None,
@@ -1961,6 +1971,17 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let conn = connect_untracked(&self.main_tape)?;
         let had_cdc_table = has_table(coro, &conn, "turso_cdc").await?;
+        let local_cdc_sequence_max = if conn.mvcc_enabled() {
+            if had_cdc_table {
+                read_cdc_sequence_watermark(coro, &conn, "turso_cdc")
+                    .await?
+                    .map(|w| w.saturating_sub(1))
+            } else {
+                Some(0)
+            }
+        } else {
+            None
+        };
         let (local_pull_gen, local_last_change_id) =
             read_last_change_id(coro, &conn, &self.client_unique_id).await?;
         let mut precollected_local_changes = Vec::new();
@@ -2017,6 +2038,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 	                self.main_db_path,
 	                remote_apply_stats.touched_rows.len()
 	            );
+            ensure_remote_watermark_not_ahead_of_local(
+                local_pull_gen,
+                remote_apply_stats.max_client_watermark,
+                self.meta().last_push_attempt,
+                local_cdc_sequence_max,
+            )?;
 
             let (last_pushed_pull_gen_hint, last_pushed_change_id_hint) = {
                 let meta = self.meta();
@@ -2557,19 +2584,26 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                                 },
                                             },
                                         };
-                                        apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
-                                            coro,
-                                            &mut replay,
-                                            changes_file,
-                                            &self.client_unique_id,
-                                            &mut logical_table_names_by_stable_id,
-                                        )
-                                        .await
-                                        .map_err(|error| {
-                                            Error::DatabaseSyncEngineError(format!(
-                                                "failed to apply replace-base follow-up logical transactions: {error}",
-                                            ))
-                                        })?;
+                                        let followup_stats =
+                                            apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                                                coro,
+                                                &mut replay,
+                                                changes_file,
+                                                &self.client_unique_id,
+                                                &mut logical_table_names_by_stable_id,
+                                            )
+                                            .await
+                                            .map_err(|error| {
+                                                Error::DatabaseSyncEngineError(format!(
+                                                    "failed to apply replace-base follow-up logical transactions: {error}",
+                                                ))
+                                            })?;
+                                        ensure_remote_watermark_not_ahead_of_local(
+                                            local_pull_gen,
+                                            followup_stats.max_client_watermark,
+                                            self.meta().last_push_attempt,
+                                            None,
+                                        )?;
                                     }
                                 }
                                 (
@@ -2703,6 +2737,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     "protocol error: remote_pull_gen > local_pull_gen: {remote_pull_gen} > {local_pull_gen}"
                 )));
             }
+            ensure_remote_watermark_not_ahead_of_local(
+                local_pull_gen,
+                remote_last_change_id.map(|change_id| DatabasePushWatermark {
+                    pull_gen: remote_pull_gen,
+                    change_id,
+                }),
+                self.meta().last_push_attempt,
+                None,
+            )?;
             let last_change_id = resolve_local_replay_floor_change_id(
                 use_pushed_change_hint,
                 local_pull_gen,
@@ -3172,13 +3215,35 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_ref(),
         );
-        let (pull_gen, replay_floor_change_id, change_id) =
-            push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
+        let last_push_attempt = self.meta().last_push_attempt;
+        let recorder = PushAttemptRecorder {
+            meta: &self.meta,
+            io: &self.io,
+            meta_path: &self.meta_path,
+            is_memory: is_memory(&self.main_db_path),
+        };
+        let (pull_gen, replay_floor_change_id, change_id) = push_logical_changes(
+            ctx,
+            &self.main_tape,
+            &self.client_unique_id,
+            &self.opts,
+            last_push_attempt,
+            Some(&recorder),
+        )
+        .await?;
 
         self.update_meta(coro, |m| {
             m.last_pushed_pull_gen_hint = pull_gen;
             m.last_pushed_replay_floor_change_id_hint = replay_floor_change_id;
             m.last_pushed_change_id_hint = change_id;
+            if change_id > 0 {
+                let watermark = DatabasePushWatermark {
+                    pull_gen,
+                    change_id,
+                };
+                let next = m.last_push_attempt.map_or(watermark, |p| p.max(watermark));
+                m.last_push_attempt = Some(next);
+            }
             m.last_push_unix_time = Some(self.io.current_time_wall_clock().secs);
         })
         .await?;
@@ -4070,6 +4135,7 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
+            last_push_attempt: None,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             fresh_bootstrap_catch_up_pending: false,
@@ -4221,6 +4287,7 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
+            last_push_attempt: None,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             fresh_bootstrap_catch_up_pending: false,
@@ -4397,6 +4464,7 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
+            last_push_attempt: None,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             fresh_bootstrap_catch_up_pending: false,
@@ -5039,6 +5107,7 @@ mod tests {
             last_pushed_pull_gen_hint: 0,
             last_pushed_change_id_hint: 0,
             last_pushed_replay_floor_change_id_hint: 0,
+            last_push_attempt: None,
             partial_bootstrap_server_revision: None,
             fresh_bootstrap_pending_cdc_ack: false,
             fresh_bootstrap_catch_up_pending: false,

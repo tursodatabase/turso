@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect,
+    ConnectOpts, Connection, Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect, Value,
 };
 use turso_sync_engine::Result;
 
@@ -53,8 +53,16 @@ impl Remote {
         Ok(())
     }
 
+    pub fn query_rows(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
+        Ok(self.conn.prepare(sql)?.run_collect_rows()?)
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot> {
         Snapshot::capture(&self.conn)
+    }
+
+    pub(super) fn connection(&self) -> &Arc<Connection> {
+        &self.conn
     }
 
     pub(super) fn checkpoint_and_read_database_file(&self) -> Result<Vec<u8>> {

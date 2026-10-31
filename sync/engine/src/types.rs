@@ -161,6 +161,12 @@ pub enum RemotePullProtocol {
     MvccLogical,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DatabasePushWatermark {
+    pub pull_gen: i64,
+    pub change_id: i64,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DatabaseMetadata {
     pub version: String,
@@ -179,6 +185,11 @@ pub struct DatabaseMetadata {
     pub last_pushed_change_id_hint: i64,
     #[serde(default)]
     pub last_pushed_replay_floor_change_id_hint: i64,
+    /// Highest `(pull_gen, change_id)` this replica instance has attempted to push to the remote
+    /// server. Persisted before each `/v2/pipeline` push batch so crash recovery never mistakes an
+    /// in-flight batch for a rewind while restoring an older backup or cloning files is caught.
+    #[serde(default)]
+    pub last_push_attempt: Option<DatabasePushWatermark>,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
     #[serde(default)]
     pub fresh_bootstrap_pending_cdc_ack: bool,
@@ -731,7 +742,9 @@ pub fn parse_bin_record(
 
 #[cfg(test)]
 mod tests {
-    use super::{DatabaseMetadata, DatabaseSavedConfiguration, RemotePullProtocol};
+    use super::{
+        DatabaseMetadata, DatabasePushWatermark, DatabaseSavedConfiguration, RemotePullProtocol,
+    };
 
     #[test]
     fn update_configuration_reports_change_only_when_values_differ() {
@@ -873,5 +886,33 @@ mod tests {
             RemotePullProtocol::MvccLogical
         );
         assert!(reloaded.logical_mvcc_pull_active());
+    }
+
+    #[test]
+    fn metadata_round_trips_last_push_attempt_and_defaults_legacy_to_none() {
+        let mut meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(meta.last_push_attempt, None);
+        let watermark = DatabasePushWatermark {
+            pull_gen: 2,
+            change_id: 19,
+        };
+        meta.last_push_attempt = Some(watermark);
+        let reloaded = DatabaseMetadata::load(&meta.dump().unwrap()).unwrap();
+        assert_eq!(reloaded.last_push_attempt, Some(watermark));
     }
 }
