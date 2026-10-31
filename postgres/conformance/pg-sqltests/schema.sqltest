@@ -465,3 +465,34 @@ test create-index-on-schema-qualified-table-constrains-that-table {
     INSERT INTO idx_s2.t VALUES (1);
 }
 expect error {}
+
+test add-column-named-like-a-string-in-a-partial-index {
+    CREATE TABLE add_col_idx (c text, x text);
+    CREATE INDEX add_col_idx_i ON add_col_idx (c) WHERE c < 'q';
+    INSERT INTO add_col_idx VALUES ('a', 'a');
+    ALTER TABLE add_col_idx ADD COLUMN q text;
+    INSERT INTO add_col_idx VALUES ('b', 'b', 'z');
+    SELECT c FROM add_col_idx WHERE c < 'q' ORDER BY c;
+}
+expect {
+    a
+    b
+}
+
+test add-column-named-like-a-string-in-a-partial-index-of-a-created-schema {
+    CREATE SCHEMA IF NOT EXISTS add_col_idx_s;
+    DROP SCHEMA add_col_idx_s CASCADE;
+    CREATE SCHEMA add_col_idx_s;
+    CREATE TABLE add_col_idx_s.t (c text, x text);
+    CREATE INDEX i ON add_col_idx_s.t (c) WHERE c < 'q';
+    INSERT INTO add_col_idx_s.t VALUES ('a', 'a');
+    ALTER TABLE add_col_idx_s.t ADD COLUMN q text;
+    INSERT INTO add_col_idx_s.t VALUES ('b', 'b', 'z');
+    SELECT c FROM add_col_idx_s.t WHERE c < 'q' ORDER BY c;
+    SELECT indexname FROM pg_indexes WHERE schemaname = 'add_col_idx_s';
+}
+expect {
+    a
+    b
+    i
+}

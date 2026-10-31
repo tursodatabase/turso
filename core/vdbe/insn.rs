@@ -287,6 +287,9 @@ pub struct AddColumnData {
     pub column: Column,
     pub check_constraints: Vec<CheckConstraint>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
+    /// Indexes of the table to drop from the in-memory schema, so they can be loaded again
+    /// from sqlite_schema after the column is added.
+    pub reloaded_indexes: Vec<String>,
 }
 
 /// Data for AlterColumn instruction (boxed to keep Insn small).
