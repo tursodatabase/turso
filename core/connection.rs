@@ -529,6 +529,8 @@ pub struct Connection {
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
     pub(super) busy_handler: RwLock<BusyHandler>,
+    pub(super) autocommit_conflict_retry_enabled: AtomicBool,
+    pub(super) conflict_retry_timeout_override: RwLock<Option<Duration>>,
     /// Step-based progress callback for SQLite-compatible cancellation hooks.
     pub(super) progress_handler: ProgressHandler,
     /// Maximum execution time for a single statement on this connection.
@@ -559,6 +561,7 @@ pub struct Connection {
     /// handles; a handle re-positions on its next blob operation after the
     /// checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
+    pub(crate) n_statements_waiting_to_retry: AtomicI32,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
@@ -4509,6 +4512,41 @@ impl Connection {
         self.busy_handler.read()
     }
 
+    pub fn set_autocommit_conflict_retry(&self, enabled: bool) {
+        self.autocommit_conflict_retry_enabled
+            .store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn get_autocommit_conflict_retry(&self) -> bool {
+        self.autocommit_conflict_retry_enabled
+            .load(Ordering::SeqCst)
+    }
+
+    pub fn set_conflict_retry_timeout(&self, duration: Duration) {
+        *self.conflict_retry_timeout_override.write() = Some(duration);
+    }
+
+    pub fn unset_conflict_retry_timeout(&self) {
+        *self.conflict_retry_timeout_override.write() = None;
+    }
+
+    pub(crate) fn conflict_retry_busy_handler(&self) -> BusyHandler {
+        if !self.get_autocommit_conflict_retry() {
+            return BusyHandler::None;
+        }
+        if let Some(duration) = *self.conflict_retry_timeout_override.read() {
+            return if duration.is_zero() {
+                BusyHandler::None
+            } else {
+                BusyHandler::Timeout(duration)
+            };
+        }
+        match &*self.busy_handler.read() {
+            BusyHandler::Timeout(d) => BusyHandler::Timeout(*d),
+            BusyHandler::None | BusyHandler::Custom { .. } => BusyHandler::None,
+        }
+    }
+
     /// Sets a progress handler invoked approximately every `ops` VM steps.
     /// Passing `ops == 0` or `None` disables the progress handler.
     pub fn set_progress_handler(&self, ops: u64, handler: Option<ProgressHandlerCallback>) {
@@ -4576,7 +4614,11 @@ impl Connection {
         // checkpoint until it is closed.
         let active_non_blob = self.n_active_root_statements.load(Ordering::SeqCst)
             - self.n_active_blob_statements.load(Ordering::SeqCst);
-        if activity.explicit_checkpoint_active || active_non_blob != statements_expected {
+        let waiting_to_retry = self.n_statements_waiting_to_retry.load(Ordering::SeqCst);
+        if activity.explicit_checkpoint_active
+            || active_non_blob != statements_expected
+            || waiting_to_retry != 0
+        {
             return Err(LimboError::StatementsInProgress(
                 "cannot checkpoint while another statement is active",
             ));
