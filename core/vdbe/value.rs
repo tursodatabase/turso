@@ -131,16 +131,16 @@ impl ComparisonOp {
         lhs: V1,
         rhs: V2,
         collation: CollationSeq,
-    ) -> bool {
-        let order = collation.compare(lhs.as_value_ref(), rhs.as_value_ref());
-        match self {
+    ) -> crate::Result<bool> {
+        let order = collation.compare_operands(lhs.as_value_ref(), rhs.as_value_ref())?;
+        Ok(match self {
             ComparisonOp::Eq => order.is_eq(),
             ComparisonOp::Ne => order.is_ne(),
             ComparisonOp::Lt => order.is_lt(),
             ComparisonOp::Le => order.is_le(),
             ComparisonOp::Gt => order.is_gt(),
             ComparisonOp::Ge => order.is_ge(),
-        }
+        })
     }
 }
 
@@ -1532,18 +1532,15 @@ impl Value {
             return Value::Null;
         }
 
-        let separator = match registers
+        let Some(separator) = registers
             .next()
             .expect("registers should have at least one element after length check")
-        {
-            Value::Null | Value::Blob(_) => return Value::Null,
-            v => format!("{v}"),
+            .cast_text_ref()
+        else {
+            return Value::Null;
         };
 
-        let parts = registers.filter_map(|val| match val {
-            Value::Text(_) | Value::Numeric(_) => Some(format!("{val}")),
-            _ => None,
-        });
+        let parts = registers.filter_map(Value::cast_text_ref);
 
         let result = parts.collect::<Vec<_>>().join(&separator);
         Value::build_text(result)
@@ -1883,7 +1880,7 @@ mod tests {
     }
 
     fn binary(lhs: &Value, rhs: &Value) -> crate::Result<std::cmp::Ordering> {
-        Ok(crate::translate::collate::CollationSeq::Binary.compare(lhs.as_ref(), rhs.as_ref()))
+        Ok(crate::translate::collate::CollationSeq::BINARY.compare(lhs.as_ref(), rhs.as_ref()))
     }
 
     fn allocated(result: std::result::Result<Value, crate::alloc::TryReserveError>) -> Value {

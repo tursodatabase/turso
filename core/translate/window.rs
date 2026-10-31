@@ -4,12 +4,15 @@ use crate::namespace::NamespaceRef;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
-use crate::translate::collate::{expr_collation, CollationSeq};
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TranslateCtx};
+use crate::translate::expr::expr_type::{type_of, ExprType};
 use crate::translate::expr::{
+    custom_operator_call, emit_operator_call_on_registers,
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
     walk_expr, walk_expr_mut, NoConstantOptReason, WalkControl,
 };
+use crate::translate::expr_context::ExprContext;
 use crate::translate::order_by::EmitOrderBy;
 use crate::translate::plan::{
     Aggregate, Distinctness, JoinOrderMember, JoinedTable, QueryDestination, ResultSetColumn,
@@ -643,7 +646,7 @@ fn allocate_window_minmax(
         let arg = args
             .first()
             .expect("min/max window calls must have one argument");
-        let collation = expr_collation(arg, Some(table_references), resolver)?;
+        let collation = ExprContext::new(Some(table_references), resolver).expr_collation(arg)?;
         let index = Arc::new(Index {
             name: format!("window_minmax_{}_{}", program.offset().as_offset_int(), i),
             table_name: String::new(),
@@ -659,10 +662,11 @@ fn allocate_window_minmax(
                     nulls_order: None,
                     pos_in_table: 0,
                     collation,
+                    explicit_collation: None,
                     default: None,
                     expr: None,
                 },
-                IndexColumn::new("1", 1, CollationSeq::Binary),
+                IndexColumn::new("1", 1, CollationSeq::BINARY),
             ],
             unique: false,
             ephemeral: true,
@@ -925,7 +929,8 @@ fn build_order_by_key_info(
         .order_by
         .iter()
         .map(|(expr, _, _)| {
-            let collation = expr_collation(expr, Some(table_references), resolver)?;
+            let collation =
+                ExprContext::new(Some(table_references), resolver).expr_collation(expr)?;
             Ok(KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation,
@@ -1702,6 +1707,7 @@ impl EmitWindow {
                         registers
                             .end_offset_reg
                             .expect("bounded RANGE end has an offset register"),
+                        FrameBoundPosition::End,
                         cursors.csr_end,
                         label_done,
                         &t_ctx.resolver,
@@ -1805,6 +1811,7 @@ impl EmitWindow {
                         RangeCmp::Ge,
                         cursors.csr_current,
                         registers.end_offset_reg.expect("checked above"),
+                        FrameBoundPosition::End,
                         cursors.csr_end,
                         label_done,
                         &t_ctx.resolver,
@@ -2001,7 +2008,8 @@ fn emit_flush_buffer_if_new_partition(
                     .expect("every deduplicated partition column has a PARTITION BY entry");
                 Ok(KeyInfo {
                     sort_order: SortOrder::Asc,
-                    collation: expr_collation(expr, Some(&plan.table_references), resolver)?,
+                    collation: ExprContext::new(Some(&plan.table_references), resolver)
+                        .expr_collation(expr)?,
                     nulls_order: None,
                 })
             })
@@ -2510,6 +2518,7 @@ fn emit_window_range_test(
     op: RangeCmp,
     csr1: CursorID,
     offset_reg: usize,
+    offset_bound: FrameBoundPosition,
     csr2: CursorID,
     target_pc: BranchOffset,
     resolver: &Resolver,
@@ -2549,7 +2558,34 @@ fn emit_window_range_test(
     } else {
         (op, false)
     };
-    let collation = expr_collation(order_expr, Some(&plan.table_references), resolver)?;
+    // The offset is added with the ORDER BY value's own `+` or `-`, chosen by
+    // the value's type as in any other arithmetic: numeric adds exactly, and
+    // a date moves by days. None means SQLite's operator runs.
+    let offset_expr = frame_offset_expr(&window.frame, offset_bound);
+    let operator = if subtract {
+        turso_parser::ast::Operator::Subtract
+    } else {
+        turso_parser::ast::Operator::Add
+    };
+    let arithmetic = Expr::Binary(
+        Box::new(order_expr.clone()),
+        operator,
+        Box::new(offset_expr.clone()),
+    );
+    let context = ExprContext::new(Some(&plan.table_references), resolver);
+    let env = context.type_env();
+    let type_arithmetic = custom_operator_call(&arithmetic, &env)?;
+    // A type with its own order but no `+` or `-` has no distance to add. A
+    // NULL offset is rejected before any arithmetic, so it needs no call.
+    let collation = context.expr_collation(order_expr)?;
+    if let CollationSeq::Type(ordering) = collation {
+        if type_arithmetic.is_none() && !matches!(type_of(offset_expr, &env), ExprType::Null) {
+            crate::bail_parse_error!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
+                ordering.name()
+            )
+        }
+    }
     let big_null = matches!(
         (sort_order, nulls_order),
         (SortOrder::Asc, Some(turso_parser::ast::NullsOrder::Last))
@@ -2592,21 +2628,25 @@ fn emit_window_range_test(
         });
     }
 
-    // Text and blobs sort at or above the empty string, so only numeric
-    // values fall through to Add/Subtract. NULL arithmetic remains NULL.
-    let reg_empty = program.alloc_register();
+    // For SQLite's operator, text and blobs sort at or above the empty
+    // string, so only numeric values fall through to Add/Subtract. NULL
+    // arithmetic remains NULL. A type's own operator always runs: numeric
+    // and date values are texts, and their `+` and `-` read them.
     let label_after_arithmetic = program.allocate_label();
-    program.emit_insn(Insn::String8 {
-        value: String::new(),
-        dest: reg_empty,
-    });
-    program.emit_insn(Insn::Ge {
-        lhs: reg1,
-        rhs: reg_empty,
-        target_pc: label_after_arithmetic,
-        flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: CollationSeq::for_internal_values(),
-    });
+    if type_arithmetic.is_none() {
+        let reg_empty = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            value: String::new(),
+            dest: reg_empty,
+        });
+        program.emit_insn(Insn::Ge {
+            lhs: reg1,
+            rhs: reg_empty,
+            target_pc: label_after_arithmetic,
+            flags: crate::vdbe::insn::CmpInsFlags::default(),
+            collation: CollationSeq::for_internal_values(),
+        });
+    }
 
     // SQLite performs this comparison before arithmetic in the two cases
     // where overflow to +/-infinity cannot change a successful result.
@@ -2621,7 +2661,9 @@ fn emit_window_range_test(
             collation,
         );
     }
-    if subtract {
+    if let Some(call) = &type_arithmetic {
+        emit_operator_call_on_registers(program, call, &[reg1, offset_reg], reg1, resolver)?;
+    } else if subtract {
         program.emit_insn(Insn::Subtract {
             lhs: reg1,
             rhs: offset_reg,
@@ -2646,6 +2688,18 @@ fn emit_window_range_test(
     );
     program.preassign_label_to_next_insn(label_done);
     Ok(())
+}
+
+/// The `N` of the frame's `N PRECEDING` or `N FOLLOWING` bound.
+fn frame_offset_expr(frame: &crate::translate::plan::Frame, bound: FrameBoundPosition) -> &Expr {
+    let bound = match bound {
+        FrameBoundPosition::Start => &frame.start,
+        FrameBoundPosition::End => &frame.end,
+    };
+    match bound {
+        FrameBound::Preceding(offset) | FrameBound::Following(offset) => offset,
+        _ => unreachable!("a RANGE offset comes from an N PRECEDING or N FOLLOWING bound"),
+    }
 }
 
 /// Emit one of the three operations that move the frame forward — add a
@@ -2739,6 +2793,7 @@ fn emit_window_op(
                             RangeCmp::Le,
                             cursors.csr_current,
                             reg,
+                            FrameBoundPosition::Start,
                             cursor_for_op,
                             label_done,
                             &t_ctx.resolver,
@@ -2750,6 +2805,7 @@ fn emit_window_op(
                             RangeCmp::Ge,
                             cursor_for_op,
                             reg,
+                            FrameBoundPosition::Start,
                             cursors.csr_current,
                             label_done,
                             &t_ctx.resolver,
@@ -2762,6 +2818,7 @@ fn emit_window_op(
                     RangeCmp::Gt,
                     cursor_for_op,
                     reg,
+                    FrameBoundPosition::End,
                     cursors.csr_current,
                     label_done,
                     &t_ctx.resolver,
@@ -3239,8 +3296,7 @@ fn emit_function_step(
                         col: arg_load_start.unwrap_or(0),
                         delimiter: 0,
                         func: AccumulatorFunc::Window(win_func.clone()),
-                        comparator: None,
-                        collation: CollationSeq::Binary,
+                        collation: CollationSeq::BINARY,
                     }),
                 });
             }
@@ -3350,7 +3406,6 @@ fn emit_function_inverse(
                 col: arg_load_start.unwrap_or(0),
                 delimiter: 0,
                 func: func.func.clone(),
-                comparator: None,
             });
 
             if let Some(label) = filter_skip_label {

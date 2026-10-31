@@ -1,0 +1,40 @@
+@database :memory:
+
+# When both operands of -> or ->> are the same expression, the compiler
+# evaluates it once into a single register. The JSON function reads its two
+# arguments from consecutive registers, so it used to read past the shared
+# register and panic with an index out of bounds.
+
+test json-arrow-same-literal-operand {
+    SELECT NULL -> NULL, 1 ->> 1, quote(NULL ->> NULL);
+}
+expect {
+    ||NULL
+}
+
+test json-arrow-same-operand-not-last-register {
+    SELECT NULL -> NULL, 1 ->> 1, 5;
+}
+expect {
+    ||5
+}
+
+test json-arrow-same-column-operand {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES('{"a":1}'), (NULL), ('[1]');
+    SELECT a -> a, quote(a ->> a) FROM t;
+}
+expect {
+    |NULL
+    |NULL
+    |NULL
+}
+
+test json-arrow-same-column-operand-in-where {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES('{"a":1}'), (NULL);
+    SELECT count(*) FROM t WHERE a -> a IS NULL;
+}
+expect {
+    2
+}

@@ -337,7 +337,6 @@ fn test_pg_local_search_path_ends_with_the_transaction(db: TempDatabase) {
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SET LOCAL search_path TO missing").unwrap();
-    assert!(conn.prepare("SELECT v FROM config_items").is_err());
     assert_eq!(
         query_text(
             &conn,
@@ -345,6 +344,9 @@ fn test_pg_local_search_path_ends_with_the_transaction(db: TempDatabase) {
         ),
         ["missing"]
     );
+    // The failing SELECT aborts the transaction block, so COMMIT performs a
+    // rollback and the LOCAL setting ends with the transaction.
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
     conn.execute("COMMIT").unwrap();
     assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
     assert_eq!(
@@ -397,18 +399,18 @@ fn test_pg_failed_statement_undoes_its_setting_changes(db: TempDatabase) {
         ["\"$user\", public"]
     );
 
+    // In an explicit transaction, a constraint violation aborts the entire
+    // transaction (PostgreSQL 25P02 semantics). The set_config from the failed
+    // statement is undone, and the transaction must end with ROLLBACK or COMMIT
+    // before any further queries are allowed.
     conn.execute("BEGIN").unwrap();
     conn.execute("SELECT set_config('search_path', 'public', false)")
         .unwrap();
-    assert!(conn.execute(failing_change).is_err());
+    assert!(conn.execute(failing_change).is_err()); // tx is now aborted
+    conn.execute("ROLLBACK").unwrap(); // end the aborted transaction
     assert_eq!(
         query_text(&conn, "SELECT current_setting('search_path')"),
-        ["public"]
-    );
-    conn.execute("COMMIT").unwrap();
-    assert_eq!(
-        query_text(&conn, "SELECT current_setting('search_path')"),
-        ["public"]
+        ["\"$user\", public"] // ROLLBACK reverts session settings to pre-transaction state
     );
 }
 

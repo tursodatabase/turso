@@ -232,7 +232,15 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
         ),
         ListTypes => Pragma::new(
             PragmaFlags::Result0,
-            &["type", "parent", "encode", "decode", "default", "operators"],
+            &[
+                "type",
+                "parent",
+                "encode",
+                "coerce",
+                "decode",
+                "default",
+                "operators",
+            ],
         ),
         PragmaName::ShowInternalSchema => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,

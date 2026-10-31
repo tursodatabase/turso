@@ -1057,8 +1057,15 @@ pub(crate) fn vacuum_target_build_step(
                 // Backing-btree indexes for custom index methods were filtered
                 // out when indexes_to_create was built. The remaining CREATE
                 // INDEX statements are user-visible; those of a stored
-                // namespace carry a mangled name.
-                let target_stmt = prepare_on_target(&state.target_conn, &entry.name, &entry.sql)?;
+                // namespace carry a mangled name. They are prepared as nested
+                // so that checks for new user SQL, such as the reserved-name
+                // check and the one rejecting qualified columns, do not reject
+                // an index the database already has. As for system tables, the
+                // guard is only for prepare.
+                state.target_conn.start_nested();
+                let target_stmt = state.target_conn.prepare(&entry.sql);
+                state.target_conn.end_nested();
+                let target_stmt = target_stmt?;
                 state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,

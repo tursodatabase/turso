@@ -521,7 +521,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
                     // Version present at this key -> resolve the shadow bit now,
                     // on the one key that actually matches a B-tree row.
                     std::cmp::Ordering::Equal => {
-                        return Ok(!db.index_chain_invalidates_btree(versions, tx_id)?);
+                        return Ok(!db.index_chain_invalidates_btree(versions, table_id, tx_id)?);
                     }
                     // Scan is behind the B-tree (a version-only key). Catch up below.
                     std::cmp::Ordering::Less => {}
@@ -574,9 +574,10 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     dual_peek: DualCursorPeek<A>,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
     index_shadow_scan: IndexShadowScan<A>,
-    /// [`MvStore::index_rows_epoch`] read before the MVCC index peek was taken.
-    /// See [`Self::reseek_index_if_index_rows_changed`].
-    index_peek_epoch: u64,
+    /// [`MvStore::table_rows_epoch`] or [`MvStore::index_rows_epoch`], by cursor
+    /// type, read before the MVCC peek was taken.
+    /// See [`Self::reseek_mvcc_if_rows_changed`].
+    mvcc_peek_epoch: u64,
 }
 
 pub enum NextRowidResult {
@@ -645,7 +646,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
-            index_peek_epoch: 0,
+            mvcc_peek_epoch: 0,
         })
     }
 
@@ -699,7 +700,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     // reusable record — like the btree cursor does with a cell —
                     // instead of cloning a `Row` first.
                     self.db
-                        .read_visible_into_record(self.snapshot, versions, record)?
+                        .read_visible_into_record(self.snapshot, row_id, versions, record)?
                 } else {
                     // Cold fallback (seek-positioned, no cached chain): point
                     // lookup, then serialize.
@@ -753,7 +754,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // Scan path: the range iterator already resolved this row's version
         // chain, so read it directly instead of a second skiplist lookup.
         if let Some(versions) = versions {
-            return self.db.read_visible_from_versions(self.snapshot, versions);
+            return self
+                .db
+                .read_visible_from_versions(self.snapshot, row_id, versions);
         }
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
@@ -873,10 +876,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 },
                 None => CursorPeek::Exhausted,
             },
-            MvccCursorType::Index(_) => match self
-                .db
-                .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, self.snapshot)
-            {
+            MvccCursorType::Index(_) => match self.db.advance_cursor_and_get_row_id_for_index(
+                &mut self.index_iterator,
+                self.snapshot,
+                self.table_id,
+            ) {
                 Some((row_id, versions)) => CursorPeek::Row {
                     key: row_id.row_id,
                     versions: Some(versions),
@@ -887,42 +891,48 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.dual_peek.mvcc_peek = new_peek_state;
     }
 
-    /// Seeks the MVCC index iterator again, just past the current key, if index
-    /// versions were inserted or deleted since the MVCC peek was taken. The
-    /// iterator sees a key added ahead of its position, but not one added
+    /// Seeks the MVCC iterator again, just past the current key, if table or
+    /// index versions were inserted or deleted since the MVCC peek was taken.
+    /// The iterator sees a key added ahead of its position, but not one added
     /// between the current key and the peek, nor any key once it is exhausted.
     /// And the peek itself may have been deleted since. Either can be a write
     /// of this cursor's own transaction.
     ///
     /// Returns true if it seeked: the MVCC peek is then already past the
     /// current key and must not be advanced again.
-    fn reseek_index_if_index_rows_changed(&mut self, dir: IterationDirection) -> Result<bool> {
-        let CursorPosition::Loaded {
-            row_id:
-                RowID {
-                    row_id: RowKey::Record(current_key),
-                    ..
-                },
-            ..
-        } = &self.current_pos
-        else {
+    fn reseek_mvcc_if_rows_changed(&mut self, dir: IterationDirection) -> Result<bool> {
+        let CursorPosition::Loaded { row_id, .. } = &self.current_pos else {
             return Ok(false);
         };
-        let epoch = self.db.index_rows_epoch();
-        if epoch == self.index_peek_epoch {
+        let epoch = self.mvcc_rows_epoch();
+        if epoch == self.mvcc_peek_epoch {
             return Ok(false);
         }
-        self.index_peek_epoch = epoch;
-        let current_key = current_key.as_ref().clone();
-        self.dual_peek.mvcc_peek = match self.db.seek_index(
-            self.table_id,
-            current_key,
-            false,
-            false,
-            dir,
-            self.snapshot,
-            &mut self.index_iterator,
-        )? {
+        self.mvcc_peek_epoch = epoch;
+        let found = match &row_id.row_id {
+            RowKey::Int(_) => self
+                .db
+                .seek_rowid(
+                    row_id.clone(),
+                    false,
+                    false,
+                    false,
+                    dir,
+                    self.snapshot,
+                    &mut self.table_iterator,
+                )
+                .map(|(row_id, versions, _)| (row_id, versions)),
+            RowKey::Record(current_key) => self.db.seek_index(
+                self.table_id,
+                current_key.as_ref().clone(),
+                false,
+                false,
+                dir,
+                self.snapshot,
+                &mut self.index_iterator,
+            )?,
+        };
+        self.dual_peek.mvcc_peek = match found {
             Some((row_id, versions)) => CursorPeek::Row {
                 key: row_id.row_id,
                 versions: Some(versions),
@@ -930,6 +940,23 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             None => CursorPeek::Exhausted,
         };
         Ok(true)
+    }
+
+    fn mvcc_rows_epoch(&self) -> u64 {
+        match self.mv_cursor_type {
+            MvccCursorType::Table => self.db.table_rows_epoch(),
+            MvccCursorType::Index(_) => self.db.index_rows_epoch(),
+        }
+    }
+
+    /// Whether the B-tree peek is now shadowed by an MVCC version, for example
+    /// a delete by this cursor's own transaction after the peek was read. The
+    /// peek is checked again on each step that does not advance the B-tree.
+    fn btree_peek_is_shadowed(&self) -> Result<bool> {
+        match self.dual_peek.btree_peek.get_row_key() {
+            Some(key) => Ok(!self.query_btree_version_is_valid(key)?),
+            None => Ok(false),
+        }
     }
 
     /// Advance btree cursor forward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
@@ -1192,7 +1219,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     /// Reset dual peek state (called on rewind/last/seek)
     fn reset_dual_peek(&mut self) {
         self.dual_peek = DualCursorPeek::default();
-        self.index_peek_epoch = self.db.index_rows_epoch();
+        self.mvcc_peek_epoch = self.mvcc_rows_epoch();
         self.eq_seek_row = None;
         // The forward scan is monotonic; a reposition invalidates it.
         self.index_shadow_scan.reset();
@@ -1411,7 +1438,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 let uninitialized = self.dual_peek.both_uninitialized();
                 if uninitialized {
                     // Initialize MVCC iterator and get first peek
-                    self.index_peek_epoch = self.db.index_rows_epoch();
+                    self.mvcc_peek_epoch = self.mvcc_rows_epoch();
                     self.init_mvcc_iterator_forward()?;
                     self.advance_mvcc_iterator();
                     self.state
@@ -1472,10 +1499,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             };
 
             // Advance cursors as needed and update peek state
-            let reseeked = self.reseek_index_if_index_rows_changed(IterationDirection::Forwards)?;
+            let reseeked = self.reseek_mvcc_if_rows_changed(IterationDirection::Forwards)?;
             if need_advance_mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
                 self.advance_mvcc_iterator();
             }
+            let need_advance_btree = need_advance_btree || self.btree_peek_is_shadowed()?;
             if need_advance_btree && !self.dual_peek.btree_exhausted() {
                 self.state
                     .replace(MvccLazyCursorState::Next(NextState::Advance));
@@ -1562,11 +1590,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             };
 
             // Advance cursors as needed and update peek state
-            let reseeked =
-                self.reseek_index_if_index_rows_changed(IterationDirection::Backwards)?;
+            let reseeked = self.reseek_mvcc_if_rows_changed(IterationDirection::Backwards)?;
             if need_advance_mvcc && !reseeked && !self.dual_peek.mvcc_exhausted() {
                 self.advance_mvcc_iterator();
             }
+            let need_advance_btree = need_advance_btree || self.btree_peek_is_shadowed()?;
             if need_advance_btree && !self.dual_peek.btree_exhausted() {
                 self.state
                     .replace(MvccLazyCursorState::Prev(PrevState::Advance));
@@ -1905,25 +1933,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 let record = record.as_ref().ok_or_else(|| {
                     LimboError::InternalError("TableRowId should have a record".to_string())
                 })?;
-                let num_columns = record.column_count();
                 crate::with_mv_store_allocation_site!(
                     RowPayload,
-                    Row::new_table_row_in(
-                        row_id,
-                        record.get_payload(),
-                        num_columns,
-                        self.db.allocator(),
-                    )
+                    Row::new_table_row_in(row_id, record.get_payload(), self.db.allocator(),)
                 )
             }
             MvccCursorType::Index(_) => {
-                let BTreeKey::IndexKey(record) = key else {
+                let BTreeKey::IndexKey(_) = key else {
                     return Err(LimboError::InternalError(
                         "Index cursor requires an IndexKey".to_string(),
                     )
                     .into());
                 };
-                Ok(Row::new_index_row(row_id, record.column_count()))
+                Ok(Row::new_index_row(row_id))
             }
         }?;
 

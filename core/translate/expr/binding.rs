@@ -1047,7 +1047,7 @@ pub(super) fn resolve_typedef_from_column(
         ast::Expr::Column { table, column, .. } => {
             resolve_column_type_str(*table, *column, referenced_tables, resolver)?
         }
-        ast::Expr::Variable(var) => var.col_type.as_ref()?.to_string(),
+        ast::Expr::Variable(var) => var.custom_type.as_ref()?.name.clone(),
         _ => return None,
     };
     let td = resolver.schema().get_type_def_unchecked(&ty_str)?;

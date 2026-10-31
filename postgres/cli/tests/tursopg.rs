@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::process::{Child, Command, Output, Stdio};
 
 fn run_tursopg(input: &[u8]) -> Output {
@@ -715,6 +715,37 @@ fn wire_create_table_as_returns_select_n() {
     });
 }
 
+#[test]
+fn wire_command_tag_ignores_comments_and_names_the_object() {
+    with_pg_client(|c| {
+        for (sql, tag) in [
+            ("CREATE TABLE t(x INT)", "CREATE TABLE"),
+            ("-- a comment\nINSERT INTO t VALUES (1)", "INSERT 0 1"),
+            (
+                "/* a /* nested */ comment */ UPDATE t SET x = 2",
+                "UPDATE 1",
+            ),
+            ("CREATE\nVIEW v AS SELECT x FROM t", "CREATE VIEW"),
+            ("CREATE UNIQUE INDEX i ON t (x)", "CREATE INDEX"),
+            ("DROP /* a comment */ INDEX i", "DROP INDEX"),
+            (
+                "CREATE TABLE t2 AS SELECT x FROM t WITH NO DATA -- a comment",
+                "CREATE TABLE AS",
+            ),
+            ("CREATE SEQUENCE s", "CREATE SEQUENCE"),
+            ("DROP SEQUENCE s", "DROP SEQUENCE"),
+            ("TRUNCATE t", "TRUNCATE TABLE"),
+        ] {
+            assert_eq!(c.query_command_tags(sql), [tag], "{sql}");
+        }
+        // A comment in front of SET must not turn it into a query that
+        // returns rows.
+        let sql = "-- a comment\nSET search_path TO public";
+        assert!(c.query_column_oids(sql).is_empty(), "{sql}");
+        assert_eq!(c.query_command_tags(sql), ["SET"], "{sql}");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Named windows (WINDOW clause)
 // ---------------------------------------------------------------------------
@@ -855,47 +886,32 @@ fn copy_from_file_not_found_repl() {
 // Wire protocol: COPY FROM returns "COPY N"
 // ---------------------------------------------------------------------------
 
-/// Start tursopg with --server on a kernel-assigned ephemeral port and wait
-/// for it to be ready. Returns the child and the port it is serving.
+/// Start tursopg with --server on a port that the server's operating system
+/// picks, and return the child and the port it is serving.
 ///
-/// The port must not be derived from a fixed seed: each test runs in its own
-/// process, so two concurrently started tests can compute the same port, and
-/// the loser of the bind race silently connects to the winner's server — and
-/// then fails mid-test when the winner tears it down. Instead, ask the kernel
-/// for a free ephemeral port and verify our own child is the process that
-/// came up on it, retrying with a fresh port if the child dies on bind.
+/// The test cannot pick a free port and pass it to the server: another
+/// process can take the port before the server binds it, and the test then
+/// talks to that process. So the server binds port 0 and the test reads the
+/// address that the server prints once it is listening.
 fn start_tursopg_server() -> (Child, u16) {
-    for _ in 0..10 {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let addr = format!("127.0.0.1:{port}");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
-            .arg("--server")
-            .arg(&addr)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start tursopg server");
-
-        // Wait for the server to be ready by polling TCP connect, bailing out
-        // to a new port if the child exited (lost a bind race).
-        for _ in 0..50 {
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-                return (child, port);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        child.kill().ok();
-        child.wait().ok();
-    }
-    panic!("tursopg server did not start");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(":memory:")
+        .arg("--server")
+        .arg("127.0.0.1:0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start tursopg server");
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    let port = line
+        .strip_prefix("PostgreSQL server listening on 127.0.0.1:")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("tursopg server did not start, printed: {line:?}"));
+    child.stdout = Some(stdout.into_inner());
+    (child, port)
 }
 
 /// Minimal PG wire protocol client for testing.
@@ -1035,6 +1051,16 @@ impl PgTestClient {
         self.send_query(sql);
         let response = self.read_until_ready();
         extract_error_fields(&response).unwrap_or_default()
+    }
+
+    /// Send query and return the ReadyForQuery ('Z') transaction status byte:
+    /// b'I' idle, b'T' in transaction, b'E' failed transaction.
+    fn query_ready_status(&mut self, sql: &str) -> u8 {
+        self.send_query(sql);
+        let response = self.read_until_ready();
+        *response
+            .last()
+            .expect("response must end with ReadyForQuery")
     }
 }
 
@@ -2082,24 +2108,111 @@ fn wire_error_syntax_error() {
 // SQLSTATE coverage: Class 25 (Invalid Transaction State)
 // ---------------------------------------------------------------------------
 
-/// BEGIN inside an already-active transaction → SQLSTATE 25001
-/// (active_sql_transaction).
-///
-/// Verified against real PostgreSQL (probed 2026-10-21): PostgreSQL emits a
-/// WARNING with code 25001, not an error. Turso diverges by returning an ERROR
-/// with the same code. The 25001 code itself is correct for this condition;
-/// the severity is the divergence. Tracked for future alignment.
 #[test]
-fn wire_error_nested_begin() {
+fn wire_begin_read_only_write_rejected_with_25006() {
     with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE t (a int)");
+        let fields = c.query_error_fields("BEGIN READ ONLY; INSERT INTO t VALUES (1)");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("25006"),
+            "write inside BEGIN READ ONLY must fail with SQLSTATE 25006, got: {fields:?}"
+        );
+        c.query_command_tags("ROLLBACK");
+    });
+}
+
+/// BEGIN inside an already-active transaction succeeds and keeps the open
+/// transaction, like PostgreSQL (which emits a WARNING, not an error).
+/// Any access mode the nested BEGIN names is applied to the transaction.
+#[test]
+fn wire_nested_begin_keeps_transaction() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE nested_begin_t (a int)");
         c.query_command_tags("BEGIN");
-        let fields = c.query_error_fields("BEGIN");
+        c.query_command_tags("INSERT INTO nested_begin_t VALUES (1)");
+        let tags = c.query_command_tags("BEGIN");
+        assert!(
+            tags.iter().any(|t| t == "BEGIN"),
+            "nested BEGIN must succeed with a BEGIN tag, got: {tags:?}"
+        );
+        let fields = c.query_error_fields("BEGIN READ ONLY; INSERT INTO nested_begin_t VALUES (2)");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("25006"),
+            "a write after nested BEGIN READ ONLY must fail read-only, got: {fields:?}"
+        );
+        c.query_command_tags("ROLLBACK");
+        let val = c.query_single_text("SELECT count(*) FROM nested_begin_t");
+        assert_eq!(val, "0");
+    });
+}
+
+/// PostgreSQL rejects switching to READ WRITE once any query has executed in
+/// a READ ONLY transaction: SQLSTATE 25001, "transaction read-write mode must
+/// be set before any query". Downgrading to READ ONLY stays allowed.
+#[test]
+fn wire_set_transaction_read_write_after_query_rejected() {
+    with_pg_client(|c| {
+        assert_eq!(c.query_ready_status("BEGIN READ ONLY"), b'T');
+        c.query_command_tags("SELECT 1");
+        let fields = c.query_error_fields("SET TRANSACTION READ WRITE");
         assert_eq!(
             fields.get(&b'C').map(String::as_str),
             Some("25001"),
-            "SQLSTATE must be 25001 for nested BEGIN, got: {fields:?}"
+            "late READ WRITE upgrade must fail with 25001, got: {fields:?}"
+        );
+        assert_eq!(
+            fields.get(&b'M').map(String::as_str),
+            Some("transaction read-write mode must be set before any query")
+        );
+        assert_eq!(c.query_ready_status("ROLLBACK"), b'I');
+
+        c.query_command_tags("BEGIN");
+        c.query_command_tags("SELECT 1");
+        let fields = c.query_error_fields("SET TRANSACTION READ ONLY");
+        assert!(
+            fields.is_empty(),
+            "downgrading to READ ONLY after a query must succeed, got: {fields:?}"
+        );
+        let fields = c.query_error_fields("SET TRANSACTION READ WRITE");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("25001"),
+            "upgrading back to READ WRITE after a query must fail, got: {fields:?}"
         );
         c.query_command_tags("ROLLBACK");
+
+        c.query_command_tags("BEGIN");
+        c.query_command_tags("SET TRANSACTION READ ONLY");
+        let fields = c.query_error_fields("SET TRANSACTION READ WRITE");
+        assert!(
+            fields.is_empty(),
+            "SET TRANSACTION itself is not a query, so the upgrade must succeed, got: {fields:?}"
+        );
+        assert_eq!(c.query_ready_status("ROLLBACK"), b'I');
+    });
+}
+
+/// A runtime error inside a transaction aborts it but must not discard its
+/// savepoints: ROLLBACK TO recovers the transaction, exactly like PostgreSQL.
+#[test]
+fn wire_savepoint_survives_runtime_error() {
+    with_pg_client(|c| {
+        c.query_command_tags("CREATE TABLE sp_recover_t (a int)");
+        assert_eq!(c.query_ready_status("BEGIN"), b'T');
+        c.query_command_tags("INSERT INTO sp_recover_t VALUES (1)");
+        c.query_command_tags("SAVEPOINT s");
+        c.query_command_tags("INSERT INTO sp_recover_t VALUES (2)");
+        assert_eq!(c.query_ready_status("SELECT 1/0"), b'E');
+        assert_eq!(
+            c.query_ready_status("ROLLBACK TO s"),
+            b'T',
+            "ROLLBACK TO must recover the aborted transaction"
+        );
+        assert_eq!(c.query_single_text("SELECT sum(a) FROM sp_recover_t"), "1");
+        assert_eq!(c.query_ready_status("COMMIT"), b'I');
+        assert_eq!(c.query_single_text("SELECT sum(a) FROM sp_recover_t"), "1");
     });
 }
 
@@ -2233,5 +2346,95 @@ fn wire_describe_ddl_and_schema_commands_perform_no_writes() {
             ),
             "0"
         );
+    });
+}
+
+#[test]
+fn aborted_state_and_chain_rejected_in_separate_request() {
+    with_pg_client(|client| {
+        // First request: enter aborted transaction state.
+        let _ = client.query_error_fields("BEGIN; SELECT 1/0");
+        // Second request: COMMIT AND CHAIN — should be rejected, not silently replaced by ROLLBACK.
+        let fields = client.query_error_fields("COMMIT AND CHAIN");
+        assert!(
+            !fields.is_empty(),
+            "expected an error for COMMIT AND CHAIN in aborted state, got success"
+        );
+        // Verify the connection recovers after an ordinary ROLLBACK.
+        let tags = client.query_command_tags("ROLLBACK");
+        assert!(
+            tags.iter().any(|t| t == "ROLLBACK"),
+            "expected ROLLBACK tag after recovery, got: {tags:?}"
+        );
+        let val = client.query_single_text("SELECT 42");
+        assert_eq!(val, "42");
+
+        // Same scenario with ROLLBACK AND CHAIN.
+        let _ = client.query_error_fields("BEGIN; SELECT 1/0");
+        let fields = client.query_error_fields("ROLLBACK AND CHAIN");
+        assert!(
+            !fields.is_empty(),
+            "expected an error for ROLLBACK AND CHAIN in aborted state, got success"
+        );
+        let tags = client.query_command_tags("ROLLBACK");
+        assert!(
+            tags.iter().any(|t| t == "ROLLBACK"),
+            "expected ROLLBACK tag after recovery, got: {tags:?}"
+        );
+    });
+}
+
+/// An error inside a READ ONLY transaction rolls the transaction back in the
+/// engine. The read-only mode must end with the transaction: after ROLLBACK the
+/// connection must accept writes again.
+#[test]
+fn read_only_mode_ends_when_an_error_aborts_the_transaction() {
+    with_pg_client(|client| {
+        client.query_command_tags("CREATE TABLE ro_err_t (a int)");
+        let fields = client.query_error_fields("BEGIN READ ONLY; SELECT 1/0");
+        assert!(!fields.is_empty(), "SELECT 1/0 must fail");
+        let tags = client.query_command_tags("ROLLBACK");
+        assert!(
+            tags.iter().any(|t| t == "ROLLBACK"),
+            "expected ROLLBACK tag, got: {tags:?}"
+        );
+        let tags = client.query_command_tags("INSERT INTO ro_err_t VALUES (1)");
+        assert!(
+            tags.iter().any(|t| t.starts_with("INSERT")),
+            "write after the read-only transaction ended must succeed, got: {tags:?}"
+        );
+        let val = client.query_single_text("SELECT count(*) FROM ro_err_t");
+        assert_eq!(val, "1");
+    });
+}
+
+/// After a prepare-time error (unknown table) the transaction is aborted on
+/// the wire but still open in the engine, so ROLLBACK TO SAVEPOINT recovers it
+/// and earlier work in the transaction survives, like PostgreSQL.
+#[test]
+fn rollback_to_savepoint_recovers_aborted_transaction() {
+    with_pg_client(|client| {
+        client.query_command_tags("CREATE TABLE sp_rec_t (a int)");
+        client.query_command_tags("BEGIN");
+        client.query_command_tags("INSERT INTO sp_rec_t VALUES (1)");
+        client.query_command_tags("SAVEPOINT s");
+        let fields = client.query_error_fields("SELECT * FROM no_such_table");
+        assert!(!fields.is_empty(), "unknown table must error");
+        let fields = client.query_error_fields("SELECT 1");
+        assert_eq!(
+            fields.get(&b'C').map(String::as_str),
+            Some("25P02"),
+            "statements in the aborted state must fail with 25P02, got: {fields:?}"
+        );
+        let tags = client.query_command_tags("ROLLBACK TO s");
+        assert!(
+            tags.iter().any(|t| t == "ROLLBACK"),
+            "ROLLBACK TO SAVEPOINT must recover the transaction, got: {tags:?}"
+        );
+        let val = client.query_single_text("SELECT count(*) FROM sp_rec_t");
+        assert_eq!(val, "1", "work before the error must survive the recovery");
+        client.query_command_tags("COMMIT");
+        let val = client.query_single_text("SELECT count(*) FROM sp_rec_t");
+        assert_eq!(val, "1");
     });
 }

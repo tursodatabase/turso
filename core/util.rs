@@ -288,7 +288,8 @@ impl ParseSchemaRowsState {
 /// Non-blocking schema-row parser: steps the schema-scan statement held in
 /// `state`, feeding each row to `handle_schema_row`, and yields IO instead of
 /// pumping it. Re-invoke after each yielded completion; accumulators persist in
-/// `state`. On completion, populates indices and materialized views.
+/// `state`. Indexes and materialized views are built afterwards by
+/// [`populate_types_views_then_indices`], once the types are loaded.
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn parse_schema_rows(
     state: &mut ParseSchemaRowsState,
@@ -336,23 +337,33 @@ pub fn parse_schema_rows(
         }));
     }
 
-    // Scan complete: finalize. Take ownership of the accumulators.
+    Ok(IOResult::Done(()))
+}
+
+/// After [`parse_schema_rows`] has scanned every row: load the CREATE TYPE
+/// statements `type_sqls`, then build the materialized views and indexes
+/// collected during the scan.
+pub fn populate_types_views_then_indices(
+    state: &mut ParseSchemaRowsState,
+    schema: &mut Schema,
+    syms: &SymbolTable,
+    type_sqls: &[String],
+) -> Result<()> {
     let inner = state
         .inner
         .take()
         .expect("ParseSchemaRowsState not initialized");
     let has_mv_store = inner.rows.mv_store().is_some();
-    schema.populate_materialized_views_then_indices(
+    schema.populate_types_views_then_indices(
         syms,
+        type_sqls,
         inner.materialized_view_info,
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,
         inner.from_sql_indexes,
         inner.automatic_indices,
         has_mv_store,
-    )?;
-
-    Ok(IOResult::Done(()))
+    )
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
@@ -1673,26 +1684,7 @@ where
             walk_with_expressions(with.as_ref(), func)?;
             if let ast::InsertBody::Select(select, upsert) = body {
                 walk_select_expressions_inner(select, func)?;
-                let mut upsert = upsert.as_deref();
-                while let Some(clause) = upsert {
-                    if let Some(index) = &clause.index {
-                        for target in &index.targets {
-                            walk_expr_with_subqueries(&target.expr, func)?;
-                        }
-                        if let Some(where_clause) = &index.where_clause {
-                            walk_expr_with_subqueries(where_clause, func)?;
-                        }
-                    }
-                    if let ast::UpsertDo::Set { sets, where_clause } = &clause.do_clause {
-                        for set in sets {
-                            walk_expr_with_subqueries(&set.expr, func)?;
-                        }
-                        if let Some(where_clause) = where_clause {
-                            walk_expr_with_subqueries(where_clause, func)?;
-                        }
-                    }
-                    upsert = clause.next.as_deref();
-                }
+                walk_upsert_expressions(upsert.as_deref(), func)?;
             }
             walk_result_column_expressions(returning, func)?;
         }
@@ -1770,6 +1762,74 @@ where
         | ast::Stmt::DropSequence { .. }
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::DropSchema { .. } => {}
+    }
+    Ok(())
+}
+
+/// Walk all expressions in a trigger command, including subqueries.
+pub fn walk_trigger_cmd_expressions<F>(cmd: &ast::TriggerCmd, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    match cmd {
+        ast::TriggerCmd::Update {
+            sets,
+            from,
+            where_clause,
+            ..
+        } => {
+            for set in sets {
+                walk_expr_with_subqueries(&set.expr, func)?;
+            }
+            if let Some(from_clause) = from {
+                walk_from_clause_expressions(from_clause, func)?;
+            }
+            if let Some(where_clause) = where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+        }
+        ast::TriggerCmd::Insert {
+            select,
+            upsert,
+            returning,
+            ..
+        } => {
+            walk_select_expressions_inner(select, func)?;
+            walk_upsert_expressions(upsert.as_deref(), func)?;
+            walk_result_column_expressions(returning, func)?;
+        }
+        ast::TriggerCmd::Delete { where_clause, .. } => {
+            if let Some(where_clause) = where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+        }
+        ast::TriggerCmd::Select(select) => walk_select_expressions_inner(select, func)?,
+    }
+    Ok(())
+}
+
+fn walk_upsert_expressions<F>(mut upsert: Option<&ast::Upsert>, func: &mut F) -> Result<()>
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    while let Some(clause) = upsert {
+        if let Some(index) = &clause.index {
+            for target in &index.targets {
+                walk_expr_with_subqueries(&target.expr, func)?;
+            }
+            if let Some(where_clause) = &index.where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+        }
+        if let ast::UpsertDo::Set { sets, where_clause } = &clause.do_clause {
+            for set in sets {
+                walk_expr_with_subqueries(&set.expr, func)?;
+            }
+            if let Some(where_clause) = where_clause {
+                walk_expr_with_subqueries(where_clause, func)?;
+            }
+        }
+        upsert = clause.next.as_deref();
     }
     Ok(())
 }
@@ -2295,7 +2355,7 @@ fn view_output_column(source: &ViewColumn) -> ViewColumn {
             None,
             None,
             source.column.ty(),
-            source.column.collation_opt(),
+            source.column.text_collation(),
             ColDef::default(),
         ),
     }
@@ -2507,7 +2567,7 @@ fn view_merged_column(first_column: &ViewColumn) -> ViewColumn {
             None,
             None,
             first_column.column.affinity().to_type(),
-            first_column.column.collation_opt(),
+            first_column.column.text_collation(),
             ColDef::default(),
         ),
     }

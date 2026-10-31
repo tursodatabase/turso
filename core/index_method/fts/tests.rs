@@ -36,8 +36,8 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
             table_name: "w".to_string(),
             index_name: "wx".to_string(),
             columns: crate::alloc::vec![
-                IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::Binary),
-                IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::Binary)
+                IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
+                IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::BINARY)
             ],
             parameters: FxHashMap::from_iter([(
                 "weights".to_string(),
@@ -61,8 +61,8 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
 #[test]
 fn field_weights_accept_finite_positive_boundaries() {
     let columns = [
-        IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::Binary),
-        IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::Binary),
+        IndexColumn::new("title", 0, crate::translate::collate::CollationSeq::BINARY),
+        IndexColumn::new("body", 1, crate::translate::collate::CollationSeq::BINARY),
     ];
     for (input, expected) in [
         ("1e-45", f32::from_bits(1)),
@@ -105,8 +105,8 @@ fn test_attachment() -> FtsIndexAttachment {
         table_name: "docs".to_string(),
         index_name: "docs_fts".to_string(),
         columns: crate::alloc::vec![
-            IndexColumn::new("title", 1, crate::translate::collate::CollationSeq::Binary),
-            IndexColumn::new("body", 2, crate::translate::collate::CollationSeq::Binary)
+            IndexColumn::new("title", 1, crate::translate::collate::CollationSeq::BINARY),
+            IndexColumn::new("body", 2, crate::translate::collate::CollationSeq::BINARY)
         ],
         parameters: FxHashMap::<String, Value>::default(),
     })
@@ -168,7 +168,7 @@ fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstima
         columns: crate::alloc::vec![IndexColumn::new(
             "body",
             1,
-            crate::translate::collate::CollationSeq::Binary
+            crate::translate::collate::CollationSeq::BINARY
         )],
         parameters: FxHashMap::<String, Value>::default(),
     })
@@ -1244,5 +1244,62 @@ fn fts_limit_applies_after_aggregates_and_distinct() {
     assert_eq!(
         categories,
         vec![vec![Value::from_i64(0)], vec![Value::from_i64(1)]]
+    );
+}
+
+/// Nine documents inserted by one statement, mentioning 'hello' once, twice or three times, so
+/// their FTS scores take three values.
+fn scored_documents() -> Arc<Connection> {
+    let db = crate::Database::open(
+        Arc::new(crate::MemoryIO::new()),
+        ":memory:",
+        crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+            .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
+    )
+    .unwrap();
+    let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+    conn.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX notes_fts ON notes USING fts(body)")
+        .unwrap();
+    let rows: Vec<String> = (1..=9i64)
+        .map(|id| format!("({id}, '{}world')", "hello ".repeat((id % 3 + 1) as usize)))
+        .collect();
+    conn.execute(format!("INSERT INTO notes VALUES {}", rows.join(", ")))
+        .unwrap();
+    conn
+}
+
+fn rows_of(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+    conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+}
+
+/// The score the FTS index provides for a query is a computed value with no column collation, so
+/// a DISTINCT, a compound SELECT and an IN subquery over it plan and run.
+#[test]
+fn fts_score_from_the_index_has_no_column_collation() {
+    let conn = scored_documents();
+    let score = "fts_score(body, 'hello')";
+    let matching = "FROM notes WHERE fts_match(body, 'hello')";
+    assert_eq!(
+        rows_of(&conn, &format!("SELECT DISTINCT {score} {matching}")).len(),
+        3
+    );
+    assert_eq!(
+        rows_of(
+            &conn,
+            &format!("SELECT {score} {matching} UNION SELECT {score} {matching}")
+        )
+        .len(),
+        3
+    );
+    assert_eq!(
+        rows_of(
+            &conn,
+            &format!(
+                "SELECT count(*) FROM (SELECT {score} AS s {matching}) WHERE s IN (SELECT {score} {matching})"
+            )
+        ),
+        vec![vec![Value::from_i64(9)]]
     );
 }

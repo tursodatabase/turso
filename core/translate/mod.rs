@@ -18,6 +18,7 @@ pub(crate) mod display;
 pub(crate) mod emitter;
 pub mod eqp;
 pub(crate) mod expr;
+pub(crate) mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
@@ -188,6 +189,24 @@ pub fn translate_inner(
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
+    // Subqueries are numbered per program, and a trigger body or foreign-key
+    // action is compiled into a program of its own with the resolver of the
+    // statement that fires it. So the same number can name a subquery of
+    // each, and the statement's row-value subqueries are set aside while
+    // another statement is compiled.
+    let callers_row_value_subqueries = std::mem::take(&mut resolver.row_value_subqueries);
+    let result = translate_statement(stmt, resolver, program, connection, input);
+    resolver.row_value_subqueries = callers_row_value_subqueries;
+    result
+}
+
+fn translate_statement(
+    stmt: ast::Stmt,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    input: &str,
+) -> Result<()> {
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
@@ -263,7 +282,11 @@ pub fn translate_inner(
                 connection.clone(),
             )?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+        ast::Stmt::Begin {
+            typ,
+            name,
+            access_mode,
+        } => translate_tx_begin(typ, name, access_mode, resolver, program)?,
         ast::Stmt::Commit { name } => {
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
@@ -562,6 +585,16 @@ pub fn translate_inner(
             &program.table_references,
             resolver,
         );
+    }
+
+    // After translation so that name resolution errors come first, as in
+    // PostgreSQL, which rejects read-only violations when the command starts
+    // executing.
+    if is_write
+        && connection.is_tx_read_only()
+        && matches!(program.get_query_mode(), QueryMode::Normal)
+    {
+        return Err(crate::LimboError::ReadOnly);
     }
 
     Ok(())

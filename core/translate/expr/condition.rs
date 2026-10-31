@@ -32,18 +32,12 @@ use super::*;
 /// Compute the affinity for an IN expression.
 /// For `x IN (y1, y2, ..., yN)`, the affinity is determined by the LHS expression `x`.
 /// This follows SQLite's `exprINAffinity()` function.
-pub(super) fn in_expr_affinity(
-    lhs: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
-) -> Affinity {
+pub(super) fn in_expr_affinity(lhs: &ast::Expr, metadata: &impl ExprProperties) -> Affinity {
     // For parenthesized expressions (vectors), we take the first element's affinity
     // since scalar IN comparisons only use the first element
     match lhs {
-        Expr::Parenthesized(exprs) if !exprs.is_empty() => {
-            get_expr_affinity(&exprs[0], referenced_tables, resolver)
-        }
-        _ => get_expr_affinity(lhs, referenced_tables, resolver),
+        Expr::Parenthesized(exprs) if !exprs.is_empty() => get_expr_affinity(&exprs[0], metadata),
+        _ => get_expr_affinity(lhs, metadata),
     }
 }
 
@@ -68,11 +62,10 @@ pub(super) fn translate_in_list(
 
     // Compute the affinity for the IN comparison based on the LHS expression
     // This follows SQLite's exprINAffinity() approach
-    let affinity = in_expr_affinity(lhs, referenced_tables, Some(resolver));
+    let metadata = ExprContext::new(referenced_tables, resolver);
+    let affinity = in_expr_affinity(lhs, &metadata);
     let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
-    // `x IN (y1, ..., yN)` compares with the collation of x alone, as SQLite
-    // does; the list items do not take part.
-    let collation = expr_collation(lhs, referenced_tables, resolver)?;
+    let collation = in_list_collation(lhs, rhs, &metadata)?;
 
     if lhs_arity == 1 && false_null_jump_targets_differ {
         check_null_reg = program.alloc_register();
@@ -152,13 +145,8 @@ pub(super) fn translate_in_list(
 
                 // Check for unequal values and skip if one is found.
                 for j in 0..lhs_arity {
-                    let (aff, collation) = row_component_affinity_collation(
-                        lhs,
-                        expr,
-                        j,
-                        referenced_tables,
-                        resolver,
-                    )?;
+                    let (aff, collation) =
+                        row_component_affinity_collation(lhs, expr, j, &metadata)?;
                     let flags = CmpInsFlags::default().with_affinity(aff);
                     program.emit_insn(Insn::Ne {
                         lhs: lhs_reg + j,
@@ -209,13 +197,8 @@ pub(super) fn translate_in_list(
             } else {
                 // Last condition, simple case: jump to false if any component doesn't match
                 for j in 0..lhs_arity {
-                    let (aff, collation) = row_component_affinity_collation(
-                        lhs,
-                        expr,
-                        j,
-                        referenced_tables,
-                        resolver,
-                    )?;
+                    let (aff, collation) =
+                        row_component_affinity_collation(lhs, expr, j, &metadata)?;
                     let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
                     program.emit_insn(Insn::Ne {
                         lhs: lhs_reg + j,
@@ -396,7 +379,7 @@ fn translate_leaf_condition_expr(
                 emit_cond_jump(program, condition_metadata, result_reg);
             }
         },
-        ast::Expr::Register(_) => {
+        ast::Expr::Register { .. } => {
             crate::bail_parse_error!(
                 "Register in WHERE clause is currently unused. Consider removing Resolver::expr_to_reg_cache and using Expr::Register instead"
             );
@@ -501,18 +484,9 @@ fn translate_leaf_condition_expr(
             }
         }
         ast::Expr::Binary(e1, op, e2) => {
-            // Check if either operand has a custom type with a matching operator
-            if let Some(resolved) =
-                find_custom_type_operator(e1, e2, op, Some(referenced_tables), resolver)
+            if let Some(result_reg) =
+                emit_custom_type_operator(program, Some(referenced_tables), expr, resolver)?
             {
-                let result_reg = emit_custom_type_operator(
-                    program,
-                    Some(referenced_tables),
-                    e1,
-                    e2,
-                    &resolved,
-                    resolver,
-                )?;
                 emit_cond_jump(program, condition_metadata, result_reg);
             } else {
                 let result_reg = program.alloc_register();

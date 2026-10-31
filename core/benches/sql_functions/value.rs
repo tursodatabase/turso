@@ -1053,5 +1053,5 @@ fn exec_randomblob_large(bencher: Bencher) {
 }
 
 fn binary(a: &Value, b: &Value) -> turso_core::Result<std::cmp::Ordering> {
-    Ok(CollationSeq::Binary.compare(a.as_ref(), b.as_ref()))
+    Ok(CollationSeq::BINARY.compare(a.as_ref(), b.as_ref()))
 }

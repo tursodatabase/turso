@@ -1037,9 +1037,9 @@ test domain-over-custom-type-expression-index {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE DOMAIN pc AS cents;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
-    CREATE INDEX i ON t(x + 0);
+    CREATE INDEX i ON t(abs(x));
     INSERT INTO t VALUES (1, 5);
-    SELECT count(*) FROM t WHERE x + 0 = 5;
+    SELECT count(*) FROM t WHERE abs(x) = 5;
     PRAGMA integrity_check;
 }
 expect {

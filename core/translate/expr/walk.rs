@@ -170,7 +170,7 @@ where
                     | ast::Expr::Name(_)
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
-                    | ast::Expr::Register(_)
+                    | ast::Expr::Register { .. }
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));
@@ -243,9 +243,13 @@ pub fn expr_references_outer_query(expr: &ast::Expr, table_references: &TableRef
 /// can call a user-defined function, and JSON or array operators can reject
 /// their input. Callers use this when an optimization would evaluate an
 /// expression for more rows than the original plan.
-pub fn expression_can_fail_on_input(expr: &ast::Expr) -> bool {
+///
+/// An operator can fail when a custom type's function runs it: `date + 1`
+/// rejects text that is not a date. `env` gives the operands' types.
+pub(crate) fn expression_can_fail_on_input(expr: &ast::Expr, env: &TypeEnv) -> bool {
     let mut can_fail = false;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        can_fail |= runs_custom_type_function(expr, env);
         if matches!(
             expr,
             ast::Expr::FunctionCall { .. }
@@ -525,7 +529,7 @@ where
                     | ast::Expr::Name(_)
                     | ast::Expr::Qualified(..)
                     | ast::Expr::Variable(_)
-                    | ast::Expr::Register(_)
+                    | ast::Expr::Register { .. }
                     | ast::Expr::Default => {}
                     ast::Expr::FieldAccess { base, .. } => {
                         stack.push(WalkItem::Expr(base));

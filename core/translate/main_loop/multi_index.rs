@@ -259,19 +259,15 @@ fn emit_in_seek_multi_index_branch(
 
     let outer_loop_start = program.allocate_label();
     program.preassign_label_to_next_insn(outer_loop_start);
-    let seek_reg = program.alloc_register();
-    program.emit_insn(Insn::Column {
-        cursor_id: ephemeral_cursor_id,
-        column: 0,
-        dest: seek_reg,
-        default: None,
-    });
-
     let next_value_label = program.allocate_label();
-    program.emit_insn(Insn::IsNull {
-        reg: seek_reg,
-        target_pc: next_value_label,
-    });
+    let seek_reg = emit_in_seek_key(
+        program,
+        table_references,
+        &t_ctx.resolver,
+        branch.index.as_ref(),
+        ephemeral_cursor_id,
+        next_value_label,
+    )?;
 
     if let Some(branch_cursor_id) = branch_cursor_id {
         let branch_loop_start = program.allocate_label();

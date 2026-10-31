@@ -68,7 +68,7 @@ fn fts_test_stats(
             index_name: index_name.to_string(),
             columns: columns
                 .iter()
-                .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::Binary))
+                .map(|&(name, index)| IndexColumn::new(name, index, CollationSeq::BINARY))
                 .collect(),
             parameters: HashMap::default(),
         })
@@ -191,7 +191,7 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -283,7 +283,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -375,7 +375,7 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
         .attach(&IndexMethodConfiguration {
             table_name: "t".to_string(),
             index_name: "t_idx".to_string(),
-            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("embedding", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -495,6 +495,45 @@ fn test_vector_sparse_ivf_mvcc_sql(tmp_db: TempDatabase) {
         nearest("[0, 1, 0]"),
         vec![vec![rusqlite::types::Value::Integer(2)]]
     );
+}
+
+#[turso_macros::test]
+fn vector_index_rejected_update_rollback(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE v(id INTEGER PRIMARY KEY, e)")
+        .unwrap();
+    conn.execute("CREATE INDEX vi ON v USING toy_vector_sparse_ivf (e)")
+        .unwrap();
+    conn.execute("INSERT INTO v VALUES(1, vector32_sparse('[1,0,0]'))")
+        .unwrap();
+
+    let mut integrity_results = Vec::new();
+    for explicit_transaction in [false, true] {
+        if explicit_transaction {
+            conn.execute("BEGIN").unwrap();
+        }
+        let error = conn.execute("UPDATE v SET e='zz' WHERE id=1").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("first value must be sparse vector"));
+        assert_eq!(conn.get_auto_commit(), !explicit_transaction);
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT id, vector_extract(e) FROM v"),
+            vec![row![1, "[1,0,0]"]]
+        );
+        integrity_results.push(limbo_exec_rows(&conn, "PRAGMA integrity_check"));
+        assert_eq!(
+            limbo_exec_rows(
+                &conn,
+                "SELECT id FROM v ORDER BY vector_distance_jaccard(e, vector32_sparse('[1,0,0]')) LIMIT 1"
+            ),
+            vec![row![1]]
+        );
+        if explicit_transaction {
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+    assert_eq!(integrity_results, vec![vec![row!["ok"]]; 2]);
 }
 
 #[turso_macros::test]
@@ -671,8 +710,8 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
             columns: vec![
-                IndexColumn::new("title", 1, CollationSeq::Binary),
-                IndexColumn::new("body", 2, CollationSeq::Binary),
+                IndexColumn::new("title", 1, CollationSeq::BINARY),
+                IndexColumn::new("body", 2, CollationSeq::BINARY),
             ],
             parameters: HashMap::default(),
         })
@@ -722,8 +761,8 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
             table_name: "docs".to_string(),
             index_name: "fts_docs".to_string(),
             columns: vec![
-                IndexColumn::new("title", 1, CollationSeq::Binary),
-                IndexColumn::new("body", 2, CollationSeq::Binary),
+                IndexColumn::new("title", 1, CollationSeq::BINARY),
+                IndexColumn::new("body", 2, CollationSeq::BINARY),
             ],
             parameters: HashMap::default(),
         })
@@ -3144,7 +3183,7 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test(mvcc)]
-fn test_fts_rename_weighted_column_keeps_weight_after_reopen(tmp_db: TempDatabase) {
+fn test_fts_renames_keep_weights_and_queries_working(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
         .unwrap();
@@ -3156,9 +3195,39 @@ fn test_fts_rename_weighted_column_keeps_weight_after_reopen(tmp_db: TempDatabas
          (1, 'needle hay hay hay', ''), (2, '', 'needle'), (3, '', 'hay hay hay hay hay hay')",
     )
     .unwrap();
-    conn.execute("ALTER TABLE docs RENAME COLUMN a TO title")
+    conn.execute(r#"ALTER TABLE docs RENAME COLUMN a TO "my col""#)
         .unwrap();
     conn.execute("ALTER TABLE docs ALTER COLUMN b TO body TEXT")
+        .unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            r#"SELECT id FROM docs WHERE fts_match("my col", body, 'needle') ORDER BY fts_score("my col", body, 'needle') DESC"#
+        ),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)],
+        ]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            r#"SELECT id FROM docs WHERE fts_match("my col", body, 'body:needle')"#
+        ),
+        vec![vec![rusqlite::types::Value::Integer(2)]]
+    );
+    conn.execute("INSERT INTO docs VALUES (4, 'fresh', '')")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            r#"SELECT id FROM docs WHERE fts_match("my col", body, 'fresh')"#
+        ),
+        vec![vec![rusqlite::types::Value::Integer(4)]]
+    );
+
+    conn.execute(r#"ALTER TABLE docs RENAME TO "my docs""#)
         .unwrap();
 
     let path = tmp_db.path.clone();
@@ -3182,15 +3251,14 @@ fn test_fts_rename_weighted_column_keeps_weight_after_reopen(tmp_db: TempDatabas
             "SELECT sql FROM sqlite_schema WHERE name = 'docs_fts'"
         ),
         vec![vec![rusqlite::types::Value::Text(
-            "CREATE INDEX docs_fts ON docs USING fts (title, body) WITH (weights = 'title=10.0,body=1.0')"
+            r#"CREATE INDEX docs_fts ON "my docs" USING fts ("my col", body) WITH (weights = 'my col=10.0,body=1.0')"#
                 .to_string()
         )]]
     );
     assert_eq!(
         limbo_exec_rows(
             &conn,
-            "SELECT id FROM docs WHERE fts_match(title, body, 'needle') \
-             ORDER BY fts_score(title, body, 'needle') DESC"
+            r#"SELECT id FROM "my docs" WHERE fts_match("my col", body, 'needle') ORDER BY fts_score("my col", body, 'needle') DESC"#
         ),
         vec![
             vec![rusqlite::types::Value::Integer(1)],
@@ -3201,7 +3269,7 @@ fn test_fts_rename_weighted_column_keeps_weight_after_reopen(tmp_db: TempDatabas
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test(mvcc)]
-fn test_fts_rename_weighted_column_to_name_with_comma_fails(tmp_db: TempDatabase) {
+fn test_fts_rename_column_to_name_fts_cannot_use_fails(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
         .unwrap();
@@ -3220,8 +3288,24 @@ fn test_fts_rename_weighted_column_to_name_with_comma_fails(tmp_db: TempDatabase
             .contains("the name cannot be written in FTS weights"),
         "{error}"
     );
+    let error = conn
+        .execute(r#"ALTER TABLE docs RENAME COLUMN a TO "-x""#)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(r#"FTS cannot index a column named "-x""#),
+        "{error}"
+    );
     conn.execute("COMMIT").unwrap();
     assert_eq!(limbo_exec_rows(&conn, schema), schema_before);
+
+    conn.execute("INSERT INTO docs VALUES (1, 'hello', 'x')")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM docs WHERE fts_match(a, b, 'hello')"),
+        vec![vec![rusqlite::types::Value::Integer(1)]]
+    );
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -5037,7 +5121,7 @@ fn fts_read_cache_is_shared_across_connections_and_bounded() {
         .attach(&IndexMethodConfiguration {
             table_name: "docs".to_string(),
             index_name: "docs_fts".to_string(),
-            columns: vec![IndexColumn::new("content", 1, CollationSeq::Binary)],
+            columns: vec![IndexColumn::new("content", 1, CollationSeq::BINARY)],
             parameters: HashMap::default(),
         })
         .unwrap();
@@ -7237,4 +7321,39 @@ fn run_in_concurrent_transaction(
         let _ = conn.execute("ROLLBACK");
     }
     result
+}
+
+#[turso_macros::test]
+fn rejected_index_method_value_keeps_row_and_index_consistent(tmp_db: TempDatabase) {
+    // The index method rejects the new value after the UPDATE already
+    // removed the row's old index entries, so the statement needs a
+    // statement savepoint: on error the entries come back, the transaction
+    // survives, and the index still finds the row.
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE vectors (id INTEGER PRIMARY KEY, embedding)")
+        .unwrap();
+    conn.execute("CREATE INDEX vectors_idx ON vectors USING toy_vector_sparse_ivf (embedding)")
+        .unwrap();
+    conn.execute("INSERT INTO vectors VALUES (1, vector32_sparse('[1,0,0]'))")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert!(conn
+        .execute("UPDATE vectors SET embedding = 'zz' WHERE id = 1")
+        .is_err());
+    assert!(!conn.get_auto_commit(), "the transaction must survive");
+    conn.execute("COMMIT").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows(
+        "SELECT id FROM vectors \
+         ORDER BY vector_distance_jaccard(embedding, vector32_sparse('[1,0,0]')) LIMIT 5",
+    );
+    assert_eq!(
+        rows,
+        vec![(1,)],
+        "the query must still find the row through the index"
+    );
+    // integrity_check still reports the row missing from the backing
+    // B-trees: index-method writes survive transaction rollback, a
+    // pre-existing bug (main corrupts the same way through plain ROLLBACK
+    // and autocommit error rollback). Once that is fixed, assert
+    // integrity_check here too.
 }

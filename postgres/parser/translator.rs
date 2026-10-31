@@ -5,8 +5,9 @@
 
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_UNDEFINED_FUNCTION,
-    SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
+    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
+    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -777,16 +778,30 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::TransactionStmtKind;
 
+        // Implementing AND CHAIN requires more than translation: on an
+        // aborted block PostgreSQL still starts the chained transaction, and
+        // the frontend's aborted-state redirect (tx_gate in
+        // postgres/frontend/statement.rs) ends the block without chaining.
+        // The and_chain_is_rejected_in_every_transaction_state test pins the
+        // rejection and says what must change.
         if txn.chain {
             return Err(not_supported("COMMIT/ROLLBACK AND CHAIN"));
         }
-        check_transaction_options(&txn.options, false)?;
+        check_transaction_options(&txn.options, true)?;
 
         match TransactionStmtKind::try_from(txn.kind) {
             Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
+                let access_mode = last_access_mode_option(&txn.options).map(|ro| {
+                    if ro {
+                        ast::AccessMode::ReadOnly
+                    } else {
+                        ast::AccessMode::ReadWrite
+                    }
+                });
                 Ok(ast::Stmt::Begin {
                     typ: Some(ast::TransactionType::Concurrent),
                     name: None,
+                    access_mode,
                 })
             }
             Ok(TransactionStmtKind::TransStmtCommit) => Ok(ast::Stmt::Commit { name: None }),
@@ -3403,37 +3418,26 @@ impl PostgreSQLTranslator {
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("SIMILAR TO: missing lhs".into()))?;
 
-                // The rhs is wrapped in a FuncCall to similar_to_escape(pattern).
-                // Extract the actual pattern from inside that wrapper.
                 let rhs_node = a_expr
                     .rexpr
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("SIMILAR TO: missing rhs".into()))?;
 
-                let pattern_node = match &rhs_node.node {
-                    Some(pg_query::protobuf::node::Node::FuncCall(fc)) => {
-                        if fc.args.len() > 1 {
-                            return Err(not_supported("SIMILAR TO ... ESCAPE"));
-                        }
-                        // Extract the first argument (the pattern) from similar_to_escape()
-                        fc.args.first().unwrap_or(rhs_node)
-                    }
-                    _ => rhs_node,
-                };
-
-                let rhs_expr = self.translate_operand(pattern_node)?;
-                let regex_rhs = match rhs_expr {
-                    ast::Expr::Literal(ast::Literal::String(ref pat)) => {
-                        // String literals in our AST include surrounding quotes
-                        let unquoted = pat
-                            .strip_prefix('\'')
-                            .and_then(|s| s.strip_suffix('\''))
-                            .unwrap_or(pat);
-                        let regex = similar_to_regex(unquoted);
-                        // Re-wrap with quotes for the AST
-                        ast::Expr::Literal(ast::Literal::String(format!("'{regex}'")))
-                    }
-                    _ => return Err(not_supported("SIMILAR TO with a non-literal pattern")),
+                // A literal pattern becomes a literal regex, which also works in
+                // index expressions, where frontend functions cannot.
+                let regex_rhs = if let Some((pattern, escape)) = similar_to_literal_args(rhs_node) {
+                    let regex = similar_to_regex(pattern, escape)?;
+                    ast::Expr::Literal(ast::Literal::String(format!(
+                        "'{}'",
+                        regex.replace('\'', "''")
+                    )))
+                } else if self.translating_index.get() {
+                    return Err(ParseError::ParseError(
+                        "CREATE INDEX supports SIMILAR TO only with a string-literal pattern and ESCAPE".to_string(),
+                    ));
+                } else {
+                    // The frontend's similar_to_escape() converts the pattern at run time.
+                    self.translate_operand(rhs_node)?
                 };
 
                 Ok(ast::Expr::Like {
@@ -3925,6 +3929,27 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
+        // PostgreSQL reads untyped string literal arguments of age() as
+        // timestamptz. Casting them gives the text the timestamp type's input
+        // rules, so age() only sees timestamps in their stored form.
+        let args = if func_name == "age" {
+            args.into_iter()
+                .map(|arg| match *arg {
+                    ast::Expr::Literal(ast::Literal::String(_)) => Box::new(ast::Expr::Cast {
+                        expr: arg,
+                        type_name: Some(ast::Type {
+                            name: "timestamptz".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
+                    _ => arg,
+                })
+                .collect()
+        } else {
+            args
+        };
+
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
@@ -4265,7 +4290,10 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = Box::new(self.translate_select(select_stmt)?);
+        let select = Box::new(match sub_link.sub_link_type() {
+            SubLinkType::ExistsSublink => self.translate_exists_subquery(select_stmt)?,
+            _ => self.translate_select(select_stmt)?,
+        });
 
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
@@ -4296,6 +4324,39 @@ impl PostgreSQLTranslator {
                 "Unsupported SubLink type: {other:?}",
             ))),
         }
+    }
+
+    /// EXISTS only checks whether its subquery returns a row, and PostgreSQL
+    /// lets that subquery select no columns: `EXISTS (SELECT FROM t)`. A Turso
+    /// SELECT needs a column, so such a subquery selects the constant 1.
+    fn translate_exists_subquery(
+        &self,
+        select: &pg_query::protobuf::SelectStmt,
+    ) -> Result<ast::Select, ParseError> {
+        use pg_query::protobuf::{a_const, node::Node, AConst, Integer, ResTarget};
+
+        if !select.target_list.is_empty()
+            || !select.values_lists.is_empty()
+            || is_set_operation(select)
+        {
+            return self.translate_select(select);
+        }
+        reject_positions_in_empty_select_list(select)?;
+        let one = AConst {
+            val: Some(a_const::Val::Ival(Integer { ival: 1 })),
+            ..Default::default()
+        };
+        let target = ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(Node::AConst(one)),
+            })),
+            ..Default::default()
+        };
+        let mut select = select.clone();
+        select.target_list.push(pg_query::protobuf::Node {
+            node: Some(Node::ResTarget(Box::new(target))),
+        });
+        self.translate_select(&select)
     }
 
     fn translate_array_subquery(select: ast::Select) -> ast::Expr {
@@ -5936,6 +5997,7 @@ fn translate_create_enum(
             }],
             base: "text".into(),
             encode: Some(Box::new(encode)),
+            coerce: None,
             decode: Some(Box::new(decode)),
             operators: vec![ast::TypeOperator {
                 op: "<".into(),
@@ -6236,6 +6298,30 @@ pub struct PgShowStmt {
     pub name: String,
 }
 
+/// Whether a parsed statement is one PostgreSQL still accepts inside an
+/// aborted transaction block: COMMIT/END, ROLLBACK/ABORT, or ROLLBACK TO
+/// SAVEPOINT (`IsTransactionExitStmt` in PostgreSQL's postgres.c).
+/// PostgreSQL's list also has PREPARE TRANSACTION; it is left out here
+/// deliberately while two-phase commit is unsupported.
+pub fn is_tx_exit_stmt(parse_result: &ParseResult) -> bool {
+    use pg_query::protobuf::TransactionStmtKind;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(node) = nodes.first() else {
+        return false;
+    };
+    let NodeRef::TransactionStmt(txn) = &node.0 else {
+        return false;
+    };
+    matches!(
+        TransactionStmtKind::try_from(txn.kind),
+        Ok(TransactionStmtKind::TransStmtCommit
+            | TransactionStmtKind::TransStmtRollback
+            | TransactionStmtKind::TransStmtRollbackTo)
+    )
+}
+
 /// Try to extract a SET, SET ... TO DEFAULT, SET ... FROM CURRENT or RESET
 /// statement of one parameter from a PG parse result.
 /// Returns None if the statement is not one of those.
@@ -6350,6 +6436,70 @@ pub fn check_set_transaction(parse_result: &ParseResult) -> Result<bool, ParseEr
         }
         _ => Ok(false),
     }
+}
+
+/// Whether PostgreSQL takes a snapshot to run the statement, which is what
+/// counts as a transaction's first query and blocks a later switch to READ
+/// WRITE. Transaction control, LOCK, SET, and SHOW run without one;
+/// everything else gets a snapshot when it executes, including utility
+/// statements like COMMENT ON.
+pub fn execution_takes_snapshot(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    !matches!(
+        parse_result.protobuf.nodes().first().map(|n| &n.0),
+        Some(
+            NodeRef::TransactionStmt(_)
+                | NodeRef::LockStmt(_)
+                | NodeRef::VariableSetStmt(_)
+                | NodeRef::VariableShowStmt(_)
+        )
+    )
+}
+
+/// The access mode a SET TRANSACTION statement names: Some(true) for READ
+/// ONLY, Some(false) for READ WRITE, None when the statement is not SET
+/// TRANSACTION or names no access mode.
+pub fn set_transaction_access_mode(parse_result: &ParseResult) -> Option<bool> {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(NodeRef::VariableSetStmt(stmt)) = nodes.first().map(|n| &n.0) else {
+        return None;
+    };
+    if stmt.kind != VariableSetKind::VarSetMulti as i32
+        || !stmt.name.eq_ignore_ascii_case("transaction")
+    {
+        return None;
+    }
+    last_access_mode_option(&stmt.args)
+}
+
+/// The access mode set by a list of transaction options: Some(true) for READ
+/// ONLY, Some(false) for READ WRITE, None when no access-mode option appears.
+/// PostgreSQL applies the LAST access-mode option when multiple are given,
+/// e.g. BEGIN READ ONLY, READ WRITE is READ WRITE.
+fn last_access_mode_option(options: &[pg_query::protobuf::Node]) -> Option<bool> {
+    use pg_query::protobuf::node::Node;
+
+    options
+        .iter()
+        .filter_map(|opt| {
+            let Node::DefElem(def) = opt.node.as_ref()? else {
+                return None;
+            };
+            if def.defname != "transaction_read_only" {
+                return None;
+            }
+            Some(!matches!(
+                def.arg.as_ref().and_then(|n| n.node.as_ref()),
+                Some(Node::AConst(pg_query::protobuf::AConst {
+                    val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
+                    ..
+                })) if i.ival == 0
+            ))
+        })
+        .next_back()
 }
 
 /// The byte offset of the table name in a CREATE TABLE statement that names
@@ -6813,6 +6963,63 @@ pub fn try_extract_copy_from(
     }))
 }
 
+/// A statement that the PostgreSQL session runs itself instead of
+/// translating it: the translator refuses all of these. One variant per kind,
+/// so that callers which must decide something for each of them (the
+/// session runs them, a server classifies them) match it exhaustively and a
+/// new kind is a compile error there instead of a statement that falls
+/// through.
+pub enum SessionStmt {
+    /// SET, SET ... TO DEFAULT, SET ... FROM CURRENT or RESET of one parameter.
+    Set(PgSetStmt),
+    /// SET TRANSACTION or SET SESSION CHARACTERISTICS AS TRANSACTION.
+    SetTransaction,
+    Show(PgShowStmt),
+    ResetAll,
+    DiscardAll,
+    CreateSchema(PgCreateSchemaStmt),
+    DropSchema(PgDropSchemaStmt),
+    RefreshMatview,
+    CommentOn,
+    CopyFrom(PgCopyFromStmt),
+}
+
+/// The statement of `parse_result` if the session runs it itself, `None` if
+/// it is translated.
+pub fn session_stmt(parse_result: &ParseResult) -> Result<Option<SessionStmt>, ParseError> {
+    if let Some(stmt) = try_extract_set(parse_result) {
+        return Ok(Some(SessionStmt::Set(stmt)));
+    }
+    if check_set_transaction(parse_result)? {
+        return Ok(Some(SessionStmt::SetTransaction));
+    }
+    if let Some(stmt) = try_extract_show(parse_result) {
+        return Ok(Some(SessionStmt::Show(stmt)));
+    }
+    if is_reset_all(parse_result) {
+        return Ok(Some(SessionStmt::ResetAll));
+    }
+    if is_discard_all(parse_result) {
+        return Ok(Some(SessionStmt::DiscardAll));
+    }
+    if let Some(stmt) = try_extract_create_schema(parse_result)? {
+        return Ok(Some(SessionStmt::CreateSchema(stmt)));
+    }
+    if let Some(stmt) = try_extract_drop_schema(parse_result) {
+        return Ok(Some(SessionStmt::DropSchema(stmt)));
+    }
+    if is_refresh_matview(parse_result)? {
+        return Ok(Some(SessionStmt::RefreshMatview));
+    }
+    if is_comment_on(parse_result) {
+        return Ok(Some(SessionStmt::CommentOn));
+    }
+    if let Some(stmt) = try_extract_copy_from(parse_result)? {
+        return Ok(Some(SessionStmt::CopyFrom(stmt)));
+    }
+    Ok(None)
+}
+
 fn copy_string_option(def: &pg_query::protobuf::DefElem) -> Result<String, ParseError> {
     def_elem_string_val(def).ok_or_else(|| {
         ParseError::ParseError(format!(
@@ -6995,33 +7202,100 @@ fn like_pattern_to_glob(pattern: &str) -> Option<String> {
     (glob.len() <= SQLITE_MAX_LIKE_PATTERN_LENGTH).then_some(glob)
 }
 
-/// Convert a SQL SIMILAR TO pattern to a regex anchored with ^(?:...)$.
-/// `%` → `.*`, `_` → `.`, and `.`, `^`, `$`, which are literals in SIMILAR TO,
-/// are escaped; other regex metacharacters and escapes are kept as-is.
-fn similar_to_regex(pattern: &str) -> String {
+/// The pattern and ESCAPE string of a SIMILAR TO, when both are string
+/// literals. pg_query passes them as the arguments of
+/// similar_to_escape(pattern[, escape]); without ESCAPE, `\` is the escape.
+fn similar_to_literal_args(rhs: &pg_query::protobuf::Node) -> Option<(&str, &str)> {
+    use pg_query::protobuf::{a_const::Val, node::Node, AConst};
+    let Some(Node::FuncCall(call)) = &rhs.node else {
+        return None;
+    };
+    let mut args = call.args.iter().map(|arg| match &arg.node {
+        Some(Node::AConst(AConst {
+            val: Some(Val::Sval(s)),
+            ..
+        })) => Some(s.sval.as_str()),
+        _ => None,
+    });
+    let pattern = args.next()??;
+    let escape = match args.next() {
+        Some(escape) => escape?,
+        None => "\\",
+    };
+    Some((pattern, escape))
+}
+
+/// Convert a SQL SIMILAR TO pattern to a regex anchored with ^(?:...)$, as
+/// PostgreSQL's similar_to_escape() does. `%` → `.*`, `_` → `.`, `(` → `(?:`,
+/// and `.`, `^`, `$` and `\`, which are literals in SIMILAR TO, are escaped;
+/// other regex metacharacters are kept as-is. `escape` is the ESCAPE string: one
+/// character, or empty for none. The escape character followed by `"`
+/// separates the pattern into the parts that substring() would return.
+pub fn similar_to_regex(pattern: &str, escape: &str) -> Result<String, ParseError> {
+    let mut escape_chars = escape.chars();
+    let escape = match (escape_chars.next(), escape_chars.next()) {
+        (escape, None) => escape,
+        _ => {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+                message: "invalid escape string: Escape string must be empty or one character."
+                    .to_string(),
+            })
+        }
+    };
     let mut regex = String::with_capacity(pattern.len() + 8);
     regex.push_str("^(?:");
     let mut in_bracket = false;
+    let mut separators = 0;
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         if in_bracket {
+            // Like PostgreSQL, a custom escape character escapes the next
+            // character inside brackets too, and there `"` is not a separator.
+            if Some(c) == escape && c != '\\' {
+                if let Some(next) = chars.next() {
+                    regex.push('\\');
+                    regex.push(next);
+                }
+                continue;
+            }
+            if c == '\\' && escape != Some('\\') {
+                regex.push('\\');
+            }
             regex.push(c);
             if c == ']' {
                 in_bracket = false;
             }
             continue;
         }
-        match c {
-            '%' => regex.push_str(".*"),
-            '_' => regex.push('.'),
-            '\\' => {
-                // Escaped character: pass through literally
-                if let Some(next) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some('"') => {
+                    regex.push_str(match separators {
+                        0 => "){1,1}?(",
+                        1 => "){1,1}(?:",
+                        _ => {
+                            return Err(ParseError::Sqlstate {
+                                sqlstate: SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
+                                message: "SQL regular expression may not contain more than two escape-double-quote separators".to_string(),
+                            })
+                        }
+                    });
+                    separators += 1;
+                }
+                Some(next) => {
                     regex.push('\\');
                     regex.push(next);
                 }
+                None => {}
             }
-            '.' | '^' | '$' => {
+            continue;
+        }
+        match c {
+            '%' => regex.push_str(".*"),
+            '_' => regex.push('.'),
+            '(' => regex.push_str("(?:"),
+            '.' | '^' | '$' | '\\' => {
                 regex.push('\\');
                 regex.push(c);
             }
@@ -7039,7 +7313,7 @@ fn similar_to_regex(pattern: &str) -> String {
         }
     }
     regex.push_str(")$");
-    regex
+    Ok(regex)
 }
 
 /// Converts a CamelCase identifier to UPPER CASE SQL keywords.
@@ -7235,6 +7509,38 @@ fn reject_into_clause(
     Ok(())
 }
 
+/// ORDER BY and GROUP BY read an integer constant as a position in the select
+/// list, so with no columns PostgreSQL rejects every such position.
+fn reject_positions_in_empty_select_list(
+    select: &pg_query::protobuf::SelectStmt,
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::{a_const, node::Node, AConst};
+
+    let order_by = select
+        .sort_clause
+        .iter()
+        .filter_map(|item| match &item.node {
+            Some(Node::SortBy(sort_by)) => sort_by.node.as_deref(),
+            _ => None,
+        });
+    let items = order_by
+        .map(|item| ("ORDER BY", item))
+        .chain(select.group_clause.iter().map(|item| ("GROUP BY", item)));
+    for (clause, item) in items {
+        if let Some(Node::AConst(AConst {
+            val: Some(a_const::Val::Ival(position)),
+            ..
+        })) = &item.node
+        {
+            return Err(ParseError::Sqlstate {
+                sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+                message: format!("{clause} position {} is not in select list", position.ival),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn is_set_operation(stmt: &pg_query::protobuf::SelectStmt) -> bool {
     use pg_query::protobuf::SetOperation;
     !matches!(stmt.op(), SetOperation::SetopNone | SetOperation::Undefined)
@@ -7421,6 +7727,46 @@ fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_stmt_names_each_kind_the_session_runs() {
+        let kind = |sql: &str| {
+            let parsed = crate::parse(sql).unwrap();
+            session_stmt(&parsed).unwrap().map(|stmt| match stmt {
+                SessionStmt::Set(_) => "set",
+                SessionStmt::SetTransaction => "set transaction",
+                SessionStmt::Show(_) => "show",
+                SessionStmt::ResetAll => "reset all",
+                SessionStmt::DiscardAll => "discard all",
+                SessionStmt::CreateSchema(_) => "create schema",
+                SessionStmt::DropSchema(_) => "drop schema",
+                SessionStmt::RefreshMatview => "refresh matview",
+                SessionStmt::CommentOn => "comment on",
+                SessionStmt::CopyFrom(_) => "copy from",
+            })
+        };
+        for (sql, want) in [
+            ("SET search_path TO app", "set"),
+            ("RESET search_path", "set"),
+            (
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                "set transaction",
+            ),
+            ("SHOW search_path", "show"),
+            ("RESET ALL", "reset all"),
+            ("DISCARD ALL", "discard all"),
+            ("CREATE SCHEMA IF NOT EXISTS app", "create schema"),
+            ("DROP SCHEMA app CASCADE", "drop schema"),
+            ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
+            ("COMMENT ON TABLE t IS 'x'", "comment on"),
+            ("COPY t FROM '/tmp/t.csv'", "copy from"),
+        ] {
+            assert_eq!(kind(sql), Some(want), "{sql}");
+        }
+        for sql in ["SELECT 1", "CREATE TABLE t (id int)", "DROP TABLE t"] {
+            assert_eq!(kind(sql), None, "{sql}");
+        }
+    }
 
     #[test]
     fn create_sequence_as_type_bounds_the_range() {
@@ -10489,14 +10835,39 @@ mod tests {
 
     #[test]
     fn fail_closed_transaction_options() {
-        assert_not_supported("BEGIN READ ONLY", "READ ONLY");
-        assert_not_supported(
-            "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-            "READ ONLY",
-        );
+        assert_translates("BEGIN READ ONLY");
+        assert_translates("START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
         assert_not_supported("COMMIT AND CHAIN", "AND CHAIN");
         assert_not_supported("ROLLBACK AND CHAIN", "AND CHAIN");
         assert_translates("COMMIT AND NO CHAIN");
+    }
+
+    #[test]
+    fn set_transaction_access_mode_detects_access_modes() {
+        let set_rw = crate::parse("SET TRANSACTION READ WRITE").unwrap();
+        let set_ro = crate::parse("SET TRANSACTION READ ONLY").unwrap();
+        let set_iso_only = crate::parse("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").unwrap();
+        let set_rw_with_iso =
+            crate::parse("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE").unwrap();
+        let begin_ro = crate::parse("BEGIN READ ONLY").unwrap();
+        let commit = crate::parse("COMMIT").unwrap();
+        let select = crate::parse("SELECT 1").unwrap();
+        assert_eq!(set_transaction_access_mode(&set_rw), Some(false));
+        assert_eq!(set_transaction_access_mode(&set_ro), Some(true));
+        assert_eq!(set_transaction_access_mode(&set_iso_only), None);
+        assert_eq!(set_transaction_access_mode(&set_rw_with_iso), Some(false));
+        assert_eq!(set_transaction_access_mode(&begin_ro), None);
+        assert_eq!(set_transaction_access_mode(&commit), None);
+        assert_eq!(set_transaction_access_mode(&select), None);
+    }
+
+    #[test]
+    fn set_transaction_access_mode_uses_last_access_mode_option() {
+        // PostgreSQL applies the last access-mode option when multiple are given.
+        let rw_then_ro = crate::parse("SET TRANSACTION READ WRITE, READ ONLY").unwrap();
+        let ro_then_rw = crate::parse("SET TRANSACTION READ ONLY, READ WRITE").unwrap();
+        assert_eq!(set_transaction_access_mode(&rw_then_ro), Some(true));
+        assert_eq!(set_transaction_access_mode(&ro_then_rw), Some(false));
     }
 
     #[test]
@@ -11035,10 +11406,17 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_similar_to() {
-        assert_not_supported("SELECT 'a%' SIMILAR TO 'a#%' ESCAPE '#'", "ESCAPE");
-        assert_not_supported("SELECT a SIMILAR TO b FROM t", "non-literal pattern");
+    fn similar_to_escape() {
+        assert_translates("SELECT 'a%' SIMILAR TO 'a#%' ESCAPE '#'");
+        assert_translates("SELECT a SIMILAR TO b FROM t");
         assert_translates("SELECT 'abc' SIMILAR TO 'a%'");
+        assert_eq!(
+            similar_to_regex(r#"a#%#"b#"c\"#, "#").unwrap(),
+            r#"^(?:a\%){1,1}?(b){1,1}(?:c\\)$"#
+        );
+        assert_eq!(similar_to_regex(r"a\%", "").unwrap(), r"^(?:a\\.*)$");
+        assert!(similar_to_regex("a", "##").is_err());
+        assert!(similar_to_regex(r#"#"a#"b#"c"#, "#").is_err());
     }
 
     #[test]

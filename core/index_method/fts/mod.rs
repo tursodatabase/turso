@@ -128,7 +128,7 @@ impl FtsStore {
 
 fn key_info() -> KeyInfo {
     KeyInfo {
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
         sort_order: SortOrder::Asc,
         nulls_order: None,
     }
@@ -364,44 +364,52 @@ impl IndexMethod for FtsIndexMethod {
         let ast::Expr::Literal(ast::Literal::String(weights)) = value.as_mut() else {
             return Ok(());
         };
-        let entries = split_weights(weights).collect::<Result<Vec<_>>>()?;
-        if !entries
-            .iter()
-            .any(|(column, _)| column.eq_ignore_ascii_case(from))
-        {
-            return Ok(());
+        if let Some(renamed_weights) = rename_column_in_weights(weights, from, to)? {
+            *weights = renamed_weights;
         }
-        let renamed: Vec<(&str, &str)> = entries
-            .into_iter()
-            .map(|(column, weight)| {
-                if column.eq_ignore_ascii_case(from) {
-                    (to, weight)
-                } else {
-                    (column, weight)
-                }
-            })
-            .collect();
-        let renamed_weights = format!(
-            "'{}'",
-            crate::util::escape_sql_string_literal(
-                &renamed
-                    .iter()
-                    .map(|(column, weight)| format!("{column}={weight}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        );
-        if !split_weights(&renamed_weights)
-            .collect::<Result<Vec<_>>>()
-            .is_ok_and(|read_back| read_back == renamed)
-        {
-            return Err(LimboError::ParseError(format!(
-                "cannot rename column {from} to \"{to}\": the name cannot be written in FTS weights"
-            )));
-        }
-        *weights = renamed_weights;
         Ok(())
     }
+}
+
+/// Renames column `from` to `to` in a weights value like 'title=2.0,body=1.0'
+/// Returns None if the weights do not name the column
+fn rename_column_in_weights(weights: &str, from: &str, to: &str) -> Result<Option<String>> {
+    let entries = split_weights(weights).collect::<Result<Vec<_>>>()?;
+    if !entries
+        .iter()
+        .any(|(column, _)| column.eq_ignore_ascii_case(from))
+    {
+        return Ok(None);
+    }
+    let renamed: Vec<(&str, &str)> = entries
+        .into_iter()
+        .map(|(column, weight)| {
+            if column.eq_ignore_ascii_case(from) {
+                (to, weight)
+            } else {
+                (column, weight)
+            }
+        })
+        .collect();
+    let renamed_weights = format!(
+        "'{}'",
+        crate::util::escape_sql_string_literal(
+            &renamed
+                .iter()
+                .map(|(column, weight)| format!("{column}={weight}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    );
+    if !split_weights(&renamed_weights)
+        .collect::<Result<Vec<_>>>()
+        .is_ok_and(|read_back| read_back == renamed)
+    {
+        return Err(LimboError::ParseError(format!(
+            "cannot rename column {from} to \"{to}\": the name cannot be written in FTS weights"
+        )));
+    }
+    Ok(Some(renamed_weights))
 }
 
 /// Splits a weights value like 'title=2.0, body=1.0' into (column, weight) pairs
@@ -799,6 +807,18 @@ impl FtsIndexAttachment {
             HashMap::default()
         };
 
+        // Tantivy panics on these names, so refuse them here
+        for col in &cfg.columns {
+            if !tantivy::schema::is_valid_field_name(&col.name)
+                || [ROWID_FIELD, IDENTITY_HI_FIELD, IDENTITY_LO_FIELD].contains(&col.name.as_str())
+            {
+                return Err(LimboError::ParseError(format!(
+                    "FTS cannot index a column named \"{}\": the name must not be empty, start with '-', or be one of {ROWID_FIELD}, {IDENTITY_HI_FIELD}, {IDENTITY_LO_FIELD}",
+                    col.name
+                )));
+            }
+        }
+
         // Build Tantivy schema (no Directory or Index creation yet)
         let mut schema_builder = Schema::builder();
 
@@ -845,45 +865,35 @@ impl FtsIndexAttachment {
         let cols = cfg
             .columns
             .iter()
-            .map(|c| c.name.as_str())
+            .map(|c| crate::util::quote_identifier(&c.name))
             .collect::<Vec<_>>()
             .join(", ");
+        let table = crate::util::quote_identifier(&cfg.table_name);
 
         // Pattern 0: score with ORDER BY DESC LIMIT
         let score_pattern = format!(
-            "SELECT fts_score({}, ?) as score FROM {} ORDER BY score DESC LIMIT ?",
-            cols, cfg.table_name
+            "SELECT fts_score({cols}, ?) as score FROM {table} ORDER BY score DESC LIMIT ?"
         );
         // Pattern 1: combined + ORDER BY DESC + LIMIT (most specific)
         let combined_ordered_limit = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score DESC LIMIT ?",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC LIMIT ?"
         );
         // Pattern 2: combined + ORDER BY DESC (no LIMIT)
         let combined_ordered = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score DESC",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC"
         );
         // Pattern 3: combined + LIMIT (no ORDER BY)
         let combined_limit = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) LIMIT ?",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) LIMIT ?"
         );
         // Pattern 4: combined (no ORDER BY, no LIMIT)
         let combined = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1)",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1)"
         );
         // Pattern 5: match + LIMIT
-        let match_limit = format!(
-            "SELECT * FROM {} WHERE fts_match({}, ?) LIMIT ?",
-            cfg.table_name, cols
-        );
+        let match_limit = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?");
         // Pattern 6: match (no LIMIT)
-        let match_pattern = format!(
-            "SELECT * FROM {} WHERE fts_match({}, ?)",
-            cfg.table_name, cols
-        );
+        let match_pattern = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)");
         let patterns = parse_patterns(&[
             &score_pattern,          // 0
             &combined_ordered_limit, // 1
@@ -985,6 +995,37 @@ impl IndexMethodAttachment for FtsIndexAttachment {
         selected.push(args.last()?.clone());
         *args = selected;
         Some(result)
+    }
+
+    fn rename_column(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
+        if !self
+            .cfg
+            .columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(from))
+        {
+            return Ok(None);
+        }
+        let mut cfg = self.cfg.clone();
+        for column in &mut cfg.columns {
+            if column.name.eq_ignore_ascii_case(from) {
+                column.name = to.to_string();
+            }
+        }
+        if let Some((_, Value::Text(weights))) = cfg
+            .parameters
+            .iter_mut()
+            .find(|(key, _)| key.eq_ignore_ascii_case("weights"))
+        {
+            if let Some(renamed_weights) = rename_column_in_weights(weights.as_str(), from, to)? {
+                *weights = crate::types::Text::new(renamed_weights);
+            }
+        }
+        Ok(Some(Arc::new(FtsIndexAttachment::new(cfg)?)))
     }
 }
 

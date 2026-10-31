@@ -108,7 +108,7 @@ STRICT tables only allow these base type names:
 **Turso Extension**: Custom types are a Turso-specific feature not available in SQLite. Custom types work only with STRICT tables. This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
 </Info>
 
-Custom types let you define how values are encoded before storage and decoded when read, enforce domain constraints at the storage layer, attach operators, and provide defaults. Custom types are declared with the `CREATE TYPE` statement.
+Custom types let you define how values are encoded before storage and decoded when read, enforce domain constraints at the storage layer, and provide defaults. Custom types are declared with the `CREATE TYPE` statement.
 
 ```sql
 -- A type that stores monetary values as cents
@@ -163,7 +163,7 @@ INSERT INTO events VALUES (
 );
 ```
 
-For the full custom types reference including ENCODE/DECODE, operators, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
+For the full custom types reference including ENCODE/DECODE/COERCE, parametric types, and validation, see [CREATE TYPE](/docs/sql-reference/statements/create-type).
 
 ### Composite Types: STRUCT and UNION
 
@@ -222,6 +222,8 @@ INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], '["a","b"]', '[0, 1, 1]');
 ```
 
 Arrays are displayed as JSON arrays on output. Element types are validated against the declared base type — for example, an `INTEGER[]` column rejects non-numeric text elements.
+
+Arrays compare element by element, each element by its stored value: in an `INTEGER[]`, `'{1}'` and `'{1.0}'` are equal, while in a `TEXT[]` they are the different texts `'1'` and `'1.0'`. Because of this, an array of a type with its own order, such as `numeric[]`, is an error: its elements would not compare in that type's order.
 
 For the full set of array functions, operators, and subscript syntax, see [Array Functions](/docs/sql-reference/functions/array).
 

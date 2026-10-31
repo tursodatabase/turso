@@ -53,7 +53,9 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
+        builder::{
+            CursorKey, CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder, ProgramBuilderOpts,
+        },
         insn::{
             to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn,
             RegisterOrLiteral,
@@ -563,8 +565,9 @@ pub fn translate_insert(
         &btree_table,
     );
 
-    let dml_ctx =
-        DmlColumnContext::from_column_reg_mapping(insertion.col_mappings.iter().map(|cm| {
+    // The inserted values are the user's values until ENCODE runs below.
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(
+        insertion.col_mappings.iter().map(|cm| {
             (
                 cm.column,
                 if cm.column.is_rowid_alias() {
@@ -573,7 +576,9 @@ pub fn translate_insert(
                     cm.register
                 },
             )
-        }));
+        }),
+        DmlRowForm::UserFacing,
+    );
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
@@ -730,7 +735,7 @@ pub fn translate_insert(
     // see the rowids this statement has used unless they are written first.
     if let Some(meta) = ctx
         .autoincrement_meta
-        .filter(|_| any_trigger_inserts_into(resolver, ctx.namespace, &ctx.table.name))
+        .filter(|meta| meta.trigger_inserts_into_table)
     {
         emit_write_sqlite_sequence(program, resolver, ctx.namespace.database_id, meta)?;
     }
@@ -803,7 +808,7 @@ pub fn translate_insert(
         compute_virtual_columns(
             program,
             &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
+            &dml_ctx.with_form(DmlRowForm::Stored),
             resolver,
             &btree_table,
         )?;
@@ -829,6 +834,7 @@ pub fn translate_insert(
     }
 
     // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
+    let check_halt_on_error = program.constraint_halt_on_error(ctx.on_conflict);
     emit_check_constraints(
         program,
         &ctx.table.check_constraints,
@@ -849,6 +855,7 @@ pub fn translate_insert(
         }),
         connection,
         ctx.on_conflict,
+        check_halt_on_error,
         ctx.loop_labels.row_done,
         Some(&table_references),
     )?;
@@ -910,9 +917,11 @@ pub fn translate_insert(
     // wrong index entries. Collations likewise: a rewritten reference to a
     // NOCASE column must keep comparing case-insensitively.
     for cm in &insertion.col_mappings {
+        let register_column =
+            RegisterColumn::table_column(cm.column, ctx.table.is_strict, resolver.schema());
         resolver
             .register_columns
-            .insert(cm.register, RegisterColumn::table_column(cm.column));
+            .insert(cm.register, register_column);
     }
     resolver
         .register_columns
@@ -1178,6 +1187,7 @@ pub fn translate_insert(
         let has_upsert_do_update = upsert_actions
             .iter()
             .any(|(_, _, upsert)| matches!(upsert.do_clause, UpsertDo::Set { .. }));
+        let has_returning = !result_columns.is_empty();
         set_insert_stmt_journal_flags(
             program,
             resolver,
@@ -1187,6 +1197,7 @@ pub fn translate_insert(
             ctx.on_conflict,
             inserting_multiple_rows,
             has_triggers,
+            has_returning,
             has_fks,
             has_upsert,
             has_upsert_do_update,
@@ -1352,7 +1363,9 @@ fn emit_write_sqlite_sequence(
     database_id: usize,
     meta: AutoincMeta,
 ) -> Result<()> {
-    reload_autoincrement_state(program, meta);
+    if meta.trigger_inserts_into_table {
+        reload_autoincrement_state(program, meta);
+    }
     let write_label = program.allocate_label();
     let done_label = program.allocate_label();
     program.emit_insn(Insn::IsNull {
@@ -1399,7 +1412,7 @@ fn emit_partial_index_check(
         .iter()
         .map(|cm| cm.column.clone())
         .collect();
-    let mut column_regs: Vec<usize> = insertion
+    let column_regs: Vec<usize> = insertion
         .col_mappings
         .iter()
         .map(|cm| {
@@ -1416,10 +1429,9 @@ fn emit_partial_index_check(
         resolver,
         expr,
         &columns,
-        &mut column_regs,
+        &column_regs,
         table,
         reg,
-        true,
     )?;
     let skip_label = program.allocate_label();
     program.emit_insn(Insn::IfNot {
@@ -1580,7 +1592,9 @@ fn emit_rowid_generation(
             insertion.key_register(),
         )?;
     } else if let Some(meta) = ctx.autoincrement_meta {
-        reload_autoincrement_state(program, meta);
+        if meta.trigger_inserts_into_table {
+            reload_autoincrement_state(program, meta);
+        }
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
@@ -1784,6 +1798,11 @@ fn open_autoincrement_state(
         r_seq_rowid,
         table_name_reg,
         r_max_rowid: program.alloc_register(),
+        trigger_inserts_into_table: any_trigger_inserts_into(
+            resolver,
+            ctx.namespace,
+            &ctx.table.name,
+        ),
     });
 
     program.emit_insn(Insn::Integer {
@@ -1832,7 +1851,7 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         rhs: name_col_reg,
         target_pc: found_label,
         flags: Default::default(),
-        collation: super::collate::CollationSeq::NoCase,
+        collation: super::collate::CollationSeq::NOCASE,
     });
     program.emit_insn(Insn::Copy {
         src_reg: name_col_reg,
@@ -2520,6 +2539,10 @@ pub struct AutoincMeta {
     r_seq_rowid: usize,
     table_name_reg: usize,
     r_max_rowid: usize,
+    /// A trigger inserts into this table. Such an INSERT runs as its own
+    /// program and moves sqlite_sequence on disk, so this statement has to
+    /// read sqlite_sequence again before using it.
+    trigger_inserts_into_table: bool,
 }
 
 pub static ROWID_COLUMN: std::sync::LazyLock<Column> = std::sync::LazyLock::new(|| {
@@ -2959,7 +2982,7 @@ fn translate_column(
         };
         let has_custom_encode = resolved
             .as_ref()
-            .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
+            .is_some_and(|r| r.chain.iter().any(|td| td.has_encode_or_coerce()));
         if has_custom_encode {
             translate_expr_no_constant_opt(
                 program,
@@ -3566,7 +3589,7 @@ fn emit_index_column_value_for_insert(
             .iter()
             .map(|cm| cm.column.clone())
             .collect();
-        let mut column_regs: Vec<usize> = insertion
+        let column_regs: Vec<usize> = insertion
             .col_mappings
             .iter()
             .map(|cm| {
@@ -3582,10 +3605,9 @@ fn emit_index_column_value_for_insert(
             resolver,
             expr,
             &columns,
-            &mut column_regs,
+            &column_regs,
             table,
             dest_reg,
-            idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
         )?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
@@ -3796,11 +3818,12 @@ fn emit_update_sqlite_sequence(
     });
 
     program.preassign_label_to_next_insn(update_existing_label);
+    // A trigger may have moved the cursor or removed the row since it was found.
     program.emit_insn(Insn::Insert {
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: autoincrement_bookkeeping_insert_flags(),
+        flag: autoincrement_bookkeeping_insert_flags().require_seek(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 

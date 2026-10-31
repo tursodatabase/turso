@@ -275,7 +275,7 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
-            Self::Begin { typ, name } => {
+            Self::Begin { typ, name, .. } => {
                 s.append(TK_BEGIN, None)?;
                 if let Some(typ) = typ {
                     typ.to_tokens(s, context)?;
@@ -716,6 +716,7 @@ impl ToTokens for Stmt {
                         params,
                         base,
                         encode,
+                        coerce,
                         decode,
                         operators,
                         default,
@@ -741,6 +742,11 @@ impl ToTokens for Stmt {
                         if let Some(ref encode) = encode {
                             s.append(TK_ID, Some("ENCODE"))?;
                             encode.to_tokens(s, context)?;
+                        }
+                        // COERCE
+                        if let Some(ref coerce) = coerce {
+                            s.append(TK_ID, Some("COERCE"))?;
+                            coerce.to_tokens(s, context)?;
                         }
                         // DECODE
                         if let Some(ref decode) = decode {
@@ -929,7 +935,7 @@ impl ToTokens for Expr {
                 op.to_tokens(s, context)?;
                 rhs.to_tokens(s, context)
             }
-            Self::Register(reg) => {
+            Self::Register { register: reg, .. } => {
                 // This is for internal use only, not part of SQL syntax
                 // Use a special notation that won't conflict with SQL
                 s.append(TK_VARIABLE, Some(&format!("$r{reg}")))
@@ -1738,6 +1744,9 @@ impl ToTokens for CreateTableBody {
                     }
                 }
                 if let Some(ref strict) = options.strict_text {
+                    if options.contains_without_rowid() {
+                        s.append(TK_COMMA, None)?;
+                    }
                     s.append(TK_ID, Some(strict))?;
                 }
                 Ok(())

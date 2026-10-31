@@ -29,6 +29,8 @@ fn is_recoverable_tx_error(err: &LimboError) -> bool {
         err,
         LimboError::WriteWriteConflict
             | LimboError::TxError(_)
+            | LimboError::TransactionAlreadyActive
+            | LimboError::NoActiveTransaction { .. }
             | LimboError::Busy
             | LimboError::BusySnapshot
     ) || matches!(

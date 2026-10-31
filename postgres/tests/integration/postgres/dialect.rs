@@ -42,10 +42,9 @@ fn test_postgres_access_share_lock_is_noop(db: TempDatabase) {
     let mut lock = conn
         .prepare("LOCK TABLE public.lock_items, ONLY public.lock_other IN ACCESS SHARE MODE")
         .unwrap();
-    conn.execute("BEGIN").unwrap();
-    assert!(lock.run_collect_rows().unwrap().is_empty());
-    drop(lock);
-    assert!(!conn.inner().get_auto_commit());
+    // Lock modes other than ACCESS SHARE are rejected. Check them in
+    // autocommit: inside a transaction block the rejection would abort the
+    // block, as any error does in PostgreSQL.
     for sql in [
         "LOCK TABLE lock_items IN ROW EXCLUSIVE MODE",
         "LOCK TABLE lock_items IN EXCLUSIVE MODE",
@@ -53,8 +52,12 @@ fn test_postgres_access_share_lock_is_noop(db: TempDatabase) {
         "LOCK TABLE lock_items",
     ] {
         assert!(conn.prepare(sql).is_err(), "{sql}");
-        assert!(!conn.inner().get_auto_commit());
+        assert!(conn.inner().get_auto_commit());
     }
+    conn.execute("BEGIN").unwrap();
+    assert!(lock.run_collect_rows().unwrap().is_empty());
+    drop(lock);
+    assert!(!conn.inner().get_auto_commit());
     writer
         .execute("INSERT INTO lock_items VALUES (29)")
         .unwrap();
@@ -1131,6 +1134,149 @@ fn test_postgres_alter_table_add_column(db: TempDatabase) {
         panic!("expected text");
     };
     assert_eq!(name.value, "alice");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_add_column_fills_existing_rows_with_a_function_default(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, name) VALUES (1, 'alice'), (2, 'bob')")
+        .unwrap();
+
+    conn.execute("ALTER TABLE t ADD COLUMN schema_name TEXT DEFAULT current_schema")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, name) VALUES (3, 'carol')")
+        .unwrap();
+
+    let rows = conn
+        .query("SELECT id, name, schema_name FROM t ORDER BY id")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::from_i64(1),
+                Value::build_text("alice"),
+                Value::build_text("public")
+            ],
+            vec![
+                Value::from_i64(2),
+                Value::build_text("bob"),
+                Value::build_text("public")
+            ],
+            vec![
+                Value::from_i64(3),
+                Value::build_text("carol"),
+                Value::build_text("public")
+            ],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_add_column_fills_existing_rows_with_a_custom_type_default(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id) VALUES (1), (2)").unwrap();
+
+    conn.execute("ALTER TABLE t ADD COLUMN created TIMESTAMPTZ DEFAULT now()")
+        .unwrap();
+
+    let rows = conn
+        .query("SELECT count(*) FROM t WHERE created IS NOT NULL")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(2)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_add_column_with_a_default_of_the_wrong_type_fails(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+
+    let error = conn
+        .execute("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT current_schema")
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("cannot store TEXT value in INTEGER column"),
+        "{error}"
+    );
+    assert!(conn.query("SELECT n FROM t").is_err());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_add_column_checks_the_domain_of_each_filled_value(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SEQUENCE seq").unwrap();
+    conn.execute("CREATE DOMAIN above_one AS INTEGER CHECK (VALUE > 1)")
+        .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+
+    let error = conn
+        .execute("ALTER TABLE t ADD COLUMN n above_one DEFAULT nextval('seq')")
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("violates check constraint"),
+        "{error}"
+    );
+    assert!(conn.query("SELECT n FROM t").is_err());
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_add_column_evaluates_the_default_once_per_row(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SEQUENCE seq").unwrap();
+    conn.execute("CREATE DOMAIN positive AS INTEGER CHECK (VALUE > 0)")
+        .unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id) VALUES (1), (2)").unwrap();
+
+    conn.execute("ALTER TABLE t ADD COLUMN n positive DEFAULT nextval('seq')")
+        .unwrap();
+
+    let rows = conn
+        .query("SELECT nextval('seq')")
+        .unwrap()
+        .unwrap()
+        .run_collect_rows()
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::from_i64(3)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_add_not_null_column_with_a_default_that_is_null_fails(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+
+    let error = conn
+        .execute(
+            "ALTER TABLE t ADD COLUMN s TEXT NOT NULL DEFAULT nullif(current_schema, 'public')",
+        )
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("NOT NULL constraint failed"),
+        "{error}"
+    );
+    assert!(conn.query("SELECT s FROM t").is_err());
 }
 
 #[turso_macros::test(mvcc)]
