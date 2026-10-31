@@ -780,6 +780,7 @@ mod tests {
                 .with_mvcc(mvcc)
                 .build();
             let conn = db.connect_limbo();
+            conn.set_show_internal_schema(true);
 
             // 257 variants: the type SQL is persisted first and rejected only when the type
             // itself is added to the schema
@@ -792,23 +793,21 @@ mod tests {
                 .display_string()
                 .contains("UNION type cannot have more than 256 variants");
 
-            let tables: Vec<(String, String, String, i64, i64, i64)> =
-                conn.exec_rows("PRAGMA table_list");
+            let tables: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema");
             assert!(
                 !tables
                     .iter()
-                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                    .any(|(name,)| name == "__turso_internal_types"),
                 "failed CREATE TYPE left the types table in the schema (mvcc={mvcc}): {tables:?}"
             );
 
             // The connection must still be usable: a later CREATE TYPE has to succeed
             conn.execute("CREATE TYPE t2 BASE text").unwrap();
-            let tables: Vec<(String, String, String, i64, i64, i64)> =
-                conn.exec_rows("PRAGMA table_list");
+            let tables: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema");
             assert!(
                 tables
                     .iter()
-                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                    .any(|(name,)| name == "__turso_internal_types"),
                 "CREATE TYPE did not register the types table (mvcc={mvcc}): {tables:?}"
             );
             conn.close().unwrap();
@@ -827,6 +826,7 @@ mod tests {
                 .build();
             let conn = db.connect_limbo();
 
+            conn.set_show_internal_schema(true);
             conn.execute("CREATE TYPE type_one BASE text").unwrap();
 
             let variants = (0..257)
@@ -838,12 +838,11 @@ mod tests {
                 .display_string()
                 .contains("UNION type cannot have more than 256 variants");
 
-            let tables: Vec<(String, String, String, i64, i64, i64)> =
-                conn.exec_rows("PRAGMA table_list");
+            let tables: Vec<(String,)> = conn.exec_rows("SELECT name FROM sqlite_schema");
             assert!(
                 tables
                     .iter()
-                    .any(|(_, name, ..)| name == "__turso_internal_types"),
+                    .any(|(name,)| name == "__turso_internal_types"),
                 "failed CREATE TYPE dropped the existing types table (mvcc={mvcc}): {tables:?}"
             );
 
