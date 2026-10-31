@@ -16,62 +16,128 @@ pub(super) fn translate_between_expr(
     between_expr: &ast::Expr,
     target_register: usize,
     resolver: &Resolver,
+    emit_mode: BinaryEmitMode,
 ) -> Result<usize> {
-    let mut between_expr = between_expr.clone();
     let ast::Expr::Between {
-        ref mut lhs,
+        lhs,
         not,
-        ref mut start,
-        ref mut end,
+        start,
+        end,
     } = between_expr
     else {
         unreachable!("translate_between_expr expects Expr::Between");
     };
+    let (lower_expr, upper_expr, combine_op) =
+        build_between_terms(*lhs.clone(), *not, *start.clone(), *end.clone());
+    if expr_vector_size(lhs)? > 1 {
+        let expr = ast::Expr::Binary(Box::new(lower_expr), combine_op, Box::new(upper_expr));
+        match emit_mode {
+            BinaryEmitMode::Value => {
+                translate_expr(program, referenced_tables, &expr, target_register, resolver)?;
+            }
+            BinaryEmitMode::Condition(metadata) => {
+                translate_condition_expr(
+                    program,
+                    referenced_tables.expect("conditions require table references"),
+                    &expr,
+                    metadata,
+                    resolver,
+                )?;
+            }
+        }
+        return Ok(target_register);
+    }
 
     let lhs_reg = program.alloc_register();
-    translate_expr(program, referenced_tables, &*lhs, lhs_reg, resolver)?;
-
-    let mut between_resolver = resolver.fork_with_expr_cache();
-    between_resolver.enable_expr_to_reg_cache();
-    #[allow(clippy::or_fun_call)]
-    between_resolver.cache_expr_reg(std::borrow::Cow::Owned(*lhs.to_owned()), lhs_reg, false);
-
-    let (lower_expr, upper_expr, combine_op) = build_between_terms(
-        std::mem::take(lhs),
-        not,
-        std::mem::take(start),
-        std::mem::take(end),
-    );
+    translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
     let lower_reg = program.alloc_register();
-    translate_expr(
-        program,
-        referenced_tables,
-        &lower_expr,
-        lower_reg,
-        &between_resolver,
-    )?;
     let upper_reg = program.alloc_register();
-    translate_expr(
-        program,
-        referenced_tables,
-        &upper_expr,
-        upper_reg,
-        &between_resolver,
-    )?;
+    let next_comparison = program.allocate_label();
+    for (is_lower, expr, result_reg) in [
+        (true, &lower_expr, lower_reg),
+        (false, &upper_expr, upper_reg),
+    ] {
+        let ast::Expr::Binary(lhs, op, bound) = expr else {
+            unreachable!("BETWEEN terms must be comparisons");
+        };
+        let bound_reg = program.alloc_register();
+        let next_span_idx = program.constant_spans_next_idx();
+        translate_expr(program, referenced_tables, bound, bound_reg, resolver)?;
+        // A comparison applies column affinity to its operands in place, so each one gets its own copy.
+        let operand_reg = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: lhs_reg,
+            dst_reg: operand_reg,
+            extra_amount: 0,
+        });
+        match emit_mode {
+            BinaryEmitMode::Value => emit_binary_insn(
+                program,
+                op,
+                operand_reg,
+                bound_reg,
+                result_reg,
+                lhs,
+                bound,
+                referenced_tables,
+                resolver,
+            )?,
+            BinaryEmitMode::Condition(metadata) => {
+                if !is_lower {
+                    program.constant_spans_invalidate_after(next_span_idx);
+                }
+                let metadata = if is_lower {
+                    if *not {
+                        ConditionMetadata {
+                            jump_if_condition_is_true: true,
+                            jump_target_when_false: next_comparison,
+                            jump_target_when_null: next_comparison,
+                            ..metadata
+                        }
+                    } else {
+                        ConditionMetadata {
+                            jump_if_condition_is_true: false,
+                            jump_target_when_true: next_comparison,
+                            ..metadata
+                        }
+                    }
+                } else {
+                    metadata
+                };
+                emit_binary_condition_insn(
+                    program,
+                    op,
+                    operand_reg,
+                    bound_reg,
+                    result_reg,
+                    lhs,
+                    bound,
+                    referenced_tables,
+                    metadata,
+                    resolver,
+                )?;
+            }
+        }
+        if is_lower {
+            program.preassign_label_to_next_insn(next_comparison);
+        }
+    }
 
-    program.emit_insn(match combine_op {
-        ast::Operator::And => Insn::And {
-            lhs: lower_reg,
-            rhs: upper_reg,
-            dest: target_register,
-        },
-        ast::Operator::Or => Insn::Or {
-            lhs: lower_reg,
-            rhs: upper_reg,
-            dest: target_register,
-        },
-        _ => unreachable!("BETWEEN combine operator must be AND/OR"),
-    });
+    if matches!(emit_mode, BinaryEmitMode::Value) {
+        program.emit_insn(match combine_op {
+            ast::Operator::And => Insn::And {
+                lhs: lower_reg,
+                rhs: upper_reg,
+                dest: target_register,
+            },
+            ast::Operator::Or => Insn::Or {
+                lhs: lower_reg,
+                rhs: upper_reg,
+                dest: target_register,
+            },
+            _ => unreachable!("BETWEEN combine operator must be AND/OR"),
+        });
+    }
 
     Ok(target_register)
 }
