@@ -28,7 +28,7 @@ use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::sync::Mutex;
 use crate::sync::RwLock;
 use crate::translate::emitter::TransactionMode;
-use crate::types::ImmutableRecordRef;
+use crate::types::{ImmutableRecordRef, SeekKey, SeekOp};
 use crate::vdbe::execute::TransactionYieldPoint;
 use crate::{
     Buffer, Completion, ConnectOpts, DatabaseOpts, EncryptionKey, LimboError, OpenFlags,
@@ -38,6 +38,7 @@ use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const TX_BASE_HEADER_SIZE: usize = 24;
@@ -7689,6 +7690,5930 @@ fn test_sequence_watermark_reader_never_skips_committed_rows_fuzz() {
     }
 }
 
+#[test]
+fn test_lazy_cursor_positioning_does_not_read_table_generation() {
+    let mut measurements = Vec::new();
+    for checkpoint in [false, true] {
+        let (db, conn) = setup_lazy_write_scan(checkpoint);
+        let store = db.get_mvcc_store();
+        store
+            .cursor_table_generation_reads
+            .store(0, Ordering::Relaxed);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        measurements.push((
+            checkpoint,
+            "open",
+            store.cursor_table_generation_reads.load(Ordering::Relaxed),
+        ));
+        for (operation, expected, payload) in [
+            ("seek_two", 2, "two"),
+            ("seek_four", 4, "four"),
+            ("exists_two", 2, "two"),
+            ("exists_four", 4, "four"),
+            ("rewind", 1, "one"),
+            ("last", 5, "five"),
+        ] {
+            store
+                .cursor_table_generation_reads
+                .store(0, Ordering::Relaxed);
+            if operation.starts_with("seek_") {
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor
+                        .seek(SeekKey::TableRowId(expected), SeekOp::GE { eq_only: true })),
+                    SeekResult::Found
+                );
+            } else if operation.starts_with("exists_") {
+                assert!(drive_lazy_payload_io(&conn, || cursor.exists(&Value::from_i64(expected))));
+            } else if operation == "rewind" {
+                drive_lazy_payload_io(&conn, || cursor.rewind());
+            } else {
+                drive_lazy_payload_io(&conn, || cursor.last());
+            }
+            measurements.push((
+                checkpoint,
+                operation,
+                store.cursor_table_generation_reads.load(Ordering::Relaxed),
+            ));
+            assert_eq!(
+                drive_lazy_payload_io(&conn, || cursor.rowid()),
+                Some(expected)
+            );
+            assert_eq!(
+                payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                payload
+            );
+        }
+        assert_eq!(
+            store
+                .write_generation(conn.get_mv_tx_id().unwrap())
+                .unwrap(),
+            0
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+    println!("table-generation lock and map reads: {measurements:?}");
+    assert!(
+        measurements.iter().all(|(_, _, reads)| *reads == 0),
+        "fresh positioning must not lock the write set or read its table map: {measurements:?}"
+    );
+}
+
+#[test]
+fn test_lazy_cursor_positioning_refreshes_after_table_write() {
+    for checkpoint in [false, true] {
+        for backwards in [false, true] {
+            for operation in ["open", "seek", "range", "exists", "rewind", "last"] {
+                if (operation == "open" || operation == "rewind") && backwards
+                    || operation == "last" && !backwards
+                {
+                    continue;
+                }
+                let (db, conn) = setup_lazy_write_scan(checkpoint);
+                conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+                    .unwrap();
+                conn.execute("UPDATE t SET v='before' WHERE id=4").unwrap();
+                conn.execute("INSERT INTO other VALUES (0)").unwrap();
+                let mut cursor = open_lazy_payload_cursor(&db, &conn);
+                position_lazy_write_scan(&conn, &mut cursor, operation, backwards);
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor.rowid()),
+                    Some(if backwards { 5 } else { 1 })
+                );
+                conn.execute("INSERT INTO t VALUES (3,'three')").unwrap();
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+                let expected = if backwards {
+                    vec![(4, "before"), (3, "three"), (2, "two"), (1, "one")]
+                } else {
+                    vec![(2, "two"), (3, "three"), (4, "before"), (5, "five")]
+                };
+                assert_eq!(
+                    collect_lazy_write_scan(&conn, &mut cursor, backwards),
+                    expected
+                        .into_iter()
+                        .map(|(id, v)| (id, v.to_string()))
+                        .collect::<Vec<_>>(),
+                    "checkpoint={checkpoint} backwards={backwards} operation={operation}"
+                );
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_positioning_keeps_sources_after_unrelated_write() {
+    for backwards in [false, true] {
+        for operation in ["open", "seek", "range", "exists", "rewind", "last"] {
+            if (operation == "open" || operation == "rewind") && backwards
+                || operation == "last" && !backwards
+            {
+                continue;
+            }
+            let (db, conn) = setup_lazy_write_scan(true);
+            conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+                .unwrap();
+            conn.execute("UPDATE t SET v='updated' || id").unwrap();
+            conn.execute("INSERT INTO other VALUES (0)").unwrap();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            position_lazy_write_scan(&conn, &mut cursor, operation, backwards);
+            if operation == "seek" || operation == "exists" {
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+            }
+            let frontier = drive_lazy_payload_io(&conn, || cursor.rowid()).unwrap();
+            let store = db.get_mvcc_store();
+            let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name='t'")[0][0]
+                .as_int()
+                .unwrap();
+            store.cursor_count_table.store(
+                i64::from(store.get_table_id_from_root_page(root)),
+                Ordering::Relaxed,
+            );
+            conn.execute("INSERT INTO other VALUES (1)").unwrap();
+            store.cursor_physical_visits.store(0, Ordering::Relaxed);
+            drive_lazy_payload_io(&conn, || {
+                if backwards {
+                    cursor.prev()
+                } else {
+                    cursor.next()
+                }
+            });
+            let rows = collect_lazy_write_scan(&conn, &mut cursor, backwards);
+            let mut expected: Vec<_> = [1, 2, 4, 5]
+                .into_iter()
+                .filter(|id| {
+                    if backwards {
+                        *id < frontier
+                    } else {
+                        *id > frontier
+                    }
+                })
+                .map(|id| (id, format!("updated{id}")))
+                .collect();
+            if backwards {
+                expected.reverse();
+            }
+            assert_eq!(
+                rows, expected,
+                "backwards={backwards} operation={operation}"
+            );
+            assert_eq!(store.cursor_physical_visits.load(Ordering::Relaxed),0,"unrelated writes must not revisit the hidden physical source: backwards={backwards} operation={operation}");
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+fn position_lazy_write_scan(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+    operation: &str,
+    backwards: bool,
+) {
+    match operation {
+        "open" => drive_lazy_payload_io(conn, || cursor.next()),
+        "seek" | "range" => assert_eq!(
+            drive_lazy_payload_io(conn, || cursor.seek(
+                SeekKey::TableRowId(if backwards { 5 } else { 1 }),
+                if backwards {
+                    SeekOp::LE {
+                        eq_only: operation == "seek",
+                    }
+                } else {
+                    SeekOp::GE {
+                        eq_only: operation == "seek",
+                    }
+                }
+            )),
+            SeekResult::Found
+        ),
+        "exists" => assert!(drive_lazy_payload_io(conn, || cursor
+            .exists(&Value::from_i64(if backwards { 5 } else { 1 })))),
+        "rewind" => drive_lazy_payload_io(conn, || cursor.rewind()),
+        "last" => drive_lazy_payload_io(conn, || cursor.last()),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_at_current_key_keeps_the_scan() {
+    for steps_disabled in [false, true] {
+        for chain_only in [false, true] {
+            let ids: Vec<i64> = (1..=20).collect();
+            let (db, conn) = if chain_only {
+                setup_lazy_walk_table(&[], &ids)
+            } else {
+                setup_lazy_walk_table(&ids, &[])
+            };
+            let store = db.get_mvcc_store();
+            store
+                .cursor_table_steps_disabled
+                .store(steps_disabled, Ordering::Relaxed);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let case = format!("steps_disabled={steps_disabled} chain_only={chain_only}");
+            let prefix = if chain_only { "c" } else { "p" };
+            for (sql, expected) in [
+                (
+                    "UPDATE t SET v = v || '!'",
+                    ids.iter()
+                        .map(|id| (*id, format!("{prefix}{id}!")))
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "UPDATE t SET v = v || '?'",
+                    ids.iter()
+                        .map(|id| (*id, format!("{prefix}{id}!?")))
+                        .collect(),
+                ),
+                (
+                    "DELETE FROM t WHERE id % 2 = 0",
+                    ids.iter()
+                        .filter(|id| *id % 2 == 1)
+                        .map(|id| (*id, format!("{prefix}{id}!?")))
+                        .collect(),
+                ),
+            ] {
+                store.cursor_scan_refreshes.store(0, Ordering::Relaxed);
+                conn.execute(sql).unwrap();
+                assert_eq!(
+                    store.cursor_scan_refreshes.load(Ordering::Relaxed),
+                    0,
+                    "{case}: {sql}"
+                );
+                assert_eq!(
+                    lazy_text_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+                    expected,
+                    "{case}: {sql}"
+                );
+            }
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_write_at_current_key_keeps_the_scan() {
+    let (db, conn) = setup_lazy_walk_table(&(1..=10).collect::<Vec<_>>(), &[]);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    store.cursor_scan_refreshes.store(0, Ordering::Relaxed);
+    store.cursor_table_walk_starts.store(0, Ordering::Relaxed);
+    drive_lazy_payload_io(&conn, || cursor.last());
+    let mut deleted = Vec::new();
+    while let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) {
+        if rowid % 2 == 0 {
+            drive_lazy_payload_io(&conn, || cursor.delete());
+            deleted.push(rowid);
+        }
+        drive_lazy_payload_io(&conn, || cursor.prev());
+    }
+    assert_eq!(deleted, vec![10, 8, 6, 4, 2]);
+    assert_eq!(store.cursor_scan_refreshes.load(Ordering::Relaxed), 0);
+    assert_eq!(store.cursor_table_walk_starts.load(Ordering::Relaxed), 1);
+    drop(cursor);
+    assert_eq!(
+        lazy_text_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+        [1, 3, 5, 7, 9]
+            .into_iter()
+            .map(|id| (id, format!("p{id}")))
+            .collect::<Vec<_>>()
+    );
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_write_at_current_key_still_sees_an_earlier_insert_ahead() {
+    let (db, conn) = setup_lazy_walk_table(&[1, 2, 3], &[]);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    conn.execute("INSERT INTO t VALUES (100, 'ahead')").unwrap();
+    store.cursor_scan_refreshes.store(0, Ordering::Relaxed);
+    drive_lazy_payload_io(&conn, || cursor.delete());
+    let mut rowids = Vec::new();
+    loop {
+        drive_lazy_payload_io(&conn, || cursor.next());
+        let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) else {
+            break;
+        };
+        rowids.push(rowid);
+    }
+    assert_eq!(rowids, vec![2, 3, 100]);
+    assert_eq!(store.cursor_scan_refreshes.load(Ordering::Relaxed), 1);
+    drop(cursor);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_update_that_fails_a_check_keeps_every_row() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE checked(id INTEGER PRIMARY KEY, v TEXT CHECK (v <> 'p7!'))")
+        .unwrap();
+    for id in 1..=10 {
+        conn.execute(format!("INSERT INTO checked VALUES ({id}, 'p{id}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let store = db.get_mvcc_store();
+    store.cursor_scan_refreshes.store(0, Ordering::Relaxed);
+    assert!(conn.execute("UPDATE checked SET v = v || '!'").is_err());
+    assert_eq!(store.cursor_scan_refreshes.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        lazy_text_rows(&conn, "SELECT id, v FROM checked ORDER BY id"),
+        (1..=10)
+            .map(|id| (id, format!("p{id}")))
+            .collect::<Vec<_>>()
+    );
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_write_at_current_key_with_injected_yields() {
+    let expected: Vec<(i64, String)> = (1..=12).map(|id| (id, format!("p{id}!"))).collect();
+    for point in [
+        CursorYieldPoint::NextStart,
+        CursorYieldPoint::NextBtreeAdvance,
+        CursorYieldPoint::AdvanceBtreeForwardProgress,
+    ] {
+        let mut fired = false;
+        for occurrence in 0..14 {
+            let (_db, conn) = setup_lazy_walk_table(&(1..=12).collect::<Vec<_>>(), &[]);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let injector = NthYieldInjector::new(point.point(), occurrence);
+            conn.set_yield_injector(Some(injector.clone()));
+            let mut update = conn.prepare("UPDATE t SET v = v || '!'").unwrap();
+            loop {
+                match update.step().unwrap() {
+                    StepResult::Done => break,
+                    StepResult::IO | StepResult::Yield => update._io().step().unwrap(),
+                    other => panic!("unexpected result {other:?}"),
+                }
+            }
+            drop(update);
+            conn.set_yield_injector(None);
+            fired |= injector.fired();
+            assert_eq!(
+                lazy_text_rows(&conn, "SELECT id, v FROM t ORDER BY id"),
+                expected,
+                "{point:?} occurrence={occurrence}"
+            );
+            conn.execute("ROLLBACK").unwrap();
+        }
+        assert!(fired, "{point:?} never fired");
+    }
+}
+
+fn lazy_text_rows(conn: &Arc<Connection>, sql: &str) -> Vec<(i64, String)> {
+    get_rows(conn, sql)
+        .into_iter()
+        .map(|row| {
+            let Value::Text(text) = &row[1] else {
+                panic!("expected text, got {:?}", row[1]);
+            };
+            (row[0].as_int().unwrap(), text.as_str().to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_bounds_hidden_physical_visits() {
+    let mut measurements = Vec::new();
+    for n in [16, 32] {
+        for backwards in [false, true] {
+            for indexes in [false, true] {
+                let db = MvccTestDbNoConn::new();
+                let conn = db.connect();
+                conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT)")
+                    .unwrap();
+                conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+                    .unwrap();
+                conn.execute(format!("WITH RECURSIVE ids(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM ids WHERE id<{n}) INSERT INTO t SELECT id,'old' FROM ids")).unwrap();
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                conn.execute("UPDATE t SET v = 'updated' || id").unwrap();
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                let mut cursor = open_lazy_payload_cursor(&db, &conn);
+                let store = db.get_mvcc_store();
+                let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name='t'")[0]
+                    [0]
+                .as_int()
+                .unwrap();
+                store.cursor_count_table.store(
+                    i64::from(store.get_table_id_from_root_page(root)),
+                    Ordering::Relaxed,
+                );
+                store.cursor_physical_visits.store(0, Ordering::Relaxed);
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.last()
+                    } else {
+                        cursor.rewind()
+                    }
+                });
+                let mut visits = store.cursor_physical_visits.load(Ordering::Relaxed);
+                let mut rows = Vec::new();
+                while let Some(id) = drive_lazy_payload_io(&conn, || cursor.rowid()) {
+                    rows.push((
+                        id,
+                        payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                    ));
+                    if indexes {
+                        conn.execute(format!("CREATE INDEX i{id} ON t(v)")).unwrap();
+                    } else {
+                        conn.execute(format!("INSERT INTO other VALUES ({id})"))
+                            .unwrap();
+                    }
+                    store.cursor_physical_visits.store(0, Ordering::Relaxed);
+                    drive_lazy_payload_io(&conn, || {
+                        if backwards {
+                            cursor.prev()
+                        } else {
+                            cursor.next()
+                        }
+                    });
+                    visits += store.cursor_physical_visits.load(Ordering::Relaxed);
+                }
+                let mut expected: Vec<_> = (1..=n).map(|id| (id, format!("updated{id}"))).collect();
+                if backwards {
+                    expected.reverse();
+                }
+                assert_eq!(rows, expected);
+                println!("n={n} backwards={backwards} indexes={indexes}: physical visits={visits}");
+                measurements.push((n, backwards, indexes, visits));
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+    assert!(
+        measurements
+            .iter()
+            .all(|(n, _, _, visits)| *visits <= 2 * *n as u64),
+        "physical validation visits must stay linear: {measurements:?}"
+    );
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_refresh_skips_unstarted_movement() {
+    let mut measurements = Vec::new();
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_write_scan(true);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let mut reference = open_lazy_payload_cursor(&db, &conn);
+        for c in [&mut cursor, &mut reference] {
+            drive_lazy_payload_io(&conn, || if backwards { c.last() } else { c.rewind() });
+        }
+        let store = db.get_mvcc_store();
+        let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name='t'")[0][0]
+            .as_int()
+            .unwrap();
+        store.cursor_count_table.store(
+            i64::from(store.get_table_id_from_root_page(root)),
+            Ordering::Relaxed,
+        );
+        conn.execute("INSERT INTO t VALUES (3,'three')").unwrap();
+        store.cursor_physical_advances.store(0, Ordering::Relaxed);
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || reference.seek(
+                SeekKey::TableRowId(if backwards { 5 } else { 1 }),
+                if backwards { SeekOp::LT } else { SeekOp::GT }
+            )),
+            SeekResult::Found
+        );
+        let required = store.cursor_physical_advances.load(Ordering::Relaxed);
+        store.cursor_physical_advances.store(0, Ordering::Relaxed);
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        let actual = store.cursor_physical_advances.load(Ordering::Relaxed);
+        println!("backwards={backwards}: required advances={required}, actual={actual}");
+        measurements.push((backwards, required, actual));
+        let expected = if backwards {
+            vec![(4, "four"), (3, "three"), (2, "two"), (1, "one")]
+        } else {
+            vec![(2, "two"), (3, "three"), (4, "four"), (5, "five")]
+        };
+        assert_eq!(
+            collect_lazy_write_scan(&conn, &mut cursor, backwards),
+            expected
+                .into_iter()
+                .map(|(id, v)| (id, v.to_string()))
+                .collect::<Vec<_>>()
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+    assert!(
+        measurements
+            .iter()
+            .all(|(_, required, actual)| required == actual),
+        "a completed movement must not be advanced before refreshing: {measurements:?}"
+    );
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_refresh_keeps_snapshot_during_checkpoint() {
+    for backwards in [false, true] {
+        for abandon in [false, true] {
+            let db = MvccTestDbNoConn::new_with_random_db_passive();
+            let conn = db.connect();
+            conn.execute("PRAGMA mvcc_checkpoint_threshold=-1").unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT)")
+                .unwrap();
+            conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1,'one'),(2,'two'),(4,'four'),(5,'five')")
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            drive_lazy_payload_io(&conn, || {
+                if backwards {
+                    cursor.last()
+                } else {
+                    cursor.rewind()
+                }
+            });
+            conn.execute("INSERT INTO t VALUES (3,'three')").unwrap();
+            let injector = FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+            conn.set_yield_injector(Some(injector.clone()));
+            let IOResult::IO(pending) = (if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            })
+            .unwrap() else {
+                panic!("refresh must yield during physical seek");
+            };
+            assert!(pending.is_explicit_yield());
+            assert!(injector.is_empty());
+            conn.set_yield_injector(None);
+            let writer = db.connect();
+            writer
+                .execute("PRAGMA mvcc_checkpoint_threshold=-1")
+                .unwrap();
+            writer.execute("BEGIN CONCURRENT").unwrap();
+            writer
+                .execute("UPDATE t SET v='foreign' WHERE id=2")
+                .unwrap();
+            writer.execute("DELETE FROM t WHERE id=4").unwrap();
+            writer.execute("INSERT INTO t VALUES (6,'six')").unwrap();
+            writer.execute("COMMIT").unwrap();
+            writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            let store = db.get_mvcc_store();
+            store.gc_incremental(usize::MAX);
+            store.drop_unused_row_versions();
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            if abandon {
+                drop(cursor);
+                cursor = open_lazy_payload_cursor(&db, &conn);
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor.seek(
+                        SeekKey::TableRowId(if backwards { 5 } else { 1 }),
+                        if backwards { SeekOp::LT } else { SeekOp::GT }
+                    )),
+                    SeekResult::Found
+                );
+            } else {
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+            }
+            let mut rows = Vec::new();
+            while let Some(id) = drive_lazy_payload_io(&conn, || cursor.rowid()) {
+                rows.push((
+                    id,
+                    payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                ));
+                conn.execute(format!("INSERT INTO other VALUES ({id})"))
+                    .unwrap();
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+            }
+            let expected = if backwards {
+                vec![(4, "four"), (3, "three"), (2, "two"), (1, "one")]
+            } else {
+                vec![(2, "two"), (3, "three"), (4, "four"), (5, "five")]
+            };
+            assert_eq!(
+                rows,
+                expected
+                    .into_iter()
+                    .map(|(id, v)| (id, v.to_string()))
+                    .collect::<Vec<_>>(),
+                "backwards={backwards} abandon={abandon}"
+            );
+            drop(cursor);
+            conn.execute("ROLLBACK").unwrap();
+            conn.execute("INSERT INTO t VALUES (3,'fresh')").unwrap();
+            assert_eq!(
+                get_rows(&conn, "SELECT id,v FROM t ORDER BY id"),
+                [
+                    (1, "one"),
+                    (2, "foreign"),
+                    (3, "fresh"),
+                    (5, "five"),
+                    (6, "six")
+                ]
+                .into_iter()
+                .map(|(id, v)| vec![Value::from_i64(id), Value::build_text(v)])
+                .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_switches_direction_after_refresh() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_write_scan(true);
+        conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.last()
+            } else {
+                cursor.rewind()
+            }
+        });
+        conn.execute("INSERT INTO t VALUES (3,'three')").unwrap();
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.rowid()),
+            Some(if backwards { 4 } else { 2 })
+        );
+        assert_eq!(
+            payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+            if backwards { "four" } else { "two" }
+        );
+        conn.execute("INSERT INTO other VALUES (1)").unwrap();
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.next()
+            } else {
+                cursor.prev()
+            }
+        });
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.rowid()),
+            Some(if backwards { 5 } else { 1 })
+        );
+        assert_eq!(
+            payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+            if backwards { "five" } else { "one" }
+        );
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.rowid()),
+            Some(if backwards { 4 } else { 2 })
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_sees_insert_after_checkpoint() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let rows = scan_with_write_after_rows(
+        &conn,
+        "SELECT id, v FROM t ORDER BY id",
+        1,
+        &conn,
+        "INSERT INTO t VALUES (3, 'own')",
+    );
+    assert_eq!(rows, "1|first,2|second,3|own");
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_keeps_frontier_after_insert() {
+    for checkpoint in [false, true] {
+        for backwards in [false, true] {
+            for probe in [false, true] {
+                let (db, conn) = setup_lazy_write_scan(checkpoint);
+                let mut cursor = open_lazy_payload_cursor(&db, &conn);
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.last()
+                    } else {
+                        cursor.rewind()
+                    }
+                });
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor.rowid()),
+                    Some(if backwards { 5 } else { 1 })
+                );
+                let record =
+                    ImmutableRecord::from_values(&[Value::Null, Value::build_text("three")], 2)
+                        .unwrap();
+                drive_lazy_payload_io(&conn, || {
+                    cursor.insert(&BTreeKey::new_table_rowid(3, Some(&record)))
+                });
+                assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(3));
+                assert_eq!(
+                    payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                    "three"
+                );
+                if probe {
+                    assert_eq!(
+                        drive_lazy_payload_io(&conn, || cursor
+                            .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })),
+                        SeekResult::Found
+                    );
+                }
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+                let rows = collect_lazy_write_scan(&conn, &mut cursor, backwards);
+                let expected = if backwards {
+                    vec![(4, "four"), (3, "three"), (2, "two"), (1, "one")]
+                } else {
+                    vec![(2, "two"), (3, "three"), (4, "four"), (5, "five")]
+                };
+                assert_eq!(
+                    rows,
+                    expected
+                        .into_iter()
+                        .map(|(id, v)| (id, v.to_string()))
+                        .collect::<Vec<_>>(),
+                    "checkpoint={checkpoint} backwards={backwards} probe={probe}"
+                );
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_refreshes_writes_and_undo() {
+    for checkpoint in [false, true] {
+        for backwards in [false, true] {
+            for change in [
+                "delete",
+                "update",
+                "undo_insert",
+                "undo_delete",
+                "undo_update",
+            ] {
+                let (db, conn) = setup_lazy_write_scan(checkpoint);
+                let mut cursor = open_lazy_payload_cursor(&db, &conn);
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.last()
+                    } else {
+                        cursor.rewind()
+                    }
+                });
+                let target = if backwards { 4 } else { 2 };
+                conn.execute("SAVEPOINT s").unwrap();
+                match change {
+                    "delete" | "undo_delete" => conn
+                        .execute(format!("DELETE FROM t WHERE id = {target}"))
+                        .unwrap(),
+                    "update" | "undo_update" => conn
+                        .execute(format!("UPDATE t SET v = 'changed' WHERE id = {target}"))
+                        .unwrap(),
+                    "undo_insert" => conn.execute("INSERT INTO t VALUES (3, 'three')").unwrap(),
+                    _ => unreachable!(),
+                };
+                if change.starts_with("undo_") {
+                    conn.execute("ROLLBACK TO s").unwrap();
+                }
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+                let rows = collect_lazy_write_scan(&conn, &mut cursor, backwards);
+                let mut expected: Vec<_> = [(1, "one"), (2, "two"), (4, "four"), (5, "five")]
+                    .into_iter()
+                    .map(|(id, v)| (id, v.to_string()))
+                    .collect();
+                expected.retain(|(id, _)| *id != if backwards { 5 } else { 1 });
+                if change == "delete" {
+                    expected.retain(|(id, _)| *id != target);
+                }
+                if change == "update" {
+                    expected.iter_mut().find(|(id, _)| *id == target).unwrap().1 =
+                        "changed".to_string();
+                }
+                if backwards {
+                    expected.reverse();
+                }
+                assert_eq!(
+                    rows, expected,
+                    "checkpoint={checkpoint} backwards={backwards} change={change}"
+                );
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_keeps_frontier_after_rollback() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_write_scan(true);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.last()
+            } else {
+                cursor.rewind()
+            }
+        });
+        conn.execute("SAVEPOINT s").unwrap();
+        let record =
+            ImmutableRecord::from_values(&[Value::Null, Value::build_text("three")], 2).unwrap();
+        drive_lazy_payload_io(&conn, || {
+            cursor.insert(&BTreeKey::new_table_rowid(3, Some(&record)))
+        });
+        conn.execute("ROLLBACK TO s").unwrap();
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        let expected = if backwards {
+            vec![(4, "four"), (2, "two"), (1, "one")]
+        } else {
+            vec![(2, "two"), (4, "four"), (5, "five")]
+        };
+        assert_eq!(
+            collect_lazy_write_scan(&conn, &mut cursor, backwards),
+            expected
+                .into_iter()
+                .map(|(id, v)| (id, v.to_string()))
+                .collect::<Vec<_>>()
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_resumes_and_abandons_refresh() {
+    for backwards in [false, true] {
+        for abandon in [false, true] {
+            let (db, conn) = setup_lazy_write_scan(true);
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            drive_lazy_payload_io(&conn, || {
+                if backwards {
+                    cursor.last()
+                } else {
+                    cursor.rewind()
+                }
+            });
+            let point = if backwards {
+                CursorYieldPoint::PrevBtreeAdvance
+            } else {
+                CursorYieldPoint::NextBtreeAdvance
+            };
+            let injector = FixedYieldInjector::new([point.point()]);
+            conn.set_yield_injector(Some(injector.clone()));
+            let IOResult::IO(pending) = (if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            })
+            .unwrap() else {
+                panic!("movement must yield");
+            };
+            assert!(pending.is_explicit_yield());
+            assert!(injector.is_empty());
+            conn.set_yield_injector(None);
+            conn.execute("INSERT INTO t VALUES (3, 'three')").unwrap();
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            let injector = FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+            conn.set_yield_injector(Some(injector.clone()));
+            let IOResult::IO(pending) = (if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            })
+            .unwrap() else {
+                panic!("refresh seek must yield");
+            };
+            assert!(pending.is_explicit_yield());
+            assert!(injector.is_empty());
+            conn.set_yield_injector(None);
+            conn.execute(format!(
+                "UPDATE t SET v = 'changed' WHERE id = {}",
+                if backwards { 4 } else { 2 }
+            ))
+            .unwrap();
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            if abandon {
+                drop(cursor);
+            } else {
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+                let expected = if backwards {
+                    vec![(4, "changed"), (3, "three"), (2, "two"), (1, "one")]
+                } else {
+                    vec![(2, "changed"), (3, "three"), (4, "four"), (5, "five")]
+                };
+                assert_eq!(
+                    collect_lazy_write_scan(&conn, &mut cursor, backwards),
+                    expected
+                        .into_iter()
+                        .map(|(id, v)| (id, v.to_string()))
+                        .collect::<Vec<_>>()
+                );
+                drop(cursor);
+            }
+            conn.execute("ROLLBACK").unwrap();
+            conn.execute("INSERT INTO t VALUES (3, 'fresh')").unwrap();
+            assert_eq!(
+                get_rows(&conn, "SELECT v FROM t WHERE id = 3"),
+                vec![vec![Value::build_text("fresh")]]
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_continues_after_independent_point() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_write_scan(true);
+        conn.execute("INSERT INTO t VALUES (3, 'three')").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let op = if backwards {
+            SeekOp::LE { eq_only: true }
+        } else {
+            SeekOp::GE { eq_only: true }
+        };
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(3), op)),
+            SeekResult::Found
+        );
+        conn.execute(if backwards {
+            "INSERT INTO t VALUES (0, 'zero')"
+        } else {
+            "INSERT INTO t VALUES (6, 'six')"
+        })
+        .unwrap();
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        let expected = if backwards {
+            vec![(2, "two"), (1, "one"), (0, "zero")]
+        } else {
+            vec![(4, "four"), (5, "five"), (6, "six")]
+        };
+        assert_eq!(
+            collect_lazy_write_scan(&conn, &mut cursor, backwards),
+            expected
+                .into_iter()
+                .map(|(id, v)| (id, v.to_string()))
+                .collect::<Vec<_>>()
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_abandons_statement_refresh() {
+    let (_db, conn) = setup_lazy_write_scan(true);
+    let mut statement = conn.prepare("SELECT id,v FROM t ORDER BY id").unwrap();
+    loop {
+        match statement.step().unwrap() {
+            StepResult::Row => break,
+            StepResult::IO | StepResult::Yield => statement._io().step().unwrap(),
+            other => panic!("first row expected: {other:?}"),
+        }
+    }
+    assert_eq!(statement.row().unwrap().get_value(0), &Value::from_i64(1));
+    conn.execute("INSERT INTO t VALUES (3,'three')").unwrap();
+    let injector = FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    loop {
+        let result = statement.step().unwrap();
+        if injector.is_empty() {
+            assert!(matches!(result, StepResult::Yield));
+            break;
+        }
+        match result {
+            StepResult::IO | StepResult::Yield => statement._io().step().unwrap(),
+            other => panic!("refresh must yield before another row: {other:?}"),
+        }
+    }
+    drop(statement);
+    conn.set_yield_injector(None);
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("INSERT INTO t VALUES (3,'fresh')").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT v FROM t WHERE id=3"),
+        vec![vec![Value::build_text("fresh")]]
+    );
+}
+
+#[test]
+fn test_lazy_cursor_write_scan_resets_frontier_on_positioning() {
+    for operation in ["seek", "exists", "rewind", "last"] {
+        let (db, conn) = setup_lazy_write_scan(true);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        drive_lazy_payload_io(&conn, || cursor.rewind());
+        let record =
+            ImmutableRecord::from_values(&[Value::Null, Value::build_text("three")], 2).unwrap();
+        drive_lazy_payload_io(&conn, || {
+            cursor.insert(&BTreeKey::new_table_rowid(3, Some(&record)))
+        });
+        match operation {
+            "seek" => assert_eq!(
+                drive_lazy_payload_io(&conn, || cursor
+                    .seek(SeekKey::TableRowId(4), SeekOp::GE { eq_only: true })),
+                SeekResult::Found
+            ),
+            "exists" => {
+                assert!(drive_lazy_payload_io(&conn, || cursor.exists(&Value::from_i64(4))))
+            }
+            "rewind" => drive_lazy_payload_io(&conn, || cursor.rewind()),
+            "last" => drive_lazy_payload_io(&conn, || cursor.last()),
+            _ => unreachable!(),
+        }
+        let backwards = operation == "last";
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        let expected = match operation {
+            "seek" | "exists" => vec![(5, "five")],
+            "rewind" => vec![(2, "two"), (3, "three"), (4, "four"), (5, "five")],
+            "last" => vec![(4, "four"), (3, "three"), (2, "two"), (1, "one")],
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            collect_lazy_write_scan(&conn, &mut cursor, backwards),
+            expected
+                .into_iter()
+                .map(|(id, v)| (id, v.to_string()))
+                .collect::<Vec<_>>(),
+            "{operation}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_write_scan_refreshes_after_page_io() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("scan.db");
+    let database = Database::open_file(
+        Arc::new(crate::MemoryYieldIO::new()),
+        path.to_str().unwrap(),
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = database.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA journal_mode='mvcc'").unwrap();
+    let db = MvccTestDbNoConn {
+        db: Some(database),
+        path: Some(path.to_str().unwrap().to_string()),
+        opts: DatabaseOpts::new(),
+        enc_opts: None,
+        _temp_dir: Some(temp_dir),
+    };
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT)")
+        .unwrap();
+    let wide = "x".repeat(3000);
+    for id in [10, 20, 40, 50] {
+        conn.execute(format!("INSERT INTO t VALUES ({id},'{wide}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.pager.load().clear_page_cache(false);
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    let mut frontier = drive_lazy_payload_io(&conn, || cursor.rowid()).unwrap();
+    let pending = loop {
+        match cursor.next().unwrap() {
+            IOResult::IO(io) => {
+                assert!(!io.is_explicit_yield());
+                assert!(!io.finished());
+                break io;
+            }
+            IOResult::Done(()) => {
+                frontier = drive_lazy_payload_io(&conn, || cursor.rowid())
+                    .expect("scan must wait on a later leaf");
+            }
+        }
+    };
+    let inserted = frontier + 1;
+    conn.execute(format!("INSERT INTO t VALUES ({inserted},'new')"))
+        .unwrap();
+    pending.wait(conn.db.io.as_ref()).unwrap();
+    drive_lazy_payload_io(&conn, || cursor.next());
+    let mut expected: Vec<_> = [10, 20, 40, 50]
+        .into_iter()
+        .filter(|id| *id > frontier)
+        .map(|id| (id, wide.clone()))
+        .collect();
+    expected.push((inserted, "new".to_string()));
+    expected.sort_by_key(|(id, _)| *id);
+    assert_eq!(collect_lazy_write_scan(&conn, &mut cursor, false), expected);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+fn setup_lazy_write_scan(checkpoint: bool) -> (MvccTestDbNoConn, Arc<Connection>) {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1,'one'),(2,'two'),(4,'four'),(5,'five')")
+        .unwrap();
+    if checkpoint {
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    (db, conn)
+}
+
+fn collect_lazy_write_scan(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+    backwards: bool,
+) -> Vec<(i64, String)> {
+    let mut rows = Vec::new();
+    while let Some(id) = drive_lazy_payload_io(conn, || cursor.rowid()) {
+        rows.push((id, payload_text(&lazy_payload_bytes(conn, cursor).unwrap())));
+        drive_lazy_payload_io(conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+    }
+    rows
+}
+
+#[test]
+fn test_lazy_cursor_transaction_reads_without_abort_lookup() {
+    let mut lookups = Vec::new();
+    for checkpoint in [false, true] {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+            .unwrap();
+        if checkpoint {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let store = db.get_mvcc_store();
+        drive_lazy_payload_io(&conn, || cursor.rewind());
+        store.tx_abort_lookups.store(0, Ordering::Relaxed);
+        for (id, value) in [(1, "one"), (2, "two"), (3, "three")] {
+            assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(id));
+            let payload = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+            assert_eq!(payload_text(&payload), value);
+            assert!(drive_lazy_payload_io(&conn, || cursor
+                .current_row()
+                .map(|r| r.map(|r| r.is_some()))));
+            drive_lazy_payload_io(&conn, || cursor.next());
+        }
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), None);
+        lookups.push(store.tx_abort_lookups.load(Ordering::Relaxed));
+        conn.execute("ROLLBACK").unwrap();
+    }
+    assert_eq!(lookups, [0, 0]);
+}
+
+#[test]
+fn test_lazy_cursor_shadowed_rows_without_transaction_lookup() {
+    let mut lookups = Vec::new();
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_shadowed_physical_rows();
+        let store = db.get_mvcc_store();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        store.btree_validity_tx_lookups.store(0, Ordering::Relaxed);
+        if backwards {
+            drive_lazy_payload_io(&conn, || cursor.last());
+        } else {
+            drive_lazy_payload_io(&conn, || cursor.rewind());
+        }
+        let rows = collect_lazy_write_scan(&conn, &mut cursor, backwards);
+        let mut expected: Vec<_> = [(1, "one"), (2, "two-new"), (3, "three-new"), (4, "four")]
+            .into_iter()
+            .map(|(id, v)| (id, v.to_string()))
+            .collect();
+        if backwards {
+            expected.reverse();
+        }
+        assert_eq!(rows, expected, "backwards={backwards}");
+        lookups.push(store.btree_validity_tx_lookups.load(Ordering::Relaxed));
+        conn.execute("ROLLBACK").unwrap();
+    }
+    assert_eq!(lookups, [0, 0]);
+}
+
+#[test]
+fn test_lazy_cursor_shadowed_row_after_transaction_removal() {
+    let (db, conn) = setup_lazy_shadowed_physical_rows();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    conn.execute("ROLLBACK").unwrap();
+    let err = loop {
+        match cursor.next() {
+            Ok(IOResult::Done(())) => panic!("next must fail without its transaction"),
+            Ok(IOResult::IO(io)) => io.wait(conn.db.io.as_ref()).unwrap(),
+            Err(err) => break err,
+        }
+    };
+    assert!(
+        matches!(*err, LimboError::NoSuchTransactionID(_)),
+        "{err:?}"
+    );
+}
+
+fn setup_lazy_shadowed_physical_rows() -> (MvccTestDbNoConn, Arc<Connection>) {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = v || '-new' WHERE id IN (2, 3)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    (db, conn)
+}
+
+#[test]
+fn test_lazy_cursor_chain_payload_read_once_per_position() {
+    let mut reads = Vec::new();
+    for shadowed in [false, true] {
+        for backwards in [false, true] {
+            let (db, conn) = if shadowed {
+                setup_lazy_shadowed_physical_rows()
+            } else {
+                setup_lazy_write_scan(false)
+            };
+            let store = db.get_mvcc_store();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            if backwards {
+                drive_lazy_payload_io(&conn, || cursor.last());
+            } else {
+                drive_lazy_payload_io(&conn, || cursor.rewind());
+            }
+            store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+            let mut rows = 0;
+            while drive_lazy_payload_io(&conn, || cursor.rowid()).is_some() {
+                let first = lazy_payload_bytes(&conn, &mut cursor);
+                assert!(first.is_some());
+                for _ in 0..2 {
+                    assert_eq!(lazy_payload_bytes(&conn, &mut cursor), first);
+                }
+                rows += 1;
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+            }
+            let chain_reads = store.cursor_chain_payload_reads.load(Ordering::Relaxed);
+            reads.push((shadowed, backwards, rows, chain_reads));
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+    assert_eq!(
+        reads,
+        [
+            (false, false, 4, 4),
+            (false, true, 4, 4),
+            (true, false, 4, 2),
+            (true, true, 4, 2),
+        ]
+    );
+}
+
+#[test]
+fn test_lazy_cursor_chain_payload_follows_transaction_writes() {
+    let (db, conn) = setup_lazy_write_scan(false);
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    drive_lazy_payload_io(&conn, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(2));
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("two")
+    );
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("UPDATE t SET v = 'changed' WHERE id = 2")
+        .unwrap();
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("changed")
+    );
+    conn.execute("ROLLBACK TO s").unwrap();
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("two")
+    );
+    store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+    assert!(conn
+        .execute("INSERT INTO t VALUES (3, 'three'), (4, 'duplicate')")
+        .is_err());
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("two")
+    );
+    assert_eq!(store.cursor_chain_payload_reads.load(Ordering::Relaxed), 1);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_chain_payload_rereads_after_movement() {
+    let (db, conn) = setup_lazy_write_scan(false);
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || cursor
+            .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+        SeekResult::Found
+    );
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("two")
+    );
+    let mut observed = Vec::new();
+    for movement in ["prev", "next", "seek_same_row", "seek_four"] {
+        store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+        match movement {
+            "prev" => drive_lazy_payload_io(&conn, || cursor.prev()),
+            "next" => drive_lazy_payload_io(&conn, || cursor.next()),
+            _ => {
+                let rowid = if movement == "seek_four" { 4 } else { 2 };
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor
+                        .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })),
+                    SeekResult::Found
+                );
+            }
+        }
+        let first = lazy_payload_text(&conn, &mut cursor);
+        assert_eq!(lazy_payload_text(&conn, &mut cursor), first);
+        observed.push((
+            movement,
+            first,
+            store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+        ));
+    }
+    assert_eq!(
+        observed,
+        [
+            ("prev", Some("one".to_string()), 1),
+            ("next", Some("two".to_string()), 1),
+            ("seek_same_row", Some("two".to_string()), 1),
+            ("seek_four", Some("four".to_string()), 0),
+        ]
+    );
+
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    let tx = store.txs.get(&tx_id).unwrap();
+    tx.value().abort_now.store(true, Ordering::Release);
+    assert!(matches!(
+        *cursor.record_payload().unwrap_err(),
+        LimboError::CommitDependencyAborted
+    ));
+    tx.value().abort_now.store(false, Ordering::Release);
+    drop(tx);
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("four")
+    );
+
+    drive_lazy_payload_io(&conn, || cursor.next());
+    drive_lazy_payload_io(&conn, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), None);
+    assert_eq!(lazy_payload_text(&conn, &mut cursor), None);
+
+    drive_lazy_payload_io(&conn, || cursor.last());
+    assert_eq!(
+        lazy_payload_text(&conn, &mut cursor).as_deref(),
+        Some("five")
+    );
+    conn.execute("ROLLBACK").unwrap();
+    store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+    let uncached = cursor
+        .read_mvcc_current_row()
+        .map(|row| row.map(|row| row.payload().to_vec()));
+    let payload = cursor.record_payload().map(|result| match result {
+        IOResult::Done(payload) => payload.map(<[u8]>::to_vec),
+        IOResult::IO(_) => panic!("a chain row payload needs no I/O"),
+    });
+    assert_eq!(format!("{payload:?}"), format!("{uncached:?}"));
+    assert_eq!(store.cursor_chain_payload_reads.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_sees_own_delete_behind_head() {
+    for backwards in [false, true] {
+        for chain_ahead in [false, true] {
+            let chain_only: Vec<i64> = match (chain_ahead, backwards) {
+                (false, _) => vec![],
+                (true, false) => vec![50],
+                (true, true) => vec![-50],
+            };
+            let (db, conn) = setup_lazy_walk_table(&(1..=10).collect::<Vec<_>>(), &chain_only);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            let rowids = scan_lazy_rowids(&conn, &mut cursor, backwards, || {
+                conn.execute("DELETE FROM t WHERE id = 5").unwrap();
+            });
+            let expected = (1..=10).filter(|id| *id != 5).chain(chain_only).collect();
+            assert_eq!(
+                rowids,
+                walk_order(expected, backwards),
+                "backwards={backwards} chain_ahead={chain_ahead}"
+            );
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_restores_row_after_rollback_to() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_walk_table(&[1, 2, 3, 4, 5, 6], &[]);
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("DELETE FROM t WHERE id = 4").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let rowids = scan_lazy_rowids(&conn, &mut cursor, backwards, || {
+            conn.execute("ROLLBACK TO s").unwrap();
+        });
+        assert_eq!(
+            rowids,
+            walk_order(vec![1, 2, 3, 4, 5, 6], backwards),
+            "backwards={backwards}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_with_writes_from_other_statements() {
+    let (_db, conn) = setup_lazy_walk_table(&[1, 2, 3, 4, 5], &[7]);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t SELECT id + 100, v FROM t")
+        .unwrap();
+    let ids: Vec<i64> = get_rows(&conn, "SELECT id FROM t")
+        .iter()
+        .map(|row| row[0].as_int().unwrap())
+        .collect();
+    assert_eq!(ids, [1, 2, 3, 4, 5, 7, 101, 102, 103, 104, 105, 107]);
+    conn.execute("ROLLBACK").unwrap();
+
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_walk_table(&[1, 2, 3, 4, 5, 7, 8, 9, 10], &[12]);
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let rowids = scan_lazy_rowids(&conn, &mut cursor, backwards, || {
+            conn.execute("INSERT INTO t VALUES (6, 'six')").unwrap();
+            conn.execute("DELETE FROM t WHERE id = 8").unwrap();
+        });
+        assert_eq!(
+            rowids,
+            walk_order(vec![1, 2, 3, 4, 5, 6, 7, 9, 10, 12], backwards),
+            "backwards={backwards}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_with_write_during_advance_yield() {
+    for backwards in [false, true] {
+        let (chain_only, first, deleted) = if backwards { (-50, 10, 8) } else { (50, 1, 3) };
+        let (db, conn) = setup_lazy_walk_table(&(1..=10).collect::<Vec<_>>(), &[chain_only]);
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        drive_lazy_payload_io(&conn, || {
+            if backwards {
+                cursor.last()
+            } else {
+                cursor.rewind()
+            }
+        });
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(first));
+        let point = if backwards {
+            CursorYieldPoint::AdvanceBtreeBackwardProgress
+        } else {
+            CursorYieldPoint::AdvanceBtreeForwardProgress
+        };
+        let injector = FixedYieldInjector::new([point.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let IOResult::IO(pending) = (if backwards {
+            cursor.prev()
+        } else {
+            cursor.next()
+        })
+        .unwrap() else {
+            panic!("movement must yield");
+        };
+        assert!(pending.is_explicit_yield());
+        assert!(injector.is_empty());
+        conn.set_yield_injector(None);
+        conn.execute(format!("DELETE FROM t WHERE id = {deleted}"))
+            .unwrap();
+        pending.wait(conn.db.io.as_ref()).unwrap();
+        let mut rowids = vec![first];
+        loop {
+            drive_lazy_payload_io(&conn, || {
+                if backwards {
+                    cursor.prev()
+                } else {
+                    cursor.next()
+                }
+            });
+            let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) else {
+                break;
+            };
+            rowids.push(rowid);
+        }
+        let expected = (1..=10)
+            .filter(|id| *id != deleted)
+            .chain([chain_only])
+            .collect();
+        assert_eq!(
+            rowids,
+            walk_order(expected, backwards),
+            "backwards={backwards}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_keeps_row_deleted_by_later_commit() {
+    for backwards in [false, true] {
+        let (chain_only, deleted) = if backwards { (-50, 6) } else { (50, 5) };
+        let (db, conn) = setup_lazy_walk_table(&(1..=10).collect::<Vec<_>>(), &[chain_only]);
+        let writer = db.connect();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        assert_eq!(
+            get_rows(&writer, "SELECT count(*) FROM t")[0][0].as_int(),
+            Some(11)
+        );
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let rowids = scan_lazy_rowids(&conn, &mut cursor, backwards, || {
+            writer
+                .execute(format!("DELETE FROM t WHERE id = {deleted}"))
+                .unwrap();
+            writer.execute("COMMIT").unwrap();
+        });
+        let expected = (1..=10).chain([chain_only]).collect();
+        assert_eq!(
+            rowids,
+            walk_order(expected, backwards),
+            "backwards={backwards}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_registers_dependency_at_row() {
+    for backwards in [false, true] {
+        for writer_commits in [false, true] {
+            let (db, conn) = setup_lazy_walk_table(&[1, 2, 3, 4, 5], &[]);
+            let store = db.get_mvcc_store();
+            let writer = db.connect();
+            writer.execute("BEGIN CONCURRENT").unwrap();
+            writer.execute("DELETE FROM t WHERE id = 3").unwrap();
+            let writer_tx_id = writer.get_mv_tx_id().unwrap();
+            let mut commit = None;
+            if writer_commits {
+                writer.set_yield_injector(Some(FixedYieldInjector::new([
+                    CommitYieldPoint::LogRecordPrepared.point(),
+                ])));
+                let mut statement = writer.prepare("COMMIT").unwrap();
+                assert!(matches!(statement.step().unwrap(), StepResult::Yield));
+                commit = Some(statement);
+            } else {
+                store.get_commit_timestamp(|ts| {
+                    store
+                        .txs
+                        .get(&writer_tx_id)
+                        .unwrap()
+                        .value()
+                        .state
+                        .store(TransactionState::Preparing(ts));
+                });
+            }
+            assert!(matches!(
+                store.txs.get(&writer_tx_id).unwrap().value().state.load(),
+                TransactionState::Preparing(_)
+            ));
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            assert_eq!(get_rows(&conn, "SELECT v FROM t WHERE id = 1").len(), 1);
+            let reader_tx_id = conn.get_mv_tx_id().unwrap();
+            let depends_on_writer = || {
+                store
+                    .txs
+                    .get(&writer_tx_id)
+                    .unwrap()
+                    .value()
+                    .commit_dep_set
+                    .lock()
+                    .contains(&reader_tx_id)
+            };
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            let step = |cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>| {
+                drive_lazy_payload_io(&conn, || {
+                    if backwards {
+                        cursor.prev()
+                    } else {
+                        cursor.next()
+                    }
+                });
+                drive_lazy_payload_io(&conn, || cursor.rowid())
+            };
+            drive_lazy_payload_io(&conn, || {
+                if backwards {
+                    cursor.last()
+                } else {
+                    cursor.rewind()
+                }
+            });
+            let order = if backwards {
+                [5, 4, 2, 1]
+            } else {
+                [1, 2, 4, 5]
+            };
+            assert_eq!(
+                drive_lazy_payload_io(&conn, || cursor.rowid()),
+                Some(order[0])
+            );
+            assert_eq!(step(&mut cursor), Some(order[1]));
+            assert!(
+                !depends_on_writer(),
+                "the walk peeked row 3 before reaching it"
+            );
+            assert_eq!(step(&mut cursor), Some(order[2]));
+            assert!(
+                depends_on_writer(),
+                "reaching row 3 must register the dependency"
+            );
+            if let Some(mut commit) = commit {
+                commit.run_ignore_rows().unwrap();
+                assert_eq!(step(&mut cursor), Some(order[3]));
+                assert!(lazy_payload_bytes(&conn, &mut cursor).is_some());
+                assert_eq!(step(&mut cursor), None);
+            } else {
+                writer.execute("ROLLBACK").unwrap();
+                assert!(matches!(
+                    *cursor.record_payload().unwrap_err(),
+                    LimboError::CommitDependencyAborted
+                ));
+            }
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_with_sequence_compaction_stamp() {
+    let (db, conn) = setup_lazy_walk_table(&[1, 2, 3, 4, 5], &[]);
+    let store = db.get_mvcc_store();
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = store.get_table_id_from_root_page(root);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut earlier = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || earlier.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || earlier.rowid()), Some(1));
+    store.get_commit_timestamp(|ts| {
+        store.seqcompact_commit_delete(RowID::new(table_id, RowKey::Int(3)), ts);
+    });
+    let later_conn = db.connect();
+    later_conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut later = open_lazy_payload_cursor(&db, &later_conn);
+    assert_eq!(
+        scan_lazy_rowids(&later_conn, &mut later, false, || {}),
+        [1, 2, 4, 5]
+    );
+    let mut rowids = vec![1];
+    loop {
+        drive_lazy_payload_io(&conn, || earlier.next());
+        let Some(rowid) = drive_lazy_payload_io(&conn, || earlier.rowid()) else {
+            break;
+        };
+        rowids.push(rowid);
+    }
+    assert_eq!(rowids, [1, 2, 3, 4, 5]);
+    later_conn.execute("ROLLBACK").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_holds_unlinked_chain() {
+    for physical_row in [true, false] {
+        let physical: Vec<i64> = if physical_row {
+            vec![1, 2, 3, 4, 5]
+        } else {
+            vec![1, 2, 4, 5]
+        };
+        let (db, conn) = setup_lazy_walk_table(&physical, &[]);
+        let store = db.get_mvcc_store();
+        let write = |value: &str| {
+            if physical_row {
+                format!("UPDATE t SET v = '{value}' WHERE id = 3")
+            } else {
+                format!("INSERT INTO t VALUES (3, '{value}')")
+            }
+        };
+        let first_writer = db.connect();
+        first_writer.execute("BEGIN CONCURRENT").unwrap();
+        first_writer.execute(write("first")).unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let rows = scan_lazy_rows(&conn, &mut cursor, false, || {
+            first_writer.execute("ROLLBACK").unwrap();
+            store.drop_unused_row_versions_and_slots();
+            reclaim_lazy_transaction_nodes(|| false);
+            let second_writer = db.connect();
+            second_writer.execute(write("second")).unwrap();
+        });
+        let expected: Vec<_> = physical.iter().map(|id| (*id, format!("p{id}"))).collect();
+        assert_eq!(rows, expected, "physical_row={physical_row}");
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_at_rowid_limits_between_tables() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    for table in ["a", "t", "z"] {
+        conn.execute(format!(
+            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, v TEXT)"
+        ))
+        .unwrap();
+    }
+    for id in [i64::MIN, -5, 0, 5, i64::MAX] {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, 'p{id}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute(format!(
+        "UPDATE t SET v = 'u' || id WHERE id IN (-5, {})",
+        i64::MAX
+    ))
+    .unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 'c3')").unwrap();
+    for table in ["a", "z"] {
+        for id in [i64::MIN, -1, 1, i64::MAX] {
+            conn.execute(format!("INSERT INTO {table} VALUES ({id}, 'n')"))
+                .unwrap();
+        }
+    }
+    let expected = vec![
+        (i64::MIN, format!("p{}", i64::MIN)),
+        (-5, "u-5".to_string()),
+        (0, "p0".to_string()),
+        (3, "c3".to_string()),
+        (5, "p5".to_string()),
+        (i64::MAX, format!("u{}", i64::MAX)),
+    ];
+    for backwards in [false, true] {
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let rows = scan_lazy_rows(&conn, &mut cursor, backwards, || {});
+        let mut expected = expected.clone();
+        if backwards {
+            expected.reverse();
+        }
+        assert_eq!(rows, expected, "backwards={backwards}");
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_dropped_as_last_store_owner() {
+    let (db, conn) = setup_lazy_walk_table(&[1, 2, 3], &[10]);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    let store = db.get_mvcc_store();
+    conn.execute("ROLLBACK").unwrap();
+    reclaim_lazy_transaction_nodes(|| false);
+    let weak_store = Arc::downgrade(&store);
+    drop(store);
+    drop(conn);
+    drop(db);
+    assert!(weak_store.upgrade().is_some());
+    std::thread::spawn(move || drop(cursor)).join().unwrap();
+    assert!(weak_store.upgrade().is_none());
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_parked_statement_across_vacuum() {
+    let db = MvccTestDbNoConn::new_with_random_db_with_opts(DatabaseOpts::new().with_vacuum(true));
+    let conn = db.connect();
+    fill_lazy_walk_table(&conn, &[1, 2, 3], &[10]);
+    let mut statement = conn.prepare("SELECT id FROM t").unwrap();
+    assert_eq!(statement.run_collect_rows().unwrap().len(), 4);
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("VACUUM").unwrap();
+    drop(statement);
+    assert_eq!(get_rows(&conn, "SELECT id FROM t").len(), 4);
+}
+
+#[test]
+fn test_lazy_cursor_table_walk_without_point_lookups() {
+    let mut lookups = Vec::new();
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_walk_table(&(1..=20).collect::<Vec<_>>(), &[25]);
+        conn.execute("UPDATE t SET v = 'u' || id WHERE id IN (5, 10, 15)")
+            .unwrap();
+        conn.execute("DELETE FROM t WHERE id = 12").unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let store = db.get_mvcc_store();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        store
+            .cursor_point_validity_lookups
+            .store(0, Ordering::Relaxed);
+        let rows = scan_lazy_rows(&conn, &mut cursor, backwards, || {});
+        let mut expected: Vec<_> = (1..=20)
+            .filter(|id| *id != 12)
+            .map(|id| {
+                let value = if matches!(id, 5 | 10 | 15) {
+                    format!("u{id}")
+                } else {
+                    format!("p{id}")
+                };
+                (id, value)
+            })
+            .chain([(25, "c25".to_string())])
+            .collect();
+        if backwards {
+            expected.reverse();
+        }
+        assert_eq!(rows, expected, "backwards={backwards}");
+        lookups.push(store.cursor_point_validity_lookups.load(Ordering::Relaxed));
+        conn.execute("ROLLBACK").unwrap();
+    }
+    assert_eq!(lookups, [0, 0]);
+}
+
+#[test]
+fn test_lazy_cursor_point_operations_start_no_table_walk() {
+    let (db, conn) = setup_lazy_walk_table(&(1..=40).collect::<Vec<_>>(), &[]);
+    conn.execute("UPDATE t SET v = 'u' || id").unwrap();
+    let store = db.get_mvcc_store();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut starts = Vec::new();
+    for (operation, sql) in [
+        ("update hit", "UPDATE t SET v = 'w' WHERE id = 7"),
+        ("update miss", "UPDATE t SET v = 'w' WHERE id = 1000"),
+        ("insert", "INSERT INTO t VALUES (500, 'n')"),
+        ("insert new rowid", "INSERT INTO t(v) VALUES ('auto')"),
+        ("select hit", "SELECT v FROM t WHERE id = 9"),
+        ("select miss", "SELECT v FROM t WHERE id = 2000"),
+        ("delete", "DELETE FROM t WHERE id = 11"),
+    ] {
+        store.cursor_table_walk_starts.store(0, Ordering::Relaxed);
+        get_rows(&conn, sql);
+        starts.push((
+            operation,
+            store.cursor_table_walk_starts.load(Ordering::Relaxed),
+        ));
+    }
+    store.cursor_table_walk_starts.store(0, Ordering::Relaxed);
+    assert_eq!(get_rows(&conn, "SELECT id FROM t").len(), 41);
+    starts.push((
+        "full scan",
+        store.cursor_table_walk_starts.load(Ordering::Relaxed),
+    ));
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        starts,
+        [
+            ("update hit", 0),
+            ("update miss", 0),
+            ("insert", 0),
+            ("insert new rowid", 1),
+            ("select hit", 0),
+            ("select miss", 0),
+            ("delete", 0),
+            ("full scan", 1),
+        ]
+    );
+}
+
+#[test]
+fn test_lazy_cursor_exact_seek_leaves_table_walk_unallocated() {
+    let (db, conn) = setup_lazy_walk_table(&[1, 2, 3, 4, 5], &[]);
+    conn.execute("UPDATE t SET v = 'u' || id WHERE id = 3")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    for (rowid, expected) in [
+        (2, SeekResult::Found),
+        (3, SeekResult::Found),
+        (9, SeekResult::NotFound),
+    ] {
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })),
+            expected
+        );
+        assert!(!cursor.has_table_walk(), "rowid={rowid}");
+    }
+    assert_eq!(
+        scan_lazy_rowids(&conn, &mut cursor, false, || {}),
+        [1, 2, 3, 4, 5]
+    );
+    assert!(cursor.has_table_walk());
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_skip_peek_reconciliation() {
+    let (db, conn) = setup_lazy_walk_table(&(1..=20).collect::<Vec<_>>(), &[]);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    store
+        .cursor_peek_reconciliations
+        .store(0, Ordering::Relaxed);
+    assert_eq!(
+        scan_lazy_rowids(&conn, &mut cursor, false, || {}),
+        (1..=20).collect::<Vec<_>>()
+    );
+    assert_eq!(store.cursor_peek_reconciliations.load(Ordering::Relaxed), 2);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_match_the_merge_path() {
+    let no_rows: Vec<i64> = Vec::new();
+    let fixtures = [
+        ("no chains", no_rows.clone(), no_rows.clone(), no_rows),
+        (
+            "10% chains",
+            (1..=4).map(|i| i * 20).collect(),
+            vec![],
+            vec![],
+        ),
+        (
+            "100% chains",
+            (1..=40).map(|i| i * 2).collect(),
+            vec![],
+            vec![],
+        ),
+        ("version-only rows", vec![], vec![], vec![5, 15, 41, 99]),
+        ("tombstones", vec![], vec![4, 20, 80], vec![]),
+        ("mixed", vec![6, 30], vec![8], vec![9, 81]),
+    ];
+    for columns in [3, 101] {
+        for (name, updated, deleted, inserted) in &fixtures {
+            let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+                || setup_lazy_step_table(columns, updated, deleted, inserted),
+                |db, conn| {
+                    let mut cursor = open_lazy_payload_cursor(db, conn);
+                    scan_lazy_payloads(conn, &mut cursor, false)
+                },
+            );
+            let expected = 40 - deleted.len() + inserted.len();
+            assert_eq!(rows.len(), expected, "columns={columns} fixture={name}");
+            assert!(
+                step_counts.0 < merge_counts.0,
+                "columns={columns} fixture={name} {step_counts:?} {merge_counts:?}"
+            );
+            assert_eq!(
+                step_counts.1, merge_counts.1,
+                "columns={columns} fixture={name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_keep_the_snapshot_across_foreign_commits() {
+    for change in [
+        "DELETE FROM t WHERE id = 10",
+        "UPDATE t SET c1 = 'later' WHERE id = 12",
+        "INSERT INTO t VALUES (13, 'later', 'later')",
+    ] {
+        scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[], &[], &[5]),
+            |db, conn| {
+                let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+                let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, false);
+                let other = db.connect();
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.rewind());
+                let mut rows = vec![(
+                    drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                    lazy_payload_bytes(conn, &mut cursor).unwrap(),
+                )];
+                other.execute(change).unwrap();
+                rows.extend(continue_lazy_payload_scan(conn, &mut cursor, false));
+                assert_eq!(rows, snapshot, "{change}");
+                rows
+            },
+        );
+    }
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_skip_invisible_version_rows() {
+    let (rows, _) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[], &[], &[5]),
+        |db, conn| {
+            let uncommitted = db.connect();
+            uncommitted.execute("BEGIN CONCURRENT").unwrap();
+            uncommitted
+                .execute("INSERT INTO t VALUES (7, 'hidden', 'hidden')")
+                .unwrap();
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            drive_lazy_payload_io(conn, || cursor.rewind());
+            db.connect()
+                .execute("INSERT INTO t VALUES (9, 'later', 'later')")
+                .unwrap();
+            let mut rows = vec![drive_lazy_payload_io(conn, || cursor.rowid()).unwrap()];
+            rows.extend(
+                continue_lazy_payload_scan(conn, &mut cursor, false)
+                    .into_iter()
+                    .map(|(rowid, _)| rowid),
+            );
+            uncommitted.execute("ROLLBACK").unwrap();
+            rows
+        },
+    );
+    let mut expected: Vec<i64> = (1..=40).map(|i| i * 2).collect();
+    expected.push(5);
+    expected.sort_unstable();
+    assert_eq!(rows, expected);
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_across_checkpoint_and_gc() {
+    scan_with_and_without_table_steps(
+        || {
+            let db = MvccTestDbNoConn::new_with_random_db_passive();
+            let conn = db.connect();
+            fill_lazy_step_table(&conn, 3, &[20], &[], &[]);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            (db, conn)
+        },
+        |db, conn| {
+            let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+            let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, false);
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            drive_lazy_payload_io(conn, || cursor.rewind());
+            let mut rows = vec![(
+                drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                lazy_payload_bytes(conn, &mut cursor).unwrap(),
+            )];
+            let other = db.connect();
+            other
+                .execute("UPDATE t SET c1 = 'later' WHERE id = 6")
+                .unwrap();
+            let store = db.get_mvcc_store();
+            let before = store.debug_gc_snapshot();
+            store.drop_unused_row_versions();
+            other.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            let after = store.debug_gc_snapshot();
+            assert_ne!(before, after, "the checkpoint and GC changed nothing");
+            rows.extend(continue_lazy_payload_scan(conn, &mut cursor, false));
+            assert_eq!(rows, snapshot);
+            rows
+        },
+    );
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_with_two_cursors() {
+    scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[20, 40], &[], &[5]),
+        |db, conn| {
+            let mut slow = open_lazy_payload_cursor(db, conn);
+            let mut fast = open_lazy_payload_cursor(db, conn);
+            drive_lazy_payload_io(conn, || slow.rewind());
+            drive_lazy_payload_io(conn, || fast.rewind());
+            let mut slow_rows = Vec::new();
+            let mut fast_rows = Vec::new();
+            loop {
+                let slow_row = drive_lazy_payload_io(conn, || slow.rowid());
+                if let Some(rowid) = slow_row {
+                    slow_rows.push(rowid);
+                    drive_lazy_payload_io(conn, || slow.next());
+                }
+                let mut fast_row = None;
+                for _ in 0..2 {
+                    fast_row = drive_lazy_payload_io(conn, || fast.rowid());
+                    if let Some(rowid) = fast_row {
+                        fast_rows.push(rowid);
+                        drive_lazy_payload_io(conn, || fast.next());
+                    }
+                }
+                if slow_row.is_none() && fast_row.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(slow_rows, fast_rows);
+            assert_eq!(slow_rows.len(), 41);
+            slow_rows
+        },
+    );
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_after_own_changes() {
+    let physical: Vec<i64> = (1..=40).map(|i| i * 2).collect();
+    for change in [
+        "INSERT INTO t VALUES (7, 'ahead', 'ahead')",
+        "INSERT INTO t VALUES (1, 'behind', 'behind')",
+        "DELETE FROM t WHERE id = 6",
+        "UPDATE t SET c1 = 'changed' WHERE id = 6",
+    ] {
+        let (rows, _) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[], &[], &[]),
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.rewind());
+                drive_lazy_payload_io(conn, || cursor.next());
+                let mut rows = vec![(2, String::new())];
+                rows.push((
+                    drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                    String::new(),
+                ));
+                conn.execute(change).unwrap();
+                rows.extend(
+                    continue_lazy_payload_scan(conn, &mut cursor, false)
+                        .into_iter()
+                        .map(|(rowid, payload)| (rowid, payload_text(&payload))),
+                );
+                rows
+            },
+        );
+        let rowids: Vec<i64> = rows.iter().map(|(rowid, _)| *rowid).collect();
+        let mut expected = physical.clone();
+        if change.contains("(7,") {
+            expected.push(7);
+            expected.sort_unstable();
+        }
+        if change.starts_with("DELETE") {
+            expected.retain(|id| *id != 6);
+        }
+        assert_eq!(rowids, expected, "{change}");
+        if change.starts_with("UPDATE") {
+            assert!(rows.contains(&(6, "changed".to_string())), "{change}");
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_after_seek_and_direction_change() {
+    let (rows, _) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[30], &[], &[]),
+        |db, conn| {
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            let mut rows = Vec::new();
+            drive_lazy_payload_io(conn, || cursor.rewind());
+            for _ in 0..3 {
+                drive_lazy_payload_io(conn, || cursor.next());
+                rows.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+            }
+            assert_eq!(
+                drive_lazy_payload_io(conn, || cursor
+                    .seek(SeekKey::TableRowId(20), SeekOp::GE { eq_only: true })),
+                SeekResult::Found
+            );
+            for _ in 0..2 {
+                drive_lazy_payload_io(conn, || cursor.prev());
+                rows.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+            }
+            for _ in 0..4 {
+                drive_lazy_payload_io(conn, || cursor.next());
+                rows.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+            }
+            rows
+        },
+    );
+    assert_eq!(rows, [4, 6, 8, 18, 16, 18, 20, 22, 24].map(Some).to_vec());
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_with_injected_yields() {
+    let mut expected: Vec<i64> = (1..=40).map(|i| i * 2).filter(|id| *id != 8).collect();
+    expected.push(9);
+    expected.sort_unstable();
+    for point in [
+        CursorYieldPoint::NextStart,
+        CursorYieldPoint::NextBtreeAdvance,
+        CursorYieldPoint::AdvanceBtreeForwardProgress,
+    ] {
+        let mut fired = false;
+        for occurrence in 0..12 {
+            for abandon in [false, true] {
+                let ((point_fired, _), _) = scan_with_and_without_table_steps(
+                    || setup_lazy_step_table(3, &[6], &[8], &[9]),
+                    |db, conn| {
+                        let mut cursor = open_lazy_payload_cursor(db, conn);
+                        drive_lazy_payload_io(conn, || cursor.rewind());
+                        let injector = NthYieldInjector::new(point.point(), occurrence);
+                        conn.set_yield_injector(Some(injector.clone()));
+                        let mut rowids =
+                            vec![drive_lazy_payload_io(conn, || cursor.rowid()).unwrap()];
+                        loop {
+                            match cursor.next().unwrap() {
+                                IOResult::Done(()) => {
+                                    let Some(rowid) =
+                                        drive_lazy_payload_io(conn, || cursor.rowid())
+                                    else {
+                                        break;
+                                    };
+                                    rowids.push(rowid);
+                                }
+                                IOResult::IO(io) => {
+                                    if io.is_explicit_yield() && abandon {
+                                        conn.set_yield_injector(None);
+                                        return (injector.fired(), rowids);
+                                    }
+                                    io.wait(conn.db.io.as_ref()).unwrap();
+                                }
+                            }
+                        }
+                        conn.set_yield_injector(None);
+                        assert_eq!(rowids, expected, "{point:?} {occurrence}");
+                        (injector.fired(), rowids)
+                    },
+                );
+                if occurrence == 0 {
+                    assert!(point_fired, "{point:?} never fired");
+                }
+                fired |= point_fired;
+            }
+        }
+        assert!(fired, "{point:?} never fired");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_at_rowid_limits_and_tiny_tables() {
+    for (physical, chain_only) in [
+        (vec![i64::MIN, -5, 0, 7, i64::MAX], vec![-3]),
+        (vec![i64::MIN, -5, 0, 7, i64::MAX], vec![]),
+        (vec![42], vec![]),
+        (vec![], vec![]),
+    ] {
+        let (rowids, _) = scan_with_and_without_table_steps(
+            || {
+                let (db, conn) = setup_lazy_walk_table(&physical, &chain_only);
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                scan_lazy_rowids(conn, &mut cursor, false, || {})
+            },
+        );
+        let expected = walk_order(physical.iter().chain(&chain_only).copied().collect(), false);
+        assert_eq!(rowids, expected, "{physical:?} {chain_only:?}");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_then_count() {
+    let (counts, _) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[10], &[12], &[5]),
+        |db, conn| {
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            let rows = scan_lazy_payloads(conn, &mut cursor, false).len();
+            (rows, drive_lazy_payload_io(conn, || cursor.count()))
+        },
+    );
+    assert_eq!(counts, (40, 40));
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_with_abort_and_removed_transaction() {
+    for removed in [false, true] {
+        scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[], &[], &[]),
+            |db, conn| {
+                let store = db.get_mvcc_store();
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.rewind());
+                let tx_id = conn.get_mv_tx_id().unwrap();
+                if removed {
+                    conn.execute("ROLLBACK").unwrap();
+                } else {
+                    let tx = store.txs.get(&tx_id).unwrap();
+                    tx.value().abort_now.store(true, Ordering::Release);
+                }
+                let mut outcomes = Vec::new();
+                for _ in 0..3 {
+                    let moved = loop {
+                        match cursor.next() {
+                            Ok(IOResult::Done(())) => break Ok(()),
+                            Ok(IOResult::IO(io)) => io.wait(conn.db.io.as_ref()).unwrap(),
+                            Err(err) => break Err(format!("{err:?}")),
+                        }
+                    };
+                    let rowid = drive_lazy_payload_io(conn, || cursor.rowid());
+                    let payload = cursor
+                        .record_payload()
+                        .map(|result| match result {
+                            IOResult::Done(payload) => payload.map(<[u8]>::to_vec),
+                            IOResult::IO(_) => panic!("a B-tree payload here needs no I/O"),
+                        })
+                        .map_err(|err| format!("{err:?}"));
+                    outcomes.push((moved, rowid, payload));
+                }
+                if !removed {
+                    conn.execute("ROLLBACK").unwrap();
+                }
+                outcomes
+            },
+        );
+    }
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_across_rollback_to() {
+    scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[30], &[], &[]),
+        |db, conn| {
+            let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+            let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, false);
+            conn.execute("SAVEPOINT s").unwrap();
+            conn.execute("UPDATE t SET c1 = 'changed' WHERE id = 10")
+                .unwrap();
+            conn.execute("DELETE FROM t WHERE id = 20").unwrap();
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            drive_lazy_payload_io(conn, || cursor.rewind());
+            let mut rows = vec![(
+                drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                lazy_payload_bytes(conn, &mut cursor).unwrap(),
+            )];
+            conn.execute("ROLLBACK TO s").unwrap();
+            rows.extend(continue_lazy_payload_scan(conn, &mut cursor, false));
+            assert_eq!(rows, snapshot);
+            rows
+        },
+    );
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_after_exact_seek() {
+    let (rows, _) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[30], &[], &[25]),
+        |db, conn| {
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            assert_eq!(
+                drive_lazy_payload_io(conn, || cursor
+                    .seek(SeekKey::TableRowId(20), SeekOp::GE { eq_only: true })),
+                SeekResult::Found
+            );
+            let mut rows = Vec::new();
+            for _ in 0..6 {
+                drive_lazy_payload_io(conn, || cursor.next());
+                rows.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+            }
+            rows
+        },
+    );
+    assert_eq!(rows, [22, 24, 25, 26, 28, 30].map(Some).to_vec());
+}
+
+#[test]
+fn test_lazy_cursor_forward_steps_keep_the_yield_sequence() {
+    let (sequence, _) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[6, 30], &[8], &[9, 81]),
+        |db, conn| {
+            let recorder = Arc::new(RecordingYieldInjector {
+                points: Mutex::new(Vec::new()),
+            });
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            conn.set_yield_injector(Some(recorder.clone()));
+            let rows = scan_lazy_payloads(conn, &mut cursor, false);
+            conn.set_yield_injector(None);
+            assert_eq!(rows.len(), 41);
+            let points = recorder.points.lock().clone();
+            points
+        },
+    );
+    assert!(sequence.contains(&CursorYieldPoint::AdvanceBtreeForwardProgress.point()));
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_skip_peek_reconciliation() {
+    let (db, conn) = setup_lazy_walk_table(&(1..=20).collect::<Vec<_>>(), &[]);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let store = db.get_mvcc_store();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    store
+        .cursor_peek_reconciliations
+        .store(0, Ordering::Relaxed);
+    assert_eq!(
+        scan_lazy_rowids(&conn, &mut cursor, true, || {}),
+        (1..=20).rev().collect::<Vec<_>>()
+    );
+    assert_eq!(store.cursor_peek_reconciliations.load(Ordering::Relaxed), 2);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_match_the_merge_path() {
+    let no_rows: Vec<i64> = Vec::new();
+    let fixtures = [
+        ("no chains", no_rows.clone(), no_rows.clone(), no_rows),
+        (
+            "10% chains",
+            (1..=4).map(|i| i * 20).collect(),
+            vec![],
+            vec![],
+        ),
+        (
+            "100% chains",
+            (1..=40).map(|i| i * 2).collect(),
+            vec![],
+            vec![],
+        ),
+        ("version-only rows", vec![], vec![], vec![5, 15, 41, 99]),
+        ("tombstones", vec![], vec![4, 20, 80], vec![]),
+        ("mixed", vec![6, 30], vec![8], vec![9, 81]),
+    ];
+    for columns in [3, 101] {
+        for (name, updated, deleted, inserted) in &fixtures {
+            let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+                || setup_lazy_step_table(columns, updated, deleted, inserted),
+                |db, conn| {
+                    let mut cursor = open_lazy_payload_cursor(db, conn);
+                    scan_lazy_payloads(conn, &mut cursor, true)
+                },
+            );
+            let expected = 40 - deleted.len() + inserted.len();
+            assert_eq!(rows.len(), expected, "columns={columns} fixture={name}");
+            assert!(
+                step_counts.0 < merge_counts.0,
+                "columns={columns} fixture={name} {step_counts:?} {merge_counts:?}"
+            );
+            assert_eq!(
+                step_counts.1, merge_counts.1,
+                "columns={columns} fixture={name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_with_injected_yields() {
+    let mut expected: Vec<i64> = (1..=40).map(|i| i * 2).filter(|id| *id != 74).collect();
+    expected.push(73);
+    expected.sort_unstable();
+    expected.reverse();
+    for point in [
+        CursorYieldPoint::PrevBtreeAdvance,
+        CursorYieldPoint::AdvanceBtreeBackwardProgress,
+    ] {
+        let mut fired = false;
+        for occurrence in 0..12 {
+            for abandon in [false, true] {
+                let ((point_fired, _), _) = scan_with_and_without_table_steps(
+                    || setup_lazy_step_table(3, &[76], &[74], &[73]),
+                    |db, conn| {
+                        let mut cursor = open_lazy_payload_cursor(db, conn);
+                        drive_lazy_payload_io(conn, || cursor.last());
+                        let injector = NthYieldInjector::new(point.point(), occurrence);
+                        conn.set_yield_injector(Some(injector.clone()));
+                        let mut rowids =
+                            vec![drive_lazy_payload_io(conn, || cursor.rowid()).unwrap()];
+                        loop {
+                            match cursor.prev().unwrap() {
+                                IOResult::Done(()) => {
+                                    let Some(rowid) =
+                                        drive_lazy_payload_io(conn, || cursor.rowid())
+                                    else {
+                                        break;
+                                    };
+                                    rowids.push(rowid);
+                                }
+                                IOResult::IO(io) => {
+                                    if io.is_explicit_yield() && abandon {
+                                        conn.set_yield_injector(None);
+                                        return (injector.fired(), rowids);
+                                    }
+                                    io.wait(conn.db.io.as_ref()).unwrap();
+                                }
+                            }
+                        }
+                        conn.set_yield_injector(None);
+                        assert_eq!(rowids, expected, "{point:?} {occurrence}");
+                        (injector.fired(), rowids)
+                    },
+                );
+                if occurrence == 0 {
+                    assert!(point_fired, "{point:?} never fired");
+                }
+                fired |= point_fired;
+            }
+        }
+        assert!(fired, "{point:?} never fired");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_after_positioning() {
+    let moves: [(&str, &[&str]); 4] = [
+        ("seek", &["prev", "prev", "prev", "next", "next"]),
+        ("last", &["prev", "prev", "prev"]),
+        ("rewind", &["prev"]),
+        ("rewind", &["next", "next", "next", "prev", "prev"]),
+    ];
+    let mut results = Vec::new();
+    for (start, steps) in moves {
+        let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[30], &[], &[]),
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                match start {
+                    "seek" => {
+                        assert_eq!(
+                            drive_lazy_payload_io(conn, || cursor
+                                .seek(SeekKey::TableRowId(20), SeekOp::GE { eq_only: true })),
+                            SeekResult::Found
+                        );
+                    }
+                    "last" => drive_lazy_payload_io(conn, || cursor.last()),
+                    _ => drive_lazy_payload_io(conn, || cursor.rewind()),
+                }
+                let mut rows = vec![drive_lazy_payload_io(conn, || cursor.rowid())];
+                for step in steps {
+                    if *step == "prev" {
+                        drive_lazy_payload_io(conn, || cursor.prev());
+                    } else {
+                        drive_lazy_payload_io(conn, || cursor.next());
+                    }
+                    rows.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+                }
+                rows
+            },
+        );
+        if start == "last" {
+            assert!(step_counts.0 < merge_counts.0, "{start}");
+        }
+        results.push(rows);
+    }
+    assert_eq!(results[0], [20, 18, 16, 14, 16, 18].map(Some).to_vec());
+    assert_eq!(results[1], [80, 78, 76, 74].map(Some).to_vec());
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_then_count() {
+    let (counts, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[10], &[12], &[5]),
+        |db, conn| {
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            let rows = scan_lazy_payloads(conn, &mut cursor, true).len();
+            (rows, drive_lazy_payload_io(conn, || cursor.count()))
+        },
+    );
+    assert!(step_counts.0 < merge_counts.0);
+    assert_eq!(counts, (40, 40));
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_after_own_changes() {
+    let physical: Vec<i64> = (1..=40).map(|i| i * 2).rev().collect();
+    for change in [
+        "INSERT INTO t VALUES (77, 'ahead', 'ahead')",
+        "INSERT INTO t VALUES (81, 'behind', 'behind')",
+        "DELETE FROM t WHERE id = 76",
+        "UPDATE t SET c1 = 'changed' WHERE id = 76",
+    ] {
+        let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[], &[], &[]),
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.last());
+                drive_lazy_payload_io(conn, || cursor.prev());
+                let mut rows = vec![(80, String::new())];
+                rows.push((
+                    drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                    String::new(),
+                ));
+                conn.execute(change).unwrap();
+                rows.extend(
+                    continue_lazy_payload_scan(conn, &mut cursor, true)
+                        .into_iter()
+                        .map(|(rowid, payload)| (rowid, payload_text(&payload))),
+                );
+                rows
+            },
+        );
+        assert!(step_counts.0 < merge_counts.0, "{change}");
+        let rowids: Vec<i64> = rows.iter().map(|(rowid, _)| *rowid).collect();
+        let mut expected = physical.clone();
+        if change.contains("(77,") {
+            expected.push(77);
+            expected.sort_unstable();
+            expected.reverse();
+        }
+        if change.starts_with("DELETE") {
+            expected.retain(|id| *id != 76);
+        }
+        assert_eq!(rowids, expected, "{change}");
+        if change.starts_with("UPDATE") {
+            assert!(rows.contains(&(76, "changed".to_string())), "{change}");
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_keep_the_snapshot_across_foreign_commits() {
+    for change in [
+        "DELETE FROM t WHERE id = 70",
+        "UPDATE t SET c1 = 'later' WHERE id = 72",
+        "INSERT INTO t VALUES (71, 'later', 'later')",
+    ] {
+        let (_, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[], &[], &[75]),
+            |db, conn| {
+                let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+                let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, true);
+                let other = db.connect();
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.last());
+                let mut rows = vec![(
+                    drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                    lazy_payload_bytes(conn, &mut cursor).unwrap(),
+                )];
+                other.execute(change).unwrap();
+                rows.extend(continue_lazy_payload_scan(conn, &mut cursor, true));
+                assert_eq!(rows, snapshot, "{change}");
+                rows
+            },
+        );
+        assert!(step_counts.0 < merge_counts.0, "{change}");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_at_rowid_limits_and_tiny_tables() {
+    for (physical, chain_only) in [
+        (vec![i64::MIN, -5, 0, 7, i64::MAX], vec![-3]),
+        (vec![i64::MIN, -5, 0, 7, i64::MAX], vec![]),
+        (vec![42], vec![]),
+        (vec![], vec![]),
+    ] {
+        let (rowids, _) = scan_with_and_without_table_steps(
+            || {
+                let (db, conn) = setup_lazy_walk_table(&physical, &chain_only);
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                scan_lazy_rowids(conn, &mut cursor, true, || {})
+            },
+        );
+        let expected = walk_order(physical.iter().chain(&chain_only).copied().collect(), true);
+        assert_eq!(rowids, expected, "{physical:?} {chain_only:?}");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_keep_the_yield_sequence() {
+    let (sequence, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[6, 30], &[8], &[9, 81]),
+        |db, conn| {
+            let recorder = Arc::new(RecordingYieldInjector {
+                points: Mutex::new(Vec::new()),
+            });
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            conn.set_yield_injector(Some(recorder.clone()));
+            let rows = scan_lazy_payloads(conn, &mut cursor, true);
+            conn.set_yield_injector(None);
+            assert_eq!(rows.len(), 41);
+            let points = recorder.points.lock().clone();
+            points
+        },
+    );
+    assert!(step_counts.0 < merge_counts.0);
+    assert!(sequence.contains(&CursorYieldPoint::AdvanceBtreeBackwardProgress.point()));
+    assert!(sequence.contains(&CursorYieldPoint::PrevBtreeAdvance.point()));
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_across_rollback_to() {
+    let (_, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[30], &[], &[]),
+        |db, conn| {
+            let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+            let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, true);
+            conn.execute("SAVEPOINT s").unwrap();
+            conn.execute("UPDATE t SET c1 = 'changed' WHERE id = 70")
+                .unwrap();
+            conn.execute("DELETE FROM t WHERE id = 60").unwrap();
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            drive_lazy_payload_io(conn, || cursor.last());
+            let mut rows = vec![(
+                drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                lazy_payload_bytes(conn, &mut cursor).unwrap(),
+            )];
+            conn.execute("ROLLBACK TO s").unwrap();
+            rows.extend(continue_lazy_payload_scan(conn, &mut cursor, true));
+            assert_eq!(rows, snapshot);
+            rows
+        },
+    );
+    assert!(step_counts.0 < merge_counts.0);
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_across_checkpoint_and_gc() {
+    let (_, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+        || {
+            let db = MvccTestDbNoConn::new_with_random_db_passive();
+            let conn = db.connect();
+            fill_lazy_step_table(&conn, 3, &[20], &[], &[]);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            (db, conn)
+        },
+        |db, conn| {
+            let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+            let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, true);
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            drive_lazy_payload_io(conn, || cursor.last());
+            let mut rows = vec![(
+                drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                lazy_payload_bytes(conn, &mut cursor).unwrap(),
+            )];
+            let other = db.connect();
+            other
+                .execute("UPDATE t SET c1 = 'later' WHERE id = 66")
+                .unwrap();
+            let store = db.get_mvcc_store();
+            let before = store.debug_gc_snapshot();
+            store.drop_unused_row_versions();
+            other.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            let after = store.debug_gc_snapshot();
+            assert_ne!(before, after, "the checkpoint and GC changed nothing");
+            rows.extend(continue_lazy_payload_scan(conn, &mut cursor, true));
+            assert_eq!(rows, snapshot);
+            rows
+        },
+    );
+    assert!(step_counts.0 < merge_counts.0);
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_skip_invisible_version_rows() {
+    let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+        || setup_lazy_step_table(3, &[], &[], &[75]),
+        |db, conn| {
+            let uncommitted = db.connect();
+            uncommitted.execute("BEGIN CONCURRENT").unwrap();
+            uncommitted
+                .execute("INSERT INTO t VALUES (73, 'hidden', 'hidden')")
+                .unwrap();
+            let mut cursor = open_lazy_payload_cursor(db, conn);
+            drive_lazy_payload_io(conn, || cursor.last());
+            db.connect()
+                .execute("INSERT INTO t VALUES (71, 'later', 'later')")
+                .unwrap();
+            let mut rows = vec![drive_lazy_payload_io(conn, || cursor.rowid()).unwrap()];
+            rows.extend(
+                continue_lazy_payload_scan(conn, &mut cursor, true)
+                    .into_iter()
+                    .map(|(rowid, _)| rowid),
+            );
+            uncommitted.execute("ROLLBACK").unwrap();
+            rows
+        },
+    );
+    assert!(step_counts.0 < merge_counts.0);
+    let mut expected: Vec<i64> = (1..=40).map(|i| i * 2).collect();
+    expected.push(75);
+    expected.sort_unstable();
+    expected.reverse();
+    assert_eq!(rows, expected);
+}
+
+#[test]
+fn test_lazy_cursor_backward_steps_after_range_seek() {
+    for (op, start, expected) in [
+        (
+            SeekOp::LE { eq_only: false },
+            41,
+            vec![40, 38, 36, 34, 33, 32, 30],
+        ),
+        (SeekOp::LT, 40, vec![38, 36, 34, 33]),
+    ] {
+        let (rows, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[30], &[], &[33]),
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.seek(SeekKey::TableRowId(start), op));
+                let mut rows = vec![drive_lazy_payload_io(conn, || cursor.rowid())];
+                for _ in 1..expected.len() {
+                    drive_lazy_payload_io(conn, || cursor.prev());
+                    rows.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+                }
+                rows
+            },
+        );
+        assert!(step_counts.0 < merge_counts.0, "{op:?}");
+        assert_eq!(
+            rows,
+            expected.iter().copied().map(Some).collect::<Vec<_>>(),
+            "{op:?}"
+        );
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_skip_peek_reconciliation() {
+    for backwards in [false, true] {
+        let (rowids, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || {
+                let (db, conn) = setup_lazy_walk_table(&[], &(1..=20).collect::<Vec<_>>());
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                let store = db.get_mvcc_store();
+                store
+                    .cursor_peek_reconciliations
+                    .store(0, Ordering::Relaxed);
+                store.cursor_btree_rowid_reads.store(0, Ordering::Relaxed);
+                scan_lazy_rows(conn, &mut cursor, backwards, || {})
+            },
+        );
+        let expected: Vec<(i64, String)> = walk_order((1..=20).collect(), backwards)
+            .into_iter()
+            .map(|id| (id, format!("c{id}")))
+            .collect();
+        assert_eq!(rowids, expected, "backwards={backwards}");
+        assert_eq!(merge_counts.0, 21, "backwards={backwards}");
+        assert_eq!(step_counts.0, 2, "backwards={backwards}");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_after_changes() {
+    for backwards in [false, true] {
+        for change in [
+            "insert ahead",
+            "delete next",
+            "update next",
+            "rollback to",
+            "gc",
+            "later commit",
+            "abort",
+            "removed transaction",
+        ] {
+            scan_with_and_without_table_steps(
+                || {
+                    let (db, conn) = setup_lazy_walk_table(&[], &[2, 4, 6, 8, 10, 12]);
+                    conn.execute("BEGIN CONCURRENT").unwrap();
+                    (db, conn)
+                },
+                |db, conn| {
+                    let store = db.get_mvcc_store();
+                    if change == "rollback to" {
+                        conn.execute("SAVEPOINT s").unwrap();
+                        conn.execute("DELETE FROM t WHERE id = 6").unwrap();
+                    }
+                    let mut cursor = open_lazy_payload_cursor(db, conn);
+                    drive_lazy_payload_io(conn, || {
+                        if backwards {
+                            cursor.last()
+                        } else {
+                            cursor.rewind()
+                        }
+                    });
+                    let (ahead, next) = if backwards { (9, 10) } else { (3, 4) };
+                    match change {
+                        "insert ahead" => {
+                            conn.execute(format!("INSERT INTO t VALUES ({ahead}, 'new')"))
+                                .unwrap();
+                        }
+                        "delete next" => {
+                            conn.execute(format!("DELETE FROM t WHERE id = {next}"))
+                                .unwrap();
+                        }
+                        "update next" => {
+                            conn.execute(format!("UPDATE t SET v = 'changed' WHERE id = {next}"))
+                                .unwrap();
+                        }
+                        "rollback to" => conn.execute("ROLLBACK TO s").unwrap(),
+                        "gc" => {
+                            store.drop_unused_row_versions();
+                        }
+                        "later commit" => {
+                            db.connect()
+                                .execute(format!("DELETE FROM t WHERE id = {next}"))
+                                .unwrap();
+                        }
+                        "abort" => {
+                            let tx_id = conn.get_mv_tx_id().unwrap();
+                            let tx = store.txs.get(&tx_id).unwrap();
+                            tx.value().abort_now.store(true, Ordering::Release);
+                        }
+                        _ => conn.execute("ROLLBACK").unwrap(),
+                    }
+                    let mut outcomes = Vec::new();
+                    for _ in 0..8 {
+                        let moved = loop {
+                            let result = if backwards {
+                                cursor.prev()
+                            } else {
+                                cursor.next()
+                            };
+                            match result {
+                                Ok(IOResult::Done(())) => break Ok(()),
+                                Ok(IOResult::IO(io)) => io.wait(conn.db.io.as_ref()).unwrap(),
+                                Err(err) => break Err(format!("{err:?}")),
+                            }
+                        };
+                        let rowid = drive_lazy_payload_io(conn, || cursor.rowid());
+                        let payload = cursor
+                            .record_payload()
+                            .map(|result| match result {
+                                IOResult::Done(payload) => payload.map(<[u8]>::to_vec),
+                                IOResult::IO(_) => panic!("a version-store payload needs no I/O"),
+                            })
+                            .map_err(|err| format!("{err:?}"));
+                        outcomes.push((moved, rowid, payload));
+                    }
+                    if change != "removed transaction" {
+                        conn.execute("ROLLBACK").unwrap();
+                    }
+                    outcomes
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_with_passive_checkpoint_where_coverage_is_false() {
+    for backwards in [false, true] {
+        scan_with_and_without_table_steps(
+            || {
+                let db = MvccTestDbNoConn::new_with_random_db_passive();
+                let conn = db.connect();
+                fill_lazy_step_table(
+                    &conn,
+                    3,
+                    &(1..=40).map(|i| i * 2).collect::<Vec<_>>(),
+                    &[],
+                    &[],
+                );
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let mut snapshot_cursor = open_lazy_payload_cursor(db, conn);
+                let snapshot = scan_lazy_payloads(conn, &mut snapshot_cursor, backwards);
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || {
+                    if backwards {
+                        cursor.last()
+                    } else {
+                        cursor.rewind()
+                    }
+                });
+                let mut rows = vec![(
+                    drive_lazy_payload_io(conn, || cursor.rowid()).unwrap(),
+                    lazy_payload_bytes(conn, &mut cursor).unwrap(),
+                )];
+                let other = db.connect();
+                other
+                    .execute("UPDATE t SET c1 = 'later' WHERE id = 40")
+                    .unwrap();
+                other.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+                rows.extend(continue_lazy_payload_scan(conn, &mut cursor, backwards));
+                assert_eq!(rows, snapshot, "backwards={backwards}");
+                rows
+            },
+        );
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_with_injected_yields() {
+    let inserted = [3, 5, 7, 9, 11, 13];
+    for backwards in [false, true] {
+        let points = if backwards {
+            vec![
+                CursorYieldPoint::PrevBtreeAdvance,
+                CursorYieldPoint::AdvanceBtreeBackwardProgress,
+            ]
+        } else {
+            vec![
+                CursorYieldPoint::NextStart,
+                CursorYieldPoint::NextBtreeAdvance,
+                CursorYieldPoint::AdvanceBtreeForwardProgress,
+            ]
+        };
+        for point in points {
+            let mut fired = false;
+            for occurrence in 0..12 {
+                for abandon in [false, true] {
+                    let ((point_fired, _), _) = scan_with_and_without_table_steps(
+                        || setup_lazy_step_table(3, &[20], &[], &inserted),
+                        |db, conn| {
+                            let mut cursor = open_lazy_payload_cursor(db, conn);
+                            drive_lazy_payload_io(conn, || {
+                                if backwards {
+                                    cursor.last()
+                                } else {
+                                    cursor.rewind()
+                                }
+                            });
+                            let injector = NthYieldInjector::new(point.point(), occurrence);
+                            conn.set_yield_injector(Some(injector.clone()));
+                            let mut rowids =
+                                vec![drive_lazy_payload_io(conn, || cursor.rowid()).unwrap()];
+                            loop {
+                                let result = if backwards {
+                                    cursor.prev()
+                                } else {
+                                    cursor.next()
+                                };
+                                match result.unwrap() {
+                                    IOResult::Done(()) => {
+                                        let Some(rowid) =
+                                            drive_lazy_payload_io(conn, || cursor.rowid())
+                                        else {
+                                            break;
+                                        };
+                                        rowids.push(rowid);
+                                    }
+                                    IOResult::IO(io) => {
+                                        if io.is_explicit_yield() && abandon {
+                                            conn.set_yield_injector(None);
+                                            return (injector.fired(), rowids);
+                                        }
+                                        io.wait(conn.db.io.as_ref()).unwrap();
+                                    }
+                                }
+                            }
+                            conn.set_yield_injector(None);
+                            let expected = walk_order(
+                                (1..=40).map(|i| i * 2).chain(inserted).collect(),
+                                backwards,
+                            );
+                            assert_eq!(rowids, expected, "{point:?} {occurrence}");
+                            (injector.fired(), rowids)
+                        },
+                    );
+                    if occurrence == 0 {
+                        assert!(point_fired, "{point:?} never fired");
+                    }
+                    fired |= point_fired;
+                }
+            }
+            assert!(fired, "{point:?} never fired");
+        }
+        let (sequence, [merge_counts, step_counts]) = scan_with_and_without_table_steps(
+            || setup_lazy_step_table(3, &[20], &[], &inserted),
+            |db, conn| {
+                let recorder = Arc::new(RecordingYieldInjector {
+                    points: Mutex::new(Vec::new()),
+                });
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                conn.set_yield_injector(Some(recorder.clone()));
+                let rows = scan_lazy_payloads(conn, &mut cursor, backwards);
+                conn.set_yield_injector(None);
+                assert_eq!(rows.len(), 46);
+                let points = recorder.points.lock().clone();
+                points
+            },
+        );
+        assert!(!sequence.is_empty());
+        assert!(step_counts.0 < merge_counts.0, "backwards={backwards}");
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_match_the_merge_when_coverage_is_forced_on_by_hand() {
+    for backwards in [false, true] {
+        let (rows, _) = scan_with_and_without_table_steps(
+            || {
+                let (db, conn) = setup_lazy_walk_table(&[1, 2, 3], &[]);
+                let updated = if backwards { "2, 3" } else { "1, 2" };
+                conn.execute(format!(
+                    "UPDATE t SET v = v || '-u' WHERE id IN ({updated})"
+                ))
+                .unwrap();
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let store = db.get_mvcc_store();
+                let root = get_rows(conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0]
+                    [0]
+                .as_int()
+                .unwrap();
+                let table_id = store.get_table_id_from_root_page(root);
+                let snapshot = store.read_snapshot(conn.get_mv_tx_id().unwrap()).unwrap();
+                let versions = store
+                    .rows
+                    .get(&RowID::new(table_id, RowKey::Int(2)))
+                    .unwrap()
+                    .value()
+                    .clone();
+                {
+                    let mut chain = versions.write();
+                    chain.retain(|version| version.end().is_none());
+                    assert_eq!(chain.len(), 1);
+                    chain[0].set_materialized_at(snapshot.read_mark);
+                }
+                let old_max = store
+                    .durable_txid_max
+                    .swap(snapshot.begin_ts, Ordering::SeqCst);
+                store.checkpoint_in_progress.store(true, Ordering::Release);
+                assert!(!store.btree_covers_chain_for_snapshot(
+                    snapshot,
+                    table_id,
+                    &versions.read()
+                ));
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || {
+                    if backwards {
+                        cursor.last()
+                    } else {
+                        cursor.rewind()
+                    }
+                });
+                let mut rows = vec![drive_lazy_payload_io(conn, || cursor.rowid())];
+                store.checkpoint_in_progress.store(false, Ordering::Release);
+                assert!(store.btree_covers_chain_for_snapshot(
+                    snapshot,
+                    table_id,
+                    &versions.read()
+                ));
+                for _ in 0..3 {
+                    drive_lazy_payload_io(conn, || {
+                        if backwards {
+                            cursor.prev()
+                        } else {
+                            cursor.next()
+                        }
+                    });
+                    rows.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+                }
+                conn.execute("ROLLBACK").unwrap();
+                store.durable_txid_max.store(old_max, Ordering::SeqCst);
+                rows
+            },
+        );
+        let expected = if backwards {
+            [Some(3), Some(1), None, None]
+        } else {
+            [Some(1), Some(3), None, None]
+        };
+        assert_eq!(
+            rows, expected,
+            "backwards={backwards}: both paths skip row 2 when coverage is forced on by hand"
+        );
+    }
+}
+
+#[test]
+fn test_lazy_cursor_version_row_steps_change_direction() {
+    let ((moves, seek, after_seek), [merge_counts, step_counts]) =
+        scan_with_and_without_table_steps(
+            || {
+                let (db, conn) = setup_lazy_walk_table(&[], &(1..=5).collect::<Vec<_>>());
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                (db, conn)
+            },
+            |db, conn| {
+                let mut cursor = open_lazy_payload_cursor(db, conn);
+                drive_lazy_payload_io(conn, || cursor.rewind());
+                let mut moves = vec![drive_lazy_payload_io(conn, || cursor.rowid())];
+                for forward in [true, true, false, false, true] {
+                    drive_lazy_payload_io(conn, || {
+                        if forward {
+                            cursor.next()
+                        } else {
+                            cursor.prev()
+                        }
+                    });
+                    moves.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+                }
+                let seek = drive_lazy_payload_io(conn, || {
+                    cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })
+                });
+                let mut after_seek = Vec::new();
+                for forward in [true, false] {
+                    drive_lazy_payload_io(conn, || {
+                        if forward {
+                            cursor.next()
+                        } else {
+                            cursor.prev()
+                        }
+                    });
+                    after_seek.push(drive_lazy_payload_io(conn, || cursor.rowid()));
+                }
+                conn.execute("ROLLBACK").unwrap();
+                (moves, seek, after_seek)
+            },
+        );
+    assert_eq!(moves.len(), 6);
+    assert_eq!(seek, SeekResult::Found);
+    assert_eq!(after_seek.len(), 2);
+    assert!(step_counts.0 < merge_counts.0);
+}
+
+fn scan_with_and_without_table_steps<T: PartialEq + std::fmt::Debug>(
+    setup: impl Fn() -> (MvccTestDbNoConn, Arc<Connection>),
+    scan: impl Fn(&MvccTestDbNoConn, &Arc<Connection>) -> T,
+) -> (T, [(u64, u64); 2]) {
+    let [(merge_path, merge_counts), (step_path, step_counts)] =
+        [true, false].map(|steps_disabled| {
+            let (db, conn) = setup();
+            let store = db.get_mvcc_store();
+            store
+                .cursor_table_steps_disabled
+                .store(steps_disabled, Ordering::Relaxed);
+            store
+                .cursor_peek_reconciliations
+                .store(0, Ordering::Relaxed);
+            store.cursor_btree_rowid_reads.store(0, Ordering::Relaxed);
+            let result = scan(&db, &conn);
+            let counts = (
+                store.cursor_peek_reconciliations.load(Ordering::Relaxed),
+                store.cursor_btree_rowid_reads.load(Ordering::Relaxed),
+            );
+            (result, counts)
+        });
+    assert_eq!(step_path, merge_path, "table steps changed the result");
+    (step_path, [merge_counts, step_counts])
+}
+
+fn setup_lazy_step_table(
+    columns: usize,
+    updated: &[i64],
+    deleted: &[i64],
+    inserted: &[i64],
+) -> (MvccTestDbNoConn, Arc<Connection>) {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    fill_lazy_step_table(&conn, columns, updated, deleted, inserted);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    (db, conn)
+}
+
+fn fill_lazy_step_table(
+    conn: &Arc<Connection>,
+    columns: usize,
+    updated: &[i64],
+    deleted: &[i64],
+    inserted: &[i64],
+) {
+    let definitions: Vec<String> = (1..columns)
+        .map(|column| format!("c{column} TEXT"))
+        .collect();
+    conn.execute(format!(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, {})",
+        definitions.join(", ")
+    ))
+    .unwrap();
+    let insert = |id: i64, tag: &str| {
+        let values: Vec<String> = (1..columns)
+            .map(|column| {
+                if column == 1 && id % 7 == 0 {
+                    format!("'{}'", tag.repeat(6000))
+                } else {
+                    format!("'{tag}{id}_{column}'")
+                }
+            })
+            .collect();
+        conn.execute(format!(
+            "INSERT INTO t VALUES ({id}, {})",
+            values.join(", ")
+        ))
+        .unwrap();
+    };
+    for id in (1..=40).map(|i| i * 2) {
+        insert(id, "p");
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    for id in updated {
+        conn.execute(format!("UPDATE t SET c1 = 'u{id}' WHERE id = {id}"))
+            .unwrap();
+    }
+    for id in deleted {
+        conn.execute(format!("DELETE FROM t WHERE id = {id}"))
+            .unwrap();
+    }
+    for id in inserted {
+        insert(*id, "i");
+    }
+}
+
+fn scan_lazy_payloads(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+    backwards: bool,
+) -> Vec<(i64, Vec<u8>)> {
+    drive_lazy_payload_io(conn, || {
+        if backwards {
+            cursor.last()
+        } else {
+            cursor.rewind()
+        }
+    });
+    let mut rows = Vec::new();
+    if let Some(rowid) = drive_lazy_payload_io(conn, || cursor.rowid()) {
+        rows.push((rowid, lazy_payload_bytes(conn, cursor).unwrap()));
+        rows.extend(continue_lazy_payload_scan(conn, cursor, backwards));
+    }
+    rows
+}
+
+fn continue_lazy_payload_scan(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+    backwards: bool,
+) -> Vec<(i64, Vec<u8>)> {
+    let mut rows = Vec::new();
+    loop {
+        drive_lazy_payload_io(conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+        let Some(rowid) = drive_lazy_payload_io(conn, || cursor.rowid()) else {
+            return rows;
+        };
+        rows.push((rowid, lazy_payload_bytes(conn, cursor).unwrap()));
+    }
+}
+
+#[derive(Debug)]
+struct NthYieldInjector {
+    point: YieldPoint,
+    remaining: AtomicU64,
+    fired: AtomicBool,
+}
+
+impl NthYieldInjector {
+    fn new(point: YieldPoint, occurrence: u64) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            remaining: AtomicU64::new(occurrence),
+            fired: AtomicBool::new(false),
+        })
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::Relaxed)
+    }
+}
+
+impl YieldInjector for NthYieldInjector {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point != self.point || self.fired() {
+            return false;
+        }
+        if self.remaining.load(Ordering::Relaxed) == 0 {
+            self.fired.store(true, Ordering::Relaxed);
+            return true;
+        }
+        self.remaining.fetch_sub(1, Ordering::Relaxed);
+        false
+    }
+}
+
+#[derive(Debug)]
+struct RecordingYieldInjector {
+    points: Mutex<Vec<YieldPoint>>,
+}
+
+impl YieldInjector for RecordingYieldInjector {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        self.points.lock().push(point);
+        false
+    }
+}
+
+fn setup_lazy_walk_table(
+    physical: &[i64],
+    chain_only: &[i64],
+) -> (MvccTestDbNoConn, Arc<Connection>) {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    fill_lazy_walk_table(&conn, physical, chain_only);
+    (db, conn)
+}
+
+fn fill_lazy_walk_table(conn: &Arc<Connection>, physical: &[i64], chain_only: &[i64]) {
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for id in physical {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, 'p{id}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    for id in chain_only {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, 'c{id}')"))
+            .unwrap();
+    }
+}
+
+fn scan_lazy_rowids(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+    backwards: bool,
+    after_first_row: impl FnOnce(),
+) -> Vec<i64> {
+    scan_lazy_rows(conn, cursor, backwards, after_first_row)
+        .into_iter()
+        .map(|(rowid, _)| rowid)
+        .collect()
+}
+
+fn scan_lazy_rows(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+    backwards: bool,
+    after_first_row: impl FnOnce(),
+) -> Vec<(i64, String)> {
+    drive_lazy_payload_io(conn, || {
+        if backwards {
+            cursor.last()
+        } else {
+            cursor.rewind()
+        }
+    });
+    let mut after_first_row = Some(after_first_row);
+    let mut rows = Vec::new();
+    while let Some(rowid) = drive_lazy_payload_io(conn, || cursor.rowid()) {
+        rows.push((rowid, lazy_payload_text(conn, cursor).unwrap()));
+        if let Some(action) = after_first_row.take() {
+            action();
+        }
+        drive_lazy_payload_io(conn, || {
+            if backwards {
+                cursor.prev()
+            } else {
+                cursor.next()
+            }
+        });
+    }
+    rows
+}
+
+fn walk_order(mut rowids: Vec<i64>, backwards: bool) -> Vec<i64> {
+    rowids.sort_unstable();
+    if backwards {
+        rowids.reverse();
+    }
+    rowids
+}
+
+#[test]
+fn test_lazy_cursor_exact_chain_hit_reads_the_seek_row() {
+    let mut observed = Vec::new();
+    for shadowed in [false, true] {
+        let (db, conn) = if shadowed {
+            setup_lazy_shadowed_physical_rows()
+        } else {
+            setup_lazy_write_scan(false)
+        };
+        let store = db.get_mvcc_store();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        for (rowid, expected) in [
+            (2, Some(SeekResult::Found)),
+            (9, Some(SeekResult::NotFound)),
+        ] {
+            store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+            let found = drive_lazy_payload_io(&conn, || {
+                cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+            });
+            assert_eq!(Some(found), expected, "shadowed={shadowed} rowid={rowid}");
+            let first = lazy_payload_text(&conn, &mut cursor);
+            assert_eq!(lazy_payload_text(&conn, &mut cursor), first);
+            observed.push((
+                shadowed,
+                rowid,
+                first,
+                store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+            ));
+        }
+        conn.execute("ROLLBACK").unwrap();
+    }
+    assert_eq!(
+        observed,
+        [
+            (false, 2, Some("two".to_string()), 0),
+            (false, 9, None, 0),
+            (true, 2, Some("two-new".to_string()), 0),
+            (true, 9, None, 0),
+        ]
+    );
+}
+
+#[test]
+fn test_lazy_cursor_exact_chain_hit_rereads_after_changes() {
+    for change in [
+        "own write to the row",
+        "own write to another row",
+        "rollback to",
+        "gc",
+        "abort",
+        "removed transaction",
+    ] {
+        let (db, conn) = setup_lazy_write_scan(false);
+        let store = db.get_mvcc_store();
+        if change == "rollback to" {
+            conn.execute("SAVEPOINT s").unwrap();
+            conn.execute("UPDATE t SET v = 'inside' WHERE id = 2")
+                .unwrap();
+        }
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        let before = lazy_payload_text(&conn, &mut cursor);
+        store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+        let (expected, rereads) = match change {
+            "own write to the row" => {
+                conn.execute("UPDATE t SET v = 'changed' WHERE id = 2")
+                    .unwrap();
+                (Some("changed".to_string()), 1)
+            }
+            "own write to another row" => {
+                conn.execute("UPDATE t SET v = 'other' WHERE id = 4")
+                    .unwrap();
+                (Some("two".to_string()), 1)
+            }
+            "rollback to" => {
+                assert_eq!(before.as_deref(), Some("inside"));
+                conn.execute("ROLLBACK TO s").unwrap();
+                (Some("two".to_string()), 1)
+            }
+            "gc" => {
+                store.drop_unused_row_versions();
+                (Some("two".to_string()), 0)
+            }
+            "abort" => {
+                let tx_id = conn.get_mv_tx_id().unwrap();
+                let tx = store.txs.get(&tx_id).unwrap();
+                tx.value().abort_now.store(true, Ordering::Release);
+                assert!(matches!(
+                    *cursor.record_payload().unwrap_err(),
+                    LimboError::CommitDependencyAborted
+                ));
+                tx.value().abort_now.store(false, Ordering::Release);
+                (Some("two".to_string()), 0)
+            }
+            _ => {
+                conn.execute("ROLLBACK").unwrap();
+                let rereads_before = store.cursor_chain_payload_reads.load(Ordering::Relaxed);
+                let _ = cursor.record_payload();
+                assert_eq!(
+                    store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+                    rereads_before + 1,
+                    "a removed transaction must not reuse the seek row"
+                );
+                continue;
+            }
+        };
+        assert_eq!(lazy_payload_text(&conn, &mut cursor), expected, "{change}");
+        assert_eq!(
+            store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+            rereads,
+            "{change}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_exact_chain_hit_rereads_after_moving_away() {
+    for change in [
+        "none",
+        "own write between moves",
+        "own delete after the seek",
+    ] {
+        let (db, conn) = setup_lazy_write_scan(false);
+        let store = db.get_mvcc_store();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        assert_eq!(
+            lazy_payload_text(&conn, &mut cursor).as_deref(),
+            Some("two")
+        );
+        if change == "own delete after the seek" {
+            store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+            conn.execute("DELETE FROM t WHERE id = 2").unwrap();
+            let _ = lazy_payload_bytes(&conn, &mut cursor);
+            assert_eq!(
+                store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+                1,
+                "the seek row must not serve a read after an own delete"
+            );
+            conn.execute("ROLLBACK").unwrap();
+            continue;
+        }
+        drive_lazy_payload_io(&conn, || cursor.next());
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(4));
+        let expected = if change == "own write between moves" {
+            conn.execute("UPDATE t SET v = 'changed' WHERE id = 2")
+                .unwrap();
+            "changed"
+        } else {
+            "two"
+        };
+        drive_lazy_payload_io(&conn, || cursor.prev());
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(2));
+        store.cursor_chain_payload_reads.store(0, Ordering::Relaxed);
+        assert_eq!(
+            lazy_payload_text(&conn, &mut cursor).as_deref(),
+            Some(expected),
+            "{change}"
+        );
+        assert_eq!(
+            store.cursor_chain_payload_reads.load(Ordering::Relaxed),
+            1,
+            "{change}: moving away and back drops the seek row, so the row is resolved again"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+fn lazy_payload_text(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+) -> Option<String> {
+    lazy_payload_bytes(conn, cursor).map(|payload| payload_text(&payload))
+}
+
+#[test]
+fn test_lazy_cursor_transaction_abort_mid_scan() {
+    for checkpoint in [false, true] {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+            .unwrap();
+        if checkpoint {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        drive_lazy_payload_io(&conn, || cursor.rewind());
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+        assert!(lazy_payload_bytes(&conn, &mut cursor).is_some());
+        let store = db.get_mvcc_store();
+        let tx_id = conn.get_mv_tx_id().unwrap();
+        let tx = store.txs.get(&tx_id).unwrap();
+        tx.value().abort_now.store(true, Ordering::Release);
+        drive_lazy_payload_io(&conn, || cursor.next());
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(2));
+        assert!(matches!(
+            *cursor.record_payload().unwrap_err(),
+            LimboError::CommitDependencyAborted
+        ));
+        assert!(matches!(
+            *cursor.current_row().unwrap_err(),
+            LimboError::CommitDependencyAborted
+        ));
+        cursor.set_null_flag(true);
+        assert!(matches!(
+            cursor.record_payload().unwrap(),
+            IOResult::Done(None)
+        ));
+        assert!(matches!(
+            *cursor.current_row().unwrap_err(),
+            LimboError::CommitDependencyAborted
+        ));
+        cursor.set_null_flag(false);
+        tx.value().abort_now.store(false, Ordering::Release);
+        assert!(lazy_payload_bytes(&conn, &mut cursor).is_some());
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_transaction_abort_during_payload_io() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("payload.db");
+    let io = Arc::new(crate::MemoryYieldIO::new());
+    let database =
+        Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+    let conn = database.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    let db = MvccTestDbNoConn {
+        db: Some(database),
+        path: Some(path.to_str().unwrap().to_string()),
+        opts: DatabaseOpts::new(),
+        enc_opts: None,
+        _temp_dir: Some(temp_dir),
+    };
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let expected = "overflow".repeat(4000);
+    conn.execute(format!("INSERT INTO t VALUES (1, '{expected}')"))
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.pager.load().clear_page_cache(false);
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    let IOResult::IO(pending) = cursor.record_payload().unwrap() else {
+        panic!("overflow payload must wait for I/O");
+    };
+    assert!(!pending.finished());
+    assert!(!pending.is_explicit_yield());
+    let store = db.get_mvcc_store();
+    let tx = store.txs.get(&conn.get_mv_tx_id().unwrap()).unwrap();
+    tx.value().abort_now.store(true, Ordering::Release);
+    pending.wait(conn.db.io.as_ref()).unwrap();
+    assert!(matches!(
+        *cursor.record_payload().unwrap_err(),
+        LimboError::CommitDependencyAborted
+    ));
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    tx.value().abort_now.store(false, Ordering::Release);
+    assert_eq!(
+        payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+        expected
+    );
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_transaction_abort_after_removal() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    let store = db.get_mvcc_store();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    let tx = store.txs.get(&tx_id).unwrap();
+    tx.value().abort_now.store(true, Ordering::Release);
+    assert!(matches!(
+        *cursor.record_payload().unwrap_err(),
+        LimboError::CommitDependencyAborted
+    ));
+    drop(tx);
+    conn.execute("ROLLBACK").unwrap();
+    store.drop_unused_row_versions();
+    reclaim_lazy_transaction_nodes(|| false);
+    assert!(!store.tx_should_abort(tx_id));
+    assert!(matches!(
+        cursor.record_payload().unwrap(),
+        IOResult::Done(None)
+    ));
+    assert!(matches!(
+        cursor.current_row().unwrap(),
+        IOResult::Done(None)
+    ));
+}
+
+#[test]
+fn test_lazy_cursor_releases_committed_write_set() {
+    for named_savepoint in [false, true] {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        if named_savepoint {
+            conn.execute("SAVEPOINT s").unwrap();
+        }
+        conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 128) INSERT INTO t SELECT x, 'written' FROM n").unwrap();
+        let store = db.get_mvcc_store();
+        let tx_id = conn.get_mv_tx_id().unwrap();
+        let chains: Vec<_> = {
+            let tx = store.txs.get(&tx_id).unwrap();
+            let write_set = tx.value().write_set.lock();
+            assert_eq!(write_set.entries.len(), 128);
+            write_set
+                .entries
+                .iter()
+                .map(|(_, chain)| chain.clone())
+                .collect()
+        };
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        conn.execute("COMMIT").unwrap();
+        assert!(store.txs.get(&tx_id).is_none());
+        store.drop_unused_row_versions();
+        reclaim_lazy_transaction_nodes(|| chains.iter().all(|chain| Arc::strong_count(chain) == 2));
+        let min = chains.iter().map(Arc::strong_count).min().unwrap();
+        let max = chains.iter().map(Arc::strong_count).max().unwrap();
+        eprintln!(
+            "named_savepoint={named_savepoint} chain_refs=[{min},{max}] while cursor is retained"
+        );
+        assert_eq!((min, max), (2, 2));
+        assert!(matches!(
+            cursor.record_payload().unwrap(),
+            IOResult::Done(None)
+        ));
+        drop(cursor);
+    }
+}
+
+#[test]
+fn test_lazy_cursor_transaction_releases_retired_storage() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("CREATE TABLE extra(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'written')").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    let store = db.get_mvcc_store();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    let tx = store.txs.get(&tx_id).unwrap();
+    assert!(!tx.value().write_set.lock().is_empty());
+    assert!(!tx.value().savepoint_stack.read().is_empty());
+    assert!(!tx.value().created_table_ids.lock().is_empty());
+    conn.execute("COMMIT").unwrap();
+    assert!(tx.is_removed());
+    let (entries_capacity, table_generations_capacity) = {
+        let write_set = tx.value().write_set.lock();
+        (
+            write_set.entries.capacity(),
+            write_set.table_generations.capacity(),
+        )
+    };
+    let capacities = (
+        entries_capacity,
+        table_generations_capacity,
+        tx.value().savepoint_stack.read().capacity(),
+        tx.value().created_table_ids.lock().capacity(),
+    );
+    eprintln!("retired capacities={capacities:?}");
+    assert_eq!(capacities, (0, 0, 0, 0));
+    assert!(matches!(
+        cursor.record_payload().unwrap(),
+        IOResult::Done(None)
+    ));
+    assert_eq!(
+        get_rows(&conn, "SELECT v FROM t"),
+        vec![vec![Value::build_text("written")]]
+    );
+}
+
+#[test]
+fn test_lazy_cursor_transaction_drops_last_store_owner_on_another_thread() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    let store = db.get_mvcc_store();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    {
+        let tx = store.txs.get(&tx_id).unwrap();
+        tx.value().abort_now.store(true, Ordering::Release);
+    }
+    assert!(matches!(
+        *cursor.record_payload().unwrap_err(),
+        LimboError::CommitDependencyAborted
+    ));
+    conn.execute("ROLLBACK").unwrap();
+    store.drop_unused_row_versions();
+    reclaim_lazy_transaction_nodes(|| false);
+    let weak_store = Arc::downgrade(&store);
+    drop(store);
+    drop(conn);
+    drop(db);
+    assert!(weak_store.upgrade().is_some());
+    std::thread::spawn(move || {
+        assert!(matches!(
+            cursor.record_payload().unwrap(),
+            IOResult::Done(None)
+        ));
+        assert!(matches!(
+            cursor.current_row().unwrap(),
+            IOResult::Done(None)
+        ));
+        drop(cursor);
+    })
+    .join()
+    .unwrap();
+    assert!(weak_store.upgrade().is_none());
+}
+
+fn reclaim_lazy_transaction_nodes(done: impl Fn() -> bool) {
+    for _ in 0..1024 {
+        crossbeam_epoch::pin().flush();
+        if done() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_payload_borrows_chain_bytes() {
+    let (db, tx_id, table_id, root_page) = setup_lazy_db(&[1]);
+    let mut cursor = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        i64::from(table_id),
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(db.conn.pager.load().clone(), root_page, 1)),
+    )
+    .unwrap();
+    assert!(matches!(cursor.next().unwrap(), IOResult::Done(())));
+    let row = cursor.read_mvcc_current_row().unwrap().unwrap();
+    let IOResult::Done(Some(payload)) = cursor.record_payload().unwrap() else {
+        panic!("positioned chain row must have a payload");
+    };
+    assert_eq!(payload, row.payload());
+    assert_eq!(payload.as_ptr(), row.payload().as_ptr());
+    cursor.set_null_flag(true);
+    assert!(matches!(
+        cursor.record_payload().unwrap(),
+        IOResult::Done(None)
+    ));
+    cursor.set_null_flag(false);
+    db.mvcc_store
+        .txs
+        .get(&tx_id)
+        .unwrap()
+        .value()
+        .abort_now
+        .store(true, Ordering::Release);
+    assert!(matches!(
+        *cursor.record_payload().unwrap_err(),
+        LimboError::CommitDependencyAborted
+    ));
+}
+
+#[test]
+fn test_lazy_cursor_payload_borrows_btree_bytes() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'small')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let mut physical = BTreeCursor::new_table(conn.pager.load().clone(), root, 2);
+    drive_lazy_payload_io(&conn, || physical.rewind());
+    let physical_ptr = drive_lazy_payload_io(&conn, || {
+        physical
+            .record_payload()
+            .map(|r| r.map(|r| r.unwrap().as_ptr()))
+    });
+    let lazy_ptr = drive_lazy_payload_io(&conn, || {
+        cursor
+            .record_payload()
+            .map(|r| r.map(|r| r.unwrap().as_ptr()))
+    });
+    assert_eq!(lazy_ptr, physical_ptr);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_payload_matches_scan_model() {
+    for layout in ["chains", "btree", "mixed"] {
+        for seed in 0..4 {
+            let db = MvccTestDbNoConn::new_with_random_db_passive();
+            let writer = db.connect();
+            writer
+                .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                .unwrap();
+            writer
+                .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            let mut model = BTreeMap::new();
+            for id in 1..=16 {
+                let value = format!(
+                    "row{id}-{}",
+                    "x".repeat(if id % 3 == 0 { 10000 } else { 8 })
+                );
+                writer
+                    .execute(format!("INSERT INTO t VALUES ({id}, '{value}')"))
+                    .unwrap();
+                model.insert(id, value);
+            }
+            if layout != "chains" {
+                writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            }
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            if layout == "mixed" {
+                for _ in 0..24 {
+                    let id = rng.random_range(1..=20);
+                    if rng.random_bool(0.3) {
+                        writer
+                            .execute(format!("DELETE FROM t WHERE id = {id}"))
+                            .unwrap();
+                        model.remove(&id);
+                    } else {
+                        let value =
+                            format!("updated-{id}-{}", "y".repeat(rng.random_range(1..6000)));
+                        writer
+                            .execute(format!("INSERT OR REPLACE INTO t VALUES ({id}, '{value}')"))
+                            .unwrap();
+                        model.insert(id, value);
+                    }
+                }
+            }
+            let reader = db.connect();
+            reader.execute("BEGIN CONCURRENT").unwrap();
+            get_rows(&reader, "SELECT * FROM t LIMIT 1");
+            writer.execute("BEGIN CONCURRENT").unwrap();
+            writer
+                .execute("UPDATE t SET v = 'invisible' WHERE id % 2 = 0")
+                .unwrap();
+            let expected: Vec<_> = model.iter().map(|(id, v)| (*id, v.clone())).collect();
+            assert_eq!(scan_lazy_cursor_payload(&db, &reader, false), expected);
+            writer.execute("COMMIT").unwrap();
+            writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            db.get_mvcc_store().gc_incremental(usize::MAX);
+            assert_eq!(scan_lazy_cursor_payload(&db, &reader, false), expected);
+            assert_eq!(
+                scan_lazy_cursor_payload(&db, &reader, true),
+                expected.iter().rev().cloned().collect::<Vec<_>>()
+            );
+            reader.execute("INSERT INTO t VALUES (30, 'own')").unwrap();
+            model.insert(30, "own".to_string());
+            assert_eq!(
+                scan_lazy_cursor_payload(&db, &reader, false),
+                model.into_iter().collect::<Vec<_>>()
+            );
+            reader.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_payload_follows_writes_and_rollback() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'original')")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    conn.execute("SAVEPOINT s").unwrap();
+    let IOResult::Done(Some(original)) = cursor.record_payload().unwrap() else {
+        panic!("chain row must have a payload");
+    };
+    conn.execute("UPDATE t SET v = 'changed' WHERE id = 1")
+        .unwrap();
+    assert_eq!(payload_text(original), "original");
+    conn.execute("ROLLBACK TO s").unwrap();
+    assert_eq!(payload_text(original), "original");
+    let IOResult::Done(Some(restored)) = cursor.record_payload().unwrap() else {
+        panic!("rolled-back update must restore the payload");
+    };
+    assert_eq!(payload_text(restored), "original");
+    conn.execute("UPDATE t SET v = 'changed again' WHERE id = 1")
+        .unwrap();
+    let IOResult::Done(Some(changed)) = cursor.record_payload().unwrap() else {
+        panic!("updated row must have a payload");
+    };
+    conn.execute("ROLLBACK TO s").unwrap();
+    assert_eq!(payload_text(changed), "changed again");
+    let IOResult::Done(Some(restored)) = cursor.record_payload().unwrap() else {
+        panic!("rolled-back update must restore the payload");
+    };
+    assert_eq!(payload_text(restored), "original");
+    let record =
+        ImmutableRecord::from_values(&[Value::Null, Value::build_text("inserted")], 2).unwrap();
+    drive_lazy_payload_io(&conn, || {
+        cursor.insert(&BTreeKey::new_table_rowid(2, Some(&record)))
+    });
+    assert_eq!(
+        lazy_payload_bytes(&conn, &mut cursor).unwrap(),
+        record.get_payload()
+    );
+    drive_lazy_payload_io(&conn, || cursor.delete());
+    assert!(lazy_payload_bytes(&conn, &mut cursor).is_none());
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_payload_sees_own_writes_ahead_of_scan() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    let first = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+    assert_eq!(payload_text(&first), "first");
+    conn.execute("INSERT INTO t VALUES (3, 'own')").unwrap();
+    let mut remaining = Vec::new();
+    loop {
+        drive_lazy_payload_io(&conn, || cursor.next());
+        let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) else {
+            break;
+        };
+        let payload = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+        remaining.push((rowid, payload_text(&payload)));
+    }
+    assert_eq!(
+        remaining,
+        vec![(2, "second".to_string()), (3, "own".to_string())]
+    );
+    assert!(lazy_payload_bytes(&conn, &mut cursor).is_none());
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_payload_columns_defaults_and_null_rows() {
+    for checkpoint in [false, true] {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'small'), (2, printf('%10000s', 'large'))")
+            .unwrap();
+        if checkpoint {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        conn.execute("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 42")
+            .unwrap();
+        let rows = get_rows(&conn, "SELECT v, n FROM t ORDER BY id");
+        assert_eq!(
+            rows[0],
+            vec![Value::build_text("small"), Value::from_i64(42)]
+        );
+        assert_eq!(rows[1][0].to_text().unwrap().len(), 10000);
+        assert_eq!(rows[1][1], Value::from_i64(42));
+        assert_eq!(
+            get_rows(&conn, "SELECT n, v, n FROM t WHERE id = 1"),
+            vec![vec![
+                Value::from_i64(42),
+                Value::build_text("small"),
+                Value::from_i64(42)
+            ]]
+        );
+        assert_eq!(
+            get_rows(&conn, "SELECT b.v, b.n FROM t a LEFT JOIN t b ON b.id = 99"),
+            vec![vec![Value::Null, Value::Null]; 2]
+        );
+    }
+}
+
+#[test]
+fn test_lazy_cursor_payload_reports_decode_errors() {
+    for sql in ["SELECT v FROM t", "SELECT v, n FROM t"] {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, n TEXT)")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let table_id = db.get_mvcc_store().get_table_id_from_root_page(
+            get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+                .as_int()
+                .unwrap(),
+        );
+        db.get_mvcc_store()
+            .insert(
+                conn.get_mv_tx_id().unwrap(),
+                Row::new_table_row(RowID::new(table_id, RowKey::Int(1)), &[20]).unwrap(),
+            )
+            .unwrap();
+        drive_lazy_payload_io(&conn, || cursor.rewind());
+        let payload = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+        assert!(matches!(
+            crate::types::ValueIterator::new(&payload),
+            Err(LimboError::Corrupt(_))
+        ));
+        let mut stmt = conn.prepare(sql).unwrap();
+        let error = loop {
+            match stmt.step() {
+                Err(error) => break error,
+                Ok(StepResult::IO | StepResult::Yield) => stmt._io().step().unwrap(),
+                other => panic!("expected decoding error for {sql}, got {other:?}"),
+            }
+        };
+        assert!(matches!(error, LimboError::Corrupt(_)));
+        drop(stmt);
+        assert!(conn.get_mv_tx_id().is_none());
+    }
+}
+
+#[test]
+fn test_lazy_cursor_payload_resumes_yields_and_drops_after_chain_read() {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = 'updated' WHERE id = 2")
+        .unwrap();
+    for abandon in [false, true] {
+        let injector = FixedYieldInjector::new([CursorYieldPoint::NextStart.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let mut stmt = conn.prepare("SELECT v FROM t ORDER BY id").unwrap();
+        let mut values = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => {
+                    values.push(stmt.row().unwrap().get_value(0).clone());
+                    if abandon && values.len() == 2 {
+                        break;
+                    }
+                }
+                StepResult::IO | StepResult::Yield => stmt._io().step().unwrap(),
+                StepResult::Done => break,
+                other => panic!("unexpected result {other:?}"),
+            }
+        }
+        assert!(injector.is_empty());
+        let mut expected = vec![Value::build_text("a"), Value::build_text("updated")];
+        if !abandon {
+            expected.push(Value::build_text("c"));
+        }
+        assert_eq!(values, expected);
+        drop(stmt);
+        conn.set_yield_injector(None);
+        conn.execute("UPDATE t SET v = v WHERE id = 1").unwrap();
+        assert_eq!(
+            get_rows(&conn, "SELECT v FROM t WHERE id = 2"),
+            vec![vec![Value::build_text("updated")]]
+        );
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_payload_resumes_and_drops_overflow_io() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("payload.db");
+    let io = Arc::new(crate::MemoryYieldIO::new());
+    let database =
+        Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+    let conn = database.connect(ConnectOpts::new()).unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    let db = MvccTestDbNoConn {
+        db: Some(database),
+        path: Some(path.to_str().unwrap().to_string()),
+        opts: DatabaseOpts::new(),
+        enc_opts: None,
+        _temp_dir: Some(temp_dir),
+    };
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    let expected = "overflow".repeat(4000);
+    conn.execute(format!("INSERT INTO t VALUES (1, '{expected}')"))
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    for abandon in [false, true] {
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.pager.load().clear_page_cache(false);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        drive_lazy_payload_io(&conn, || cursor.rewind());
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+        let IOResult::IO(pending) = cursor.record_payload().unwrap() else {
+            panic!("overflow payload must wait for I/O");
+        };
+        assert!(!pending.finished());
+        assert!(!pending.is_explicit_yield());
+        if abandon {
+            drop(cursor);
+            assert!(!pending.finished());
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            cursor = open_lazy_payload_cursor(&db, &conn);
+            drive_lazy_payload_io(&conn, || cursor.rewind());
+        } else {
+            pending.wait(conn.db.io.as_ref()).unwrap();
+        }
+        let payload = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+        assert_eq!(payload_text(&payload), expected);
+        drop(cursor);
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_seek_visibility() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("UPDATE t SET v = 'updated' WHERE id = 2")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let _snapshot = get_rows(&conn, "SELECT id FROM t LIMIT 1");
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (7, 'invisible')")
+        .unwrap();
+    for op in [SeekOp::GE { eq_only: true }, SeekOp::LE { eq_only: true }] {
+        for (rowid, expected) in [
+            (1, Some("one")),
+            (2, Some("updated")),
+            (3, Some("three")),
+            (4, None),
+            (6, Some("six")),
+            (7, None),
+            (8, None),
+            (0, None),
+            (i64::MIN, None),
+            (i64::MAX, None),
+        ] {
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            cursor.set_null_flag(true);
+            let found =
+                drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(rowid), op));
+            assert!(!cursor.get_null_flag());
+            assert_eq!(
+                found,
+                if expected.is_some() {
+                    SeekResult::Found
+                } else {
+                    SeekResult::NotFound
+                }
+            );
+            if let Some(expected) = expected {
+                assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(rowid));
+                let payload = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+                assert_eq!(payload_text(&payload), expected, "rowid={rowid} op={op:?}");
+            }
+        }
+    }
+    writer.execute("ROLLBACK").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_probe_preserves_scan() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_exact_seek_db();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        if backwards {
+            drive_lazy_payload_io(&conn, || cursor.last());
+        } else {
+            drive_lazy_payload_io(&conn, || cursor.rewind());
+        }
+        let mut rows = Vec::new();
+        while let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) {
+            let before = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+            let op = if backwards {
+                SeekOp::LE { eq_only: true }
+            } else {
+                SeekOp::GE { eq_only: true }
+            };
+            assert_eq!(
+                drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(rowid), op)),
+                SeekResult::Found
+            );
+            assert_eq!(lazy_payload_bytes(&conn, &mut cursor).unwrap(), before);
+            rows.push((rowid, payload_text(&before)));
+            if backwards {
+                drive_lazy_payload_io(&conn, || cursor.prev());
+            } else {
+                drive_lazy_payload_io(&conn, || cursor.next());
+            }
+        }
+        let mut expected: Vec<_> = [
+            (1, "one"),
+            (2, "two"),
+            (3, "three"),
+            (5, "five"),
+            (6, "six"),
+        ]
+        .into_iter()
+        .map(|(id, value)| (id, value.to_string()))
+        .collect();
+        if backwards {
+            expected.reverse();
+        }
+        assert_eq!(rows, expected);
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_probe_preserves_delete_loop() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let mut physical = BTreeCursor::new_table(conn.pager.load().clone(), root, 2);
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || physical
+            .seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true })),
+        SeekResult::NotFound
+    );
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(0), SeekOp::GT)),
+        SeekResult::Found
+    );
+    let mut deleted = Vec::new();
+    while let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) {
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        assert!(lazy_payload_bytes(&conn, &mut cursor).is_some());
+        drive_lazy_payload_io(&conn, || cursor.delete());
+        deleted.push(rowid);
+        drive_lazy_payload_io(&conn, || cursor.next());
+    }
+    assert_eq!(deleted, vec![1, 2, 3, 5, 6]);
+    assert!(get_rows(&conn, "SELECT id FROM t").is_empty());
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(5)]]
+    );
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_seek_keeps_range_iterator() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let store = db.get_mvcc_store();
+    let table_id = store.get_table_id_from_root_page(root);
+    let snapshot = store.read_snapshot(conn.get_mv_tx_id().unwrap()).unwrap();
+    let mut iterator = None;
+    let first = store
+        .seek_rowid(
+            RowID::new(table_id, RowKey::Int(1)),
+            true,
+            false,
+            false,
+            IterationDirection::Forwards,
+            snapshot,
+            &mut iterator,
+        )
+        .unwrap();
+    assert_eq!(first.0.row_id, RowKey::Int(1));
+    let iterator_ptr = std::ptr::from_ref(iterator.as_deref().unwrap());
+    let found = store
+        .seek_rowid(
+            RowID::new(table_id, RowKey::Int(5)),
+            true,
+            true,
+            true,
+            IterationDirection::Forwards,
+            snapshot,
+            &mut iterator,
+        )
+        .unwrap();
+    assert_eq!(found.0.row_id, RowKey::Int(5));
+    assert_eq!(payload_text(found.2.as_ref().unwrap().payload()), "five");
+    assert!(std::ptr::eq(
+        iterator_ptr,
+        std::ptr::from_ref(iterator.as_deref().unwrap())
+    ));
+    assert!(store
+        .seek_rowid(
+            RowID::new(table_id, RowKey::Int(99)),
+            true,
+            true,
+            true,
+            IterationDirection::Forwards,
+            snapshot,
+            &mut iterator
+        )
+        .is_none());
+    assert!(std::ptr::eq(
+        iterator_ptr,
+        std::ptr::from_ref(iterator.as_deref().unwrap())
+    ));
+    let next = store
+        .advance_cursor_and_get_row_id_for_table(table_id, &mut iterator, snapshot)
+        .unwrap();
+    assert_eq!(next.0.row_id, RowKey::Int(3));
+    let mut exact_iterator = None;
+    assert!(store
+        .seek_rowid(
+            RowID::new(table_id, RowKey::Int(1)),
+            true,
+            true,
+            true,
+            IterationDirection::Forwards,
+            snapshot,
+            &mut exact_iterator
+        )
+        .is_some());
+    assert!(exact_iterator.is_none());
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_payload_survives_rollback_and_gc() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (8, 'owned')").unwrap();
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let store = db.get_mvcc_store();
+    let table_id = store.get_table_id_from_root_page(root);
+    let snapshot = store.read_snapshot(conn.get_mv_tx_id().unwrap()).unwrap();
+    let mut iterator = None;
+    let (_, versions, payload) = store
+        .seek_rowid(
+            RowID::new(table_id, RowKey::Int(8)),
+            true,
+            true,
+            true,
+            IterationDirection::Forwards,
+            snapshot,
+            &mut iterator,
+        )
+        .unwrap();
+    let payload = payload.unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    store.gc_incremental(usize::MAX);
+    assert!(versions.read().is_empty());
+    assert_eq!(payload_text(payload.payload()), "owned");
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_seek_resumes_after_yield() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for (rowid, expected) in [(3, Some("three")), (6, Some("six")), (4, None), (8, None)] {
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let injector = FixedYieldInjector::new([CursorYieldPoint::SeekStart.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let IOResult::IO(pending) = cursor
+            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+            .unwrap()
+        else {
+            panic!("exact seek must pause at SeekStart");
+        };
+        assert!(pending.is_explicit_yield());
+        assert!(injector.is_empty());
+        pending.wait(conn.db.io.as_ref()).unwrap();
+        let result = drive_lazy_payload_io(&conn, || {
+            cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+        });
+        assert_eq!(
+            result,
+            if expected.is_some() {
+                SeekResult::Found
+            } else {
+                SeekResult::NotFound
+            }
+        );
+        if let Some(expected) = expected {
+            let payload = lazy_payload_bytes(&conn, &mut cursor).unwrap();
+            assert_eq!(payload_text(&payload), expected);
+        }
+        conn.set_yield_injector(None);
+    }
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_hit_can_move() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_exact_seek_db();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let op = if backwards {
+            SeekOp::LE { eq_only: true }
+        } else {
+            SeekOp::GE { eq_only: true }
+        };
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(3), op)),
+            SeekResult::Found
+        );
+        if backwards {
+            drive_lazy_payload_io(&conn, || cursor.prev());
+        } else {
+            drive_lazy_payload_io(&conn, || cursor.next());
+        }
+        let rowid = drive_lazy_payload_io(&conn, || cursor.rowid());
+        println!("mixed backwards={backwards}: row after exact hit 3 = {rowid:?}");
+        assert_eq!(rowid, Some(if backwards { 2 } else { 5 }));
+        assert_eq!(
+            payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+            if backwards { "two" } else { "five" }
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_chain_hit_can_move() {
+    for backwards in [true, false] {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'one'), (3, 'three'), (5, 'five')")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let op = if backwards {
+            SeekOp::LE { eq_only: true }
+        } else {
+            SeekOp::GE { eq_only: true }
+        };
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(3), op)),
+            SeekResult::Found
+        );
+        if backwards {
+            drive_lazy_payload_io(&conn, || cursor.prev());
+        } else {
+            drive_lazy_payload_io(&conn, || cursor.next());
+        }
+        let rowid = drive_lazy_payload_io(&conn, || cursor.rowid());
+        println!("chain-only backwards={backwards}: row after exact hit 3 = {rowid:?}");
+        assert_eq!(rowid, Some(if backwards { 1 } else { 5 }));
+        assert_eq!(
+            payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+            if backwards { "one" } else { "five" }
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_direction_switch() {
+    for chain_only in [false, true] {
+        for backwards in [false, true] {
+            for yield_on_switch in [false, true] {
+                let (db, conn) = if chain_only {
+                    let db = MvccTestDbNoConn::new();
+                    let conn = db.connect();
+                    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                        .unwrap();
+                    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                        .unwrap();
+                    conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three'), (5, 'five'), (6, 'six')").unwrap();
+                    (db, conn)
+                } else {
+                    setup_lazy_exact_seek_db()
+                };
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                let mut cursor = open_lazy_payload_cursor(&db, &conn);
+                let op = if backwards {
+                    SeekOp::LE { eq_only: true }
+                } else {
+                    SeekOp::GE { eq_only: true }
+                };
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(2), op)),
+                    SeekResult::Found
+                );
+                if backwards {
+                    drive_lazy_payload_io(&conn, || cursor.prev());
+                } else {
+                    drive_lazy_payload_io(&conn, || cursor.next());
+                }
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor.rowid()),
+                    Some(if backwards { 1 } else { 3 })
+                );
+                if yield_on_switch {
+                    let injector = FixedYieldInjector::new([CursorYieldPoint::SeekStart.point()]);
+                    conn.set_yield_injector(Some(injector.clone()));
+                    let IOResult::IO(pending) = (if backwards {
+                        cursor.next()
+                    } else {
+                        cursor.prev()
+                    })
+                    .unwrap() else {
+                        panic!("direction switch must yield during range preparation");
+                    };
+                    assert!(pending.is_explicit_yield());
+                    assert!(injector.is_empty());
+                    pending.wait(conn.db.io.as_ref()).unwrap();
+                }
+                if backwards {
+                    drive_lazy_payload_io(&conn, || cursor.next());
+                } else {
+                    drive_lazy_payload_io(&conn, || cursor.prev());
+                }
+                let rowid = drive_lazy_payload_io(&conn, || cursor.rowid());
+                println!("chain_only={chain_only} backwards={backwards}: switched row={rowid:?}");
+                assert_eq!(rowid, Some(2));
+                assert_eq!(
+                    payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                    "two"
+                );
+                if yield_on_switch {
+                    conn.set_yield_injector(None);
+                }
+                if backwards {
+                    drive_lazy_payload_io(&conn, || cursor.prev());
+                } else {
+                    drive_lazy_payload_io(&conn, || cursor.next());
+                }
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor.rowid()),
+                    Some(if backwards { 1 } else { 3 })
+                );
+                if backwards {
+                    drive_lazy_payload_io(&conn, || cursor.next());
+                } else {
+                    drive_lazy_payload_io(&conn, || cursor.prev());
+                }
+                assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(2));
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_direction_switch_at_end() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_exact_seek_db();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        loop {
+            if backwards {
+                drive_lazy_payload_io(&conn, || cursor.prev());
+            } else {
+                drive_lazy_payload_io(&conn, || cursor.next());
+            }
+            if drive_lazy_payload_io(&conn, || cursor.rowid()).is_none() {
+                break;
+            }
+        }
+        if backwards {
+            drive_lazy_payload_io(&conn, || cursor.next());
+        } else {
+            drive_lazy_payload_io(&conn, || cursor.prev());
+        }
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.rowid()),
+            Some(if backwards { 1 } else { 6 })
+        );
+        assert_eq!(
+            payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+            if backwards { "one" } else { "six" }
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_exists_hit_can_move() {
+    for backwards in [false, true] {
+        for key in [3, 2] {
+            let (db, conn) = setup_lazy_exact_seek_db();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            assert!(drive_lazy_payload_io(&conn, || cursor.exists(&Value::from_i64(key))));
+            assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(key));
+            if backwards {
+                drive_lazy_payload_io(&conn, || cursor.prev());
+            } else {
+                drive_lazy_payload_io(&conn, || cursor.next());
+            }
+            let rowid = drive_lazy_payload_io(&conn, || cursor.rowid());
+            println!("exists({key}) backwards={backwards}: moved row={rowid:?}");
+            let expected = match (key, backwards) {
+                (3, false) => 5,
+                (3, true) => 2,
+                (2, false) => 3,
+                (2, true) => 1,
+                _ => unreachable!(),
+            };
+            assert_eq!(rowid, Some(expected));
+            let expected_text = match expected {
+                1 => "one",
+                2 => "two",
+                3 => "three",
+                5 => "five",
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                expected_text
+            );
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_hit_resumes_movement() {
+    for abandon in ["none", "probe", "movement"] {
+        for backwards in [false, true] {
+            for point in [
+                CursorYieldPoint::SeekStart,
+                CursorYieldPoint::SeekBtreeProgress,
+            ] {
+                let (db, conn) = setup_lazy_exact_seek_db();
+                conn.execute("UPDATE t SET v = 'two-updated' WHERE id = 2")
+                    .unwrap();
+                conn.execute("BEGIN CONCURRENT").unwrap();
+                let mut cursor = open_lazy_payload_cursor(&db, &conn);
+                let injector = FixedYieldInjector::new([point.point()]);
+                conn.set_yield_injector(Some(injector.clone()));
+                let IOResult::IO(pending) = cursor
+                    .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })
+                    .unwrap()
+                else {
+                    panic!("point seek must yield");
+                };
+                assert!(pending.is_explicit_yield());
+                assert!(injector.is_empty());
+                pending.wait(conn.db.io.as_ref()).unwrap();
+                if abandon == "probe" {
+                    drop(cursor);
+                    conn.set_yield_injector(None);
+                    check_lazy_cursor_after_abandonment(&db, &conn);
+                    continue;
+                }
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor
+                        .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+                    SeekResult::Found
+                );
+                assert_eq!(
+                    payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+                    "two-updated"
+                );
+                conn.set_yield_injector(None);
+                let injector = FixedYieldInjector::new([CursorYieldPoint::SeekStart.point()]);
+                conn.set_yield_injector(Some(injector.clone()));
+                let result = if backwards {
+                    cursor.prev()
+                } else {
+                    cursor.next()
+                }
+                .unwrap();
+                let IOResult::IO(pending) = result else {
+                    panic!("range preparation must yield");
+                };
+                assert!(pending.is_explicit_yield());
+                assert!(injector.is_empty());
+                pending.wait(conn.db.io.as_ref()).unwrap();
+                if abandon == "movement" {
+                    drop(cursor);
+                    conn.set_yield_injector(None);
+                    check_lazy_cursor_after_abandonment(&db, &conn);
+                    continue;
+                }
+                if backwards {
+                    drive_lazy_payload_io(&conn, || cursor.prev());
+                } else {
+                    drive_lazy_payload_io(&conn, || cursor.next());
+                }
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor.rowid()),
+                    Some(if backwards { 1 } else { 3 })
+                );
+                conn.set_yield_injector(None);
+                conn.execute("ROLLBACK").unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_exact_rowid_hit_rechecks_checkpoint_coverage() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("UPDATE t SET v = v WHERE id = 2").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let store = db.get_mvcc_store();
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = store.get_table_id_from_root_page(root);
+    let snapshot = store.read_snapshot(conn.get_mv_tx_id().unwrap()).unwrap();
+    let versions = store
+        .rows
+        .get(&RowID::new(table_id, RowKey::Int(2)))
+        .unwrap()
+        .value()
+        .clone();
+    {
+        let mut chain = versions.write();
+        chain.retain(|version| version.end().is_none());
+        assert_eq!(chain.len(), 1);
+        chain[0].set_materialized_at(snapshot.read_mark);
+    }
+    let old_max = store
+        .durable_txid_max
+        .swap(snapshot.begin_ts, Ordering::SeqCst);
+    store.checkpoint_in_progress.store(true, Ordering::Release);
+    assert!(!store.btree_covers_chain_for_snapshot(snapshot, table_id, &versions.read()));
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    let injector = FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let IOResult::IO(pending) = cursor
+        .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })
+        .unwrap()
+    else {
+        panic!("point probe must yield");
+    };
+    assert!(injector.is_empty());
+    pending.wait(conn.db.io.as_ref()).unwrap();
+    store.checkpoint_in_progress.store(false, Ordering::Release);
+    assert!(store.btree_covers_chain_for_snapshot(snapshot, table_id, &versions.read()));
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || cursor
+            .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+        SeekResult::Found
+    );
+    assert_eq!(
+        payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+        "two"
+    );
+    conn.set_yield_injector(None);
+    drive_lazy_payload_io(&conn, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(3));
+    conn.execute("ROLLBACK").unwrap();
+    store.durable_txid_max.store(old_max, Ordering::SeqCst);
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_does_not_advance_hidden_physical_rows() {
+    for backwards in [false, true] {
+        let (db, conn) = setup_lazy_exact_seek_db();
+        conn.execute("UPDATE t SET v = v || '-updated'").unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let point = if backwards {
+            CursorYieldPoint::AdvanceBtreeBackwardProgress
+        } else {
+            CursorYieldPoint::AdvanceBtreeForwardProgress
+        };
+        let injector = FixedYieldInjector::new([point.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let op = if backwards {
+            SeekOp::LE { eq_only: true }
+        } else {
+            SeekOp::GE { eq_only: true }
+        };
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(2), op)),
+            SeekResult::Found
+        );
+        assert_eq!(
+            payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+            "two-updated"
+        );
+        assert_eq!(
+            injector.remaining_len(),
+            1,
+            "exact probe advanced the physical cursor"
+        );
+        conn.set_yield_injector(None);
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_continues_in_both_directions() {
+    for start in [1, 3, 5] {
+        for backwards in [false, true] {
+            let (db, conn) = setup_lazy_exact_seek_db();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            assert_eq!(
+                drive_lazy_payload_io(&conn, || cursor
+                    .seek(SeekKey::TableRowId(start), SeekOp::GE { eq_only: true })),
+                SeekResult::Found
+            );
+            let mut rows = vec![start];
+            loop {
+                if backwards {
+                    drive_lazy_payload_io(&conn, || cursor.prev());
+                } else {
+                    drive_lazy_payload_io(&conn, || cursor.next());
+                }
+                let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) else {
+                    break;
+                };
+                assert!(lazy_payload_bytes(&conn, &mut cursor).is_some());
+                rows.push(rowid);
+            }
+            let mut expected: Vec<_> = [1, 2, 3, 5, 6]
+                .into_iter()
+                .filter(|id| {
+                    if backwards {
+                        *id <= start
+                    } else {
+                        *id >= start
+                    }
+                })
+                .collect();
+            if backwards {
+                expected.reverse();
+            }
+            assert_eq!(rows, expected);
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_resets_for_new_positions() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    for reposition in ["rewind", "last", "range", "point", "miss"] {
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        match reposition {
+            "rewind" => drive_lazy_payload_io(&conn, || cursor.rewind()),
+            "last" => drive_lazy_payload_io(&conn, || cursor.last()),
+            "range" => {
+                drive_lazy_payload_io(&conn, || cursor.seek(SeekKey::TableRowId(2), SeekOp::GT));
+            }
+            "point" => {
+                drive_lazy_payload_io(&conn, || {
+                    cursor.seek(SeekKey::TableRowId(5), SeekOp::GE { eq_only: true })
+                });
+            }
+            "miss" => {
+                assert_eq!(
+                    drive_lazy_payload_io(&conn, || cursor
+                        .seek(SeekKey::TableRowId(99), SeekOp::GE { eq_only: true })),
+                    SeekResult::NotFound
+                );
+            }
+            _ => unreachable!(),
+        }
+        let expected = match reposition {
+            "rewind" => Some(1),
+            "last" => Some(6),
+            "range" => Some(3),
+            "point" => Some(5),
+            _ => None,
+        };
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), expected);
+        if reposition == "last" {
+            drive_lazy_payload_io(&conn, || cursor.prev());
+        } else {
+            drive_lazy_payload_io(&conn, || cursor.next());
+        }
+        let expected_next = match reposition {
+            "rewind" => Some(2),
+            "last" => Some(5),
+            "range" => Some(5),
+            "point" => Some(6),
+            _ => None,
+        };
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.rowid()),
+            expected_next
+        );
+    }
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_keeps_payload_during_rollback_and_gc() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("UPDATE t SET v = 'changed' WHERE id = 3")
+        .unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || cursor
+            .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })),
+        SeekResult::Found
+    );
+    let IOResult::Done(Some(payload)) = cursor.record_payload().unwrap() else {
+        panic!("chain bytes expected");
+    };
+    conn.execute("ROLLBACK TO s").unwrap();
+    db.get_mvcc_store().gc_incremental(usize::MAX);
+    assert_eq!(payload_text(payload), "changed");
+    assert_eq!(
+        payload_text(&lazy_payload_bytes(&conn, &mut cursor).unwrap()),
+        "three"
+    );
+    drive_lazy_payload_io(&conn, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(5));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_preserves_write_loop_after_physical_miss() {
+    let (db, conn) = setup_lazy_exact_seek_db();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let mut physical = BTreeCursor::new_table(conn.pager.load().clone(), root, 2);
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || physical
+            .seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true })),
+        SeekResult::NotFound
+    );
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    assert_eq!(
+        drive_lazy_payload_io(&conn, || cursor
+            .seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true })),
+        SeekResult::Found
+    );
+    let mut deleted = Vec::new();
+    while let Some(rowid) = drive_lazy_payload_io(&conn, || cursor.rowid()) {
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor
+                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        drive_lazy_payload_io(&conn, || cursor.delete());
+        deleted.push(rowid);
+        drive_lazy_payload_io(&conn, || cursor.next());
+    }
+    assert_eq!(deleted, vec![1, 2, 3, 5, 6]);
+    assert!(get_rows(&conn, "SELECT id FROM t").is_empty());
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_survives_checkpoint_before_movement() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let writer = db.connect();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer
+        .execute("UPDATE t SET v = 'updated' WHERE id = 2")
+        .unwrap();
+    let reader = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &reader);
+    let injector = FixedYieldInjector::new([CursorYieldPoint::SeekBtreeProgress.point()]);
+    reader.set_yield_injector(Some(injector.clone()));
+    loop {
+        let IOResult::IO(pending) = cursor
+            .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })
+            .unwrap()
+        else {
+            panic!("point probe completed before SeekBtreeProgress");
+        };
+        if pending.is_explicit_yield() {
+            assert!(injector.is_empty());
+            pending.wait(reader.db.io.as_ref()).unwrap();
+            break;
+        }
+        assert_eq!(injector.remaining_len(), 1);
+        pending.wait(reader.db.io.as_ref()).unwrap();
+    }
+    assert!(injector.is_empty());
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    db.get_mvcc_store().gc_incremental(usize::MAX);
+    assert_eq!(
+        drive_lazy_payload_io(&reader, || cursor
+            .seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true })),
+        SeekResult::Found
+    );
+    assert_eq!(
+        payload_text(&lazy_payload_bytes(&reader, &mut cursor).unwrap()),
+        "updated"
+    );
+    reader.set_yield_injector(None);
+    writer
+        .execute("UPDATE t SET v = 'later' WHERE id = 3")
+        .unwrap();
+    writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    drive_lazy_payload_io(&reader, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&reader, || cursor.rowid()), Some(3));
+    assert_eq!(
+        payload_text(&lazy_payload_bytes(&reader, &mut cursor).unwrap()),
+        "three"
+    );
+    reader.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_point_seek_abandons_physical_miss() {
+    for point in [
+        CursorYieldPoint::SeekStart,
+        CursorYieldPoint::SeekBtreeProgress,
+    ] {
+        let (db, conn) = setup_lazy_exact_seek_db();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+            .as_int()
+            .unwrap();
+        let mut physical = BTreeCursor::new_table(conn.pager.load().clone(), root, 2);
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || physical
+                .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })),
+            SeekResult::NotFound
+        );
+        drop(physical);
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let injector = FixedYieldInjector::new([point.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let IOResult::IO(pending) = cursor
+            .seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true })
+            .unwrap()
+        else {
+            panic!("point probe must yield");
+        };
+        assert!(pending.is_explicit_yield());
+        assert!(injector.is_empty());
+        pending.wait(conn.db.io.as_ref()).unwrap();
+        drop(cursor);
+        conn.set_yield_injector(None);
+        check_lazy_cursor_after_abandonment(&db, &conn);
+    }
+}
+
+fn check_lazy_cursor_after_abandonment(db: &MvccTestDbNoConn, conn: &Arc<Connection>) {
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("UPDATE t SET v = 'after-drop' WHERE id = 2")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (7, 'inserted-after-drop')")
+        .unwrap();
+    let mut cursor = open_lazy_payload_cursor(db, conn);
+    for (rowid, expected) in [(2, "after-drop"), (7, "inserted-after-drop")] {
+        assert_eq!(
+            drive_lazy_payload_io(conn, || cursor
+                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })),
+            SeekResult::Found
+        );
+        assert_eq!(drive_lazy_payload_io(conn, || cursor.rowid()), Some(rowid));
+        assert_eq!(
+            payload_text(&lazy_payload_bytes(conn, &mut cursor).unwrap()),
+            expected
+        );
+    }
+    conn.execute("ROLLBACK").unwrap();
+}
+
+fn setup_lazy_exact_seek_db() -> (MvccTestDbNoConn, Arc<Connection>) {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'two'), (4, 'four'), (6, 'six')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'one'), (3, 'three'), (5, 'five')")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id = 4").unwrap();
+    (db, conn)
+}
+
+fn scan_lazy_cursor_payload(
+    db: &MvccTestDbNoConn,
+    conn: &Arc<Connection>,
+    backwards: bool,
+) -> Vec<(i64, String)> {
+    let mut cursor = open_lazy_payload_cursor(db, conn);
+    if backwards {
+        drive_lazy_payload_io(conn, || cursor.last());
+    } else {
+        drive_lazy_payload_io(conn, || cursor.rewind());
+    }
+    let mut rows = Vec::new();
+    while let Some(rowid) = drive_lazy_payload_io(conn, || cursor.rowid()) {
+        let payload = lazy_payload_bytes(conn, &mut cursor).unwrap();
+        let record = drive_lazy_payload_io(conn, || {
+            cursor
+                .record()
+                .map(|r| r.map(|r| r.unwrap().get_payload().to_vec()))
+        });
+        assert_eq!(payload, record);
+        let value = crate::types::ValueIterator::new(&payload)
+            .unwrap()
+            .nth(1)
+            .unwrap()
+            .unwrap()
+            .to_text()
+            .unwrap()
+            .to_string();
+        rows.push((rowid, value));
+        if backwards {
+            drive_lazy_payload_io(conn, || cursor.prev());
+        } else {
+            drive_lazy_payload_io(conn, || cursor.next());
+        }
+    }
+    assert!(lazy_payload_bytes(conn, &mut cursor).is_none());
+    rows
+}
+
+fn payload_text(payload: &[u8]) -> String {
+    crate::types::ValueIterator::new(payload)
+        .unwrap()
+        .nth(1)
+        .unwrap()
+        .unwrap()
+        .to_text()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn test_lazy_cursor_count_uses_physical_pages() {
+    let (db, conn) = setup_lazy_count_db(false);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    let injector = FixedYieldInjector::new([CursorYieldPoint::NextStart.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    cursor.set_null_flag(true);
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 500);
+    assert!(!cursor.get_null_flag());
+    assert!(!injector.is_empty());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), None);
+    drive_lazy_payload_io(&conn, || cursor.next());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), None);
+    drive_lazy_payload_io(&conn, || cursor.prev());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), None);
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 500);
+    conn.set_yield_injector(None);
+    drive_lazy_payload_io(&conn, || cursor.rewind());
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.rowid()), Some(1));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_count_merges_versions() {
+    for checkpoint in [false, true] {
+        let db = MvccTestDbNoConn::new();
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+            .unwrap();
+        if checkpoint {
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("UPDATE t SET v = 'updated' WHERE id = 1")
+            .unwrap();
+        conn.execute("DELETE FROM t WHERE id = 3").unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 'four')").unwrap();
+        let writer = db.connect();
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (5, 'invisible')")
+            .unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 3);
+        conn.execute("SAVEPOINT s").unwrap();
+        conn.execute("DELETE FROM t WHERE id = 4").unwrap();
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 2);
+        conn.execute("ROLLBACK TO s").unwrap();
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 3);
+        writer.execute("ROLLBACK").unwrap();
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_count_restarts_after_writes_during_io() {
+    for change in ["delete", "insert", "update", "rollback", "abandon"] {
+        let (db, conn) = setup_lazy_count_db(true);
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        conn.pager.load().clear_page_cache(false);
+        let IOResult::IO(pending) = cursor.count().unwrap() else {
+            panic!("physical count must wait for page I/O");
+        };
+        assert!(!pending.finished());
+        assert!(!pending.is_explicit_yield());
+        match change {
+            "insert" => conn.execute("INSERT INTO t VALUES (501, 'new')").unwrap(),
+            "update" => conn
+                .execute("UPDATE t SET v = 'new' WHERE id = 500")
+                .unwrap(),
+            _ => conn.execute("DELETE FROM t WHERE id = 500").unwrap(),
+        }
+        if change == "rollback" {
+            conn.execute("ROLLBACK TO s").unwrap();
+        }
+        if change == "abandon" {
+            drop(cursor);
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            conn.execute("ROLLBACK").unwrap();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            conn.execute("INSERT INTO t VALUES (501, 'after abandonment')")
+                .unwrap();
+            cursor = open_lazy_payload_cursor(&db, &conn);
+        } else {
+            pending.wait(conn.db.io.as_ref()).unwrap();
+        }
+        let expected = match change {
+            "delete" => 499,
+            "insert" | "abandon" => 501,
+            _ => 500,
+        };
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.count()),
+            expected,
+            "{change}"
+        );
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.count()),
+            expected,
+            "repeat {change}"
+        );
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_count_sql_sees_delete_during_io() {
+    let (_db, conn) = setup_lazy_count_db(true);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+    conn.pager.load().clear_page_cache(false);
+    assert!(matches!(stmt.step().unwrap(), StepResult::IO));
+    conn.execute("DELETE FROM t WHERE id = 500").unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                assert_eq!(stmt.row().unwrap().get_value(0), &Value::from_i64(499));
+                break;
+            }
+            StepResult::IO | StepResult::Yield => stmt._io().step().unwrap(),
+            other => panic!("unexpected result {other:?}"),
+        }
+    }
+    drop(stmt);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_count_restarts_after_physical_result() {
+    for undo in [false, true] {
+        let (db, conn) = setup_lazy_count_db(false);
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("SAVEPOINT s").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let injector = FixedYieldInjector::new([CursorYieldPoint::CountProgress.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let IOResult::IO(pending) = cursor.count().unwrap() else {
+            panic!("count must yield with a completed physical result");
+        };
+        assert!(pending.is_explicit_yield());
+        assert!(injector.is_empty());
+        conn.set_yield_injector(None);
+        let store = db.get_mvcc_store();
+        let tx_id = conn.get_mv_tx_id().unwrap();
+        let before = store.write_generation(tx_id).unwrap();
+        conn.execute("DELETE FROM t WHERE id = 500").unwrap();
+        let after_write = store.write_generation(tx_id).unwrap();
+        assert!(after_write > before);
+        if undo {
+            conn.execute("ROLLBACK TO s").unwrap();
+            assert!(store.write_generation(tx_id).unwrap() > after_write);
+        }
+        pending.wait(conn.db.io.as_ref()).unwrap();
+        let expected = if undo { 500 } else { 499 };
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), expected);
+        assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), expected);
+        conn.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn test_lazy_cursor_count_abandons_pending_physical_result() {
+    let (_db, conn) = setup_lazy_count_db(false);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let injector = FixedYieldInjector::new([CursorYieldPoint::CountProgress.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut stmt = conn.prepare("SELECT count(*) FROM t").unwrap();
+    assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
+    assert!(injector.is_empty());
+    conn.set_yield_injector(None);
+    drop(stmt);
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("INSERT INTO t VALUES (501, 'after abandonment')")
+        .unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(501)]]
+    );
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_count_snapshot_survives_checkpoint_and_gc_during_io() {
+    for passive in [false, true] {
+        for insert in [false, true] {
+            let opts = DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(passive);
+            let (db, conn) = setup_lazy_count_db_with_options(true, opts);
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mut cursor = open_lazy_payload_cursor(&db, &conn);
+            conn.pager.load().clear_page_cache(false);
+            let injector = FixedYieldInjector::new([CursorYieldPoint::CountProgress.point()]);
+            conn.set_yield_injector(Some(injector.clone()));
+            let IOResult::IO(pending) = cursor.count().unwrap() else {
+                panic!("physical count must wait for page I/O");
+            };
+            assert!(!pending.finished());
+            assert!(!pending.is_explicit_yield());
+            assert!(
+                !injector.is_empty(),
+                "merged count would consume CountProgress before page I/O"
+            );
+            conn.set_yield_injector(None);
+            let writer = db.connect();
+            writer
+                .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                .unwrap();
+            writer.execute("BEGIN CONCURRENT").unwrap();
+            if insert {
+                writer
+                    .execute("INSERT INTO t VALUES (501, 'later')")
+                    .unwrap();
+            } else {
+                writer.execute("DELETE FROM t WHERE id = 500").unwrap();
+            }
+            writer.execute("COMMIT").unwrap();
+            if passive {
+                writer.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+            } else {
+                assert!(matches!(
+                    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)"),
+                    Err(LimboError::Busy)
+                ));
+            }
+            let store = db.get_mvcc_store();
+            store.gc_incremental(usize::MAX);
+            store.drop_unused_row_versions();
+            pending.wait(conn.db.io.as_ref()).unwrap();
+            let actual = drive_lazy_payload_io(&conn, || cursor.count());
+            println!("passive={passive} insert={insert}: pending snapshot count={actual}");
+            assert_eq!(actual, 500);
+            let fresh = db.connect();
+            assert_eq!(
+                get_rows(&fresh, "SELECT count(*) FROM t"),
+                vec![vec![Value::from_i64(if insert { 501 } else { 499 })]]
+            );
+            drop(cursor);
+            conn.execute("ROLLBACK").unwrap();
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            store.gc_incremental(usize::MAX);
+            assert_eq!(
+                get_rows(&fresh, "SELECT count(*) FROM t"),
+                vec![vec![Value::from_i64(if insert { 501 } else { 499 })]]
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lazy_cursor_count_keeps_abort_timing() {
+    for path in ["physical", "merged", "index"] {
+        for after_start in [false, true] {
+            let db = MvccTestDbNoConn::new();
+            let conn = db.connect();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+            conn.execute("CREATE INDEX i ON t(v)").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'one')").unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.execute("BEGIN CONCURRENT").unwrap();
+            let mut cursor = if path == "index" {
+                let index = conn
+                    .schema
+                    .read()
+                    .get_index(NamespaceId::ROOT, "t", "i")
+                    .unwrap()
+                    .clone();
+                let root = get_rows(&conn, "SELECT rootpage FROM sqlite_schema WHERE name = 'i'")
+                    [0][0]
+                    .as_int()
+                    .unwrap();
+                let info = Arc::new(IndexInfo::new_from_index(&index).unwrap());
+                MvccLazyCursor::new(
+                    db.get_mvcc_store(),
+                    &conn,
+                    conn.get_mv_tx_id().unwrap(),
+                    root,
+                    MvccCursorType::Index(info),
+                    Box::new(
+                        BTreeCursor::new_index(
+                            conn.pager.load().clone(),
+                            root,
+                            &index,
+                            index.columns.len(),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .unwrap()
+            } else {
+                open_lazy_payload_cursor(&db, &conn)
+            };
+            if path == "merged" {
+                let writer = db.connect();
+                writer
+                    .execute("INSERT INTO t VALUES (2, 'invisible')")
+                    .unwrap();
+            }
+            if after_start {
+                let injector = FixedYieldInjector::new([CursorYieldPoint::CountProgress.point()]);
+                conn.set_yield_injector(Some(injector.clone()));
+                let IOResult::IO(pending) = cursor.count().unwrap() else {
+                    panic!("count must yield after starting");
+                };
+                assert!(pending.is_explicit_yield());
+                assert!(injector.is_empty());
+                conn.set_yield_injector(None);
+            }
+            let store = db.get_mvcc_store();
+            let tx_id = conn.get_mv_tx_id().unwrap();
+            store
+                .txs
+                .get(&tx_id)
+                .unwrap()
+                .value()
+                .abort_now
+                .store(true, Ordering::Release);
+            let actual = drive_lazy_payload_io(&conn, || cursor.count());
+            println!("path={path} after_start={after_start}: aborted count={actual}");
+            assert_eq!(actual, 1);
+            assert!(store.tx_should_abort(tx_id));
+            conn.execute("ROLLBACK").unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "io_memory_yield")]
+#[test]
+fn test_lazy_cursor_count_keeps_abort_timing_during_io() {
+    let (db, conn) = setup_lazy_count_db(true);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    conn.pager.load().clear_page_cache(false);
+    let IOResult::IO(pending) = cursor.count().unwrap() else {
+        panic!("count must wait for page I/O");
+    };
+    assert!(!pending.finished());
+    assert!(!pending.is_explicit_yield());
+    let store = db.get_mvcc_store();
+    store
+        .txs
+        .get(&conn.get_mv_tx_id().unwrap())
+        .unwrap()
+        .value()
+        .abort_now
+        .store(true, Ordering::Release);
+    pending.wait(conn.db.io.as_ref()).unwrap();
+    assert_eq!(drive_lazy_payload_io(&conn, || cursor.count()), 500);
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_lazy_cursor_count_rejects_exhausted_generation() {
+    let (db, conn) = setup_lazy_count_db(false);
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut cursor = open_lazy_payload_cursor(&db, &conn);
+    let store = db.get_mvcc_store();
+    store
+        .txs
+        .get(&conn.get_mv_tx_id().unwrap())
+        .unwrap()
+        .value()
+        .write_generation
+        .store(u64::MAX, Ordering::Release);
+    assert!(matches!(
+        *cursor.count().unwrap_err(),
+        LimboError::CommitDependencyAborted
+    ));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+fn setup_lazy_count_db(yield_io: bool) -> (MvccTestDbNoConn, Arc<Connection>) {
+    setup_lazy_count_db_with_options(yield_io, DatabaseOpts::new())
+}
+
+fn setup_lazy_count_db_with_options(
+    yield_io: bool,
+    opts: DatabaseOpts,
+) -> (MvccTestDbNoConn, Arc<Connection>) {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("count.db");
+    let io: Arc<dyn IO> = if yield_io {
+        #[cfg(not(feature = "io_memory_yield"))]
+        unreachable!();
+        #[cfg(feature = "io_memory_yield")]
+        {
+            Arc::new(crate::MemoryYieldIO::new())
+        }
+    } else {
+        Arc::new(MemoryIO::new())
+    };
+    let database = Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let db = MvccTestDbNoConn {
+        db: Some(database),
+        path: Some(path.to_str().unwrap().to_string()),
+        opts,
+        enc_opts: None,
+        _temp_dir: Some(temp_dir),
+    };
+    let conn = db.connect();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("WITH RECURSIVE s(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM s WHERE x<500) INSERT INTO t SELECT x, printf('%0200d', x) FROM s").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    (db, conn)
+}
+
+fn open_lazy_payload_cursor(
+    db: &MvccTestDbNoConn,
+    conn: &Arc<Connection>,
+) -> MvccLazyCursor<MvccClock, crate::alloc::DynAllocator> {
+    let store = db.get_mvcc_store();
+    let root = get_rows(conn, "SELECT rootpage FROM sqlite_schema WHERE name = 't'")[0][0]
+        .as_int()
+        .unwrap();
+    let physical_root = if root < 0 {
+        store.get_real_table_id(root)
+    } else {
+        root
+    };
+    MvccLazyCursor::new(
+        store,
+        conn,
+        conn.get_mv_tx_id().unwrap(),
+        root,
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new_table(
+            conn.pager.load().clone(),
+            physical_root,
+            2,
+        )),
+    )
+    .unwrap()
+}
+
+fn lazy_payload_bytes(
+    conn: &Arc<Connection>,
+    cursor: &mut MvccLazyCursor<MvccClock, crate::alloc::DynAllocator>,
+) -> Option<Vec<u8>> {
+    drive_lazy_payload_io(conn, || {
+        cursor
+            .record_payload()
+            .map(|r| r.map(|payload| payload.map(<[u8]>::to_vec)))
+    })
+}
+
+fn drive_lazy_payload_io<T>(
+    conn: &Arc<Connection>,
+    mut operation: impl FnMut() -> crate::types::IOResultOr<T>,
+) -> T {
+    loop {
+        match operation().unwrap() {
+            IOResult::Done(value) => return value,
+            IOResult::IO(io) => io.wait(conn.db.io.as_ref()).unwrap(),
+        }
+    }
+}
+
 /// What this test checks: Cursor traversal and seek operations honor MVCC visibility and key ordering under updates/deletes.
 /// Why this matters: Read-path correctness is critical: wrong cursor semantics directly surface as wrong query answers.
 #[test]
@@ -8011,6 +13936,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         tx_id,
         begin_ts,
         write_set: Mutex::new(WriteSet::new()),
+        write_generation: AtomicU64::new(0),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
@@ -9802,6 +15728,7 @@ fn transaction_display() {
         tx_id,
         begin_ts,
         write_set,
+        write_generation: AtomicU64::new(0),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
         savepoint_stack: RwLock::new(Vec::new()),
@@ -12106,6 +18033,110 @@ fn reader_errors_instead_of_panicking_after_its_transaction_is_rolled_back() {
     }
 }
 
+#[test]
+fn reader_fails_at_a_row_updated_after_its_transaction_ends() {
+    for foreign_commit in [true, false] {
+        let (db, conn) = setup_rows_for_ended_reader();
+        let other = db.connect();
+        let mut read = start_ended_reader(&conn);
+        if foreign_commit {
+            other.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+        } else {
+            other.execute("BEGIN CONCURRENT").unwrap();
+            other.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+        }
+        assert_ended_reader_fails_at_row_three(
+            &mut read,
+            &format!("foreign_commit={foreign_commit}"),
+        );
+    }
+}
+
+#[test]
+fn reader_fails_at_its_own_updated_row_after_its_transaction_ends() {
+    for end_transaction in ["COMMIT", "ROLLBACK"] {
+        let (_db, conn) = setup_rows_for_ended_reader();
+        conn.execute("BEGIN").unwrap();
+        let mut read = conn.prepare("SELECT id FROM t").unwrap();
+        assert!(matches!(read.step().unwrap(), StepResult::Row));
+        assert_eq!(read.row().unwrap().get::<i64>(0).unwrap(), 1);
+        conn.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+        conn.execute(end_transaction).unwrap();
+        assert_ended_reader_fails_at_row_three(&mut read, end_transaction);
+    }
+}
+
+#[test]
+fn reader_fails_at_an_empty_chain_after_its_transaction_ends() {
+    let (db, conn) = setup_rows_for_ended_reader();
+    let other = db.connect();
+    other.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("UPDATE t SET v = 'z' WHERE id = 3").unwrap();
+    other.execute("ROLLBACK").unwrap();
+    let mut read = start_ended_reader(&conn);
+    assert_ended_reader_fails_at_row_three(&mut read, "empty chain");
+}
+
+#[test]
+fn test_lazy_cursor_count_returns_after_its_transaction_ends() {
+    for end_transaction in ["COMMIT", "ROLLBACK"] {
+        let (db, conn) = setup_lazy_count_db(false);
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        let mut cursor = open_lazy_payload_cursor(&db, &conn);
+        let injector = FixedYieldInjector::new([CursorYieldPoint::CountProgress.point()]);
+        conn.set_yield_injector(Some(injector.clone()));
+        let IOResult::IO(pending) = cursor.count().unwrap() else {
+            panic!("count must yield with a completed physical result");
+        };
+        assert!(pending.is_explicit_yield());
+        conn.set_yield_injector(None);
+        conn.execute(end_transaction).unwrap();
+        pending.wait(conn.db.io.as_ref()).unwrap();
+        assert_eq!(
+            drive_lazy_payload_io(&conn, || cursor.count()),
+            500,
+            "{end_transaction}"
+        );
+    }
+}
+
+fn setup_rows_for_ended_reader() -> (MvccTestDbNoConn, Arc<Connection>) {
+    let db = MvccTestDbNoConn::new();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    (db, conn)
+}
+
+fn start_ended_reader(conn: &Arc<Connection>) -> crate::Statement {
+    conn.execute("BEGIN").unwrap();
+    let mut read = conn.prepare("SELECT id FROM t").unwrap();
+    assert!(matches!(read.step().unwrap(), StepResult::Row));
+    assert_eq!(read.row().unwrap().get::<i64>(0).unwrap(), 1);
+    conn.execute("ROLLBACK").unwrap();
+    read
+}
+
+fn assert_ended_reader_fails_at_row_three(read: &mut crate::Statement, case: &str) {
+    let mut ids = vec![1];
+    let err = loop {
+        match read.step() {
+            Ok(StepResult::Row) => ids.push(read.row().unwrap().get::<i64>(0).unwrap()),
+            Ok(StepResult::IO) => read.get_pager().io.step().unwrap(),
+            Ok(other) => panic!("{case}: expected an error, got {other:?} after {ids:?}"),
+            Err(err) => break err,
+        }
+    };
+    assert!(
+        matches!(err, LimboError::NoSuchTransactionID(_)),
+        "{case}: expected NoSuchTransactionID, got {err:?}"
+    );
+    assert_eq!(ids, vec![1, 2], "{case}");
+}
+
 /// GC trims chains with retain()/clear(), which keeps the Vec's allocation.
 /// After a burst of versions is collected, the chain's capacity must be
 /// released down to a quarter of its previous value (deliberately not to fit)
@@ -12360,10 +18391,14 @@ fn test_write_set_has_one_entry_for_each_written_chain() {
 
     conn.execute("BEGIN CONCURRENT").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
-    conn.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
-    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
-    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     let tx_id = conn.get_mv_tx_id().unwrap();
+    conn.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+    let before_delete = mvcc_store.write_generation(tx_id).unwrap();
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    let after_delete = mvcc_store.write_generation(tx_id).unwrap();
+    assert!(after_delete > before_delete);
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    assert!(mvcc_store.write_generation(tx_id).unwrap() > after_delete);
     // The table row 1 and the index keys 'a' and 'b'.
     assert_eq!(
         write_set_len_and_distinct_chains(&mvcc_store, tx_id),
