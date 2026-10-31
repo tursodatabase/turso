@@ -458,12 +458,11 @@ expect {
 
 @requires strict "uses STRICT tables"
 test op-date-minus-value-of-unknown-type-error {
-    -- substr() returns a value of the type of its first argument, and a string
-    -- literal has no type, so substr(...) - d could be a date minus days or a
-    -- date minus a date. Casting it says which.
+    -- json_extract() may return a value of any type, so json_extract(...) - d
+    -- could be a date minus days or a date minus a date. Casting it says which.
     CREATE TABLE t1(d date) STRICT;
     INSERT INTO t1 VALUES ('2024-01-05');
-    SELECT substr('2024-02-01', 1) - d FROM t1;
+    SELECT json_extract('"2024-02-01"', '$') - d FROM t1;
 }
 expect error {
     operator does not exist: value - date
@@ -690,6 +689,61 @@ test op-date-minus-subquery-and-coalesce {
 }
 expect {
     4|0|5|5
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-iif-with-several-conditions {
+    -- iif returns one of its values, never one of its conditions.
+    CREATE TABLE t(d date, i INTEGER) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', 1);
+    SELECT d - iif(i = 1, d, i = 2, d), d - iif(i = 2, d, i = 3, d, '2024-01-01') FROM t;
+}
+expect {
+    0|4
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-number-of-unknown-kind {
+    -- ceil, floor and trunc of text, and text plus 0, give a number that may
+    -- be an integer, so they may be days to subtract from a date.
+    CREATE TABLE t(d date, s TEXT) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', '3');
+    SELECT d - floor(s), d - ceil('3'), d - trunc(NULL), d - (s + 0) FROM t;
+}
+expect {
+    2024-01-02|2024-01-02||2024-01-02
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-abs-of-text-error {
+    -- abs of text is a real, never days: abs('3') is 3.0.
+    CREATE TABLE t(d date, s TEXT) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', '3');
+    SELECT d + abs(s) FROM t;
+}
+expect error {
+    operator does not exist: date \+ real
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-abs-of-numeric-error {
+    -- abs of a numeric value is numeric, as -n is.
+    CREATE TABLE t(d date, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', 3);
+    SELECT d + abs(n) FROM t;
+}
+expect error {
+    operator does not exist: date \+ numeric
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-with-abs-of-numeric-is-exact {
+    CREATE TABLE t(n numeric(10,2), m numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (0.10, 0.20);
+    SELECT n + abs(m), n - abs(m), n * abs(m) FROM t;
+}
+expect {
+    0.30|-0.10|0.020
 }
 
 @requires strict "uses STRICT tables"
