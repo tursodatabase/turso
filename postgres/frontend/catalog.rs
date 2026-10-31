@@ -182,7 +182,7 @@ impl Dialect for PostgresDialect {
             "greatest" => {
                 if arg_count < 1 {
                     return Err(LimboError::ParseError(
-                        "greatest number of arguments to function {name}()".to_string(),
+                        "wrong number of arguments to function greatest()".to_string(),
                     ));
                 }
                 Ok(Some(Func::Scalar(ScalarFunc::Greatest)))
@@ -190,7 +190,7 @@ impl Dialect for PostgresDialect {
             "least" => {
                 if arg_count < 1 {
                     return Err(LimboError::ParseError(
-                        "least number of arguments to function {name}()".to_string(),
+                        "wrong number of arguments to function least()".to_string(),
                     ));
                 }
                 Ok(Some(Func::Scalar(ScalarFunc::Least)))

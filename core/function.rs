@@ -1770,7 +1770,25 @@ impl Func {
     /// SQLite name table lives; kept on `Func` for the engine call sites
     /// that classify translated AST.
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
-        crate::dialect::sqlite::resolve_builtin_function(name, arg_count)
+        match name.to_ascii_lowercase().as_str() {
+            "greatest" => {
+                if arg_count < 1 {
+                    return Err(LimboError::ParseError(
+                        "greatest number of arguments to function {name}()".to_string(),
+                    ));
+                }
+                Ok(Some(Func::Scalar(ScalarFunc::Greatest)))
+            }
+            "least" => {
+                if arg_count < 1 {
+                    return Err(LimboError::ParseError(
+                        "least number of arguments to function {name}()".to_string(),
+                    ));
+                }
+                Ok(Some(Func::Scalar(ScalarFunc::Least)))
+            }
+            _ => crate::dialect::sqlite::resolve_builtin_function(name, arg_count),
+        }
     }
 
     /// Returns a list of all built-in functions for PRAGMA function_list.
