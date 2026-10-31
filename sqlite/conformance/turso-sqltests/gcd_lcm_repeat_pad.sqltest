@@ -204,3 +204,17 @@ test gcd_one_arg {
 expect error {
     wrong number of arguments to function gcd()
 }
+
+test lpad_one_arg_in_check {
+    CREATE TABLE t_lpad_check(a, CHECK (lpad(a)));
+}
+expect error {
+    wrong number of arguments to function lpad()
+}
+
+test lpad_one_arg_in_generated_column {
+    CREATE TABLE t_lpad_gen(a, b AS (lpad('a')));
+}
+expect error {
+    wrong number of arguments to function lpad()
+}
