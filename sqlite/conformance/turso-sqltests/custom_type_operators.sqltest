@@ -703,6 +703,18 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test op-date-minus-number-of-unknown-kind {
+    -- ceil, floor and trunc of text, and text plus 0, give a number that may
+    -- be an integer, so they may be days to subtract from a date.
+    CREATE TABLE t(d date, s TEXT) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', '3');
+    SELECT d - floor(s), d - ceil('3'), d - trunc(NULL), d - (s + 0) FROM t;
+}
+expect {
+    2024-01-02|2024-01-02||2024-01-02
+}
+
+@requires strict "uses STRICT tables"
 test op-date-minus-derived-table-cte-and-view-columns {
     CREATE TABLE t(d date) STRICT;
     CREATE TABLE u(e date) STRICT;
