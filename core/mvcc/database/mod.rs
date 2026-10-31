@@ -934,12 +934,14 @@ struct SavepointRollbackResult {
 #[derive(Debug)]
 struct WriteSet<A: RowVersionAllocator = TursoAllocator> {
     entries: Vec<(RowID, RowVersions<A>)>,
+    table_generations: HashMap<MVTableId, u64>,
 }
 
 impl<A: RowVersionAllocator> Default for WriteSet<A> {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
+            table_generations: HashMap::default(),
         }
     }
 }
@@ -981,6 +983,7 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     begin_ts: u64,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet<A>>,
+    write_generation: AtomicU64,
     /// The transaction header.
     header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
@@ -1043,6 +1046,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             schema_generation_at_begin,
             portable_logical_changes,
             write_set: Mutex::new(WriteSet::new()),
+            write_generation: AtomicU64::new(0),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
@@ -1232,6 +1236,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
 
     /// Record a version that was created during the current savepoint.
     fn record_created_table_version(&self, rowid: RowID, version_id: u64) {
+        self.record_table_write(rowid.table_id);
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
             tracing::debug!(
                 "record_created_table_version(tx_id={}, table_id={}, row_id={}, version_id={})",
@@ -1250,6 +1255,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         key: (MVTableId, Arc<SortableIndexKey>),
         version_id: u64,
     ) {
+        self.bump_write_generation();
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
             tracing::debug!(
                 "record_created_index_version(tx_id={}, table_id={}, version_id={})",
@@ -1263,6 +1269,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
 
     /// Record a version that was deleted during the current savepoint.
     fn record_deleted_table_version(&self, rowid: RowID, version_id: u64) {
+        self.record_table_write(rowid.table_id);
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
             tracing::debug!(
                 "record_deleted_table_version(tx_id={}, table_id={}, row_id={}, version_id={})",
@@ -1281,6 +1288,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         key: (MVTableId, Arc<SortableIndexKey>),
         version_id: u64,
     ) {
+        self.bump_write_generation();
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
             tracing::debug!(
                 "record_deleted_index_version(tx_id={}, table_id={}, version_id={})",
@@ -1290,6 +1298,18 @@ impl<A: RowVersionAllocator> Transaction<A> {
             );
             savepoint.deleted_index_versions.push((key, version_id));
         }
+    }
+
+    fn record_table_write(&self, table_id: MVTableId) {
+        let generation = self.bump_write_generation();
+        self.write_set
+            .lock()
+            .table_generations
+            .insert(table_id, generation);
+    }
+
+    fn bump_write_generation(&self) -> u64 {
+        self.write_generation.fetch_add(1, Ordering::Release) + 1
     }
 }
 
@@ -6117,6 +6137,42 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         row_id: &RowKey,
         tx_id: TxID,
     ) -> Result<bool> {
+        self.with_btree_row_chain(table_id, row_id, |versions| {
+            self.chain_leaves_btree_row_valid(tx_id, table_id, versions)
+        })
+    }
+
+    pub(crate) fn cursor_btree_row_is_valid(
+        &self,
+        cursor_transaction: &CursorTransaction<Clock, A>,
+        table_id: MVTableId,
+        row_id: &RowKey,
+        tx_id: TxID,
+    ) -> Result<bool> {
+        self.with_btree_row_chain(table_id, row_id, |versions| {
+            self.cursor_chain_leaves_btree_row_valid(cursor_transaction, table_id, versions, tx_id)
+        })
+    }
+
+    pub(crate) fn cursor_chain_leaves_btree_row_valid(
+        &self,
+        cursor_transaction: &CursorTransaction<Clock, A>,
+        table_id: MVTableId,
+        versions: &[RowVersion],
+        tx_id: TxID,
+    ) -> Result<bool> {
+        let tx = cursor_transaction
+            .live_transaction()
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        Ok(self.transaction_leaves_btree_row_valid(tx, table_id, versions))
+    }
+
+    fn with_btree_row_chain(
+        &self,
+        table_id: MVTableId,
+        row_id: &RowKey,
+        chain_leaves_row_valid: impl FnOnce(&[RowVersion]) -> Result<bool>,
+    ) -> Result<bool> {
         match row_id {
             RowKey::Int(_) => {
                 let row_id_full = RowID {
@@ -6128,7 +6184,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return Ok(true);
                 };
                 let versions = versions.value().read();
-                self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
+                chain_leaves_row_valid(&versions)
             }
             RowKey::Record(record) => {
                 // Dont allocate new SkipList here to avoid introducing concerns around error handling
@@ -6141,7 +6197,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return Ok(true);
                 };
                 let versions = versions.value().read();
-                self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
+                chain_leaves_row_valid(&versions)
             }
         }
     }
@@ -6156,9 +6212,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .txs
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let tx = tx.value();
+        Ok(self.transaction_leaves_btree_row_valid(tx.value(), table_id, versions))
+    }
+
+    fn transaction_leaves_btree_row_valid(
+        &self,
+        tx: &Transaction<A>,
+        table_id: MVTableId,
+        versions: &[RowVersion],
+    ) -> bool {
         if self.btree_covers_chain_for_tx(tx, table_id, versions) {
-            return Ok(true);
+            return true;
         }
 
         // Check if any version invalidates the B-tree row
@@ -6166,7 +6230,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
         });
 
-        Ok(!btree_is_invalid)
+        !btree_is_invalid
     }
 
     fn find_visible_version<'a>(
@@ -6281,43 +6345,41 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
         let table_id = start.table_id;
-        let iter_box = {
-            let range = if eq_only {
-                // An eq-only rowid seek (point lookup, NotExists / rowid-uniqueness
-                // probe) only cares about the single key `start`. Bound BOTH ends of
-                // the range to that key so the skiplist walk stops immediately instead
-                // of scanning forward over every invisible neighbor until it happens to
-                // find the next visible row. Without this bound a single probe costs
-                // O(pending invisible versions), which compounds into quadratic work
-                // when each row of a concurrent batch insert pays it. This mirrors the
-                // eq-only bound in `seek_index`. The cursor's final position is still
-                // decided by `PickWinner` from the merged MVCC/B-tree peeks, so bounding
-                // the range here does not change where the cursor lands.
-                (Bound::Included(start.clone()), Bound::Included(start))
-            } else {
-                let start = if inclusive {
-                    Bound::Included(start)
-                } else {
-                    Bound::Excluded(start)
-                };
-                create_seek_range(start, direction)
-            };
-            match direction {
-                IterationDirection::Forwards => {
-                    Box::new(self.rows.range(range)) as TableRowIterator<'_, A>
-                }
-                IterationDirection::Backwards => {
-                    Box::new(self.rows.range(range).rev()) as TableRowIterator<'_, A>
-                }
-            }
+        if eq_only {
+            return self
+                .rows
+                .get(&start)
+                .and_then(|row| self.find_last_visible_version(snapshot, &row, take_payload));
+        }
+        let start = if inclusive {
+            Bound::Included(start)
+        } else {
+            Bound::Excluded(start)
         };
-        *table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+        *table_iterator = Some(self.table_rows_iterator(start, direction));
 
         let mv_store_iterator = table_iterator
             .as_mut()
             .expect("table_iterator was assigned above if it was None");
 
         self.find_next_visible_table_row(snapshot, mv_store_iterator, table_id, take_payload)
+    }
+
+    pub(crate) fn table_rows_iterator(
+        &self,
+        start: Bound<RowID>,
+        direction: IterationDirection,
+    ) -> MvccIterator<'static, RowID, A> {
+        let range = create_seek_range(start, direction);
+        let iter_box = match direction {
+            IterationDirection::Forwards => {
+                Box::new(self.rows.range(range)) as TableRowIterator<'_, A>
+            }
+            IterationDirection::Backwards => {
+                Box::new(self.rows.range(range).rev()) as TableRowIterator<'_, A>
+            }
+        };
+        static_iterator_hack!(iter_box, RowID, A)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6850,6 +6912,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
             }
+            drop(tx.write_set.lock().take());
+            drop(std::mem::take(&mut *tx.savepoint_stack.write()));
+            drop(std::mem::take(&mut *tx.created_table_ids.lock()));
             return;
         }
         self.txs.remove(&tx_id);
@@ -7466,6 +7531,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint) {
+        let tx = self.txs.get(&tx_id).unwrap();
+        let generation = tx.value().bump_write_generation();
+        let undone_tables: HashSet<MVTableId> = savepoint
+            .created_table_versions
+            .iter()
+            .chain(savepoint.deleted_table_versions.iter())
+            .map(|(rowid, _)| rowid.table_id)
+            .collect();
+        {
+            let mut write_set = tx.value().write_set.lock();
+            for table_id in undone_tables {
+                write_set.table_generations.insert(table_id, generation);
+            }
+        }
+        drop(tx);
         let Savepoint {
             header,
             header_dirty,
@@ -10571,6 +10651,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             false
         }
     }
+
+    pub(crate) fn cursor_transaction(
+        self: &Arc<Self>,
+        tx_id: TxID,
+    ) -> Result<Box<CursorTransaction<Clock, A>>> {
+        let entry = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        // SAFETY: the entry borrows `self.txs`. The field order drops `transaction` before
+        // `_store`, so the store outlives the entry. The entry holds a reference count on the
+        // node, so it stays readable after the transaction leaves `txs`. `transaction` is
+        // private, and no `'static` reference to it may leave this struct.
+        let transaction =
+            unsafe { std::mem::transmute::<TxEntry<'_, A>, TxEntry<'static, A>>(entry) };
+        Ok(Box::new(CursorTransaction {
+            transaction,
+            _store: self.clone(),
+        }))
+    }
 }
 
 fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {
@@ -11282,5 +11382,45 @@ impl Ord for RowID {
             std::cmp::Ordering::Equal => self.row_id.cmp(&other.row_id),
             ord => ord,
         }
+    }
+}
+
+pub(crate) struct CursorTransaction<
+    Clock: LogicalClock + 'static,
+    A: ConcurrentAllocator = TursoAllocator,
+> {
+    transaction: TxEntry<'static, A>,
+    _store: Arc<MvStore<Clock, A>>,
+}
+
+impl<Clock: LogicalClock, A: ConcurrentAllocator> CursorTransaction<Clock, A> {
+    pub(crate) fn should_abort(&self) -> bool {
+        !self.transaction.is_removed() && self.transaction.value().abort_now.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn write_generation(&self) -> u64 {
+        self.transaction
+            .value()
+            .write_generation
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn table_write_generation(&self, table_id: MVTableId) -> u64 {
+        self.transaction
+            .value()
+            .write_set
+            .lock()
+            .table_generations
+            .get(&table_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn is_removed(&self) -> bool {
+        self.transaction.is_removed()
+    }
+
+    fn live_transaction(&self) -> Option<&Transaction<A>> {
+        (!self.transaction.is_removed()).then(|| self.transaction.value())
     }
 }

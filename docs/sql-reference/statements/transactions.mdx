@@ -171,6 +171,10 @@ When COMMIT is issued, Turso checks whether any other transaction has modified t
 
 This provides **snapshot isolation**: each transaction sees a consistent view of the database as of its first statement, without blocking other writers.
 
+### MVCC scan results
+
+In MVCC mode, consider a checkpoint followed by a transaction that scans rows `1` and `2` in ascending rowid order. If that transaction inserts row `3` after the scan returns row `1`, the scan also returns row `3`.
+
 ### Example
 
 ```sql
