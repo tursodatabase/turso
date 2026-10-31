@@ -790,7 +790,7 @@ impl Statement {
     /// * `value_type` - The type constant (0=null, 1=int, 2=float, 3=text, 4=blob).
     /// * `value` - The value to bind.
     #[napi]
-    pub fn bind_at(&self, index: u32, value: Unknown) -> Result<()> {
+    pub fn bind_at(&self, env: &Env, index: u32, value: Unknown) -> Result<()> {
         let non_zero_idx = NonZeroUsize::new(index as usize).ok_or_else(|| {
             create_error(Status::InvalidArg, "parameter index must be greater than 0")
         })?;
@@ -823,14 +823,8 @@ impl Statement {
             ValueType::Object => {
                 let obj = value.coerce_to_object()?;
 
-                if obj.is_buffer()? || obj.is_typedarray()? {
-                    let length = obj.get_named_property::<u32>("length")?;
-                    let mut bytes = Vec::with_capacity(length as usize);
-                    for i in 0..length {
-                        let byte = obj.get_element::<u32>(i)?;
-                        bytes.push(byte as u8);
-                    }
-                    turso_core::Value::Blob(bytes)
+                if obj.is_buffer()? || obj.is_typedarray()? || obj.is_dataview()? {
+                    turso_core::Value::Blob(array_buffer_view_bytes(env, value)?)
                 } else {
                     let s = value.coerce_to_string()?.into_utf8()?;
                     turso_core::Value::Text(s.as_str()?.to_owned().into())
@@ -981,6 +975,64 @@ impl Statement {
         *self.stmt.borrow_mut() = None;
         Ok(())
     }
+}
+
+/// Copies the bytes a typed array, Buffer or DataView covers.
+///
+/// The view's buffer, byte offset and byte length are read with the built-in
+/// getters of `%TypedArray%.prototype` or `DataView.prototype`. The N-API layer
+/// of the WASM build (emnapi) reads them as ordinary properties and checks the
+/// view type with `instanceof`, so passing the view to it directly gives wrong
+/// bytes for a view with overridden properties and fails for a view from
+/// another realm (an iframe or a `vm` context) or with a changed prototype.
+fn array_buffer_view_bytes(env: &Env, view: Unknown) -> Result<Vec<u8>> {
+    let global = env.get_global()?;
+    let reflect_get: Function<FnArgs<(Object, Unknown, Unknown)>, Unknown> = global
+        .get_named_property::<Object>("Reflect")?
+        .get_named_property("get")?;
+    let uint8_array: Function<FnArgs<(Unknown, Unknown, f64)>> =
+        global.get_named_property("Uint8Array")?;
+    let typed_array_prototype: Object = uint8_array
+        .get_named_property::<Object>("prototype")?
+        .get_prototype_unchecked()?;
+    // The `Symbol.toStringTag` getter of `%TypedArray%.prototype` returns
+    // undefined for anything that is not a typed array.
+    let to_string_tag = global
+        .get_named_property::<Function>("Symbol")?
+        .get_named_property::<Unknown>("toStringTag")?;
+    let tag = reflect_get.call((typed_array_prototype, to_string_tag, view).into())?;
+    let is_data_view = tag.get_type()? == ValueType::Undefined;
+    let prototype = if is_data_view {
+        global
+            .get_named_property::<Function>("DataView")?
+            .get_named_property("prototype")?
+    } else {
+        typed_array_prototype
+    };
+    let get = |name: &str| -> Result<Unknown> {
+        let name = env.create_string(name)?.to_unknown();
+        reflect_get.call((prototype, name, view).into())
+    };
+    // When the buffer is detached or was resized to end before the view does,
+    // the typed array getter returns 0 and the DataView getter throws. The view
+    // then covers no bytes, and a Uint8Array cannot be created over it.
+    let byte_length = match get("byteLength") {
+        Ok(byte_length) => f64::from_unknown(byte_length)?,
+        Err(_) if is_data_view => 0.0,
+        Err(err) => return Err(err),
+    };
+    if byte_length == 0.0 {
+        return Ok(Vec::new());
+    }
+    let bytes = uint8_array
+        .new_instance((get("buffer")?, get("byteOffset")?, byte_length).into())?
+        .coerce_to_object()?;
+    // Reading the elements one at a time avoids `napi_get_buffer_info`, which in
+    // emnapi copies the whole underlying ArrayBuffer into WASM memory and keeps
+    // that copy, sized at first use, until the ArrayBuffer is garbage collected.
+    (0..byte_length as u32)
+        .map(|i| Ok(bytes.get_element::<u32>(i)? as u8))
+        .collect()
 }
 
 /// Async task for running the I/O loop.

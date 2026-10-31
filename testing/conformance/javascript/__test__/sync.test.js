@@ -1,6 +1,7 @@
 import test from "ava";
 import crypto from 'crypto';
 import fs from 'fs';
+import vm from 'vm';
 
 test.beforeEach(async (t) => {
   const [db, path, provider, errorType] = await connect();
@@ -326,7 +327,7 @@ test.skip("Statement.run() with array bind parameter", async (t) => {
   });
 });
 
-test.skip("Statement.run() with Float32Array bind parameter", async (t) => {
+test.serial("Statement.run() with Float32Array bind parameter", async (t) => {
   const db = t.context.db;
 
   db.exec(`
@@ -341,6 +342,51 @@ test.skip("Statement.run() with Float32Array bind parameter", async (t) => {
 
   const selectStmt = db.prepare("SELECT value FROM t");
   t.deepEqual(selectStmt.raw().get()[0], Buffer.from(array.buffer));
+});
+
+test.serial("Statement.get() binds the bytes of a typed array or DataView", async (t) => {
+  const db = t.context.db;
+
+  const shadowedBuffer = new Uint8Array([1, 2]);
+  Object.defineProperty(shadowedBuffer, "buffer", { value: new Uint8Array([7, 7, 7]).buffer });
+  const shadowedOffset = new Uint8Array([1, 2]);
+  Object.defineProperty(shadowedOffset, "byteOffset", { value: 1 });
+  const shadowedLength = new Uint8Array([1, 2]);
+  Object.defineProperty(shadowedLength, "length", { value: 1 });
+  const detached = new Uint8Array([1, 2]);
+  structuredClone(detached.buffer, { transfer: [detached.buffer] });
+  const detachedDataView = new DataView(new Uint8Array([1, 2]).buffer);
+  structuredClone(detachedDataView.buffer, { transfer: [detachedDataView.buffer] });
+  const shrunkBuffer = new ArrayBuffer(4, { maxByteLength: 4 });
+  const shrunk = new Uint8Array(shrunkBuffer, 1, 2);
+  const shrunkDataView = new DataView(shrunkBuffer, 1, 2);
+  shrunkBuffer.resize(2);
+
+  const cases = [
+    [new Float32Array([1.5, 2.25]), "0000C03F00001040"],
+    [new Uint16Array([1000, 2000]), "E803D007"],
+    [new Float64Array([1.5]), "000000000000F83F"],
+    [new BigInt64Array([1n]), "0100000000000000"],
+    [new DataView(new Uint8Array([1, 2]).buffer), "0102"],
+    [new Uint8Array(new Uint8Array([9, 1, 2, 3]).buffer, 1, 2), "0102"],
+    [new DataView(new Uint8Array([9, 1, 2, 3]).buffer, 1, 2), "0102"],
+    [vm.runInNewContext("new Float32Array([1.5])"), "0000C03F"],
+    [vm.runInNewContext("new Uint8Array([1, 2])"), "0102"],
+    [vm.runInNewContext("new DataView(new Uint8Array([1, 2]).buffer)"), "0102"],
+    [Object.setPrototypeOf(new Uint8Array([1, 2]), null), "0102"],
+    [shadowedBuffer, "0102"],
+    [shadowedOffset, "0102"],
+    [shadowedLength, "0102"],
+    [detached, ""],
+    [detachedDataView, ""],
+    [shrunk, ""],
+    [shrunkDataView, ""],
+  ];
+  const stmt = db.prepare("SELECT hex(?) AS h");
+  for (const [value, hex] of cases) {
+    t.is(stmt.get(value).h, hex);
+    t.is(stmt.get([value]).h, hex);
+  }
 });
 
 test.skip("Statement.run() for vector feature with Float32Array bind parameter", async (t) => {
