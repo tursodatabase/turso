@@ -430,6 +430,22 @@ expect error {
     bigint out of range
 }
 
+test select-cast-int8-rejects-negative-hex-literal-below-its-range {
+    SELECT (-0x8000000000000001)::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-octal-and-binary-literals-above-its-range {
+    SELECT 0o1000000000000000000000::int8, 0b1000000000000000000000000000000000000000000000000000000000000000::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
 test select-cast-int8-out-of-range-literal-in-unused-column-default {
     CREATE TABLE int8_default(a int8 DEFAULT 9223372036854775808::int8, b int);
     INSERT INTO int8_default VALUES (5, 1);

@@ -6103,7 +6103,7 @@ fn numeric_literal_text(arg: &pg_query::protobuf::Node) -> Option<&str> {
 /// Rounds half away from zero before the range check, like PostgreSQL's
 /// numeric to int8 cast.
 fn numeric_literal_exceeds_int8(literal: &str) -> bool {
-    let literal = non_decimal_literal_to_decimal(literal).replace('_', "");
+    let literal = literal.replace('_', "");
     let (negative, unsigned) = match literal.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, literal.as_str()),
@@ -6113,6 +6113,17 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
     } else {
         i64::MAX as u128
     };
+    let radix = match unsigned.get(..2) {
+        Some("0x" | "0X") => Some(16),
+        Some("0o" | "0O") => Some(8),
+        Some("0b" | "0B") => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        let digits = unsigned[2..].trim_start_matches('0');
+        // Too many digits for a u128 is far outside the bigint range.
+        return u128::from_str_radix(digits, radix).map_or(!digits.is_empty(), |m| m > limit);
+    }
     let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
         Some((mantissa, exponent)) => match exponent.parse::<i64>() {
             Ok(exponent) => (mantissa, exponent),
@@ -6152,40 +6163,6 @@ fn numeric_literal_exceeds_int8(literal: &str) -> bool {
         magnitude += 1;
     }
     magnitude > limit
-}
-
-fn non_decimal_literal_to_decimal(literal: &str) -> String {
-    let (sign, unsigned) = match literal.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", literal),
-    };
-    let radix = match unsigned.get(..2) {
-        Some("0x" | "0X") => 16,
-        Some("0o" | "0O") => 8,
-        Some("0b" | "0B") => 2,
-        _ => return literal.to_string(),
-    };
-    let mut decimal_digits = vec![0u8];
-    for digit in unsigned[2..].chars().filter(|&c| c != '_') {
-        let mut carry = digit
-            .to_digit(radix)
-            .expect("PostgreSQL's lexer only accepts digits of the literal's radix");
-        for decimal_digit in decimal_digits.iter_mut() {
-            let value = *decimal_digit as u32 * radix + carry;
-            *decimal_digit = (value % 10) as u8;
-            carry = value / 10;
-        }
-        while carry > 0 {
-            decimal_digits.push((carry % 10) as u8);
-            carry /= 10;
-        }
-    }
-    let magnitude: String = decimal_digits
-        .iter()
-        .rev()
-        .map(|&d| char::from(b'0' + d))
-        .collect();
-    format!("{sign}{magnitude}")
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
