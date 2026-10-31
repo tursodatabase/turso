@@ -480,11 +480,17 @@ fn resolve_func_return_type(
         ResultType::OneOfTheIifValues => {
             common_check_type(iif_values(args).map(|arg| type_of(arg)))
         }
-        // abs, ceil, floor and trunc give an integer for an integer and a real
-        // for a real. A text or blob argument is first converted to a number,
+        // ceil, floor and trunc give an integer for an integer and a real for
+        // a real. A text or blob argument is first converted to a number,
         // which may be either.
         ResultType::NumberOfTheFirstArgumentsType => Ok(match first_argument()? {
             Some(ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null)) => ty,
+            _ => CheckExprType::Any,
+        }),
+        // abs gives a real for text or a blob, without converting it first.
+        ResultType::RealForTextOtherwiseTheFirstArgumentsType => Ok(match first_argument()? {
+            Some(ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null)) => ty,
+            Some(CheckExprType::Text | CheckExprType::Blob) => CheckExprType::Real,
             _ => CheckExprType::Any,
         }),
         ResultType::RealForARealArgument => Ok(CheckExprType::Real),

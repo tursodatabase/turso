@@ -863,6 +863,13 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
             Some(ty) => negated_type(ty, env.schema()),
             None => any,
         },
+        ResultType::RealForTextOtherwiseTheFirstArgumentsType => match first_argument() {
+            Some(ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob) | ExprType::Untyped) => {
+                ExprType::Builtin(BuiltinType::Real)
+            }
+            Some(ty) => negated_type(ty, env.schema()),
+            None => any,
+        },
         ResultType::RealForARealArgument => {
             let is_real =
                 |arg: &ast::Expr| matches!(type_of(arg, env), ExprType::Builtin(BuiltinType::Real));

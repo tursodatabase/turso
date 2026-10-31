@@ -1201,7 +1201,7 @@ impl ScalarFunc {
             | Self::Unlikely
             | Self::Likelihood
             | Self::TestUintDecode => ResultType::FirstArgument,
-            Self::Abs => ResultType::NumberOfTheFirstArgumentsType,
+            Self::Abs => ResultType::RealForTextOtherwiseTheFirstArgumentsType,
             // A real for a real argument; see MathFunc::result_type.
             Self::Round => ResultType::RealForARealArgument,
             Self::Substr | Self::Substring => ResultType::TextOrBlobLikeTheFirstArgument,
@@ -1883,10 +1883,13 @@ pub enum ResultType {
     /// argument from the second on, and the last one when there is an odd
     /// number of arguments. The conditions are never returned.
     OneOfTheIifValues,
-    /// A number that keeps the type of a numeric first argument: `abs(5)` and
-    /// `ceil(5)` are integers, `abs(5.5)` a real. A text argument is first
-    /// converted to a number.
+    /// A number that keeps the type of a numeric first argument: `ceil(5)` is
+    /// an integer, `ceil(5.5)` a real. A text argument is first converted to a
+    /// number, so `ceil('3')` is an integer.
     NumberOfTheFirstArgumentsType,
+    /// `abs`: like NumberOfTheFirstArgumentsType, but a text or blob argument
+    /// is not converted first and gives a real: `abs('3')` is 3.0.
+    RealForTextOtherwiseTheFirstArgumentsType,
     /// A number that is a real when an argument is a real. SQLite always
     /// returns a real, but PostgreSQL computes these exactly for an exact
     /// argument (`round(0.25, 1)` and `mod(10, 4)`), so without a real
