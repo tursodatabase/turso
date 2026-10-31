@@ -7117,6 +7117,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         })
     }
 
+    pub fn tx_has_writes(&self, tx_id: TxID) -> bool {
+        self.txs
+            .get(&tx_id)
+            .is_some_and(|tx| !tx.value().write_set.lock().is_empty())
+    }
+
     /// Rolls back a transaction with the specified ID.
     ///
     /// This function rolls back a transaction with the specified `tx_id` by

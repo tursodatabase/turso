@@ -3847,12 +3847,8 @@ pub fn halt(
             //
             // FIXME: when this statement is a writer in MVCC mode, deferring
             // its commit to the last sibling statement means the writer's
-            // caller observes success before the changes are durable. If the
-            // shared transaction then ends in a rollback — the last sibling
-            // reader is reset or dropped mid-scan, or a later joining writer
-            // errors or is abandoned after changing rows — the finished
-            // writer's changes are silently discarded
-            // (see test_mvcc_completed_writer_changes_lost_when_last_reader_abandoned).
+            // caller observes success before the changes are durable, and a
+            // commit error surfaces on whichever sibling finishes last.
             // SQLite never has this window: it commits at the writer's own
             // halt and downgrades the transaction to read-only for the
             // remaining statements (btreeEndTransaction). The MVCC equivalent
@@ -5086,7 +5082,15 @@ pub fn op_transaction_inner(
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
                 let in_explicit_txn = !auto_commit;
-                if needs_stmt_journal {
+                let joins_shared_mvcc_auto_txn = statement_writes_db
+                    && auto_commit
+                    && program.connection.mv_store().is_some()
+                    && program
+                        .connection
+                        .n_active_root_statements
+                        .load(Ordering::SeqCst)
+                        > 1;
+                if needs_stmt_journal || joins_shared_mvcc_auto_txn {
                     if is_main_db {
                         let res = state.begin_statement(
                             &program.connection,
