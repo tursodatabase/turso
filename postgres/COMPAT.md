@@ -99,7 +99,12 @@ stored SQL; relation oid and pretty printing do not change the output),
 (only for years 1 to 9999, so `infinity` and BC dates are errors; text arguments
 are read as numbers instead of being rejected, because tursopg chooses functions
 by name and argument count only; the `to_timestamp(text, text)` form is not
-supported).
+supported), `age(timestamp[, timestamp])`
+(returns text in PostgreSQL's interval format, since intervals are stored as text;
+string literal arguments are cast to timestamptz, so they follow the timestamp input rules;
+other text arguments, such as text columns, are read as timestamps instead of being
+rejected, because tursopg chooses functions by name and argument count only;
+the `age(xid)` form is not supported).
 Session information functions: `version()`, `current_database()` /
 `current_catalog`, `current_schema` (call, bare-keyword, and FROM-position
 forms; the first schema of `search_path` that exists), `current_schemas(boolean)`

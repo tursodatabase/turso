@@ -1771,7 +1771,7 @@ pub(super) fn partial_index_predicate_terms(
     // query WHERE term for the partial index to be safe to use.
     let mut bound = (**index_where).clone();
     bind_partial_index_columns(&mut bound, table_reference);
-    rewrite_between_exprs(&mut bound).ok()?;
+    rewrite_between_exprs(&mut bound, None).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
     break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
     let mut matched_terms = SmallVec::<[usize; 4]>::new();

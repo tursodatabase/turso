@@ -90,6 +90,27 @@ fn emit_row_valued_binary_expr(
     Ok(target_register)
 }
 
+/// Function instructions read contiguous registers start_reg..start_reg+arg_count.
+/// When both operands are equivalent the compiler reuses a single shared register,
+/// so copy it into a contiguous pair.
+fn contiguous_operands(program: &mut ProgramBuilder, lhs: usize, rhs: usize) -> usize {
+    if lhs != rhs {
+        return lhs;
+    }
+    let regs = program.alloc_registers(2);
+    program.emit_insn(Insn::Copy {
+        src_reg: lhs,
+        dst_reg: regs,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: lhs,
+        dst_reg: regs + 1,
+        extra_amount: 0,
+    });
+    regs
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_binary_expr_scalar(
     program: &mut ProgramBuilder,
@@ -661,10 +682,11 @@ pub(super) fn emit_binary_insn(
                 ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
                 _ => unreachable!(),
             };
+            let start = contiguous_operands(program, lhs, rhs);
 
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
-                start_reg: lhs,
+                start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
                     func: Func::Json(json_func),
@@ -692,25 +714,7 @@ pub(super) fn emit_binary_insn(
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
             resolver.require_custom_types("Array features")?;
-            // Function instructions read contiguous registers start_reg..start_reg+arg_count.
-            // When both operands are equivalent the compiler reuses a single shared register,
-            // so we must copy it into a contiguous pair.
-            let start = if lhs == rhs {
-                let regs = program.alloc_registers(2);
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs,
-                    extra_amount: 0,
-                });
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs + 1,
-                    extra_amount: 0,
-                });
-                regs
-            } else {
-                lhs
-            };
+            let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
                 ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
@@ -983,10 +987,11 @@ pub(super) fn emit_binary_condition_insn(
                 ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
                 _ => unreachable!(),
             };
+            let start = contiguous_operands(program, lhs, rhs);
 
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
-                start_reg: lhs,
+                start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
                     func: Func::Json(json_func),
@@ -1016,22 +1021,7 @@ pub(super) fn emit_binary_condition_insn(
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
             resolver.require_custom_types("Array features")?;
-            let start = if lhs == rhs {
-                let regs = program.alloc_registers(2);
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs,
-                    extra_amount: 0,
-                });
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs + 1,
-                    extra_amount: 0,
-                });
-                regs
-            } else {
-                lhs
-            };
+            let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
                 ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,

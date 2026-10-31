@@ -1,4 +1,4 @@
-use super::{Resolver, Result, TranslateCtx};
+use super::{emit_columns_and_dependencies, Resolver, Result, TranslateCtx};
 use crate::namespace::NamespaceRef;
 use crate::{
     emit_explain,
@@ -379,24 +379,26 @@ pub fn emit_fk_child_decrement_on_delete(
         if !fk_ref.fk.deferred {
             continue;
         }
+        let child_positions: Vec<usize> = fk_ref
+            .fk
+            .child_columns
+            .iter()
+            .map(|cname| child_tbl.get_column(cname).unwrap().0)
+            .collect();
+        let child_key = emit_columns_and_dependencies(
+            program,
+            child_tbl,
+            child_cursor_id,
+            child_rowid_reg,
+            child_positions.iter().copied(),
+            resolver,
+        )?;
+
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
-        for cname in &fk_ref.fk.child_columns {
-            let (pos, col) = child_tbl.get_column(cname).unwrap();
-            let src = if col.is_rowid_alias() {
-                child_rowid_reg
-            } else {
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: child_cursor_id,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-                tmp
-            };
+        for &pos in &child_positions {
             program.emit_insn(Insn::IsNull {
-                reg: src,
+                reg: child_key.to_column_reg(pos),
                 target_pc: null_skip,
             });
         }
@@ -410,33 +412,20 @@ pub fn emit_fk_child_decrement_on_delete(
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
-            let (pos, col) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
-            let val = if col.is_rowid_alias() {
-                child_rowid_reg
-            } else {
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: child_cursor_id,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-                tmp
-            };
             let tmpi = program.alloc_register();
             program.emit_insn(Insn::Copy {
-                src_reg: val,
+                src_reg: child_key.to_column_reg(child_positions[0]),
                 dst_reg: tmpi,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt {
-                reg: tmpi,
-                target_pc: None,
-            });
-
-            // NotExists jumps when the parent key is missing, so we decrement there
+            // A key that is not an integer cannot match a parent rowid, so the
+            // parent is missing, and NotExists jumps there too
             let missing = program.allocate_label();
             let done = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: tmpi,
+                target_pc: Some(missing),
+            });
 
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
@@ -466,22 +455,9 @@ pub fn emit_fk_child_decrement_on_delete(
             // Build probe from current child row
             let n = fk_ref.fk.child_columns.len();
             let probe = program.alloc_registers(n);
-            for (i, cname) in fk_ref.fk.child_columns.iter().enumerate() {
-                let (pos, col) = child_tbl.get_column(cname).unwrap();
-                let src = if col.is_rowid_alias() {
-                    child_rowid_reg
-                } else {
-                    let r = program.alloc_register();
-                    program.emit_insn(Insn::Column {
-                        cursor_id: child_cursor_id,
-                        column: pos,
-                        dest: r,
-                        default: None,
-                    });
-                    r
-                };
+            for (i, &pos) in child_positions.iter().enumerate() {
                 program.emit_insn(Insn::Copy {
-                    src_reg: src,
+                    src_reg: child_key.to_column_reg(pos),
                     dst_reg: probe + i,
                     extra_amount: 0,
                 });
