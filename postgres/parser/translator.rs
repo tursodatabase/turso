@@ -7870,6 +7870,17 @@ mod tests {
     }
 
     #[test]
+    fn create_index_keeps_table_schema() {
+        let parsed = crate::parse("CREATE INDEX i ON s.t (a)").unwrap();
+        let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        let ast::Stmt::CreateIndex { idx_name, .. } = stmt else {
+            panic!("expected CREATE INDEX, got {stmt:?}");
+        };
+        assert_eq!(idx_name.namespace.as_ref().map(|n| n.as_str()), Some("s"));
+        assert_eq!(idx_name.name.as_str(), "i");
+    }
+
+    #[test]
     fn test_type_mapping() {
         let no_params: &[i64] = &[];
         let s = PgTypeMapping::scalar;
