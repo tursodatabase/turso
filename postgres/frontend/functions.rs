@@ -55,7 +55,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "pg_get_function_result"
         | "pg_get_function_arguments"
         | "pg_get_statisticsobjdef_columns"(FunctionArity::Exact(1), true) => None::<String>,
-        "pg_relation_is_publishable"(FunctionArity::Exact(1), true) => None::<bool>,
+        "pg_relation_is_publishable"(FunctionArity::Exact(1), true) => None::<Boolean>,
         "quote_ident"(FunctionArity::Exact(1), true) => match args[0].get_value() {
             Value::Null => None,
             _ => Some(turso_pg_parser::quote_identifier(&text_arg(args, 0))),
@@ -82,8 +82,8 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "textlike"(FunctionArity::Exact(2), true) => exec_textlike(args)?,
         "like_escape"(FunctionArity::Exact(2), true) => exec_like_escape(args)?,
         "similar_to_escape"(FunctionArity::OneOf(&[1, 2]), true) => exec_similar_to_escape(args)?,
-        "booleq"(FunctionArity::Exact(2), true) => args[0].get_value() == args[1].get_value(),
-        "boolne"(FunctionArity::Exact(2), true) => args[0].get_value() != args[1].get_value(),
+        "booleq"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() == args[1].get_value()),
+        "boolne"(FunctionArity::Exact(2), true) => Boolean(args[0].get_value() != args[1].get_value()),
         "col_description"(FunctionArity::Exact(2), true) => None::<String>,
         "set_config"(FunctionArity::Exact(3), false) => exec_set_config(connection, args)?,
         "current_setting"(FunctionArity::OneOf(&[1, 2]), false) => {
@@ -173,6 +173,20 @@ impl ScalarReturn for Timestamptz {
 
     fn into_value(self) -> Value {
         Value::build_text(self.0)
+    }
+}
+
+/// A `boolean` value. Its stored form is the integer 0 or 1, which is also the
+/// form the type's DECODE gives, so a function can return it directly. Returning
+/// one gives the function the type `boolean`, as in PostgreSQL, instead of
+/// integer.
+pub(crate) struct Boolean(pub(crate) bool);
+
+impl ScalarReturn for Boolean {
+    const TYPE: Option<ReturnType> = Some(ReturnType::Custom("boolean"));
+
+    fn into_value(self) -> Value {
+        Value::from_i64(self.0 as i64)
     }
 }
 
@@ -635,8 +649,8 @@ fn exec_pg_get_user_by_id(oid: i64) -> &'static str {
     }
 }
 
-fn exec_pg_is_visible(_oid: i64) -> bool {
-    true
+fn exec_pg_is_visible(_oid: i64) -> Boolean {
+    Boolean(true)
 }
 
 /// PostgreSQL version advertised by version(). The major version matches the
@@ -673,7 +687,7 @@ fn exec_quote_literal(value: &Value) -> Option<String> {
     Some(quoted)
 }
 
-fn exec_textlike(args: &[Register]) -> Result<Option<bool>> {
+fn exec_textlike(args: &[Register]) -> Result<Option<Boolean>> {
     if args
         .iter()
         .any(|arg| matches!(arg.get_value(), Value::Null))
@@ -682,7 +696,7 @@ fn exec_textlike(args: &[Register]) -> Result<Option<bool>> {
     }
     let text: Vec<char> = args[0].get_value().to_string().chars().collect();
     let pattern: Vec<char> = args[1].get_value().to_string().chars().collect();
-    Ok(Some(like_matches(&text, &pattern)?))
+    Ok(Some(Boolean(like_matches(&text, &pattern)?)))
 }
 
 /// PostgreSQL's LIKE: case-sensitive, `%` and `_` wildcards, and `\` makes the
@@ -985,13 +999,13 @@ fn format_interval(months: i64, days: i64, micros: i64) -> String {
 
 /// pg_input_is_valid(text, type) → boolean
 /// Returns true if the text is valid input for the given type.
-fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Option<bool> {
+fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Option<Boolean> {
     let s = match input {
         Value::Text(t) => t.as_str().to_string(),
         Value::Null => return None,
         v => v.to_string(),
     };
-    Some(validate_pg_input(&s, type_name).is_none())
+    Some(Boolean(validate_pg_input(&s, type_name).is_none()))
 }
 
 fn exec_pg_get_expr(args: &[Register]) -> Result<Option<String>> {

@@ -1595,3 +1595,11 @@ test check-constraint-compares-a-timestamptz-column-with-now {
 expect {
     1
 }
+
+# booleq() returns boolean, not integer, so it cannot be added to a number.
+test booleq-plus-an-integer-errors {
+    SELECT booleq(true, true) + 1;
+}
+expect error {
+    operator does not exist: boolean \+ integer
+}
