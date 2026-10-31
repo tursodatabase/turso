@@ -69,6 +69,16 @@ jobs:
             artifact: sync-bindings-aarch64-unknown-linux-gnu
             build: yarn workspace @tursodatabase/sync napi-build --target aarch64-unknown-linux-gnu
           - host: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-musl
+            artifact: db-bindings-x86_64-unknown-linux-musl
+            setup: rustup target add x86_64-unknown-linux-musl
+            build: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-musl -x
+          - host: blacksmith-8vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-musl
+            artifact: db-bindings-aarch64-unknown-linux-musl
+            setup: rustup target add aarch64-unknown-linux-musl
+            build: yarn workspace @tursodatabase/database napi-build --target aarch64-unknown-linux-musl -x
+          - host: blacksmith-4vcpu-ubuntu-2404
             target: wasm32-wasip1-threads
             artifact: db-bindings-wasm32-wasip1-threads
             setup: |
@@ -148,9 +158,16 @@ jobs:
           restore-keys: |
             ${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-
       - uses: mlugg/setup-zig@v2
-        if: ${{ matrix.settings.target == 'armv7-unknown-linux-gnueabihf' || matrix.settings.target == 'armv7-unknown-linux-musleabihf' }}
+        if: ${{ contains(matrix.settings.target, 'musl') || matrix.settings.target == 'armv7-unknown-linux-gnueabihf' }}
         with:
-          version: 0.13.0
+          version: 0.15.2
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        if: ${{ contains(matrix.settings.target, 'musl') }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-zigbuild
       - name: Setup toolchain
         run: ${{ matrix.settings.setup }}
         if: ${{ matrix.settings.setup }}
@@ -197,7 +214,7 @@ jobs:
       # .node file itself (~80% of its size). macOS and Windows keep debug info
       # in separate files, so only Linux needs stripping.
       - name: Strip debug info
-        if: ${{ contains(matrix.settings.target, 'unknown-linux-gnu') }}
+        if: ${{ contains(matrix.settings.target, 'unknown-linux') }}
         shell: bash
         run: |
           shopt -s nullglob
@@ -250,6 +267,46 @@ jobs:
         shell: bash
       - name: Test bindings
         run: docker run --rm -v $(pwd):/build -w /build node:${{ matrix.node }}-slim yarn workspace @tursodatabase/database test
+  test-db-linux-musl-binding:
+    name: Test DB bindings on Linux-${{ matrix.arch }}-musl - node@${{ matrix.node }}
+    timeout-minutes: 30
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - x64
+          - arm64
+        node:
+          - "22"
+          - "24"
+    runs-on: ${{ matrix.arch == 'arm64' && 'blacksmith-4vcpu-ubuntu-2404-arm' || 'blacksmith-4vcpu-ubuntu-2404' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup node
+        uses: useblacksmith/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      # The tests run in an Alpine container, so the native packages that the
+      # test tooling depends on must be installed in their musl variants too.
+      - name: Install dependencies
+        run: |
+          yarn config set --json supportedArchitectures.libc '["current", "musl"]'
+          yarn install
+      - name: Build common
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Download all DB artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'db*'
+      - name: List packages
+        run: ls -R .
+        shell: bash
+      - name: Test bindings
+        run: docker run --rm -v $(pwd):/build -w /build node:${{ matrix.node }}-alpine yarn workspace @tursodatabase/database test
   test-db-windows-x64-msvc-binding:
     name: Test DB bindings on Windows-x64-msvc - node@${{ matrix.node }}
     timeout-minutes: 30
@@ -499,6 +556,7 @@ jobs:
       id-token: write
     needs:
       - test-db-linux-x64-gnu-binding
+      - test-db-linux-musl-binding
       - test-db-windows-x64-msvc-binding
       - test-db-wasm-binding
       - test-sync-linux-x64-gnu-binding
