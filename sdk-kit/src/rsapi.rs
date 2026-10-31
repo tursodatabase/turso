@@ -3012,44 +3012,36 @@ mod tests {
     }
 
     #[test]
-    fn finalize_does_not_resume_an_insert_that_failed_with_busy() {
+    fn finalize_does_not_resume_statements_that_failed_with_busy() {
         let (_file, holder, writer) = open_holder_and_writer();
         execute_sql(&holder, "CREATE TABLE t(x INTEGER)");
         execute_sql(&holder, "BEGIN IMMEDIATE");
 
-        let mut insert = writer.prepare_single("INSERT INTO t VALUES (1)").unwrap();
-        let result = insert.execute(None);
-        assert!(matches!(result, Err(TursoError::Busy(_))), "{result:?}");
+        let mut failed = Vec::new();
+        for sql in ["INSERT INTO t VALUES (1)", "BEGIN IMMEDIATE"] {
+            let mut stmt = writer.prepare_single(sql).unwrap();
+            let result = stmt.execute(None);
+            assert!(
+                matches!(result, Err(TursoError::Busy(_))),
+                "{sql}: {result:?}"
+            );
+            failed.push(stmt);
+        }
 
         execute_sql(&holder, "ROLLBACK");
-        assert_eq!(insert.finalize(None).unwrap(), TursoStatusCode::Done);
-
-        assert_eq!(
-            count_rows(&holder),
-            Value::from_i64(0),
-            "finalize committed an INSERT whose execute returned Busy"
-        );
-        assert!(writer.get_auto_commit());
-    }
-
-    #[test]
-    fn finalize_does_not_resume_a_begin_immediate_that_failed_with_busy() {
-        let (_file, holder, writer) = open_holder_and_writer();
-        execute_sql(&holder, "CREATE TABLE t(x INTEGER)");
-        execute_sql(&holder, "BEGIN IMMEDIATE");
-
-        let mut begin = writer.prepare_single("BEGIN IMMEDIATE").unwrap();
-        let result = begin.execute(None);
-        assert!(matches!(result, Err(TursoError::Busy(_))), "{result:?}");
-
-        execute_sql(&holder, "ROLLBACK");
-        assert_eq!(begin.finalize(None).unwrap(), TursoStatusCode::Done);
+        for mut stmt in failed {
+            assert_eq!(stmt.finalize(None).unwrap(), TursoStatusCode::Done);
+        }
 
         assert!(
             writer.get_auto_commit(),
             "finalize opened the transaction of a BEGIN IMMEDIATE that returned Busy"
         );
-        execute_sql(&holder, "INSERT INTO t VALUES (1)");
+        assert_eq!(
+            count_rows(&holder),
+            Value::from_i64(0),
+            "finalize committed an INSERT whose execute returned Busy"
+        );
     }
 
     #[test]
