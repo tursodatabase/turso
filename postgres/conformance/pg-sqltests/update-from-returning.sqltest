@@ -1,0 +1,185 @@
+@database :memory:
+
+# RETURNING on UPDATE ... FROM reads the FROM tables.
+# The statements run through the PostgreSQL frontend (tursopg).
+# PostgreSQL gave every expected result.
+
+setup data {
+    CREATE TABLE t(id INT PRIMARY KEY, a INT);
+    CREATE TABLE u(id INT, a INT, x INT, n NUMERIC(10,2), tags TEXT[], d DATE);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO u VALUES (2, 200, 7, 1.50, ARRAY['p,q', 'r"s', NULL], '2024-01-02');
+}
+
+@setup data
+test returning-from-column {
+    UPDATE t SET a = u.a FROM u WHERE t.id = u.id RETURNING u.x;
+}
+expect {
+    7
+}
+
+@setup data
+test returning-star-has-target-then-from-columns {
+    UPDATE t SET a = u.a FROM u WHERE t.id = u.id RETURNING *;
+}
+expect {
+    2|200|2|200|7|1.50|{"p,q","r\"s",NULL}|2024-01-02
+}
+
+@setup data
+test returning-target-star-and-from-star {
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id RETURNING u.x, t.*, u.*;
+}
+expect {
+    7|2|1|2|200|7|1.50|{"p,q","r\"s",NULL}|2024-01-02
+}
+
+@setup data
+test returning-target-star-has-only-target-columns {
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id RETURNING t.*;
+}
+expect {
+    2|1
+}
+
+@setup data
+test returning-column-only-in-from-table-needs-no-qualifier {
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id RETURNING x, d;
+}
+expect {
+    7|2024-01-02
+}
+
+@setup data
+test returning-column-in-both-tables-is-ambiguous {
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id RETURNING a;
+}
+@sqlstate 42702
+expect error {
+}
+
+@setup data
+test returning-sees-new-target-value-and-from-value {
+    UPDATE t SET a = u.a + 1 FROM u WHERE t.id = u.id RETURNING t.a, u.a, t.a - u.a;
+}
+expect {
+    201|200|1
+}
+
+@setup data
+test returning-from-table-aliases {
+    UPDATE t AS y SET a = 1 FROM u AS v WHERE y.id = v.id RETURNING y.a, v.x, y.*;
+}
+expect {
+    1|7|2|1
+}
+
+@setup data
+test returning-target-name-is-hidden-by-its-alias {
+    UPDATE t AS y SET a = 1 FROM u WHERE y.id = u.id RETURNING t.a;
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup data
+test returning-custom-type-values-from-from-table {
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id RETURNING u.n, u.n * 2, u.d, u.d + 1;
+}
+expect {
+    1.50|3.00|2024-01-02|2024-01-03
+}
+
+@setup data
+test returning-array-subscript-from-from-table {
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id RETURNING u.tags, u.tags[1], u.tags[2], u.tags[3];
+}
+expect {
+    {"p,q","r\"s",NULL}|p,q|r"s|
+}
+
+@setup data
+test returning-subquery-reads-from-table {
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id
+    RETURNING (SELECT u.x + 1), (SELECT (SELECT u.tags[1])), (SELECT count(*) FROM u AS w WHERE w.id = u.id AND w.id = t.id);
+}
+expect {
+    8|p,q|1
+}
+
+@setup data
+test returning-in-subquery-with-from-column-on-the-left {
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id RETURNING (SELECT u.id IN (SELECT id FROM t))::int;
+}
+expect {
+    1
+}
+
+@setup data
+test returning-from-subquery-values-and-cte {
+    UPDATE t SET a = 1 FROM (SELECT id, x * 2 AS dbl FROM u) AS s WHERE t.id = s.id RETURNING s.dbl, s.*;
+    UPDATE t SET a = 2 FROM (VALUES (3, 'w')) AS v(id, w) WHERE t.id = v.id RETURNING v.w, t.a;
+    WITH c AS (SELECT id, x FROM u) UPDATE t SET a = 3 FROM c WHERE t.id = c.id RETURNING c.x, t.a;
+}
+expect {
+    14|2|14
+    w|2
+    7|3
+}
+
+@setup data
+test returning-from-self-join-sees-old-row {
+    UPDATE t SET a = old.a + 1 FROM t AS old WHERE t.id = old.id AND t.id = 3 RETURNING t.a, old.a;
+}
+expect {
+    31|30
+}
+
+@setup data
+test returning-from-left-join-null-row {
+    UPDATE t SET a = 1 FROM u LEFT JOIN t AS other ON other.id = u.id + 100 WHERE t.id = u.id RETURNING u.x, other.a;
+}
+expect {
+    7|
+}
+
+@setup data
+test returning-star-merges-using-columns {
+    UPDATE t SET a = 1 FROM u JOIN (SELECT 2 AS id, 'z' AS z) AS s USING (id) WHERE t.id = u.id RETURNING t.*, s.z;
+    UPDATE t SET a = 2 FROM (SELECT 2 AS id) AS p JOIN (SELECT 2 AS id, 'z' AS z) AS s USING (id) WHERE t.id = p.id RETURNING *;
+}
+expect {
+    2|1|z
+    2|2|2|z
+}
+
+@setup data
+test returning-column-not-covered-by-the-from-tables-index {
+    CREATE INDEX u_id ON u(id);
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id RETURNING u.x;
+}
+expect {
+    7
+}
+
+@setup data
+test returning-no-matching-rows {
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id AND false RETURNING u.x;
+    SELECT a FROM t WHERE id = 2;
+}
+expect {
+    20
+}
+
+@setup data
+test returning-from-table-rolls-back-with-update {
+    BEGIN;
+    UPDATE t SET a = 1 FROM u WHERE t.id = u.id RETURNING u.x;
+    ROLLBACK;
+    SELECT a FROM t WHERE id = 2;
+}
+expect {
+    7
+    20
+}

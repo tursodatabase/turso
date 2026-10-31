@@ -579,6 +579,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn generates_integer_primary_keys(&self) -> bool {
         true
     }
+
+    /// Whether RETURNING on `UPDATE ... FROM` can read the FROM tables.
+    ///
+    /// PostgreSQL allows it, and its `RETURNING *` includes their columns.
+    /// SQLite's RETURNING sees only the updated table.
+    fn returning_reads_from_tables(&self) -> bool {
+        false
+    }
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.
