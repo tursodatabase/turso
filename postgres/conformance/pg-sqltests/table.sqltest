@@ -728,3 +728,58 @@ expect {
     1|public
     2|public
 }
+
+test table-insert-default-without-column-list {
+    CREATE TABLE p5a (a int DEFAULT 7, b int, c serial);
+    INSERT INTO p5a VALUES (DEFAULT, 5);
+    SELECT a, b, c FROM p5a;
+}
+expect {
+    7|5|1
+}
+
+test table-insert-values-shorter-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-longer-row-with-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1, 2), (3, 4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-shorter-row-without-column-list {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u VALUES (1, 2, 3), (4, 5);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-values-different-row-length-with-default {
+    CREATE TABLE u (id int, a int, b int DEFAULT 9);
+    INSERT INTO u VALUES (1, 2, DEFAULT), (3, 4);
+}
+@sqlstate 42601
+expect error {}
+
+test table-insert-more-target-columns-than-expressions {
+    CREATE TABLE u (id int, a int, b int);
+    INSERT INTO u (id, a) VALUES (1);
+}
+@sqlstate 42601
+expect error {
+    INSERT has more target columns than expressions
+}
+
+test table-insert-select-more-expressions-than-target-columns {
+    CREATE TABLE u (id int, a int);
+    INSERT INTO u SELECT 1, 2, 3;
+}
+@sqlstate 42601
+expect error {
+    INSERT has more expressions than target columns
+}
