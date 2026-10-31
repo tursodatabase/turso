@@ -70,6 +70,8 @@ EXPLAIN QUERY PLAN SELECT * FROM users WHERE name = 'Alice';
 | notused | Reserved for future use (always 0) |
 | detail | Human-readable description of the execution step |
 
+Rowid range searches show their lower bound first, for example `(rowid>? AND rowid<?)` for `WHERE rowid > 2 AND rowid < 8`; inclusive bounds use `>=` and `<=`.
+
 ### Common Detail Messages
 
 | Detail Pattern | Meaning |
