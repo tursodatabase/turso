@@ -82,6 +82,8 @@ NEW.email
 OLD.status
 ```
 
+Bind parameters such as `?` and `:name` are not allowed in a new trigger's WHEN clause or body. Use `NEW` and `OLD` row references to read values from the triggering row. `IF NOT EXISTS` remains a no-op when the trigger already exists.
+
 ## WHEN Clause
 
 The optional `WHEN` clause filters which rows cause the trigger body to execute. The expression can reference `NEW` and `OLD` columns.
