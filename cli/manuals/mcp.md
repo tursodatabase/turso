@@ -36,12 +36,6 @@ The MCP server exposes the following tools. Clients call a tool with a JSON-RPC 
 }
 ```
 
-The server replies with the result as text:
-
-```json
-{"jsonrpc":"2.0","id":1,"result":{"content":[{"text":"name | age\n----------\nAlice | 30\n","type":"text"}]}}
-```
-
 The examples below show the `arguments` object for each tool.
 
 ### `open_database`
