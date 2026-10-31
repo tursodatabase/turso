@@ -1689,6 +1689,38 @@ fn rewritten_table_definitions_survive_reopen() {
     std::fs::remove_dir_all(&test_dir).ok();
 }
 
+/// An enum type is not loaded again when the database is reopened, so a
+/// CREATE TABLE AS from a table with an enum column cannot type the new
+/// column. The column is left unchecked instead of failing the statement.
+#[test]
+fn create_table_as_from_enum_column_works_after_reopen() {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let test_dir = std::env::temp_dir().join(format!("tursopg_ctas_enum_reopen_{timestamp}"));
+    std::fs::create_dir(&test_dir).expect("failed to create temp test directory");
+    let db_path = test_dir.join("main.db");
+
+    let setup = "CREATE TYPE mood AS ENUM ('sad');\n\
+                 CREATE TABLE s (m mood);\n\
+                 INSERT INTO s VALUES ('sad');\n";
+    let out1 = run_tursopg_with_db(&db_path, setup.as_bytes());
+    let err1 = String::from_utf8_lossy(&out1.stderr);
+    assert_eq!(out1.status.code(), Some(0), "first run failed: {err1}");
+    assert!(!err1.contains("Error"), "first run failed: {err1}");
+
+    let query = "CREATE TABLE t AS SELECT * FROM s;\nSELECT m FROM t;\n";
+    let out2 = run_tursopg_with_db(&db_path, query.as_bytes());
+    let out = stdout(&out2);
+    let err = String::from_utf8_lossy(&out2.stderr);
+    assert_eq!(out2.status.code(), Some(0), "reopen failed: {err}");
+    assert!(!err.contains("Error"), "reopen failed: {err}");
+    assert!(out.contains("sad"), "expected sad in: {out}");
+
+    std::fs::remove_dir_all(&test_dir).ok();
+}
+
 // ---------------------------------------------------------------------------
 // Wire protocol: constraint violation error fields
 //

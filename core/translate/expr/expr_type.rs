@@ -904,7 +904,9 @@ fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) ->
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
 }
 
-fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
+/// [`common_type`] for types that are already worked out, such as the types of
+/// one result column in each SELECT of a compound SELECT.
+pub(crate) fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
     let mut common: Option<ExprType> = None;
     for ty in types {
         common = Some(match (common, ty) {
