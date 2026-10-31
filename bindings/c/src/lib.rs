@@ -975,13 +975,34 @@ pub unsafe extern "C" fn sqlite3_busy_handler(
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_readonly(
     db: *mut sqlite3,
-    _db_name: *const ffi::c_char,
+    db_name: *const ffi::c_char,
 ) -> ffi::c_int {
     if db.is_null() {
         return -1;
     }
+    let name = if db_name.is_null() {
+        "main"
+    } else {
+        match CStr::from_ptr(db_name).to_str() {
+            Ok(name) => name,
+            Err(_) => return -1,
+        }
+    };
     let inner = (*db).inner.lock().unwrap();
-    inner._db.is_readonly() as ffi::c_int
+    database_readonly(&inner.conn, name)
+}
+
+/// Returns 1 if the named database is read-only, 0 if it is writable, and -1
+/// if the connection has no database with that name.
+fn database_readonly(conn: &turso_core::Connection, name: &str) -> ffi::c_int {
+    let Ok(database_id) = conn.get_database_id_by_name(name) else {
+        return -1;
+    };
+    // Like SQLite, temp is not a database until something creates it.
+    if database_id == turso_core::TEMP_DB_ID && !conn.has_temp_database() {
+        return -1;
+    }
+    conn.is_readonly(database_id) as ffi::c_int
 }
 
 #[no_mangle]
@@ -4642,5 +4663,44 @@ mod tests {
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
+    }
+
+    #[test]
+    fn test_database_readonly_reports_each_attached_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let open = |name: &str| {
+            let path = dir.path().join(name);
+            let database = turso_core::Database::open_file_with_flags(
+                io.clone(),
+                path.to_str().unwrap(),
+                turso_core::OpenFlags::default(),
+                DatabaseOpts::new().with_attach(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            (path, database.connect(ConnectOpts::new()).unwrap())
+        };
+        let (ro_path, ro_conn) = open("ro.db");
+        ro_conn.execute("CREATE TABLE t(x)").unwrap();
+        ro_conn.close().unwrap();
+        drop(ro_conn);
+        let (_, conn) = open("main.db");
+
+        conn.execute(format!("ATTACH 'file:{}?mode=ro' AS ro", ro_path.display()))
+            .unwrap();
+        conn.execute(format!(
+            "ATTACH '{}' AS rw",
+            dir.path().join("rw.db").display()
+        ))
+        .unwrap();
+        assert_eq!(database_readonly(&conn, "ro"), 1);
+        assert_eq!(database_readonly(&conn, "RO"), 1);
+        assert_eq!(database_readonly(&conn, "rw"), 0);
+        assert_eq!(database_readonly(&conn, "main"), 0);
+
+        conn.execute("DETACH ro").unwrap();
+        assert_eq!(database_readonly(&conn, "ro"), -1);
     }
 }
