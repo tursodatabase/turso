@@ -163,6 +163,34 @@ fn validated_query(arguments: &Option<Value>, class: StmtClass) -> Result<&str, 
     Ok(sql)
 }
 
+fn jsonrpc_error(id: Option<Value>, code: i32, message: &str) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        }),
+    }
+}
+
+const PARSE_ERROR: i32 = -32700;
+const INVALID_REQUEST: i32 = -32600;
+
+/// Turn one input line into a JSON-RPC request.
+///
+/// Malformed JSON is a Parse error (`-32700`). Well-formed JSON that does not
+/// describe a request is an Invalid Request (`-32600`) that echoes the id when
+/// the client supplied one, so it can pair the error with its call.
+fn parse_request_line(line: &str) -> Result<JsonRpcRequest, JsonRpcResponse> {
+    let value: Value =
+        serde_json::from_str(line).map_err(|_| jsonrpc_error(None, PARSE_ERROR, "Parse error"))?;
+    let id = value.get("id").cloned();
+    serde_json::from_value(value).map_err(|_| jsonrpc_error(id, INVALID_REQUEST, "Invalid Request"))
+}
+
 pub struct TursoMcpServer {
     conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
@@ -176,6 +204,23 @@ impl TursoMcpServer {
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
             current_db_path: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Turn one input line into the response that must be written to stdout.
+    ///
+    /// Blank lines and notifications (requests without an id) produce nothing.
+    fn process_line(&self, line: &str) -> Option<JsonRpcResponse> {
+        if line.trim().is_empty() {
+            return None;
+        }
+        match parse_request_line(line) {
+            Ok(request) => {
+                let response = self.handle_request(request);
+                // Don't send a response for notifications (when id is None)
+                (response.id.is_some() || response.error.is_some()).then_some(response)
+            }
+            Err(response) => Some(response),
         }
     }
 
@@ -216,21 +261,7 @@ impl TursoMcpServer {
             // Try to receive a line with a timeout so we can check for interruption
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(line)) => {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-
-                    let request: JsonRpcRequest = match serde_json::from_str(&line) {
-                        Ok(req) => req,
-                        Err(e) => {
-                            eprintln!("Failed to parse JSON-RPC request: {e}");
-                            continue;
-                        }
-                    };
-
-                    let response = self.handle_request(request);
-                    // Don't send a response for notifications (when id is None)
-                    if response.id.is_some() || response.error.is_some() {
+                    if let Some(response) = self.process_line(&line) {
                         let response_json = serde_json::to_string(&response)?;
                         writeln!(stdout_lock, "{response_json}")?;
                         stdout_lock.flush()?;
@@ -833,6 +864,60 @@ mod tests {
         let response = serde_json::to_value(server.handle_request(request)).unwrap();
 
         assert_eq!(response, json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
+    }
+
+    fn reply_json(reply: Option<JsonRpcResponse>) -> Value {
+        serde_json::to_value(reply.expect("a JSON-RPC reply must be written to stdout")).unwrap()
+    }
+
+    #[test]
+    fn malformed_json_gets_parse_error() {
+        let server = memory_server();
+
+        let reply = reply_json(server.process_line("{bad json"));
+
+        assert_eq!(
+            reply,
+            json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32700, "message": "Parse error" }
+            })
+        );
+    }
+
+    #[test]
+    fn request_without_method_gets_invalid_request_with_id() {
+        let server = memory_server();
+
+        let reply = reply_json(server.process_line(r#"{"jsonrpc":"2.0","id":5}"#));
+
+        assert_eq!(
+            reply,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "error": { "code": -32600, "message": "Invalid Request" }
+            })
+        );
+    }
+
+    #[test]
+    fn valid_request_still_dispatches() {
+        let server = memory_server();
+
+        let reply = reply_json(server.process_line(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#));
+
+        assert_eq!(reply, json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
+    }
+
+    #[test]
+    fn notification_produces_no_reply() {
+        let server = memory_server();
+
+        assert!(server
+            .process_line(r#"{"jsonrpc":"2.0","method":"ping"}"#)
+            .is_none());
     }
 
     #[test]
