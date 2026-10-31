@@ -9,10 +9,8 @@
 //! - Empty field = empty string (not NULL)
 //! - Lines starting with `\.` = end of data
 
-use std::num::NonZero;
-
-use crate::session::{database_of, relation_lookup_namespaces};
-use turso_core::{LimboError, Result, Value};
+use crate::session::relation_lookup_namespaces;
+use turso_core::{LimboError, Result};
 use turso_pg_parser::{copy::CopyToStdout, quote_identifier};
 
 pub(crate) fn prepare_copy_to_stdout(
@@ -21,29 +19,23 @@ pub(crate) fn prepare_copy_to_stdout(
 ) -> Result<turso_core::Statement> {
     let mut found = None;
     for namespace in relation_lookup_namespaces(conn, spec.schema.as_deref()) {
-        let mut stmt = conn.prepare_sqlite(format!(
-            "SELECT type, rootpage, sql FROM {}.sqlite_schema \
-             WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1",
-            quote_identifier(&database_of(conn, &namespace))
-        ))?;
-        stmt.bind_at(
-            NonZero::new(1).unwrap(),
-            Value::build_text(namespace.mangle_name(&spec.table)),
-        )?;
-        let mut table = None;
-        stmt.run_with_row_callback(|row| {
-            let kind = row.get::<String>(0)?;
-            let root_page = row.get::<i64>(1)?;
-            if kind != "table" || root_page == 0 {
+        let table = conn.with_schema(namespace.database_id(), |schema| {
+            let ns = namespace.target.id;
+            if schema.get_view(ns, &spec.table).is_some()
+                || schema.is_materialized_view(ns, &spec.table)
+            {
                 return Err(LimboError::ParseError(
                     "COPY TO STDOUT requires a plain table".to_owned(),
                 ));
             }
-            table = Some(
-                conn.dialect()
-                    .parse_table_sql(&row.get::<String>(2)?, root_page)?,
-            );
-            Ok(())
+            schema
+                .get_table(ns, &spec.table)
+                .map(|table| {
+                    table.btree().ok_or_else(|| {
+                        LimboError::ParseError("COPY TO STDOUT requires a plain table".to_owned())
+                    })
+                })
+                .transpose()
         })?;
         if let Some(table) = table {
             found = Some((namespace, table));

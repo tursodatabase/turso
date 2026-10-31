@@ -112,6 +112,12 @@ struct TxTracking {
     role: TxRole,
 }
 
+struct RollbackExecution {
+    stmt: turso_core::Statement,
+    outcome: Result<StepResult>,
+    io_completions: Option<turso_core::types::IOCompletions>,
+}
+
 /// Called after every execution of a statement to apply connection state
 /// changes that must happen at execute time, not at prepare time, and to
 /// replace errors whose PostgreSQL outcome depends on execute-time
@@ -121,6 +127,7 @@ pub(crate) type PostRunFn = Arc<dyn Fn(Result<()>) -> Result<()> + Send + Sync>;
 pub struct Statement {
     pub(crate) inner: turso_core::Statement,
     deferred: Option<Box<DeferredExecution>>,
+    rollback: Option<Box<RollbackExecution>>,
     tx_tracking: Option<TxTracking>,
     commit_became_rollback: bool,
     /// Applied by all run/step methods after the core statement completes. Used
@@ -142,6 +149,7 @@ impl Statement {
         Self {
             inner,
             deferred: None,
+            rollback: None,
             tx_tracking: None,
             commit_became_rollback: false,
             post_run: None,
@@ -213,11 +221,11 @@ impl Statement {
     /// Enforce PostgreSQL's aborted-transaction rules before running the
     /// statement. While the block is aborted, only COMMIT, ROLLBACK, and
     /// ROLLBACK TO SAVEPOINT may run; COMMIT and ROLLBACK end the block
-    /// right here by rolling back. For statements that do run, capture
+    /// through a resumable rollback. For statements that do run, capture
     /// whether the session is inside a transaction block now — an error
     /// may make the core roll the transaction back before we see it.
-    /// Returns None when COMMIT or ROLLBACK already ended the aborted block,
-    /// so the inner statement must be skipped and reported as complete.
+    /// Returns None when COMMIT or ROLLBACK must roll back the aborted block
+    /// instead of executing the inner statement.
     fn tx_gate(&mut self) -> Result<Option<bool>> {
         let Some(t) = &self.tx_tracking else {
             return Ok(Some(false));
@@ -228,16 +236,6 @@ impl Statement {
                     return Err(in_failed_sql_transaction_error().into());
                 }
                 TxRole::Commit | TxRole::Rollback => {
-                    // A rollback failure (an unfinished statement on this
-                    // connection blocks it) leaves the block aborted and
-                    // fails this COMMIT/ROLLBACK: reporting success while
-                    // the transaction is still open would let a later
-                    // COMMIT persist the aborted block's writes.
-                    rollback_aborted_block(&t.conn)?;
-                    t.tx.transaction_ended();
-                    if t.role == TxRole::Commit {
-                        self.commit_became_rollback = true;
-                    }
                     return Ok(None);
                 }
                 TxRole::RollbackToSavepoint => {}
@@ -257,7 +255,7 @@ impl Statement {
             // transaction is still open, and aborted is the only honest
             // state to report.
             TxRole::Commit | TxRole::Rollback => {
-                if !t.conn.get_auto_commit() && rollback_aborted_block(&t.conn).is_err() {
+                if !t.conn.get_auto_commit() {
                     t.tx.abort();
                 }
             }
@@ -293,13 +291,16 @@ impl Statement {
     }
 
     fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        if self.rollback.is_some() {
+            return self.step_rollback(waker);
+        }
         let saved_tx = self.deferred.as_ref().and_then(|exec| exec.was_in_tx);
         let tx = match saved_tx {
             Some(was_in_tx) => Some(was_in_tx),
             None => self.tx_gate()?,
         };
         let Some(was_in_tx) = tx else {
-            return Ok(StepResult::Done);
+            return self.start_rollback(Ok(StepResult::Done), waker);
         };
         if saved_tx.is_none() {
             self.mark_query_start();
@@ -312,41 +313,127 @@ impl Statement {
             },
         }
         .map_err(Into::into);
-        self.finish_step(result, was_in_tx)
+        self.finish_step(result, was_in_tx, waker)
     }
 
-    fn finish_step(&mut self, result: Result<StepResult>, was_in_tx: bool) -> Result<StepResult> {
-        match result {
-            Ok(StepResult::Done) => self.finish(Ok(()), was_in_tx).map(|()| StepResult::Done),
-            Err(e) => self.finish(Err(e), was_in_tx).map(|()| StepResult::Done),
-            // The core reports interruption and lock contention as results
-            // rather than errors, but PostgreSQL treats query cancellation
-            // and lock timeouts as ordinary errors that abort the block.
-            Ok(result @ (StepResult::Interrupt | StepResult::Busy)) => {
-                self.note_execution_error(was_in_tx);
-                Ok(result)
-            }
+    fn finish_step(
+        &mut self,
+        result: Result<StepResult>,
+        was_in_tx: bool,
+        waker: Option<&Waker>,
+    ) -> Result<StepResult> {
+        let result = match result {
+            Ok(StepResult::Done) => self.apply_post_run(Ok(())).map(|()| StepResult::Done),
+            Err(e) => self.apply_post_run(Err(e)).map(|()| StepResult::Done),
             other => other,
+        };
+        match &result {
+            Ok(StepResult::Done) => self.note_execution_done(),
+            Err(_) | Ok(StepResult::Interrupt | StepResult::Busy) => {
+                if self.tx_tracking.as_ref().is_some_and(|t| {
+                    matches!(t.role, TxRole::Commit | TxRole::Rollback) && !t.conn.get_auto_commit()
+                }) {
+                    return self.start_rollback(result, waker);
+                }
+                self.note_execution_error(was_in_tx);
+            }
+            _ => {}
         }
+        result
     }
 
-    /// Applies post_run to the completed statement's outcome and records
-    /// the final outcome in the transaction state.
-    fn finish(&mut self, result: Result<()>, was_in_tx: bool) -> Result<()> {
-        let ret = self.apply_post_run(result);
-        match &ret {
-            Ok(()) => self.note_execution_done(),
-            Err(_) => self.note_execution_error(was_in_tx),
+    fn start_rollback(
+        &mut self,
+        outcome: Result<StepResult>,
+        waker: Option<&Waker>,
+    ) -> Result<StepResult> {
+        let t = self.tx_tracking.as_ref().unwrap();
+        t.tx.abort();
+        let mut stmt = match t.conn.prepare_sqlite("ROLLBACK") {
+            Ok(stmt) => stmt,
+            Err(error) => {
+                return outcome.and(Err(error.into()));
+            }
+        };
+        stmt.set_query_timeout_override(Some(None));
+        self.rollback = Some(Box::new(RollbackExecution {
+            stmt,
+            outcome,
+            io_completions: None,
+        }));
+        self.step_rollback(waker)
+    }
+
+    fn step_rollback(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        let rollback = self.rollback.as_mut().unwrap();
+        let result = rollback.stmt.run_ignore_rows_nonblock();
+        if let Ok(IOResult::IO(io)) = result {
+            io.set_waker(waker);
+            let result = if io.is_explicit_yield() {
+                StepResult::Yield
+            } else {
+                StepResult::IO
+            };
+            rollback.io_completions = Some(io);
+            return Ok(result);
         }
-        ret
+        let rollback = self.rollback.take().unwrap();
+        let t = self.tx_tracking.as_ref().unwrap();
+        match result {
+            Ok(IOResult::Done(())) => {}
+            Err(error) if matches!(*error, LimboError::NoActiveTransaction { .. }) => {}
+            Err(error) => {
+                t.tx.abort();
+                return rollback.outcome.and(Err((*error).into()));
+            }
+            Ok(IOResult::IO(_)) => unreachable!(),
+        }
+        t.tx.transaction_ended();
+        if matches!(rollback.outcome, Ok(StepResult::Done)) && t.role == TxRole::Commit {
+            self.commit_became_rollback = true;
+        }
+        rollback.outcome
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        if let Some(exec) = &mut self.deferred {
-            exec.reset()?;
+        loop {
+            match self.cleanup_nonblock()? {
+                IOResult::Done(()) => break,
+                IOResult::IO(io) => {
+                    io.wait(self._io())?;
+                }
+            }
         }
         self.commit_became_rollback = false;
         self.inner.reset().map_err(Into::into)
+    }
+
+    /// Finish PostgreSQL deferred cleanup before resetting or dropping this
+    /// statement. Resume after each returned completion until Done. This does
+    /// not replace core statement reset, which remains synchronous.
+    pub fn cleanup_nonblock(&mut self) -> Result<IOResult<()>> {
+        if self.rollback.is_some() {
+            match self.step_rollback(None) {
+                Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                    return Ok(IOResult::IO(self.take_io_completions().unwrap()));
+                }
+                Ok(StepResult::Done) => {}
+                outcome => {
+                    if !self.tx_tracking.as_ref().unwrap().conn.get_auto_commit() {
+                        return match outcome {
+                            Err(error) => Err(error),
+                            Ok(StepResult::Busy) => Err(LimboError::Busy.into()),
+                            Ok(StepResult::Interrupt) => Err(LimboError::Interrupt.into()),
+                            _ => unreachable!(),
+                        };
+                    }
+                }
+            }
+        }
+        match &mut self.deferred {
+            Some(exec) => exec.cleanup_nonblock().map_err(Into::into),
+            None => Ok(IOResult::Done(())),
+        }
     }
 
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
@@ -371,31 +458,16 @@ impl Statement {
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
-        if self.deferred.is_some() {
-            return self.run_with_row_callback(|_| Ok(()));
-        }
-        let Some(was_in_tx) = self.tx_gate()? else {
-            return Ok(());
-        };
-        self.mark_query_start();
-        let result = self.inner.run_ignore_rows().map_err(Into::into);
-        self.finish(result, was_in_tx)
+        self.run_with_row_callback(|_| Ok(()))
     }
 
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
-        if self.deferred.is_some() {
-            self.run_ignore_rows()?;
-            return Ok(Vec::new());
-        }
-        let Some(was_in_tx) = self.tx_gate()? else {
-            return Ok(Vec::new());
-        };
-        self.mark_query_start();
-        let result = self.inner.run_collect_rows().map_err(Into::into);
-        match result {
-            Ok(rows) => self.finish(Ok(()), was_in_tx).map(|()| rows),
-            Err(e) => self.finish(Err(e), was_in_tx).map(|()| Vec::new()),
-        }
+        let mut rows = Vec::new();
+        self.run_with_row_callback(|row| {
+            rows.push(row.get_values().cloned().collect());
+            Ok(())
+        })?;
+        Ok(rows)
     }
 
     pub fn run_with_row_callback(
@@ -416,22 +488,7 @@ impl Statement {
     }
 
     pub fn run_ignore_rows_nonblock(&mut self) -> Result<IOResult<()>> {
-        if self.deferred.is_some() {
-            return self.run_with_row_callback_nonblock(|_| Ok(()));
-        }
-        let Some(was_in_tx) = self.tx_gate()? else {
-            return Ok(IOResult::Done(()));
-        };
-        self.mark_query_start();
-        match self
-            .inner
-            .run_ignore_rows_nonblock()
-            .map_err(|error| (*error).into())
-        {
-            Ok(IOResult::Done(())) => self.finish(Ok(()), was_in_tx).map(|()| IOResult::Done(())),
-            Err(e) => self.finish(Err(e), was_in_tx).map(|()| IOResult::Done(())),
-            other => other,
-        }
+        self.run_with_row_callback_nonblock(|_| Ok(()))
     }
 
     pub fn run_with_row_callback_nonblock(
@@ -475,6 +532,9 @@ impl Statement {
     }
 
     pub fn take_io_completions(&mut self) -> Option<turso_core::types::IOCompletions> {
+        if let Some(rollback) = &mut self.rollback {
+            return rollback.io_completions.take();
+        }
         if let Some(exec) = &mut self.deferred {
             return exec.io_completions.take();
         }
@@ -506,12 +566,11 @@ impl Statement {
     }
 
     pub fn reset_best_effort(&mut self) {
-        if let Some(exec) = &mut self.deferred {
-            if let Err(error) = exec.reset() {
-                tracing::error!("Failed to reset PostgreSQL deferred statement: {error}");
-            }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.reset())) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!("Failed to reset PostgreSQL statement: {error}"),
+            Err(_) => tracing::error!("PostgreSQL statement reset panicked"),
         }
-        self.inner.reset_best_effort();
     }
 }
 
@@ -577,20 +636,6 @@ fn boolean_result_type(
 
 fn is_boolean_type(name: &str) -> bool {
     name.eq_ignore_ascii_case("boolean") || name.eq_ignore_ascii_case("bool")
-}
-
-/// Roll back the connection's transaction so a block can end. A transaction
-/// that is already gone — some errors make the core roll it back on its own —
-/// counts as ended. Every other failure means the transaction is still open
-/// and must reach the caller.
-fn rollback_aborted_block(conn: &Arc<Connection>) -> Result<()> {
-    let run = conn
-        .prepare_sqlite("ROLLBACK")
-        .and_then(|mut rollback| rollback.run_ignore_rows());
-    match run {
-        Ok(()) | Err(LimboError::NoActiveTransaction { .. }) => Ok(()),
-        Err(err) => Err(err.into()),
-    }
 }
 
 impl std::ops::Deref for Statement {
