@@ -36,6 +36,20 @@ expect {
     0
 }
 
+test fk-pragma-off-in-transaction-still-blocks-parent-delete {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a PRIMARY KEY);
+    CREATE TABLE c(a REFERENCES p(a));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    BEGIN;
+    PRAGMA foreign_keys=OFF;
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
 # A child row matches a parent key the way `parent_col = child_col` compares,
 # with affinity, also when the child column has no index.
 @cross-check-integrity
