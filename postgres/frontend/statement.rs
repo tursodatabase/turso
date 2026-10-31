@@ -12,15 +12,8 @@ use turso_core::{
 };
 
 use crate::error::in_failed_sql_transaction_error;
+use crate::session::DeferredExecution;
 use crate::Result;
-
-pub(crate) type DeferredExec =
-    Box<dyn FnMut(&mut turso_core::Statement) -> turso_core::Result<()> + Send + Sync>;
-
-struct DeferredState {
-    exec: DeferredExec,
-    completed: bool,
-}
 
 /// How a statement interacts with PostgreSQL's aborted-transaction state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -126,8 +119,8 @@ struct TxTracking {
 pub(crate) type PostRunFn = Arc<dyn Fn(Result<()>) -> Result<()> + Send + Sync>;
 
 pub struct Statement {
-    inner: turso_core::Statement,
-    deferred: Option<DeferredState>,
+    pub(crate) inner: turso_core::Statement,
+    deferred: Option<Box<DeferredExecution>>,
     tx_tracking: Option<TxTracking>,
     commit_became_rollback: bool,
     /// Applied by all run/step methods after the core statement completes. Used
@@ -189,13 +182,15 @@ impl Statement {
         }
     }
 
-    pub(crate) fn with_deferred(inner: turso_core::Statement, exec: DeferredExec) -> Self {
+    pub(crate) fn with_deferred(inner: turso_core::Statement, exec: DeferredExecution) -> Self {
         let mut stmt = Self::new(inner);
-        stmt.deferred = Some(DeferredState {
-            exec,
-            completed: false,
-        });
+        stmt.deferred = Some(Box::new(exec));
         stmt
+    }
+
+    pub(crate) fn without_tx_tracking(mut self) -> Self {
+        self.tx_tracking = None;
+        self
     }
 
     pub(crate) fn with_tx_tracking(
@@ -289,44 +284,34 @@ impl Statement {
         }
     }
 
-    fn execute_deferred(&mut self, was_in_tx: bool) -> Result<()> {
-        let Some(deferred) = self.deferred.as_mut() else {
-            return Ok(());
-        };
-        if !deferred.completed {
-            let result: Result<()> = (deferred.exec)(&mut self.inner).map_err(Into::into);
-            if result.is_err() {
-                self.note_execution_error(was_in_tx);
-                return result;
-            }
-            deferred.completed = true;
-        }
-        Ok(())
-    }
-
     pub fn step(&mut self) -> Result<StepResult> {
-        let Some(was_in_tx) = self.tx_gate()? else {
-            return Ok(StepResult::Done);
-        };
-        self.mark_query_start();
-        if self.deferred.is_some() {
-            self.execute_deferred(was_in_tx)?;
-            return Ok(StepResult::Done);
-        }
-        let result = self.inner.step().map_err(Into::into);
-        self.finish_step(result, was_in_tx)
+        self.step_inner(None)
     }
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
-        let Some(was_in_tx) = self.tx_gate()? else {
+        self.step_inner(Some(waker))
+    }
+
+    fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        let saved_tx = self.deferred.as_ref().and_then(|exec| exec.was_in_tx);
+        let tx = match saved_tx {
+            Some(was_in_tx) => Some(was_in_tx),
+            None => self.tx_gate()?,
+        };
+        let Some(was_in_tx) = tx else {
             return Ok(StepResult::Done);
         };
-        self.mark_query_start();
-        if self.deferred.is_some() {
-            self.execute_deferred(was_in_tx)?;
-            return Ok(StepResult::Done);
+        if saved_tx.is_none() {
+            self.mark_query_start();
         }
-        let result = self.inner.step_with_waker(waker).map_err(Into::into);
+        let result = match &mut self.deferred {
+            Some(exec) => exec.step(&mut self.inner, waker),
+            None => match waker {
+                Some(waker) => self.inner.step_with_waker(waker),
+                None => self.inner.step(),
+            },
+        }
+        .map_err(Into::into);
         self.finish_step(result, was_in_tx)
     }
 
@@ -357,8 +342,8 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        if let Some(deferred) = self.deferred.as_mut() {
-            deferred.completed = false;
+        if let Some(exec) = &mut self.deferred {
+            exec.reset()?;
         }
         self.commit_became_rollback = false;
         self.inner.reset().map_err(Into::into)
@@ -386,26 +371,26 @@ impl Statement {
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
+        if self.deferred.is_some() {
+            return self.run_with_row_callback(|_| Ok(()));
+        }
         let Some(was_in_tx) = self.tx_gate()? else {
             return Ok(());
         };
         self.mark_query_start();
-        if self.deferred.is_some() {
-            return self.execute_deferred(was_in_tx);
-        }
         let result = self.inner.run_ignore_rows().map_err(Into::into);
         self.finish(result, was_in_tx)
     }
 
     pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
+        if self.deferred.is_some() {
+            self.run_ignore_rows()?;
+            return Ok(Vec::new());
+        }
         let Some(was_in_tx) = self.tx_gate()? else {
             return Ok(Vec::new());
         };
         self.mark_query_start();
-        if self.deferred.is_some() {
-            self.execute_deferred(was_in_tx)?;
-            return Ok(Vec::new());
-        }
         let result = self.inner.run_collect_rows().map_err(Into::into);
         match result {
             Ok(rows) => self.finish(Ok(()), was_in_tx).map(|()| rows),
@@ -431,14 +416,13 @@ impl Statement {
     }
 
     pub fn run_ignore_rows_nonblock(&mut self) -> Result<IOResult<()>> {
+        if self.deferred.is_some() {
+            return self.run_with_row_callback_nonblock(|_| Ok(()));
+        }
         let Some(was_in_tx) = self.tx_gate()? else {
             return Ok(IOResult::Done(()));
         };
         self.mark_query_start();
-        if self.deferred.is_some() {
-            self.execute_deferred(was_in_tx)?;
-            return Ok(IOResult::Done(()));
-        }
         match self
             .inner
             .run_ignore_rows_nonblock()
@@ -459,7 +443,7 @@ impl Statement {
                 StepResult::Done => return Ok(IOResult::Done(())),
                 StepResult::Row => callback(self.row().expect("row should be present"))?,
                 StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                    let completions = self.inner.take_io_completions().unwrap_or_else(|| {
+                    let completions = self.take_io_completions().unwrap_or_else(|| {
                         turso_core::types::IOCompletions(turso_core::io::Completion::new_yield())
                     });
                     return Ok(IOResult::IO(completions));
@@ -491,6 +475,9 @@ impl Statement {
     }
 
     pub fn take_io_completions(&mut self) -> Option<turso_core::types::IOCompletions> {
+        if let Some(exec) = &mut self.deferred {
+            return exec.io_completions.take();
+        }
         self.inner.take_io_completions()
     }
 
@@ -499,6 +486,10 @@ impl Statement {
     }
 
     pub fn interrupt(&mut self) {
+        if let Some(exec) = &mut self.deferred {
+            exec.interrupted = true;
+            return;
+        }
         self.inner.interrupt();
     }
 
@@ -515,8 +506,10 @@ impl Statement {
     }
 
     pub fn reset_best_effort(&mut self) {
-        if let Some(deferred) = self.deferred.as_mut() {
-            deferred.completed = false;
+        if let Some(exec) = &mut self.deferred {
+            if let Err(error) = exec.reset() {
+                tracing::error!("Failed to reset PostgreSQL deferred statement: {error}");
+            }
         }
         self.inner.reset_best_effort();
     }

@@ -46,6 +46,11 @@ Foreign-key definitions quote identifiers and include the parent schema when
 the parent table is not visible through the current `search_path`.
 Index definitions retain descending keys.
 
+The PostgreSQL frontend executes each `CREATE SCHEMA` or `DROP SCHEMA` statement
+as one operation, including its schema elements or cascading drops.
+An error or cancellation before commit rolls back the whole operation.
+Cancellation after commit does not undo the changes.
+
 ## See Also
 
 - [Experimental Features](/docs/sql-reference/experimental-features) for how to enable experimental features
