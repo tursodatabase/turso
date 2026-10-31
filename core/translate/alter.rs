@@ -575,6 +575,7 @@ fn emit_column_constraints_validation(
     table: &BTreeTable,
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
+    prior_checks: &[CheckConstraint],
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     namespace: NamespaceRef,
@@ -596,6 +597,9 @@ fn emit_column_constraints_validation(
             }
         })
         .collect();
+    if !check_constraints.is_empty() {
+        check_constraints.extend_from_slice(prior_checks);
+    }
     if table.is_strict {
         let (_, domain_checks) = resolver.with_schema(database_id, |schema| {
             schema.column_domain_constraints(column)
@@ -1482,6 +1486,7 @@ pub fn translate_alter_table(
                 &btree,
                 &column,
                 &constraints,
+                &original_btree.check_constraints,
                 resolver,
                 connection,
                 namespace,
@@ -2290,6 +2295,7 @@ pub fn translate_alter_table(
                     &altered_table,
                     &altered_table.columns()[column_index],
                     &definition.constraints,
+                    &[],
                     resolver,
                     connection,
                     namespace,
