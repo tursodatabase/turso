@@ -1435,12 +1435,16 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
     let mut end = 0;
     let mut has_decimal = false;
     let mut has_exponent = false;
+    let mut has_mantissa_digit = false;
     if bytes[0] == b'-' || bytes[0] == b'+' {
         end = 1;
     }
     while end < bytes.len() {
         match bytes[end] {
-            b'0'..=b'9' => end += 1,
+            b'0'..=b'9' => {
+                has_mantissa_digit |= !has_exponent;
+                end += 1;
+            }
             b'.' if !has_decimal && !has_exponent => {
                 has_decimal = true;
                 end += 1;
@@ -1456,7 +1460,9 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
             _ => break,
         }
     }
-    if end == 0 || (end == 1 && (bytes[0] == b'-' || bytes[0] == b'+')) {
+    // like sqlite3AtoF, a number needs at least one digit before any exponent:
+    // ".", "-." and "+e5" are not numeric
+    if !has_mantissa_digit {
         return Err(());
     }
     // edge case: if it ends with exponent, strip and cast valid digits as float
@@ -5897,14 +5903,8 @@ pub mod tests {
             Value::from_i64(0)
         );
         assert!(checked_cast_text_to_numeric("-", false).is_err());
-        assert_eq!(
-            checked_cast_text_to_numeric("-e", false).unwrap(),
-            Value::from_f64(0.0)
-        );
-        assert_eq!(
-            checked_cast_text_to_numeric("-E", false).unwrap(),
-            Value::from_f64(0.0)
-        );
+        assert!(checked_cast_text_to_numeric("-e", false).is_err());
+        assert!(checked_cast_text_to_numeric("-E", false).is_err());
     }
 
     #[test]
@@ -5962,6 +5962,10 @@ pub mod tests {
         assert_eq!(parse_numeric_str("+"), Err(()));
         assert_eq!(parse_numeric_str("e10"), Err(()));
         assert_eq!(parse_numeric_str(".e10"), Err(()));
+        assert_eq!(parse_numeric_str("."), Err(()));
+        assert_eq!(parse_numeric_str("-."), Err(()));
+        assert_eq!(parse_numeric_str(" . "), Err(()));
+        assert_eq!(parse_numeric_str("+e5"), Err(()));
     }
 
     #[test]
