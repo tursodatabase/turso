@@ -229,6 +229,9 @@ pub struct OpenOptions {
     wal_path: Option<String>,
     flags: OpenFlags,
     db_opts: DatabaseOpts,
+    /// Whether a registry hit must match `db_opts`; see
+    /// [`Database::check_registry_db_opts`].
+    check_db_opts_on_registry_hit: bool,
     pub(crate) native_extensions: crate::native_ext::NativeExtensions,
     encryption: Option<EncryptionOpts>,
     page_codec: Option<Arc<dyn PageCodec>>,
@@ -249,6 +252,7 @@ impl OpenOptions {
             wal_path: None,
             flags: OpenFlags::default(),
             db_opts: DatabaseOpts::default(),
+            check_db_opts_on_registry_hit: true,
             native_extensions: crate::native_ext::NativeExtensions::default(),
             encryption: None,
             page_codec: None,
@@ -279,6 +283,15 @@ impl OpenOptions {
 
     pub fn db_opts(mut self, db_opts: DatabaseOpts) -> Self {
         self.db_opts = db_opts;
+        self
+    }
+
+    /// Accept a registry hit whose `DatabaseOpts` differ from `db_opts`.
+    /// ATTACH uses this: its options are copied from the main database
+    /// rather than requested by the user, and an attached database keeps
+    /// the options it was first opened with.
+    pub(crate) fn skip_db_opts_check_on_registry_hit(mut self) -> Self {
+        self.check_db_opts_on_registry_hit = false;
         self
     }
 
@@ -1109,16 +1122,64 @@ impl Database {
         Ok(())
     }
 
+    /// Check that a registry hit behaves the way the caller's `DatabaseOpts`
+    /// ask for. Most options only decide which SQL statements are accepted
+    /// and are not compared. The options checked here change how the shared
+    /// instance checkpoints, locks the WAL, journals, or whether it can be
+    /// written, for every user at once, so the instance cannot give one
+    /// caller a different value and a mismatch is an error.
+    fn check_registry_db_opts(db: &Database, options: &OpenOptions) -> Result<()> {
+        if !options.check_db_opts_on_registry_hit {
+            return Ok(());
+        }
+        let requested = options.db_opts;
+        let same_for_every_user = [
+            (
+                "experimental MVCC passive checkpoint",
+                db.opts.enable_experimental_mvcc_passive_checkpoint,
+                requested.enable_experimental_mvcc_passive_checkpoint,
+            ),
+            (
+                "experimental multiprocess WAL",
+                db.opts.enable_multiprocess_wal,
+                requested.enable_multiprocess_wal,
+            ),
+            // Opening an autovacuum database without this option makes the
+            // shared instance read-only for everyone.
+            (
+                "experimental autovacuum",
+                db.opts.enable_autovacuum,
+                requested.enable_autovacuum,
+            ),
+        ];
+        for (name, existing, wanted) in same_for_every_user {
+            if existing != wanted {
+                let state = |enabled: bool| if enabled { "enabled" } else { "disabled" };
+                return Err(LimboError::InvalidArgument(format!(
+                    "database is already open with {name} {}; requested {name} {}",
+                    state(existing),
+                    state(wanted)
+                )));
+            }
+        }
+        // A plain open of a database that is already in MVCC mode keeps that
+        // mode, so only asking for MVCC on a non-MVCC instance is a mismatch.
+        // A read-only open never converts and accepts either mode.
+        let would_convert_to_mvcc =
+            requested.enable_mvcc && !options.flags.contains(OpenFlags::ReadOnly);
+        if would_convert_to_mvcc && !db.mvcc_enabled() {
+            return Err(LimboError::InvalidArgument(
+                "database is already open without MVCC; requested MVCC".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Look up a database in the process-wide registry by file identity.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the
     /// database is already open in this process.
-    fn lookup_in_registry(
-        path: &str,
-        encryption_opts: &Option<EncryptionOpts>,
-        dialect: &dyn Dialect,
-        page_codec: Option<&dyn PageCodec>,
-    ) -> Result<Option<Arc<Database>>> {
+    fn lookup_in_registry(path: &str, options: &OpenOptions) -> Result<Option<Arc<Database>>> {
         if is_memory_like(path) {
             return Ok(None);
         }
@@ -1140,14 +1201,15 @@ impl Database {
         // Validate encryption compatibility (key is not stored for security,
         // so we can only check cipher mode)
         let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-        if db_is_encrypted && encryption_opts.is_none() {
+        if db_is_encrypted && options.encryption.is_none() {
             return Err(LimboError::InvalidArgument(
                 "Database is encrypted but no encryption options provided".to_string(),
             ));
         }
-        db.validate_page_codec(page_codec)?;
+        db.validate_page_codec(options.page_codec.as_deref())?;
 
-        Self::check_registry_dialect(&db, dialect)?;
+        Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+        Self::check_registry_db_opts(&db, options)?;
 
         Ok(Some(db))
     }
@@ -1209,12 +1271,7 @@ impl Database {
         // Check the registry before opening the file to avoid acquiring a file
         // lock that would conflict with an already-open Database in this process.
         if use_registry {
-            if let Some(db) = Self::lookup_in_registry(
-                path,
-                &options.encryption,
-                options.dialect.as_ref(),
-                options.page_codec.as_deref(),
-            )? {
+            if let Some(db) = Self::lookup_in_registry(path, options)? {
                 if options.durable_storage.is_some() && db.durable_storage.is_none() {
                     return Err(LimboError::InvalidArgument(
                         "database already open without custom durable storage; \
@@ -1383,6 +1440,7 @@ impl Database {
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            Self::check_registry_db_opts(&db, options)?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
