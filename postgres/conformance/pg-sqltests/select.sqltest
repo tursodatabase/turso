@@ -1399,6 +1399,87 @@ test cast-to-type-in-unknown-schema-errors {
 expect error {
 }
 
+# DISTINCT ON keeps the first row of each group in ORDER BY order. The frontend
+# rewrites it with row_number(), so cover a single key, a key that is not
+# selected, several keys, a trailing LIMIT, an aliased expression, and the
+# PostgreSQL rule that the ON expressions must lead the ORDER BY.
+
+setup distinct_on_sales {
+    CREATE TABLE sales (region TEXT, product TEXT, amount INT);
+    INSERT INTO sales VALUES
+        ('west', 'a', 10),
+        ('west', 'b', 30),
+        ('east', 'c', 5),
+        ('east', 'd', 20),
+        ('east', 'd', 25);
+}
+
+@setup distinct_on_sales
+test distinct-on-keeps-highest-per-region {
+    SELECT DISTINCT ON (region) region, amount FROM sales ORDER BY region, amount DESC;
+}
+expect {
+    east|25
+    west|30
+}
+
+@setup distinct_on_sales
+test distinct-on-order-by-column-not-selected {
+    SELECT DISTINCT ON (region) amount FROM sales ORDER BY region, amount DESC;
+}
+expect {
+    25
+    30
+}
+
+@setup distinct_on_sales
+test distinct-on-several-keys {
+    SELECT DISTINCT ON (region, product) region, product, amount
+    FROM sales ORDER BY region, product, amount DESC;
+}
+expect {
+    east|c|5
+    east|d|25
+    west|a|10
+    west|b|30
+}
+
+@setup distinct_on_sales
+test distinct-on-with-limit {
+    SELECT DISTINCT ON (region) region, amount FROM sales ORDER BY region, amount DESC LIMIT 1;
+}
+expect {
+    east|25
+}
+
+@setup distinct_on_sales
+test distinct-on-aliased-expression {
+    SELECT DISTINCT ON (region) region, amount * 2 AS double_amount
+    FROM sales ORDER BY region, amount DESC;
+}
+expect {
+    east|50
+    west|60
+}
+
+@setup distinct_on_sales
+test distinct-on-unaliased-expression {
+    SELECT DISTINCT ON (region) amount * 2 FROM sales ORDER BY region, amount DESC;
+}
+expect {
+    50
+    60
+}
+
+@setup distinct_on_sales
+test distinct-on-must-match-initial-order-by {
+    SELECT DISTINCT ON (region) region, amount FROM sales ORDER BY amount DESC;
+}
+@sqlstate 42P10
+expect error {
+    SELECT DISTINCT ON expressions must match initial ORDER BY expressions
+}
+
 test function-in-schema-main-errors {
     SELECT main.lower('A');
 }

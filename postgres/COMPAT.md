@@ -204,7 +204,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | ANY_VALUE aggregate | ❌ Not supported | |
-| DISTINCT ON | ❌ Not supported | Rejected |
+| DISTINCT ON | 🟡 Partial | Lowered to a `row_number()` window that keeps the first row of each group; the ON expressions must lead the ORDER BY (42P10 otherwise). `SELECT DISTINCT ON (...) *` is rejected, because the rewrite needs to name each output column and the frontend has no catalog to expand `*` |
 | FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES rejected |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
 | INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *`; on UPDATE ... FROM, `RETURNING *` is rejected (it would omit the FROM tables' columns) |
