@@ -54,42 +54,31 @@ fn embedded_statement_methods_format_postgres_errors() {
         let mut error = None;
         for _ in 0..100 {
             let result = match method {
-                0 => stmt.step().map(|_| ()).map_err(|e| e.to_string()),
-                1 => stmt
-                    .step_with_waker(std::task::Waker::noop())
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
-                2 => stmt.run_ignore_rows().map_err(|e| e.to_string()),
-                3 => stmt
-                    .run_collect_rows()
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
-                4 => stmt
-                    .run_with_row_callback(|_| Ok(()))
-                    .map_err(|e| e.to_string()),
-                5 => stmt
-                    .run_ignore_rows_nonblock()
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
-                6 => stmt
-                    .run_with_row_callback_nonblock(|_| Ok(()))
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
-                7 => stmt
-                    .run_one_step_blocking(|| Ok(()), || Ok(()))
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
+                0 => stmt.step().map(|_| ()),
+                1 => stmt.step_with_waker(std::task::Waker::noop()).map(|_| ()),
+                2 => stmt.run_ignore_rows(),
+                3 => stmt.run_collect_rows().map(|_| ()),
+                4 => stmt.run_with_row_callback(|_| Ok(())),
+                5 => stmt.run_ignore_rows_nonblock().map(|_| ()),
+                6 => stmt.run_with_row_callback_nonblock(|_| Ok(())).map(|_| ()),
+                7 => stmt.run_one_step_blocking(|| Ok(()), || Ok(())).map(|_| ()),
                 _ => unreachable!(),
             };
-            if let Err(message) = result {
-                error = Some(message);
+            if let Err(e) = result {
+                error = Some(e);
                 break;
             }
             io.step().unwrap();
         }
+        let error = error.unwrap_or_else(|| panic!("method {method} must fail"));
         assert_eq!(
-            error.as_deref(),
-            Some("duplicate key value violates unique constraint \"t_pkey\""),
+            error.to_string(),
+            "duplicate key value violates unique constraint \"t_pkey\"",
+            "method {method}"
+        );
+        assert_eq!(
+            constraint_violation(&error).schema_name.as_deref(),
+            Some("public"),
             "method {method}"
         );
     }
@@ -639,6 +628,46 @@ fn structured_foreign_key_errors_preserve_sqlite_transaction_behavior() {
             outcomes[0], outcomes[1],
             "reporting changed transaction behavior for {sql}"
         );
+    }
+}
+
+#[test]
+fn constraint_violations_report_the_schema_of_the_table() {
+    let (_io, conn) = pg_connection_with_fk();
+    conn.execute("CREATE SCHEMA s").unwrap();
+    for schema in ["public", "s"] {
+        conn.execute(format!(
+            "CREATE TABLE {schema}.t (id INT PRIMARY KEY, n INT NOT NULL, v INT CHECK (v > 0), u TEXT UNIQUE)"
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "CREATE TABLE {schema}.c (id INT PRIMARY KEY, tid INT REFERENCES {schema}.t (id))"
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "INSERT INTO {schema}.t VALUES (1, 1, 1, 'a'), (2, 1, 1, 'b')"
+        ))
+        .unwrap();
+    }
+    for schema in ["public", "s"] {
+        for sql in [
+            "INSERT INTO {s}.t VALUES (1, 1, 1, 'c')",
+            "INSERT INTO {s}.t VALUES (3, NULL, 1, 'c')",
+            "INSERT INTO {s}.t VALUES (3, 1, -1, 'c')",
+            "INSERT INTO {s}.t VALUES (3, 1, 1, 'a')",
+            "INSERT INTO {s}.t VALUES (1, 1, 1, 'c') ON CONFLICT (id) DO UPDATE SET u = 'b'",
+            "UPDATE {s}.t SET id = 1 WHERE id = 2",
+            "UPDATE {s}.t SET n = NULL",
+            "UPDATE {s}.t SET v = -1",
+            "UPDATE {s}.t SET u = 'a' WHERE id = 2",
+            "INSERT INTO {s}.c VALUES (1, 99)",
+        ] {
+            let sql = sql.replace("{s}", schema);
+            let e = exec_err(&conn, &sql);
+            let cv = constraint_violation(&e);
+            assert_eq!(cv.schema_name.as_deref(), Some(schema), "{sql}");
+            assert!(matches!(cv.table_name.as_deref(), Some("t" | "c")), "{sql}");
+        }
     }
 }
 

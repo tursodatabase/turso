@@ -294,7 +294,8 @@ impl Statement {
             return Ok(());
         };
         if !deferred.completed {
-            let result: Result<()> = (deferred.exec)(&mut self.inner).map_err(Into::into);
+            let result: Result<()> = (deferred.exec)(&mut self.inner)
+                .map_err(|error| statement_error(&self.inner, error));
             if result.is_err() {
                 self.note_execution_error(was_in_tx);
                 return result;
@@ -313,7 +314,10 @@ impl Statement {
             self.execute_deferred(was_in_tx)?;
             return Ok(StepResult::Done);
         }
-        let result = self.inner.step().map_err(Into::into);
+        let result = self
+            .inner
+            .step()
+            .map_err(|error| statement_error(&self.inner, error));
         self.finish_step(result, was_in_tx)
     }
 
@@ -326,7 +330,10 @@ impl Statement {
             self.execute_deferred(was_in_tx)?;
             return Ok(StepResult::Done);
         }
-        let result = self.inner.step_with_waker(waker).map_err(Into::into);
+        let result = self
+            .inner
+            .step_with_waker(waker)
+            .map_err(|error| statement_error(&self.inner, error));
         self.finish_step(result, was_in_tx)
     }
 
@@ -361,7 +368,9 @@ impl Statement {
             deferred.completed = false;
         }
         self.commit_became_rollback = false;
-        self.inner.reset().map_err(Into::into)
+        self.inner
+            .reset()
+            .map_err(|error| statement_error(&self.inner, error))
     }
 
     pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) -> Result<()> {
@@ -393,7 +402,10 @@ impl Statement {
         if self.deferred.is_some() {
             return self.execute_deferred(was_in_tx);
         }
-        let result = self.inner.run_ignore_rows().map_err(Into::into);
+        let result = self
+            .inner
+            .run_ignore_rows()
+            .map_err(|error| statement_error(&self.inner, error));
         self.finish(result, was_in_tx)
     }
 
@@ -406,7 +418,10 @@ impl Statement {
             self.execute_deferred(was_in_tx)?;
             return Ok(Vec::new());
         }
-        let result = self.inner.run_collect_rows().map_err(Into::into);
+        let result = self
+            .inner
+            .run_collect_rows()
+            .map_err(|error| statement_error(&self.inner, error));
         match result {
             Ok(rows) => self.finish(Ok(()), was_in_tx).map(|()| rows),
             Err(e) => self.finish(Err(e), was_in_tx).map(|()| Vec::new()),
@@ -442,7 +457,7 @@ impl Statement {
         match self
             .inner
             .run_ignore_rows_nonblock()
-            .map_err(|error| (*error).into())
+            .map_err(|error| statement_error(&self.inner, *error))
         {
             Ok(IOResult::Done(())) => self.finish(Ok(()), was_in_tx).map(|()| IOResult::Done(())),
             Err(e) => self.finish(Err(e), was_in_tx).map(|()| IOResult::Done(())),
@@ -520,6 +535,10 @@ impl Statement {
         }
         self.inner.reset_best_effort();
     }
+}
+
+fn statement_error(stmt: &turso_core::Statement, error: LimboError) -> crate::Error {
+    crate::Error::from_statement(&stmt.get_program().connection, error)
 }
 
 enum BooleanResultType {

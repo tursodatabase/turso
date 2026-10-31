@@ -906,6 +906,7 @@ where
     ];
     for (tag, value) in [
         (b'D', &error.detail),
+        (b's', &error.schema_name),
         (b't', &error.table_name),
         (b'c', &error.column_name),
         (b'n', &error.constraint_name),

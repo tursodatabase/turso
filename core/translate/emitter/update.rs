@@ -565,6 +565,7 @@ fn emit_notnull_constraint_check(
     table_references: &TableReferences,
     target_reg: usize,
     table_column: &Column,
+    namespace: NamespaceId,
     table_name: &str,
     or_conflict: ResolveType,
     skip_row_label: BranchOffset,
@@ -614,7 +615,9 @@ fn emit_notnull_constraint_check(
         // violation and SQLite aborts.
         let col_name = table_column.name.as_deref().unwrap_or("").to_string();
         program.emit_insn(Insn::HaltIfNull {
-            constraint_info: Some(Box::new(ConstraintInfo::not_null(table_name, col_name))),
+            constraint_info: Some(Box::new(ConstraintInfo::not_null(
+                namespace, table_name, col_name,
+            ))),
             target_reg,
             err_code: SQLITE_CONSTRAINT_NOTNULL,
             description: description(),
@@ -960,6 +963,7 @@ fn emit_update_column_values<'a>(
                                     table_references,
                                     target_reg,
                                     table_column,
+                                    column_ctx.target_table.namespace.id,
                                     column_ctx.table_name(),
                                     notnull_conflict,
                                     skip_row_label,
@@ -1084,6 +1088,7 @@ fn emit_deferred_notnull_checks<'a>(
             table_references,
             target_reg,
             table_column,
+            column_ctx.target_table.namespace.id,
             column_ctx.table_name(),
             or_conflict,
             skip_row_label,
@@ -1739,6 +1744,7 @@ fn emit_update_insns<'a>(
                 };
                 program.emit_insn(Insn::Halt {
                     constraint_info: Some(Box::new(ConstraintInfo::primary_key(
+                        update_namespace.id,
                         table_name,
                         target_table
                             .table
@@ -1838,6 +1844,7 @@ fn emit_update_insns<'a>(
                 program,
                 &relevant_checks,
                 &mut t_ctx.resolver,
+                update_namespace.id,
                 &btree_table.name,
                 effective_rowid_reg,
                 btree_table
@@ -2117,6 +2124,7 @@ fn emit_update_insns<'a>(
                     );
                     program.emit_insn(Insn::Halt {
                         constraint_info: Some(Box::new(ConstraintInfo::unique_index(
+                            update_namespace.id,
                             table_name,
                             index,
                             (idx_start_reg..idx_start_reg + num_cols).collect(),
