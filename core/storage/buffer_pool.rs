@@ -383,7 +383,8 @@ impl Arena {
                 BufferPool::MAX_ARENA_SIZE
             ));
         }
-        let ptr = unsafe { arena::alloc(rounded_bytes) };
+        let huge_pages = huge_pages_requested();
+        let ptr = unsafe { arena::alloc(rounded_bytes, huge_pages) };
         let base = NonNull::new(ptr).ok_or("Failed to allocate arena")?;
         let id = io
             .register_fixed_buffer(base, rounded_bytes)
@@ -439,13 +440,25 @@ impl Arena {
     }
 }
 
+/// Whether the page arenas should ask Linux for 2 MB transparent huge pages.
+/// Off by default: a huge page is filled as soon as one of its slots is used, so
+/// each open database would cost up to ~2 MB of memory even when it is small.
+/// Set `TURSO_HUGE_PAGES=1` (or `true`) to turn it on. Read once per process, so
+/// every database in the process gets the same setting.
+fn huge_pages_requested() -> bool {
+    static HUGE_PAGES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("TURSO_HUGE_PAGES").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    });
+    *HUGE_PAGES
+}
+
 #[cfg(all(unix, not(miri)))]
 mod arena {
     use libc::MAP_ANONYMOUS;
     use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
     use std::ffi::c_void;
 
-    pub unsafe fn alloc(len: usize) -> *mut u8 {
+    pub unsafe fn alloc(len: usize, huge_pages: bool) -> *mut u8 {
         let ptr = mmap(
             std::ptr::null_mut(),
             len,
@@ -458,9 +471,11 @@ mod arena {
             panic!("mmap failed: {}", std::io::Error::last_os_error());
         }
         #[cfg(target_os = "linux")]
-        {
+        if huge_pages {
             libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = huge_pages; // transparent huge pages only exist on Linux
         ptr as *mut u8
     }
 
@@ -474,7 +489,7 @@ mod arena {
 
 #[cfg(any(not(unix), miri))]
 mod arena {
-    pub unsafe fn alloc(len: usize) -> *mut u8 {
+    pub unsafe fn alloc(len: usize, _huge_pages: bool) -> *mut u8 {
         let layout = std::alloc::Layout::from_size_align(len, std::mem::size_of::<u8>()).unwrap();
         unsafe { std::alloc::alloc_zeroed(layout) }
     }
@@ -1765,5 +1780,55 @@ mod shuttle_tests {
             },
             1000,
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux", not(miri)))]
+mod tests {
+    use super::arena;
+
+    const LEN: usize = 4 * 1024 * 1024;
+
+    #[test]
+    fn arena_asks_for_huge_pages_only_when_requested() {
+        let plain = unsafe { arena::alloc(LEN, false) };
+        let huge = unsafe { arena::alloc(LEN, true) };
+        let plain_flagged = has_huge_page_flag(plain);
+        let huge_flagged = has_huge_page_flag(huge);
+        unsafe {
+            arena::dealloc(plain, LEN);
+            arena::dealloc(huge, LEN);
+        }
+        assert!(
+            !plain_flagged,
+            "arena advised MADV_HUGEPAGE without being asked"
+        );
+        assert!(huge_flagged, "arena not advised MADV_HUGEPAGE when asked");
+    }
+
+    /// Whether the mapping holding `ptr` has the `hg` flag in `/proc/self/smaps`, which the
+    /// kernel sets on `madvise(MADV_HUGEPAGE)` whatever the system's huge page mode is.
+    fn has_huge_page_flag(ptr: *mut u8) -> bool {
+        let addr = ptr as usize;
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut in_mapping = false;
+        for line in smaps.lines() {
+            let range = line.split_whitespace().next().unwrap_or("");
+            if let Some((start, end)) = range.split_once('-') {
+                if let (Ok(start), Ok(end)) = (
+                    usize::from_str_radix(start, 16),
+                    usize::from_str_radix(end, 16),
+                ) {
+                    in_mapping = (start..end).contains(&addr);
+                    continue;
+                }
+            }
+            if in_mapping {
+                if let Some(flags) = line.strip_prefix("VmFlags:") {
+                    return flags.split_whitespace().any(|flag| flag == "hg");
+                }
+            }
+        }
+        panic!("no mapping in /proc/self/smaps holds {addr:#x}");
     }
 }
