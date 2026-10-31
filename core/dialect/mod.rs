@@ -247,6 +247,19 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// The value to store when a value's type does not match a STRICT column,
+    /// or `None` to reject the mismatch.
+    ///
+    /// SQLite rejects it. PostgreSQL applies an assignment cast, so a float
+    /// stored in an integer column is rounded instead of refused.
+    fn assignment_cast(
+        &self,
+        _value: &crate::Value,
+        _target: crate::types::ValueType,
+    ) -> Option<crate::Value> {
+        None
+    }
+
     /// Whether `CREATE INDEX` accepts qualified column names such as `t.a`
     /// in its indexed terms.
     ///
