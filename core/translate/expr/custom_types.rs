@@ -173,23 +173,7 @@ pub(crate) fn emit_user_facing_column_value(
         return Ok(());
     }
     if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
-        if resolved.chain.iter().all(|td| td.decode().is_none()) {
-            return Ok(());
-        }
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg: dest_reg,
-            target_pc: skip_label,
-        });
-
-        // Apply decode in reverse order (parent/ancestor first, then child)
-        for td in resolved.chain.iter().rev() {
-            if let Some(decode_expr) = td.decode() {
-                emit_type_expr(program, decode_expr, dest_reg, dest_reg, resolver)?;
-            }
-        }
-
-        program.preassign_label_to_next_insn(skip_label);
+        emit_decode(program, &resolved.chain, dest_reg, resolver)?;
     }
     Ok(())
 }
@@ -278,9 +262,7 @@ pub(crate) fn emit_store_value(
     resolver: &Resolver,
 ) -> Result<()> {
     for type_def in chain {
-        if let Some(encode) = type_def.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
-        }
+        emit_encode(program, type_def, reg, resolver)?;
         emit_coerce(program, type_def, reg, type_params, resolver)?;
     }
     Ok(())
@@ -940,11 +922,22 @@ pub(crate) fn emit_stored_form(
         target_pc: skip_null,
     });
     for td in &ty.chain {
-        if let Some(encode) = td.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
-        }
+        emit_encode(program, td, reg, resolver)?;
     }
     program.preassign_label_to_next_insn(skip_null);
+    Ok(())
+}
+
+/// Runs the type's own ENCODE on the value in `reg`, if it has one.
+fn emit_encode(
+    program: &mut ProgramBuilder,
+    type_def: &TypeDef,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if let Some(encode) = type_def.encode() {
+        emit_type_expr(program, encode, reg, reg, resolver)?;
+    }
     Ok(())
 }
 
