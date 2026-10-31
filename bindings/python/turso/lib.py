@@ -229,20 +229,6 @@ def _batch_begin_sql(mode: Optional[str]) -> Optional[str]:
     return begin_sql
 
 
-def _check_isolation_level(level: Optional[str]) -> Optional[str]:
-    """Return `level` in the uppercase form sqlite3 stores, or raise as sqlite3 does
-    for a value that is not a transaction mode."""
-    if level is None:
-        return None
-    if not isinstance(level, str):
-        raise TypeError("isolation_level must be str or None")
-    if level != "" and level.lower() not in _BATCH_MODES:
-        raise ValueError(
-            "isolation_level string must be '', 'DEFERRED', 'IMMEDIATE', 'EXCLUSIVE', or 'CONCURRENT'"
-        )
-    return level.upper()
-
-
 def _normalize_batch_statements(
     statements: Iterable[Any],
 ) -> list[tuple[str, Sequence[Any] | Mapping[str, Any]]]:
@@ -402,7 +388,7 @@ class Connection:
         #   We'll use BEGIN DEFERRED after commit/rollback.
         # - "LEGACY": implicit transactions on DML when isolation_level is not None.
         self._autocommit_mode: object | bool = "LEGACY"
-        self._isolation_level: Optional[str] = _check_isolation_level(isolation_level)
+        self.isolation_level = isolation_level
         self.row_factory: Callable[[Cursor, Row], object] | type[Row] | None = None
         self.text_factory: Any = str
         self.extra_io = extra_io
@@ -494,7 +480,15 @@ class Connection:
 
     @isolation_level.setter
     def isolation_level(self, val: Optional[str]) -> None:
-        self._isolation_level = _check_isolation_level(val)
+        if val is not None:
+            if not isinstance(val, str):
+                raise TypeError("isolation_level must be str or None")
+            if val != "" and val.lower() not in _BATCH_MODES:
+                raise ValueError(
+                    "isolation_level string must be '', 'DEFERRED', 'IMMEDIATE', 'EXCLUSIVE', or 'CONCURRENT'"
+                )
+            val = val.upper()
+        self._isolation_level = val
         # As in sqlite3, switching to autocommit commits any pending transaction
         if val is None:
             self.commit()
