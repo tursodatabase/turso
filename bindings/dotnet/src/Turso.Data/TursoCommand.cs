@@ -181,7 +181,7 @@ public class TursoCommand : DbCommand
 
                 if (!string.IsNullOrEmpty(parameter.ParameterName))
                 {
-                    var parameterIndex = TursoBindings.BindNamedParameter(preparedStatement, parameter.ParameterName, parameter.ToValue());
+                    var parameterIndex = TursoBindings.BindNamedParameter(preparedStatement, parameter.ParameterName, parameter.ToValue(_connection.BinaryGuid));
                     if (parameterIndex == 0)
                         throw new InvalidOperationException($"Parameter {parameter.ParameterName} was not found in the SQL statement.");
 
@@ -193,7 +193,7 @@ public class TursoCommand : DbCommand
                     if (parameterIndex > parameterCount)
                         throw new InvalidOperationException($"Parameter at position {parameterIndex} was not found in the SQL statement.");
 
-                    TursoBindings.BindParameter(preparedStatement, parameterIndex, parameter.ToValue());
+                    TursoBindings.BindParameter(preparedStatement, parameterIndex, parameter.ToValue(_connection.BinaryGuid));
                     boundParameters[parameterIndex] = true;
                 }
             }

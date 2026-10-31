@@ -48,6 +48,8 @@ public class TursoConnection : DbConnection
 
     public override string DataSource => _connectionOptions["Data Source"] ?? "";
 
+    internal bool BinaryGuid => _connectionOptions.BinaryGuid;
+
     public override string ServerVersion => typeof(TursoConnection).Assembly.GetName().Version?.ToString() ?? "0.0.0";
 
     public override ConnectionState State => _turso is not null || _remoteClient is not null
@@ -475,11 +477,17 @@ public class TursoConnection : DbConnection
         var handler = RemoteMessageHandlerFactory?.Invoke();
         _remoteClient = handler is null
             ? new TursoRemoteClient(_connectionOptions.GetRemoteUri(), _connectionOptions.AuthToken)
+            {
+                BinaryGuid = _connectionOptions.BinaryGuid,
+            }
             : new TursoRemoteClient(
                 new HttpClient(handler),
                 _connectionOptions.GetRemoteUri(),
                 _connectionOptions.AuthToken,
-                disposeHttpClient: true);
+                disposeHttpClient: true)
+            {
+                BinaryGuid = _connectionOptions.BinaryGuid,
+            };
     }
 
     private void OpenReplica()

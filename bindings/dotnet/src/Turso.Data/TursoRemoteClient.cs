@@ -40,6 +40,8 @@ internal sealed class TursoRemoteClient : IDisposable
 
     public bool HasOpenSession => _baton is not null;
 
+    internal bool BinaryGuid { get; init; }
+
     public void ResetSession()
     {
         _baton = null;
@@ -190,7 +192,7 @@ internal sealed class TursoRemoteClient : IDisposable
         throw new InvalidOperationException("Auth Token requires an HTTPS remote Turso URL unless the host is localhost or loopback.");
     }
 
-    private static RemoteStatement BuildStatement(string sql, TursoParameterCollection parameters, bool wantRows)
+    private RemoteStatement BuildStatement(string sql, TursoParameterCollection parameters, bool wantRows)
     {
         var statement = new RemoteStatement
         {
@@ -200,7 +202,7 @@ internal sealed class TursoRemoteClient : IDisposable
 
         foreach (TursoParameter parameter in parameters)
         {
-            var value = RemoteRequestValue.FromTursoValue(parameter.ToValue());
+            var value = RemoteRequestValue.FromTursoValue(parameter.ToValue(BinaryGuid));
             if (string.IsNullOrEmpty(parameter.ParameterName))
             {
                 statement.Args.Add(value);
