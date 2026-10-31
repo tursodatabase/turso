@@ -231,6 +231,42 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether integer arithmetic whose result does not fit in 64 bits
+    /// raises an error.
+    ///
+    /// PostgreSQL raises SQLSTATE 22003. SQLite returns the result as a
+    /// REAL.
+    fn errors_on_integer_overflow(&self) -> bool {
+        false
+    }
+
+    /// Whether a constant that is not an integer may appear in ORDER BY
+    /// or GROUP BY.
+    ///
+    /// SQLite sorts and groups by the constant, which does nothing.
+    /// PostgreSQL reads integer constants as select-list positions and
+    /// rejects every other constant as a syntax error.
+    fn allows_non_integer_sort_constants(&self) -> bool {
+        true
+    }
+
+    /// Whether a numeric constant is a valid WHERE clause.
+    ///
+    /// SQLite treats any nonzero number as true. PostgreSQL requires WHERE
+    /// to be boolean and raises SQLSTATE 42804.
+    fn allows_numeric_constants_in_where(&self) -> bool {
+        true
+    }
+
+    /// Whether a result column outside any aggregate may reference a
+    /// column in an aggregate query that has no GROUP BY clause.
+    ///
+    /// SQLite allows these bare columns and takes their value from an
+    /// arbitrary row. PostgreSQL raises SQLSTATE 42803.
+    fn allows_bare_columns_in_aggregate_queries(&self) -> bool {
+        true
+    }
+
     /// Whether `mod` of two integers returns an integer.
     ///
     /// PostgreSQL returns an integer. SQLite always returns a REAL.

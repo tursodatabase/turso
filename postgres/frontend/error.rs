@@ -215,9 +215,15 @@ fn sqlstate(error: &LimboError) -> &'static str {
             ConstraintKind::ForeignKey => SQLSTATE_FK_VIOLATION,
             ConstraintKind::NotNull => SQLSTATE_NOT_NULL_VIOLATION,
             ConstraintKind::Check => SQLSTATE_CHECK_VIOLATION,
+            ConstraintKind::Other if cv.message.starts_with("invalid input for type") => {
+                SQLSTATE_INVALID_TEXT_REPRESENTATION
+            }
             ConstraintKind::Other => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
         },
         LimboError::ForeignKeyConstraint(_) => SQLSTATE_FK_VIOLATION,
+        LimboError::Constraint(msg) if msg.starts_with("invalid input for type") => {
+            SQLSTATE_INVALID_TEXT_REPRESENTATION
+        }
         LimboError::Constraint(_) => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
         LimboError::LexerError(_) => SQLSTATE_SYNTAX_ERROR,
         LimboError::ParseError(msg) => parse_error_sqlstate(msg),
@@ -279,21 +285,30 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
+    } else if msg.starts_with("duplicate column name") {
+        SQLSTATE_DUPLICATE_COLUMN
     } else if msg.contains("no such table")
         || msg.contains("table not found")
         || msg.starts_with("no such object")
+        || msg.starts_with("no such view")
     {
         SQLSTATE_UNDEFINED_TABLE
     } else if msg.contains("no such column") || msg.contains("column not found") {
         SQLSTATE_UNDEFINED_COLUMN
-    } else if msg.contains("no such function") || msg.contains("no such window") {
+    } else if msg.contains("no such function")
+        || msg.contains("no such window")
+        || msg.starts_with("operator does not exist")
+    {
         SQLSTATE_UNDEFINED_FUNCTION
     } else if msg.contains("already exists") {
         SQLSTATE_DUPLICATE_TABLE
     } else if msg.starts_with("ambiguous column name") {
         SQLSTATE_AMBIGUOUS_COLUMN
+    } else if msg.starts_with("argument of WHERE must be type boolean") {
+        SQLSTATE_DATATYPE_MISMATCH
     } else if msg.starts_with("misuse of aggregate")
         || msg.starts_with("aggregate functions are not allowed")
+        || msg.contains("must appear in the GROUP BY clause")
     {
         SQLSTATE_GROUPING_ERROR
     } else if msg.starts_with("misuse of window function") {
@@ -340,6 +355,8 @@ fn is_duplicate_object_error(msg: &str) -> bool {
 fn invalid_argument_sqlstate(msg: &str) -> &'static str {
     if msg.starts_with("no such database") {
         SQLSTATE_INVALID_SCHEMA_NAME
+    } else if msg.starts_with("No such index") {
+        SQLSTATE_UNDEFINED_OBJECT
     } else {
         SQLSTATE_DATA_EXCEPTION
     }
@@ -442,6 +459,16 @@ mod tests {
         for (msg, code) in [
             ("no such table: t", SQLSTATE_UNDEFINED_TABLE),
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
+            ("duplicate column name: x", SQLSTATE_DUPLICATE_COLUMN),
+            ("no such view: v", SQLSTATE_UNDEFINED_TABLE),
+            (
+                "operator does not exist: - boolean",
+                SQLSTATE_UNDEFINED_FUNCTION,
+            ),
+            (
+                "duplicate column name: no such table",
+                SQLSTATE_DUPLICATE_COLUMN,
+            ),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
             (
@@ -487,6 +514,22 @@ mod tests {
                 ErrorReport::from(&e).sqlstate,
                 code,
                 "wrong SQLSTATE for parse error {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_argument_errors_classify_by_message() {
+        for (msg, code) in [
+            ("No such index: i", SQLSTATE_UNDEFINED_OBJECT),
+            ("no such database: d", SQLSTATE_INVALID_SCHEMA_NAME),
+            ("bad argument", SQLSTATE_DATA_EXCEPTION),
+        ] {
+            let e = LimboError::InvalidArgument(msg.to_string());
+            assert_eq!(
+                ErrorReport::from(&e).sqlstate,
+                code,
+                "wrong SQLSTATE for invalid argument {msg:?}"
             );
         }
     }

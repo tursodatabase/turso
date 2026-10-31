@@ -316,46 +316,61 @@ pub fn op_init(
 }
 
 pub fn op_add(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Add { lhs, rhs, dest }, insn);
-    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_add(r)) {
-        state.registers[*dest].set_numeric(result);
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
+    if let Some((l, r)) = numeric_operands(state, *lhs, *rhs) {
+        if let Some(result) = l.checked_add(r) {
+            if integer_overflow_widened(l, r, result) {
+                check_integer_overflow(program)?;
+            }
+            state.registers[*dest].set_numeric(result);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_add)
 }
 
 pub fn op_subtract(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
-    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_sub(r)) {
-        state.registers[*dest].set_numeric(result);
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
+    if let Some((l, r)) = numeric_operands(state, *lhs, *rhs) {
+        if let Some(result) = l.checked_sub(r) {
+            if integer_overflow_widened(l, r, result) {
+                check_integer_overflow(program)?;
+            }
+            state.registers[*dest].set_numeric(result);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_subtract)
 }
 
 pub fn op_multiply(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
-    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_mul(r)) {
-        state.registers[*dest].set_numeric(result);
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
+    if let Some((l, r)) = numeric_operands(state, *lhs, *rhs) {
+        if let Some(result) = l.checked_mul(r) {
+            if integer_overflow_widened(l, r, result) {
+                check_integer_overflow(program)?;
+            }
+            state.registers[*dest].set_numeric(result);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_multiply)
 }
@@ -416,6 +431,9 @@ pub fn op_divide(
         return Ok(InsnFunctionStepResult::Step);
     }
     check_divisor(program, state, *lhs, *rhs)?;
+    if integer_operands(state, *lhs, *rhs).is_some() {
+        check_integer_overflow(program)?;
+    }
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_divide)
 }
 
@@ -464,6 +482,25 @@ pub fn op_remainder(
     }
     check_divisor(program, state, *lhs, *rhs)?;
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_remainder)
+}
+
+/// Whether an arithmetic result on two integer operands came out as a
+/// REAL, which means the integer result did not fit in 64 bits.
+#[inline(always)]
+fn integer_overflow_widened(lhs: Numeric, rhs: Numeric, result: Numeric) -> bool {
+    matches!(
+        (lhs, rhs, result),
+        (Numeric::Integer(_), Numeric::Integer(_), Numeric::Float(_))
+    )
+}
+
+/// SQLite returns overflowing integer arithmetic as a REAL; dialects like
+/// PostgreSQL raise an error instead.
+fn check_integer_overflow(program: &Program) -> Result<(), Box<LimboError>> {
+    if program.connection.dialect().errors_on_integer_overflow() {
+        return Err(LimboError::IntegerOverflow.into());
+    }
+    Ok(())
 }
 
 fn check_divisor(

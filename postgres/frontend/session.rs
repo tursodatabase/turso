@@ -132,6 +132,7 @@ impl PgConnection {
         opts: turso_core::ConnectOpts,
     ) -> crate::Result<Self> {
         let conn = db.connect_with_hooks(opts, Arc::new(PgSessionState::default()))?;
+        conn.set_foreign_keys_enabled(true);
         refuse_tables_in_no_schema(&conn)?;
         set_search_path(&conn, None, SettingScope::Session)?;
         Ok(Self {
@@ -406,9 +407,10 @@ fn prepare_statement_inner(
     };
     let (sql, parse_result) = name_foreign_key_tables(&pg_conn.conn, sql, parse_result)?;
     let translator = PostgreSQLTranslator::new();
-    let translated = translator
+    let mut translated = translator
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
+    apply_assignment_coercion(&pg_conn.conn, &mut translated.cmd);
     reject_catalog_dml(translated.cmd.stmt())?;
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
@@ -512,25 +514,33 @@ fn tx_state_post_run(
                 Ok(())
             })
         }
-        TxRole::Other => match stmt {
-            ast::Stmt::Savepoint { name } => {
-                let name = name.as_str().to_string();
-                Arc::new(move |result: crate::Result<()>| {
-                    result?;
-                    tx.savepoint_created(&conn, &name);
-                    Ok(())
-                })
-            }
-            ast::Stmt::Release { name } => {
-                let name = name.as_str().to_string();
-                Arc::new(move |result: crate::Result<()>| {
-                    result?;
-                    tx.savepoint_released(&conn, &name);
-                    Ok(())
-                })
-            }
-            _ => Arc::new(|result| result),
-        },
+        TxRole::Savepoint => {
+            let name = match stmt {
+                ast::Stmt::Savepoint { name } => Some(name.as_str().to_string()),
+                _ => None,
+            };
+            Arc::new(move |result: crate::Result<()>| {
+                result?;
+                if let Some(name) = &name {
+                    tx.savepoint_created(&conn, name);
+                }
+                Ok(())
+            })
+        }
+        TxRole::Release => {
+            let name = match stmt {
+                ast::Stmt::Release { name } => Some(name.as_str().to_string()),
+                _ => None,
+            };
+            Arc::new(move |result: crate::Result<()>| {
+                result?;
+                if let Some(name) = &name {
+                    tx.savepoint_released(&conn, name);
+                }
+                Ok(())
+            })
+        }
+        TxRole::Other => Arc::new(|result| result),
     }
 }
 
@@ -553,6 +563,8 @@ fn tx_role(stmt: &ast::Stmt) -> TxRole {
             ..
         } => TxRole::RollbackToSavepoint,
         ast::Stmt::Rollback { .. } => TxRole::Rollback,
+        ast::Stmt::Savepoint { .. } => TxRole::Savepoint,
+        ast::Stmt::Release { .. } => TxRole::Release,
         _ => TxRole::Other,
     }
 }
@@ -719,6 +731,143 @@ fn foreign_key_table_namespace(
         })
         .or_else(|| candidates.first())
         .cloned()
+}
+
+/// PostgreSQL coerces each inserted or assigned value to its column's
+/// type, where SQLite's affinity accepts anything, and an INSERT without a
+/// column list may give fewer values than the table has columns, with the
+/// rest filled from defaults. Values headed for a basic numeric column are
+/// wrapped in pg_cast_input, and a short INSERT gets the leading columns
+/// as its column list. Columns of other types keep the engine's handling.
+fn apply_assignment_coercion(conn: &Arc<Connection>, cmd: &mut ast::Cmd) {
+    let ast::Cmd::Stmt(stmt) = cmd else { return };
+    match stmt {
+        ast::Stmt::Insert {
+            tbl_name,
+            columns,
+            body: ast::InsertBody::Select(select, _),
+            ..
+        } => {
+            let Some(table) = assignment_target_table(conn, tbl_name) else {
+                return;
+            };
+            let ast::OneSelect::Values(rows) = &mut select.body.select else {
+                return;
+            };
+            if columns.is_empty() {
+                let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+                if width > 0 && width < table.columns().len() {
+                    *columns = table
+                        .columns()
+                        .iter()
+                        .take(width)
+                        .filter_map(|column| column.name.clone())
+                        .map(ast::Name::exact)
+                        .collect();
+                    if columns.len() != width {
+                        columns.clear();
+                    }
+                }
+            }
+            let labels: Vec<Option<&'static str>> = if columns.is_empty() {
+                table
+                    .columns()
+                    .iter()
+                    .map(|column| numeric_column_type(column))
+                    .collect()
+            } else {
+                columns
+                    .iter()
+                    .map(|name| {
+                        table
+                            .get_column(name.as_str())
+                            .and_then(|(_, column)| numeric_column_type(column))
+                    })
+                    .collect()
+            };
+            for row in rows {
+                for (expr, label) in row.iter_mut().zip(&labels) {
+                    if let Some(label) = label {
+                        wrap_in_cast_input(expr, label);
+                    }
+                }
+            }
+        }
+        ast::Stmt::Update(update) => {
+            let Some(table) = assignment_target_table(conn, &update.tbl_name) else {
+                return;
+            };
+            for set in &mut update.sets {
+                let [name] = set.col_names.as_slice() else {
+                    continue;
+                };
+                let Some(label) = table
+                    .get_column(name.as_str())
+                    .and_then(|(_, column)| numeric_column_type(column))
+                else {
+                    continue;
+                };
+                wrap_in_cast_input(&mut set.expr, label);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assignment_target_table(
+    conn: &Arc<Connection>,
+    tbl_name: &ast::QualifiedName,
+) -> Option<Arc<turso_core::schema::BTreeTable>> {
+    let schema = conn.current_schema();
+    let name = tbl_name.name.as_str();
+    let namespace = match &tbl_name.namespace {
+        Some(namespace) => conn.qualifier(namespace.as_str())?.target,
+        None => {
+            conn.search_order()
+                .into_iter()
+                .find(|namespace| schema.has_table(namespace.target.id, name))?
+                .target
+        }
+    };
+    schema.get_btree_table(namespace.id, name)
+}
+
+/// The PostgreSQL name of a column type whose input pg_cast_input
+/// validates. Array columns and types backed by custom types validate
+/// their own input.
+fn numeric_column_type(column: &turso_core::schema::Column) -> Option<&'static str> {
+    if column.array_dimensions() != 0 {
+        return None;
+    }
+    match column.ty_str.to_ascii_lowercase().as_str() {
+        "int2" | "smallint" => Some("smallint"),
+        "int4" | "int" | "integer" => Some("integer"),
+        "int8" | "bigint" => Some("bigint"),
+        "float4" | "real" => Some("real"),
+        "float8" | "double precision" => Some("double precision"),
+        "numeric" | "decimal" => Some("numeric"),
+        _ => None,
+    }
+}
+
+fn wrap_in_cast_input(expr: &mut Box<ast::Expr>, cast_type: &str) {
+    let value = std::mem::replace(expr.as_mut(), ast::Expr::Literal(ast::Literal::Null));
+    *expr.as_mut() = ast::Expr::FunctionCall {
+        name: ast::Name::exact("pg_cast_input".to_string()),
+        distinctness: None,
+        args: vec![
+            Box::new(value),
+            Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                "'{cast_type}'"
+            )))),
+        ],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    };
 }
 
 /// Core reports a name whose namespace does not exist as a missing
@@ -1065,7 +1214,7 @@ fn prepare_set_transaction(
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
-    conn.prepare("SELECT 0 WHERE 0")
+    conn.prepare("SELECT 0 LIMIT 0")
 }
 
 fn execute_sqlite(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
