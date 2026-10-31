@@ -216,6 +216,63 @@ fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
 /// directly, because the translated AST always references the engine
 /// surface regardless of the frontend dialect.
 pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
+    let func = resolve_builtin_function_name(name, arg_count)?;
+    // These functions read a fixed number of argument registers, and their
+    // arms in `resolve_builtin_function_name` do not check the argument count.
+    if let Some(Func::Scalar(srf)) = &func {
+        if matches!(
+            srf,
+            ScalarFunc::ArrayElement
+                | ScalarFunc::ArraySetElement
+                | ScalarFunc::GetByte
+                | ScalarFunc::SetByte
+                | ScalarFunc::TestUintEncode
+                | ScalarFunc::TestUintDecode
+                | ScalarFunc::StringReverse
+                | ScalarFunc::BooleanToInt
+                | ScalarFunc::IntToBoolean
+                | ScalarFunc::ValidateIpAddr
+                | ScalarFunc::Gcd
+                | ScalarFunc::Lcm
+                | ScalarFunc::Repeat
+                | ScalarFunc::Lpad
+                | ScalarFunc::Rpad
+                | ScalarFunc::NumericEncode
+                | ScalarFunc::NumericDecode
+                | ScalarFunc::NumericAdd
+                | ScalarFunc::NumericSub
+                | ScalarFunc::NumericMul
+                | ScalarFunc::NumericDiv
+                | ScalarFunc::NumericMod
+                | ScalarFunc::NumericFit
+                | ScalarFunc::NumericNeg
+                | ScalarFunc::DatePlus
+                | ScalarFunc::DateMinus
+                | ScalarFunc::DateDiff
+                | ScalarFunc::ArrayLength
+                | ScalarFunc::ArrayAppend
+                | ScalarFunc::ArrayPrepend
+                | ScalarFunc::ArrayCat
+                | ScalarFunc::ArrayRemove
+                | ScalarFunc::ArrayContains
+                | ScalarFunc::ArrayPosition
+                | ScalarFunc::ArraySlice
+                | ScalarFunc::StringToArray
+                | ScalarFunc::ArrayToString
+                | ScalarFunc::ArrayOverlap
+                | ScalarFunc::ArrayContainsAll
+                | ScalarFunc::NextVal
+                | ScalarFunc::SetVal
+                | ScalarFunc::CurrVal
+        ) && !srf.arities().contains(&(arg_count as i32))
+        {
+            crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+        }
+    }
+    Ok(func)
+}
+
+fn resolve_builtin_function_name(name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
     let normalized_name = crate::util::normalize_ident(name);
     match normalized_name.as_str() {
         "avg" => {
