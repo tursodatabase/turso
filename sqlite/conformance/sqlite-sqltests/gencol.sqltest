@@ -6243,3 +6243,23 @@ expect {
     0
     ok
 }
+
+test gencol_delete_returning_column_after_virtual {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT AS (ZEROBLOB(5)) VIRTUAL, c INTEGER);
+    INSERT INTO t1(a, c) VALUES (1, 100), (2, 200), (3, 300);
+    DELETE FROM t1 RETURNING c;
+}
+expect {
+    100
+    200
+    300
+}
+
+test gencol_delete_returning_column_before_and_after_virtual {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT AS (ZEROBLOB(3)) VIRTUAL, c INTEGER, d TEXT AS (a || c) VIRTUAL, e TEXT);
+    INSERT INTO t1(a, c, e) VALUES (1, 10, 'x'), (2, 20, 'y');
+    DELETE FROM t1 WHERE a = 1 RETURNING a, c, e;
+}
+expect {
+    1|10|x
+}
