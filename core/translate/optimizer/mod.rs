@@ -1,6 +1,6 @@
 use super::{
     emitter::Resolver,
-    expr_context::ExprContext,
+    expr_context::{ExprContext, ExprProperties, TableMetadata},
     plan::{
         DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember,
         JoinOrigin, JoinType, JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp,
@@ -24,7 +24,8 @@ use crate::{
     translate::{
         expr::{
             expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
-            expression_can_fail_on_input, walk_expr, WalkControl,
+            expr_type::TypeEnv, expression_can_fail_on_input, runs_custom_type_function, walk_expr,
+            WalkControl,
         },
         insert::ROWID_COLUMN,
         optimizer::{
@@ -905,7 +906,10 @@ fn detect_simple_aggregate(
         AggFunc::Count
             if is_unfiltered_btree_count
                 && matches!(agg.distinctness, super::plan::Distinctness::NonDistinct)
-                && agg.args[0].is_nonnull(&plan.table_references) =>
+                && agg.args[0].is_nonnull(
+                    &TableMetadata::new(Some(&plan.table_references)),
+                    &TypeEnv::new(Some(&plan.table_references), resolver),
+                ) =>
         {
             Some(SimpleAggregate::Count)
         }
@@ -3984,7 +3988,7 @@ pub trait Optimizable {
         Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysFalse))
     }
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool;
-    fn is_nonnull(&self, tables: &TableReferences) -> bool;
+    fn is_nonnull(&self, properties: &impl ExprProperties, types: &TypeEnv) -> bool;
 }
 
 impl Optimizable for ast::Expr {
@@ -3994,16 +3998,25 @@ impl Optimizable for ast::Expr {
     /// This function is currently very conservative, and will return false
     /// for any expression where we aren't sure and didn't bother to find out
     /// by writing more complex code.
-    fn is_nonnull(&self, tables: &TableReferences) -> bool {
+    fn is_nonnull(&self, properties: &impl ExprProperties, types: &TypeEnv) -> bool {
         match self {
             Expr::SubqueryResult { .. } => false,
             Expr::Between {
                 lhs, start, end, ..
-            } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
+            } => {
+                lhs.is_nonnull(properties, types)
+                    && start.is_nonnull(properties, types)
+                    && end.is_nonnull(properties, types)
+            }
             Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
             Expr::Binary(_, ast::Operator::ArrowRight | ast::Operator::ArrowRightShift, _) => false, // JSON path may be absent, yielding NULL
             Expr::Binary(_, ast::Operator::ArrayContains | ast::Operator::ArrayOverlap, _) => false,
-            Expr::Binary(expr, _, expr1) => expr.is_nonnull(tables) && expr1.is_nonnull(tables),
+            Expr::Binary(lhs, _, rhs) => {
+                // A custom type's function may return NULL for any operands.
+                !runs_custom_type_function(self, types)
+                    && lhs.is_nonnull(properties, types)
+                    && rhs.is_nonnull(properties, types)
+            }
             Expr::Case {
                 when_then_pairs,
                 else_expr,
@@ -4016,13 +4029,13 @@ impl Optimizable for ast::Expr {
                 // result, so its nullability does not matter.
                 when_then_pairs
                     .iter()
-                    .all(|(_, then)| then.is_nonnull(tables))
+                    .all(|(_, then)| then.is_nonnull(properties, types))
                     && else_expr
                         .as_ref()
-                        .is_some_and(|else_expr| else_expr.is_nonnull(tables))
+                        .is_some_and(|else_expr| else_expr.is_nonnull(properties, types))
             }
-            Expr::Cast { expr, .. } => expr.is_nonnull(tables),
-            Expr::Collate(expr, _) => expr.is_nonnull(tables),
+            Expr::Cast { expr, .. } => expr.is_nonnull(properties, types),
+            Expr::Collate(expr, _) => expr.is_nonnull(properties, types),
             Expr::DoublyQualified(..) => {
                 panic!("Do not call is_nonnull before DoublyQualified has been rewritten as Column")
             }
@@ -4032,36 +4045,17 @@ impl Optimizable for ast::Expr {
             // A merged USING column is NULL when all of its source columns are NULL.
             Expr::MergedColumn(_) => false,
             Expr::Id(..) => panic!("Do not call is_nonnull before Id has been rewritten as Column"),
+            // A rowid alias column reads the rowid itself.
             Expr::Column {
                 table,
-                column,
-                is_rowid_alias,
+                is_rowid_alias: true,
                 ..
-            } => {
-                // SQLite marks columns from the nullable side of an outer join
-                // as nullable, even when the table schema says NOT NULL.
-                if tables.outer_join_may_null_extend(*table) {
-                    return false;
-                }
-                if *is_rowid_alias {
-                    return true;
-                }
-
-                let (_, table_ref) = tables
-                    .find_table_by_internal_id(*table)
-                    .expect("table not found");
-                let columns = table_ref.columns();
-                let column = &columns[*column];
-                // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
-                // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
-                column.is_rowid_alias() || column.notnull()
-            }
-            // A rowid is not NULL for a real table row. An outer join can
-            // replace that row with a synthetic row whose rowid is NULL.
-            Expr::RowId { table, .. } => !tables.outer_join_may_null_extend(*table),
+            } => properties.rowid_is_nonnull(*table),
+            Expr::Column { table, column, .. } => properties.column_is_nonnull(*table, *column),
+            Expr::RowId { table, .. } => properties.rowid_is_nonnull(*table),
             Expr::InList { lhs, rhs, .. } => {
-                lhs.is_nonnull(tables)
-                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables)))
+                lhs.is_nonnull(properties, types)
+                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(properties, types)))
             }
             Expr::InSelect { .. } => false,
             Expr::InTable { .. } => false,
@@ -4073,11 +4067,11 @@ impl Optimizable for ast::Expr {
             Expr::Like {
                 lhs, rhs, escape, ..
             } => {
-                lhs.is_nonnull(tables)
-                    && rhs.is_nonnull(tables)
+                lhs.is_nonnull(properties, types)
+                    && rhs.is_nonnull(properties, types)
                     && escape
                         .as_ref()
-                        .is_none_or(|escape| escape.is_nonnull(tables))
+                        .is_none_or(|escape| escape.is_nonnull(properties, types))
             }
             Expr::Literal(literal) => match literal {
                 ast::Literal::Numeric(_) => true,
@@ -4093,16 +4087,20 @@ impl Optimizable for ast::Expr {
             },
             Expr::Name(..) => false,
             Expr::NotNull(..) => true,
-            Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_nonnull(tables)),
+            Expr::Parenthesized(exprs) => {
+                exprs.iter().all(|expr| expr.is_nonnull(properties, types))
+            }
             Expr::Qualified(..) => {
                 panic!("Do not call is_nonnull before Qualified has been rewritten as Column")
             }
             Expr::FieldAccess { .. } => false, // struct/union field extraction can return NULL
             Expr::Raise(..) => false,
             Expr::Subquery(..) => false,
-            Expr::Unary(_, expr) => expr.is_nonnull(tables),
+            Expr::Unary(_, expr) => {
+                !runs_custom_type_function(self, types) && expr.is_nonnull(properties, types)
+            }
             Expr::Variable(..) => false,
-            Expr::Register(..) => false, // Register values can be null
+            Expr::Register { .. } => false, // Register values can be null
             Expr::Default => false,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
@@ -4202,7 +4200,7 @@ impl Optimizable for ast::Expr {
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
             Expr::Variable(_) => true,
-            Expr::Register(_) => false,
+            Expr::Register { .. } => false,
             Expr::Default => true,
             Expr::Array { .. } | Expr::Subscript { .. } => {
                 unreachable!("Array and Subscript are desugared into function calls by the parser")
@@ -4335,6 +4333,7 @@ fn ephemeral_index_build(
                 nulls_order: None,
                 pos_in_table: i,
                 collation: c.collation(),
+                explicit_collation: None,
                 default: c.default.clone(),
                 expr: expr.map(Box::new),
             }
@@ -4441,11 +4440,7 @@ fn autoindex_prefilter(
             let depends_on_another_table = !constraint.lhs_mask.is_empty();
             let is_virtual_column = column.is_virtual_generated();
             let is_array = column.is_array();
-            let has_custom_type = resolver
-                .schema()
-                .get_type_def(&column.ty_str, table_reference.table.is_strict())
-                .is_some();
-            if depends_on_another_table || is_virtual_column || is_array || has_custom_type {
+            if depends_on_another_table || is_virtual_column || is_array {
                 continue;
             }
 
@@ -4463,7 +4458,10 @@ fn autoindex_prefilter(
             let contains_subquery = expr_references_any_subquery(&term.expr);
             // The build scans inner rows whose keys might never be searched.
             // Do not make a possibly failing expression run for those rows.
-            let can_fail_for_unused_row = expression_can_fail_on_input(&term.expr);
+            let can_fail_for_unused_row = expression_can_fail_on_input(
+                &term.expr,
+                &TypeEnv::new(Some(table_references), resolver),
+            );
             let was_already_added = term_positions.contains(&term_pos);
             if runs_before_outer_join_condition
                 || comes_from_another_outer_join

@@ -1266,14 +1266,7 @@ pub(super) fn tables_in_hashable_equal_test(
     else {
         return Ok(None);
     };
-    if !comparison_collation(
-        left,
-        right,
-        &ExprContext::new(Some(tables), resolver),
-        &resolver.catalog,
-    )?
-    .can_hash()
-    {
+    if !comparison_collation(left, right, &ExprContext::new(Some(tables), resolver))?.can_hash() {
         return Ok(None);
     }
     Ok(Some((left_table, right_table)))
@@ -2121,6 +2114,7 @@ fn materialized_subquery_ephemeral_index(
                 nulls_order: None,
                 pos_in_table: col_pos,
                 collation: column.collation(),
+                explicit_collation: None,
                 default: column.default.clone(),
                 expr: None,
             })
@@ -2138,6 +2132,7 @@ fn materialized_subquery_ephemeral_index(
                 nulls_order: None,
                 pos_in_table: col_pos,
                 collation: column.collation(),
+                explicit_collation: None,
                 default: column.default.clone(),
                 expr: None,
             })

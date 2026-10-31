@@ -2110,7 +2110,7 @@ fn build_fk_match_where_clause(
                 .ok()
                 .and_then(std::num::NonZeroU32::new)
                 .expect("fk parameter index must fit into NonZeroU32"),
-            "",
+            None,
             Some(&collation.name()),
         );
         let cond = Expr::Binary(
@@ -2812,7 +2812,7 @@ mod tests {
         let skip = program.allocate_label();
         let changed = program.allocate_label();
 
-        emit_key_change_check(&mut program, 1, 2, &[CollationSeq::Binary], skip, changed);
+        emit_key_change_check(&mut program, 1, 2, &[CollationSeq::BINARY], skip, changed);
 
         assert!(
             program.insns.iter().any(|(insn, _)| matches!(

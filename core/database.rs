@@ -1717,6 +1717,7 @@ impl Database {
                         pager,
                         &syms,
                         dialect.as_ref(),
+                        conn.experimental_custom_types_enabled(),
                     );
 
                     match result {
@@ -1726,30 +1727,6 @@ impl Database {
                             state.schema_guard = None;
                         }
                         Err(e) => return Err(e),
-                    }
-
-                    // Load custom types from __turso_internal_types if the table
-                    // exists and custom types are enabled. The schema loaded by
-                    // make_from_btree includes the table definition but not its
-                    // contents. We need to read the stored type definitions so
-                    // that DECODE/ENCODE and affinity metadata are available to
-                    // all subsequent connections.
-                    let conn = state
-                        .conn
-                        .as_ref()
-                        .expect("conn must be initialized in Init phase");
-                    if conn.experimental_custom_types_enabled() {
-                        // Sync the connection's schema from the database so it
-                        // can query __turso_internal_types.
-                        conn.maybe_update_schema();
-                        let type_sqls = conn.query_stored_type_definitions()?;
-                        if !type_sqls.is_empty() {
-                            let db = state
-                                .db
-                                .as_ref()
-                                .expect("db must be initialized in Init phase");
-                            db.with_schema_mut(|schema| schema.load_type_definitions(&type_sqls))?;
-                        }
                     }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
@@ -2721,6 +2698,7 @@ impl Database {
             search_path: RwLock::new(None),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
+            tx_read_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),

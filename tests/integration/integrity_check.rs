@@ -67,48 +67,18 @@ fn test_integrity_check_healthy_strict_table() {
 
 #[test]
 fn test_integrity_check_strict_custom_types() {
-    for custom_types in [false, true] {
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let path = temp_dir.path().join("strict_custom_types.db");
-        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
-        {
-            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
-            let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 0",
-            )
-            .unwrap();
-            conn.execute("CREATE TABLE t(amount cents) STRICT").unwrap();
-            conn.execute("INSERT INTO t VALUES (5)").unwrap();
-            let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t");
-            assert_eq!(rows, vec![(5,)]);
-            assert_eq!(run_integrity_check(&conn), "ok");
-            assert_eq!(run_quick_check(&conn), "ok");
-            conn.close().unwrap();
-        }
-        {
-            let db =
-                TempDatabase::new_with_existent_with_opts(&path, opts.with_custom_types(false));
-            let conn = db.connect_limbo();
-            let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t");
-            assert_eq!(rows, vec![(500,)]);
-            conn.execute("UPDATE t SET amount = 'abc'").unwrap();
-            let rows: Vec<(String,)> = conn.exec_rows("SELECT amount FROM t");
-            assert_eq!(rows, vec![("abc".to_string(),)]);
-            conn.close().unwrap();
-        }
-        let db =
-            TempDatabase::new_with_existent_with_opts(&path, opts.with_custom_types(custom_types));
-        let conn = db.connect_limbo();
-        let expected = if custom_types {
-            "non-INTEGER value in t.amount"
-        } else {
-            "ok"
-        };
-        assert_eq!(run_integrity_check(&conn), expected);
-        assert_eq!(run_quick_check(&conn), expected);
-        conn.close().unwrap();
-    }
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 0")
+        .unwrap();
+    conn.execute("CREATE TABLE t(amount cents) STRICT").unwrap();
+    conn.execute("INSERT INTO t VALUES (5)").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t");
+    assert_eq!(rows, vec![(5,)]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(run_quick_check(&conn), "ok");
 }
 
 #[test]

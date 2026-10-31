@@ -157,3 +157,539 @@ test txn-drop-table-rollback-restores {
 expect {
     0
 }
+
+# D-42: BEGIN READ ONLY rejects writes but allows reads.
+
+@setup counter
+test txn-begin-read-only-rejects-write {
+    BEGIN READ ONLY;
+    UPDATE counter SET n = 99;
+}
+@sqlstate 25006
+expect error {
+}
+
+@setup counter
+test txn-begin-read-only-rejects-insert {
+    BEGIN READ ONLY;
+    INSERT INTO counter VALUES (1);
+}
+@sqlstate 25006
+expect error {
+}
+
+@setup counter
+test txn-begin-read-only-rejects-delete {
+    BEGIN READ ONLY;
+    DELETE FROM counter;
+}
+@sqlstate 25006
+expect error {
+}
+
+@setup counter
+test txn-begin-read-only-allows-read {
+    BEGIN READ ONLY;
+    SELECT n FROM counter;
+    ROLLBACK;
+}
+expect {
+    0
+}
+
+test txn-begin-read-only-select-no-table {
+    BEGIN READ ONLY;
+    SELECT 42;
+    ROLLBACK;
+}
+expect {
+    42
+}
+
+@setup counter
+test txn-begin-read-only-rollback-restores-write {
+    BEGIN READ ONLY;
+    ROLLBACK;
+    UPDATE counter SET n = 5;
+    SELECT n FROM counter;
+}
+expect {
+    5
+}
+
+@setup counter
+test txn-begin-read-only-commit-restores-write {
+    BEGIN READ ONLY;
+    COMMIT;
+    UPDATE counter SET n = 5;
+    SELECT n FROM counter;
+}
+expect {
+    5
+}
+
+test txn-begin-read-write-allows-writes {
+    CREATE TABLE w (v int);
+    INSERT INTO w VALUES (0);
+    BEGIN READ WRITE;
+    UPDATE w SET v = 7;
+    COMMIT;
+    SELECT v FROM w;
+}
+expect {
+    7
+}
+
+@setup counter
+test txn-begin-read-only-with-isolation-level {
+    BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+    SELECT n FROM counter;
+    ROLLBACK;
+}
+expect {
+    0
+}
+
+@setup counter
+test txn-begin-read-only-savepoint-allowed {
+    BEGIN READ ONLY;
+    SAVEPOINT sp;
+    SELECT n FROM counter;
+    ROLLBACK;
+}
+expect {
+    0
+}
+
+@setup counter
+test txn-begin-read-only-release-savepoint-allowed {
+    BEGIN READ ONLY;
+    SAVEPOINT sp;
+    RELEASE SAVEPOINT sp;
+    SELECT n FROM counter;
+    ROLLBACK;
+}
+expect {
+    0
+}
+
+@setup counter
+test txn-begin-read-only-rollback-to-savepoint-stays-read-only {
+    BEGIN READ ONLY;
+    SAVEPOINT sp;
+    ROLLBACK TO sp;
+    UPDATE counter SET n = 1;
+}
+@sqlstate 25006
+expect error {
+}
+
+@setup counter
+test txn-set-transaction-read-write-clears-read-only {
+    BEGIN READ ONLY;
+    SET TRANSACTION READ WRITE;
+    UPDATE counter SET n = 1;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    1
+}
+
+test txn-start-transaction-read-only-rejects-write {
+    CREATE TABLE w (v int);
+    INSERT INTO w VALUES (0);
+    START TRANSACTION READ ONLY;
+    INSERT INTO w VALUES (1);
+}
+@sqlstate 25006
+expect error {
+}
+
+# D-43: After any error in an explicit transaction the connection enters
+# aborted state. All subsequent statements fail with 25P02 until ROLLBACK.
+# Cross-batch behavior is covered by Rust integration tests in
+# tests/integration/postgres/.
+
+@setup counter
+test txn-aborted-state-error-in-transaction-aborts-batch {
+    BEGIN;
+    SELECT 1/0;
+    SELECT n FROM counter;
+}
+@sqlstate 22012
+expect error {
+}
+
+@setup counter
+test txn-aborted-state-commit-after-error-in-same-batch {
+    BEGIN;
+    SELECT 1/0;
+    COMMIT;
+}
+@sqlstate 22012
+expect error {
+}
+
+@setup counter
+test txn-aborted-state-rollback-after-error-in-same-batch {
+    BEGIN;
+    SELECT 1/0;
+    ROLLBACK;
+}
+@sqlstate 22012
+expect error {
+}
+
+@setup counter
+test txn-aborted-state-ddl-error-causes-abort {
+    BEGIN;
+    CREATE TABLE counter (n int);
+    SELECT n FROM counter;
+}
+@sqlstate 42P07
+expect error {
+}
+
+@setup counter
+test txn-aborted-state-begin-after-error-rejected {
+    BEGIN;
+    SELECT 1/0;
+    BEGIN;
+}
+@sqlstate 22012
+expect error {
+}
+
+@setup counter
+test txn-rollback-to-savepoint-recovers-partial-work {
+    BEGIN;
+    SAVEPOINT sp;
+    UPDATE counter SET n = 99;
+    ROLLBACK TO sp;
+    SELECT n FROM counter;
+    COMMIT;
+}
+expect {
+    0
+}
+
+@setup counter
+test txn-rollback-to-savepoint-with-comment {
+    BEGIN;
+    SAVEPOINT sp;
+    UPDATE counter SET n = 99;
+    ROLLBACK /* mid-statement comment */ TO sp;
+    SELECT n FROM counter;
+    COMMIT;
+}
+expect {
+    0
+}
+
+@setup counter
+test txn-begin-semicolon-is-transaction-start {
+    BEGIN;
+    UPDATE counter SET n = 7;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    7
+}
+
+@setup counter
+test txn-begin-last-access-mode-wins {
+    BEGIN READ ONLY, READ WRITE;
+    UPDATE counter SET n = 3;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    3
+}
+
+@skip-if postgres "tursopg rejects AND CHAIN as unsupported; PostgreSQL rejects it outside a transaction block with 25P01"
+test txn-and-chain-unsupported-outside-transaction {
+    COMMIT AND CHAIN;
+}
+expect error {
+}
+
+@skip-if postgres "tursopg rejects AND CHAIN as unsupported; PostgreSQL rejects it outside a transaction block with 25P01"
+test txn-rollback-and-chain-unsupported-outside-transaction {
+    ROLLBACK AND CHAIN;
+}
+expect error {
+}
+
+@setup counter
+test txn-set-transaction-read-only-rejects-write {
+    BEGIN;
+    SET TRANSACTION READ ONLY;
+    UPDATE counter SET n = 1;
+}
+@sqlstate 25006
+expect error {
+}
+
+@setup counter
+test txn-set-transaction-last-access-mode-wins {
+    BEGIN;
+    SET TRANSACTION READ WRITE, READ ONLY;
+    UPDATE counter SET n = 1;
+}
+@sqlstate 25006
+expect error {
+}
+
+@setup counter
+test txn-set-read-write-after-query-rejected {
+    BEGIN READ ONLY;
+    SELECT n FROM counter;
+    SET TRANSACTION READ WRITE;
+}
+@sqlstate 25001
+expect error {
+    transaction read-write mode must be set before any query
+}
+
+@setup counter
+test txn-set-read-only-after-query-takes-effect {
+    BEGIN;
+    SELECT n FROM counter;
+    SET TRANSACTION READ ONLY;
+    UPDATE counter SET n = 1;
+}
+@sqlstate 25006
+expect error {
+}
+
+@setup counter
+test txn-set-same-access-mode-after-query-allowed {
+    BEGIN READ ONLY;
+    SELECT n FROM counter;
+    SET TRANSACTION READ ONLY;
+    ROLLBACK;
+    SELECT 5;
+}
+expect {
+    0
+    5
+}
+
+@setup counter
+test txn-set-access-modes-before-first-query-allowed {
+    BEGIN;
+    SET TRANSACTION READ ONLY;
+    SET TRANSACTION READ WRITE;
+    UPDATE counter SET n = 4;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    4
+}
+
+@setup counter
+test txn-nested-begin-read-write-after-query-rejected {
+    BEGIN READ ONLY;
+    SELECT n FROM counter;
+    BEGIN READ WRITE;
+}
+@sqlstate 25001
+expect error {
+    transaction read-write mode must be set before any query
+}
+
+@skip-if postgres "the runner sends the whole test as one simple-query batch, which PostgreSQL runs in an implicit transaction block, so SET TRANSACTION takes effect there; Turso runs each statement in autocommit"
+@setup counter
+test txn-set-transaction-outside-transaction-has-no-effect {
+    SET TRANSACTION READ ONLY;
+    UPDATE counter SET n = 5;
+    SELECT n FROM counter;
+}
+expect {
+    5
+}
+
+@setup counter
+test txn-commit-outside-transaction-succeeds {
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    0
+}
+
+@setup counter
+test txn-rollback-outside-transaction-succeeds {
+    ROLLBACK;
+    SELECT n FROM counter;
+}
+expect {
+    0
+}
+
+@setup counter
+test txn-nested-begin-keeps-transaction {
+    BEGIN;
+    UPDATE counter SET n = 8;
+    BEGIN;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    8
+}
+
+@setup counter
+test txn-nested-begin-read-only-applies-access-mode {
+    BEGIN;
+    BEGIN READ ONLY;
+    UPDATE counter SET n = 1;
+}
+@sqlstate 25006
+expect error {
+}
+
+@setup counter
+test txn-nested-begin-read-write-applies-access-mode {
+    BEGIN READ ONLY;
+    BEGIN READ WRITE;
+    UPDATE counter SET n = 6;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    6
+}
+
+@setup counter
+test txn-savepoint-release-restores-access-mode {
+    BEGIN;
+    SAVEPOINT a;
+    SET TRANSACTION READ ONLY;
+    RELEASE a;
+    UPDATE counter SET n = 3;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    3
+}
+
+@setup counter
+test txn-savepoint-rollback-restores-access-mode {
+    BEGIN;
+    SAVEPOINT a;
+    SET TRANSACTION READ ONLY;
+    ROLLBACK TO a;
+    UPDATE counter SET n = 4;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    4
+}
+
+@setup counter
+test txn-savepoint-does-not-count-as-first-query {
+    BEGIN READ ONLY;
+    SAVEPOINT s;
+    RELEASE s;
+    SET TRANSACTION READ WRITE;
+    UPDATE counter SET n = 1;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    1
+}
+
+@setup counter
+test txn-lock-table-does-not-count-as-first-query {
+    BEGIN READ ONLY;
+    LOCK TABLE counter IN ACCESS SHARE MODE;
+    SET TRANSACTION READ WRITE;
+    UPDATE counter SET n = 2;
+    COMMIT;
+    SELECT n FROM counter;
+}
+expect {
+    2
+}
+
+test txn-read-only-rejects-nextval {
+    CREATE SEQUENCE ro_seq;
+    BEGIN READ ONLY;
+    SELECT nextval('ro_seq');
+}
+@sqlstate 25006
+expect error {
+}
+
+test txn-read-only-rejects-setval {
+    CREATE SEQUENCE ro_seq2;
+    BEGIN READ ONLY;
+    SELECT setval('ro_seq2', 100);
+}
+@sqlstate 25006
+expect error {
+}
+
+@setup counter
+test txn-read-write-inside-savepoint-of-read-only-rejected {
+    BEGIN READ ONLY;
+    SAVEPOINT a;
+    SET TRANSACTION READ WRITE;
+}
+@sqlstate 25001
+expect error {
+    cannot set transaction read-write mode inside a read-only transaction
+}
+
+@setup counter
+test txn-nested-begin-read-write-inside-savepoint-rejected {
+    BEGIN READ ONLY;
+    SAVEPOINT a;
+    BEGIN READ WRITE;
+}
+@sqlstate 25001
+expect error {
+    cannot set transaction read-write mode inside a read-only transaction
+}
+
+@setup counter
+test txn-read-only-rejects-comment-on {
+    BEGIN READ ONLY;
+    COMMENT ON TABLE counter IS 'x';
+}
+@sqlstate 25006
+expect error {
+}
+
+@setup counter
+test txn-comment-on-counts-as-first-query {
+    BEGIN;
+    COMMENT ON TABLE counter IS 'x';
+    SET TRANSACTION READ ONLY;
+    SET TRANSACTION READ WRITE;
+}
+@sqlstate 25001
+expect error {
+    transaction read-write mode must be set before any query
+}
+
+test txn-read-only-allows-unevaluated-nextval {
+    CREATE SEQUENCE lazy_seq;
+    BEGIN READ ONLY;
+    SELECT nextval('lazy_seq') WHERE false;
+    SELECT coalesce(CASE WHEN false THEN nextval('lazy_seq') END, -1);
+    ROLLBACK;
+    SELECT nextval('lazy_seq');
+}
+expect {
+    -1
+    1
+}

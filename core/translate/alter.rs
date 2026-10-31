@@ -2,7 +2,7 @@ use crate::alloc::TursoIteratorExt;
 use crate::namespace::{demangle_name, NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
-use crate::{turso_assert_eq, turso_assert_ne};
+use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -26,6 +26,7 @@ use crate::{
             emit_stored_column, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
             NoConstantOptReason, WalkControl,
         },
+        index::expression_type_ordering,
         plan::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
             TableReferences,
@@ -39,7 +40,7 @@ use crate::{
     },
     vdbe::{
         affinity::Affinity,
-        builder::{CursorType, DmlColumnContext, ProgramBuilder},
+        builder::{CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder},
         insn::{to_u32, AddColumnData, CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
@@ -651,8 +652,13 @@ fn emit_column_constraints_validation(
         program.emit_column_or_rowid(cursor_id, idx, layout.to_register(base_dest_reg, idx));
     }
 
-    let dml_ctx =
-        DmlColumnContext::layout(resolved_table.columns(), base_dest_reg, rowid_reg, layout);
+    let dml_ctx = DmlColumnContext::layout(
+        resolved_table.columns(),
+        base_dest_reg,
+        rowid_reg,
+        layout,
+        DmlRowForm::Stored,
+    );
     compute_virtual_columns(
         program,
         &resolved_table.columns_topo_sort()?,
@@ -1200,6 +1206,11 @@ pub fn translate_alter_table(
                 }
                 let written_ty = column.written_ty_str.as_deref().unwrap_or(ty);
                 let is_builtin = ty.is_empty() || is_builtin_strict_type(written_ty);
+                if column.is_array() {
+                    resolver
+                        .schema()
+                        .check_array_element_type(&normalize_ident(ty))?;
+                }
                 // Domain types require STRICT tables because domain constraints
                 // (CHECK, NOT NULL, DEFAULT) are only enforced on STRICT tables.
                 if !is_builtin && !btree.is_strict {
@@ -1227,6 +1238,9 @@ pub fn translate_alter_table(
                 }
 
                 default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
+            }
+            if btree.is_strict {
+                column.resolve_custom_type(resolver.schema());
             }
 
             // If a column has no explicit DEFAULT but its custom type defines
@@ -1620,7 +1634,7 @@ pub fn translate_alter_table(
                     func: crate::function::FuncCtx {
                         func: Func::AlterTable(AlterTableFunc::RenameTable),
                         arg_count: 7,
-                        collation: CollationSeq::Binary,
+                        collation: CollationSeq::BINARY,
                     },
                 });
 
@@ -1928,7 +1942,7 @@ pub fn translate_alter_table(
             let altered_table = if let Some(replacement_column) = &replacement_column {
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] = replacement_column.clone();
-                table.resolve_custom_type_affinities(resolver.schema());
+                table.resolve_custom_types(resolver.schema());
                 table.prepare_generated_columns()?;
                 let column_names: Vec<&str> = table
                     .columns()
@@ -1944,6 +1958,17 @@ pub fn translate_alter_table(
             } else {
                 None
             };
+
+            if let Some(altered_table) = &altered_table {
+                reject_change_of_indexed_column_order(
+                    &original_btree,
+                    altered_table,
+                    &table_indexes,
+                    column_index,
+                    resolver.schema(),
+                    resolver.catalog.symbol_table,
+                )?;
+            }
 
             let indexes_to_rewrite = if let Some(altered_table) = &altered_table {
                 if !rewrites_physical_layout && !virtual_generated_values_may_change {
@@ -2145,7 +2170,7 @@ pub fn translate_alter_table(
                             AlterTableFunc::AlterColumn
                         }),
                         arg_count: 8,
-                        collation: CollationSeq::Binary,
+                        collation: CollationSeq::BINARY,
                     },
                 });
 
@@ -2387,6 +2412,69 @@ fn reject_alter_of_view(
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
         }
     }
+}
+
+/// Refuse an ALTER COLUMN that changes how an indexed column sorts, such as
+/// `blob` to `numeric` or `COLLATE NOCASE` to no collation. An index keeps
+/// the order it was created with until the schema is read again, so the
+/// rows written in between would be in a different order from the one the
+/// index is read in after a reopen.
+fn reject_change_of_indexed_column_order(
+    original_table: &BTreeTable,
+    rewritten_table: &BTreeTable,
+    indexes: &[Arc<Index>],
+    column_index: usize,
+    schema: &Schema,
+    syms: &SymbolTable,
+) -> Result<()> {
+    let column_name = original_table.columns()[column_index]
+        .name
+        .as_deref()
+        .expect("ALTER COLUMN target must be named");
+    let new_column = &rewritten_table.columns()[column_index];
+    let new_column_name = new_column
+        .name
+        .as_deref()
+        .expect("ALTER COLUMN replacement must be named");
+    for index in indexes {
+        for index_column in &index.columns {
+            let order_changes = if index_column.pos_in_table == column_index {
+                // After a reopen the index column takes the new column's
+                // order, unless the index names its own COLLATE, which a
+                // type with its own order does not accept.
+                match index_column.explicit_collation {
+                    Some(_) if new_column.type_ordering().is_some() => {
+                        return Err(LimboError::ParseError(format!(
+                            "cannot ALTER COLUMN \"{column_name}\": index {} names a COLLATE for it, and the new type has its own order",
+                            index.name
+                        )));
+                    }
+                    Some(_) => false,
+                    None => index_column.collation != new_column.collation(),
+                }
+            } else if index_column.pos_in_table == EXPR_INDEX_SENTINEL {
+                // An index expression sorts in the order of its type, which
+                // the column's new type can change, as for `x * 2`.
+                let expr = index_column
+                    .expr
+                    .as_ref()
+                    .expect("expression index column must have an expression");
+                let mut renamed = expr.as_ref().clone();
+                rename_identifiers(&mut renamed, column_name, new_column_name);
+                expression_type_ordering(expr, original_table, schema, syms)?
+                    != expression_type_ordering(&renamed, rewritten_table, schema, syms)?
+            } else {
+                false
+            };
+            if order_changes {
+                return Err(LimboError::ParseError(format!(
+                    "cannot ALTER COLUMN \"{column_name}\": it changes how the column sorts, and index {} is sorted by it",
+                    index.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 // Return the indexes whose persisted entries may become stale after ALTER COLUMN,
@@ -2842,7 +2930,7 @@ fn translate_rename_virtual_table(
             func: crate::function::FuncCtx {
                 func: Func::AlterTable(AlterTableFunc::RenameTable),
                 arg_count: 7,
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
             },
         });
 

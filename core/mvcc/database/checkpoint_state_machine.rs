@@ -4013,12 +4013,12 @@ mod tests {
                 vec![
                     KeyInfo {
                         sort_order: SortOrder::Asc,
-                        collation: CollationSeq::Binary,
+                        collation: CollationSeq::BINARY,
                         nulls_order: None,
                     },
                     KeyInfo {
                         sort_order: SortOrder::Asc,
-                        collation: CollationSeq::Binary,
+                        collation: CollationSeq::BINARY,
                         nulls_order: None,
                     },
                 ],

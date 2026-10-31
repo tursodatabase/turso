@@ -787,13 +787,21 @@ impl PostgreSQLTranslator {
         if txn.chain {
             return Err(not_supported("COMMIT/ROLLBACK AND CHAIN"));
         }
-        check_transaction_options(&txn.options, false)?;
+        check_transaction_options(&txn.options, true)?;
 
         match TransactionStmtKind::try_from(txn.kind) {
             Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
+                let access_mode = last_access_mode_option(&txn.options).map(|ro| {
+                    if ro {
+                        ast::AccessMode::ReadOnly
+                    } else {
+                        ast::AccessMode::ReadWrite
+                    }
+                });
                 Ok(ast::Stmt::Begin {
                     typ: Some(ast::TransactionType::Concurrent),
                     name: None,
+                    access_mode,
                 })
             }
             Ok(TransactionStmtKind::TransStmtCommit) => Ok(ast::Stmt::Commit { name: None }),
@@ -3921,6 +3929,27 @@ impl PostgreSQLTranslator {
             _ => func_name,
         };
 
+        // PostgreSQL reads untyped string literal arguments of age() as
+        // timestamptz. Casting them gives the text the timestamp type's input
+        // rules, so age() only sees timestamps in their stored form.
+        let args = if func_name == "age" {
+            args.into_iter()
+                .map(|arg| match *arg {
+                    ast::Expr::Literal(ast::Literal::String(_)) => Box::new(ast::Expr::Cast {
+                        expr: arg,
+                        type_name: Some(ast::Type {
+                            name: "timestamptz".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    }),
+                    _ => arg,
+                })
+                .collect()
+        } else {
+            args
+        };
+
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
             "FLOAT8" | "FLOAT4" => Some("REAL"),
@@ -6409,6 +6438,70 @@ pub fn check_set_transaction(parse_result: &ParseResult) -> Result<bool, ParseEr
     }
 }
 
+/// Whether PostgreSQL takes a snapshot to run the statement, which is what
+/// counts as a transaction's first query and blocks a later switch to READ
+/// WRITE. Transaction control, LOCK, SET, and SHOW run without one;
+/// everything else gets a snapshot when it executes, including utility
+/// statements like COMMENT ON.
+pub fn execution_takes_snapshot(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    !matches!(
+        parse_result.protobuf.nodes().first().map(|n| &n.0),
+        Some(
+            NodeRef::TransactionStmt(_)
+                | NodeRef::LockStmt(_)
+                | NodeRef::VariableSetStmt(_)
+                | NodeRef::VariableShowStmt(_)
+        )
+    )
+}
+
+/// The access mode a SET TRANSACTION statement names: Some(true) for READ
+/// ONLY, Some(false) for READ WRITE, None when the statement is not SET
+/// TRANSACTION or names no access mode.
+pub fn set_transaction_access_mode(parse_result: &ParseResult) -> Option<bool> {
+    use pg_query::{protobuf::VariableSetKind, NodeRef};
+
+    let nodes = parse_result.protobuf.nodes();
+    let Some(NodeRef::VariableSetStmt(stmt)) = nodes.first().map(|n| &n.0) else {
+        return None;
+    };
+    if stmt.kind != VariableSetKind::VarSetMulti as i32
+        || !stmt.name.eq_ignore_ascii_case("transaction")
+    {
+        return None;
+    }
+    last_access_mode_option(&stmt.args)
+}
+
+/// The access mode set by a list of transaction options: Some(true) for READ
+/// ONLY, Some(false) for READ WRITE, None when no access-mode option appears.
+/// PostgreSQL applies the LAST access-mode option when multiple are given,
+/// e.g. BEGIN READ ONLY, READ WRITE is READ WRITE.
+fn last_access_mode_option(options: &[pg_query::protobuf::Node]) -> Option<bool> {
+    use pg_query::protobuf::node::Node;
+
+    options
+        .iter()
+        .filter_map(|opt| {
+            let Node::DefElem(def) = opt.node.as_ref()? else {
+                return None;
+            };
+            if def.defname != "transaction_read_only" {
+                return None;
+            }
+            Some(!matches!(
+                def.arg.as_ref().and_then(|n| n.node.as_ref()),
+                Some(Node::AConst(pg_query::protobuf::AConst {
+                    val: Some(pg_query::protobuf::a_const::Val::Ival(i)),
+                    ..
+                })) if i.ival == 0
+            ))
+        })
+        .next_back()
+}
+
 /// The byte offset of the table name in a CREATE TABLE statement that names
 /// its table without a schema. None for temporary tables and for other
 /// statements.
@@ -6868,6 +6961,63 @@ pub fn try_extract_copy_from(
         header,
         null_string,
     }))
+}
+
+/// A statement that the PostgreSQL session runs itself instead of
+/// translating it: the translator refuses all of these. One variant per kind,
+/// so that callers which must decide something for each of them (the
+/// session runs them, a server classifies them) match it exhaustively and a
+/// new kind is a compile error there instead of a statement that falls
+/// through.
+pub enum SessionStmt {
+    /// SET, SET ... TO DEFAULT, SET ... FROM CURRENT or RESET of one parameter.
+    Set(PgSetStmt),
+    /// SET TRANSACTION or SET SESSION CHARACTERISTICS AS TRANSACTION.
+    SetTransaction,
+    Show(PgShowStmt),
+    ResetAll,
+    DiscardAll,
+    CreateSchema(PgCreateSchemaStmt),
+    DropSchema(PgDropSchemaStmt),
+    RefreshMatview,
+    CommentOn,
+    CopyFrom(PgCopyFromStmt),
+}
+
+/// The statement of `parse_result` if the session runs it itself, `None` if
+/// it is translated.
+pub fn session_stmt(parse_result: &ParseResult) -> Result<Option<SessionStmt>, ParseError> {
+    if let Some(stmt) = try_extract_set(parse_result) {
+        return Ok(Some(SessionStmt::Set(stmt)));
+    }
+    if check_set_transaction(parse_result)? {
+        return Ok(Some(SessionStmt::SetTransaction));
+    }
+    if let Some(stmt) = try_extract_show(parse_result) {
+        return Ok(Some(SessionStmt::Show(stmt)));
+    }
+    if is_reset_all(parse_result) {
+        return Ok(Some(SessionStmt::ResetAll));
+    }
+    if is_discard_all(parse_result) {
+        return Ok(Some(SessionStmt::DiscardAll));
+    }
+    if let Some(stmt) = try_extract_create_schema(parse_result)? {
+        return Ok(Some(SessionStmt::CreateSchema(stmt)));
+    }
+    if let Some(stmt) = try_extract_drop_schema(parse_result) {
+        return Ok(Some(SessionStmt::DropSchema(stmt)));
+    }
+    if is_refresh_matview(parse_result)? {
+        return Ok(Some(SessionStmt::RefreshMatview));
+    }
+    if is_comment_on(parse_result) {
+        return Ok(Some(SessionStmt::CommentOn));
+    }
+    if let Some(stmt) = try_extract_copy_from(parse_result)? {
+        return Ok(Some(SessionStmt::CopyFrom(stmt)));
+    }
+    Ok(None)
 }
 
 fn copy_string_option(def: &pg_query::protobuf::DefElem) -> Result<String, ParseError> {
@@ -7577,6 +7727,46 @@ fn is_binary_collation(collname: &[pg_query::protobuf::Node]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_stmt_names_each_kind_the_session_runs() {
+        let kind = |sql: &str| {
+            let parsed = crate::parse(sql).unwrap();
+            session_stmt(&parsed).unwrap().map(|stmt| match stmt {
+                SessionStmt::Set(_) => "set",
+                SessionStmt::SetTransaction => "set transaction",
+                SessionStmt::Show(_) => "show",
+                SessionStmt::ResetAll => "reset all",
+                SessionStmt::DiscardAll => "discard all",
+                SessionStmt::CreateSchema(_) => "create schema",
+                SessionStmt::DropSchema(_) => "drop schema",
+                SessionStmt::RefreshMatview => "refresh matview",
+                SessionStmt::CommentOn => "comment on",
+                SessionStmt::CopyFrom(_) => "copy from",
+            })
+        };
+        for (sql, want) in [
+            ("SET search_path TO app", "set"),
+            ("RESET search_path", "set"),
+            (
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                "set transaction",
+            ),
+            ("SHOW search_path", "show"),
+            ("RESET ALL", "reset all"),
+            ("DISCARD ALL", "discard all"),
+            ("CREATE SCHEMA IF NOT EXISTS app", "create schema"),
+            ("DROP SCHEMA app CASCADE", "drop schema"),
+            ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
+            ("COMMENT ON TABLE t IS 'x'", "comment on"),
+            ("COPY t FROM '/tmp/t.csv'", "copy from"),
+        ] {
+            assert_eq!(kind(sql), Some(want), "{sql}");
+        }
+        for sql in ["SELECT 1", "CREATE TABLE t (id int)", "DROP TABLE t"] {
+            assert_eq!(kind(sql), None, "{sql}");
+        }
+    }
 
     #[test]
     fn create_sequence_as_type_bounds_the_range() {
@@ -10645,14 +10835,39 @@ mod tests {
 
     #[test]
     fn fail_closed_transaction_options() {
-        assert_not_supported("BEGIN READ ONLY", "READ ONLY");
-        assert_not_supported(
-            "START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
-            "READ ONLY",
-        );
+        assert_translates("BEGIN READ ONLY");
+        assert_translates("START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
         assert_not_supported("COMMIT AND CHAIN", "AND CHAIN");
         assert_not_supported("ROLLBACK AND CHAIN", "AND CHAIN");
         assert_translates("COMMIT AND NO CHAIN");
+    }
+
+    #[test]
+    fn set_transaction_access_mode_detects_access_modes() {
+        let set_rw = crate::parse("SET TRANSACTION READ WRITE").unwrap();
+        let set_ro = crate::parse("SET TRANSACTION READ ONLY").unwrap();
+        let set_iso_only = crate::parse("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").unwrap();
+        let set_rw_with_iso =
+            crate::parse("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ WRITE").unwrap();
+        let begin_ro = crate::parse("BEGIN READ ONLY").unwrap();
+        let commit = crate::parse("COMMIT").unwrap();
+        let select = crate::parse("SELECT 1").unwrap();
+        assert_eq!(set_transaction_access_mode(&set_rw), Some(false));
+        assert_eq!(set_transaction_access_mode(&set_ro), Some(true));
+        assert_eq!(set_transaction_access_mode(&set_iso_only), None);
+        assert_eq!(set_transaction_access_mode(&set_rw_with_iso), Some(false));
+        assert_eq!(set_transaction_access_mode(&begin_ro), None);
+        assert_eq!(set_transaction_access_mode(&commit), None);
+        assert_eq!(set_transaction_access_mode(&select), None);
+    }
+
+    #[test]
+    fn set_transaction_access_mode_uses_last_access_mode_option() {
+        // PostgreSQL applies the last access-mode option when multiple are given.
+        let rw_then_ro = crate::parse("SET TRANSACTION READ WRITE, READ ONLY").unwrap();
+        let ro_then_rw = crate::parse("SET TRANSACTION READ ONLY, READ WRITE").unwrap();
+        assert_eq!(set_transaction_access_mode(&rw_then_ro), Some(true));
+        assert_eq!(set_transaction_access_mode(&ro_then_rw), Some(false));
     }
 
     #[test]
