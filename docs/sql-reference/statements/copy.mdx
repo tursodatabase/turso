@@ -1,6 +1,6 @@
 ---
 title: COPY
-description: Export PostgreSQL table rows through COPY TO STDOUT
+description: Import PostgreSQL table rows from a file or export rows through COPY TO STDOUT
 sidebarTitle: COPY
 ---
 
@@ -29,8 +29,32 @@ returns, backspaces, form feeds, and vertical tabs are escaped. Empty strings
 remain empty fields. The server sends rows individually and reports `COPY n`
 when the export succeeds.
 
+Preparing an export does not look up the table or read its rows.
+During execution, metadata queries and row reads return pending I/O to the caller.
+The server waits for each completion and each socket send before it reads more rows.
+
 COPY reads changes visible to the current transaction and does not commit that
 transaction. Views, query sources such as `COPY (SELECT ...)`, file or program
 destinations, CSV, binary format, and custom output options are not supported.
 COPY TO STDOUT is not supported through the extended query protocol or the
 embedded `execute()` API.
+
+## Import from a file
+
+The PostgreSQL frontend also supports `COPY FROM` a text file on the host that
+executes the statement.
+
+```sql
+COPY [schema.]table_name [(column_name, ...)] FROM 'filename';
+```
+
+An unqualified table uses the session's `search_path`.
+Preparing the statement does not read the file or insert rows.
+Execution reads the file on a worker thread and inserts all rows in one statement.
+If an insert fails, COPY does not keep partial rows.
+Inside an explicit transaction, COPY does not commit the transaction.
+
+The nonblocking statement methods return pending I/O to the caller during the
+file read and database writes.
+The caller must wait for each completion and resume the same statement.
+The synchronous statement methods wait for these operations themselves.

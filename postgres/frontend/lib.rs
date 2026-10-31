@@ -2,6 +2,7 @@ mod auth_functions;
 mod catalog;
 mod copy;
 mod error;
+mod execution;
 mod functions;
 mod options;
 mod session;

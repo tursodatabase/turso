@@ -4559,3 +4559,459 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
         ]
     );
 }
+
+#[cfg(feature = "io_memory_yield")]
+mod nonblocking {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use turso_core::{Clock, File, IOResult, MemoryYieldIO, OpenFlags, IO};
+
+    #[test]
+    fn copy_to_stdout_defers_lookup_and_yields_between_rows() {
+        let (io, conn) = open();
+        let spec =
+            turso_pg_parser::copy::parse_copy_to_stdout("COPY exported (name, id) TO STDOUT")
+                .unwrap()
+                .unwrap();
+        io.allow_step.store(false, Ordering::SeqCst);
+        let prepared = conn.prepare_copy_to_stdout(&spec);
+        io.allow_step.store(true, Ordering::SeqCst);
+        let mut copy = prepared.unwrap();
+        conn.execute(
+            "CREATE TABLE exported (id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO exported VALUES (7, 'first'), (19, 'second')",
+        )
+        .unwrap();
+        conn.inner().get_pager().clear_page_cache(false);
+        let wake = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut rows = Vec::new();
+        let mut yields = 0;
+        loop {
+            wake.0.store(false, Ordering::SeqCst);
+            io.allow_step.store(false, Ordering::SeqCst);
+            let result = copy.step_with_waker(&waker);
+            io.allow_step.store(true, Ordering::SeqCst);
+            match result.unwrap() {
+                StepResult::Row => {
+                    rows.push(
+                        copy.row()
+                            .unwrap()
+                            .get_values()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield => {
+                    yields += 1;
+                    copy.take_io_completions()
+                        .unwrap()
+                        .wait(io.as_ref())
+                        .unwrap();
+                    assert!(wake.0.load(Ordering::SeqCst));
+                }
+                result => panic!("unexpected COPY result: {result:?}"),
+            }
+        }
+        assert!(yields > 0);
+        assert_eq!(copy.get_column_name(0), "name");
+        assert_eq!(copy.get_column_name(1), "id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::build_text("first"), Value::from_i64(7)],
+                vec![Value::build_text("second"), Value::from_i64(19)],
+            ]
+        );
+        conn.execute("INSERT INTO exported VALUES (31, 'third')")
+            .unwrap();
+        rows.push(vec![Value::build_text("third"), Value::from_i64(31)]);
+        copy.reset().unwrap();
+        assert_eq!(drive(&io, &mut copy).0, rows);
+        copy.reset().unwrap();
+        assert_eq!(copy.run_collect_rows().unwrap(), rows);
+        copy.reset().unwrap();
+        copy.run_ignore_rows().unwrap();
+        assert!(conn.inner().get_auto_commit());
+    }
+
+    #[test]
+    fn frontend_commands_return_pending_io() {
+        let (io, conn) = open();
+        conn.inner().set_foreign_keys_enabled(true);
+        let mut serial = conn
+            .prepare("CREATE TABLE serials (a SERIAL, b BIGSERIAL)")
+            .unwrap();
+        let wake = Arc::new(WakeFlag(AtomicBool::new(false)));
+        let waker = std::task::Waker::from(wake.clone());
+        let mut yields = 0;
+        loop {
+            wake.0.store(false, Ordering::SeqCst);
+            io.allow_step.store(false, Ordering::SeqCst);
+            let result = serial.step_with_waker(&waker);
+            io.allow_step.store(true, Ordering::SeqCst);
+            match result.unwrap() {
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield => {
+                    yields += 1;
+                    serial
+                        .take_io_completions()
+                        .unwrap()
+                        .wait(io.as_ref())
+                        .unwrap();
+                    assert!(wake.0.load(Ordering::SeqCst));
+                }
+                result => panic!("unexpected CREATE TABLE result: {result:?}"),
+            }
+        }
+        assert!(yields > 0);
+        conn.execute("SELECT setval('serials_a_seq', 40)").unwrap();
+        conn.execute(
+            "INSERT INTO serials VALUES (nextval('serials_a_seq'), nextval('serials_b_seq'))",
+        )
+        .unwrap();
+        assert_eq!(
+            drive(&io, &mut conn.prepare("SELECT a, b FROM serials").unwrap()).0,
+            vec![vec![Value::from_i64(41), Value::from_i64(1)]]
+        );
+
+        let mut schema = conn
+            .prepare("CREATE SCHEMA extra CREATE TABLE copied (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        assert!(drive(&io, &mut schema).1 > 0);
+        assert_eq!(
+            conn.prepare("SHOW search_path")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::build_text("\"$user\", public")]]
+        );
+        conn.execute("SET search_path TO extra, public").unwrap();
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), "7\tO'Brien\n19\t\\N\n").unwrap();
+        let mut copy = conn
+            .prepare(format!("COPY copied FROM '{}'", input.path().display()))
+            .unwrap();
+        assert!(drive(&io, &mut copy).1 > 0);
+        assert_eq!(copy.n_change(), 2);
+        assert_eq!(
+            drive(
+                &io,
+                &mut conn
+                    .prepare("SELECT id, name FROM copied ORDER BY id")
+                    .unwrap()
+            )
+            .0,
+            vec![
+                vec![Value::from_i64(7), Value::build_text("O'Brien")],
+                vec![Value::from_i64(19), Value::Null],
+            ]
+        );
+        std::fs::write(input.path(), "").unwrap();
+        copy.reset().unwrap();
+        drive(&io, &mut copy);
+        assert_eq!(copy.n_change(), 0);
+        std::fs::write(input.path(), "23\tnew\n7\tduplicate\n").unwrap();
+        copy.reset().unwrap();
+        assert!(drive_result(&io, &mut copy).is_err());
+        assert_eq!(
+            conn.prepare("SELECT count(*) FROM copied")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(2)]]
+        );
+        assert!(conn.inner().get_auto_commit());
+        std::fs::write(input.path(), "29\ttransaction\n").unwrap();
+        copy.reset().unwrap();
+        conn.execute("BEGIN").unwrap();
+        drive(&io, &mut copy);
+        assert!(!conn.inner().get_auto_commit());
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(
+            conn.prepare("SELECT count(*) FROM copied")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(2)]]
+        );
+        assert!(drive(&io, &mut conn.prepare("DROP SCHEMA extra CASCADE").unwrap()).1 > 0);
+        assert!(conn.inner().qualifier("extra").is_none());
+        assert!(conn.inner().foreign_keys_enabled());
+    }
+
+    #[test]
+    fn serial_prerequisites_are_atomic_across_yields_and_reset() {
+        let (io, conn) = open();
+        let mut schema = conn
+            .prepare("CREATE SCHEMA failed CREATE TABLE t (a INT) CREATE TABLE t (b INT)")
+            .unwrap();
+        let error = drive_result(&io, &mut schema).unwrap_err();
+        assert_eq!(error.sqlstate, "42P07");
+        assert_eq!(conn.transaction_state(), turso_pg::TransactionState::Idle);
+        assert!(conn.inner().qualifier("failed").is_none());
+        let mut prepared = conn.prepare("CREATE TABLE conflict (id SERIAL)").unwrap();
+        conn.execute("CREATE TABLE conflict (value INTEGER)")
+            .unwrap();
+        assert!(drive_result(&io, &mut prepared).is_err());
+        assert!(conn.inner().get_auto_commit());
+        assert_eq!(
+            conn.prepare(
+                "SELECT count(*) FROM pg_sequences WHERE sequencename = 'conflict_id_seq'"
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+            vec![vec![Value::from_i64(0)]]
+        );
+
+        let mut stmt = conn.prepare("CREATE TABLE reset_me (id SERIAL)").unwrap();
+        io.allow_step.store(false, Ordering::SeqCst);
+        let IOResult::IO(completion) = stmt.run_ignore_rows_nonblock().unwrap() else {
+            panic!("SERIAL must yield");
+        };
+        io.allow_step.store(true, Ordering::SeqCst);
+        completion.wait(io.as_ref()).unwrap();
+        stmt.reset().unwrap();
+        assert!(conn.inner().get_auto_commit());
+        drive(&io, &mut stmt);
+        conn.execute("INSERT INTO reset_me VALUES (nextval('reset_me_id_seq'))")
+            .unwrap();
+        assert_eq!(
+            conn.prepare("SELECT id FROM reset_me")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(1)]]
+        );
+    }
+
+    #[test]
+    fn abandoning_serial_creation_never_leaves_partial_prerequisites() {
+        let sql = "CREATE TABLE abandoned (a SERIAL, b BIGSERIAL)";
+        let (io, conn) = open();
+        let yields = drive(&io, &mut conn.prepare(sql).unwrap()).1;
+        for action in ["drop", "reset", "interrupt", "timeout"] {
+            for stop_at in 0..yields {
+                let (io, conn) = open();
+                let mut stmt = conn.prepare(sql).unwrap();
+                for _ in 0..=stop_at {
+                    io.allow_step.store(false, Ordering::SeqCst);
+                    let result = stmt.run_ignore_rows_nonblock();
+                    io.allow_step.store(true, Ordering::SeqCst);
+                    let IOResult::IO(completion) = result.unwrap() else {
+                        panic!("creation finished before yield {stop_at}");
+                    };
+                    completion.wait(io.as_ref()).unwrap();
+                }
+                match action {
+                    "drop" => {}
+                    "reset" => stmt.reset_best_effort(),
+                    "interrupt" | "timeout" => {
+                        if action == "interrupt" {
+                            stmt.interrupt();
+                        } else {
+                            stmt.set_query_timeout_override(Some(Some(std::time::Duration::ZERO)));
+                        }
+                        if let Err(error) = drive_result(&io, &mut stmt) {
+                            assert!(
+                                matches!(error.core_error(), turso_core::LimboError::Interrupt),
+                                "{error}"
+                            );
+                        }
+                        assert!(conn.inner().get_auto_commit(), "yield {stop_at}, {action}");
+                    }
+                    _ => unreachable!(),
+                }
+                drop(stmt);
+                assert!(conn.inner().get_auto_commit(), "yield {stop_at}, {action}");
+                let rows = conn.prepare(
+                    "SELECT (SELECT count(*) FROM pg_tables WHERE tablename = 'abandoned'), \
+                     (SELECT count(*) FROM pg_sequences WHERE sequencename IN ('abandoned_a_seq', 'abandoned_b_seq'))"
+                ).unwrap().run_collect_rows().unwrap();
+                assert!(
+                    rows == vec![vec![Value::from_i64(0), Value::from_i64(0)]]
+                        || rows == vec![vec![Value::from_i64(1), Value::from_i64(2)]],
+                    "yield {stop_at}, {action}: {rows:?}"
+                );
+                conn.execute("CREATE TABLE reusable (id INTEGER)").unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn interruption_after_returning_rolls_back_the_write() {
+        for reset in [false, true] {
+            let (io, conn) = open();
+            conn.execute("CREATE TABLE interrupted (id INTEGER)")
+                .unwrap();
+            let interrupted = Arc::new(AtomicBool::new(false));
+            let requested = interrupted.clone();
+            conn.inner()
+                .set_progress_handler(1, Some(Box::new(move || requested.load(Ordering::SeqCst))));
+            let mut stmt = conn
+                .prepare("INSERT INTO interrupted VALUES (7), (19) RETURNING id")
+                .unwrap();
+            loop {
+                io.allow_step.store(false, Ordering::SeqCst);
+                let result = stmt.step();
+                io.allow_step.store(true, Ordering::SeqCst);
+                match result.unwrap() {
+                    StepResult::Row => break,
+                    StepResult::IO | StepResult::Yield => {
+                        stmt.take_io_completions()
+                            .unwrap()
+                            .wait(io.as_ref())
+                            .unwrap();
+                    }
+                    result => panic!("expected RETURNING row, got {result:?}"),
+                }
+            }
+            interrupted.store(true, Ordering::SeqCst);
+            let error = drive_result(&io, &mut stmt).unwrap_err();
+            assert!(matches!(
+                error.core_error(),
+                turso_core::LimboError::Interrupt
+            ));
+            conn.inner().set_progress_handler(0, None);
+            if reset {
+                stmt.reset().unwrap();
+            }
+            drop(stmt);
+            assert_eq!(
+                conn.prepare("SELECT count(*) FROM interrupted")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![vec![Value::from_i64(0)]]
+            );
+            assert!(conn.inner().get_auto_commit());
+        }
+    }
+
+    #[test]
+    fn interrupted_frontend_statement_can_be_reset() {
+        let (io, conn) = open();
+        let mut stmt = conn
+            .prepare("CREATE TABLE interrupted (id SERIAL)")
+            .unwrap();
+        stmt.interrupt();
+        let error = drive_result(&io, &mut stmt).unwrap_err();
+        assert!(matches!(
+            error.core_error(),
+            turso_core::LimboError::Interrupt
+        ));
+        assert_eq!(
+            conn.prepare(
+                "SELECT count(*) FROM pg_sequences WHERE sequencename = 'interrupted_id_seq'"
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+            vec![vec![Value::from_i64(0)]]
+        );
+        stmt.reset().unwrap();
+        drive(&io, &mut stmt);
+        conn.execute("INSERT INTO interrupted VALUES (nextval('interrupted_id_seq'))")
+            .unwrap();
+    }
+
+    fn open() -> (Arc<StepGuardedIO>, turso_pg::PgConnection) {
+        let io = Arc::new(StepGuardedIO {
+            inner: MemoryYieldIO::new(),
+            allow_step: AtomicBool::new(true),
+        });
+        let db = turso_pg::open_database_with_io(
+            io.clone(),
+            &format!("frontend-{}.db", rand::random::<u64>()),
+            OpenFlags::default(),
+            turso_core::DatabaseOpts::new().with_views(true),
+        )
+        .unwrap();
+        let conn = turso_pg::PgConnection::connect(&db).unwrap();
+        (io, conn)
+    }
+
+    fn drive(io: &StepGuardedIO, stmt: &mut turso_pg::Statement) -> (Vec<Vec<Value>>, usize) {
+        drive_result(io, stmt).unwrap()
+    }
+
+    fn drive_result(
+        io: &StepGuardedIO,
+        stmt: &mut turso_pg::Statement,
+    ) -> turso_pg::Result<(Vec<Vec<Value>>, usize)> {
+        let mut rows = Vec::new();
+        let mut yields = 0;
+        loop {
+            io.allow_step.store(false, Ordering::SeqCst);
+            let result = stmt.run_with_row_callback_nonblock(|row| {
+                rows.push(row.get_values().cloned().collect());
+                Ok(())
+            });
+            io.allow_step.store(true, Ordering::SeqCst);
+            match result? {
+                IOResult::Done(()) => return Ok((rows, yields)),
+                IOResult::IO(completion) => {
+                    yields += 1;
+                    completion.wait(io)?;
+                }
+            }
+        }
+    }
+
+    struct WakeFlag(AtomicBool);
+
+    impl std::task::Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct StepGuardedIO {
+        inner: MemoryYieldIO,
+        allow_step: AtomicBool,
+    }
+
+    impl Clock for StepGuardedIO {
+        fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for StepGuardedIO {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: OpenFlags,
+            direct: bool,
+        ) -> turso_core::Result<Arc<dyn File>> {
+            self.inner.open_file(path, flags, direct)
+        }
+
+        fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+            self.inner.file_id(path)
+        }
+
+        fn supports_shared_wal_coordination(&self) -> bool {
+            false
+        }
+
+        fn step(&self) -> turso_core::Result<()> {
+            assert!(
+                self.allow_step.load(Ordering::SeqCst),
+                "frontend code must not call IO::step"
+            );
+            self.inner.step()
+        }
+    }
+}
