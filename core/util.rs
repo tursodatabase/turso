@@ -14,7 +14,7 @@ use crate::types::IOResultOr;
 use crate::vdbe::affinity::Affinity;
 use crate::IO;
 use crate::{
-    schema::{Column, Schema, Table, Type},
+    schema::{Column, GeneratedType, Index, Schema, Table, Trigger, Type},
     types::{Value, ValueType},
     LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
@@ -1674,38 +1674,180 @@ impl ViewColumnSchema {
     }
 }
 
+/// What a walk over a statement, a SELECT or a trigger reports. A closure
+/// over `&ast::Expr` is a visitor that only looks at expressions.
+pub trait AstVisitor {
+    /// Every expression, including the ones inside subqueries. `SkipChildren`
+    /// leaves out its sub-expressions and the subqueries in them.
+    fn expr(&mut self, expr: &ast::Expr) -> Result<WalkControl>;
+
+    /// Every table a FROM clause names.
+    fn table(&mut self, _name: &ast::QualifiedName) -> Result<()> {
+        Ok(())
+    }
+
+    /// Every table-valued function a FROM clause calls.
+    fn table_function(&mut self, _name: &ast::QualifiedName) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<F> AstVisitor for F
+where
+    F: FnMut(&ast::Expr) -> Result<WalkControl>,
+{
+    fn expr(&mut self, expr: &ast::Expr) -> Result<WalkControl> {
+        self(expr)
+    }
+}
+
+/// The schema object an expression stored in the schema belongs to.
+#[derive(Clone, Copy)]
+pub enum SchemaExprOwner<'a> {
+    ColumnDefault {
+        table: &'a Table,
+        column: &'a Column,
+    },
+    GeneratedColumn {
+        table: &'a Table,
+        column: &'a Column,
+    },
+    CheckConstraint {
+        table: &'a Table,
+    },
+    Index(&'a Index),
+    View(&'a str),
+    MaterializedView(&'a str),
+    Trigger(&'a Trigger),
+}
+
+impl std::fmt::Display for SchemaExprOwner<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let column_name = |column: &Column| column.name.as_deref().unwrap_or("?").to_string();
+        match self {
+            Self::ColumnDefault { table, column } => write!(
+                f,
+                "the default of column {} in table {}",
+                column_name(column),
+                table.get_name()
+            ),
+            Self::GeneratedColumn { table, column } => write!(
+                f,
+                "generated column {} in table {}",
+                column_name(column),
+                table.get_name()
+            ),
+            Self::CheckConstraint { table } => {
+                write!(f, "a CHECK constraint in table {}", table.get_name())
+            }
+            Self::Index(index) => write!(f, "index {}", index.name),
+            Self::View(name) => write!(f, "view {name}"),
+            Self::MaterializedView(name) => write!(f, "materialized view {name}"),
+            Self::Trigger(trigger) => write!(f, "trigger {}", trigger.name),
+        }
+    }
+}
+
+/// Call `func` on every expression the schema stores, with the object it
+/// belongs to: column defaults, generated columns, CHECK constraints, index
+/// keys and WHERE clauses, view and materialized view bodies, and trigger
+/// WHEN clauses and bodies, subqueries included.
+pub fn walk_schema_expressions<F>(schema: &Schema, func: &mut F) -> Result<()>
+where
+    F: FnMut(SchemaExprOwner<'_>, &ast::Expr) -> Result<WalkControl>,
+{
+    for namespace in schema.namespace_ids() {
+        for table in schema.tables(namespace) {
+            let table: &Table = table;
+            for column in table.columns() {
+                if let Some(default) = &column.default {
+                    walk_expr_with_subqueries(default, &mut |expr| {
+                        func(SchemaExprOwner::ColumnDefault { table, column }, expr)
+                    })?;
+                }
+                if let GeneratedType::Virtual { expr, .. } = column.generated_type() {
+                    walk_expr_with_subqueries(expr, &mut |expr| {
+                        func(SchemaExprOwner::GeneratedColumn { table, column }, expr)
+                    })?;
+                }
+            }
+            if let Table::BTree(btree) = table {
+                for check in &btree.check_constraints {
+                    walk_expr_with_subqueries(&check.expr, &mut |expr| {
+                        func(SchemaExprOwner::CheckConstraint { table }, expr)
+                    })?;
+                }
+            }
+            if let Some(view) = schema.get_materialized_view(namespace, table.get_name()) {
+                walk_select_expressions(&view.lock().select_stmt, &mut |expr| {
+                    func(SchemaExprOwner::MaterializedView(table.get_name()), expr)
+                })?;
+            }
+        }
+        for index in schema.indexes(namespace) {
+            let index_exprs = index
+                .columns
+                .iter()
+                .filter_map(|column| column.expr.as_deref())
+                .chain(index.where_clause.as_deref());
+            for expr in index_exprs {
+                walk_expr_with_subqueries(expr, &mut |expr| {
+                    func(SchemaExprOwner::Index(index), expr)
+                })?;
+            }
+        }
+        for (name, view) in schema.views(namespace) {
+            walk_select_expressions(&view.select_stmt, &mut |expr| {
+                func(SchemaExprOwner::View(name), expr)
+            })?;
+        }
+        for trigger in schema.triggers(namespace) {
+            visit_trigger(trigger, &mut |expr: &ast::Expr| {
+                func(SchemaExprOwner::Trigger(trigger), expr)
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Walk all expressions in a statement, including subqueries.
 pub fn walk_stmt_expressions<F>(stmt: &ast::Stmt, func: &mut F) -> Result<()>
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
+    visit_stmt(stmt, func)
+}
+
+/// Walk a statement: the tables it reads and all of its expressions,
+/// including subqueries.
+pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()> {
     match stmt {
-        ast::Stmt::Select(select) => walk_select_expressions_inner(select, func)?,
+        ast::Stmt::Select(select) => visit_select(select, visitor)?,
         ast::Stmt::Insert {
             with,
             body,
             returning,
             ..
         } => {
-            walk_with_expressions(with.as_ref(), func)?;
+            visit_with(with.as_ref(), visitor)?;
             if let ast::InsertBody::Select(select, upsert) = body {
-                walk_select_expressions_inner(select, func)?;
-                walk_upsert_expressions(upsert.as_deref(), func)?;
+                visit_select(select, visitor)?;
+                visit_upsert(upsert.as_deref(), visitor)?;
             }
-            walk_result_column_expressions(returning, func)?;
+            visit_result_columns(returning, visitor)?;
         }
         ast::Stmt::Update(update) => {
-            walk_with_expressions(update.with.as_ref(), func)?;
+            visit_with(update.with.as_ref(), visitor)?;
             for set in &update.sets {
-                walk_expr_with_subqueries(&set.expr, func)?;
+                visit_expr_with_subqueries(&set.expr, visitor)?;
             }
             if let Some(from_clause) = &update.from {
-                walk_from_clause_expressions(from_clause, func)?;
+                visit_from_clause(from_clause, visitor)?;
             }
             if let Some(where_clause) = &update.where_clause {
-                walk_expr_with_subqueries(where_clause, func)?;
+                visit_expr_with_subqueries(where_clause, visitor)?;
             }
-            walk_result_column_expressions(&update.returning, func)?;
+            visit_result_columns(&update.returning, visitor)?;
         }
         ast::Stmt::Delete {
             with,
@@ -1713,34 +1855,34 @@ where
             returning,
             ..
         } => {
-            walk_with_expressions(with.as_ref(), func)?;
+            visit_with(with.as_ref(), visitor)?;
             if let Some(where_clause) = where_clause {
-                walk_expr_with_subqueries(where_clause, func)?;
+                visit_expr_with_subqueries(where_clause, visitor)?;
             }
-            walk_result_column_expressions(returning, func)?;
+            visit_result_columns(returning, visitor)?;
         }
         ast::Stmt::Attach { expr, db_name, key } => {
-            walk_expr_with_subqueries(expr, func)?;
-            walk_expr_with_subqueries(db_name, func)?;
+            visit_expr_with_subqueries(expr, visitor)?;
+            visit_expr_with_subqueries(db_name, visitor)?;
             if let Some(key) = key {
-                walk_expr_with_subqueries(key, func)?;
+                visit_expr_with_subqueries(key, visitor)?;
             }
         }
-        ast::Stmt::Detach { name } => walk_expr_with_subqueries(name, func)?,
+        ast::Stmt::Detach { name } => visit_expr_with_subqueries(name, visitor)?,
         ast::Stmt::Vacuum { into, .. } => {
             if let Some(into) = into {
-                walk_expr_with_subqueries(into, func)?;
+                visit_expr_with_subqueries(into, visitor)?;
             }
         }
         ast::Stmt::Pragma { body, .. } => {
             if let Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) = body {
-                walk_expr_with_subqueries(value, func)?;
+                visit_expr_with_subqueries(value, visitor)?;
             }
         }
         ast::Stmt::CreateTable {
             body: ast::CreateTableBody::AsSelect(select),
             ..
-        } => walk_select_expressions_inner(select, func)?,
+        } => visit_select(select, visitor)?,
         ast::Stmt::AlterTable(_)
         | ast::Stmt::Analyze { .. }
         | ast::Stmt::Begin { .. }
@@ -1772,11 +1914,18 @@ where
     Ok(())
 }
 
-/// Walk all expressions in a trigger command, including subqueries.
-pub fn walk_trigger_cmd_expressions<F>(cmd: &ast::TriggerCmd, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+/// Walk a trigger: its WHEN clause and its commands.
+pub fn visit_trigger<V: AstVisitor>(trigger: &Trigger, visitor: &mut V) -> Result<()> {
+    if let Some(when_clause) = &trigger.when_clause {
+        visit_expr_with_subqueries(when_clause, visitor)?;
+    }
+    for command in &trigger.commands {
+        visit_trigger_cmd(command, visitor)?;
+    }
+    Ok(())
+}
+
+fn visit_trigger_cmd<V: AstVisitor>(cmd: &ast::TriggerCmd, visitor: &mut V) -> Result<()> {
     match cmd {
         ast::TriggerCmd::Update {
             sets,
@@ -1785,13 +1934,13 @@ where
             ..
         } => {
             for set in sets {
-                walk_expr_with_subqueries(&set.expr, func)?;
+                visit_expr_with_subqueries(&set.expr, visitor)?;
             }
             if let Some(from_clause) = from {
-                walk_from_clause_expressions(from_clause, func)?;
+                visit_from_clause(from_clause, visitor)?;
             }
             if let Some(where_clause) = where_clause {
-                walk_expr_with_subqueries(where_clause, func)?;
+                visit_expr_with_subqueries(where_clause, visitor)?;
             }
         }
         ast::TriggerCmd::Insert {
@@ -1800,39 +1949,39 @@ where
             returning,
             ..
         } => {
-            walk_select_expressions_inner(select, func)?;
-            walk_upsert_expressions(upsert.as_deref(), func)?;
-            walk_result_column_expressions(returning, func)?;
+            visit_select(select, visitor)?;
+            visit_upsert(upsert.as_deref(), visitor)?;
+            visit_result_columns(returning, visitor)?;
         }
-        ast::TriggerCmd::Delete { where_clause, .. } => {
+        ast::TriggerCmd::Delete {
+            tbl_name: _,
+            where_clause,
+        } => {
             if let Some(where_clause) = where_clause {
-                walk_expr_with_subqueries(where_clause, func)?;
+                visit_expr_with_subqueries(where_clause, visitor)?;
             }
         }
-        ast::TriggerCmd::Select(select) => walk_select_expressions_inner(select, func)?,
+        ast::TriggerCmd::Select(select) => visit_select(select, visitor)?,
     }
     Ok(())
 }
 
-fn walk_upsert_expressions<F>(mut upsert: Option<&ast::Upsert>, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+fn visit_upsert<V: AstVisitor>(mut upsert: Option<&ast::Upsert>, visitor: &mut V) -> Result<()> {
     while let Some(clause) = upsert {
         if let Some(index) = &clause.index {
             for target in &index.targets {
-                walk_expr_with_subqueries(&target.expr, func)?;
+                visit_expr_with_subqueries(&target.expr, visitor)?;
             }
             if let Some(where_clause) = &index.where_clause {
-                walk_expr_with_subqueries(where_clause, func)?;
+                visit_expr_with_subqueries(where_clause, visitor)?;
             }
         }
         if let ast::UpsertDo::Set { sets, where_clause } = &clause.do_clause {
             for set in sets {
-                walk_expr_with_subqueries(&set.expr, func)?;
+                visit_expr_with_subqueries(&set.expr, visitor)?;
             }
             if let Some(where_clause) = where_clause {
-                walk_expr_with_subqueries(where_clause, func)?;
+                visit_expr_with_subqueries(where_clause, visitor)?;
             }
         }
         upsert = clause.next.as_deref();
@@ -1840,23 +1989,20 @@ where
     Ok(())
 }
 
-fn walk_with_expressions<F>(with: Option<&ast::With>, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+fn visit_with<V: AstVisitor>(with: Option<&ast::With>, visitor: &mut V) -> Result<()> {
     for cte in with.iter().flat_map(|with| &with.ctes) {
-        walk_select_expressions_inner(&cte.select, func)?;
+        visit_select(&cte.select, visitor)?;
     }
     Ok(())
 }
 
-fn walk_result_column_expressions<F>(columns: &[ast::ResultColumn], func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+fn visit_result_columns<V: AstVisitor>(
+    columns: &[ast::ResultColumn],
+    visitor: &mut V,
+) -> Result<()> {
     for column in columns {
         if let ast::ResultColumn::Expr(expr, _) = column {
-            walk_expr_with_subqueries(expr, func)?;
+            visit_expr_with_subqueries(expr, visitor)?;
         }
     }
     Ok(())
@@ -1867,38 +2013,34 @@ pub fn walk_select_expressions<F>(select: &ast::Select, func: &mut F) -> Result<
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
-    walk_select_expressions_inner(select, func)
+    visit_select(select, func)
 }
 
-fn walk_select_expressions_inner<F>(select: &ast::Select, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
-    walk_with_expressions(select.with.as_ref(), func)?;
+/// Walk a SELECT: the tables it reads and all of its expressions, including
+/// subqueries.
+pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Result<()> {
+    visit_with(select.with.as_ref(), visitor)?;
 
-    walk_one_select_expressions(&select.body.select, func)?;
+    visit_one_select(&select.body.select, visitor)?;
     for compound in &select.body.compounds {
-        walk_one_select_expressions(&compound.select, func)?;
+        visit_one_select(&compound.select, visitor)?;
     }
 
     for sorted_col in &select.order_by {
-        walk_expr_with_subqueries(&sorted_col.expr, func)?;
+        visit_expr_with_subqueries(&sorted_col.expr, visitor)?;
     }
 
     if let Some(limit) = &select.limit {
-        walk_expr_with_subqueries(&limit.expr, func)?;
+        visit_expr_with_subqueries(&limit.expr, visitor)?;
         if let Some(offset) = &limit.offset {
-            walk_expr_with_subqueries(offset, func)?;
+            visit_expr_with_subqueries(offset, visitor)?;
         }
     }
 
     Ok(())
 }
 
-fn walk_one_select_expressions<F>(one_select: &ast::OneSelect, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+fn visit_one_select<V: AstVisitor>(one_select: &ast::OneSelect, visitor: &mut V) -> Result<()> {
     match one_select {
         ast::OneSelect::Select {
             columns,
@@ -1908,33 +2050,33 @@ where
             window_clause,
             ..
         } => {
-            walk_result_column_expressions(columns, func)?;
+            visit_result_columns(columns, visitor)?;
 
             if let Some(from_clause) = from {
-                walk_from_clause_expressions(from_clause, func)?;
+                visit_from_clause(from_clause, visitor)?;
             }
 
             if let Some(where_expr) = where_clause {
-                walk_expr_with_subqueries(where_expr, func)?;
+                visit_expr_with_subqueries(where_expr, visitor)?;
             }
 
             if let Some(group_by) = group_by {
                 for expr in &group_by.exprs {
-                    walk_expr_with_subqueries(expr, func)?;
+                    visit_expr_with_subqueries(expr, visitor)?;
                 }
                 if let Some(having_expr) = &group_by.having {
-                    walk_expr_with_subqueries(having_expr, func)?;
+                    visit_expr_with_subqueries(having_expr, visitor)?;
                 }
             }
 
             for window_def in window_clause {
-                walk_window_expressions(&window_def.window, func)?;
+                visit_window(&window_def.window, visitor)?;
             }
         }
         ast::OneSelect::Values(values) => {
             for row in values {
                 for expr in row {
-                    walk_expr_with_subqueries(expr, func)?;
+                    visit_expr_with_subqueries(expr, visitor)?;
                 }
             }
         }
@@ -1943,69 +2085,61 @@ where
     Ok(())
 }
 
-fn walk_from_clause_expressions<F>(from_clause: &ast::FromClause, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
-    walk_select_table_expressions(&from_clause.select, func)?;
+fn visit_from_clause<V: AstVisitor>(from_clause: &ast::FromClause, visitor: &mut V) -> Result<()> {
+    visit_select_table(&from_clause.select, visitor)?;
 
     for join in &from_clause.joins {
-        walk_select_table_expressions(&join.table, func)?;
+        visit_select_table(&join.table, visitor)?;
 
         if let Some(ast::JoinConstraint::On(expr)) = &join.constraint {
-            walk_expr_with_subqueries(expr, func)?;
+            visit_expr_with_subqueries(expr, visitor)?;
         }
     }
 
     Ok(())
 }
 
-fn walk_select_table_expressions<F>(select_table: &ast::SelectTable, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+fn visit_select_table<V: AstVisitor>(
+    select_table: &ast::SelectTable,
+    visitor: &mut V,
+) -> Result<()> {
     match select_table {
-        ast::SelectTable::Select { select, .. } => walk_select_expressions_inner(select, func),
-        ast::SelectTable::Sub(from_clause, _) => walk_from_clause_expressions(from_clause, func),
-        ast::SelectTable::TableCall(_, args, _) => {
+        ast::SelectTable::Table(name, _, _) => visitor.table(name),
+        ast::SelectTable::Select { select, .. } => visit_select(select, visitor),
+        ast::SelectTable::Sub(from_clause, _) => visit_from_clause(from_clause, visitor),
+        ast::SelectTable::TableCall(name, args, _) => {
+            visitor.table_function(name)?;
             for arg in args {
-                walk_expr_with_subqueries(arg, func)?;
+                visit_expr_with_subqueries(arg, visitor)?;
             }
             Ok(())
         }
-        ast::SelectTable::Table(_, _, _) => Ok(()),
     }
 }
 
-fn walk_window_expressions<F>(window: &ast::Window, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+fn visit_window<V: AstVisitor>(window: &ast::Window, visitor: &mut V) -> Result<()> {
     for expr in &window.partition_by {
-        walk_expr_with_subqueries(expr, func)?;
+        visit_expr_with_subqueries(expr, visitor)?;
     }
 
     for sorted_col in &window.order_by {
-        walk_expr_with_subqueries(&sorted_col.expr, func)?;
+        visit_expr_with_subqueries(&sorted_col.expr, visitor)?;
     }
 
     if let Some(frame_clause) = &window.frame_clause {
-        walk_frame_bound_expressions(&frame_clause.start, func)?;
+        visit_frame_bound(&frame_clause.start, visitor)?;
         if let Some(end_bound) = &frame_clause.end {
-            walk_frame_bound_expressions(end_bound, func)?;
+            visit_frame_bound(end_bound, visitor)?;
         }
     }
 
     Ok(())
 }
 
-fn walk_frame_bound_expressions<F>(bound: &ast::FrameBound, func: &mut F) -> Result<()>
-where
-    F: FnMut(&ast::Expr) -> Result<WalkControl>,
-{
+fn visit_frame_bound<V: AstVisitor>(bound: &ast::FrameBound, visitor: &mut V) -> Result<()> {
     match bound {
         ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) => {
-            walk_expr_with_subqueries(expr, func)
+            visit_expr_with_subqueries(expr, visitor)
         }
         ast::FrameBound::CurrentRow
         | ast::FrameBound::UnboundedFollowing
@@ -2017,15 +2151,20 @@ pub fn walk_expr_with_subqueries<F>(expr: &ast::Expr, func: &mut F) -> Result<()
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,
 {
+    visit_expr_with_subqueries(expr, func)
+}
+
+/// Walk an expression and the subqueries in it.
+pub fn visit_expr_with_subqueries<V: AstVisitor>(expr: &ast::Expr, visitor: &mut V) -> Result<()> {
     walk_expr(expr, &mut |e| {
-        let control = func(e)?;
+        let control = visitor.expr(e)?;
         if matches!(control, WalkControl::Continue) {
             match e {
                 ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
-                    walk_select_expressions_inner(select, func)?;
+                    visit_select(select, visitor)?;
                 }
                 ast::Expr::InSelect { rhs, .. } => {
-                    walk_select_expressions_inner(rhs, func)?;
+                    visit_select(rhs, visitor)?;
                 }
                 _ => {}
             }
@@ -2035,52 +2174,57 @@ where
     Ok(())
 }
 
-fn validate_no_cross_db_references(
+pub fn validate_select_for_views(
     select_stmt: &ast::Select,
     resolver: &Resolver,
     view_database_id: usize,
 ) -> Result<()> {
-    if let Some(with_clause) = &select_stmt.with {
-        for cte in &with_clause.ctes {
-            validate_no_cross_db_references(&cte.select, resolver, view_database_id)?;
-        }
-    }
+    visit_select(
+        select_stmt,
+        &mut CrossDbReferences {
+            resolver,
+            view_database_id,
+        },
+    )?;
 
-    validate_one_select_no_cross_db(&select_stmt.body.select, resolver, view_database_id)?;
-
-    for compound in &select_stmt.body.compounds {
-        validate_one_select_no_cross_db(&compound.select, resolver, view_database_id)?;
-    }
-
-    Ok(())
-}
-
-fn validate_one_select_no_cross_db(
-    one_select: &ast::OneSelect,
-    resolver: &Resolver,
-    view_database_id: usize,
-) -> Result<()> {
-    match one_select {
-        ast::OneSelect::Select { from, .. } => {
-            if let Some(from_clause) = from {
-                validate_from_clause_no_cross_db(from_clause, resolver, view_database_id)?;
+    walk_select_expressions(select_stmt, &mut |expr| {
+        if let ast::Expr::FunctionCall {
+            name,
+            order_by,
+            filter_over,
+            ..
+        } = expr
+        {
+            if !order_by.is_empty() && filter_over.over_clause.is_some() {
+                crate::bail_parse_error!(
+                    "ORDER BY may not be used with non-aggregate {}()",
+                    name.as_str()
+                );
             }
         }
-        ast::OneSelect::Values(_) => {}
-    }
-    Ok(())
+        Ok(WalkControl::Continue)
+    })
 }
 
-fn validate_from_clause_no_cross_db(
-    from_clause: &ast::FromClause,
-    resolver: &Resolver,
+/// Rejects every table or table-valued function of another database that a
+/// view body names.
+struct CrossDbReferences<'r, 'a> {
+    resolver: &'r Resolver<'a>,
     view_database_id: usize,
-) -> Result<()> {
-    validate_select_table_no_cross_db(&from_clause.select, resolver, view_database_id)?;
-    for join in &from_clause.joins {
-        validate_select_table_no_cross_db(&join.table, resolver, view_database_id)?;
+}
+
+impl AstVisitor for CrossDbReferences<'_, '_> {
+    fn expr(&mut self, _expr: &ast::Expr) -> Result<WalkControl> {
+        Ok(WalkControl::Continue)
     }
-    Ok(())
+
+    fn table(&mut self, name: &ast::QualifiedName) -> Result<()> {
+        reject_cross_db_qualified_name(name, self.resolver, self.view_database_id)
+    }
+
+    fn table_function(&mut self, name: &ast::QualifiedName) -> Result<()> {
+        reject_cross_db_qualified_name(name, self.resolver, self.view_database_id)
+    }
 }
 
 /// A view may read any namespace of the database it is in, so a name is
@@ -2105,60 +2249,6 @@ fn reject_cross_db_qualified_name(
             )));
         }
     }
-    Ok(())
-}
-
-fn validate_select_table_no_cross_db(
-    select_table: &ast::SelectTable,
-    resolver: &Resolver,
-    view_database_id: usize,
-) -> Result<()> {
-    match select_table {
-        ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
-            reject_cross_db_qualified_name(name, resolver, view_database_id)?;
-        }
-        ast::SelectTable::Select { select, .. } => {
-            validate_no_cross_db_references(select, resolver, view_database_id)?;
-        }
-        ast::SelectTable::Sub(from_clause, _) => {
-            validate_from_clause_no_cross_db(from_clause, resolver, view_database_id)?;
-        }
-    }
-    Ok(())
-}
-
-pub fn validate_select_for_views(
-    select_stmt: &ast::Select,
-    resolver: &Resolver,
-    view_database_id: usize,
-) -> Result<()> {
-    validate_no_cross_db_references(select_stmt, resolver, view_database_id)?;
-
-    walk_select_expressions(select_stmt, &mut |expr| {
-        match expr {
-            ast::Expr::FunctionCall {
-                name,
-                order_by,
-                filter_over,
-                ..
-            } if !order_by.is_empty() && filter_over.over_clause.is_some() => {
-                crate::bail_parse_error!(
-                    "ORDER BY may not be used with non-aggregate {}()",
-                    name.as_str()
-                );
-            }
-            ast::Expr::Subquery(subquery_select) | ast::Expr::Exists(subquery_select) => {
-                validate_no_cross_db_references(subquery_select, resolver, view_database_id)?;
-            }
-            ast::Expr::InSelect { rhs, .. } => {
-                validate_no_cross_db_references(rhs, resolver, view_database_id)?;
-            }
-            _ => {}
-        }
-
-        Ok(WalkControl::Continue)
-    })?;
-
     Ok(())
 }
 
