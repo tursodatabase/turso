@@ -1,0 +1,66 @@
+@database :memory:
+@skip-file-if mvcc "attach is not supported for mvcc"
+
+# ATTACH and DETACH evaluate their arguments as expressions. Only a bare
+# identifier is used as its own name.
+
+test attach-subquery-as-filename-and-schema-name {
+    ATTACH (SELECT ':memory:') AS aux;
+    ATTACH ':memory:' AS (SELECT 'aux2');
+    SELECT name FROM pragma_database_list ORDER BY seq;
+}
+expect {
+    main
+    aux
+    aux2
+}
+
+test attach-subquery-reads-a-table {
+    CREATE TABLE cfg(path TEXT, name TEXT);
+    INSERT INTO cfg VALUES (':memory:', 'aux');
+    ATTACH (SELECT path FROM cfg) AS (SELECT name FROM cfg);
+    CREATE TABLE aux.t(x);
+    INSERT INTO aux.t VALUES (1);
+    SELECT x FROM aux.t;
+}
+expect {
+    1
+}
+
+test attach-subquery-as-key {
+    ATTACH ':memory:' AS aux KEY (SELECT NULL);
+    SELECT name FROM pragma_database_list ORDER BY seq;
+}
+expect {
+    main
+    aux
+}
+
+test detach-subquery-as-schema-name {
+    ATTACH ':memory:' AS aux;
+    DETACH (SELECT 'aux');
+    SELECT name FROM pragma_database_list ORDER BY seq;
+}
+expect {
+    main
+}
+
+test attach-subquery-with-two-columns {
+    ATTACH ':memory:' AS (SELECT 'a', 'b');
+}
+expect error {
+}
+
+# x.db is a column reference, not the file name x.db.
+test attach-qualified-name-as-filename {
+    ATTACH x.db AS y;
+}
+expect error {
+}
+
+test detach-qualified-name {
+    ATTACH ':memory:' AS aux;
+    DETACH aux.x;
+}
+expect error {
+}
