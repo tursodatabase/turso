@@ -111,6 +111,10 @@ SELECT name, price FROM products;
 
 Add a new column to an existing table. The new column is always appended as the last column.
 
+For existing rows, a constant default uses the new column's affinity, just as it does
+for later inserts that omit the column. For example, `INT DEFAULT 5.0` reads as the
+integer `5`, while `REAL DEFAULT 5.0` reads as a real value.
+
 ```sql
 ALTER TABLE table-name ADD COLUMN column-name type [constraints];
 ```
