@@ -4173,7 +4173,54 @@ fn one_select_has_explicit_alias(one_select: &ast::OneSelect, name: &str) -> boo
     })
 }
 
-pub fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
+/// Renames the table `normalized_from` to `to` in a view. When
+/// `table_qualifiers` is given, a qualified name is the table only when its
+/// qualifier is one of them, and `unqualified_names_table` says whether a
+/// name without a qualifier can be the table; when it is None, both are
+/// ignored.
+pub fn rewrite_view_for_table_rename(
+    view: ast::Stmt,
+    normalized_from: &str,
+    to: &str,
+    unqualified_names_table: bool,
+    table_qualifiers: Option<&[String]>,
+) -> Option<(String, ast::Select)> {
+    let ast::Stmt::CreateView {
+        temporary,
+        if_not_exists,
+        view_name,
+        columns,
+        mut select,
+    } = view
+    else {
+        panic!("rewrite_view_for_table_rename called with a statement that is not CREATE VIEW");
+    };
+    let old_select = select.clone();
+    match table_qualifiers {
+        Some(qualifiers) => rewrite_select_namespace_table_refs(
+            &mut select,
+            normalized_from,
+            to,
+            unqualified_names_table,
+            qualifiers,
+        ),
+        None => rewrite_select_table_refs(&mut select, normalized_from, to),
+    }
+    if select == old_select {
+        return None;
+    }
+    let new_sql = ast::Stmt::CreateView {
+        temporary,
+        if_not_exists,
+        view_name,
+        columns,
+        select: select.clone(),
+    }
+    .to_string();
+    Some((new_sql, select))
+}
+
+fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tbl: &str) {
     rewrite_select_in_scope(select, TableRenameScope::new(old_tbl, new_tbl));
 }
 
@@ -4182,7 +4229,7 @@ pub fn rewrite_select_table_refs(select: &mut ast::Select, old_tbl: &str, new_tb
 /// `unqualified_names_table`, that is, when the view is in the table's
 /// namespace; a qualified name is the table only when its qualifier is one
 /// of `table_qualifiers`, the names of the table's namespace.
-pub fn rewrite_select_namespace_table_refs(
+fn rewrite_select_namespace_table_refs(
     select: &mut ast::Select,
     old_tbl: &str,
     new_tbl: &str,
