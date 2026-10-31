@@ -5,7 +5,7 @@ use super::output::NodeOutputContract;
 use super::stream::{binding_rowid_metadata_width, DeltaIdentity};
 use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
-use crate::schema::BTreeTable;
+use crate::schema::{BTreeTable, HIDDEN_KEY_ORDER_TYPE_PREFIX};
 use crate::sync::Arc;
 use crate::translate::collate::{first_collation, CollationSeq};
 use crate::translate::emitter::Resolver;
@@ -1767,7 +1767,7 @@ fn state_table_sql(state_table_name: &str, node: &dag::OpNode) -> Result<String>
         } => {
             let mut columns = Vec::new();
             for (i, key) in group_keys.iter().enumerate() {
-                columns.push(format!("g{i}{}", collate_clause(key.collation)));
+                columns.push(format!("g{i}{}", key_column_clause(key.collation)));
             }
             for i in 0..aggregates.len() {
                 columns.push(format!("v{i}"));
@@ -1798,7 +1798,7 @@ fn state_table_sql(state_table_name: &str, node: &dag::OpNode) -> Result<String>
                 ));
             }
             let mut columns: Vec<String> = (0..*arity)
-                .map(|i| format!("c{i}{}", collate_clause(key_columns[i].collation)))
+                .map(|i| format!("c{i}{}", key_column_clause(key_columns[i].collation)))
                 .collect();
             for i in 0..*prefix_len {
                 columns.push(format!("cnt{i}"));
@@ -1841,10 +1841,10 @@ fn aggregate_multiset_table_sql(
     let mut key = Vec::with_capacity(group_keys.len() + 4);
     let mut columns = Vec::with_capacity(group_keys.len() + 5);
     for (i, group_key) in group_keys.iter().enumerate() {
-        columns.push(format!("g{i}{}", collate_clause(group_key.collation)));
+        columns.push(format!("g{i}{}", key_column_clause(group_key.collation)));
         key.push(format!("g{i}"));
     }
-    columns.push(format!("val{}", collate_clause(value_key.collation)));
+    columns.push(format!("val{}", key_column_clause(value_key.collation)));
     key.push("val".to_string());
     if value_key.ambiguous {
         let members = member_column_names(1);
@@ -1871,7 +1871,7 @@ fn class_members_table_sql(table_name: &str, keys: &[dag::KeyColumn]) -> String 
     let mut columns = keys
         .iter()
         .enumerate()
-        .map(|(i, column)| format!("c{i}{}", collate_clause(column.collation)))
+        .map(|(i, column)| format!("c{i}{}", key_column_clause(column.collation)))
         .collect::<Vec<_>>();
     let members = member_column_names(keys.len());
     columns.extend(members.iter().cloned());
@@ -1918,13 +1918,18 @@ fn match_counts_table_sql(table_name: &str, payload_width: usize) -> String {
     format!("CREATE TABLE {table_ident} (present, matches, published{payload})")
 }
 
-/// The `COLLATE` clause for a hidden-table key column, empty for the
-/// default binary comparison. The name round-trips through
+/// The `COLLATE` clause or declared type of a hidden-table key column, empty
+/// for the default binary comparison. A collation name round-trips through
 /// [`CollationSeq::new`] when the generated DDL is parsed back; custom
-/// collations (which do not) are rejected at classify time.
-fn collate_clause(collation: CollationSeq) -> String {
+/// collations (which do not) are rejected at classify time. A type's order has
+/// no collation name, so it is declared with a type only hidden tables
+/// understand (see [`crate::schema::Column::resolve_hidden_key_order`]).
+fn key_column_clause(collation: CollationSeq) -> String {
     match collation {
         CollationSeq::BINARY => String::new(),
+        CollationSeq::Type(ordering) => {
+            format!(" {HIDDEN_KEY_ORDER_TYPE_PREFIX}{}", ordering.name())
+        }
         other => format!(" COLLATE \"{}\"", other.name()),
     }
 }
