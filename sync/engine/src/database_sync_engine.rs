@@ -21,9 +21,10 @@ use crate::{
         apply_transformation, bootstrap_db_file, connect_untracked, count_local_changes, has_table,
         is_logically_replayable_table, list_user_tables, max_local_change_id, pull_updates_v1,
         push_logical_changes, read_last_change_id, read_logical_replay_table_map, read_wal_salt,
-        reset_wal_file, should_replay_local_change, sync_file, update_last_change_id,
-        wait_all_results, wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result,
-        SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        rename_tables_in_local_changes, reset_wal_file, should_replay_local_change, sync_file,
+        update_last_change_id, wait_all_results, wal_apply_from_file, wal_pull_to_file,
+        PullUpdatesV1Result, RenamedTables, SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE,
+        WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         run_stmt_ignore_rows, try_wal_watermark_read_page, DatabaseChangesIteratorMode,
@@ -1995,6 +1996,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             cached_insert_stmt: HashMap::new(),
             cached_update_stmt: HashMap::new(),
             in_txn: true,
+            temporary_table_name: None,
             generator: DatabaseReplayGenerator {
                 conn: conn.clone(),
                 opts: DatabaseReplaySessionOpts {
@@ -2017,6 +2019,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 	                self.main_db_path,
 	                remote_apply_stats.touched_rows.len()
 	            );
+            if had_cdc_table && !remote_apply_stats.renamed_tables.is_empty() {
+                rename_tables_in_local_changes(coro, &conn, &remote_apply_stats.renamed_tables)
+                    .await?;
+            }
 
             let (last_pushed_pull_gen_hint, last_pushed_change_id_hint) = {
                 let meta = self.meta();
@@ -2042,6 +2048,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             let local_changes = precollected_local_changes
                 .into_iter()
                 .filter(|change| change.change_id > replay_floor)
+                .map(|mut change| {
+                    change.table_name = remote_apply_stats
+                        .renamed_tables
+                        .current_name(&change.table_name)
+                        .to_string();
+                    change
+                })
                 .collect::<Vec<_>>();
             let mut skipped_internal_local_changes = 0usize;
             let local_changes = local_changes
@@ -2070,6 +2083,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     cached_insert_stmt: HashMap::new(),
                     cached_update_stmt: HashMap::new(),
                     in_txn: true,
+                    temporary_table_name: None,
                     generator: DatabaseReplayGenerator {
                         conn: conn.clone(),
                         opts: DatabaseReplaySessionOpts {
@@ -2374,6 +2388,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             let applied_raw_db_size: u32;
             let mut revert_since_wal_watermark = None;
             let mut followup_revision = None;
+            let mut followup_renamed_tables = RenamedTables::default();
             match stream_kind {
                 stream_kind if stream_kind_applies_remote_pages(stream_kind) => {
                     if matches!(stream_kind, DbChangesStreamKind::ReplaceBasePages) {
@@ -2550,6 +2565,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                             cached_insert_stmt: HashMap::new(),
                                             cached_update_stmt: HashMap::new(),
                                             in_txn: true,
+                                            temporary_table_name: None,
                                             generator: DatabaseReplayGenerator {
                                                 conn: replay_conn.clone(),
                                                 opts: DatabaseReplaySessionOpts {
@@ -2557,7 +2573,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                                 },
                                             },
                                         };
-                                        apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                                        followup_renamed_tables = apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
                                             coro,
                                             &mut replay,
                                             changes_file,
@@ -2569,7 +2585,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                             Error::DatabaseSyncEngineError(format!(
                                                 "failed to apply replace-base follow-up logical transactions: {error}",
                                             ))
-                                        })?;
+                                        })?
+                                        .renamed_tables;
                                     }
                                 }
                                 (
@@ -2729,6 +2746,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 precollected_local_changes
                     .into_iter()
                     .filter(|change| change.change_id > replay_floor)
+                    .map(|mut change| {
+                        change.table_name = followup_renamed_tables
+                            .current_name(&change.table_name)
+                            .to_string();
+                        change
+                    })
                     .collect::<Vec<_>>()
             } else {
                 let iterate_opts = DatabaseChangesIteratorOpts {
@@ -2831,6 +2854,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     cached_insert_stmt: HashMap::new(),
                     cached_update_stmt: HashMap::new(),
                     in_txn: true,
+                    temporary_table_name: None,
                     generator: DatabaseReplayGenerator {
                         conn: phase_conn.clone(),
                         opts: DatabaseReplaySessionOpts {

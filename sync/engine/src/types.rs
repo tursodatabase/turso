@@ -617,6 +617,16 @@ pub enum DatabaseSchemaReplay {
     Alter {
         sql: String,
     },
+    RenameTable {
+        old_name: String,
+        new_name: String,
+    },
+    RenameTableToTemporaryName {
+        name: String,
+    },
+    RenameTemporaryTable {
+        new_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
