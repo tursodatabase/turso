@@ -1640,9 +1640,9 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Min => {
+                ScalarFunc::Min | ScalarFunc::Least => {
                     if args.is_empty() {
-                        crate::bail_parse_error!("min function with no arguments");
+                        crate::bail_parse_error!("{} function with no arguments", srf.to_string());
                     }
                     let start_reg = program.alloc_registers(args.len());
                     for (i, arg) in args.iter().enumerate() {
@@ -1657,43 +1657,9 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Max => {
+                ScalarFunc::Max | ScalarFunc::Greatest => {
                     if args.is_empty() {
-                        crate::bail_parse_error!("min function with no arguments");
-                    }
-                    let start_reg = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
-
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Greatest => {
-                    if args.is_empty() {
-                        crate::bail_parse_error!("greatest function with no arguments");
-                    }
-                    let start_reg = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
-
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Least => {
-                    if args.is_empty() {
-                        crate::bail_parse_error!("least function with no arguments");
+                        crate::bail_parse_error!("{} function with no arguments", srf.to_string());
                     }
                     let start_reg = program.alloc_registers(args.len());
                     for (i, arg) in args.iter().enumerate() {
