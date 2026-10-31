@@ -566,7 +566,7 @@ SELECT * FROM json_each(json_text, path);
 
 **Output columns:**
 
-For object members, `key` is the decoded member name, including any JSON escapes.
+For object members, `key` is the decoded member name, including any JSON escapes. In `fullkey` and `path`, a member name written with JSON5 escapes, such as `a\vb`, keeps those escapes as written.
 
 | Column | Type | Description |
 |--------|------|-------------|
