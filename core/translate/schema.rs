@@ -159,21 +159,52 @@ pub(crate) fn validate_check_expr(
 /// are stored. For a type whose DECODE changes the value, such as `uuid`
 /// stored as a blob and read as text, comparing the function's value with a
 /// column would never find them equal, so the CHECK constraint is refused.
-/// A CAST of the call, or a call that is not compared, is fine.
+/// The call may be wrapped in a function that returns it unchanged, such as
+/// coalesce(), or in a CASE. A CAST of the call, or a call that is not compared,
+/// is fine.
 fn reject_value_unlike_stored_columns(
     operand: &ast::Expr,
     resolver: &CatalogContext,
 ) -> Result<()> {
-    let operand = match operand {
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => &exprs[0],
-        _ => operand,
-    };
-    let ast::Expr::FunctionCall { name, args, .. } = operand else {
-        return Ok(());
+    let (name, args) = match operand {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            return reject_value_unlike_stored_columns(&exprs[0], resolver);
+        }
+        // The value of a CASE is the value of one of its results.
+        ast::Expr::Case {
+            when_then_pairs,
+            else_expr,
+            ..
+        } => {
+            for (_, result) in when_then_pairs {
+                reject_value_unlike_stored_columns(result, resolver)?;
+            }
+            if let Some(else_expr) = else_expr {
+                reject_value_unlike_stored_columns(else_expr, resolver)?;
+            }
+            return Ok(());
+        }
+        ast::Expr::FunctionCall { name, args, .. } => (name, args),
+        _ => return Ok(()),
     };
     let Some(func) = resolver.resolve_function(name.as_str(), args.len())? else {
         return Ok(());
     };
+    // These functions return one of their arguments unchanged, so
+    // coalesce(auth.uid(), ...) has auth.uid()'s value.
+    let passed_through: &[Box<ast::Expr>] = match func {
+        Func::Scalar(
+            ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Min | ScalarFunc::Max,
+        ) => args,
+        Func::Scalar(
+            ScalarFunc::Nullif | ScalarFunc::Likely | ScalarFunc::Unlikely | ScalarFunc::Likelihood,
+        ) => &args[..args.len().min(1)],
+        Func::Scalar(ScalarFunc::Iif) => args.get(1..).unwrap_or_default(),
+        _ => &[],
+    };
+    for arg in passed_through {
+        reject_value_unlike_stored_columns(arg, resolver)?;
+    }
     let Some(ReturnType::Custom(type_name)) = func.return_type() else {
         return Ok(());
     };

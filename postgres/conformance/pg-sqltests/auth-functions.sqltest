@@ -993,6 +993,53 @@ expect @tursopg error {
     cannot compare auth\.uid\(\) in a CHECK constraint: it returns uuid values in a different form than they are stored
 }
 
+# coalesce(), nullif() and CASE give auth.uid()'s value unchanged, so comparing
+# them with a uuid column is refused as well.
+@setup auth_functions
+test auth-uid-in-coalesce-in-a-check-constraint-on-a-uuid-column {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = coalesce(auth.uid(), 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')));
+    INSERT INTO owned VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT owner FROM owned;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+expect @tursopg error {
+    cannot compare auth\.uid\(\) in a CHECK constraint: it returns uuid values in a different form than they are stored
+}
+
+@setup auth_functions
+test auth-uid-in-nullif-in-a-check-constraint-on-a-uuid-column {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = nullif(auth.uid(), 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')));
+    INSERT INTO owned VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT owner FROM owned;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+expect @tursopg error {
+    cannot compare auth\.uid\(\) in a CHECK constraint: it returns uuid values in a different form than they are stored
+}
+
+@setup auth_functions
+test auth-uid-in-case-in-a-check-constraint-on-a-uuid-column {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = CASE WHEN true THEN auth.uid() END));
+    INSERT INTO owned VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    SELECT owner FROM owned;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+}
+expect @tursopg error {
+    cannot compare auth\.uid\(\) in a CHECK constraint: it returns uuid values in a different form than they are stored
+}
+
 # A CAST of auth.uid() to text compares text with text, so the CHECK constraint
 # is accepted and holds.
 @setup auth_functions
