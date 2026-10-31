@@ -1,0 +1,57 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/9840
+# SQLite drops the sign of a negative-zero REAL when the value becomes JSON, so
+# a document built from -0.0 is written like one built from 0.0 and the two
+# compare equal. Turso kept the sign, which made DISTINCT and GROUP BY over such
+# documents return two rows where SQLite returns one. JSON text that already
+# contains -0.0 is a different case: both engines pass it through unchanged.
+
+test json-array-negative-zero-real {
+    SELECT json_array(-0.0);
+}
+expect {
+    [0.0]
+}
+
+test json-object-negative-zero-real {
+    SELECT json_object('a', -0.0);
+}
+expect {
+    {"a":0.0}
+}
+
+test json-quote-negative-zero-real {
+    SELECT json_quote(-0.0);
+}
+expect {
+    0.0
+}
+
+test json-of-jsonb-array-negative-zero-real {
+    SELECT json(jsonb_array(-0.0));
+}
+expect {
+    [0.0]
+}
+
+test jsonb-negative-zero-equals-jsonb-positive-zero {
+    SELECT jsonb_array(-0.0) = jsonb_array(0.0);
+}
+expect {
+    1
+}
+
+test distinct-json-of-negative-and-positive-zero {
+    SELECT count(*) FROM (SELECT DISTINCT json_array(x) FROM (SELECT -0.0 AS x UNION ALL SELECT 0.0));
+}
+expect {
+    1
+}
+
+test json-text-negative-zero-is-preserved {
+    SELECT json('[-0.0]');
+}
+expect {
+    [-0.0]
+}
