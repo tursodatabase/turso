@@ -3612,3 +3612,92 @@ expect {
     1
     1
 }
+
+# RENAME COLUMN and DROP COLUMN store double-quoted strings in indexes with single quotes,
+# so the indexes keep reading strings after a column of that name is added.
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+@cross-check-integrity
+test alter-table-rename-column-single-quotes-index-strings {
+    CREATE TABLE t(c, x);
+    CREATE TABLE u(a);
+    CREATE INDEX i ON t (c || "q");
+    CREATE INDEX ip ON t (c) WHERE c || "q" IS NOT NULL;
+    CREATE INDEX iu ON u (a || "q");
+    INSERT INTO t VALUES (1, 2);
+    ALTER TABLE t RENAME COLUMN x TO z;
+    ALTER TABLE t ADD COLUMN q;
+    SELECT name, sql FROM sqlite_schema WHERE type = 'index' ORDER BY name;
+    SELECT count(*) FROM t INDEXED BY i WHERE c || 'q' = '1q';
+}
+expect {
+    i|CREATE INDEX i ON t (c || 'q')
+    ip|CREATE INDEX ip ON t (c) WHERE c || 'q' IS NOT NULL
+    iu|CREATE INDEX iu ON u (a || 'q')
+    1
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+@cross-check-integrity
+test alter-table-drop-column-single-quotes-index-strings {
+    CREATE TABLE t(c, x);
+    CREATE TABLE u(a);
+    CREATE INDEX i ON t (c || "q");
+    CREATE INDEX ip ON t (c) WHERE c || "q" IS NOT NULL;
+    CREATE INDEX iu ON u (a || "q");
+    INSERT INTO t VALUES (1, 2);
+    ALTER TABLE t DROP COLUMN x;
+    ALTER TABLE t ADD COLUMN q;
+    SELECT name, sql FROM sqlite_schema WHERE type = 'index' ORDER BY name;
+    SELECT count(*) FROM t INDEXED BY i WHERE c || 'q' = '1q';
+}
+expect {
+    i|CREATE INDEX i ON t (c || 'q')
+    ip|CREATE INDEX ip ON t (c) WHERE c || 'q' IS NOT NULL
+    iu|CREATE INDEX iu ON u (a || 'q')
+    1
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+@cross-check-integrity
+test alter-table-rename-column-to-index-string {
+    CREATE TABLE t(c, x);
+    CREATE INDEX i ON t (c || "z");
+    INSERT INTO t VALUES (1, 2);
+    ALTER TABLE t RENAME COLUMN x TO z;
+    SELECT sql FROM sqlite_schema WHERE name = 'i';
+    SELECT count(*) FROM t INDEXED BY i WHERE c || 'z' = '1z';
+}
+expect {
+    CREATE INDEX i ON t (c || 'z')
+    1
+}
+
+# A single-quoted name alone in an index is a column name, so 'zz' would not load.
+test alter-table-rename-column-index-of-string-alone {
+    CREATE TABLE t(c, x);
+    CREATE INDEX i ON t ("zz");
+    ALTER TABLE t RENAME COLUMN x TO z;
+}
+expect error {
+}
+
+# Like SQLite, which reloads the schema after ADD COLUMN, a double-quoted string in an index
+# names the added column from then on. A single-quoted string stays a string.
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+@cross-check-integrity
+test alter-table-add-column-named-like-index-string {
+    CREATE TABLE t(c);
+    CREATE INDEX i ON t (c || "q");
+    CREATE INDEX j ON t (c || 'q');
+    CREATE INDEX k ON t (c) WHERE "q" IS NOT NULL;
+    ALTER TABLE t ADD COLUMN q;
+    INSERT INTO t VALUES (2, 3), (4, NULL);
+    SELECT c FROM t INDEXED BY i WHERE c || q = '23';
+    SELECT c FROM t INDEXED BY j WHERE c || 'q' = '4q';
+    SELECT c FROM t INDEXED BY k WHERE q IS NOT NULL;
+}
+expect {
+    2
+    4
+    2
+}

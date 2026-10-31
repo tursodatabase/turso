@@ -302,3 +302,97 @@ test create-index-sqlite-source-id {
 }
 expect error {
 }
+
+# A double-quoted name that is not a column is a string literal, as in SELECT.
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+@cross-check-integrity
+test create-index-double-quoted-string-in-expression {
+    CREATE TABLE t20(c);
+    INSERT INTO t20 VALUES ('2020-01-31');
+    CREATE INDEX idx20 ON t20(datetime(c, "+1 month"));
+    INSERT INTO t20 VALUES ('2021-05-01');
+    SELECT c FROM t20 INDEXED BY idx20 WHERE datetime(c, '+1 month') > '2021';
+}
+expect {
+    2021-05-01
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+@cross-check-integrity
+test create-index-double-quoted-string-in-where {
+    CREATE TABLE t21(c);
+    INSERT INTO t21 VALUES (1), ('-7'), ('-70');
+    CREATE INDEX idx21 ON t21(c) WHERE c < "-61";
+    INSERT INTO t21 VALUES (2), ('-80');
+    SELECT c FROM t21 INDEXED BY idx21 WHERE c < '-61' ORDER BY c;
+}
+expect {
+    1
+    2
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+@cross-check-integrity
+test create-index-double-quoted-string-alone {
+    CREATE TABLE t22(c);
+    INSERT INTO t22 VALUES (1);
+    CREATE INDEX idx22 ON t22("zz");
+    INSERT INTO t22 VALUES (2);
+    SELECT count(*) FROM t22;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+test create-index-double-quoted-column-name {
+    CREATE TABLE t23(c, d);
+    INSERT INTO t23 VALUES (1, 'x'), (2, 'y');
+    CREATE INDEX idx23 ON t23(c || "d");
+    SELECT c FROM t23 INDEXED BY idx23 WHERE c || d = '2y';
+}
+expect {
+    2
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+@cross-check-integrity
+test create-index-double-quoted-rowid-name {
+    CREATE TABLE t24(c);
+    INSERT INTO t24 VALUES ('a'), ('b');
+    CREATE INDEX idx24a ON t24(c || "oid");
+    CREATE INDEX idx24b ON t24(c) WHERE c > "rowid";
+    SELECT c FROM t24 INDEXED BY idx24a WHERE c || 'oid' = 'boid';
+    SELECT count(*) FROM t24 INDEXED BY idx24b WHERE c > rowid;
+}
+expect {
+    b
+    2
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test create-index-double-quoted-now-in-expression {
+    CREATE TABLE t25(c);
+    INSERT INTO t25 VALUES (1);
+    CREATE INDEX idx25 ON t25(c, datetime("now"));
+}
+expect error {
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test create-index-double-quoted-localtime-in-expression {
+    CREATE TABLE t26(c);
+    INSERT INTO t26 VALUES (1);
+    CREATE INDEX idx26 ON t26(strftime('%s', c, "localtime"));
+}
+expect error {
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test create-index-double-quoted-now-in-where {
+    CREATE TABLE t27(c);
+    INSERT INTO t27 VALUES (1);
+    CREATE INDEX idx27 ON t27(c) WHERE c > julianday("now");
+}
+expect error {
+}

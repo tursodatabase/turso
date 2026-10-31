@@ -18,10 +18,11 @@ use crate::translate::{
     expr::expr_type::{type_of, type_ordering, TypeEnv},
     expr::{
         bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
-        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        unwrap_parens, walk_expr, walk_expr_mut, BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
+    planner::ROWID_STRS,
 };
 use crate::type_ordering::TypeOrdering;
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
@@ -222,6 +223,10 @@ pub fn translate_create_index(
             resolver.catalog.symbol_table,
         )
     })?;
+    let mut where_clause = where_clause;
+    if let Some(where_clause) = &mut where_clause {
+        double_quoted_names_to_strings(where_clause, &tbl, true)?;
+    }
 
     // Block CREATE INDEX on STRUCT/UNION columns and on types that can't be sorted
     for col in &columns {
@@ -1084,20 +1089,26 @@ fn resolve_sorted_columns_with_catalog(
                 expr,
             }
         } else {
-            if !validate_index_expression(unwrapped_expr, table) {
+            let mut expr = sc.expr.clone();
+            double_quoted_names_to_strings(&mut expr, table, false)?;
+            if matches!(unwrapped_expr, Expr::Literal(ast::Literal::String(_)))
+                || !validate_index_expression(&expr, table)
+            {
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
-            let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;
+            let mut converted_expr = unwrapped_expr.clone();
+            double_quoted_names_to_strings(&mut converted_expr, table, false)?;
+            let ordering = expression_type_ordering(&converted_expr, table, schema, syms)?;
             let collation = index_collation(explicit_collation, ordering)?;
             IndexColumn {
-                name: sc.expr.to_string(),
+                name: expr.to_string(),
                 order,
                 nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
                 collation: collation.unwrap_or(CollationSeq::BINARY),
                 explicit_collation,
                 default: None,
-                expr: Some(sc.expr.clone()),
+                expr: Some(expr),
             }
         };
         // SQLite reports any other error in the same term instead of this one.
@@ -1238,17 +1249,7 @@ fn resolve_index_column<'a>(
 /// (a.k.a.: deterministic functions). Obviously, functions like random() will not work well in an index. But also functions like sqlite_version(), though they
 /// are constant across any one database connection, are not constant across the life of the underlying database file, and hence may not be used in a CREATE INDEX statement.
 /// Expressions in CREATE INDEX statements may not use subqueries.
-/// Additionally, a standalone string literal is interpreted as a column name (for backwards
-/// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
 fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
-    // A top-level string literal would have been handled by resolve_index_column().
-    // If we get here with a string literal, it means the column doesn't exist.
-    // (SQLite interprets standalone string literals as column names for backwards compat.)
-    // Note: extract_collation already unwraps parentheses, so we check the unwrapped expr.
-    if matches!(expr, Expr::Literal(ast::Literal::String(_))) {
-        return false;
-    }
-
     let tbl_norm = normalize_ident(table.name.as_str());
     let has_col = |name: &str| {
         let n = normalize_ident(name);
@@ -1330,6 +1331,41 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         })
     });
     ok
+}
+
+/// Like SQLite, reads a double-quoted name that is not a column of the indexed table as a
+/// string literal. This is done once, when the index is created or loaded from the schema,
+/// so the index does not start reading a column of that name added later.
+pub fn double_quoted_names_to_strings(
+    expr: &mut Expr,
+    table: &BTreeTable,
+    rowid_names_are_columns: bool,
+) -> crate::Result<bool> {
+    let mut changed = false;
+    walk_expr_mut(expr, &mut |e: &mut Expr| -> crate::Result<WalkControl> {
+        if let Expr::Id(name) = e {
+            if is_double_quoted_string(name, table, rowid_names_are_columns) {
+                *e = Expr::Literal(ast::Literal::String(name.as_literal()));
+                changed = true;
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(changed)
+}
+
+fn is_double_quoted_string(
+    name: &ast::Name,
+    table: &BTreeTable,
+    rowid_names_are_columns: bool,
+) -> bool {
+    name.quoted_with('"')
+        && table.get_column(name.as_str()).is_none()
+        && !(rowid_names_are_columns
+            && table.has_rowid
+            && ROWID_STRS
+                .iter()
+                .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str())))
 }
 
 fn emit_index_column_value_from_cursor(
