@@ -396,18 +396,29 @@ fn prepare_update_plan(
 
     let set_clauses = collect_update_set_clauses(&mut body.sets, &table, table_name)?;
 
+    let returning_reads_from_tables = read_scope_tables.joined_tables().len() > 1
+        && resolver.catalog.dialect.returning_reads_from_tables();
+    let mut returning_from_values = Vec::new();
     let result_columns = if !body.returning.is_empty() {
         // Plan subqueries in RETURNING expressions before processing
         // (so SubqueryResult nodes are cloned into result_columns)
-        let mut returning_target = read_scope_tables.joined_tables()[0].clone();
-        // SQLite resolves RETURNING columns for an aliased UPDATE target through the
-        // base table name, not the UPDATE alias. Keep the target table in scope, but
-        // under its schema name so `RETURNING t.col` works while `RETURNING alias.col`
-        // still fails.
-        returning_target.identifier = table_name.to_string();
-        returning_target.has_alias = false;
+        let mut returning_tables = vec![read_scope_tables.joined_tables()[0].clone()];
+        if returning_reads_from_tables {
+            for from_table in &read_scope_tables.joined_tables()[1..] {
+                let mut from_table = from_table.clone();
+                from_table.col_used_mask = Default::default();
+                returning_tables.push(from_table);
+            }
+        } else {
+            // SQLite resolves RETURNING columns for an aliased UPDATE target through the
+            // base table name, not the UPDATE alias. Keep the target table in scope, but
+            // under its schema name so `RETURNING t.col` works while `RETURNING alias.col`
+            // still fails.
+            returning_tables[0].identifier = table_name.to_string();
+            returning_tables[0].has_alias = false;
+        }
         let mut returning_table_references = TableReferences::new(
-            vec![returning_target],
+            returning_tables,
             read_scope_tables.outer_query_refs().to_vec(),
         );
         plan_subqueries_from_returning(
@@ -419,11 +430,19 @@ fn prepare_update_plan(
             connection,
         )?;
 
-        process_returning_clause(
+        let result_columns = process_returning_clause(
             &mut body.returning,
             &mut returning_table_references,
             resolver,
-        )?
+        )?;
+        returning_from_values =
+            values_returning_reads_from_from_tables(&returning_table_references);
+        for value in &returning_from_values {
+            if let Expr::Column { table, column, .. } = value {
+                read_scope_tables.mark_column_used(*table, *column);
+            }
+        }
+        result_columns
     } else {
         vec![]
     };
@@ -466,6 +485,7 @@ fn prepare_update_plan(
         set_clauses,
         where_clause,
         returning: (!result_columns.is_empty()).then_some(result_columns),
+        returning_from_values,
         contains_constant_false_condition: false,
         indexes_to_update,
         write_set_plan: None,
@@ -473,6 +493,28 @@ fn prepare_update_plan(
         non_from_clause_subqueries,
         safety: DmlSafety::default(),
     })
+}
+
+/// What RETURNING can read from every table after the target (the first table): the columns
+/// marked used, and the rowid. The rowid is always included because a subquery's use of it is
+/// not recorded on these tables.
+fn values_returning_reads_from_from_tables(table_references: &TableReferences) -> Vec<Expr> {
+    let mut values = Vec::new();
+    for from_table in &table_references.joined_tables()[1..] {
+        values.extend(from_table.col_used_mask.iter().map(|column| Expr::Column {
+            database: None,
+            table: from_table.internal_id,
+            column,
+            is_rowid_alias: from_table.columns()[column].is_rowid_alias(),
+        }));
+        if from_table.btree().is_some_and(|table| table.has_rowid) {
+            values.push(Expr::RowId {
+                database: None,
+                table: from_table.internal_id,
+            });
+        }
+    }
+    values
 }
 
 fn collect_update_set_clauses(

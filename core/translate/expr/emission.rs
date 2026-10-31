@@ -168,6 +168,14 @@ pub fn process_returning_clause(
                     contains_aggregates: false,
                 });
             }
+            ast::ResultColumn::Star if table_references.joined_tables().len() > 1 => {
+                crate::translate::plan::expand_star(
+                    table_references,
+                    &mut result_columns,
+                    false,
+                    resolver,
+                )?;
+            }
             ast::ResultColumn::Star => {
                 let table = table_references
                     .joined_tables()
@@ -192,6 +200,14 @@ pub fn process_returning_clause(
                         contains_aggregates: false,
                     });
                 }
+            }
+            ast::ResultColumn::TableStar(name) if table_references.joined_tables().len() > 1 => {
+                crate::translate::plan::expand_table_star(
+                    table_references,
+                    &mut result_columns,
+                    name.as_str(),
+                    false,
+                )?;
             }
             ast::ResultColumn::TableStar(_) => {
                 crate::bail_parse_error!("RETURNING may not use \"TABLE.*\" wildcards");
@@ -341,6 +357,47 @@ pub(crate) fn emit_returning_results<'a>(
     result
 }
 
+/// Reads the FROM values that RETURNING needs from the scratch table's current
+/// row, where they follow the SET payloads, and puts their registers in the cache.
+pub(crate) fn seed_returning_from_values_in_cache<'a>(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    from_values: &[ast::Expr],
+    scratch_cursor_id: usize,
+    first_scratch_column: usize,
+    resolver: &mut Resolver<'a>,
+) -> Result<ReturningRowImageCacheState> {
+    let cache_len = resolver.expr_to_reg_cache.len();
+    let cache_enabled = resolver.expr_to_reg_cache_enabled;
+    resolver.enable_expr_to_reg_cache();
+    for (i, value) in from_values.iter().enumerate() {
+        let reg = program.alloc_register();
+        program.emit_column_or_rowid(scratch_cursor_id, first_scratch_column + i, reg);
+        if let ast::Expr::Column { table, column, .. } = value {
+            let (_, from_table) = table_references
+                .find_table_by_internal_id(*table)
+                .expect("a FROM table that RETURNING reads must be in its table references");
+            let array_column = from_table.get_column_at(*column).filter(|c| c.is_array());
+            if let Some(array_column) = array_column {
+                // The scratch table holds the display form of an array. Subscripts and array
+                // functions in RETURNING need the stored form.
+                let skip_null = program.allocate_label();
+                program.emit_insn(Insn::IsNull {
+                    reg,
+                    target_pc: skip_null,
+                });
+                emit_array_encode(program, reg, array_column, resolver, from_table.get_name())?;
+                program.preassign_label_to_next_insn(skip_null);
+            }
+        }
+        resolver.cache_expr_reg(std::borrow::Cow::Owned(value.clone()), reg, false);
+    }
+    Ok(ReturningRowImageCacheState {
+        cache_len,
+        cache_enabled,
+    })
+}
+
 pub(crate) struct ReturningRowImageCacheState {
     cache_len: usize,
     cache_enabled: bool,
@@ -354,11 +411,11 @@ pub(crate) fn seed_returning_row_image_in_cache<'a>(
     resolver: &mut Resolver<'a>,
     layout: &ColumnLayout,
 ) -> Result<ReturningRowImageCacheState> {
-    turso_assert!(
-        table_references.joined_tables().len() == 1,
-        "RETURNING is only used with INSERT, UPDATE, or DELETE statements, which target a single table"
-    );
-    let table = table_references.joined_tables().first().unwrap();
+    // The first table is the one being written. Only `UPDATE ... FROM` has others after it.
+    let table = table_references
+        .joined_tables()
+        .first()
+        .expect("RETURNING is only used with INSERT, UPDATE, or DELETE statements, which have a target table");
 
     let cache_len = resolver.expr_to_reg_cache.len();
     let cache_enabled = resolver.expr_to_reg_cache_enabled;
