@@ -1064,6 +1064,62 @@ fn live_aggregate_accumulators_cannot_be_copied() {
 }
 
 #[test]
+fn external_aggregate_states_are_equal_only_when_all_fields_match() {
+    let state = ExternalAggState {
+        context: 7,
+        state: std::ptr::null_mut(),
+        argc: 2,
+        step_fn: unused_aggregate_step,
+        finalize_fn: unused_aggregate_finalize,
+        aggregate_destructor: None,
+        value_destructor: None,
+    };
+    assert_eq!(state, state.clone());
+    assert_ne!(
+        state,
+        ExternalAggState {
+            aggregate_destructor: Some(unused_context_destructor),
+            ..state.clone()
+        }
+    );
+    assert_ne!(
+        state,
+        ExternalAggState {
+            step_fn: other_unused_aggregate_step,
+            ..state.clone()
+        }
+    );
+    assert_ne!(
+        state,
+        ExternalAggState {
+            finalize_fn: other_unused_aggregate_finalize,
+            ..state.clone()
+        }
+    );
+    assert_ne!(
+        state,
+        ExternalAggState {
+            value_destructor: Some(unused_value_destructor),
+            ..state.clone()
+        }
+    );
+    assert_ne!(
+        state,
+        ExternalAggState {
+            argc: 3,
+            ..state.clone()
+        }
+    );
+    assert_ne!(
+        state,
+        ExternalAggState {
+            context: 8,
+            ..state.clone()
+        }
+    );
+}
+
+#[test]
 fn pending_aggregates_release_state_on_reset_and_failed_completion() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
@@ -2554,6 +2610,30 @@ unsafe extern "C" fn unused_aggregate_finalize(
     _ctx: *mut turso_ext::AggCtx,
 ) -> turso_ext::Value {
     unreachable!("the test never finalizes an aggregate")
+}
+
+unsafe extern "C" fn other_unused_aggregate_step(
+    _context: usize,
+    _ctx: *mut turso_ext::AggCtx,
+    _argc: i32,
+    _argv: *const turso_ext::Value,
+) -> turso_ext::Value {
+    unreachable!("the test never steps the other aggregate")
+}
+
+unsafe extern "C" fn other_unused_aggregate_finalize(
+    _context: usize,
+    _ctx: *mut turso_ext::AggCtx,
+) -> turso_ext::Value {
+    unreachable!("the test never finalizes the other aggregate")
+}
+
+unsafe extern "C" fn unused_context_destructor(_context: usize) {
+    unreachable!("the test never destroys an aggregate context")
+}
+
+unsafe extern "C" fn unused_value_destructor(_result: *mut turso_ext::Value) {
+    unreachable!("the test never destroys an aggregate value")
 }
 
 unsafe extern "C" fn c_double(

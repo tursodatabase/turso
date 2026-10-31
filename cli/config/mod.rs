@@ -96,14 +96,29 @@ impl Config {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, JsonSchema, Validate)]
+#[derive(Debug, Deserialize, Clone, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct TableConfig {
     #[serde(default = "TableConfig::default_header_color")]
     pub header_color: LimboColor,
     #[serde(default = "TableConfig::default_column_colors")]
-    #[validate(length(min = 1))]
     pub column_colors: Vec<LimboColor>,
+}
+
+impl Validate for TableConfig {
+    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+        if self.column_colors.is_empty() {
+            let mut errors = validator::ValidationErrors::new();
+            errors.add(
+                "column_colors",
+                validator::ValidationError::new("length")
+                    .with_message("must contain at least one color".into()),
+            );
+            return Err(errors);
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for TableConfig {
@@ -191,5 +206,34 @@ impl Default for HighlightConfig {
             hint: LimboColor(Color::Rgb(107u8, 114u8, 128u8)),
             candidate: LimboColor(Color::Green),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn column_colors(config: &str) -> Vec<Color> {
+        Config::from_config_str(config)
+            .table
+            .column_colors
+            .into_iter()
+            .map(|color| color.0)
+            .collect()
+    }
+
+    #[test]
+    fn empty_column_colors_fall_back_to_default_table_config() {
+        let default_colors: Vec<Color> = TableConfig::default()
+            .column_colors
+            .into_iter()
+            .map(|color| color.0)
+            .collect();
+        assert!(!default_colors.is_empty());
+        assert_eq!(column_colors("[table]\ncolumn_colors = []"), default_colors);
+        assert_eq!(
+            column_colors("[table]\ncolumn_colors = [\"red\"]"),
+            vec![Color::Red]
+        );
     }
 }
