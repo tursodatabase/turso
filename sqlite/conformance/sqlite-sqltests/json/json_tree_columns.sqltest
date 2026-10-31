@@ -292,6 +292,24 @@ expect {
     632264
 }
 
+test json-each-decoded-json5-escape-keys {
+    SELECT hex(key) FROM json_each('{"\\v":1,"\\x41":2,"a\\vb":3}') WHERE type = 'integer';
+    SELECT hex(key) FROM json_each(jsonb('{"\\v":1}'));
+}
+expect {
+    0B
+    41
+    610B62
+    0B
+}
+
+test json-tree-root-key-from-path-keeps-the-path-spelling {
+    SELECT hex(key), key FROM json_tree('{"c\\"d":{"x":1}}', '$."c\\"d"') ORDER BY id LIMIT 1;
+}
+expect {
+    635C2264|c\\"d
+}
+
 test json-tree-decoded-object-keys-keep-escaped-paths {
     SELECT hex(key), fullkey, path FROM json_tree('{"p\\nq":{"a\\nb":1,"e\\\\f":2}}') WHERE key IS NOT NULL;
     WITH d(j) AS (VALUES('{"p\\nq":{"a\\nb":1,"e\\\\f":2,"c\\"d":3}}'))
