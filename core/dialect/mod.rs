@@ -132,10 +132,6 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
-    fn random_value(&self, bits: i64) -> crate::Value {
-        crate::Value::from_i64(bits) // SQLite default
-    }
-
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect

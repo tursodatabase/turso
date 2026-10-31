@@ -10588,7 +10588,7 @@ pub fn op_function(
             }
             ScalarFunc::Random => {
                 let bits = pager.io.generate_random_number();
-                let value = program.connection.dialect().random_value(bits);
+                let value = Value::from_i64(bits);
                 state.registers[*dest].set_value(value);
             }
             #[cfg(feature = "test_helper")]

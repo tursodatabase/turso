@@ -94,7 +94,11 @@ impl StatementOrigin {
 /// (`"INTEGER"`, `"TEXT"`, `"REAL"`). For a typed expression — CAST, rowid,
 /// or anything else SQLite's affinity rules can pin down — it's the
 /// inferred primitive. In both cases `array_dimensions` is `0`, `base_type`
-/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When neither path
+/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. An expression whose
+/// type is a custom type (`CAST(x AS cents)`, `coalesce(cents_col, 0)`, a
+/// function declared to return one) is reported exactly like a column of
+/// that type: `declared_name` is the type's name, `base_type` the primitive
+/// it is stored as, and `kind` its kind. When none of these paths
 /// produces a usable primitive (binary arithmetic that SQLite refuses to
 /// propagate through, BLOB literals, NULL literals, function calls without
 /// declared return affinity), `get_column_type_info` returns `Ok(None)`

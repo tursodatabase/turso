@@ -227,7 +227,7 @@ A comparison in a WHERE clause does not encode the other operand. With a type wh
 
 ## CHECK Constraints with Custom Types
 
-In STRICT tables with custom types, CHECK constraints operate on the **decoded** (presentation) values. When comparing a column of a custom type against a literal, use CAST to encode the literal:
+In STRICT tables with custom types, CHECK constraints operate on the **stored** (encoded) values. When comparing a column of a custom type against a literal, use CAST to encode the literal:
 
 ```sql
 CREATE TYPE cents BASE integer
@@ -239,6 +239,8 @@ CREATE TABLE products (
     price cents CHECK(price >= CAST(0 AS cents))
 ) STRICT;
 ```
+
+A function can return a value of a custom type. It returns the value as a column read gives it, after DECODE. A CHECK constraint sees the stored values instead, so when the type's DECODE changes the value, a comparison of such a call with a column would be wrong. In a STRICT table, CREATE TABLE refuses `CHECK (owner = f())` on such a column, also through `coalesce()` or `nullif()`, with `cannot compare f() in a CHECK constraint: it returns <type> values in a different form than they are stored`. A CAST of the call compared with a column of the CAST's type, as in `owner text CHECK (owner = CAST(f() AS text))`, is accepted.
 
 ## Inspecting Types
 

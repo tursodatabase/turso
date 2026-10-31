@@ -178,6 +178,12 @@ impl Dialect for PostgresDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
+        // random() is a native function (see functions.rs) because it returns
+        // a double, not SQLite's integer. Skipping the builtin lets that one
+        // be found.
+        if name.eq_ignore_ascii_case("random") {
+            return Ok(None);
+        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
@@ -187,11 +193,6 @@ impl Dialect for PostgresDialect {
 
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
         true
-    }
-
-    fn random_value(&self, bits: i64) -> Value {
-        let mantissa = (bits as u64) >> 11;
-        Value::from_f64(mantissa as f64 / (1_u64 << 53) as f64)
     }
 
     fn binds_names_at_create(&self) -> bool {
