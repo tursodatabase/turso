@@ -10,7 +10,7 @@ use crate::schema::{
 use crate::sync::Arc;
 use crate::translate::{
     catalog::CatalogContext,
-    collate::{CollationSeq, TextCollation},
+    collate::{key_collation, CollationSeq, TextCollation},
     emitter::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
@@ -1067,7 +1067,7 @@ fn resolve_sorted_columns_with_catalog(
         let index_column = if let Some((pos, column_name, column)) =
             resolve_index_column(unwrapped_expr, table)
         {
-            let collation = index_collation(explicit_collation, column.type_ordering())?
+            let collation = key_collation(explicit_collation, column.type_ordering())?
                 .unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
@@ -1088,7 +1088,7 @@ fn resolve_sorted_columns_with_catalog(
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
             let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;
-            let collation = index_collation(explicit_collation, ordering)?;
+            let collation = key_collation(explicit_collation, ordering)?;
             IndexColumn {
                 name: sc.expr.to_string(),
                 order,
@@ -1138,21 +1138,6 @@ fn has_qualified_columns(expr: &Expr, table: &BTreeTable, db_name: &str) -> crat
         Ok(WalkControl::Continue)
     })?;
     Ok(has_qualified_column)
-}
-
-/// The collation of an index column: the order of its type when it has one,
-/// otherwise the explicit COLLATE, if any.
-fn index_collation(
-    explicit_collation: Option<TextCollation>,
-    ordering: Option<TypeOrdering>,
-) -> crate::Result<Option<CollationSeq>> {
-    match (ordering, explicit_collation) {
-        (Some(ordering), Some(_)) => {
-            bail_parse_error!("collations are not supported by type {}", ordering.name())
-        }
-        (Some(ordering), None) => Ok(Some(CollationSeq::Type(ordering))),
-        (None, explicit_collation) => Ok(explicit_collation.map(CollationSeq::Text)),
-    }
 }
 
 /// The order of the type of an index expression over `table`'s columns, such

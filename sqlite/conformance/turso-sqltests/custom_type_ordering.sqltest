@@ -468,6 +468,118 @@ expect error {
     cannot ALTER COLUMN "x": index ix names a COLLATE for it, and the new type has its own order
 }
 
+# CREATE INDEX rejects a COLLATE on such a type, and so does every statement
+# that declares a column or a key.
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-numeric-column {
+    CREATE TABLE t(x numeric(10,2) COLLATE NOCASE) STRICT;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-binary-on-numeric-column {
+    CREATE TABLE t(x numeric(10,2) COLLATE BINARY) STRICT;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-array-column {
+    CREATE TABLE t(x integer[] COLLATE NOCASE) STRICT;
+}
+expect error {
+    collations are not supported by type array
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-text-array-column {
+    CREATE TABLE t(x text[] COLLATE RTRIM) STRICT;
+}
+expect error {
+    collations are not supported by type text_array
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-domain-over-numeric {
+    CREATE DOMAIN money_amount AS numeric;
+    CREATE TABLE t(x money_amount COLLATE NOCASE) STRICT;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-in-unique-key-on-numeric-column {
+    CREATE TABLE t(x numeric(10,2), UNIQUE(x COLLATE NOCASE)) STRICT;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-in-primary-key-on-numeric-column {
+    CREATE TABLE t(x numeric(10,2), PRIMARY KEY(x COLLATE NOCASE)) STRICT;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test add-column-rejects-collate-on-numeric-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    ALTER TABLE t ADD COLUMN x numeric(10,2) COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-rejects-collate-on-numeric-column {
+    CREATE TABLE t(y text) STRICT;
+    ALTER TABLE t ALTER COLUMN y TO x numeric(10,2) COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type numeric
+}
+
+# A column whose type has no order of its own keeps its COLLATE, and outside a
+# STRICT table numeric is only a type name, as in SQLite.
+@requires strict "uses STRICT tables"
+test collate-allowed-on-text-column-and-key-next-to-numeric-column {
+    CREATE TABLE t(n numeric(10,2), a text COLLATE NOCASE, b text, UNIQUE(b COLLATE RTRIM)) STRICT;
+    ALTER TABLE t ADD COLUMN c text COLLATE NOCASE;
+    INSERT INTO t VALUES (1.5, 'A', 'x', 'C');
+    INSERT OR IGNORE INTO t VALUES (2.5, 'B', 'x  ', 'D');
+    SELECT count(*) FROM t WHERE a = 'a' AND c = 'c';
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+    1
+}
+
+test collate-allowed-on-numeric-column-of-non-strict-table {
+    CREATE TABLE t(x numeric(10,2) COLLATE NOCASE, UNIQUE(x COLLATE RTRIM));
+    ALTER TABLE t ADD COLUMN y numeric(10,2) COLLATE NOCASE;
+    INSERT INTO t VALUES ('a', 'b');
+    SELECT count(*) FROM t WHERE x = 'A' AND y = 'B';
+}
+expect {
+    1
+}
+
+test create-table-if-not-exists-ignores-collate-when-table-exists {
+    CREATE TABLE t(a);
+    CREATE TABLE IF NOT EXISTS t(x numeric(10,2) COLLATE NOCASE) STRICT;
+    SELECT 1;
+}
+expect {
+    1
+}
+
 @requires strict "uses STRICT tables"
 test alter-column-refuses-to-change-the-order-of-an-indexed-expression {
     CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10,2)) STRICT;
