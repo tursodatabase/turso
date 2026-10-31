@@ -144,6 +144,8 @@ jobs:
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+          # Retries failed tests and writes a JUnit report (.config/nextest.toml).
+          NEXTEST_PROFILE: ci
         # for some reason, test(test_busy_snapshot_immediate) hung with coverage - so let's exclude it from the run for now
         run: |
           cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not binary(pending_byte_tests) and not test(test_busy_snapshot_immediate)' --failure-output=final --html --output-dir coverage
@@ -157,6 +159,7 @@ jobs:
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+          NEXTEST_PROFILE: ci
           SUITE: ${{ matrix.suite }}
         run: |
           # "nextest 1/2" runs part 1 of 2; plain "nextest" runs everything.
@@ -168,6 +171,16 @@ jobs:
           fi
           cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not binary(pending_byte_tests)' "${partition[@]}" --failure-output=final
         timeout-minutes: 30
+      # On main, report-flaky-tests reads these reports. cargo llvm-cov builds
+      # in its own target directory, hence the glob.
+      - name: Upload JUnit report
+        if: ${{ !cancelled() && github.event_name == 'push' && matrix.suite == 'nextest' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ runner.os }}
+          path: target/**/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
       # Same suite against a --sync-dir server, so directory mode's per-database
       # routing gets the coverage the single-database run above provides.
       - name: Test sync suite against --sync-dir
@@ -193,6 +206,27 @@ jobs:
           name: coverage-report
           path: coverage/
           retention-days: 14
+
+  # A test that failed and then passed on a retry in a main build is flaky:
+  # file an issue for it, or comment on its open one.
+  report-flaky-tests:
+    needs: build-native
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: junit
+      - name: Report flaky tests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/report-flaky-tests.py junit
 
   # Runs without --all-features because the corruption and short-read tests
   # are compile-gated on the "checksum" feature being disabled: with page
