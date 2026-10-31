@@ -172,6 +172,14 @@ fn build_plan_dag_node(
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
+            if left.iter().any(|(_, operator)| {
+                matches!(
+                    operator,
+                    ast::CompoundOperator::ExceptAll | ast::CompoundOperator::IntersectAll
+                )
+            }) {
+                return unsupported("EXCEPT ALL or INTERSECT ALL");
+            }
             let mut inputs = Vec::with_capacity(left.len() + 1);
             for (branch, _) in left {
                 inputs.push(build_select_plan_dag(builder, branch, resolver)?);
