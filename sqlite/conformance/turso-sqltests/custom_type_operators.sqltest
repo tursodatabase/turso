@@ -715,6 +715,17 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test op-date-plus-abs-of-text-error {
+    -- abs of text is a real, never days: abs('3') is 3.0.
+    CREATE TABLE t(d date, s TEXT) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', '3');
+    SELECT d + abs(s) FROM t;
+}
+expect error {
+    operator does not exist: date \+ real
+}
+
+@requires strict "uses STRICT tables"
 test op-date-minus-derived-table-cte-and-view-columns {
     CREATE TABLE t(d date) STRICT;
     CREATE TABLE u(e date) STRICT;
