@@ -2727,8 +2727,7 @@ pub enum Cookie {
     ApplicationId = 8,
     /// The page size, as read by the page_size pragma.
     PageSize = 9,
-    /// The connection's `PRAGMA data_version`. Not stored in the header: like SQLite's
-    /// `BTREE_DATA_VERSION`, it comes from the pager.
+    /// The connection's data version, as read by the data_version pragma.
     DataVersion = 15,
 }
 
