@@ -3490,7 +3490,7 @@ impl Connection {
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning
-    pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
+    pub fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
             crate::MAIN_DB_ID => {
                 let schema = self.schema.read();

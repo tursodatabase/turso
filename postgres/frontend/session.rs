@@ -10,7 +10,7 @@ use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
 use crate::functions::{find_parameter, ConfigParameter, Parameter};
 use crate::settings::{ConnectionSettings, PgSessionState, SettingScope};
 use crate::statement::{PgTxState, PostRunFn, TxRole};
-use turso_core::schema::{Table, SEQ_BACKING_TABLE_PREFIX};
+use turso_core::schema::Table;
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
@@ -634,6 +634,7 @@ pub(crate) struct DeferredExecution {
     phase: DeferredPhase,
     active: Option<crate::Statement>,
     pub(crate) io_completions: Option<turso_core::types::IOCompletions>,
+    cleaning_up: bool,
     pub(crate) was_in_tx: Option<bool>,
     savepoint_open: bool,
     error: Option<LimboError>,
@@ -649,6 +650,7 @@ impl DeferredExecution {
             phase: DeferredPhase::Start,
             active: None,
             io_completions: None,
+            cleaning_up: false,
             was_in_tx: None,
             savepoint_open: false,
             error: None,
@@ -661,6 +663,10 @@ impl DeferredExecution {
         inner: &mut Statement,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
+        assert!(
+            !self.cleaning_up,
+            "deferred cleanup must finish before execution"
+        );
         self.io_completions = None;
         loop {
             if self.phase == DeferredPhase::Done {
@@ -902,41 +908,83 @@ impl DeferredExecution {
     }
 
     pub(crate) fn reset(&mut self) -> Result<()> {
-        let io_result = match self.io_completions.take() {
-            Some(io) if !io.0.is_wait() => io.wait(self.active.as_ref().unwrap()._io()),
-            _ => Ok(()),
-        };
-        let active_result = self
-            .active
-            .as_mut()
-            .map_or(Ok(()), crate::Statement::reset)
-            .map_err(crate::Error::into_core_error);
-        self.active = None;
-        if self.savepoint_open && !self.pg_conn.conn.get_auto_commit() {
-            let conn = &self.pg_conn.conn;
-            let result = if self.was_in_tx == Some(true) {
-                execute_sqlite(
-                    conn,
-                    format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\""),
-                )
-                .and_then(|()| {
-                    execute_sqlite(conn, format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\""))
-                })
-            } else {
-                execute_sqlite(conn, "ROLLBACK")
-            };
-            if result.is_err() {
-                self.pg_conn.tx.abort();
+        loop {
+            match self.cleanup_nonblock()? {
+                IOResult::Done(()) => return Ok(()),
+                IOResult::IO(io) => {
+                    io.wait(self.active.as_ref().unwrap()._io())?;
+                }
             }
-            result?;
         }
+    }
+
+    pub(crate) fn cleanup_nonblock(&mut self) -> Result<IOResult<()>> {
+        if !self.cleaning_up {
+            if let Some(io) = &self.io_completions {
+                if !io.0.is_wait() && !io.finished() {
+                    return Ok(IOResult::IO(turso_core::types::IOCompletions(io.0.clone())));
+                }
+            }
+            let mut cleanup_error = self
+                .io_completions
+                .as_ref()
+                .and_then(|io| io.get_error())
+                .map(Into::into);
+            if let Some(active) = self.active.as_mut() {
+                match active.cleanup_nonblock() {
+                    Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                    Ok(IOResult::Done(())) => {}
+                    Err(error) => {
+                        cleanup_error.get_or_insert(error.into_core_error());
+                    }
+                }
+            }
+            self.error = cleanup_error;
+            let active_result = self.active.as_mut().map_or(Ok(()), crate::Statement::reset);
+            if let Err(error) = active_result {
+                self.error.get_or_insert(error.into_core_error());
+            }
+            self.active = None;
+            self.io_completions = None;
+            self.cleaning_up = true;
+            self.phase = if self.savepoint_open && !self.pg_conn.conn.get_auto_commit() {
+                DeferredPhase::Rollback
+            } else {
+                DeferredPhase::Done
+            };
+        }
+        while self.phase != DeferredPhase::Done {
+            if self.active.is_none() {
+                if let Err(error) = self.prepare_active() {
+                    self.fail(error);
+                    continue;
+                }
+            }
+            let active = self.active.as_mut().unwrap();
+            active.set_query_timeout_override(Some(None));
+            match active.run_ignore_rows_nonblock() {
+                Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                Ok(IOResult::Done(())) => {
+                    self.active = None;
+                    self.phase =
+                        if self.phase == DeferredPhase::Rollback && self.was_in_tx == Some(true) {
+                            DeferredPhase::RollbackRelease
+                        } else {
+                            self.savepoint_open = false;
+                            DeferredPhase::Done
+                        };
+                }
+                Err(error) => self.fail(error.into_core_error()),
+            }
+        }
+        let result = self.error.take().map_or(Ok(()), Err);
         self.phase = DeferredPhase::Start;
         self.work = None;
         self.was_in_tx = None;
         self.savepoint_open = false;
-        self.error = None;
         self.interrupted = false;
-        io_result.and(active_result)
+        self.cleaning_up = false;
+        result.map(|()| IOResult::Done(()))
     }
 }
 
@@ -1367,26 +1415,20 @@ fn relation_name_is_taken(
     let namespaces = relation_lookup_namespaces(conn, schema);
     let mut taken = false;
     for namespace in namespaces {
-        let database = database_of(conn, &namespace);
-        let mut stmt = conn.prepare_sqlite(format!(
-            "SELECT \
-             EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
-                     WHERE type = 'table' AND name COLLATE NOCASE = ?1), \
-             EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
-                     WHERE type IN ('table', 'index', 'view') \
-                     AND name COLLATE NOCASE IN (?2, '{SEQ_BACKING_TABLE_PREFIX}' || ?2))"
-        ))?;
-        stmt.bind_at(
-            NonZero::new(1).unwrap(),
-            Value::build_text(namespace.mangle_name(table)),
-        )?;
-        stmt.bind_at(
-            NonZero::new(2).unwrap(),
-            Value::build_text(namespace.mangle_name(name)),
-        )?;
-        let row = &stmt.run_collect_rows()?[0];
-        taken = row[1] == Value::from_i64(1);
-        if row[0] == Value::from_i64(1) {
+        let (table_exists, name_exists) = conn.with_schema(namespace.database_id(), |schema| {
+            let ns = namespace.target.id;
+            (
+                schema.get_table(ns, table).is_some() && !schema.is_materialized_view(ns, table),
+                schema.get_table(ns, name).is_some()
+                    || schema.get_view(ns, name).is_some()
+                    || schema.has_sequence(ns, name)
+                    || schema
+                        .indexes(ns)
+                        .any(|index| index.name.eq_ignore_ascii_case(name)),
+            )
+        });
+        taken = name_exists;
+        if table_exists {
             break;
         }
     }
@@ -1409,22 +1451,23 @@ fn reject_drop_of_other_view_kind(
     };
     let schema = view_name.namespace.as_ref().map(|name| name.as_str());
     for namespace in relation_lookup_namespaces(conn, schema) {
-        let database = database_of(conn, &namespace);
-        let mut stmt = conn.prepare_sqlite(format!(
-            "SELECT CASE WHEN type = 'table' THEN 'table' \
-                         WHEN rootpage = 0 THEN 'view' \
-                         ELSE 'materialized view' END \
-             FROM \"{database}\".sqlite_schema \
-             WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1"
-        ))?;
-        stmt.bind_at(
-            NonZero::new(1).unwrap(),
-            Value::build_text(namespace.mangle_name(view_name.name.as_str())),
-        )?;
-        let Some(row) = stmt.run_collect_rows()?.into_iter().next() else {
+        let kind = conn.with_schema(namespace.database_id(), |schema| {
+            let ns = namespace.target.id;
+            let name = view_name.name.as_str();
+            if schema.is_materialized_view(ns, name) {
+                Some("materialized view")
+            } else if schema.get_view(ns, name).is_some() {
+                Some("view")
+            } else if schema.get_table(ns, name).is_some() {
+                Some("table")
+            } else {
+                None
+            }
+        });
+        let Some(kind) = kind else {
             continue;
         };
-        if row[0] != Value::build_text(expected_kind) {
+        if kind != expected_kind {
             return Err(sqlstate_error(
                 SQLSTATE_WRONG_OBJECT_TYPE,
                 format!("\"{}\" is not a {expected_kind}", view_name.name.as_str()),
@@ -1609,11 +1652,6 @@ fn prepare_set_transaction(
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
     conn.prepare("SELECT 0 WHERE 0")
-}
-
-fn execute_sqlite(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-    let mut stmt = conn.prepare_sqlite(sql)?;
-    stmt.run_ignore_rows()
 }
 
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
