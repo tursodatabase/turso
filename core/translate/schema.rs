@@ -130,94 +130,10 @@ pub(crate) fn validate_check_expr(
             ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
                 bail_parse_error!("subqueries prohibited in CHECK constraints");
             }
-            ast::Expr::Binary(lhs, op, rhs) if op.is_comparison() => {
-                reject_value_unlike_stored_columns(lhs, resolver)?;
-                reject_value_unlike_stored_columns(rhs, resolver)?;
-            }
-            ast::Expr::InList { lhs, rhs, .. } => {
-                reject_value_unlike_stored_columns(lhs, resolver)?;
-                for value in rhs {
-                    reject_value_unlike_stored_columns(value, resolver)?;
-                }
-            }
-            ast::Expr::Between {
-                lhs, start, end, ..
-            } => {
-                reject_value_unlike_stored_columns(lhs, resolver)?;
-                reject_value_unlike_stored_columns(start, resolver)?;
-                reject_value_unlike_stored_columns(end, resolver)?;
-            }
             _ => {}
         }
         Ok(WalkControl::Continue)
     })?;
-    Ok(())
-}
-
-/// A function that returns a value of a custom type returns it as a column
-/// read gives it, after DECODE, but a CHECK constraint sees the columns as they
-/// are stored. For a type whose DECODE changes the value, such as `uuid`
-/// stored as a blob and read as text, comparing the function's value with a
-/// column would never find them equal, so the CHECK constraint is refused.
-/// The call may be wrapped in a function that returns it unchanged, such as
-/// coalesce(), or in a CASE. A CAST of the call, or a call that is not compared,
-/// is fine.
-fn reject_value_unlike_stored_columns(
-    operand: &ast::Expr,
-    resolver: &CatalogContext,
-) -> Result<()> {
-    let (name, args) = match operand {
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            return reject_value_unlike_stored_columns(&exprs[0], resolver);
-        }
-        // The value of a CASE is the value of one of its results.
-        ast::Expr::Case {
-            when_then_pairs,
-            else_expr,
-            ..
-        } => {
-            for (_, result) in when_then_pairs {
-                reject_value_unlike_stored_columns(result, resolver)?;
-            }
-            if let Some(else_expr) = else_expr {
-                reject_value_unlike_stored_columns(else_expr, resolver)?;
-            }
-            return Ok(());
-        }
-        ast::Expr::FunctionCall { name, args, .. } => (name, args),
-        _ => return Ok(()),
-    };
-    let Some(func) = resolver.resolve_function(name.as_str(), args.len())? else {
-        return Ok(());
-    };
-    // These functions return one of their arguments unchanged, so
-    // coalesce(auth.uid(), ...) has auth.uid()'s value.
-    let passed_through: &[Box<ast::Expr>] = match func {
-        Func::Scalar(
-            ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Min | ScalarFunc::Max,
-        ) => args,
-        Func::Scalar(
-            ScalarFunc::Nullif | ScalarFunc::Likely | ScalarFunc::Unlikely | ScalarFunc::Likelihood,
-        ) => &args[..args.len().min(1)],
-        Func::Scalar(ScalarFunc::Iif) => args.get(1..).unwrap_or_default(),
-        _ => &[],
-    };
-    for arg in passed_through {
-        reject_value_unlike_stored_columns(arg, resolver)?;
-    }
-    let Some(ReturnType::Custom(type_name)) = func.return_type() else {
-        return Ok(());
-    };
-    if let Some(resolved) = resolver.schema().resolve_type_unchecked(type_name)? {
-        if !resolved.is_domain() && !resolved.reads_stored_values_unchanged() {
-            bail_parse_error!(
-                "cannot compare {}() in a CHECK constraint: it returns {} values in a \
-                 different form than they are stored",
-                name.as_str(),
-                type_name
-            );
-        }
-    }
     Ok(())
 }
 
@@ -498,7 +414,10 @@ fn resolve_func_return_type(
         Some(ReturnType::Real) => return Ok(CheckExprType::Real),
         Some(ReturnType::Text) => return Ok(CheckExprType::Text),
         Some(ReturnType::Blob) => return Ok(CheckExprType::Blob),
-        Some(ReturnType::Custom(type_name)) => return resolve_type_name(type_name, resolver),
+        Some(ReturnType::Custom(type_name)) => {
+            reject_value_unlike_stored_columns(name, type_name, resolver)?;
+            return resolve_type_name(type_name, resolver);
+        }
         Some(ReturnType::Array) => return Ok(CheckExprType::Any),
         None => {}
     }
@@ -527,6 +446,29 @@ fn resolve_func_return_type(
         }
         _ => Ok(CheckExprType::Any),
     }
+}
+
+/// A function that returns a value of a custom type returns it as a column
+/// read gives it, after DECODE, but a CHECK constraint sees the columns as they
+/// are stored. For a type whose DECODE changes the value, such as `uuid`
+/// stored as a blob and read as text, comparing the function's value with a
+/// column would never find them equal, so the CHECK constraint is refused.
+fn reject_value_unlike_stored_columns(
+    name: &str,
+    type_name: &str,
+    resolver: &CatalogContext,
+) -> Result<()> {
+    if let Some(resolved) = resolver.schema().resolve_type_unchecked(type_name)? {
+        if !resolved.is_domain() && !resolved.reads_stored_values_unchanged() {
+            bail_parse_error!(
+                "cannot compare {}() in a CHECK constraint: it returns {} values in a \
+                 different form than they are stored",
+                name,
+                type_name
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the return type of a scalar function that declares none, because
