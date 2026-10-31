@@ -3785,6 +3785,65 @@ mod tests {
     }
 
     #[test]
+    fn test_value_text_coerces_non_text_like_sqlite() {
+        unsafe {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("test.db");
+            let path_cstr = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(path_cstr.as_ptr(), &mut db), SQLITE_OK);
+
+            unsafe extern "C" fn text_len_func(
+                ctx: *mut libc::c_void,
+                _argc: i32,
+                argv: *mut *mut libc::c_void,
+            ) {
+                let p = sqlite3_value_text(*argv);
+                let len = if p.is_null() {
+                    -1
+                } else {
+                    libc::strlen(p) as i32
+                };
+                sqlite3_result_int(ctx, len);
+            }
+
+            assert_eq!(
+                sqlite3_create_function_v2(
+                    db,
+                    c"text_len".as_ptr(),
+                    1,
+                    SQLITE_UTF8,
+                    ptr::null_mut(),
+                    Some(text_len_func),
+                    None,
+                    None,
+                    None,
+                ),
+                SQLITE_OK
+            );
+
+            let cases: &[(&std::ffi::CStr, i64)] = &[
+                (c"SELECT text_len(42)", 2),
+                (c"SELECT text_len(1.5)", 3),
+                (c"SELECT text_len(X'414243')", 3),
+                (c"SELECT text_len('hello')", 5),
+            ];
+            for (sql, expected) in cases {
+                let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+                assert_eq!(
+                    sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                    SQLITE_OK
+                );
+                assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+                assert_eq!(sqlite3_column_int(stmt, 0), *expected, "{sql:?}");
+                assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            }
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
     #[cfg(not(feature = "sqlite3"))]
     fn test_sqlite3_context_db_handle() {
         unsafe {
