@@ -300,6 +300,32 @@ expect {
     1.50
 }
 
+test table-numeric-column-compared-with-literal-not-rounded {
+    CREATE TABLE nm (v numeric(10,2));
+    INSERT INTO nm VALUES (1.50);
+    SELECT count(*) FROM nm WHERE v = 1.501;
+    SELECT count(*) FROM nm WHERE 1.501 = v;
+    SELECT count(*) FROM nm WHERE v < 1.501;
+    SELECT count(*) FROM nm WHERE v >= 1.501;
+    SELECT count(*) FROM nm WHERE v <> 1.501;
+    SELECT count(*) FROM nm WHERE v = 123456789012.5;
+    CREATE INDEX nm_v ON nm (v);
+    SELECT count(*) FROM nm WHERE v = 1.501;
+    SELECT count(*) FROM nm WHERE v = 1.50;
+    SELECT count(*) FROM nm WHERE v = 1.5;
+}
+expect {
+    0
+    0
+    1
+    0
+    1
+    0
+    0
+    1
+    1
+}
+
 test table-numeric-column-rounds-extra-digits {
     CREATE TABLE prices (id int PRIMARY KEY, val numeric(10,2));
     INSERT INTO prices VALUES (1, 0.019), (2, 0.015), (3, -0.015), (4, '1.999');
