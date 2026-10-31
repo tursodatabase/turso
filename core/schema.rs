@@ -5280,7 +5280,7 @@ impl BTreeTable {
     /// [Self::resolve_custom_types].
     pub(crate) fn check_collates_are_allowed(&self) -> Result<()> {
         for column in &self.columns {
-            column.check_collate_is_allowed()?;
+            key_collation(column.text_collation(), column.type_ordering())?;
         }
         for key in self.unique_sets.iter().flat_map(|set| &set.columns) {
             if let Some((_, column)) = self.get_column(&key.name) {
@@ -7703,14 +7703,6 @@ impl Column {
     #[inline]
     pub fn type_ordering(&self) -> Option<TypeOrdering> {
         self.type_ordering
-    }
-    /// Fails when the column has a COLLATE and its type has its own order, in
-    /// which case the COLLATE would do nothing. Only new columns are checked:
-    /// a database can already hold such a column, and [Self::collation]
-    /// reads it with the type's order.
-    pub(crate) fn check_collate_is_allowed(&self) -> Result<()> {
-        key_collation(self.collation, self.type_ordering)?;
-        Ok(())
     }
     /// Whether an index on this column is ordered differently from how its
     /// values compare. A custom type without an ordering is indexed by its

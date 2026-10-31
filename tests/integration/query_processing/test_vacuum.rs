@@ -4397,6 +4397,38 @@ fn test_vacuum_keeps_a_table_with_collate_on_numeric_column() -> anyhow::Result<
     Ok(())
 }
 
+/// CREATE TABLE rejects AUTOINCREMENT on a key not declared INTEGER PRIMARY KEY,
+/// but a database written before that check can have one. VACUUM must keep such
+/// a table.
+#[test]
+fn test_vacuum_keeps_a_table_with_autoincrement_on_int_primary_key() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("autoincrement_on_int.db");
+    let stored_sql = "CREATE TABLE t (id INT PRIMARY KEY AUTOINCREMENT, v)";
+    {
+        let sqlite_conn = SqliteConnection::open(&db_path)?;
+        sqlite_conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+             INSERT INTO t (v) VALUES (1);
+             PRAGMA writable_schema = ON;",
+        )?;
+        sqlite_conn.execute(
+            "UPDATE sqlite_schema SET sql = ?1 WHERE name = 't'",
+            [stored_sql],
+        )?;
+    }
+    let tmp_db = TempDatabase::new_with_existent(&db_path);
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("VACUUM")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT v FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    let schema: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+    assert_eq!(schema, vec![(stored_sql.to_string(),)]);
+    Ok(())
+}
+
 /// Plain VACUUM reparses the live schema on the same connection. Custom types
 /// with an index on a non-monotonic encoding must still order correctly after the
 /// rewrite, and the same connection must remain able to use that type in new
