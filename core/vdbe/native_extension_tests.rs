@@ -67,6 +67,39 @@ fn native_scalar_accepts_only_declared_argument_counts() {
 }
 
 #[test]
+fn native_scalar_returning_i64_can_be_called_in_a_strict_check_constraint() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "typed_nine".into(),
+                    FunctionArity::Exact(1),
+                    true,
+                    Nine,
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "untyped_nine".into(),
+                    FunctionArity::Exact(1),
+                    true,
+                    NullToNine,
+                )
+                .unwrap(),
+            ),
+    );
+
+    conn.execute("CREATE TABLE typed (x INTEGER CHECK (x = typed_nine(NULL))) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO typed VALUES (9)").unwrap();
+    assert!(conn.execute("INSERT INTO typed VALUES (8)").is_err());
+    assert!(conn
+        .execute("CREATE TABLE untyped (x INTEGER CHECK (x = untyped_nine(NULL))) STRICT")
+        .is_err());
+}
+
+#[test]
 fn native_scalar_borrows_the_same_registers_across_io() {
     let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
     let args = [
@@ -200,6 +233,8 @@ struct ConnectionContextCall {
 }
 
 impl ScalarCall for ConnectionContextCall {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if integer(args[0].get_value()) == 0 {
             let context = connection.context::<AtomicI64>().ok_or_else(|| {
@@ -506,6 +541,8 @@ struct GatedSevenCall {
 }
 
 impl ScalarCall for GatedSevenCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
@@ -537,6 +574,8 @@ struct RegisterProbeCall {
 }
 
 impl ScalarCall for RegisterProbeCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         assert_eq!(args.as_ptr() as usize, self.args_address);
         if let Some(io) = self.gate.wait() {
@@ -560,10 +599,31 @@ impl ScalarFunction for ConnectionChanges {
 }
 
 impl ScalarCall for ConnectionChanges {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         Ok(IOResult::Done(Value::from_i64(
             connection.changes() * 10 + integer(args[0].get_value()),
         )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Nine;
+
+impl ScalarFunction for Nine {
+    type Call = Self;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(*self)
+    }
+}
+
+impl ScalarCall for Nine {
+    type Output = i64;
+
+    fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<i64> {
+        Ok(IOResult::Done(9))
     }
 }
 
@@ -581,6 +641,8 @@ impl ScalarFunction for NullToNine {
 struct NullToNineCall;
 
 impl ScalarCall for NullToNineCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         Ok(IOResult::Done(match args[0].get_value() {
             Value::Null => Value::from_i64(9),
@@ -2021,6 +2083,8 @@ struct DelayedCall {
 }
 
 impl ScalarCall for DelayedCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
@@ -2065,6 +2129,8 @@ struct NestedSumCall {
 }
 
 impl ScalarCall for NestedSumCall {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if self.statement.is_none() {
             self.statement = Some(connection.prepare_internal("SELECT x FROM input_values")?);
