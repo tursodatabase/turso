@@ -1652,13 +1652,27 @@ pub fn emit_from_clause_subqueries(
                     t_ctx,
                 )?),
                 FromClauseSubqueryExecutionMode::MaterializedTable => {
-                    let (result_columns_start, cursor_id, shared_table) =
-                        emit_materialized_subquery_table(
+                    let cte_info = from_clause_subquery
+                        .cte_id()
+                        .map(|id| (id, from_clause_subquery.name.clone()));
+                    let (result_columns_start, cursor_id, shared_table) = match cte_info {
+                        Some((cte_id, cte_name)) => {
+                            program.with_cte_materialization_eqp(cte_id, &cte_name, |program| {
+                                emit_materialized_subquery_table(
+                                    program,
+                                    from_clause_subquery.plan.as_mut(),
+                                    t_ctx,
+                                    &from_clause_subquery.columns,
+                                )
+                            })?
+                        }
+                        None => emit_materialized_subquery_table(
                             program,
                             from_clause_subquery.plan.as_mut(),
                             t_ctx,
                             &from_clause_subquery.columns,
-                        )?;
+                        )?,
+                    };
                     from_clause_subquery.materialized_cursor_id = Some(cursor_id);
                     if let (Some(cte_id), Some(cte_info)) =
                         (from_clause_subquery.cte_id(), shared_table)
