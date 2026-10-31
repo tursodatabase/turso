@@ -146,7 +146,9 @@ fn parse_as_json_text_tracking(slice: &[u8]) -> crate::Result<(Jsonb, ParseInfo)
 fn malformed_json_error(error: JsonError) -> LimboError {
     match error {
         JsonError::OutOfMemory => LimboError::OutOfMemory,
-        JsonError::Message { .. } => LimboError::ParseError("malformed JSON".to_string()),
+        JsonError::Message { .. } | JsonError::TrailingInput => {
+            LimboError::ParseError("malformed JSON".to_string())
+        }
     }
 }
 
@@ -853,6 +855,7 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             let text = &text[..text.find('\0').unwrap_or(text.len())];
             match Jsonb::from_str(text) {
                 Ok(_) => Ok(Value::from_i64(0)),
+                Err(JsonError::TrailingInput) => Ok(Value::from_i64(1)),
                 Err(JsonError::Message { location, .. }) => {
                     if let Some(loc) = location {
                         // The parser reports a byte offset, but SQLite
@@ -888,6 +891,7 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             let zero_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
             match Jsonb::from_str(&String::from_utf8_lossy(&blob[..zero_pos])) {
                 Ok(_) => Ok(Value::from_i64(0)),
+                Err(JsonError::TrailingInput) => Ok(Value::from_i64(1)),
                 Err(JsonError::Message { location, .. }) => {
                     Ok(Value::from_i64(location.map_or(1, |loc| loc as i64 + 1)))
                 }
@@ -1564,6 +1568,22 @@ mod tests {
         let input = Value::build_text(r#"["a",55,"b",72,,]"#);
         let result = json_error_position(&input).unwrap();
         assert_eq!(result, Value::from_i64(16));
+    }
+
+    #[test]
+    fn test_json_error_position_after_top_level_numeric_value() {
+        assert_eq!(
+            json_error_position(&Value::build_text("1 2")).unwrap(),
+            Value::from_i64(1)
+        );
+    }
+
+    #[test]
+    fn test_json_error_position_after_top_level_string_value() {
+        assert_eq!(
+            json_error_position(&Value::build_text(r#""a""a""#)).unwrap(),
+            Value::from_i64(1)
+        );
     }
 
     #[test]
