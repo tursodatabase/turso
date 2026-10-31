@@ -178,6 +178,8 @@ PRAGMA index_info(index-name);
 -- 0     | 2   | email
 ```
 
+An expression column (for example `CREATE INDEX i ON t(lower(name))`) has `cid` -2 and a NULL `name`.
+
 The PRIMARY KEY of a `WITHOUT ROWID` table is reported as an index named `sqlite_autoindex_<table>_1`. Passing the table's name to `index_info` or `index_xinfo` also describes that index.
 
 ### index_xinfo
@@ -554,6 +556,9 @@ PRAGMA integrity_check(N);    -- check only the first N errors
 
 Returns `ok` if no problems are found, otherwise returns one row per error.
 
+For custom index methods, this checks the structure of their backing B-trees.
+It does not compare their custom records with table rows as it does for ordinary indexes.
+
 ### quick_check
 
 Performs a faster but less thorough integrity check than `integrity_check`.
@@ -782,12 +787,12 @@ Lists all available types (built-in and custom) with their metadata.
 
 ```sql
 PRAGMA list_types;
--- type    | parent | encode | decode | default | operators
--- INTEGER |        |        |        |         |
--- REAL    |        |        |        |         |
--- TEXT    |        |        |        |         |
--- BLOB    |        |        |        |         |
--- ANY     |        |        |        |         |
+-- type    | parent | encode | coerce | decode | default | operators
+-- INTEGER |        |        |        |        |         |
+-- REAL    |        |        |        |        |         |
+-- TEXT    |        |        |        |        |         |
+-- BLOB    |        |        |        |        |         |
+-- ANY     |        |        |        |        |         |
 ```
 
 See [CREATE TYPE](/docs/sql-reference/statements/create-type) for creating custom types.

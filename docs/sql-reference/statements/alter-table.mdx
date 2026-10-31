@@ -73,6 +73,7 @@ ALTER TABLE table-name RENAME COLUMN old-column-name TO new-column-name;
 Renaming a column updates all references to the column in:
 
 - Indexes that reference the column (including expression indexes)
+- The `weights` option of FTS indexes
 - Triggers that reference the column
 - CHECK constraints that reference the column
 - Foreign key constraint definitions
@@ -85,6 +86,8 @@ A column rename fails if:
 - The new column name conflicts with an existing column in the same table.
 - A trigger on the table uses a qualified reference (e.g., `table_name.column_name`) to the column in its body.
 - A trigger's WHEN clause references the column.
+- An FTS index lists the column in its `weights` option and the new name cannot be written there, for example because it contains a comma or an equals sign.
+- The column is in an FTS index and the new name is one that an FTS index cannot include (see [FTS limitations](/docs/sql-reference/functions/fts#current-limitations)).
 
 ### Example
 

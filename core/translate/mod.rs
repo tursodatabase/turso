@@ -10,6 +10,7 @@
 pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
+pub(crate) mod catalog;
 pub(crate) mod collate;
 mod compound_select;
 pub(crate) mod delete;
@@ -17,6 +18,7 @@ pub(crate) mod display;
 pub(crate) mod emitter;
 pub mod eqp;
 pub(crate) mod expr;
+pub(crate) mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
@@ -123,12 +125,13 @@ pub fn translate(
     } else {
         connection.search_path()
     };
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -180,6 +183,24 @@ pub fn translate_inner(
     connection: &Arc<Connection>,
     input: &str,
 ) -> Result<()> {
+    // Subqueries are numbered per program, and a trigger body or foreign-key
+    // action is compiled into a program of its own with the resolver of the
+    // statement that fires it. So the same number can name a subquery of
+    // each, and the statement's row-value subqueries are set aside while
+    // another statement is compiled.
+    let callers_row_value_subqueries = std::mem::take(&mut resolver.row_value_subqueries);
+    let result = translate_statement(stmt, resolver, program, connection, input);
+    resolver.row_value_subqueries = callers_row_value_subqueries;
+    result
+}
+
+fn translate_statement(
+    stmt: ast::Stmt,
+    resolver: &mut Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<Connection>,
+    input: &str,
+) -> Result<()> {
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
@@ -204,6 +225,8 @@ pub fn translate_inner(
             | ast::Stmt::Insert { .. }
             | ast::Stmt::CreateSequence { .. }
             | ast::Stmt::DropSequence { .. }
+            | ast::Stmt::CreateSchema { .. }
+            | ast::Stmt::DropSchema { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -253,7 +276,11 @@ pub fn translate_inner(
                 connection.clone(),
             )?;
         }
-        ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver, program)?,
+        ast::Stmt::Begin {
+            typ,
+            name,
+            access_mode,
+        } => translate_tx_begin(typ, name, access_mode, resolver, program)?,
         ast::Stmt::Commit { name } => {
             translate_tx_commit(name, resolver.schema(), resolver, program)?
         }
@@ -285,32 +312,20 @@ pub fn translate_inner(
             for_each_row,
             when_clause,
             commands,
-        } => {
-            // Reconstruct SQL for storage
-            let sql = trigger::create_trigger_to_sql(
-                temporary,
-                if_not_exists,
-                &trigger_name,
-                time,
-                &event,
-                &tbl_name,
-                for_each_row,
-                when_clause.as_deref(),
-                &commands,
-            );
-            trigger::translate_create_trigger(
-                trigger_name,
-                resolver,
-                temporary,
-                if_not_exists,
-                time,
-                tbl_name,
-                program,
-                sql,
-                &commands,
-                when_clause.as_deref(),
-            )?
-        }
+        } => trigger::translate_create_trigger(
+            trigger_name,
+            resolver,
+            temporary,
+            if_not_exists,
+            time,
+            &event,
+            tbl_name,
+            for_each_row,
+            connection,
+            program,
+            &commands,
+            when_clause.as_deref(),
+        )?,
         ast::Stmt::CreateView {
             view_name,
             select,
@@ -324,6 +339,7 @@ pub fn translate_inner(
             &columns,
             temporary,
             if_not_exists,
+            connection,
             program,
         )?,
         ast::Stmt::CreateMaterializedView {
@@ -511,6 +527,7 @@ pub fn translate_inner(
                 &max_value,
                 cycle,
                 resolver,
+                connection,
                 program,
             )?;
         }
@@ -519,6 +536,12 @@ pub fn translate_inner(
             seq_name,
         } => {
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+        }
+        ast::Stmt::CreateSchema { name } => {
+            schema::translate_create_schema(&name, resolver, program)?;
+        }
+        ast::Stmt::DropSchema { name } => {
+            schema::translate_drop_schema(&name, resolver, program)?;
         }
     };
 
@@ -556,6 +579,16 @@ pub fn translate_inner(
             &program.table_references,
             resolver,
         );
+    }
+
+    // After translation so that name resolution errors come first, as in
+    // PostgreSQL, which rejects read-only violations when the command starts
+    // executing.
+    if is_write
+        && connection.is_tx_read_only()
+        && matches!(program.get_query_mode(), QueryMode::Normal)
+    {
+        return Err(crate::LimboError::ReadOnly);
     }
 
     Ok(())
@@ -596,6 +629,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Optimize { .. } => "optimize",
         ast::Stmt::CreateSequence { .. } => "create_sequence",
         ast::Stmt::DropSequence { .. } => "drop_sequence",
+        ast::Stmt::CreateSchema { .. } => "create_schema",
+        ast::Stmt::DropSchema { .. } => "drop_schema",
     }
 }
 

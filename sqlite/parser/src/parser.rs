@@ -891,6 +891,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Begin {
             typ: transtype,
             name: self.parse_transopt()?,
+            access_mode: None,
         })
     }
 
@@ -5028,11 +5029,12 @@ impl<'a> Parser<'a> {
         }
 
         let mut encode = None;
+        let mut coerce = None;
         let mut decode = None;
         let mut default = None;
         let mut operators = Vec::new();
 
-        // Parse optional clauses: ENCODE, DECODE, OPERATOR
+        // Parse optional clauses: ENCODE, COERCE, DECODE, DEFAULT, OPERATOR
         loop {
             match self.peek()? {
                 Some(tok) if tok.token_type == TK_ID => {
@@ -5042,6 +5044,11 @@ impl<'a> Parser<'a> {
                             eat_assert!(self, TK_ID);
                             let expr = self.parse_expr(0)?;
                             encode = Some(expr);
+                        }
+                        "COERCE" => {
+                            eat_assert!(self, TK_ID);
+                            let expr = self.parse_expr(0)?;
+                            coerce = Some(expr);
                         }
                         "DECODE" => {
                             eat_assert!(self, TK_ID);
@@ -5059,6 +5066,13 @@ impl<'a> Parser<'a> {
                                 .and_then(|s| s.strip_suffix('\''))
                                 .unwrap_or(&op_raw)
                                 .to_owned();
+                            // Only the built-in types have arithmetic operators.
+                            if op != "<" {
+                                return Err(Error::ParseError(format!(
+                                    "CREATE TYPE does not accept OPERATOR '{op}': only \
+                                     OPERATOR '<' is supported"
+                                )));
+                            }
                             // Three syntaxes:
                             // 1. OPERATOR 'op' func_name          (named)
                             // 2. OPERATOR 'op' (type) -> func_name (old named)
@@ -5086,7 +5100,7 @@ impl<'a> Parser<'a> {
                                 let next_kw = from_bytes_as_str(self.peek()?.unwrap().as_bytes())
                                     .to_ascii_uppercase();
                                 match next_kw.as_str() {
-                                    "ENCODE" | "DECODE" | "OPERATOR" | "DEFAULT" => {
+                                    "ENCODE" | "COERCE" | "DECODE" | "OPERATOR" | "DEFAULT" => {
                                         // Naked operator: no function name
                                         None
                                     }
@@ -5110,6 +5124,15 @@ impl<'a> Parser<'a> {
                                 // End of statement or semicolon: naked operator
                                 None
                             };
+                            // A plain OPERATOR '<' lets the type be sorted, by its
+                            // stored value. A function for it would never be called.
+                            if op == "<" && func_name.is_some() {
+                                return Err(Error::ParseError(
+                                    "OPERATOR '<' takes no function: a type that declares it \
+                                     sorts by its stored value"
+                                        .to_owned(),
+                                ));
+                            }
                             operators.push(TypeOperator { op, func_name });
                         }
                         _ => break,
@@ -5131,6 +5154,7 @@ impl<'a> Parser<'a> {
                 params,
                 base,
                 encode,
+                coerce,
                 decode,
                 operators,
                 default,
@@ -5791,6 +5815,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: None,
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5798,6 +5823,7 @@ mod tests {
                 vec![Cmd::Explain(Stmt::Begin {
                     typ: None,
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5806,6 +5832,7 @@ mod tests {
                     stmt: Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     },
                     format: EqpFormat::Text,
                 }],
@@ -5816,6 +5843,7 @@ mod tests {
                     stmt: Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     },
                     format: EqpFormat::Json,
                 }],
@@ -5826,6 +5854,7 @@ mod tests {
                     stmt: Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     },
                     format: EqpFormat::Json,
                 }],
@@ -5836,6 +5865,7 @@ mod tests {
                     stmt: Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     },
                     format: EqpFormat::Text,
                 }],
@@ -5845,6 +5875,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: None,
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5852,6 +5883,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Deferred),
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5859,6 +5891,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Immediate),
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5866,6 +5899,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5873,6 +5907,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Deferred),
                     name: Some(Name::from_string("my_transaction")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5880,6 +5915,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Immediate),
                     name: Some(Name::from_string("my_transaction")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5887,6 +5923,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
                     name: Some(Name::from_string("my_transaction")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5894,6 +5931,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Exclusive),
                     name: Some(Name::from_string("'my_transaction'")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5901,6 +5939,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Concurrent),
                     name: None,
+                    access_mode: None,
                 })],
             ),
             (
@@ -5908,6 +5947,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Concurrent),
                     name: Some(Name::from_string("my_transaction")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5915,6 +5955,7 @@ mod tests {
                 vec![Cmd::Stmt(Stmt::Begin {
                     typ: Some(TransactionType::Concurrent),
                     name: Some(Name::from_string("'my_transaction'")),
+                    access_mode: None,
                 })],
             ),
             (
@@ -5923,14 +5964,17 @@ mod tests {
                     Cmd::Stmt(Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     }),
                     Cmd::Stmt(Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     }),
                     Cmd::Stmt(Stmt::Begin {
                         typ: None,
                         name: None,
+                        access_mode: None,
                     }),
                 ],
             ),

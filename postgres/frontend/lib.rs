@@ -1,3 +1,4 @@
+mod auth_functions;
 mod catalog;
 mod copy;
 mod error;
@@ -13,6 +14,7 @@ pub use error::{Error, ErrorReport, Result};
 pub use session::PgConnection as Connection;
 pub use session::{
     open_database, open_database_with_io, split_statements, PgConnection, PgQueryRunner,
+    TransactionState,
 };
 pub use statement::Statement;
 pub use turso_core::{

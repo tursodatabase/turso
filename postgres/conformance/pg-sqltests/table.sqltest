@@ -234,6 +234,17 @@ expect {
     0
 }
 
+test table-expression-index-with-qualified-column {
+    CREATE TABLE qual (a int, b int);
+    CREATE INDEX qual_a_plus_one ON qual ((qual.a + 1));
+    CREATE INDEX qual_a ON qual ((public.qual.a));
+    INSERT INTO qual VALUES (1, 2), (5, 6);
+    SELECT b FROM qual WHERE a + 1 = 6;
+}
+expect {
+    6
+}
+
 test table-numeric-column-compared-with-expression {
     CREATE TABLE nm (v numeric(10,2));
     INSERT INTO nm VALUES (1.50);
@@ -251,6 +262,42 @@ expect {
     1
     0
     0
+}
+
+test table-numeric-column-modulo-keeps-scale {
+    CREATE TABLE nm (id int PRIMARY KEY, v numeric(10,2), w numeric(10,3));
+    INSERT INTO nm VALUES (1, 1.5, 0.4), (2, -7.25, 2), (3, NULL, 1);
+    SELECT v % 1, v % w, v % 0.3, 5 % v FROM nm ORDER BY id;
+}
+expect {
+    0.50|0.300|0.00|0.50
+    -0.25|-1.250|-0.05|5.00
+    |||
+}
+
+test table-numeric-column-negation-keeps-scale {
+    CREATE TABLE nm (id int PRIMARY KEY, v numeric(10,2), w numeric(10,3));
+    INSERT INTO nm VALUES (1, 1.5, 0.4), (2, -7.25, 2), (3, NULL, 1);
+    SELECT -v, -w FROM nm ORDER BY id;
+}
+expect {
+    -1.50|-0.400
+    7.25|-2.000
+    |-1.000
+}
+
+test table-numeric-negation-and-modulo-compare-as-numbers {
+    CREATE TABLE nm (id int PRIMARY KEY, v numeric(10,2));
+    INSERT INTO nm VALUES (1, 9), (2, 10), (3, -1.5), (4, 1.5);
+    SELECT id FROM nm WHERE -v < -5 ORDER BY -v;
+    SELECT id FROM nm WHERE v % 1 > 0.1;
+    SELECT max(-v) FROM nm;
+}
+expect {
+    2
+    1
+    4
+    1.50
 }
 
 test table-uuid-column-omitted-from-insert-is-null {
@@ -530,3 +577,64 @@ test table-domain-not-null-default-rejects-explicit-null {
     INSERT INTO t VALUES (NULL, 2);
 }
 expect error {}
+
+test table-add-column-function-default-fills-each-existing-row {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN c uuid DEFAULT gen_random_uuid();
+    ALTER TABLE t ADD COLUMN d timestamptz DEFAULT now();
+    SELECT count(c), count(DISTINCT c), count(d) FROM t;
+}
+expect {
+    2|2|2
+}
+
+test table-add-column-expression-default-fills-existing-rows {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN e int DEFAULT (5 + 3);
+    INSERT INTO t (x) VALUES (3);
+    SELECT x, e FROM t ORDER BY x;
+}
+expect {
+    1|8
+    2|8
+    3|8
+}
+
+test table-add-column-default-with-column-reference-errors {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (5);
+    ALTER TABLE t ADD COLUMN c int DEFAULT x * 2;
+}
+expect error {}
+
+test table-add-column-not-null-default-with-null-inside-fills-existing-rows {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN c int NOT NULL DEFAULT coalesce(NULL, 7);
+    ALTER TABLE t ADD COLUMN d text NOT NULL DEFAULT CASE WHEN 1 < 2 THEN 'y' ELSE NULL END;
+    SELECT x, c, d FROM t ORDER BY x;
+}
+expect {
+    1|7|y
+    2|7|y
+}
+
+test table-add-column-not-null-default-that-is-null-errors {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN z int NOT NULL DEFAULT nullif(1, 1);
+}
+expect error {}
+
+test add-column-fills-existing-rows-with-a-function-default {
+    CREATE TABLE add_column_fill (id int);
+    INSERT INTO add_column_fill VALUES (1), (2);
+    ALTER TABLE add_column_fill ADD COLUMN schema_name text DEFAULT current_schema;
+    SELECT id, schema_name FROM add_column_fill ORDER BY id;
+}
+expect {
+    1|public
+    2|public
+}

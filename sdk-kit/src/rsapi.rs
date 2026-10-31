@@ -469,7 +469,7 @@ pub unsafe fn bytes_from_slice<'a>(
             "expected slice, got null pointer".to_string(),
         ));
     }
-    Ok(std::slice::from_raw_parts(ptr as *const u8, len))
+    Ok(std::slice::from_raw_parts(ptr.cast::<u8>(), len))
 }
 
 /// SAFETY: slice must points to the valid memory
@@ -733,9 +733,11 @@ impl From<Box<LimboError>> for TursoError {
 impl From<LimboError> for TursoError {
     fn from(value: LimboError) -> Self {
         match value {
-            LimboError::ForeignKeyConstraint(e) | LimboError::Constraint(e) => {
-                TursoError::Constraint(e)
-            }
+            // A Raise is a constraint error that carries its own conflict
+            // resolution, and SQLite reports it as SQLITE_CONSTRAINT.
+            LimboError::ForeignKeyConstraint(e)
+            | LimboError::Constraint(e)
+            | LimboError::Raise(_, e) => TursoError::Constraint(e),
             LimboError::ConstraintViolation(violation) => TursoError::Constraint(violation.message),
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),

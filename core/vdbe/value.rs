@@ -3,7 +3,7 @@ use crate::{
     function::MathFunc,
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
     translate::collate::CollationSeq,
-    types::{compare_immutable_single, AsValueRef, SeekOp},
+    types::{AsValueRef, SeekOp},
     vdbe::affinity::{real_to_i64, Affinity},
     LimboError, Result, Value,
 };
@@ -131,16 +131,16 @@ impl ComparisonOp {
         lhs: V1,
         rhs: V2,
         collation: CollationSeq,
-    ) -> bool {
-        let order = compare_immutable_single(lhs, rhs, collation);
-        match self {
+    ) -> crate::Result<bool> {
+        let order = collation.compare_operands(lhs.as_value_ref(), rhs.as_value_ref())?;
+        Ok(match self {
             ComparisonOp::Eq => order.is_eq(),
             ComparisonOp::Ne => order.is_ne(),
             ComparisonOp::Lt => order.is_lt(),
             ComparisonOp::Le => order.is_le(),
             ComparisonOp::Gt => order.is_gt(),
             ComparisonOp::Ge => order.is_ge(),
-        }
+        })
     }
 }
 
@@ -459,12 +459,17 @@ impl Value {
         }
     }
 
-    pub fn exec_nullif(&self, second_value: &Self) -> Self {
-        if self != second_value {
-            self.clone()
-        } else {
+    /// `compare` orders two values with the collation of the call.
+    pub fn exec_nullif(
+        &self,
+        second_value: &Self,
+        compare: impl FnOnce(&Value, &Value) -> crate::Result<std::cmp::Ordering>,
+    ) -> crate::Result<Self> {
+        Ok(if compare(self, second_value)?.is_eq() {
             Value::Null
-        }
+        } else {
+            self.clone()
+        })
     }
 
     pub fn exec_substring(
@@ -1434,36 +1439,42 @@ impl Value {
         Ok(pattern_compare(pattern, text, &GLOB_INFO, None) == CompareResult::Match)
     }
 
-    pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
-        // SQLite: multi-arg min() returns NULL if ANY argument is NULL
-        let mut result: Option<&Value> = None;
-        for v in regs {
-            if matches!(v, Value::Null) {
-                return Value::Null;
-            }
-            result = Some(match result {
-                None => v,
-                Some(cur) if v <= cur => v,
-                Some(cur) => cur,
-            });
-        }
-        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
+    /// `compare` orders two values with the collation of the call.
+    pub fn exec_min<'a>(
+        regs: impl Iterator<Item = &'a Value>,
+        compare: impl FnMut(&Value, &Value) -> crate::Result<std::cmp::Ordering>,
+    ) -> crate::Result<Value> {
+        // Like SQLite, a later argument equal to the minimum replaces it.
+        Self::extreme(regs, std::cmp::Ordering::is_le, compare)
     }
 
-    pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
-        // SQLite: multi-arg max() returns NULL if ANY argument is NULL
+    /// `compare` orders two values with the collation of the call.
+    pub fn exec_max<'a>(
+        regs: impl Iterator<Item = &'a Value>,
+        compare: impl FnMut(&Value, &Value) -> crate::Result<std::cmp::Ordering>,
+    ) -> crate::Result<Value> {
+        Self::extreme(regs, std::cmp::Ordering::is_gt, compare)
+    }
+
+    /// Walks the arguments and keeps the current best, replacing it with an
+    /// argument `v` when `replaces(compare(v, best))`. SQLite: a
+    /// multi-argument min() or max() returns NULL if any argument is NULL.
+    fn extreme<'a>(
+        regs: impl Iterator<Item = &'a Value>,
+        replaces: fn(std::cmp::Ordering) -> bool,
+        mut compare: impl FnMut(&Value, &Value) -> crate::Result<std::cmp::Ordering>,
+    ) -> crate::Result<Value> {
         let mut result: Option<&Value> = None;
         for v in regs {
             if matches!(v, Value::Null) {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             result = Some(match result {
-                None => v,
-                Some(cur) if v > cur => v,
-                Some(cur) => cur,
+                Some(best) if !replaces(compare(v, best)?) => best,
+                _ => v,
             });
         }
-        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
+        Ok(result.cloned().unwrap_or(Value::Null))
     }
 
     /// Fallibly concatenate another value onto this Text value, converting it to a string.
@@ -1521,18 +1532,15 @@ impl Value {
             return Value::Null;
         }
 
-        let separator = match registers
+        let Some(separator) = registers
             .next()
             .expect("registers should have at least one element after length check")
-        {
-            Value::Null | Value::Blob(_) => return Value::Null,
-            v => format!("{v}"),
+            .cast_text_ref()
+        else {
+            return Value::Null;
         };
 
-        let parts = registers.filter_map(|val| match val {
-            Value::Text(_) | Value::Numeric(_) => Some(format!("{val}")),
-            _ => None,
-        });
+        let parts = registers.filter_map(Value::cast_text_ref);
 
         let result = parts.collect::<Vec<_>>().join(&separator);
         Value::build_text(result)
@@ -1869,6 +1877,10 @@ mod tests {
 
     fn blob(bytes: &[u8]) -> Value {
         Value::from_slice(bytes).expect(crate::alloc::ALLOC_ERR_MSG)
+    }
+
+    fn binary(lhs: &Value, rhs: &Value) -> crate::Result<std::cmp::Ordering> {
+        Ok(crate::translate::collate::CollationSeq::BINARY.compare(lhs.as_ref(), rhs.as_ref()))
     }
 
     fn allocated(result: std::result::Result<Value, crate::alloc::TryReserveError>) -> Value {
@@ -2374,6 +2386,10 @@ mod tests {
         let expected = Value::build_text("'hello''''world'");
         assert_eq!(input.exec_quote(), expected);
 
+        let input = Value::from_f64(std::f64::consts::PI);
+        let expected = Value::build_text("3.141592653589793116e+00");
+        assert_eq!(input.exec_quote(), expected);
+
         let input = Value::from_f64(
             crate::numeric::str_to_f64("2.042747795102219097e+05")
                 .map(f64::from)
@@ -2603,11 +2619,11 @@ mod tests {
             Register::Value(Value::from_i64(10)),
         ];
         assert_eq!(
-            Value::exec_min(input_int_vec.iter().map(|v| v.get_value())),
+            Value::exec_min(input_int_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::from_i64(-1)
         );
         assert_eq!(
-            Value::exec_max(input_int_vec.iter().map(|v| v.get_value())),
+            Value::exec_max(input_int_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::from_i64(10)
         );
 
@@ -2615,31 +2631,31 @@ mod tests {
         let str2 = Register::Value(Value::build_text("z"));
         let input_str_vec = [&str2, &str1];
         assert_eq!(
-            Value::exec_min(input_str_vec.iter().map(|v| v.get_value())),
+            Value::exec_min(input_str_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::build_text("A")
         );
         assert_eq!(
-            Value::exec_max(input_str_vec.iter().map(|v| v.get_value())),
+            Value::exec_max(input_str_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::build_text("z")
         );
 
         let input_null_vec = [Register::Value(Value::Null), Register::Value(Value::Null)];
         assert_eq!(
-            Value::exec_min(input_null_vec.iter().map(|v| v.get_value())),
+            Value::exec_min(input_null_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::Null
         );
         assert_eq!(
-            Value::exec_max(input_null_vec.iter().map(|v| v.get_value())),
+            Value::exec_max(input_null_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::Null
         );
 
         let input_mixed_vec = [Register::Value(Value::from_i64(10)), str1];
         assert_eq!(
-            Value::exec_min(input_mixed_vec.iter().map(|v| v.get_value())),
+            Value::exec_min(input_mixed_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::from_i64(10)
         );
         assert_eq!(
-            Value::exec_max(input_mixed_vec.iter().map(|v| v.get_value())),
+            Value::exec_max(input_mixed_vec.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::build_text("A")
         );
 
@@ -2649,11 +2665,11 @@ mod tests {
             Register::Value(Value::Null),
         ];
         assert_eq!(
-            Value::exec_min(input_with_null.iter().map(|v| v.get_value())),
+            Value::exec_min(input_with_null.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::Null
         );
         assert_eq!(
-            Value::exec_max(input_with_null.iter().map(|v| v.get_value())),
+            Value::exec_max(input_with_null.iter().map(|v| v.get_value()), binary).unwrap(),
             Value::Null
         );
     }
@@ -3173,28 +3189,40 @@ mod tests {
     #[test]
     fn test_nullif() {
         assert_eq!(
-            Value::from_i64(1).exec_nullif(&Value::from_i64(1)),
+            Value::from_i64(1)
+                .exec_nullif(&Value::from_i64(1), binary)
+                .unwrap(),
             Value::Null
         );
         assert_eq!(
-            Value::from_f64(1.1).exec_nullif(&Value::from_f64(1.1)),
+            Value::from_f64(1.1)
+                .exec_nullif(&Value::from_f64(1.1), binary)
+                .unwrap(),
             Value::Null
         );
         assert_eq!(
-            Value::build_text("limbo").exec_nullif(&Value::build_text("limbo")),
+            Value::build_text("limbo")
+                .exec_nullif(&Value::build_text("limbo"), binary)
+                .unwrap(),
             Value::Null
         );
 
         assert_eq!(
-            Value::from_i64(1).exec_nullif(&Value::from_i64(2)),
+            Value::from_i64(1)
+                .exec_nullif(&Value::from_i64(2), binary)
+                .unwrap(),
             Value::from_i64(1)
         );
         assert_eq!(
-            Value::from_f64(1.1).exec_nullif(&Value::from_f64(1.2)),
+            Value::from_f64(1.1)
+                .exec_nullif(&Value::from_f64(1.2), binary)
+                .unwrap(),
             Value::from_f64(1.1)
         );
         assert_eq!(
-            Value::build_text("limbo").exec_nullif(&Value::build_text("limb")),
+            Value::build_text("limbo")
+                .exec_nullif(&Value::build_text("limb"), binary)
+                .unwrap(),
             Value::build_text("limbo")
         );
     }

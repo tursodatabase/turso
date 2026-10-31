@@ -1129,10 +1129,11 @@ impl LogicalLog {
 #[cfg(feature = "bench")]
 pub fn benchmark_serialize_op_entry(
     buffer: &mut Vec<u8>,
+    row_id: &RowID,
     row_version: &RowVersion,
     portable_extension: Option<&[u8]>,
 ) -> Result<()> {
-    LogSerializer::new(buffer).serialize_op_entry(row_version, portable_extension)
+    LogSerializer::new(buffer).serialize_op_entry(row_id, row_version, portable_extension)
 }
 
 fn read_proto_varint_from_buf(bytes: &[u8], offset: &mut usize) -> Result<u64> {
@@ -3358,17 +3359,11 @@ impl StreamingLogicalLogReader {
                 commit_ts,
                 btree_resident,
             } => {
-                // Compute column_count from the serialized record so recovered rows keep
-                // the same shape metadata as non-recovered rows.
-                // Decode shape metadata by reference; ownership is only needed for the row payload.
-                let column_count =
-                    crate::types::ImmutableRecordRef::from_bin_record(&record_bytes).column_count();
                 let row = crate::with_mv_store_allocation_site!(
                     RowPayload,
                     Row::new_table_row_in(
                         RowID::new(table_id, rowid.row_id.clone()),
                         &record_bytes,
-                        column_count,
                         alloc,
                     )?
                 );
@@ -3397,13 +3392,12 @@ impl StreamingLogicalLogReader {
                 btree_resident,
             } => {
                 let key_record = crate::types::ImmutableRecordRef::from_bin_record(&payload);
-                let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Upsert)?;
                 let key = Arc::new(SortableIndexKey::new_from_payload_in(
                     key_record, index_info, alloc,
                 )?);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
-                let row = Row::new_index_row(rowid.clone(), column_count);
+                let row = Row::new_index_row(rowid.clone());
                 Ok(StreamingResult::UpsertIndexRow {
                     row,
                     rowid,
@@ -3418,13 +3412,12 @@ impl StreamingLogicalLogReader {
                 btree_resident,
             } => {
                 let key_record = crate::types::ImmutableRecordRef::from_bin_record(&payload);
-                let column_count = key_record.column_count();
                 let index_info = get_index_info(table_id, IndexOpKind::Delete)?;
                 let key = Arc::new(SortableIndexKey::new_from_payload_in(
                     key_record, index_info, alloc,
                 )?);
                 let rowid = RowID::new(table_id, RowKey::Record(key));
-                let row = Row::new_index_row(rowid.clone(), column_count);
+                let row = Row::new_index_row(rowid.clone());
                 Ok(StreamingResult::DeleteIndexRow {
                     row,
                     rowid,
@@ -3862,11 +3855,11 @@ mod tests {
                 crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
             )),
             end: crate::mvcc::database::PackedTs::pack(None),
-            row: row.clone(),
+            data: row.data.clone(),
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
-        tx.push_row_version_for_test(&version);
+        tx.push_row_version_for_test(&row.id, &version);
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -3968,11 +3961,12 @@ mod tests {
             } else {
                 None
             }),
-            row,
+            data: row.data,
             btree_resident,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
-        let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
+        let tx =
+            crate::mvcc::database::LogRecord::for_test(commit_ts, &[(row.id, row_version)], None);
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
     }
@@ -4136,17 +4130,21 @@ mod tests {
         rowid: i64,
         commit_ts: u64,
         data: &str,
-    ) -> crate::mvcc::database::RowVersion {
-        crate::mvcc::database::RowVersion {
-            id: commit_ts,
-            begin: crate::mvcc::database::PackedTs::pack(Some(
-                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
-            )),
-            end: crate::mvcc::database::PackedTs::pack(None),
-            row: generate_simple_string_row(table_id, rowid, data),
-            btree_resident: false,
-            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-        }
+    ) -> (RowID, crate::mvcc::database::RowVersion) {
+        let row = generate_simple_string_row(table_id, rowid, data);
+        (
+            row.id,
+            crate::mvcc::database::RowVersion {
+                id: commit_ts,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                data: row.data,
+                btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            },
+        )
     }
 
     /// Recover all ops through `SlowReadFile`, driving the reader one deferred IO
@@ -4220,7 +4218,7 @@ mod tests {
         // multi-op small frame. The large frame is what would dominate memory if
         // the whole frame had to stay buffered for re-parse.
         let big_payload = "x".repeat(3000);
-        let frames: Vec<Vec<crate::mvcc::database::RowVersion>> = vec![
+        let frames: Vec<Vec<(RowID, crate::mvcc::database::RowVersion)>> = vec![
             vec![table_row_version(table_id, 1, 10, "first")],
             (0..40)
                 .map(|i| table_row_version(table_id, 100 + i as i64, 20, &big_payload))
@@ -4361,12 +4359,8 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row::new_table_row(
-                        RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob(),
-                        5,
-                    )
-                    .unwrap(),
+                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
+                        .unwrap(),
                 )
                 .unwrap();
             // now insert a row into table -2
@@ -4434,12 +4428,8 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row::new_table_row(
-                        RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob(),
-                        5,
-                    )
-                    .unwrap(),
+                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
+                        .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -4549,12 +4539,8 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row::new_table_row(
-                        RowID::new((-1).into(), RowKey::Int(1000)),
-                        data.as_blob(),
-                        5,
-                    )
-                    .unwrap(),
+                    Row::new_table_row(RowID::new((-1).into(), RowKey::Int(1000)), data.as_blob())
+                        .unwrap(),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -4759,32 +4745,38 @@ mod tests {
         let mut tx1 =
             crate::mvcc::database::LogRecord::new(10, crate::alloc::DynAllocator::default())
                 .unwrap();
-        tx1.push_row_version_for_test(&crate::mvcc::database::RowVersion {
-            id: 1,
-            begin: crate::mvcc::database::PackedTs::pack(Some(
-                crate::mvcc::database::TxTimestampOrID::Timestamp(10),
-            )),
-            end: crate::mvcc::database::PackedTs::pack(None),
-            row: row.clone(),
-            btree_resident: false,
-            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-        });
+        tx1.push_row_version_for_test(
+            &row.id,
+            &crate::mvcc::database::RowVersion {
+                id: 1,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(10),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                data: row.data.clone(),
+                btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            },
+        );
         let c = log.log_tx(tx1).unwrap();
         io.wait_for_completion(c).unwrap();
 
         let mut tx2 =
             crate::mvcc::database::LogRecord::new(20, crate::alloc::DynAllocator::default())
                 .unwrap();
-        tx2.push_row_version_for_test(&crate::mvcc::database::RowVersion {
-            id: 2,
-            begin: crate::mvcc::database::PackedTs::pack(Some(
-                crate::mvcc::database::TxTimestampOrID::Timestamp(20),
-            )),
-            end: crate::mvcc::database::PackedTs::pack(None),
-            row,
-            btree_resident: false,
-            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-        });
+        tx2.push_row_version_for_test(
+            &row.id,
+            &crate::mvcc::database::RowVersion {
+                id: 2,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(20),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                data: row.data,
+                btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            },
+        );
         let c = log.log_tx(tx2).unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -4933,16 +4925,19 @@ mod tests {
         let row3 = generate_simple_string_row((-2).into(), 3, "deferred");
         let tx3 = crate::mvcc::database::LogRecord::for_test(
             3,
-            &[crate::mvcc::database::RowVersion {
-                id: 3,
-                begin: crate::mvcc::database::PackedTs::pack(Some(
-                    crate::mvcc::database::TxTimestampOrID::Timestamp(3),
-                )),
-                end: crate::mvcc::database::PackedTs::pack(None),
-                row: row3,
-                btree_resident: false,
-                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-            }],
+            &[(
+                row3.id,
+                crate::mvcc::database::RowVersion {
+                    id: 3,
+                    begin: crate::mvcc::database::PackedTs::pack(Some(
+                        crate::mvcc::database::TxTimestampOrID::Timestamp(3),
+                    )),
+                    end: crate::mvcc::database::PackedTs::pack(None),
+                    data: row3.data,
+                    btree_resident: false,
+                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                },
+            )],
             None,
         );
         let (c, bytes_written) = log.log_tx_deferred_offset(tx3, None).unwrap();
@@ -4993,36 +4988,44 @@ mod tests {
             Ok(())
         };
 
+        let row1 = generate_simple_string_row((-2).into(), 1, "first");
         let tx1 = crate::mvcc::database::LogRecord::for_test(
             1,
-            &[crate::mvcc::database::RowVersion {
-                id: 1,
-                begin: crate::mvcc::database::PackedTs::pack(Some(
-                    crate::mvcc::database::TxTimestampOrID::Timestamp(1),
-                )),
-                end: crate::mvcc::database::PackedTs::pack(None),
-                row: generate_simple_string_row((-2).into(), 1, "first"),
-                btree_resident: false,
-                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-            }],
+            &[(
+                row1.id,
+                crate::mvcc::database::RowVersion {
+                    id: 1,
+                    begin: crate::mvcc::database::PackedTs::pack(Some(
+                        crate::mvcc::database::TxTimestampOrID::Timestamp(1),
+                    )),
+                    end: crate::mvcc::database::PackedTs::pack(None),
+                    data: row1.data,
+                    btree_resident: false,
+                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                },
+            )],
             None,
         );
         let (c, first_len) = log.log_tx_deferred_offset(tx1, Some(&callback)).unwrap();
         io.wait_for_completion(c).unwrap();
         log.advance_offset_after_success(first_len);
 
+        let row2 = generate_simple_string_row((-2).into(), 2, "second");
         let tx2 = crate::mvcc::database::LogRecord::for_test(
             2,
-            &[crate::mvcc::database::RowVersion {
-                id: 2,
-                begin: crate::mvcc::database::PackedTs::pack(Some(
-                    crate::mvcc::database::TxTimestampOrID::Timestamp(2),
-                )),
-                end: crate::mvcc::database::PackedTs::pack(None),
-                row: generate_simple_string_row((-2).into(), 2, "second"),
-                btree_resident: false,
-                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-            }],
+            &[(
+                row2.id,
+                crate::mvcc::database::RowVersion {
+                    id: 2,
+                    begin: crate::mvcc::database::PackedTs::pack(Some(
+                        crate::mvcc::database::TxTimestampOrID::Timestamp(2),
+                    )),
+                    end: crate::mvcc::database::PackedTs::pack(None),
+                    data: row2.data,
+                    btree_resident: false,
+                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                },
+            )],
             None,
         );
         let (c, second_len) = log.log_tx_deferred_offset(tx2, Some(&callback)).unwrap();
@@ -5094,11 +5097,11 @@ mod tests {
                 crate::mvcc::database::TxTimestampOrID::Timestamp(123),
             )),
             end: crate::mvcc::database::PackedTs::pack(None),
-            row,
+            data: row.data,
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
-        tx.push_row_version_for_test(&version);
+        tx.push_row_version_for_test(&row.id, &version);
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -5567,16 +5570,20 @@ mod tests {
         let mut tx =
             crate::mvcc::database::LogRecord::new(300, crate::alloc::DynAllocator::default())
                 .unwrap();
-        tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
-            id: 1,
-            begin: crate::mvcc::database::PackedTs::pack(Some(
-                crate::mvcc::database::TxTimestampOrID::Timestamp(300),
-            )),
-            end: crate::mvcc::database::PackedTs::pack(None),
-            row: generate_simple_string_row((-2).into(), 42, "flip"),
-            btree_resident: false,
-            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-        });
+        let row = generate_simple_string_row((-2).into(), 42, "flip");
+        tx.push_row_version_for_test(
+            &row.id,
+            &crate::mvcc::database::RowVersion {
+                id: 1,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(300),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                data: row.data.clone(),
+                btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            },
+        );
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -5649,21 +5656,21 @@ mod tests {
                 let btree_resident = (rng.next_u32() & 1) == 1;
                 let is_delete = (rng.next_u32() & 1) == 1;
                 if is_delete {
-                    tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
-                        id: 0,
-                        begin: crate::mvcc::database::PackedTs::pack(None),
-                        end: crate::mvcc::database::PackedTs::pack(Some(
-                            crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
-                        )),
-                        row: Row::new_table_row(
-                            RowID::new((-2).into(), RowKey::Int(rowid)),
-                            &[],
-                            0,
-                        )
-                        .unwrap(),
-                        btree_resident,
-                        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                    });
+                    let row = Row::new_table_row(RowID::new((-2).into(), RowKey::Int(rowid)), &[])
+                        .unwrap();
+                    tx.push_row_version_for_test(
+                        &row.id,
+                        &crate::mvcc::database::RowVersion {
+                            id: 0,
+                            begin: crate::mvcc::database::PackedTs::pack(None),
+                            end: crate::mvcc::database::PackedTs::pack(Some(
+                                crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
+                            )),
+                            data: row.data.clone(),
+                            btree_resident,
+                            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                        },
+                    );
                     expected.push(ExpectedTableOp::Delete {
                         rowid,
                         commit_ts: tx.tx_timestamp,
@@ -5672,16 +5679,19 @@ mod tests {
                 } else {
                     let payload = format!("r-{tx_i}-{rowid}");
                     let row = generate_simple_string_row((-2).into(), rowid, &payload);
-                    tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
-                        id: 0,
-                        begin: crate::mvcc::database::PackedTs::pack(Some(
-                            crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
-                        )),
-                        end: crate::mvcc::database::PackedTs::pack(None),
-                        row: row.clone(),
-                        btree_resident,
-                        materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-                    });
+                    tx.push_row_version_for_test(
+                        &row.id,
+                        &crate::mvcc::database::RowVersion {
+                            id: 0,
+                            begin: crate::mvcc::database::PackedTs::pack(Some(
+                                crate::mvcc::database::TxTimestampOrID::Timestamp(tx.tx_timestamp),
+                            )),
+                            end: crate::mvcc::database::PackedTs::pack(None),
+                            data: row.data.clone(),
+                            btree_resident,
+                            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                        },
+                    );
                     expected.push(ExpectedTableOp::Upsert {
                         rowid,
                         payload: crate::types::value_blob_from_slice(row.payload())
@@ -5714,16 +5724,19 @@ mod tests {
                 commit_ts: large_commit_ts,
                 btree_resident: false,
             });
-            large_tx.push_row_version_for_test(&crate::mvcc::database::RowVersion {
-                id: rowid as u64,
-                begin: crate::mvcc::database::PackedTs::pack(Some(
-                    crate::mvcc::database::TxTimestampOrID::Timestamp(large_commit_ts),
-                )),
-                end: crate::mvcc::database::PackedTs::pack(None),
-                row,
-                btree_resident: false,
-                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-            });
+            large_tx.push_row_version_for_test(
+                &row.id,
+                &crate::mvcc::database::RowVersion {
+                    id: rowid as u64,
+                    begin: crate::mvcc::database::PackedTs::pack(Some(
+                        crate::mvcc::database::TxTimestampOrID::Timestamp(large_commit_ts),
+                    )),
+                    end: crate::mvcc::database::PackedTs::pack(None),
+                    data: row.data,
+                    btree_resident: false,
+                    materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+                },
+            );
         }
         let c = log.log_tx(large_tx).unwrap();
         io.wait_for_completion(c).unwrap();
@@ -5761,7 +5774,7 @@ mod tests {
                 } else {
                     None
                 }),
-                row: row.clone(),
+                data: row.data.clone(),
                 btree_resident,
                 materialized_at: crate::mvcc::database::WalPos::ORIGIN,
             };
@@ -5780,7 +5793,11 @@ mod tests {
                     btree_resident,
                 }
             });
-            let tx = crate::mvcc::database::LogRecord::for_test(commit_ts, &[row_version], None);
+            let tx = crate::mvcc::database::LogRecord::for_test(
+                commit_ts,
+                &[(row.id, row_version)],
+                None,
+            );
             let Ok(c) = log.log_tx(tx) else {
                 return false;
             };
@@ -5868,11 +5885,11 @@ mod tests {
                 crate::mvcc::database::TxTimestampOrID::Timestamp(55),
             )),
             end: crate::mvcc::database::PackedTs::pack(None),
-            row,
+            data: row.data,
             btree_resident: true,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
-        tx.push_row_version_for_test(&version);
+        tx.push_row_version_for_test(&row.id, &version);
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -5932,11 +5949,11 @@ mod tests {
                 crate::mvcc::database::TxTimestampOrID::Timestamp(10),
             )),
             end: crate::mvcc::database::PackedTs::pack(None),
-            row,
+            data: row.data,
             btree_resident: false,
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
-        tx.push_row_version_for_test(&version);
+        tx.push_row_version_for_test(&row.id, &version);
         let c = log.log_tx(tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -6251,18 +6268,21 @@ mod tests {
         rowid: i64,
         value: &str,
         commit_ts: u64,
-    ) -> crate::mvcc::database::RowVersion {
+    ) -> (RowID, crate::mvcc::database::RowVersion) {
         let row = generate_simple_string_row(table_id, rowid, value);
-        crate::mvcc::database::RowVersion {
-            id: rowid as u64,
-            begin: crate::mvcc::database::PackedTs::pack(Some(
-                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
-            )),
-            end: crate::mvcc::database::PackedTs::pack(None),
-            row,
-            btree_resident: false,
-            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-        }
+        (
+            row.id,
+            crate::mvcc::database::RowVersion {
+                id: rowid as u64,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                data: row.data,
+                btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            },
+        )
     }
 
     fn make_test_index_row_version(
@@ -6270,7 +6290,7 @@ mod tests {
         rowid: i64,
         value: &str,
         commit_ts: u64,
-    ) -> crate::mvcc::database::RowVersion {
+    ) -> (RowID, crate::mvcc::database::RowVersion) {
         let key_record = ImmutableRecord::from_values(
             &[
                 Value::Text(Text::new(value.to_string())),
@@ -6286,17 +6306,20 @@ mod tests {
         )
         .unwrap();
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
-        let row = Row::new_index_row(row_id, 2);
-        crate::mvcc::database::RowVersion {
-            id: rowid as u64,
-            begin: crate::mvcc::database::PackedTs::pack(Some(
-                crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
-            )),
-            end: crate::mvcc::database::PackedTs::pack(None),
-            row,
-            btree_resident: false,
-            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-        }
+        let row = Row::new_index_row(row_id);
+        (
+            row.id,
+            crate::mvcc::database::RowVersion {
+                id: rowid as u64,
+                begin: crate::mvcc::database::PackedTs::pack(Some(
+                    crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts),
+                )),
+                end: crate::mvcc::database::PackedTs::pack(None),
+                data: row.data,
+                btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            },
+        )
     }
 
     fn test_index_info() -> Arc<IndexInfo> {
@@ -6305,12 +6328,12 @@ mod tests {
                 [
                     crate::types::KeyInfo {
                         sort_order: turso_parser::ast::SortOrder::Asc,
-                        collation: crate::translate::collate::CollationSeq::Binary,
+                        collation: crate::translate::collate::CollationSeq::BINARY,
                         nulls_order: None,
                     },
                     crate::types::KeyInfo {
                         sort_order: turso_parser::ast::SortOrder::Asc,
-                        collation: crate::translate::collate::CollationSeq::Binary,
+                        collation: crate::translate::collate::CollationSeq::BINARY,
                         nulls_order: None,
                     },
                 ],
@@ -6328,25 +6351,28 @@ mod tests {
         record_bytes: Vec<u8>,
         commit_ts: u64,
         is_delete: bool,
-    ) -> crate::mvcc::database::RowVersion {
+    ) -> (RowID, crate::mvcc::database::RowVersion) {
         let row =
-            Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), &record_bytes, 1).unwrap();
-        crate::mvcc::database::RowVersion {
-            id: rowid as u64,
-            begin: crate::mvcc::database::PackedTs::pack(if is_delete {
-                None
-            } else {
-                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
-            }),
-            end: crate::mvcc::database::PackedTs::pack(if is_delete {
-                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
-            } else {
-                None
-            }),
-            row,
-            btree_resident: false,
-            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-        }
+            Row::new_table_row(RowID::new(table_id, RowKey::Int(rowid)), &record_bytes).unwrap();
+        (
+            row.id,
+            crate::mvcc::database::RowVersion {
+                id: rowid as u64,
+                begin: crate::mvcc::database::PackedTs::pack(if is_delete {
+                    None
+                } else {
+                    Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+                }),
+                end: crate::mvcc::database::PackedTs::pack(if is_delete {
+                    Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+                } else {
+                    None
+                }),
+                data: row.data,
+                btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            },
+        )
     }
 
     fn make_test_raw_index_row_version(
@@ -6355,7 +6381,7 @@ mod tests {
         payload_bytes: Vec<u8>,
         commit_ts: u64,
         is_delete: bool,
-    ) -> crate::mvcc::database::RowVersion {
+    ) -> (RowID, crate::mvcc::database::RowVersion) {
         let sortable_key = SortableIndexKey::new_from_payload_in(
             &payload_bytes,
             test_index_info(),
@@ -6363,31 +6389,34 @@ mod tests {
         )
         .unwrap();
         let row_id = RowID::new(table_id, RowKey::Record(Arc::new(sortable_key)));
-        let row = Row::new_index_row(row_id, 2);
-        crate::mvcc::database::RowVersion {
-            id: rowid as u64,
-            begin: crate::mvcc::database::PackedTs::pack(if is_delete {
-                None
-            } else {
-                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
-            }),
-            end: crate::mvcc::database::PackedTs::pack(if is_delete {
-                Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
-            } else {
-                None
-            }),
-            row,
-            btree_resident: false,
-            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-        }
+        let row = Row::new_index_row(row_id);
+        (
+            row.id,
+            crate::mvcc::database::RowVersion {
+                id: rowid as u64,
+                begin: crate::mvcc::database::PackedTs::pack(if is_delete {
+                    None
+                } else {
+                    Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+                }),
+                end: crate::mvcc::database::PackedTs::pack(if is_delete {
+                    Some(crate::mvcc::database::TxTimestampOrID::Timestamp(commit_ts))
+                } else {
+                    None
+                }),
+                data: row.data,
+                btree_resident: false,
+                materialized_at: crate::mvcc::database::WalPos::ORIGIN,
+            },
+        )
     }
 
     fn single_upsert_table_op_size_for_text_len(rowid: i64, text_len: usize) -> usize {
         let mut encoded = Vec::new();
         let value = "x".repeat(text_len);
-        let row_version = make_test_row_version((-2).into(), rowid, &value, 100);
+        let (row_id, row_version) = make_test_row_version((-2).into(), rowid, &value, 100);
         LogSerializer::new(&mut encoded)
-            .serialize_op_entry(&row_version, None)
+            .serialize_op_entry(&row_id, &row_version, None)
             .unwrap();
         encoded.len()
     }
@@ -6724,14 +6753,14 @@ mod tests {
     }
 
     fn expected_upsert_table_fuzz_op(
-        row_version: &crate::mvcc::database::RowVersion,
+        (row_id, row_version): &(RowID, crate::mvcc::database::RowVersion),
         rowid: i64,
         commit_ts: u64,
     ) -> ParsedOp {
         ParsedOp::UpsertTable {
             table_id: (-2).into(),
             rowid: RowID::new((-2).into(), RowKey::Int(rowid)),
-            record_bytes: crate::types::value_blob_from_slice(row_version.row.payload())
+            record_bytes: crate::types::value_blob_from_slice(row_version.payload(row_id))
                 .expect(crate::alloc::ALLOC_ERR_MSG),
             commit_ts,
             btree_resident: false,
@@ -6739,22 +6768,22 @@ mod tests {
     }
 
     fn assert_forced_upsert_carry_prefix_layout(
-        short_filler: &crate::mvcc::database::RowVersion,
-        short_upsert: &crate::mvcc::database::RowVersion,
-        long_upsert: &crate::mvcc::database::RowVersion,
+        short_filler: &(RowID, crate::mvcc::database::RowVersion),
+        short_upsert: &(RowID, crate::mvcc::database::RowVersion),
+        long_upsert: &(RowID, crate::mvcc::database::RowVersion),
         chunk_size: usize,
     ) {
         let mut filler_buf = Vec::new();
         LogSerializer::new(&mut filler_buf)
-            .serialize_op_entry(short_filler, None)
+            .serialize_op_entry(&short_filler.0, &short_filler.1, None)
             .unwrap();
         let mut short_upsert_buf = Vec::new();
         LogSerializer::new(&mut short_upsert_buf)
-            .serialize_op_entry(short_upsert, None)
+            .serialize_op_entry(&short_upsert.0, &short_upsert.1, None)
             .unwrap();
         let mut long_upsert_buf = Vec::new();
         LogSerializer::new(&mut long_upsert_buf)
-            .serialize_op_entry(long_upsert, None)
+            .serialize_op_entry(&long_upsert.0, &long_upsert.1, None)
             .unwrap();
 
         turso_assert_less_than!(
@@ -6788,7 +6817,7 @@ mod tests {
         rng: &mut ChaCha8Rng,
         chunk_size: usize,
         commit_ts: u64,
-        row_versions: &mut Vec<crate::mvcc::database::RowVersion>,
+        row_versions: &mut Vec<(RowID, crate::mvcc::database::RowVersion)>,
         expected_ops: &mut Vec<ParsedOp>,
     ) {
         // Every forced case starts with:
@@ -6806,7 +6835,7 @@ mod tests {
         );
         let mut short_upsert_buf = Vec::new();
         LogSerializer::new(&mut short_upsert_buf)
-            .serialize_op_entry(&short_upsert, None)
+            .serialize_op_entry(&short_upsert.0, &short_upsert.1, None)
             .unwrap();
         turso_assert_less_than!(
             short_upsert_buf.len(),
@@ -6859,7 +6888,7 @@ mod tests {
         rowid: i64,
         chunk_size: usize,
         commit_ts: u64,
-    ) -> (crate::mvcc::database::RowVersion, ParsedOp) {
+    ) -> ((RowID, crate::mvcc::database::RowVersion), ParsedOp) {
         // first generate a random payload size
         let record_bytes_len = encrypted_carry_fuzz_record_bytes_len(rng, rowid, chunk_size);
         let row_version = make_test_raw_table_row_version(
@@ -7059,7 +7088,7 @@ mod tests {
         let text_len = text_len_for_single_upsert_table_op_size(target_op_size);
         let value = "t".repeat(text_len);
         let row_version = make_test_row_version((-2).into(), 1, &value, 100);
-        let expected_record_bytes = row_version.row.payload().to_vec();
+        let expected_record_bytes = row_version.1.payload(&row_version.0).to_vec();
         let tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
 
         let file = write_single_encrypted_tx_with_chunk_size_for_test(
@@ -7681,7 +7710,7 @@ mod tests {
             let text_len = text_len_for_single_upsert_table_op_size(target_op_size);
             let value = "x".repeat(text_len);
             let row_version = make_test_row_version((-2).into(), 1, &value, 100);
-            let expected_record_bytes = row_version.row.payload().to_vec();
+            let expected_record_bytes = row_version.1.payload(&row_version.0).to_vec();
             let tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
             let file = write_single_encrypted_tx(
                 &io,
@@ -7724,7 +7753,7 @@ mod tests {
         let text_len = text_len_for_single_upsert_table_op_size(target_op_size);
         let value = "x".repeat(text_len);
         let row_version = make_test_row_version((-2).into(), 1, &value, 100);
-        let expected_record_bytes = row_version.row.payload().to_vec();
+        let expected_record_bytes = row_version.1.payload(&row_version.0).to_vec();
 
         let tx = crate::mvcc::database::LogRecord::for_test(100, &[row_version], None);
         let file = write_single_encrypted_tx(&io, "enc-cross-boundary.db-log", &enc_ctx, tx);
@@ -7751,18 +7780,18 @@ mod tests {
         let second_value = "b".repeat(200);
         let filler = make_test_row_version((-2).into(), 1, &filler_value, 100);
         let second = make_test_row_version((-2).into(), 2, &second_value, 100);
-        let expected_filler_record_bytes = filler.row.payload().to_vec();
-        let expected_second_record_bytes = second.row.payload().to_vec();
+        let expected_filler_record_bytes = filler.1.payload(&filler.0).to_vec();
+        let expected_second_record_bytes = second.1.payload(&second.0).to_vec();
 
         let mut filler_buf = Vec::new();
         LogSerializer::new(&mut filler_buf)
-            .serialize_op_entry(&filler, None)
+            .serialize_op_entry(&filler.0, &filler.1, None)
             .unwrap();
         assert_eq!(filler_buf.len(), ENCRYPTED_PAYLOAD_CHUNK_SIZE - 7);
 
         let mut second_buf = Vec::new();
         LogSerializer::new(&mut second_buf)
-            .serialize_op_entry(&second, None)
+            .serialize_op_entry(&second.0, &second.1, None)
             .unwrap();
         // Table ops begin with a fixed 6-byte prelude:
         // 1 byte op tag + 1 byte flags + 4 bytes table_id.
@@ -7811,11 +7840,11 @@ mod tests {
         let filler_len = text_len_for_single_upsert_table_op_size(filler_payload_size);
         let filler_value = "h".repeat(filler_len);
         let filler = make_test_row_version((-2).into(), 1, &filler_value, 100);
-        let expected_filler_record_bytes = filler.row.payload().to_vec();
+        let expected_filler_record_bytes = filler.1.payload(&filler.0).to_vec();
 
         let mut filler_buf = Vec::new();
         LogSerializer::new(&mut filler_buf)
-            .serialize_op_entry(&filler, None)
+            .serialize_op_entry(&filler.0, &filler.1, None)
             .unwrap();
         assert_eq!(filler_buf.len(), filler_payload_size);
         assert_eq!(
@@ -7852,7 +7881,7 @@ mod tests {
             .collect::<Vec<_>>();
         let expected_record_bytes = row_versions
             .iter()
-            .map(|row_version| row_version.row.payload().to_vec())
+            .map(|(row_id, row_version)| row_version.payload(row_id).to_vec())
             .collect::<Vec<_>>();
         let tx = crate::mvcc::database::LogRecord::for_test(200, &row_versions, None);
         write_first_encrypted_tx(file.clone(), &io, &enc_ctx, tx);
@@ -7879,7 +7908,7 @@ mod tests {
         let index_id: MVTableId = (-3).into();
         let value = "i".repeat(ENCRYPTED_PAYLOAD_CHUNK_SIZE * 2);
         let row_version = make_test_index_row_version(index_id, 42, &value, 250);
-        let expected_payload = row_version.row.payload().to_vec();
+        let expected_payload = row_version.1.payload(&row_version.0).to_vec();
 
         let tx = crate::mvcc::database::LogRecord::for_test(250, &[row_version], None);
         let file = write_single_encrypted_tx(&io, "enc-index-boundary.db-log", &enc_ctx, tx);
@@ -8069,7 +8098,8 @@ mod tests {
         let table_id: MVTableId = (-2).into();
         let enc_ctx = test_enc_ctx();
         let first_row_version = make_test_row_version(table_id, 0, "data", 100);
-        let expected_first_record_bytes = first_row_version.row.payload().to_vec();
+        let expected_first_record_bytes =
+            first_row_version.1.payload(&first_row_version.0).to_vec();
 
         // Write 2 frames.
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
@@ -8122,7 +8152,7 @@ mod tests {
 
         let base_file = open_test_file(&io, "enc-chunk-integrity-base.db-log");
         let row_version = make_test_row_version((-2).into(), 1, &value, 333);
-        let expected_record_bytes = row_version.row.payload().to_vec();
+        let expected_record_bytes = row_version.1.payload(&row_version.0).to_vec();
         let tx = crate::mvcc::database::LogRecord::for_test(333, &[row_version], None);
         write_first_encrypted_tx(base_file.clone(), &io, &enc_ctx, tx);
         let base_ops = parse_only_encrypted_tx_ops(base_file.clone(), &io, &enc_ctx);
@@ -8250,7 +8280,8 @@ mod tests {
 
         let mut log = LogicalLog::new(file.clone(), io.clone(), Some(enc_ctx.clone()));
         let first_row_version = make_test_row_version(table_id, 1, "prefix", 500);
-        let expected_prefix_record_bytes = first_row_version.row.payload().to_vec();
+        let expected_prefix_record_bytes =
+            first_row_version.1.payload(&first_row_version.0).to_vec();
         let first_tx = crate::mvcc::database::LogRecord::for_test(500, &[first_row_version], None);
         let c = log.log_tx(first_tx).unwrap();
         io.wait_for_completion(c).unwrap();

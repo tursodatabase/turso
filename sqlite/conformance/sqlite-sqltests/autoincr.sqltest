@@ -284,6 +284,83 @@ test autoinc-fail-on-non-integer-pk {
 expect error {
 }
 
+# Test: AUTOINCREMENT needs a key declared exactly as INTEGER PRIMARY KEY.
+# Other integer types, a sized INTEGER, and an inline DESC key are rejected.
+test autoinc-fail-on-int-pk {
+    CREATE TABLE t8(x INT PRIMARY KEY AUTOINCREMENT);
+}
+expect error {
+    AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY
+}
+
+test autoinc-fail-on-bigint-pk {
+    CREATE TABLE t8(x BIGINT PRIMARY KEY AUTOINCREMENT);
+}
+expect error {
+    AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY
+}
+
+test autoinc-fail-on-sized-integer-pk {
+    CREATE TABLE t8(x INTEGER(8) PRIMARY KEY AUTOINCREMENT);
+}
+expect error {
+    AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY
+}
+
+test autoinc-fail-on-integer-pk-desc {
+    CREATE TABLE t8(x INTEGER PRIMARY KEY DESC AUTOINCREMENT);
+}
+expect error {
+    AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY
+}
+
+test autoinc-fail-on-int-in-pk-clause {
+    CREATE TABLE t8(x INT, y, PRIMARY KEY(x AUTOINCREMENT));
+}
+expect error {
+    AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY
+}
+
+# Test: IF NOT EXISTS on an existing table does not check the body, so a
+# startup script that still has an old AUTOINCREMENT key keeps working.
+test autoinc-if-not-exists-skips-check-on-existing-table {
+    CREATE TABLE t8(x INT, y);
+    CREATE TABLE IF NOT EXISTS t8(x INT PRIMARY KEY AUTOINCREMENT, y);
+    INSERT INTO t8 VALUES(5, 'a');
+    SELECT x, y FROM t8;
+    SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_sequence';
+}
+expect {
+    5|a
+    0
+}
+
+# Test: quotes around INTEGER are allowed, as in SQLite. Only the CREATE is
+# checked: unlike SQLite, Turso does not make a quoted INTEGER key a rowid alias.
+test autoinc-quoted-integer-pk {
+    CREATE TABLE t8(x "INTEGER" PRIMARY KEY AUTOINCREMENT, y);
+    SELECT name FROM sqlite_schema WHERE name = 't8';
+}
+expect {
+    t8
+}
+
+# Test: DESC in a separate PRIMARY KEY clause still makes a rowid alias, so
+# AUTOINCREMENT is allowed there.
+@cross-check-integrity
+test autoinc-desc-in-pk-clause {
+    CREATE TABLE t8(x INTEGER, y, PRIMARY KEY(x DESC AUTOINCREMENT));
+    INSERT INTO t8(y) VALUES('a');
+    INSERT INTO t8(y) VALUES('b');
+    SELECT x, y FROM t8 ORDER BY x;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    1|a
+    2|b
+    t8|2
+}
+
 # Test: An empty INSERT...SELECT does not damage the sequence table. (Ticket #3148)
 @cross-check-integrity
 test autoinc-empty-insert-select-is-safe {

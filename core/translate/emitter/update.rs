@@ -1,8 +1,10 @@
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
-use crate::namespace::NamespaceId;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
+use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::RegisterColumn;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -52,7 +54,7 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, DmlColumnContext},
+        builder::{CursorKey, CursorType, DmlColumnContext, DmlRowForm},
         insn::{
             to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn,
             RegisterOrLiteral,
@@ -183,7 +185,7 @@ pub fn emit_program_for_update(
                 col_used_mask: Default::default(),
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
-                database_id: MAIN_DB_ID,
+                namespace: NamespaceRef::root_of(MAIN_DB_ID),
                 indexed: None,
                 plan_estimate: None,
             }],
@@ -194,7 +196,7 @@ pub fn emit_program_for_update(
             has_alias: target_table.has_alias,
             internal_id: target_table.internal_id,
             table: target_table.table.clone(),
-            database_id: target_table.database_id,
+            namespace: target_table.namespace,
             join_info: None,
             col_used_mask: target_table.col_used_mask.try_clone()?,
             cte_select: None,
@@ -306,7 +308,7 @@ pub fn emit_program_for_update(
     )?;
 
     // Prepare index cursors
-    let target_database_id = target_table.database_id;
+    let target_database_id = target_table.namespace.database_id;
     let mut index_cursors = Vec::with_capacity(plan.indexes_to_update.len());
     for index in &plan.indexes_to_update {
         let index_cursor = if let Some(cursor) = program.resolve_cursor_id_safe(&CursorKey::index(
@@ -384,7 +386,7 @@ pub fn emit_program_for_update(
     let all_index_cursors = if any_replace {
         let table_name = target_table.table.get_name();
         let all_indexes: Vec<_> = resolver.with_schema(target_database_id, |s| {
-            s.get_indices(NamespaceId::ROOT, table_name)
+            s.get_indices(target_table.namespace.id, table_name)
                 .cloned()
                 .collect()
         });
@@ -516,6 +518,9 @@ struct UpdateColumnCtx<'a> {
     cdc_updates_register: Option<usize>,
     layout: &'a ColumnLayout,
     affected_columns: &'a ColumnMask,
+    /// The SET columns. Until ENCODE runs, their registers hold the user's
+    /// values and the other columns hold stored values.
+    updated_columns: &'a ColumnMask,
 }
 
 impl UpdateColumnCtx<'_> {
@@ -685,14 +690,15 @@ fn emit_replace_delete<'a>(
     all_index_cursors: &[(Arc<Index>, usize)],
     conflicting_rowid_reg: usize,
     new_row_registers: Option<(usize, usize)>,
-    update_database_id: usize,
+    update_namespace: NamespaceRef,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> crate::Result<()> {
+    let update_database_id = update_namespace.database_id;
     let table_name = target_table.table.get_name();
     let internal_id = target_table.internal_id;
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
         let prepared = if t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.any_resolved_fks_referencing(NamespaceId::ROOT, table_name)
+            s.any_resolved_fks_referencing(update_namespace.id, table_name)
         }) {
             ForeignKeyActions::prepare_fk_delete_actions(
                 program,
@@ -701,13 +707,13 @@ fn emit_replace_delete<'a>(
                 target_table_cursor_id,
                 conflicting_rowid_reg,
                 new_row_registers,
-                update_database_id,
+                update_namespace,
             )?
         } else {
             ForeignKeyActions::default()
         };
         if t_ctx.resolver.with_schema(update_database_id, |s| {
-            s.has_child_fks(NamespaceId::ROOT, table_name)
+            s.has_child_fks(update_namespace.id, table_name)
         }) {
             emit_fk_child_decrement_on_delete(
                 program,
@@ -718,7 +724,7 @@ fn emit_replace_delete<'a>(
                 table_name,
                 target_table_cursor_id,
                 conflicting_rowid_reg,
-                update_database_id,
+                update_namespace,
                 &t_ctx.resolver,
             )?;
         }
@@ -887,9 +893,9 @@ fn emit_update_column_values<'a>(
                                 column_ctx.start,
                                 column_ctx.rowid_reg,
                                 column_ctx.layout.clone(),
+                                DmlRowForm::StoredExceptUpdated(column_ctx.updated_columns.clone()),
                             ),
                             table: column_ctx.target_table.table.require_btree()?,
-                            uses_custom_type_operators: false,
                         }),
                         GeneratedType::NotGenerated => None,
                     };
@@ -902,7 +908,7 @@ fn emit_update_column_values<'a>(
                             // against this column's union type. See ProgramBuilder::target_union_type.
                             let union_td = t_ctx
                                 .resolver
-                                .schema
+                                .schema()
                                 .get_type_def_unchecked(&table_column.ty_str)
                                 .filter(|td| td.is_union())
                                 .cloned();
@@ -914,11 +920,13 @@ fn emit_update_column_values<'a>(
                             // comment on NoConstantOptReason::CustomTypeEncode.
                             let has_custom_encode = t_ctx
                                 .resolver
-                                .schema
+                                .schema()
                                 .resolve_type_unchecked(&table_column.ty_str)
                                 .ok()
                                 .flatten()
-                                .is_some_and(|r| r.chain.iter().any(|td| td.encode().is_some()));
+                                .is_some_and(|r| {
+                                    r.chain.iter().any(|td| td.has_encode_or_coerce())
+                                });
                             let translate_result = if has_custom_encode {
                                 translate_expr_no_constant_opt(
                                     program,
@@ -1063,7 +1071,7 @@ fn emit_deferred_notnull_checks<'a>(
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     for (idx, table_column) in target_table.table.columns().iter().enumerate() {
-        if !table_column.notnull() {
+        if !table_column.notnull() || table_column.is_rowid_alias() {
             continue;
         }
         // Only check columns that are in SET clauses
@@ -1215,7 +1223,8 @@ fn emit_update_insns<'a>(
     };
 
     let not_exists_check_required = updates_rowid || iteration_cursor_id != target_table_cursor_id;
-    let update_database_id = target_table.database_id;
+    let update_namespace = target_table.namespace;
+    let update_database_id = update_namespace.database_id;
     let updated_column_indices: ColumnMask = set_clauses
         .iter()
         .map(|set_clause| set_clause.column_index)
@@ -1227,7 +1236,7 @@ fn emit_update_insns<'a>(
     let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         has_triggers_including_temp(
             &t_ctx.resolver,
-            update_database_id,
+            update_namespace,
             TriggerEvent::Update,
             Some(&updated_column_names),
             &btree_table,
@@ -1314,7 +1323,7 @@ fn emit_update_insns<'a>(
             &t_ctx.resolver,
             table,
             &updated_column_indices,
-            update_database_id,
+            update_namespace,
         )?,
         _ => crate::alloc::vec![],
     };
@@ -1340,6 +1349,7 @@ fn emit_update_insns<'a>(
         cdc_updates_register,
         layout: &layout,
         affected_columns: &affected_columns,
+        updated_columns: &updated_column_indices,
     };
     let skip_set_clauses = false;
 
@@ -1353,7 +1363,7 @@ fn emit_update_insns<'a>(
     let relevant_before_update_triggers = match target_table.table.btree() {
         Some(btree_table) => get_triggers_including_temp(
             &t_ctx.resolver,
-            update_database_id,
+            update_namespace,
             TriggerEvent::Update,
             TriggerTime::Before,
             Some(&updated_column_names),
@@ -1404,7 +1414,7 @@ fn emit_update_insns<'a>(
         if let Some(btree_table) = target_table.table.btree() {
             has_after_triggers = has_triggers_including_temp(
                 &t_ctx.resolver,
-                update_database_id,
+                update_namespace,
                 TriggerEvent::Update,
                 Some(&updated_column_names),
                 &btree_table,
@@ -1448,8 +1458,13 @@ fn emit_update_insns<'a>(
                 // Compute virtual columns for NEW values
                 //TODO only emit required virtual columns
                 if let Table::BTree(ref btree) = target_table.table {
-                    let new_ctx =
-                        DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
+                    let new_ctx = DmlColumnContext::layout(
+                        columns,
+                        start,
+                        new_rowid_reg,
+                        layout.clone(),
+                        DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+                    );
                     compute_virtual_columns(
                         program,
                         &btree.columns_topo_sort()?,
@@ -1484,7 +1499,7 @@ fn emit_update_insns<'a>(
                         trigger,
                         &trigger_ctx,
                         connection,
-                        update_database_id,
+                        update_namespace,
                         trigger_ignore_jump_label,
                     )?;
                 }
@@ -1590,16 +1605,19 @@ fn emit_update_insns<'a>(
     // the end of the function.
     {
         let columns = target_table.table.columns();
+        let is_strict = target_table.table.is_strict();
         for (idx, col) in columns.iter().enumerate() {
+            let register_column =
+                RegisterColumn::table_column(col, is_strict, t_ctx.resolver.schema());
             t_ctx
                 .resolver
-                .register_affinities
-                .insert(layout.to_register(start, idx), col.affinity());
+                .register_columns
+                .insert(layout.to_register(start, idx), register_column);
         }
         t_ctx
             .resolver
-            .register_affinities
-            .insert(effective_rowid_reg, Affinity::Integer);
+            .register_columns
+            .insert(effective_rowid_reg, RegisterColumn::rowid());
     }
 
     let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
@@ -1651,8 +1669,13 @@ fn emit_update_insns<'a>(
             || has_check_constraints
             || index_references_virtual_column
         {
-            let dml_ctx =
-                DmlColumnContext::layout(cols, start, effective_rowid_reg, layout.clone());
+            let dml_ctx = DmlColumnContext::layout(
+                cols,
+                start,
+                effective_rowid_reg,
+                layout.clone(),
+                DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+            );
             compute_virtual_columns(
                 program,
                 &btree.columns_topo_sort()?,
@@ -1679,7 +1702,7 @@ fn emit_update_insns<'a>(
             rhs: beg,
             target_pc: record_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
 
         // If a row with the new rowid doesn't exist, no conflict
@@ -1810,6 +1833,7 @@ fn emit_update_insns<'a>(
 
             let check_constraint_tables =
                 TableReferences::new(vec![target_table.as_ref().clone()], vec![]);
+            let check_halt_on_error = program.constraint_halt_on_error(or_conflict);
             emit_check_constraints(
                 program,
                 &relevant_checks,
@@ -1831,6 +1855,7 @@ fn emit_update_insns<'a>(
                     }),
                 connection,
                 or_conflict,
+                check_halt_on_error,
                 skip_row_label,
                 Some(&check_constraint_tables),
             )?;
@@ -1885,7 +1910,7 @@ fn emit_update_insns<'a>(
                 .as_ref()
                 .clone();
             let columns = target_table.table.columns();
-            let mut column_regs: Vec<usize> = columns
+            let column_regs: Vec<usize> = columns
                 .iter()
                 .enumerate()
                 .map(|(i, col)| {
@@ -1903,10 +1928,9 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 new_where_expr,
                 columns,
-                &mut column_regs,
+                &column_regs,
                 &bt,
                 new_satisfied_reg,
-                true,
             )?;
 
             // now we have two registers that tell us whether or not the old and new values satisfy
@@ -2028,7 +2052,7 @@ fn emit_update_insns<'a>(
                 rhs: idx_rowid_reg,
                 target_pc: constraint_check,
                 flags: CmpInsFlags::default(),
-                collation: program.curr_collation(),
+                collation: CollationSeq::for_internal_values(),
             });
             match idx_conflict {
                 ResolveType::Ignore => {
@@ -2062,7 +2086,7 @@ fn emit_update_insns<'a>(
                         all_index_cursors,
                         idx_rowid_reg,
                         Some((start, effective_rowid_reg)),
-                        update_database_id,
+                        update_namespace,
                         t_ctx,
                     )?;
 
@@ -2142,7 +2166,7 @@ fn emit_update_insns<'a>(
             rhs: beg,
             target_pc: no_rowid_conflict_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
 
         // If a row with the new rowid doesn't exist, no conflict.
@@ -2161,7 +2185,7 @@ fn emit_update_insns<'a>(
             all_index_cursors,
             target_reg,
             Some((start, effective_rowid_reg)),
-            update_database_id,
+            update_namespace,
             t_ctx,
         )?;
 
@@ -2232,11 +2256,9 @@ fn emit_update_insns<'a>(
     // the parent-side checks above.
     if connection.foreign_keys_enabled() {
         if let Some(table_btree) = target_table.table.btree() {
-            if t_ctx
-                .resolver
-                .schema()
-                .has_child_fks(NamespaceId::ROOT, table_name)
-            {
+            if t_ctx.resolver.with_schema(update_database_id, |s| {
+                s.has_child_fks(update_namespace.id, table_name)
+            }) {
                 emit_fk_child_update_counters(
                     program,
                     &table_btree,
@@ -2246,7 +2268,7 @@ fn emit_update_insns<'a>(
                     effective_rowid_reg,
                     &affected_columns,
                     !affected_parent_fks.is_empty(),
-                    update_database_id,
+                    update_namespace,
                     &t_ctx.resolver,
                     &layout,
                 )?;
@@ -2519,7 +2541,9 @@ fn emit_update_insns<'a>(
                 && table.has_autoincrement
                 && connection.mv_store_for_db(update_database_id).is_some()
             {
-                let seq_name = crate::schema::autoincrement_sequence_name(&target_table.identifier);
+                let seq_name = crate::schema::autoincrement_sequence_name(
+                    &t_ctx.resolver.mangle_name(update_namespace, &table.name),
+                );
                 let seq = t_ctx
                     .resolver
                     .with_schema(update_database_id, |s| {
@@ -2534,7 +2558,7 @@ fn emit_update_insns<'a>(
                 crate::translate::sequence::emit_disk_advance_past(
                     program,
                     &t_ctx.resolver,
-                    update_database_id,
+                    NamespaceRef::root_of(update_database_id),
                     &seq_name,
                     &seq,
                     effective_rowid_reg,
@@ -2566,7 +2590,7 @@ fn emit_update_insns<'a>(
                     start, // new_values_start
                     effective_rowid_reg,
                     connection,
-                    update_database_id,
+                    update_namespace,
                     &affected_parent_fks,
                 )?;
             }
@@ -2596,7 +2620,7 @@ fn emit_update_insns<'a>(
                         .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
                     {
                         let rerun_for_target_scan = subquery
-                            .reads_table(target_table.database_id, target_table.table.get_name());
+                            .reads_table(target_table.namespace, target_table.table.get_name());
                         let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                         emit_non_from_clause_subquery(
                             program,
@@ -2634,7 +2658,7 @@ fn emit_update_insns<'a>(
             if let Some(btree_table) = target_table.table.btree() {
                 let relevant_triggers = get_triggers_including_temp(
                     &t_ctx.resolver,
-                    update_database_id,
+                    update_namespace,
                     TriggerEvent::Update,
                     TriggerTime::After,
                     Some(&updated_column_names),
@@ -2650,7 +2674,13 @@ fn emit_update_insns<'a>(
                             "UPDATE on virtual table has no btree".into(),
                         )
                     })?;
-                    let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
+                    let new_ctx = DmlColumnContext::layout(
+                        columns,
+                        start,
+                        beg,
+                        layout.clone(),
+                        DmlRowForm::Stored,
+                    );
                     compute_virtual_columns(
                         program,
                         &btree_table.columns_topo_sort()?,
@@ -2663,7 +2693,8 @@ fn emit_update_insns<'a>(
                     if let Some(ref old_regs) = preserved_old_registers {
                         let pairs = columns.iter().zip(old_regs.iter().copied());
                         //TODO only emit required virtual columns
-                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+                        let old_ctx =
+                            DmlColumnContext::from_column_reg_mapping(pairs, DmlRowForm::Stored);
                         compute_virtual_columns(
                             program,
                             &btree_table.columns_topo_sort()?,
@@ -2703,7 +2734,7 @@ fn emit_update_insns<'a>(
                             trigger,
                             &trigger_ctx_after,
                             connection,
-                            update_database_id,
+                            update_namespace,
                             after_trigger_done,
                         )?;
                     }
@@ -2728,7 +2759,6 @@ fn emit_update_insns<'a>(
     }
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
-    t_ctx.resolver.register_affinities.clear();
-    t_ctx.resolver.register_collations.clear();
+    t_ctx.resolver.register_columns.clear();
     Ok(())
 }

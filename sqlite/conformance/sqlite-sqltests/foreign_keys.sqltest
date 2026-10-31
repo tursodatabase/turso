@@ -1,5 +1,33 @@
 @database :memory:
 
+# A child row matches a parent key the way `parent_col = child_col` compares,
+# with affinity, also when the child column has no index.
+@cross-check-integrity
+test fk-delete-parent-finds-child-of-other-affinity {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT PRIMARY KEY);
+    CREATE TABLE c(x INTEGER REFERENCES p(a));
+    INSERT INTO p VALUES ('1');
+    INSERT INTO c VALUES ('1');
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+@cross-check-integrity
+test fk-delete-rowid-parent-finds-text-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER PRIMARY KEY);
+    CREATE TABLE c(x TEXT REFERENCES p(a));
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (1);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
 @cross-check-integrity
 test fk-basic-ok {
     PRAGMA foreign_keys=ON;
@@ -721,6 +749,23 @@ test fk-deferred-self-unique-parent-affinity-does-not-coerce-same-row-child {
         k INTEGER UNIQUE,
         pk TEXT REFERENCES t(k) DEFERRABLE INITIALLY DEFERRED
     );
+    BEGIN;
+    INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
+    COMMIT;
+}
+expect error {
+}
+
+# The same with an index on the child key: the new row is not its own child.
+@cross-check-integrity
+test fk-deferred-self-unique-parent-affinity-with-child-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k INTEGER UNIQUE,
+        pk TEXT REFERENCES t(k) DEFERRABLE INITIALLY DEFERRED
+    );
+    CREATE INDEX t_pk ON t(pk);
     BEGIN;
     INSERT INTO t(id, k, pk) VALUES (1, 1, '1');
     COMMIT;
@@ -4789,4 +4834,74 @@ snapshot fk-upsert-column-no-child-points-at {
 @skip-if mvcc "MVCC uses negative root page numbers, so the bytecode snapshot differs"
 snapshot fk-upsert-parent-key-with-cascade-child {
     INSERT INTO parent(id, k, v) VALUES (1, 10, 2) ON CONFLICT(id) DO UPDATE SET k = excluded.k;
+}
+
+test fk-delete-mixed-case-parent {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE "Mixed Parent" (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (parent_id INTEGER REFERENCES "Mixed Parent" (id) ON DELETE CASCADE);
+    INSERT INTO "Mixed Parent" VALUES (1), (2);
+    INSERT INTO child VALUES (1), (2);
+    DELETE FROM "Mixed Parent" WHERE id = 1;
+    SELECT parent_id FROM child;
+    DELETE FROM "Mixed Parent";
+    SELECT count(*) FROM child;
+}
+expect {
+    2
+    0
+}
+
+# A child key that is not an integer has no INTEGER PRIMARY KEY parent, so
+# deleting the child row removes the deferred violation.
+@cross-check-integrity
+test fk-deferred-delete-child-with-non-integer-key-of-rowid-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(a REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO c VALUES('x'), (1.5);
+    DELETE FROM c;
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-deferred-repeated-child-column {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(x, y, PRIMARY KEY(x, y));
+    CREATE TABLE c(k INTEGER PRIMARY KEY, a, FOREIGN KEY(a, a) REFERENCES p(x, y) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(2, 2);
+    BEGIN;
+    INSERT INTO c(k, a) VALUES(1, 1);
+    UPDATE c SET a=2;
+    INSERT INTO c(k, a) VALUES(2, 1);
+    INSERT OR REPLACE INTO c(k, a) VALUES(2, 2);
+    INSERT INTO c(k, a) VALUES(3, 1);
+    UPDATE OR REPLACE c SET k=3 WHERE k=2;
+    INSERT INTO c(k, a) VALUES(4, 1);
+    DELETE FROM c WHERE k=4;
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|2
+    3|2
+}
+
+test fk-deferred-upsert-rowid-alias-child-change-creates-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(k INTEGER PRIMARY KEY REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED, a UNIQUE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c(k, a) VALUES(1, 7);
+    BEGIN;
+    INSERT INTO c(k, a) VALUES(3, 7) ON CONFLICT DO UPDATE SET k=9;
+    COMMIT;
+}
+expect error {
+    FOREIGN KEY constraint failed
 }

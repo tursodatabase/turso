@@ -1,5 +1,7 @@
 use crate::alloc::Arc;
+use crate::namespace::NamespaceRef;
 use crate::schema::Column;
+use crate::translate::collate::CollationSeq;
 use crate::translate::expr::{emit_stored_column, emit_table_column};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
@@ -286,7 +288,10 @@ fn translate_integrity_check_for_schema(
                 col_used_mask: ColumnUsedMask::default(),
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
-                database_id,
+                namespace: NamespaceRef {
+                    database_id,
+                    id: namespace,
+                },
                 indexed: None,
                 plan_estimate: None,
             }],
@@ -294,7 +299,7 @@ fn translate_integrity_check_for_schema(
         );
 
         let mut bound_indexes = Vec::new();
-        for index in schema.indices_including_backing(namespace, btree_table.name.as_str()) {
+        for index in schema.get_indices(namespace, btree_table.name.as_str()) {
             if index.root_page <= 0 || !connection_root_pages.contains(&index.root_page) {
                 continue;
             }
@@ -603,16 +608,6 @@ fn translate_integrity_check_for_schema(
         program.preassign_label_to_next_insn(table_empty_label);
 
         for bound_index in &bound_indexes {
-            // An index method's backing B-tree stores its data in the index
-            // alone; the owning table has zero rows by construction, so the
-            // entry-count comparison below would report every healthy FTS
-            // database as corrupt. Its pages are still visited above.
-            if bound_index.index.is_backing_btree_index() {
-                program.emit_insn(Insn::Close {
-                    cursor_id: bound_index.cursor_id,
-                });
-                continue;
-            }
             if bound_index.where_expr.is_none() {
                 let actual_count_reg = program.alloc_register();
                 program.emit_insn(Insn::Count {
@@ -627,7 +622,7 @@ fn translate_integrity_check_for_schema(
                     rhs: bound_index.expected_count_reg,
                     target_pc: counts_match,
                     flags: CmpInsFlags::default(),
-                    collation: None,
+                    collation: CollationSeq::for_internal_values(),
                 });
                 program.emit_string8(
                     format!("wrong # of entries in index {}", bound_index.index.name),

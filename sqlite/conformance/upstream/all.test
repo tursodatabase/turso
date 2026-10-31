@@ -133,7 +133,7 @@ set test_files {
   collate5             fail
   collate6             fail
   collate7             fail
-  collate8             fail
+  collate8             pass
   collate9             fail
   collateA             pass
   collateB             pass
@@ -310,7 +310,7 @@ set test_files {
   init                 fail
   insert               fail
   insert2              pass
-  insert3              fail
+  insert3              pass
   insert4              fail
   insert5              pass
   instr                pass
@@ -688,7 +688,7 @@ set test_files {
   tkt3541              pass
   tkt3554              pass
   tkt3581              pass
-  tkt35xx              fail
+  tkt35xx              pass
   tkt3630              pass
   tkt3718              fail
   tkt3731              pass

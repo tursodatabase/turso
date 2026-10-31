@@ -1,5 +1,5 @@
-use super::{Resolver, Result, TranslateCtx};
-use crate::namespace::NamespaceId;
+use super::{emit_columns_and_dependencies, Resolver, Result, TranslateCtx};
+use crate::namespace::NamespaceRef;
 use crate::{
     emit_explain,
     schema::{BTreeTable, ColumnLayout},
@@ -167,15 +167,16 @@ fn emit_row_loop_delete(
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: table_cursor_id,
                 root_page: RegisterOrLiteral::Literal(btree_table.root_page),
-                db: table_ref.database_id,
+                db: table_ref.namespace.database_id,
             });
 
             // Open all indexes for writing (needed for DELETE)
-            let write_indices: Vec<_> = resolver.with_schema(table_ref.database_id, |s| {
-                s.get_indices(NamespaceId::ROOT, table_ref.table.get_name())
-                    .cloned()
-                    .collect()
-            });
+            let write_indices: Vec<_> =
+                resolver.with_schema(table_ref.namespace.database_id, |s| {
+                    s.get_indices(table_ref.namespace.id, table_ref.table.get_name())
+                        .cloned()
+                        .collect()
+                });
             for index in &write_indices {
                 let index_cursor_id = program.alloc_cursor_index(
                     Some(CursorKey::index(table_ref.internal_id, index.clone())),
@@ -184,7 +185,7 @@ fn emit_row_loop_delete(
                 program.emit_insn(Insn::OpenWrite {
                     cursor_id: index_cursor_id,
                     root_page: RegisterOrLiteral::Literal(index.root_page),
-                    db: table_ref.database_id,
+                    db: table_ref.namespace.database_id,
                 });
             }
         }
@@ -320,23 +321,26 @@ fn emit_clear_btree_delete(
     let Some(table) = table_ref.btree() else {
         return Ok(false);
     };
-    if connection.mv_store_for_db(table_ref.database_id).is_some() {
+    if connection
+        .mv_store_for_db(table_ref.namespace.database_id)
+        .is_some()
+    {
         return Ok(false);
     }
 
     let table_name = table_ref.table.get_name();
-    let has_dependent_views = resolver.with_schema(table_ref.database_id, |schema| {
+    let has_dependent_views = resolver.with_schema(table_ref.namespace.database_id, |schema| {
         !schema
-            .get_dependent_materialized_views(NamespaceId::ROOT, table_name)
+            .get_dependent_materialized_views(table_ref.namespace.id, table_name)
             .is_empty()
     });
     if has_dependent_views {
         return Ok(false);
     }
     if connection.foreign_keys_enabled() {
-        let has_foreign_keys = resolver.with_schema(table_ref.database_id, |schema| {
-            schema.any_resolved_fks_referencing(NamespaceId::ROOT, table_name)
-                || schema.has_child_fks(NamespaceId::ROOT, table_name)
+        let has_foreign_keys = resolver.with_schema(table_ref.namespace.database_id, |schema| {
+            schema.any_resolved_fks_referencing(table_ref.namespace.id, table_name)
+                || schema.has_child_fks(table_ref.namespace.id, table_name)
         });
         if has_foreign_keys {
             return Ok(false);
@@ -345,13 +349,13 @@ fn emit_clear_btree_delete(
 
     for index in &plan.indexes {
         program.emit_insn(Insn::ClearBtree {
-            db: table_ref.database_id,
+            db: table_ref.namespace.database_id,
             root: index.root_page,
             count: ClearBtreeCount::RowsWritten,
         });
     }
     program.emit_insn(Insn::ClearBtree {
-        db: table_ref.database_id,
+        db: table_ref.namespace.database_id,
         root: table.root_page,
         count: ClearBtreeCount::ChangesAndRowsWritten,
     });
@@ -365,33 +369,36 @@ pub fn emit_fk_child_decrement_on_delete(
     child_table_name: &str,
     child_cursor_id: usize,
     child_rowid_reg: usize,
-    database_id: usize,
+    namespace: NamespaceRef,
     resolver: &Resolver,
 ) -> crate::Result<()> {
+    let database_id = namespace.database_id;
     for fk_ref in resolver.with_schema(database_id, |s| {
-        s.resolved_fks_for_child(NamespaceId::ROOT, child_table_name, None)
+        s.resolved_fks_for_child(namespace.id, child_table_name, None)
     })? {
         if !fk_ref.fk.deferred {
             continue;
         }
+        let child_positions: Vec<usize> = fk_ref
+            .fk
+            .child_columns
+            .iter()
+            .map(|cname| child_tbl.get_column(cname).unwrap().0)
+            .collect();
+        let child_key = emit_columns_and_dependencies(
+            program,
+            child_tbl,
+            child_cursor_id,
+            child_rowid_reg,
+            child_positions.iter().copied(),
+            resolver,
+        )?;
+
         // Fast path: if any FK column is NULL can't be a violation
         let null_skip = program.allocate_label();
-        for cname in &fk_ref.fk.child_columns {
-            let (pos, col) = child_tbl.get_column(cname).unwrap();
-            let src = if col.is_rowid_alias() {
-                child_rowid_reg
-            } else {
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: child_cursor_id,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-                tmp
-            };
+        for &pos in &child_positions {
             program.emit_insn(Insn::IsNull {
-                reg: src,
+                reg: child_key.to_column_reg(pos),
                 target_pc: null_skip,
             });
         }
@@ -400,38 +407,25 @@ pub fn emit_fk_child_decrement_on_delete(
             // Probe parent table by rowid
             let parent_tbl = resolver
                 .with_schema(database_id, |s| {
-                    s.get_btree_table(NamespaceId::ROOT, &fk_ref.fk.parent_table)
+                    s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
                 })
                 .expect("parent btree");
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
-            let (pos, col) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
-            let val = if col.is_rowid_alias() {
-                child_rowid_reg
-            } else {
-                let tmp = program.alloc_register();
-                program.emit_insn(Insn::Column {
-                    cursor_id: child_cursor_id,
-                    column: pos,
-                    dest: tmp,
-                    default: None,
-                });
-                tmp
-            };
             let tmpi = program.alloc_register();
             program.emit_insn(Insn::Copy {
-                src_reg: val,
+                src_reg: child_key.to_column_reg(child_positions[0]),
                 dst_reg: tmpi,
                 extra_amount: 0,
             });
-            program.emit_insn(Insn::MustBeInt {
-                reg: tmpi,
-                target_pc: None,
-            });
-
-            // NotExists jumps when the parent key is missing, so we decrement there
+            // A key that is not an integer cannot match a parent rowid, so the
+            // parent is missing, and NotExists jumps there too
             let missing = program.allocate_label();
             let done = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg: tmpi,
+                target_pc: Some(missing),
+            });
 
             program.emit_insn(Insn::NotExists {
                 cursor: pcur,
@@ -452,7 +446,7 @@ pub fn emit_fk_child_decrement_on_delete(
             // Probe parent unique index
             let parent_tbl = resolver
                 .with_schema(database_id, |s| {
-                    s.get_btree_table(NamespaceId::ROOT, &fk_ref.fk.parent_table)
+                    s.get_btree_table(fk_ref.fk.parent_namespace, &fk_ref.fk.parent_table)
                 })
                 .expect("parent btree");
             let idx = fk_ref.parent_unique_index.as_ref().expect("unique index");
@@ -461,22 +455,9 @@ pub fn emit_fk_child_decrement_on_delete(
             // Build probe from current child row
             let n = fk_ref.fk.child_columns.len();
             let probe = program.alloc_registers(n);
-            for (i, cname) in fk_ref.fk.child_columns.iter().enumerate() {
-                let (pos, col) = child_tbl.get_column(cname).unwrap();
-                let src = if col.is_rowid_alias() {
-                    child_rowid_reg
-                } else {
-                    let r = program.alloc_register();
-                    program.emit_insn(Insn::Column {
-                        cursor_id: child_cursor_id,
-                        column: pos,
-                        dest: r,
-                        default: None,
-                    });
-                    r
-                };
+            for (i, &pos) in child_positions.iter().enumerate() {
                 program.emit_insn(Insn::Copy {
-                    src_reg: src,
+                    src_reg: child_key.to_column_reg(pos),
                     dst_reg: probe + i,
                     extra_amount: 0,
                 });
@@ -551,14 +532,14 @@ fn emit_delete_insns<'a>(
         }
     };
     let btree_table = unsafe { &*table_reference }.btree();
-    let database_id = unsafe { (*table_reference).database_id };
+    let namespace = unsafe { (*table_reference).namespace };
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
     let iteration_index = unsafe { &*table_reference }.op.index();
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
         has_triggers_including_temp(
             &t_ctx.resolver,
-            database_id,
+            namespace,
             TriggerEvent::Delete,
             None,
             &btree_table,
@@ -700,11 +681,13 @@ fn emit_delete_row_common(
     // Phase 1: Before Delete - build parent key registers and handle NoAction/Restrict.
     // CASCADE/SetNull/SetDefault actions are prepared but deferred until after Delete.
     let prepared_fk_actions = if connection.foreign_keys_enabled() {
-        let delete_db_id = unsafe { (*table_reference).database_id };
+        let delete_namespace = unsafe { (*table_reference).namespace };
         if let Some(table) = unsafe { &*table_reference }.btree() {
-            let prepared = if t_ctx.resolver.with_schema(delete_db_id, |s| {
-                s.any_resolved_fks_referencing(NamespaceId::ROOT, table_name)
-            }) {
+            let prepared = if t_ctx
+                .resolver
+                .with_schema(delete_namespace.database_id, |s| {
+                    s.any_resolved_fks_referencing(delete_namespace.id, table_name)
+                }) {
                 ForeignKeyActions::prepare_fk_delete_actions(
                     program,
                     &mut t_ctx.resolver,
@@ -712,21 +695,24 @@ fn emit_delete_row_common(
                     main_table_cursor_id,
                     rowid_reg,
                     None,
-                    delete_db_id,
+                    delete_namespace,
                 )?
             } else {
                 ForeignKeyActions::default()
             };
-            if t_ctx.resolver.with_schema(delete_db_id, |s| {
-                s.has_child_fks(NamespaceId::ROOT, table_name)
-            }) {
+            if t_ctx
+                .resolver
+                .with_schema(delete_namespace.database_id, |s| {
+                    s.has_child_fks(delete_namespace.id, table_name)
+                })
+            {
                 emit_fk_child_decrement_on_delete(
                     program,
                     &table,
                     table_name,
                     main_table_cursor_id,
                     rowid_reg,
-                    delete_db_id,
+                    delete_namespace,
                     &t_ctx.resolver,
                 )?;
             }
@@ -750,12 +736,14 @@ fn emit_delete_row_common(
         });
     } else {
         // Delete from all indexes before deleting from the main table.
-        let db_id = unsafe { (*table_reference).database_id };
-        let all_indices: Vec<_> = t_ctx.resolver.with_schema(db_id, |s| {
-            s.get_indices(NamespaceId::ROOT, table_name)
-                .cloned()
-                .collect()
-        });
+        let delete_namespace = unsafe { (*table_reference).namespace };
+        let all_indices: Vec<_> = t_ctx
+            .resolver
+            .with_schema(delete_namespace.database_id, |s| {
+                s.get_indices(delete_namespace.id, table_name)
+                    .cloned()
+                    .collect()
+            });
 
         // Get indexes to delete from (skip the iteration index if specified)
         let indexes_to_delete = all_indices
@@ -876,7 +864,7 @@ fn emit_delete_row_common(
                 .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
             {
                 let rerun_for_target_scan =
-                    subquery.reads_table(delete_table.database_id, delete_table.table.get_name());
+                    subquery.reads_table(delete_table.namespace, delete_table.table.get_name());
                 let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                 emit_non_from_clause_subquery(
                     program,
@@ -906,7 +894,7 @@ fn emit_delete_row_common(
     // Per SQLite docs, the parent row must be deleted before FK cascade actions fire,
     // so triggers during cascade see the parent row as already deleted.
     {
-        let delete_db_id = unsafe { (*table_reference).database_id };
+        let delete_db_id = unsafe { (*table_reference).namespace.database_id };
         prepared_fk_actions.fire_prepared_fk_delete_actions(
             program,
             &mut t_ctx.resolver,
@@ -951,12 +939,12 @@ fn emit_delete_insns_when_triggers_present(
         return Err(crate::LimboError::ReadOnly);
     }
     let btree_table = unsafe { &*table_reference }.btree();
-    let database_id = unsafe { (*table_reference).database_id };
+    let namespace = unsafe { (*table_reference).namespace };
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
         has_triggers_including_temp(
             &t_ctx.resolver,
-            database_id,
+            namespace,
             TriggerEvent::Delete,
             None,
             &btree_table,
@@ -992,7 +980,7 @@ fn emit_delete_insns_when_triggers_present(
     if let Some(btree_table) = unsafe { &*table_reference }.btree() {
         let relevant_triggers = get_triggers_including_temp(
             &t_ctx.resolver,
-            database_id,
+            namespace,
             TriggerEvent::Delete,
             TriggerTime::Before,
             None,
@@ -1024,7 +1012,7 @@ fn emit_delete_insns_when_triggers_present(
                     trigger,
                     &trigger_ctx,
                     connection,
-                    database_id,
+                    namespace,
                     skip_not_found_label,
                 )?;
             }
@@ -1058,7 +1046,7 @@ fn emit_delete_insns_when_triggers_present(
     if let Some(btree_table) = unsafe { &*table_reference }.btree() {
         let relevant_triggers = get_triggers_including_temp(
             &t_ctx.resolver,
-            database_id,
+            namespace,
             TriggerEvent::Delete,
             TriggerTime::After,
             None,
@@ -1087,7 +1075,7 @@ fn emit_delete_insns_when_triggers_present(
                     trigger,
                     &trigger_ctx_after,
                     connection,
-                    database_id,
+                    namespace,
                     skip_not_found_label,
                 )?;
             }

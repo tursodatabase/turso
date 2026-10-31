@@ -491,6 +491,7 @@ enum StatsRefresh {
 
 /// Settings for a single connection, passed to [`Database::connect`] and
 /// [`Database::connect_async`].
+#[derive(Clone)]
 pub struct ConnectOpts {
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
@@ -1716,6 +1717,7 @@ impl Database {
                         pager,
                         &syms,
                         dialect.as_ref(),
+                        conn.experimental_custom_types_enabled(),
                     );
 
                     match result {
@@ -1725,30 +1727,6 @@ impl Database {
                             state.schema_guard = None;
                         }
                         Err(e) => return Err(e),
-                    }
-
-                    // Load custom types from __turso_internal_types if the table
-                    // exists and custom types are enabled. The schema loaded by
-                    // make_from_btree includes the table definition but not its
-                    // contents. We need to read the stored type definitions so
-                    // that DECODE/ENCODE and affinity metadata are available to
-                    // all subsequent connections.
-                    let conn = state
-                        .conn
-                        .as_ref()
-                        .expect("conn must be initialized in Init phase");
-                    if conn.experimental_custom_types_enabled() {
-                        // Sync the connection's schema from the database so it
-                        // can query __turso_internal_types.
-                        conn.maybe_update_schema();
-                        let type_sqls = conn.query_stored_type_definitions()?;
-                        if !type_sqls.is_empty() {
-                            let db = state
-                                .db
-                                .as_ref()
-                                .expect("db must be initialized in Init phase");
-                            db.with_schema_mut(|schema| schema.load_type_definitions(&type_sqls))?;
-                        }
                     }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;
@@ -1808,6 +1786,22 @@ impl Database {
                         );
                         // Done — drop the bootstrap connection.
                         state.mvcc_bootstrap_conn = None;
+                    }
+
+                    // Load the names of the namespaces, which the schema rows
+                    // of their objects do not carry. This comes after the MVCC
+                    // bootstrap, whose recovery rebuilds the schema from the
+                    // schema rows and may replay rows of the namespaces table.
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    conn.maybe_update_schema();
+                    if !conn
+                        .with_schema(crate::MAIN_DB_ID, |schema| schema.namespace_names_loaded())
+                    {
+                        let namespace_rows = conn.query_stored_namespaces()?;
+                        db.with_schema_mut(|schema| schema.load_namespace_names(&namespace_rows))?;
                     }
 
                     state.phase = OpenDbAsyncPhase::Done;
@@ -2486,47 +2480,54 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>, opts: ConnectOpts) -> Result<Arc<Connection>> {
+        self.connect_with(opts, ConnectionContext::default())
+    }
+
+    /// Connects with `opts`, and with `context` as the value that
+    /// [`Connection::context`] returns for the connection.
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn connect_with_context<C: Any + Send + Sync>(
+        self: &Arc<Database>,
+        opts: ConnectOpts,
+        context: Arc<C>,
+    ) -> Result<Arc<Connection>> {
+        self.connect_with(
+            opts,
+            ConnectionContext {
+                value: Some(context),
+                hooks: None,
+            },
+        )
+    }
+
+    /// Connects with `opts`, and with `hooks` as the hooks that the
+    /// connection calls, which are also the value that
+    /// [`Connection::context`] returns for it.
+    pub fn connect_with_hooks<C: ConnectionHooks + Any>(
+        self: &Arc<Database>,
+        opts: ConnectOpts,
+        hooks: Arc<C>,
+    ) -> Result<Arc<Connection>> {
+        self.connect_with(
+            opts,
+            ConnectionContext {
+                value: Some(hooks.clone()),
+                hooks: Some(hooks),
+            },
+        )
+    }
+
+    fn connect_with(
+        self: &Arc<Database>,
+        opts: ConnectOpts,
+        context: ConnectionContext,
+    ) -> Result<Arc<Connection>> {
         self._connect(
             false,
             None,
             opts.encryption_key,
             opts.page_codec,
-            ConnectionContext::default(),
-            StatsRefresh::Blocking,
-        )
-    }
-
-    #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn connect_with_context<C: Any + Send + Sync>(
-        self: &Arc<Database>,
-        context: Arc<C>,
-    ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            None,
-            None,
-            ConnectionContext {
-                value: Some(context),
-                hooks: None,
-            },
-            StatsRefresh::Blocking,
-        )
-    }
-
-    pub fn connect_with_hooks<C: ConnectionHooks + Any>(
-        self: &Arc<Database>,
-        context: Arc<C>,
-    ) -> Result<Arc<Connection>> {
-        self._connect(
-            false,
-            None,
-            None,
-            None,
-            ConnectionContext {
-                value: Some(context.clone()),
-                hooks: Some(context),
-            },
+            context,
             StatsRefresh::Blocking,
         )
     }
@@ -2693,16 +2694,19 @@ impl Database {
             closed: AtomicBool::new(false),
             temp: crate::connection::TempDbContext::new(),
             attached_databases: RwLock::new(DatabaseCatalog::new()),
-            namespaces: crate::Namespaces::default(),
+            qualifiers: crate::Qualifiers::default(),
             search_path: RwLock::new(None),
             has_non_main_pagers: AtomicBool::new(false),
             query_only: AtomicBool::new(false),
+            tx_read_only: AtomicBool::new(false),
             vdbe_trace: AtomicBool::new(false),
             dml_require_where: AtomicBool::new(false),
             count_changes: AtomicBool::new(false),
             fts_merge_threshold: AtomicI64::new(crate::index_method::DEFAULT_FTS_MERGE_THRESHOLD),
             dqs_dml: AtomicBool::new(true),
             sequence_inner_retries: AtomicU64::new(0),
+            #[cfg(feature = "test_helper")]
+            test_nondet_counter: AtomicI64::new(0),
             mv_tx: RwLock::new(None),
             attached_mv_txs: RwLock::new(HashMap::default()),
             #[cfg(any(test, injected_yields))]
@@ -3593,7 +3597,7 @@ pub(crate) struct AttachedDatabase {
 }
 
 /// The databases of a connection other than main and temp, by database id.
-/// Their names are in the connection's [`crate::Namespaces`].
+/// Their names are in the connection's [`crate::Qualifiers`].
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
     allocated: Vec<u64>,

@@ -1,6 +1,6 @@
-use crate::namespace::NamespaceId;
+use crate::namespace::NamespaceRef;
 use crate::{
-    alloc::{self, TursoIteratorExt, TursoVecExt},
+    alloc::{self, TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
@@ -8,12 +8,13 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{expr_text_collation, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
             lookup_unqualified_column, StorageClassMask,
         },
+        expr_context::{ExprContext, TableMetadata},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -38,7 +39,7 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{type_of, TypeEnv};
+use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -51,7 +52,7 @@ use super::expr::expr_type::{type_of, TypeEnv};
 /// The affinity (and whether it's a real declared one) determines comparison
 /// behavior in IN expressions, etc.
 fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> Affinity {
-    get_expr_affinity(expr, tables, None)
+    get_expr_affinity(expr, &TableMetadata::new(tables))
 }
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
@@ -71,13 +72,13 @@ pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affini
     let col_affinities = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, Some(&arm.table_references), None))
+            .map(|rc| get_expr_affinity(&rc.expr, &TableMetadata::new(Some(&arm.table_references))))
             .unwrap_or(Affinity::None)
     };
     let col_data_type = |arm: &SelectPlan| {
         arm.result_columns
             .get(i)
-            .map(|rc| expr_data_type(&rc.expr, Some(&arm.table_references)))
+            .map(|rc| expr_data_type(&rc.expr, &TableMetadata::new(Some(&arm.table_references))))
             .unwrap_or(StorageClassMask::from_null())
     };
 
@@ -172,7 +173,7 @@ impl ResultSetColumn {
     /// Returns the canonical short type name for this column's affinity,
     /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
     pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
-        get_expr_affinity(&self.expr, Some(tables), None).short_type_name()
+        get_expr_affinity(&self.expr, &TableMetadata::new(Some(tables))).short_type_name()
     }
 }
 
@@ -298,11 +299,12 @@ impl WhereTerm {
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
         table_references: Option<&TableReferences>,
+        resolver: &Resolver,
     ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references, resolver) else {
             return false;
         };
         eval_at == EvalAt::BeforeLoop
@@ -314,11 +316,12 @@ impl WhereTerm {
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
         table_references: Option<&TableReferences>,
+        resolver: &Resolver,
     ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references, resolver) else {
             return false;
         };
         eval_at == EvalAt::Loop(loop_idx)
@@ -329,8 +332,9 @@ impl WhereTerm {
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
         table_references: Option<&TableReferences>,
+        resolver: &Resolver,
     ) -> Result<EvalAt> {
-        determine_where_to_eval_term(self, join_order, subqueries, table_references)
+        determine_where_to_eval_term(self, join_order, subqueries, table_references, resolver)
     }
 }
 
@@ -610,19 +614,19 @@ impl Plan {
 
     /// Returns true if this plan or any of its subplans read from the given table.
     /// (Not for Delete/Update plans)
-    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
         match self {
-            Plan::Select(select_plan) => select_plan.reads_table(database_id, table_name),
+            Plan::Select(select_plan) => select_plan.reads_table(namespace, table_name),
             Plan::CompoundSelect {
                 left, right_most, ..
             } => {
                 left.iter()
-                    .any(|(select_plan, _)| select_plan.reads_table(database_id, table_name))
-                    || right_most.reads_table(database_id, table_name)
+                    .any(|(select_plan, _)| select_plan.reads_table(namespace, table_name))
+                    || right_most.reads_table(namespace, table_name)
             }
             Plan::RecursiveCte(plan) => {
-                plan.initial_query.reads_table(database_id, table_name)
-                    || plan.recursive_query.reads_table(database_id, table_name)
+                plan.initial_query.reads_table(namespace, table_name)
+                    || plan.recursive_query.reads_table(namespace, table_name)
             }
             Plan::Delete(_) | Plan::Update(_) => false,
         }
@@ -773,6 +777,19 @@ pub struct DistinctCtx {
 }
 
 impl DistinctCtx {
+    /// A DISTINCT that finds duplicates with a hash table. The values are
+    /// compared with `collations`, so each must be one that can be hashed.
+    pub fn new(program: &mut ProgramBuilder, collations: Vec<CollationSeq>) -> Result<Self> {
+        if let Some(collation) = collations.iter().find(|collation| !collation.can_hash()) {
+            crate::bail_parse_error!("DISTINCT does not support the custom collation {collation}");
+        }
+        Ok(Self {
+            hash_table_id: program.alloc_hash_table_id(),
+            collations,
+            label_on_conflict: program.allocate_label(),
+        })
+    }
+
     pub fn emit_deduplication_insns(
         &self,
         program: &mut ProgramBuilder,
@@ -801,8 +818,8 @@ pub struct MinMaxDef {
     pub func: AggFunc,
     pub argument: ast::Expr,
     pub order: SortOrder,
-    /// Explicit COLLATE override, if any. `None` means use the column default.
-    pub collation: Option<CollationSeq>,
+    /// The collation that orders the argument values.
+    pub collation: CollationSeq,
 }
 
 #[derive(Debug, Clone)]
@@ -891,19 +908,19 @@ impl SelectPlan {
                 })
     }
 
-    fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
         self.table_references.joined_tables().iter().any(|table| {
-            table.matches(database_id, table_name)
+            table.matches(namespace, table_name)
                 || match &table.table {
                     Table::FromClauseSubquery(subquery) => {
-                        subquery.plan.reads_table(database_id, table_name)
+                        subquery.plan.reads_table(namespace, table_name)
                     }
                     Table::BTree(_) | Table::Virtual(_) | Table::RecursiveCteInput(_) => false,
                 }
         }) || self
             .non_from_clause_subqueries
             .iter()
-            .any(|subquery| subquery.reads_table(database_id, table_name))
+            .any(|subquery| subquery.reads_table(namespace, table_name))
     }
 }
 
@@ -1149,7 +1166,7 @@ pub(super) fn expand_star(
             {
                 if matches!(&table.table, Table::BTree(_) | Table::Virtual(_)) {
                     let database_name = resolver
-                        .namespace_name(table.database_id)
+                        .namespace_name(table.namespace.database_id)
                         .expect("the table database must exist while compiling a query");
                     crate::bail_parse_error!(
                         "ambiguous column name: {}.{}.{}",
@@ -1294,7 +1311,7 @@ pub(crate) fn alias_or_stored_name(table: &JoinedTable) -> &str {
     if table.has_alias || !is_schema_table(&table.table) {
         return &table.identifier;
     }
-    if table.database_id == TEMP_DB_ID {
+    if table.namespace.database_id == TEMP_DB_ID {
         TEMP_SCHEMA_TABLE_NAME_ALT
     } else {
         SCHEMA_TABLE_NAME_ALT
@@ -1321,7 +1338,7 @@ fn parenthesized_star_source_match(
 ) -> StarSourceMatch {
     let direct_table = &tables[direct_table_index];
     let database_id = matches!(&direct_table.table, Table::BTree(_) | Table::Virtual(_))
-        .then_some(direct_table.database_id);
+        .then_some(direct_table.namespace.database_id);
     let mut first_table_index = None;
     for (group_index, table) in tables.iter().enumerate() {
         let Some(columns) = table.table.parenthesized_join_columns() else {
@@ -1788,8 +1805,8 @@ pub struct JoinedTable {
     /// expression? If yes, all columns that *only* feed this expression can be
     /// removed from the required-column set.
     pub expression_index_usages: Vec<ExpressionIndexUsage>,
-    /// The index of the database. "main" is always zero.
-    pub database_id: usize,
+    /// The namespace the table is in.
+    pub namespace: NamespaceRef,
     /// INDEXED BY / NOT INDEXED hint from the SQL statement.
     pub indexed: Option<ast::Indexed>,
     /// Cost and row estimates for the selected table access.
@@ -1822,8 +1839,8 @@ pub struct OuterQueryReference {
     pub internal_id: TableInternalId,
     /// Table object, which contains metadata about the table, e.g. columns.
     pub table: Table,
-    /// The database the table belongs to, used to match schema-qualified names.
-    pub database_id: usize,
+    /// The namespace the table is in, used to match schema-qualified names.
+    pub namespace: NamespaceRef,
     /// The join that added this table in the outer scope's FROM list, so an
     /// unqualified name follows the same USING rules there as it does in the
     /// outer query itself (see [unqualified_column_sources]). None for the
@@ -2217,6 +2234,17 @@ impl TableReferences {
         self.joined_tables
             .iter()
             .find(|t| t.internal_id == internal_id)
+    }
+
+    /// Whether `column` of the joined table `internal_id` is a value its index method query
+    /// provides (see [IndexMethodQuery::covered_columns]) instead of a column of the table: it
+    /// stands for an expression the index method computes, such as a score or a distance.
+    pub fn provided_by_index_method(&self, internal_id: TableInternalId, column: usize) -> bool {
+        self.find_joined_table_by_internal_id(internal_id)
+            .is_some_and(|table| match &table.op {
+                Operation::IndexMethodQuery(query) => query.covered_columns.contains_key(&column),
+                _ => false,
+            })
     }
 
     /// Returns a mutable reference to the [JoinedTable] with the given internal ID.
@@ -3042,11 +3070,12 @@ impl Operation {
     }
 }
 
+/// The columns a query gives an outer query, and the type of each.
 pub(super) fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
     resolver: &Resolver,
-) -> Result<alloc::Vec<Column>> {
+) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
         Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
         Plan::CompoundSelect {
@@ -3106,10 +3135,21 @@ pub(super) fn query_output_columns(
         })
         .try_collect::<alloc::Vec<_>>()?;
 
-    let env = TypeEnv::new(Some(table_references), resolver);
+    let context = ExprContext::new(Some(table_references), resolver);
+    let env = context.type_env();
+    let mut column_types = alloc::Vec::try_with_capacity_ext(columns.len())?;
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        let dimensions = type_of(result_expr, &env).array_dimensions();
+        // A compound's column has the common type of every SELECT, but the
+        // text collation of the leftmost SELECT only, as in SQLite. The
+        // compound itself removes duplicates with the collation of
+        // `compound_column_collation`, which looks at every SELECT.
+        let result_type = match &compound_arms {
+            Some(arms) => compound_column_type(arms.iter().copied(), column_index, resolver),
+            None => type_of(result_expr, &env),
+        };
+        let text_collation = expr_text_collation(result_expr, &context, context.catalog())?;
+        let dimensions = result_type.array_dimensions();
         if dimensions > ast::MAX_ARRAY_DIMENSIONS {
             crate::bail_parse_error!(
                 "result column {} is an array with {dimensions} dimensions, but arrays have at most {}",
@@ -3118,19 +3158,21 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
+        column.set_collation(Some(text_collation));
+        column.set_type_ordering(type_ordering(&result_type, resolver.schema()));
+        column_types.try_push(result_type)?;
     }
-    Ok(columns)
+    Ok((columns, column_types))
 }
 
 fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
     resolver: &Resolver,
-) -> Result<alloc::Vec<Column>> {
-    let mut columns = query_output_columns(plan, explicit_columns, resolver)?;
+) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
+    let (mut columns, column_types) = query_output_columns(plan, explicit_columns, resolver)?;
     make_column_names_unique(&mut columns);
-    Ok(columns)
+    Ok((columns, column_types))
 }
 
 fn make_column_names_unique(columns: &mut [Column]) {
@@ -3173,8 +3215,8 @@ impl JoinedTable {
         }
     }
 
-    fn matches(&self, database_id: usize, table_name: &str) -> bool {
-        self.database_id == database_id
+    fn matches(&self, namespace: NamespaceRef, table_name: &str) -> bool {
+        self.namespace == namespace
             && matches!(self.table, Table::BTree(_) | Table::Virtual(_))
             && self.table.get_name().eq_ignore_ascii_case(table_name)
     }
@@ -3188,12 +3230,13 @@ impl JoinedTable {
         resolver: &Resolver,
     ) -> Result<Self> {
         let plan = Plan::Select(Box::new(plan));
-        let columns = subquery_output_columns(&plan, None, resolver)?;
+        let (columns, column_types) = subquery_output_columns(&plan, None, resolver)?;
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
+            column_types,
             parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -3210,7 +3253,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
         })
@@ -3232,7 +3275,7 @@ impl JoinedTable {
         materialize_hint: bool,
         resolver: &Resolver,
     ) -> Result<Self> {
-        let columns = subquery_output_columns(&plan, explicit_columns, resolver)?;
+        let (columns, column_types) = subquery_output_columns(&plan, explicit_columns, resolver)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -3246,6 +3289,7 @@ impl JoinedTable {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
+            column_types,
             parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -3262,7 +3306,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
         })
@@ -3275,7 +3319,8 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         resolver: &Resolver,
     ) -> Result<Self> {
-        let mut columns = subquery_output_columns(query, explicit_columns, resolver)?;
+        let (mut columns, column_types) =
+            subquery_output_columns(query, explicit_columns, resolver)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the
@@ -3286,6 +3331,7 @@ impl JoinedTable {
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),
             columns,
+            column_types,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
@@ -3298,7 +3344,7 @@ impl JoinedTable {
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             indexed: None,
             plan_estimate: None,
         })
@@ -3467,8 +3513,8 @@ impl JoinedTable {
                     // schema of the table's own database: a table in an
                     // attached database can share a name with a materialized
                     // view in a different database.
-                    let cursor_type = match resolver.with_schema(self.database_id, |s| {
-                        s.get_materialized_view(NamespaceId::ROOT, &btree.name)
+                    let cursor_type = match resolver.with_schema(self.namespace.database_id, |s| {
+                        s.get_materialized_view(self.namespace.id, &btree.name)
                     }) {
                         Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
                         None => CursorType::BTreeTable(btree.clone()),
@@ -4352,10 +4398,10 @@ impl NonFromClauseSubquery {
             && matches!(self.eval_phase, SubqueryEvalPhase::PostWriteReturning)
     }
 
-    pub fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
+    pub fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
         match &self.state {
             SubqueryState::Unevaluated { plan: Some(plan) } => {
-                Plan::reads_table(plan, database_id, table_name)
+                Plan::reads_table(plan, namespace, table_name)
             }
             _ => false,
         }

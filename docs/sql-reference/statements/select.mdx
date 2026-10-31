@@ -311,6 +311,8 @@ SELECT DISTINCT department, title FROM employees;
 DISTINCT applies to the entire result row, not to a single column. Two rows are considered duplicates only if every column value is identical.
 </Info>
 
+Text values are compared with the collation of their result column. A column with a custom collation registered by the application is not supported in `SELECT DISTINCT` or in an aggregate such as `count(DISTINCT x)`, and is an error.
+
 ## ORDER BY
 
 Sorts the result set. Without ORDER BY, the row order is unspecified.

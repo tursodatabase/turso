@@ -115,6 +115,14 @@ impl SchemaEntry {
     }
 }
 
+/// Whether replaying the object called `name` on the target needs the
+/// reserved-name check bypassed: the engine's own tables, and the objects of
+/// namespaces, which are copied under mangled names that no user
+/// statement may create.
+fn replay_bypasses_reserved_names(name: &str) -> bool {
+    crate::schema::is_system_table(name) || crate::namespace::is_reserved_object_name(true, name)
+}
+
 /// Split rowid-ordered schema entries into the replay phases used by VACUUM.
 /// Returns indices into `entries` for `(tables_to_create, tables_to_copy,
 /// indexes_to_create, post_data_entries)`.
@@ -724,6 +732,27 @@ pub(crate) fn vacuum_target_build_step(
             VacuumTargetBuildPhase::PrepareCreateTable { idx } => {
                 let entries_len = state.tables_to_create.len();
                 if idx >= entries_len {
+                    // The rows of the namespaces table are copied with the
+                    // data, but the tables of a namespace are copied by the
+                    // namespace's name, so the target needs the names first.
+                    // Naming them any earlier would not last: switching the
+                    // target to MVCC reloads its schema.
+                    let namespaces: Vec<(NamespaceId, String)> =
+                        config
+                            .source_conn
+                            .with_schema(config.source_db_id, |schema| {
+                                schema
+                                    .namespaces()
+                                    .map(|(id, name)| (id, name.to_string()))
+                                    .collect()
+                            });
+                    if !namespaces.is_empty() {
+                        state.target_conn.with_schema_mut(|target_schema| {
+                            for (id, name) in &namespaces {
+                                target_schema.name_namespace(*id, name);
+                            }
+                        })?;
+                    }
                     // Done creating tables, start copying data
                     state.phase = VacuumTargetBuildPhase::StartCopyTable { table_idx: 0 };
                     continue;
@@ -740,7 +769,7 @@ pub(crate) fn vacuum_target_build_step(
                 // time. The guard is only for prepare: keeping it during step()
                 // would make this CREATE TABLE look nested, so its Transaction
                 // opcode would skip write setup.
-                let is_system = crate::schema::is_system_table(&entry.name);
+                let is_system = replay_bypasses_reserved_names(&entry.name);
                 if is_system {
                     state.target_conn.start_nested();
                 }
@@ -873,19 +902,45 @@ pub(crate) fn vacuum_target_build_step(
                 let entry_ordinal = state.tables_to_copy[table_idx];
                 let entry = &state.schema_entries[entry_ordinal];
                 let table_name = &entry.name;
-                let escaped_table_name = table_name.replace('"', "\"\"");
+                // A table of a namespace is copied by the name that
+                // names it in SQL: its namespace and its bare name, which
+                // the target knows too, since its namespaces were named above.
                 // Derive copy-column list from BTreeTable.columns in schema,
                 // filtering out virtual generated columns so the SELECT and
                 // INSERT arities stay aligned.
-                let source_btree_table = config
-                    .source_conn
-                    .with_schema(config.source_db_id, |schema| {
-                        schema.get_btree_table(NamespaceId::ROOT, table_name)
-                    });
+                let (namespace, bare_name, source_btree_table) =
+                    config
+                        .source_conn
+                        .with_schema(config.source_db_id, |schema| {
+                            let (namespace, bare_name) = schema.demangle_name(table_name);
+                            (
+                                namespace,
+                                bare_name.to_string(),
+                                schema.get_btree_table(namespace, bare_name),
+                            )
+                        });
+                let escaped_schema_name = if namespace.is_root() {
+                    config.escaped_schema_name.clone()
+                } else {
+                    config
+                        .source_conn
+                        .with_schema(config.source_db_id, |schema| {
+                            schema
+                                .namespace_name(namespace)
+                                .map(|name| name.replace('"', "\"\""))
+                        })
+                        .ok_or_else(|| {
+                            LimboError::Corrupt(format!(
+                                "table \"{table_name}\" is stored under a namespace without a name"
+                            ))
+                        })?
+                };
+                let escaped_table_name = bare_name.replace('"', "\"\"");
 
                 let (select_sql, insert_sql) = build_copy_sql(
-                    &config.escaped_schema_name,
+                    &escaped_schema_name,
                     &escaped_table_name,
+                    (!namespace.is_root()).then_some(escaped_schema_name.as_str()),
                     source_btree_table.as_deref(),
                 )?;
 
@@ -1001,8 +1056,16 @@ pub(crate) fn vacuum_target_build_step(
                 let entry = &state.schema_entries[entry_ordinal];
                 // Backing-btree indexes for custom index methods were filtered
                 // out when indexes_to_create was built. The remaining CREATE
-                // INDEX statements are user-visible and can use ordinary prepare.
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                // INDEX statements are user-visible; those of a stored
+                // namespace carry a mangled name. They are prepared as nested
+                // so that checks for new user SQL, such as the reserved-name
+                // check and the one rejecting qualified columns, do not reject
+                // an index the database already has. As for system tables, the
+                // guard is only for prepare.
+                state.target_conn.start_nested();
+                let target_stmt = state.target_conn.prepare(&entry.sql);
+                state.target_conn.end_nested();
+                let target_stmt = target_stmt?;
                 state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -1048,7 +1111,7 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                let target_stmt = prepare_on_target(&state.target_conn, &entry.name, &entry.sql)?;
                 state.phase = VacuumTargetBuildPhase::StepPostData {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -1118,7 +1181,7 @@ fn prepare_on_target(
     table_name: &str,
     sql: &str,
 ) -> Result<crate::Statement> {
-    let is_system = crate::schema::is_system_table(table_name);
+    let is_system = replay_bypasses_reserved_names(table_name);
     if is_system {
         target_conn.start_nested();
     }
@@ -1151,9 +1214,13 @@ fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Resu
 //   Output:
 //   - select_sql: SELECT rowid, "name", "salary" FROM "main"."employees"
 //   - insert_sql: INSERT INTO "main"."employees" (rowid, "name", "salary") VALUES (?, ?, ?)
+/// `target_schema_name` qualifies the table in the INSERT, for a table of a
+/// namespace, which the target names by the namespace's name; a
+/// table of the root is inserted into unqualified, into the target's main.
 pub(crate) fn build_copy_sql(
     escaped_schema_name: &str,
     escaped_table_name: &str,
+    target_schema_name: Option<&str>,
     source_btree_table: Option<&BTreeTable>,
 ) -> Result<(String, String)> {
     let Some(btree) = source_btree_table else {
@@ -1268,7 +1335,14 @@ pub(crate) fn build_copy_sql(
     let select_sql =
         format!("SELECT {select_cols} FROM \"{escaped_schema_name}\".\"{escaped_table_name}\"");
     let insert_sql =
-        format!("INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})");
+        match target_schema_name {
+            Some(schema) => format!(
+                "INSERT INTO \"{schema}\".\"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})"
+            ),
+            None => format!(
+                "INSERT INTO \"{escaped_table_name}\" ({insert_cols}) VALUES ({placeholders})"
+            ),
+        };
 
     Ok((select_sql, insert_sql))
 }

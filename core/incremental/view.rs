@@ -1,5 +1,6 @@
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::io::{Buffer, Completion, File, TempFile, IO};
+use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
@@ -107,8 +108,9 @@ pub fn create_dbsp_state_index(
             nulls_order: None,
             // Key columns carry the defining query's comparison collation
             // (see state_table_sql), and the index must compare the same way.
-            collation: state_table.columns()[pos_in_table].collation_opt(),
+            collation: state_table.columns()[pos_in_table].collation(),
             pos_in_table,
+            explicit_collation: None,
             default: None,
             expr: None,
         })?;
@@ -704,7 +706,14 @@ pub struct IncrementalView {
 crate::assert::assert_send_sync!(IncrementalView);
 
 impl IncrementalView {
-    pub fn from_sql(sql: &str, schema: &Schema, main_data_root: i64) -> Result<Self> {
+    /// Builds the view from its `CREATE MATERIALIZED VIEW` text. `namespace`
+    /// is the namespace the view is in, where its unqualified names resolve.
+    pub fn from_sql(
+        sql: &str,
+        schema: &Schema,
+        main_data_root: i64,
+        namespace: NamespaceId,
+    ) -> Result<Self> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         let cmd = cmd.expect("View is an empty statement");
@@ -715,7 +724,7 @@ impl IncrementalView {
                 columns,
                 select,
             }) => {
-                let mut column_schema = extract_view_columns(&select, schema)?;
+                let mut column_schema = extract_view_columns(namespace, &select, schema)?;
                 column_schema.rename_columns(&columns);
                 Ok(Self {
                     name: view_name.name.as_str().to_string(),
@@ -744,11 +753,15 @@ impl IncrementalView {
     /// Schema reconstruction uses this to order persisted materialized views
     /// before binding them. The executable DAG is still produced by the main
     /// bound planner; this walker is identity metadata only.
-    pub(crate) fn referenced_table_names(select: &ast::Select) -> std::vec::Vec<String> {
+    /// The tables `select` reads, each with the namespace it is written
+    /// with, if any. A name that is a CTE of the select is not a table.
+    pub(crate) fn referenced_tables(
+        select: &ast::Select,
+    ) -> std::vec::Vec<(Option<String>, String)> {
         fn collect_source(
             source: &ast::SelectTable,
             cte_names: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             match source {
                 ast::SelectTable::Table(name, _, _) => {
@@ -758,7 +771,12 @@ impl IncrementalView {
                     {
                         return;
                     }
-                    tables.insert(crate::util::normalize_ident(name.name.as_str()));
+                    tables.insert((
+                        name.namespace
+                            .as_ref()
+                            .map(|namespace| crate::util::normalize_ident(namespace.as_str())),
+                        crate::util::normalize_ident(name.name.as_str()),
+                    ));
                 }
                 ast::SelectTable::Select { select, .. } => {
                     collect_select(select, cte_names, tables)
@@ -776,7 +794,7 @@ impl IncrementalView {
         fn collect_one(
             select: &ast::OneSelect,
             cte_names: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             let ast::OneSelect::Select {
                 columns,
@@ -832,7 +850,7 @@ impl IncrementalView {
         fn collect_select(
             select: &ast::Select,
             inherited_ctes: &HashSet<String>,
-            tables: &mut HashSet<String>,
+            tables: &mut HashSet<(Option<String>, String)>,
         ) {
             let mut cte_names = inherited_ctes.clone();
             if let Some(with) = &select.with {

@@ -1,4 +1,5 @@
 use super::emitter::{emit_program, TranslateCtx};
+use super::expr_context::ExprContext;
 use super::plan::{
     expand_star, expand_table_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound,
     NamedWindowDef, Operation, OuterQueryReference, QueryDestination, Search, TableReferences,
@@ -7,7 +8,7 @@ use super::plan::{
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::{resolve_comparison_collseq_with_symbols, CollationSeq};
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
@@ -949,6 +950,7 @@ fn first_aggregate_without_over_clause<'a>(
         {
             Ok(Some(crate::function::Func::Agg(_))) => true,
             _ => resolver
+                .catalog
                 .symbol_table
                 .resolve_function(name.as_str(), args_count)
                 .is_some_and(|f| f.func.is_aggregate()),
@@ -1652,12 +1654,9 @@ pub fn emit_simple_count(
         .aggregates
         .first()
         .expect("simple count requires exactly one aggregate");
-    t_ctx.resolver.cache_expr_reg(
-        Cow::Owned(agg.original_expr.clone()),
-        target_reg,
-        false,
-        None,
-    );
+    t_ctx
+        .resolver
+        .cache_expr_reg(Cow::Owned(agg.original_expr.clone()), target_reg, false);
     t_ctx.resolver.enable_expr_to_reg_cache();
 
     emit_select_result(
@@ -1862,12 +1861,9 @@ fn is_constant_or_group_by(
         }
         for group_by_expr in group_by_exprs {
             if exprs_are_equivalent(e, group_by_expr)
-                && resolve_comparison_collseq_with_symbols(
-                    group_by_expr,
-                    group_by_expr,
-                    table_references,
-                    Some(resolver.symbol_table),
-                )? == CollationSeq::Binary
+                && ExprContext::new(Some(table_references), resolver)
+                    .expr_collation(group_by_expr)?
+                    == CollationSeq::BINARY
             {
                 *e = Expr::Literal(ast::Literal::Null);
                 return Ok(WalkControl::SkipChildren);

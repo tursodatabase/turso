@@ -512,18 +512,21 @@ fn test_analyze_statements() {
 
 #[test]
 fn test_set_search_path_extractor_multi_value() {
-    use turso_pg_parser::translator::try_extract_set;
+    use turso_pg_parser::translator::{try_extract_set, PgSetTo};
     let result = parse("SET search_path TO sp_a_test, sp_b_test").unwrap();
     let set_stmt = try_extract_set(&result).expect("should extract SET stmt");
     assert_eq!(set_stmt.name, "search_path");
-    assert_eq!(set_stmt.values.len(), 2, "expected two path entries");
+    let PgSetTo::Values(values) = set_stmt.to else {
+        panic!("SET has values");
+    };
+    assert_eq!(values.len(), 2, "expected two path entries");
     assert_eq!(
-        set_stmt.values[0].as_search_path_name(),
+        values[0].as_search_path_name(),
         Some("sp_a_test"),
         "first entry"
     );
     assert_eq!(
-        set_stmt.values[1].as_search_path_name(),
+        values[1].as_search_path_name(),
         Some("sp_b_test"),
         "second entry"
     );
@@ -531,14 +534,17 @@ fn test_set_search_path_extractor_multi_value() {
 
 #[test]
 fn test_set_search_path_extractor_quoted_literal() {
-    use turso_pg_parser::translator::try_extract_set;
+    use turso_pg_parser::translator::{try_extract_set, PgSetTo};
     // Quoted form: SET search_path TO 'schema_name' is valid PostgreSQL.
     // as_search_path_name() must return the bare name without SQL quotes.
     let result = parse("SET search_path TO 'sp_literal_test'").unwrap();
     let set_stmt = try_extract_set(&result).expect("should extract SET stmt");
-    assert_eq!(set_stmt.values.len(), 1);
+    let PgSetTo::Values(values) = set_stmt.to else {
+        panic!("SET has values");
+    };
+    assert_eq!(values.len(), 1);
     assert_eq!(
-        set_stmt.values[0].as_search_path_name(),
+        values[0].as_search_path_name(),
         Some("sp_literal_test"),
         "quoted literal should be returned without quotes"
     );

@@ -7,9 +7,10 @@ use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
 use crate::schema::BTreeTable;
 use crate::sync::Arc;
-use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
+use crate::translate::collate::{first_collation, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, WalkControl};
+use crate::translate::expr_context::ExprContext;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::optimizer::unnest::rewrite_correlated_subqueries;
 use crate::translate::plan::{
@@ -430,7 +431,7 @@ fn build_select_plan_dag(
             (
                 vec![ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))],
                 vec![dag::KeyColumn {
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                     ambiguous: false,
                 }],
                 true,
@@ -623,31 +624,17 @@ fn hidden_count_aggregate(resolver: &Resolver) -> Result<Vec<Aggregate>> {
     Ok(aggregates)
 }
 
-fn plan_expr_collation(
-    expr: &ast::Expr,
-    tables: &TableReferences,
-    resolver: &Resolver,
-) -> Result<Option<CollationSeq>> {
-    let collation = get_collseq_from_expr_with_symbols(expr, tables, Some(resolver.symbol_table))?;
-    if collation.is_some_and(|collation| collation.is_custom()) {
-        return unsupported("custom collations on grouping or dedup keys");
-    }
-    Ok(collation.map(|collation| match collation {
-        CollationSeq::Unset => CollationSeq::Binary,
-        other => other,
-    }))
-}
-
 /// The key column a stateful operator uses for `expr`.
 fn key_column(
     expr: &ast::Expr,
     tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<dag::KeyColumn> {
-    let collation = plan_expr_collation(expr, tables, resolver)?.unwrap_or(CollationSeq::Binary);
+    let collation =
+        supported_key_collation(ExprContext::new(Some(tables), resolver).expr_collation(expr)?)?;
     Ok(dag::KeyColumn {
         collation,
-        ambiguous: collation != CollationSeq::Binary || stored_affinity(expr, tables).is_none(),
+        ambiguous: collation != CollationSeq::BINARY || stored_affinity(expr, tables).is_none(),
     })
 }
 
@@ -660,24 +647,33 @@ fn set_op_key_column(
     index: usize,
     resolver: &Resolver,
 ) -> Result<dag::KeyColumn> {
-    let mut collation = None;
-    let mut affinities = Vec::with_capacity(branches.len());
-    for branch in branches {
-        let expr = &branch.result_columns[index].expr;
-        if collation.is_none() {
-            collation = plan_expr_collation(expr, &branch.table_references, resolver)?;
-        }
-        affinities.push(stored_affinity(expr, &branch.table_references));
-    }
-    let collation = collation.unwrap_or(CollationSeq::Binary);
+    let collation = supported_key_collation(first_collation(branches.iter().map(|branch| {
+        (
+            &branch.result_columns[index].expr,
+            ExprContext::new(Some(&branch.table_references), resolver),
+        )
+    }))?)?;
+    let affinities = branches
+        .iter()
+        .map(|branch| stored_affinity(&branch.result_columns[index].expr, &branch.table_references))
+        .collect::<Vec<_>>();
     let mixes_integers_and_reals =
         affinities.contains(&Some(Affinity::Integer)) && affinities.contains(&Some(Affinity::Real));
     Ok(dag::KeyColumn {
         collation,
-        ambiguous: collation != CollationSeq::Binary
+        ambiguous: collation != CollationSeq::BINARY
             || affinities.contains(&None)
             || mixes_integers_and_reals,
     })
+}
+
+/// Hidden tables store their keys with the collation in their DDL, so a key
+/// collation has to be one that DDL can name.
+fn supported_key_collation(collation: CollationSeq) -> Result<CollationSeq> {
+    if collation.is_custom() {
+        return unsupported("custom collations on grouping or dedup keys");
+    }
+    Ok(collation)
 }
 
 /// The affinity of the base-table column `expr` reads, when that affinity
@@ -1928,7 +1924,7 @@ fn match_counts_table_sql(table_name: &str, payload_width: usize) -> String {
 /// collations (which do not) are rejected at classify time.
 fn collate_clause(collation: CollationSeq) -> String {
     match collation {
-        CollationSeq::Binary | CollationSeq::Unset => String::new(),
+        CollationSeq::BINARY => String::new(),
         other => format!(" COLLATE \"{}\"", other.name()),
     }
 }

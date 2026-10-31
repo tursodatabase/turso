@@ -4,7 +4,7 @@
 @requires strict "uses custom types which require STRICT tables"
 
 test custom-type-explicit-null-stays-null {
-    CREATE TYPE ct_lower BASE text ENCODE (lower(value)) DECODE (value) OPERATOR '<';
+    CREATE TYPE ct_lower BASE text ENCODE (lower(value)) DECODE (value);
     CREATE TABLE t1(id INT PRIMARY KEY, x0 ct_lower DEFAULT ('hello')) STRICT;
     INSERT INTO t1 VALUES (1, 'World');
     INSERT INTO t1 VALUES (2, NULL);
@@ -67,7 +67,7 @@ expect {
 }
 
 test custom-type-expr-index-with-null {
-    CREATE TYPE ct_low BASE text ENCODE (lower(value)) DECODE (value) OPERATOR '<';
+    CREATE TYPE ct_low BASE text ENCODE (lower(value)) DECODE (value);
     CREATE TABLE t6(id INT PRIMARY KEY, x0 ct_low DEFAULT ('fallback')) STRICT;
     CREATE INDEX ix6 ON t6(CAST(x0 AS TEXT));
     INSERT INTO t6 VALUES (1, 'Hello');
@@ -82,7 +82,7 @@ expect {
 }
 
 test custom-type-expr-index-delete-non-null {
-    CREATE TYPE ct_low2 BASE text ENCODE (lower(value)) DECODE (value) OPERATOR '<';
+    CREATE TYPE ct_low2 BASE text ENCODE (lower(value)) DECODE (value);
     CREATE TABLE t7(id INT PRIMARY KEY, x0 ct_low2 DEFAULT ('dflt')) STRICT;
     CREATE INDEX ix7 ON t7(CAST(x0 AS TEXT));
     INSERT INTO t7 VALUES (1, 'AAA');

@@ -105,7 +105,7 @@ CREATE INDEX idx_active_orders ON orders (customer_id)
 SELECT * FROM orders WHERE status = 'active' AND customer_id = 42;
 ```
 
-The `WHERE` clause of a partial index can reference any column of the table and may use operators, literal values, and built-in functions. Subqueries are not allowed.
+The `WHERE` clause of a partial index can reference any column of the table and may use operators, literal values, and deterministic built-in functions. Subqueries, bind parameters, non-deterministic functions such as `random()`, and `CURRENT_DATE`, `CURRENT_TIME`, and `CURRENT_TIMESTAMP` are not allowed.
 
 ## Expression Indexes
 
@@ -124,7 +124,7 @@ SELECT * FROM users WHERE lower(email) = 'alice@example.com';
 CREATE INDEX idx_items_total ON items (quantity * unit_price);
 ```
 
-Each expression in the index must be a deterministic expression that references only columns of the indexed table. Aggregate functions and subqueries are not allowed.
+Each expression in the index must be a deterministic expression that references only columns of the indexed table. Aggregate functions and subqueries are not allowed. Columns must be named without a table qualifier: `t.a` is rejected with `the "." operator prohibited in index expressions`. The `WHERE` clause of a partial index may use qualified names.
 
 ## Custom Index Methods {#using-method}
 

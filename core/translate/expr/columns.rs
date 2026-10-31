@@ -48,7 +48,6 @@ pub fn emit_table_column_for_dml(
         &SelfTableContext::ForDML {
             dml_ctx: dml_column_context,
             table: Arc::clone(table),
-            uses_custom_type_operators: false,
         },
         None,
         column,
@@ -130,7 +129,7 @@ pub fn emit_stored_column(
         resolved
             .chain
             .iter()
-            .any(|td| td.encode().is_some())
+            .any(|td| td.has_encode_or_coerce())
             .then_some((table, column, default_expr))
     });
     let Some((table, column, default_expr)) = encoded_default else {
