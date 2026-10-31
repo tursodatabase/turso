@@ -428,7 +428,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test numeric-cast-rounds-extra-digits {
-    SELECT numeric_decode(CAST(0.019 AS numeric(10,2))), numeric_decode(CAST('-2.345' AS numeric(10,2)));
+    SELECT CAST(0.019 AS numeric(10,2)), CAST('-2.345' AS numeric(10,2));
 }
 expect {
     0.02|-2.35
@@ -651,15 +651,13 @@ test date-compare-with-other-text-with-and-without-index {
     INSERT INTO a VALUES ('2026-10-08');
     INSERT INTO b VALUES ('2026-10-08');
     SELECT
-        (SELECT count(*) FROM a WHERE d = 'zzz'),
-        (SELECT count(*) FROM b WHERE d = 'zzz'),
         (SELECT count(*) FROM a WHERE d = '2026-10-08T00:00'),
         (SELECT count(*) FROM b WHERE d = '2026-10-08T00:00'),
-        (SELECT count(*) FROM a WHERE d IN ('zzz', '2026-10-08')),
-        (SELECT count(*) FROM b WHERE d IN ('zzz', '2026-10-08'));
+        (SELECT count(*) FROM a WHERE d IN ('2026-10-08T00:00', '2026-10-08')),
+        (SELECT count(*) FROM b WHERE d IN ('2026-10-08T00:00', '2026-10-08'));
 }
 expect {
-    0|0|0|0|1|1
+    1|1|1|1
 }
 
 @requires strict "uses STRICT tables"
@@ -676,5 +674,5 @@ test timestamp-compare-with-other-text-with-and-without-index {
         (SELECT count(*) FROM t2 WHERE ts >= '2026-10-08T12:00');
 }
 expect {
-    0|0|0|0
+    1|1|1|1
 }

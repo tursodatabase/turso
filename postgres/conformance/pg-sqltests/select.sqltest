@@ -1582,3 +1582,100 @@ expect {
     1
     0
 }
+
+# A date compared with a timestamp or a timestamptz becomes midnight of that
+# day, and a timestamp compared with a timestamptz becomes a timestamptz in
+# UTC. Each query runs before and after the indexes exist.
+test compare-date-timestamp-timestamptz {
+    CREATE TABLE t (id int PRIMARY KEY, d date, ts timestamp, tz timestamptz);
+    INSERT INTO t VALUES
+        (1, '2024-01-01', '2024-01-01 10:00:00', '2024-01-01 00:00:00+00:00'),
+        (2, '2024-01-01', '2024-01-01 00:00:00', '2024-01-02 00:00:00+00:00'),
+        (3, '2024-01-02', '2023-12-31 23:59:59', '2024-01-01 10:00:00+00:00'),
+        (4, NULL, NULL, NULL);
+    SELECT 'ts-gt-d', string_agg(id::text, ',' ORDER BY id) FROM t WHERE ts > d;
+    SELECT 'd-lt-ts', string_agg(id::text, ',' ORDER BY id) FROM t WHERE d < ts;
+    SELECT 'ts-eq-d', string_agg(id::text, ',' ORDER BY id) FROM t WHERE ts = d;
+    SELECT 'tz-gt-ts', string_agg(id::text, ',' ORDER BY id) FROM t WHERE tz > ts;
+    SELECT 'ts-lt-tz', string_agg(id::text, ',' ORDER BY id) FROM t WHERE ts < tz;
+    SELECT 'tz-eq-d', string_agg(id::text, ',' ORDER BY id) FROM t WHERE tz = d;
+    SELECT 'between', string_agg(id::text, ',' ORDER BY id) FROM t WHERE ts BETWEEN d AND tz;
+    SELECT 'in', string_agg(id::text, ',' ORDER BY id) FROM t WHERE ts IN (d, '2024-01-01 10:00:00');
+    SELECT 'in-mixed', string_agg(id::text, ',' ORDER BY id) FROM t WHERE tz IN (d, ts);
+    SELECT 'date-literal', string_agg(id::text, ',' ORDER BY id) FROM t WHERE ts >= DATE '2024-01-01';
+    CREATE INDEX t_d ON t (d);
+    CREATE INDEX t_ts ON t (ts);
+    CREATE INDEX t_tz ON t (tz);
+    SELECT 'ts-gt-d', string_agg(id::text, ',' ORDER BY id) FROM t WHERE ts > d;
+    SELECT 'tz-gt-ts', string_agg(id::text, ',' ORDER BY id) FROM t WHERE tz > ts;
+    SELECT 'tz-eq-d', string_agg(id::text, ',' ORDER BY id) FROM t WHERE tz = d;
+    SELECT 'date-literal', string_agg(id::text, ',' ORDER BY id) FROM t WHERE ts >= DATE '2024-01-01';
+}
+expect {
+    ts-gt-d|1
+    d-lt-ts|1
+    ts-eq-d|2
+    tz-gt-ts|2,3
+    ts-lt-tz|2,3
+    tz-eq-d|1
+    between|2
+    in|1,2
+    in-mixed|1
+    date-literal|1,2
+    ts-gt-d|1
+    tz-gt-ts|2,3
+    tz-eq-d|1
+    date-literal|1,2
+}
+
+# A join between a date column and a timestamp column gives the same rows
+# with and without indexes.
+test compare-date-timestamp-join {
+    CREATE TABLE a (d date);
+    CREATE TABLE b (ts timestamp);
+    INSERT INTO a VALUES ('2024-01-01'), ('2024-01-02'), ('2024-01-03');
+    INSERT INTO b VALUES ('2024-01-01 00:00:00'), ('2024-01-02 00:00:01'), ('2024-01-03 00:00:00');
+    SELECT 'join', string_agg(a.d::text, ',' ORDER BY a.d) FROM a JOIN b ON a.d = b.ts;
+    SELECT 'join-swapped', string_agg(a.d::text, ',' ORDER BY a.d) FROM a JOIN b ON b.ts = a.d;
+    SELECT 'lt', count(*) FROM a JOIN b ON b.ts < a.d;
+    CREATE INDEX a_d ON a (d);
+    CREATE INDEX b_ts ON b (ts);
+    SELECT 'indexed', string_agg(a.d::text, ',' ORDER BY a.d) FROM a JOIN b ON a.d = b.ts;
+    SELECT 'indexed-lt', count(*) FROM a JOIN b ON b.ts < a.d;
+}
+expect {
+    join|2024-01-01,2024-01-03
+    join-swapped|2024-01-01,2024-01-03
+    lt|3
+    indexed|2024-01-01,2024-01-03
+    indexed-lt|3
+}
+
+test compare-date-timestamp-subquery-and-case {
+    CREATE TABLE b (id int, ts timestamp, tz timestamptz, d date);
+    INSERT INTO b VALUES (1, '2024-01-01 00:00:00', '2024-01-01 00:00:00+00:00', '2024-01-01'),
+        (2, '2024-01-02 12:00:00', '2024-01-03 00:00:00+00:00', '2024-01-02');
+    SELECT 'ts-in-tz', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts IN (SELECT tz FROM b);
+    SELECT 'tz-in-ts', string_agg(id::text, ',' ORDER BY id) FROM b WHERE tz IN (SELECT ts FROM b);
+    SELECT 'd-in-ts', string_agg(id::text, ',' ORDER BY id) FROM b WHERE d IN (SELECT ts FROM b);
+    SELECT 'ts-not-in-d', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts NOT IN (SELECT d FROM b);
+    SELECT 'ts-in-union', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts IN (SELECT d FROM b UNION SELECT d FROM b);
+    SELECT 'ts-eq-scalar', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts = (SELECT min(d) FROM b);
+    SELECT 'ts-lt-scalar', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts < (SELECT max(d) FROM b);
+    SELECT 'case', string_agg(CASE ts WHEN d THEN 'same' ELSE 'other' END, ',' ORDER BY id) FROM b;
+    CREATE INDEX b_ts ON b (ts);
+    SELECT 'indexed-ts-in-tz', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts IN (SELECT tz FROM b);
+    SELECT 'indexed-ts-eq-scalar', string_agg(id::text, ',' ORDER BY id) FROM b WHERE ts = (SELECT min(d) FROM b);
+}
+expect {
+    ts-in-tz|1
+    tz-in-ts|1
+    d-in-ts|1
+    ts-not-in-d|2
+    ts-in-union|1
+    ts-eq-scalar|1
+    ts-lt-scalar|1
+    case|same,other
+    indexed-ts-in-tz|1
+    indexed-ts-eq-scalar|1
+}

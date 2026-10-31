@@ -1611,3 +1611,51 @@ test booleq-prints-as-a-boolean {
 expect {
     t|f
 }
+
+test now-compares-with-timestamp-columns {
+    CREATE TABLE b (ts timestamp, tz timestamptz);
+    INSERT INTO b VALUES ('2000-01-01 00:00:00', '2000-01-01 00:00:00+00:00');
+    SELECT count(*) FROM b WHERE tz < now() AND tz < current_timestamp AND ts < localtimestamp;
+}
+expect {
+    1
+}
+
+test now-finds-rows-of-an-indexed-timestamptz-column {
+    CREATE TABLE ev (id int, at timestamptz);
+    INSERT INTO ev VALUES (1, '2000-01-01 00:00:00+00:00');
+    INSERT INTO ev VALUES (2, '2999-01-01 00:00:00+00:00');
+    SELECT id FROM ev WHERE at < now();
+    CREATE INDEX ev_at ON ev (at);
+    SELECT id FROM ev WHERE at < now();
+    SELECT id FROM ev WHERE at > clock_timestamp();
+}
+expect {
+    1
+    1
+    2
+}
+
+test timestamp-compares-with-timestamptz-and-date {
+    -- A timestamp compared with a timestamptz becomes one, and a date compared
+    -- with a timestamp becomes midnight of that day.
+    CREATE TABLE c (ts timestamp, d date);
+    INSERT INTO c VALUES ('2000-01-01 10:00:00', '2000-01-01'), ('2000-01-02 00:00:00', '2000-01-02');
+    SELECT count(*) FROM c WHERE ts < now() AND ts >= DATE '2000-01-01' AND d < now();
+    SELECT count(*) FROM c WHERE ts = d;
+    SELECT count(*) FROM c WHERE ts > d;
+}
+expect {
+    2
+    1
+    1
+}
+
+test current-date-compares-with-date-columns {
+    CREATE TABLE e (d date);
+    INSERT INTO e VALUES ('2000-01-01');
+    SELECT count(*) FROM e WHERE d < current_date AND d > current_date - 100000;
+}
+expect {
+    1
+}

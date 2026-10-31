@@ -640,24 +640,38 @@ fn translate_case_expr(
     // case statement we're processing.
     let base_reg = base.as_ref().map(|_| program.alloc_register());
     let expr_reg = program.alloc_register();
+    let compared_as = match base {
+        Some(base_expr) => stored_comparison_type(
+            std::iter::once(base_expr.as_ref())
+                .chain(when_then_pairs.iter().map(|(when, _)| when.as_ref())),
+            referenced_tables,
+            resolver,
+        )?,
+        None => None,
+    };
     if let Some(base_expr) = base {
-        translate_expr(
+        translate_compared_expr(
             program,
             referenced_tables,
             base_expr,
             base_reg.unwrap(),
             resolver,
+            compared_as.as_ref(),
         )?;
     };
     for (when_expr, then_expr) in when_then_pairs {
-        translate_expr_no_constant_opt(
+        // The register is reused for every WHEN, so nothing written to it may
+        // be hoisted as a constant.
+        let next_span_idx = program.constant_spans_next_idx();
+        translate_compared_expr(
             program,
             referenced_tables,
             when_expr,
             expr_reg,
             resolver,
-            NoConstantOptReason::RegisterReuse,
+            compared_as.as_ref(),
         )?;
+        program.constant_spans_invalidate_after(next_span_idx);
         match base_reg {
             // CASE 1 WHEN 0 THEN 0 ELSE 1 becomes 1==0, Ne branch to next clause
             Some(base_reg) => program.emit_insn(Insn::Ne {
@@ -769,9 +783,12 @@ fn translate_cast_expr(
                 None => Vec::new(),
             };
 
-            // Domains: store the value as a column of the domain does, which
-            // runs the ENCODE and COERCE of the types under it, then check
-            // the domain's constraints on the stored value.
+            // CAST gives the value a column of the type returns when it is
+            // read: the value is stored (ENCODE, then COERCE with the type
+            // arguments) and read back (DECODE). So CAST(5 AS neg) is 5, not
+            // its stored -5, and CAST('3.504' AS numeric(10,2)) is 3.50, as
+            // reading a column of that type gives. A domain's constraints are checked on the
+            // stored value, as storing in a column of the domain does.
             if resolved.is_domain() {
                 // A cast to a domain over boolean gives true for every
                 // nonzero integer in dialects whose integer-to-boolean cast
@@ -790,26 +807,18 @@ fn translate_cast_expr(
                     &ty_params,
                     resolver,
                 )?;
-
-                // Validate domain constraints on the encoded value
                 emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
+                emit_decode(program, &resolved.chain, target_register, resolver)?;
                 return Ok(target_register);
             }
 
-            // CAST gives the stored form: CAST(42 AS cents) → 4200. With type
-            // arguments it applies their limits too, as storing in a column
-            // of that type does: CAST('3.504' AS numeric(10,2)) is 3.50. A
-            // type that takes arguments, named without all of them, is
+            // A type that takes arguments, named without all of them, is
             // SQLite's CAST: CAST(x AS NUMERIC) is a common SQLite idiom.
             let user_param_count = resolved.leaf().user_params().count();
             if user_param_count == 0 || ty_params.len() == user_param_count {
-                emit_store_value(
-                    program,
-                    &resolved.chain[..1],
-                    target_register,
-                    &ty_params,
-                    resolver,
-                )?;
+                let chain = &resolved.chain[..1];
+                emit_store_value(program, chain, target_register, &ty_params, resolver)?;
+                emit_decode(program, chain, target_register, resolver)?;
                 return Ok(target_register);
             }
         }
@@ -1655,13 +1664,31 @@ fn translate_function_call_expr(
                     });
                     Ok(target_register)
                 }
-                ScalarFunc::Min => {
+                ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif => {
                     if args.is_empty() {
-                        crate::bail_parse_error!("min function with no arguments");
+                        crate::bail_parse_error!("{} function with no arguments", srf);
                     }
+                    if matches!(srf, ScalarFunc::Nullif) && args.len() != 2 {
+                        crate::bail_parse_error!("nullif function must have two argument");
+                    }
+                    // The arguments compare with each other, and the result is
+                    // one of them, so a custom type's values compare in their
+                    // stored form and the result is decoded.
+                    let compared_as = stored_comparison_type(
+                        args.iter().map(|arg| arg.as_ref()),
+                        referenced_tables,
+                        resolver,
+                    )?;
                     let start_reg = program.alloc_registers(args.len());
                     for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
+                        translate_compared_expr(
+                            program,
+                            referenced_tables,
+                            arg,
+                            start_reg + i,
+                            resolver,
+                            compared_as.as_ref(),
+                        )?;
                     }
 
                     program.emit_insn(Insn::Function {
@@ -1670,26 +1697,12 @@ fn translate_function_call_expr(
                         dest: target_register,
                         func: func_ctx,
                     });
+                    if let Some(compared_as) = &compared_as {
+                        emit_decode(program, &compared_as.chain, target_register, resolver)?;
+                    }
                     Ok(target_register)
                 }
-                ScalarFunc::Max => {
-                    if args.is_empty() {
-                        crate::bail_parse_error!("min function with no arguments");
-                    }
-                    let start_reg = program.alloc_registers(args.len());
-                    for (i, arg) in args.iter().enumerate() {
-                        translate_expr(program, referenced_tables, arg, start_reg + i, resolver)?;
-                    }
-
-                    program.emit_insn(Insn::Function {
-                        constant_mask: 0,
-                        start_reg,
-                        dest: target_register,
-                        func: func_ctx,
-                    });
-                    Ok(target_register)
-                }
-                ScalarFunc::Nullif | ScalarFunc::Instr => {
+                ScalarFunc::Instr => {
                     if args.len() != 2 {
                         crate::bail_parse_error!(
                             "{} function must have two argument",

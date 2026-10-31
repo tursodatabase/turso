@@ -1,16 +1,18 @@
 use crate::alloc::TursoSliceExt;
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
 use crate::namespace::NamespaceRef;
-use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, ResolvedType, Table};
 use crate::sync::Arc;
-use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
+use crate::translate::aggregation::{
+    aggregate_stored_comparison_type, translate_aggregation_step, AggArgumentSource,
+};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TranslateCtx};
 use crate::translate::expr::expr_type::{type_of, ExprType};
 use crate::translate::expr::{
-    custom_operator_call, emit_operator_call_on_registers,
-    expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
-    walk_expr, walk_expr_mut, NoConstantOptReason, WalkControl,
+    custom_operator_call, emit_decode, emit_operator_call_on_registers, emit_stored_form,
+    expr_contains_nondeterministic_scalar_function, translate_compared_expr, translate_expr,
+    translate_expr_no_constant_opt, walk_expr, walk_expr_mut, NoConstantOptReason, WalkControl,
 };
 use crate::translate::expr_context::ExprContext;
 use crate::translate::order_by::EmitOrderBy;
@@ -598,6 +600,11 @@ pub struct WindowMetadata<'a> {
     /// leaving row deletes exactly its own entry. `None` for any function
     /// that isn't a min/max needing this index.
     pub minmax: Vec<Option<WindowMinMax>>,
+    /// For each window function, the custom type whose stored form a `min()`
+    /// or `max()` compares its values in. The running value and the `minmax`
+    /// index hold stored values, and the result is decoded. `None` for any
+    /// other function.
+    pub min_max_stored_types: Vec<Option<ResolvedType>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1231,6 +1238,22 @@ impl EmitWindow {
         }
         let minmax =
             allocate_window_minmax(program, window, &plan.table_references, &t_ctx.resolver)?;
+        let min_max_stored_types = window
+            .functions
+            .iter()
+            .map(|func| match (&func.func, func.current_expr()) {
+                (AccumulatorFunc::Agg(agg), Expr::FunctionCall { args, .. }) => {
+                    let args: Vec<Expr> = args.iter().map(|arg| (**arg).clone()).collect();
+                    aggregate_stored_comparison_type(
+                        agg,
+                        &args,
+                        &plan.table_references,
+                        &t_ctx.resolver,
+                    )
+                }
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Window function processing is similar to aggregation processing in how results are mapped
         // to registers. Each function expression is stored in `expr_to_reg_cache` along with its
@@ -1342,6 +1365,7 @@ impl EmitWindow {
             expressions_referencing_subquery,
             buffer_table_name: buffer_table.name.clone(),
             minmax,
+            min_max_stored_types,
         });
 
         Ok(())
@@ -1404,6 +1428,7 @@ impl EmitWindow {
         let src_column_count = meta.src_column_count;
         let buffer_table_name = meta.buffer_table_name.clone();
         let minmax = meta.minmax.clone();
+        let min_max_stored_types = meta.min_max_stored_types.clone();
 
         emit_load_order_by_columns(program, window, &registers);
         emit_flush_buffer_if_new_partition(
@@ -1577,7 +1602,15 @@ impl EmitWindow {
                 });
             }
             if window.frame.exclude.is_none() {
-                emit_window_agg_final(program, window, &registers, &minmax, false);
+                emit_window_agg_final(
+                    program,
+                    window,
+                    &registers,
+                    &minmax,
+                    &min_max_stored_types,
+                    false,
+                    &t_ctx.resolver,
+                )?;
             }
             // The row was just inserted, so the empty branch of this
             // Rewind is unreachable — the label lands on the next
@@ -2218,8 +2251,10 @@ fn emit_window_agg_final(
     window: &Window,
     registers: &WindowRegisters,
     minmax: &[Option<WindowMinMax>],
+    min_max_stored_types: &[Option<ResolvedType>],
     finalize: bool,
-) {
+    resolver: &Resolver,
+) -> Result<()> {
     for (i, func) in window.functions.iter().enumerate() {
         let positional = matches!(
             &func.func,
@@ -2252,9 +2287,7 @@ fn emit_window_agg_final(
                 default: None,
             });
             program.preassign_label_to_next_insn(label_empty);
-            continue;
-        }
-        if finalize {
+        } else if finalize {
             program.emit_insn(Insn::AggFinal {
                 register: acc_reg,
                 func: func.func.clone(),
@@ -2275,7 +2308,11 @@ fn emit_window_agg_final(
                 func: func.func.clone(),
             });
         }
+        if let Some(ty) = &min_max_stored_types[i] {
+            emit_decode(program, &ty.chain, result_reg, resolver)?;
+        }
     }
+    Ok(())
 }
 
 /// Recompute every function from scratch over the current frame. Used when
@@ -2296,6 +2333,7 @@ fn emit_window_full_scan(
     let registers = meta.registers;
     let cursors = meta.cursors;
     let minmax = meta.minmax.clone();
+    let min_max_stored_types = meta.min_max_stored_types.clone();
     let exclude = window
         .frame
         .exclude
@@ -2443,7 +2481,15 @@ fn emit_window_full_scan(
         is_index: false,
     });
     program.preassign_label_to_next_insn(label_break);
-    emit_window_agg_final(program, window, &registers, &minmax, true);
+    emit_window_agg_final(
+        program,
+        window,
+        &registers,
+        &minmax,
+        &min_max_stored_types,
+        true,
+        &t_ctx.resolver,
+    )?;
     Ok(())
 }
 
@@ -2734,6 +2780,7 @@ fn emit_window_op(
     let cursors = meta.cursors;
     let buffer_table_name = meta.buffer_table_name.clone();
     let minmax = meta.minmax.clone();
+    let min_max_stored_types = meta.min_max_stored_types.clone();
     let order_by_len = window.order_by.len();
     let frame_mode = window.frame.mode;
     // Under RANGE / GROUPS frames one advance steps over every row with
@@ -2843,7 +2890,15 @@ fn emit_window_op(
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
     // windowAggFinal at window.c:2284).
     if matches!(op, WindowOp::ReturnRow) && window.frame.exclude.is_none() {
-        emit_window_agg_final(program, window, &registers, &minmax, false);
+        emit_window_agg_final(
+            program,
+            window,
+            &registers,
+            &minmax,
+            &min_max_stored_types,
+            false,
+            &t_ctx.resolver,
+        )?;
     }
 
     let label_continue = program.allocate_label();
@@ -3154,11 +3209,12 @@ fn emit_function_step(
     plan: &SelectPlan,
     read_csr: CursorID,
 ) -> Result<()> {
-    let (acc_start, minmax, csr_current) = {
+    let (acc_start, minmax, min_max_stored_types, csr_current) = {
         let meta = t_ctx.meta_window.as_ref().expect("missing window metadata");
         (
             meta.registers.acc_start,
             meta.minmax.clone(),
+            meta.min_max_stored_types.clone(),
             meta.cursors.csr_current,
         )
     };
@@ -3238,12 +3294,13 @@ fn emit_function_step(
 
                 if let Some(state) = minmax[i] {
                     let label_skip = filter_skip_label.unwrap_or_else(|| program.allocate_label());
-                    translate_expr(
+                    translate_compared_expr(
                         program,
                         Some(&plan.table_references),
                         &args[0],
                         state.registers,
                         &t_ctx.resolver,
+                        min_max_stored_types[i].as_ref(),
                     )?;
                     program.emit_insn(Insn::IsNull {
                         reg: state.registers,
@@ -3333,6 +3390,7 @@ fn emit_function_inverse(
     let window = plan.window.as_ref().expect("missing window");
     let acc_start = meta.registers.acc_start;
     let minmax = meta.minmax.clone();
+    let min_max_stored_types = meta.min_max_stored_types.clone();
     let csr_start = meta.cursors.csr_start.expect(
         "emit_function_inverse: csr_start must be allocated when any AGGINVERSE is emitted",
     );
@@ -3381,6 +3439,9 @@ fn emit_function_inverse(
                 dst_reg: state.registers,
                 extra_amount: 0,
             });
+            if let Some(ty) = &min_max_stored_types[i] {
+                emit_stored_form(program, state.registers, ty, &t_ctx.resolver)?;
+            }
             program.emit_insn(Insn::IsNull {
                 reg: state.registers,
                 target_pc: label_skip,

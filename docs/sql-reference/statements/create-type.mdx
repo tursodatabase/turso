@@ -20,7 +20,6 @@ CREATE TYPE [IF NOT EXISTS] type-name [(parameters)]
     [ENCODE encode-expr]
     [COERCE coerce-expr]
     [DECODE decode-expr]
-    [OPERATOR '<']
     [DEFAULT default-expr];
 ```
 
@@ -61,7 +60,7 @@ CREATE TYPE cents BASE integer
 
 The ENCODE expression is evaluated whenever a value is written to a column of this type. The DECODE expression is evaluated whenever a value is read. Both expressions use the identifier `value` to refer to the input.
 
-- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST, and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first).
+- **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST (which then runs DECODE), and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first).
 - **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT.
 - **NULL handling**: NULL values bypass both ENCODE and DECODE. A NULL input produces a NULL output without evaluating the expression.
 
@@ -125,13 +124,12 @@ The built-in `numeric` type uses both clauses: `ENCODE numeric_encode(value)` tu
 
 ### Sorting and comparing
 
-ORDER BY and indexes sort a custom type by its stored value, using SQLite's comparison for the base type. Comparison operators, MIN and MAX use the value DECODE returns. The two orders agree only when ENCODE keeps the order of its input, so a type with a DECODE must declare `OPERATOR '<'` to say that it does. Without it, ORDER BY and CREATE INDEX on a column of the type fail with `type does not declare OPERATOR '<'`. When ENCODE does not keep the order, ORDER BY follows the stored form:
+A custom type sorts and compares by its stored value, using SQLite's comparison for the base type. This holds for ORDER BY, MIN, MAX, GROUP BY, DISTINCT and indexes. An index on an expression of the type, such as `CAST(x AS reversed_text)`, also keeps the stored value, so it sorts rows the same way. For a type whose ENCODE does not keep the order of its input, the order follows the stored form:
 
 ```sql
 CREATE TYPE reversed_text BASE text
     ENCODE turso_reverse(value)
-    DECODE turso_reverse(value)
-    OPERATOR '<';
+    DECODE turso_reverse(value);
 CREATE TABLE t(w reversed_text) STRICT;
 INSERT INTO t VALUES ('apple'), ('banana'), ('cherry');
 SELECT w FROM t ORDER BY w;
@@ -139,6 +137,19 @@ SELECT w FROM t ORDER BY w;
 -- apple    (stored as 'elppa')
 -- cherry   (stored as 'yrrehc')
 ```
+
+Comparisons use the same order, so a query returns the same rows with and without an index, and `max(w)` is the last row of `ORDER BY w`. This holds for `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `min`/`max` (also the scalar and window forms), ORDER BY with GROUP BY, and joins. The column's stored value is compared with the other value encoded:
+
+```sql
+SELECT w FROM t WHERE w < 'cherry';
+-- apple, banana   ('elppa' and 'ananab' are less than 'yrrehc')
+```
+
+Because the other value goes through ENCODE, a value that ENCODE rejects is an error: `d = '2024-1-1'` on a `date` column fails with `invalid date value` instead of matching no rows. Comparing values of two different custom types, such as `a = b` where `a` and `b` have types `t1` and `t2`, fails with `cannot compare type t1 with type t2`.
+
+In the PostgreSQL frontend, the built-in `date`, `timestamp` and `timestamptz` types are the exception, as in PostgreSQL: comparing two of them converts the narrower value first. A `date` becomes midnight of that day, and a `timestamp` becomes a `timestamptz` in UTC, so `ts > d` works as `ts > CAST(d AS timestamp)`. This holds in `IN` lists and subqueries, `BETWEEN` and `CASE x WHEN y` too. The SQLite frontend does not convert them, so `ts > d` is an error there.
+
+Any other value compared with a custom type is cast to that type first, the way SQLite applies a column's affinity: `d = s`, where `d` is a `date` column and `s` a `text` column, works as `d = CAST(s AS date)`, in joins, `IN` subqueries and row values too. As with a constant, a value that ENCODE rejects stops the query: if a row of `s` holds `'not a date'`, `d = s` fails with `invalid date value`. In the PostgreSQL frontend, as in PostgreSQL, only a value of unknown type, such as a string constant or the result of a function whose type is not known, is cast: `d = s` fails with `cannot compare type date with text: cast it to date first`, so write `d = CAST(s AS date)` there. A comparison, `NOT`, `IN`, `LIKE`, `BETWEEN` or `EXISTS` gives a `boolean`, so `b = (x > 0)` on a `boolean` column `b` needs no cast.
 
 The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and comparing two types with different orders fails with `cannot compare type x with type y`.
 
@@ -160,9 +171,7 @@ The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic op
 - A domain uses the operators of its base type.
 - A column of a subquery, view or CTE has the type of the value it selects. In `SELECT x + 1 FROM (SELECT d AS x FROM t)`, `x` is a date, and `x * 2` fails with `operator does not exist: date * integer`.
 
-### OPERATOR '<'
-
-`OPERATOR '<'`, with no function, says that the type can be sorted by its stored value (see [Sorting and comparing](#sorting-and-comparing)). It takes no function: `OPERATOR '<' f` fails with `OPERATOR '<' takes no function: a type that declares it sorts by its stored value`. It is the only OPERATOR clause CREATE TYPE accepts: `OPERATOR '+' f` fails with `CREATE TYPE does not accept OPERATOR '+': only OPERATOR '<' is supported`, and so do the other operators.
+CREATE TYPE has no OPERATOR clause. `CREATE TYPE t BASE text OPERATOR '<'` fails with `CREATE TYPE does not accept OPERATOR: values of a custom type sort and compare by their stored value, and have no arithmetic`.
 
 ### DEFAULT
 
@@ -172,7 +181,6 @@ The DEFAULT clause sets a type-level default value. When a column of this type d
 CREATE TYPE boolean BASE integer
     ENCODE boolean_to_int(value)
     DECODE CASE WHEN value THEN 1 ELSE 0 END
-    OPERATOR '<'
     DEFAULT 0;
 ```
 
@@ -210,24 +218,24 @@ CREATE TYPE email BASE text
 
 ## CAST Support
 
-The CAST expression applies a custom type's ENCODE logic, and its COERCE logic when the CAST gives the type's arguments (see [COERCE](#coerce)):
+`CAST(x AS t)` makes `x` a value of type `t`. It runs ENCODE (and COERCE when the CAST gives the type's arguments, see [COERCE](#coerce)) and then DECODE, so the result reads like a column of the type would:
 
 ```sql
 CREATE TYPE cents BASE integer
     ENCODE value * 100
     DECODE value / 100;
 
-SELECT CAST(42.5 AS cents);
--- 4250
+SELECT CAST(42 AS cents);
+-- 42 (stored as 4200)
+SELECT CAST('3.504' AS numeric(10,2));
+-- 3.50
 ```
 
-This is useful for converting values to the encoded form outside of INSERT/UPDATE, such as in WHERE clauses and CHECK constraints.
-
-A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the encoded value.
+A value of type `t` compares with a column of type `t` by stored value. Cast a column of another type to compare it with a custom type column: `d.x = CAST(t.s AS date)`.
 
 ## CHECK Constraints with Custom Types
 
-In STRICT tables with custom types, CHECK constraints operate on the **stored** (encoded) values. When comparing a column of a custom type against a literal, use CAST to encode the literal:
+In STRICT tables with custom types, a CHECK constraint compares a column of a custom type only with a value of the same type, so cast a literal to the type:
 
 ```sql
 CREATE TYPE cents BASE integer
@@ -240,7 +248,7 @@ CREATE TABLE products (
 ) STRICT;
 ```
 
-A function can return a value of a custom type. It returns the value as a column read gives it, after DECODE. A CHECK constraint sees the stored values instead, so when the type's DECODE changes the value, a comparison of such a call with a column would be wrong. In a STRICT table, CREATE TABLE refuses `CHECK (owner = f())` on such a column, also through `coalesce()` or `nullif()`, with `cannot compare f() in a CHECK constraint: it returns <type> values in a different form than they are stored`. A CAST of the call compared with a column of the CAST's type, as in `owner text CHECK (owner = CAST(f() AS text))`, is accepted.
+A function can return a value of a custom type. It returns the value as a column read gives it, after DECODE. A comparison, in a CHECK constraint or anywhere else, puts the call's value through the type's ENCODE first, so it is compared with the stored column value in the same form: `CHECK (owner = f())` holds when `f()` returns the same value as `owner` reads.
 
 ## Inspecting Types
 
@@ -600,7 +608,7 @@ INSERT INTO configs VALUES (2, 'not json');
 
 ### Unsigned Integer
 
-A non-negative integer type. The stored value is the integer itself, so it sorts in the same order and the type can declare `OPERATOR '<'`:
+A non-negative integer type. Values sort and compare as integers, because the stored value is the integer itself:
 
 ```sql
 CREATE TYPE uint BASE integer
@@ -608,8 +616,7 @@ CREATE TYPE uint BASE integer
         WHEN value >= 0 THEN value
         ELSE RAISE(ABORT, 'uint must be non-negative')
     END
-    DECODE value
-    OPERATOR '<';
+    DECODE value;
 
 CREATE TABLE counters (
     id INTEGER PRIMARY KEY,

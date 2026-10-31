@@ -12,7 +12,10 @@ use crate::{
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
-        expr::expr_type::{query_column_type, type_of, type_ordering, ExprType},
+        expr::{
+            expr_type::{query_column_type, type_of, type_ordering, ExprType},
+            stored_comparison_type_across_queries,
+        },
         expr_context::{ExprContext, ExprProperties},
         plan::{Plan, SelectPlan, TableReferences},
     },
@@ -478,7 +481,9 @@ impl LocaleCollationRegistry {
 /// When an operand's type has its own order (numeric and arrays), the
 /// comparison uses that order. An
 /// explicit COLLATE next to such an operand, or two operands with different
-/// orders, is an error, as in PostgreSQL. Otherwise the rules are SQLite's
+/// orders, is an error, as in PostgreSQL. So are two operands of different
+/// custom types that compare in their stored forms (see
+/// `stored_comparison_type`). Otherwise the rules are SQLite's
 /// (`sqlite3BinaryCompareCollSeq`):
 ///
 /// 1. If an operand contains a COLLATE operator anywhere outside a subquery,
@@ -508,6 +513,8 @@ pub fn comparison_collation_across_queries(
     if let Some(ordering) = common_type_ordering([(lhs, lhs_context), (rhs, rhs_context)])? {
         return Ok(CollationSeq::Type(ordering));
     }
+    // Fails for two different custom types compared in their stored forms.
+    stored_comparison_type_across_queries([(lhs, lhs_context), (rhs, rhs_context)])?;
     let catalog = lhs_context.catalog();
     let collation = if has_collate_operator(lhs) {
         expr_collation_if_any(lhs, lhs_context, catalog)?
@@ -563,9 +570,11 @@ pub fn in_list_collation(
     let operands = std::iter::once(lhs)
         .chain(rhs.iter().map(|item| item.as_ref()))
         .map(|expr| (expr, context));
-    if let Some(ordering) = common_type_ordering(operands)? {
+    if let Some(ordering) = common_type_ordering(operands.clone())? {
         return Ok(CollationSeq::Type(ordering));
     }
+    // Fails for two different custom types compared in their stored forms.
+    stored_comparison_type_across_queries(operands)?;
     expr_text_collation(lhs, context, context.catalog()).map(CollationSeq::Text)
 }
 

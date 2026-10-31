@@ -887,7 +887,7 @@ expect error {
 test cmp-index-seek-key-is-encoded {
     -- The index holds encoded values (500, 700), so a seek key is encoded
     -- before it is compared. The results match the same queries on a scan.
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(id INTEGER PRIMARY KEY, c cents) STRICT;
     INSERT INTO t VALUES (1, 5), (2, 7);
     CREATE INDEX t_c ON t(c);
@@ -1092,4 +1092,509 @@ test cmp-numeric-with-non-number-text-index {
 }
 expect error {
     invalid input syntax for type numeric: "abc"
+}
+
+# A custom type without its own order compares by its stored value, the value
+# an index keeps and ORDER BY sorts. With ENCODE -value, 1, 5 and 10 are
+# stored as -1, -5 and -10, so 10 sorts first and 1 is the largest value.
+# Scans, index searches, ORDER BY, GROUP BY, min/max and window functions must
+# all agree on that order.
+@requires strict "uses STRICT tables"
+test cmp-stored-value-order-same-everywhere {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 5), (3, 10), (4, NULL);
+    SELECT 'eq', id FROM t WHERE c = 5 ORDER BY id;
+    SELECT 'gt', id FROM t WHERE c > 4 ORDER BY id;
+    SELECT 'lt', id FROM t WHERE c < 5 ORDER BY id;
+    SELECT 'between', id FROM t WHERE c BETWEEN 10 AND 1 ORDER BY id;
+    SELECT 'in', id FROM t WHERE c IN (5, 7) ORDER BY id;
+    SELECT 'case', id FROM t WHERE CASE c WHEN 5 THEN 1 ELSE 0 END ORDER BY id;
+    SELECT 'order', id FROM t WHERE c IS NOT NULL ORDER BY c;
+    SELECT 'desc1', c FROM t ORDER BY c DESC LIMIT 1;
+    SELECT 'max', max(c), min(c) FROM t;
+    SELECT 'group', c, count(*) FROM t GROUP BY c ORDER BY c;
+    SELECT 'order-by-max', id % 2, max(c) m FROM t GROUP BY id % 2 ORDER BY m;
+    SELECT 'scalar-max', id, max(c, 7) FROM t ORDER BY id;
+    SELECT 'window-max', id, max(c) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.c < b.c ORDER BY 2, 3;
+    CREATE INDEX t_c ON t(c);
+    SELECT 'eq', id FROM t WHERE c = 5 ORDER BY id;
+    SELECT 'gt', id FROM t WHERE c > 4 ORDER BY id;
+    SELECT 'lt', id FROM t WHERE c < 5 ORDER BY id;
+    SELECT 'between', id FROM t WHERE c BETWEEN 10 AND 1 ORDER BY id;
+    SELECT 'in', id FROM t WHERE c IN (5, 7) ORDER BY id;
+    SELECT 'order', id FROM t WHERE c IS NOT NULL ORDER BY c;
+    SELECT 'desc1', c FROM t ORDER BY c DESC LIMIT 1;
+    SELECT 'max', max(c), min(c) FROM t;
+}
+expect {
+    eq|2
+    gt|1
+    lt|3
+    between|1
+    between|2
+    between|3
+    in|2
+    case|2
+    order|3
+    order|2
+    order|1
+    desc1|1
+    max|1|10
+    group||1
+    group|10|1
+    group|5|1
+    group|1|1
+    order-by-max|0|5
+    order-by-max|1|1
+    scalar-max|1|1
+    scalar-max|2|5
+    scalar-max|3|7
+    scalar-max|4|
+    window-max|1|1
+    window-max|2|1
+    window-max|3|5
+    window-max|4|10
+    join|2|1
+    join|3|1
+    join|3|2
+    eq|2
+    gt|1
+    lt|3
+    between|1
+    between|2
+    between|3
+    in|2
+    order|3
+    order|2
+    order|1
+    desc1|1
+    max|1|10
+}
+
+# ORDER BY on a compound SELECT sorts a custom type by its stored value too,
+# as it does when the same compound is a subquery.
+@requires strict "uses STRICT tables"
+test cmp-stored-value-order-compound-order-by {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 5), (3, 10), (4, NULL);
+    SELECT 'union-all', c FROM t WHERE id < 3 UNION ALL SELECT 'union-all', c FROM t WHERE id >= 3 ORDER BY 2;
+    SELECT 'union', id, c FROM t UNION SELECT 'union', id, c FROM t ORDER BY 3 DESC, 2;
+    SELECT 'subquery', x FROM (SELECT c AS x FROM t UNION ALL SELECT c FROM t WHERE 0) ORDER BY x;
+}
+expect {
+    union-all|
+    union-all|10
+    union-all|5
+    union-all|1
+    union|1|1
+    union|2|5
+    union|3|10
+    union|4|
+    subquery|
+    subquery|10
+    subquery|5
+    subquery|1
+}
+
+# CAST(x AS type) gives the stored value, so it is compared as it is, with
+# and without an index, and not encoded a second time.
+@requires strict "uses STRICT tables"
+test cmp-cast-to-type-is-stored-value {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 5), (3, 10);
+    SELECT 'eq', id FROM t WHERE c = CAST(5 AS neg) ORDER BY id;
+    SELECT 'lt', id FROM t WHERE c < CAST(5 AS neg) ORDER BY id;
+    CREATE INDEX t_c ON t(c);
+    SELECT 'eq', id FROM t WHERE c = CAST(5 AS neg) ORDER BY id;
+    SELECT 'lt', id FROM t WHERE c < CAST(5 AS neg) ORDER BY id;
+}
+expect {
+    eq|2
+    lt|3
+    eq|2
+    lt|3
+}
+
+# Each component of a row value compares the way a single value does, so with
+# ENCODE -value, (c, d) > (1, 0) holds only where c is 1, like c > 1 holds for
+# no row and c = 1 for one. This holds with and without an index on (c, d).
+@requires strict "uses STRICT tables"
+test cmp-row-value-components-use-stored-value {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg, d integer) STRICT;
+    INSERT INTO t VALUES (1, 1, 5), (2, 5, 5), (3, 10, 5);
+    SELECT 'gt', id FROM t WHERE (c, d) > (1, 0) ORDER BY id;
+    SELECT 'gt-none', id FROM t WHERE (c, d) > (1, 9) ORDER BY id;
+    SELECT 'lt', id FROM t WHERE (c, d) < (5, 9) ORDER BY id;
+    SELECT 'eq', id FROM t WHERE (c, d) = (5, 5) ORDER BY id;
+    SELECT 'in', id FROM t WHERE (c, d) IN ((5, 5), (7, 0)) ORDER BY id;
+    SELECT 'subquery', id FROM t WHERE (c, d) >= (SELECT CAST(5 AS neg), 5) ORDER BY id;
+    CREATE INDEX t_cd ON t(c, d);
+    SELECT 'gt', id FROM t WHERE (c, d) > (1, 0) ORDER BY id;
+    SELECT 'gt-none', id FROM t WHERE (c, d) > (1, 9) ORDER BY id;
+    SELECT 'lt', id FROM t WHERE (c, d) < (5, 9) ORDER BY id;
+    SELECT 'eq', id FROM t WHERE (c, d) = (5, 5) ORDER BY id;
+    SELECT 'in', id FROM t WHERE (c, d) IN ((5, 5), (7, 0)) ORDER BY id;
+    SELECT 'subquery', id FROM t WHERE (c, d) >= (SELECT CAST(5 AS neg), 5) ORDER BY id;
+}
+expect {
+    gt|1
+    lt|2
+    lt|3
+    eq|2
+    in|2
+    subquery|1
+    subquery|2
+    gt|1
+    lt|2
+    lt|3
+    eq|2
+    in|2
+    subquery|1
+    subquery|2
+}
+
+# CAST(t.s AS neg) is ENCODEd for the comparison, so
+# d.x < CAST(t.s AS neg) is -x < -s, which holds where x > s. An index or rowid
+# on t holds s itself, not -s, so the query scans t instead.
+@requires strict "uses STRICT tables"
+test cmp-plain-column-index-unused-when-cast-is-encoded {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE d(x neg) STRICT;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, s integer) STRICT;
+    INSERT INTO d VALUES (1), (2), (3);
+    INSERT INTO t VALUES (1, 1), (2, 2), (5, 5);
+    SELECT 'scan', count(*) FROM d NOT INDEXED CROSS JOIN t NOT INDEXED WHERE d.x < CAST(t.s AS neg);
+    SELECT 'automatic index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < CAST(t.s AS neg);
+    SELECT 'rowid', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < CAST(t.id AS neg);
+    CREATE INDEX t_s ON t(s);
+    SELECT 'index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < CAST(t.s AS neg);
+    SELECT 'index or', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x < CAST(t.s AS neg) OR d.x > CAST(t.s AS neg);
+}
+expect {
+    scan|3
+    automatic index|3
+    rowid|3
+    index|3
+    index or|7
+}
+
+# The date ENCODE drops the time, so CAST(t.s AS date) = d.x matches
+# '2024-01-01 10:00'. An index on t.s holds the text with the time and would
+# miss it.
+@requires strict "uses STRICT tables"
+test cmp-date-with-text-cast-same-rows-with-and-without-index {
+    CREATE TABLE d(x date) STRICT;
+    INSERT INTO d VALUES ('2024-01-01');
+    CREATE TABLE t(s text) STRICT;
+    INSERT INTO t VALUES ('2024-01-01 10:00'), ('2024-01-02');
+    SELECT 'scan', count(*) FROM d NOT INDEXED CROSS JOIN t NOT INDEXED WHERE d.x = CAST(t.s AS date);
+    SELECT 'automatic index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x = CAST(t.s AS date);
+    SELECT 'in list', count(*) FROM t WHERE CAST(t.s AS date) IN (CAST('2024-01-01' AS date), CAST('2024-01-03' AS date));
+    CREATE INDEX t_s ON t(s);
+    SELECT 'index', count(*) FROM d NOT INDEXED CROSS JOIN t WHERE d.x = CAST(t.s AS date);
+    SELECT 'index in list', count(*) FROM t WHERE CAST(t.s AS date) IN (CAST('2024-01-01' AS date), CAST('2024-01-03' AS date));
+    SELECT 'index constant', count(*) FROM t WHERE CAST(t.s AS date) = CAST('2024-01-01' AS date);
+}
+expect {
+    scan|1
+    automatic index|1
+    in list|1
+    index|1
+    index in list|1
+    index constant|1
+}
+
+# varchar has no ENCODE, so it stores text as it is and compares with any
+# text expression, as in PostgreSQL.
+@requires strict "uses STRICT tables"
+test cmp-varchar-with-text-expressions {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(10), s text) STRICT;
+    INSERT INTO t VALUES (1, 'a', 'a'), (2, 'b', 'c');
+    SELECT 'eq', id FROM t WHERE v = s;
+    SELECT 'lt', id FROM t WHERE v < s;
+    SELECT 'upper', id FROM t WHERE upper(v) = upper(s);
+    SELECT 'in', id FROM t WHERE v IN (SELECT s FROM t);
+    SELECT 'join', a.id FROM t a JOIN t b ON a.v = b.s ORDER BY a.id;
+}
+expect {
+    eq|1
+    lt|2
+    upper|1
+    in|1
+    join|1
+}
+
+# A text value compared with a date is cast to date first, the way SQLite
+# applies a column's affinity, so '2024-01-01 10:00' equals the date
+# 2024-01-01 in every plan: a hash join, a scan, an IN subquery, a scalar
+# subquery and a row value. A date function's text result is cast too.
+@requires strict "uses STRICT tables"
+test cmp-date-with-text-casts-the-text {
+    CREATE TABLE d(x date) STRICT;
+    INSERT INTO d VALUES ('2024-01-01'), ('2024-01-02');
+    CREATE TABLE t(s text) STRICT;
+    INSERT INTO t VALUES ('2024-01-01 10:00'), ('2024-01-03');
+    SELECT 'join', group_concat(d.x) FROM d JOIN t ON d.x = t.s;
+    SELECT 'scan', group_concat(d.x) FROM d NOT INDEXED CROSS JOIN t NOT INDEXED WHERE d.x = t.s;
+    SELECT 'in', group_concat(d.x) FROM d WHERE d.x IN (SELECT s FROM t);
+    SELECT 'in text', group_concat(s) FROM t WHERE t.s IN (SELECT x FROM d);
+    SELECT 'scalar', group_concat(d.x) FROM d WHERE d.x = (SELECT s FROM t LIMIT 1);
+    SELECT 'row', group_concat(d.x) FROM d, t WHERE (d.x, d.x) = (t.s, t.s);
+    SELECT 'date()', group_concat(d.x) FROM d WHERE d.x > date('2024-01-01', '+0 day');
+}
+expect {
+    join|2024-01-01
+    scan|2024-01-01
+    in|2024-01-01
+    in text|2024-01-01 10:00
+    scalar|2024-01-01
+    row|2024-01-01
+    date()|2024-01-02
+}
+
+# The cast runs the date's ENCODE, so a text value that is not a date is an
+# error, as with CAST(t.s AS date), instead of a row that silently doesn't match.
+@requires strict "uses STRICT tables"
+test cmp-date-with-text-that-is-not-a-date-is-an-error {
+    CREATE TABLE d(x date) STRICT;
+    INSERT INTO d VALUES ('2024-01-01');
+    CREATE TABLE t(s text) STRICT;
+    INSERT INTO t VALUES ('2024-01-01'), ('not a date');
+    SELECT count(*) FROM d JOIN t ON d.x = t.s;
+}
+expect error {
+    invalid date value
+}
+
+# A comparison, NOT, IS, IN or BETWEEN gives a boolean, as in PostgreSQL, so it
+# compares with a boolean column without a cast.
+@requires strict "uses STRICT tables"
+test cmp-boolean-with-truth-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b boolean, u integer) STRICT;
+    INSERT INTO t VALUES (1, 1, 1), (2, 0, 1), (3, 0, 0), (4, NULL, NULL);
+    SELECT 'cmp', group_concat(id) FROM t WHERE b = (u > 0);
+    SELECT 'is', group_concat(id) FROM t WHERE b IS (u > 0);
+    SELECT 'not', group_concat(id) FROM t WHERE b = NOT u;
+    SELECT 'isnull', group_concat(id) FROM t WHERE b = (u IS NULL);
+    SELECT 'in', group_concat(id) FROM t WHERE b = (u IN (1, 2));
+    SELECT 'between', group_concat(id) FROM t WHERE b = (u BETWEEN 1 AND 2);
+    SELECT 'join', group_concat(a.id) FROM t a JOIN t c ON a.b = (c.u = 1) WHERE c.id = 1;
+}
+expect {
+    cmp|1,3
+    is|1,3,4
+    not|2
+    isnull|2,3
+    in|1,3
+    between|1,3
+    join|1
+}
+
+# An integer column compared with a boolean is cast to boolean first.
+@requires strict "uses STRICT tables"
+test cmp-boolean-with-integer-column-casts-the-integer {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b boolean, u integer) STRICT;
+    INSERT INTO t VALUES (1, 1, 1), (2, 0, 0), (3, 1, 0);
+    SELECT group_concat(id) FROM t WHERE b = u;
+}
+expect {
+    1,2
+}
+
+# A value cast to a type compares the same in a nested loop, a hash join and
+# an IN subquery.
+@requires strict "uses STRICT tables"
+test cmp-cast-same-rows-in-every-plan {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE a(x neg) STRICT;
+    CREATE TABLE b(i integer) STRICT;
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (2), (3);
+    SELECT 'loop', count(*) FROM a NOT INDEXED CROSS JOIN b NOT INDEXED WHERE a.x = CAST(b.i AS neg);
+    SELECT 'join', count(*) FROM a JOIN b ON a.x = CAST(b.i AS neg);
+    SELECT 'in', count(*) FROM a WHERE a.x IN (SELECT CAST(i AS neg) FROM b);
+}
+expect {
+    loop|1
+    join|1
+    in|1
+}
+
+# coalesce(c, c) > 4 compares stored values: -c > -4, which holds for c = 1.
+# The comparison encodes the value of coalesce(c, c), so the query scans t
+# instead of searching the index on it.
+@requires strict "uses STRICT tables"
+test cmp-expression-index-unused-when-expression-is-encoded {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 5), (3, 10);
+    CREATE INDEX i ON t(coalesce(c, c));
+    SELECT id FROM t WHERE coalesce(c, c) > 4;
+}
+expect {
+    1
+}
+
+# An index on an expression of a custom type keeps the expression's stored
+# value, as an index on a column of the type does. ORDER BY, GROUP BY and max
+# give the same rows with and without the index, and reading the expression
+# from the index still gives the user's values.
+@requires strict "uses STRICT tables"
+test cmp-expression-index-keeps-stored-value {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg) STRICT;
+    INSERT INTO t VALUES (1, 1), (2, 5), (3, 10), (4, NULL), (5, 5);
+    SELECT 'order', coalesce(c, c) FROM t ORDER BY coalesce(c, c);
+    SELECT 'desc', coalesce(c, c) FROM t ORDER BY coalesce(c, c) DESC;
+    SELECT 'group', coalesce(c, c), count(*) FROM t GROUP BY coalesce(c, c) ORDER BY coalesce(c, c);
+    SELECT 'max', max(coalesce(c, c)), min(coalesce(c, c)) FROM t;
+    CREATE INDEX i ON t(coalesce(c, c));
+    SELECT 'order', coalesce(c, c) FROM t ORDER BY coalesce(c, c);
+    SELECT 'desc', coalesce(c, c) FROM t ORDER BY coalesce(c, c) DESC;
+    SELECT 'group', coalesce(c, c), count(*) FROM t GROUP BY coalesce(c, c) ORDER BY coalesce(c, c);
+    SELECT 'max', max(coalesce(c, c)), min(coalesce(c, c)) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    order|
+    order|10
+    order|5
+    order|5
+    order|1
+    desc|1
+    desc|5
+    desc|5
+    desc|10
+    desc|
+    group||1
+    group|10|1
+    group|5|2
+    group|1|1
+    max|1|10
+    order|
+    order|10
+    order|5
+    order|5
+    order|1
+    desc|1
+    desc|5
+    desc|5
+    desc|10
+    desc|
+    group||1
+    group|10|1
+    group|5|2
+    group|1|1
+    max|1|10
+    ok
+}
+
+# Writes keep the keys of expression indexes in stored form: an index on
+# CAST(x AS cents) keeps 500 for x = 5, while the CAST returns 5.
+@requires strict "uses STRICT tables"
+test cmp-expression-index-keys-after-writes {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg, x integer) STRICT;
+    CREATE INDEX t_c ON t(coalesce(c, c));
+    CREATE INDEX t_x ON t(CAST(x AS cents));
+    INSERT INTO t VALUES (1, 1, 1), (2, 5, 5), (3, 10, 10), (4, NULL, NULL);
+    UPDATE t SET c = 6, x = 6 WHERE id = 2;
+    DELETE FROM t WHERE id = 3;
+    INSERT INTO t VALUES (3, 7, 7) ON CONFLICT(id) DO UPDATE SET c = 0, x = 0;
+    INSERT INTO t VALUES (2, 0, 0) ON CONFLICT(id) DO UPDATE SET c = excluded.c, x = excluded.x;
+    REPLACE INTO t VALUES (1, 2, 2);
+    PRAGMA integrity_check;
+    SELECT 'order', id, coalesce(c, c) FROM t ORDER BY coalesce(c, c);
+    SELECT 'cast', id, CAST(x AS cents) FROM t ORDER BY CAST(x AS cents);
+}
+expect {
+    ok
+    order|4|
+    order|3|7
+    order|1|2
+    order|2|0
+    cast|4|
+    cast|2|0
+    cast|1|2
+    cast|3|7
+}
+
+# CREATE INDEX on a table with rows computes the same keys as INSERT does.
+@requires strict "uses STRICT tables"
+test cmp-expression-index-built-from-existing-rows {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c neg, x integer) STRICT;
+    INSERT INTO t VALUES (1, 1, 1), (2, 5, 5), (3, 10, 10), (4, NULL, NULL);
+    CREATE INDEX t_c ON t(coalesce(c, c));
+    CREATE INDEX t_x ON t(CAST(x AS cents));
+    INSERT INTO t VALUES (5, 3, 3);
+    PRAGMA integrity_check;
+    SELECT 'order', id FROM t ORDER BY coalesce(c, c);
+    SELECT 'cast', id, CAST(x AS cents) FROM t WHERE x IS NOT NULL ORDER BY CAST(x AS cents);
+}
+expect {
+    ok
+    order|4
+    order|3
+    order|2
+    order|5
+    order|1
+    cast|1|1
+    cast|5|3
+    cast|2|5
+    cast|3|10
+}
+
+# A value compared with a date column goes through the date's ENCODE, so a
+# malformed date fails the same way in a table scan and in an index search.
+@requires strict "uses STRICT tables"
+test cmp-date-malformed-literal-scan {
+    CREATE TABLE d(x date) STRICT;
+    INSERT INTO d VALUES ('2024-01-01');
+    SELECT count(*) FROM d WHERE x = '2024-1-1';
+}
+expect error {
+    invalid date value
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-malformed-literal-index {
+    CREATE TABLE d(x date) STRICT;
+    INSERT INTO d VALUES ('2024-01-01');
+    CREATE INDEX d_x ON d(x);
+    SELECT count(*) FROM d WHERE x = '2024-1-1';
+}
+expect error {
+    invalid date value
+}
+
+# Two custom types have two stored forms, and neither fits both values.
+@requires strict "uses STRICT tables"
+test cmp-two-custom-types-is-an-error {
+    CREATE TYPE neg BASE integer ENCODE -value DECODE -value;
+    CREATE TYPE neg2 BASE integer ENCODE -value DECODE -value;
+    CREATE TABLE t(c neg) STRICT;
+    CREATE TABLE u(d neg2) STRICT;
+    SELECT count(*) FROM t, u WHERE t.c = u.d;
+}
+expect error {
+    cannot compare type neg with type neg2
+}
+
+# Only the PostgreSQL frontend converts a date to a timestamp before comparing
+# them. With SQLite's rules they are two different custom types.
+@requires strict "uses STRICT tables"
+test cmp-date-with-timestamp-is-an-error {
+    CREATE TABLE t(d date, ts timestamp) STRICT;
+    SELECT count(*) FROM t WHERE ts > d;
+}
+expect error {
+    cannot compare type timestamp with type date
 }

@@ -133,7 +133,7 @@ use std::sync::OnceLock;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, NullsOrder, RefAct, ResolveType,
-    SortOrder, TableInternalId, TypeOperator,
+    SortOrder, TableInternalId,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -249,7 +249,6 @@ pub enum TypeDefKind {
         /// own order, such as numeric. `None` compares the stored values as
         /// SQLite does.
         ordering: Option<TypeOrdering>,
-        operators: std::vec::Vec<TypeOperator>,
         /// How operators such as `+` and `-x` run on values of this type.
         operator_signatures: std::vec::Vec<OperatorSignature>,
         default: Option<Box<ast::Expr>>,
@@ -434,6 +433,22 @@ impl ResolvedType {
         self.chain.iter().find(|type_def| !type_def.is_domain)
     }
 
+    /// The type without its domains, whose ENCODE turns a value into what a
+    /// column of this type stores: a domain stores its values as its base type
+    /// does. None when the type stores values as they are.
+    pub fn stored_form(&self) -> crate::Result<Option<ResolvedType>> {
+        let Some(base) = self.chain.iter().position(|type_def| !type_def.is_domain) else {
+            return Ok(None);
+        };
+        if self.chain[base..].iter().all(|td| td.encode().is_none()) {
+            return Ok(None);
+        }
+        Ok(Some(ResolvedType {
+            primitive: self.primitive.clone(),
+            chain: self.chain[base..].try_to_vec()?,
+        }))
+    }
+
     pub fn reads_stored_values_unchanged(&self) -> bool {
         self.chain.iter().all(|td| {
             matches!(td.kind, TypeDefKind::Custom { .. }) && td.decode_returns_value_unchanged()
@@ -550,24 +565,6 @@ impl TypeDef {
         }
     }
 
-    /// Whether ORDER BY and CREATE INDEX accept values of the type. A type
-    /// with its own order sorts in it. Otherwise values sort by their stored
-    /// value, which only keeps the order of the decoded values when the type
-    /// says so with OPERATOR '<' (or has no DECODE, so the two are the same).
-    pub fn is_sortable(&self) -> bool {
-        self.ordering().is_some()
-            || self.decode().is_none()
-            || self.operators().iter().any(|op| op.op == "<")
-    }
-
-    /// Returns the operators (Custom types only, empty for Struct/Union).
-    pub fn operators(&self) -> &[TypeOperator] {
-        match &self.kind {
-            TypeDefKind::Custom { operators, .. } => operators,
-            _ => &[],
-        }
-    }
-
     /// Whether arithmetic with an integer or a decimal gives a value of this
     /// type, as `numeric + 1` gives a numeric.
     pub fn computes_with_exact_numbers(&self) -> bool {
@@ -650,7 +647,6 @@ impl TypeDef {
                 encode,
                 coerce,
                 decode,
-                operators,
                 default,
             } => {
                 // CREATE TYPE checks where type parameters are used. A type
@@ -675,7 +671,6 @@ impl TypeDef {
                         coerce: coerce.clone(),
                         decode: decode.clone(),
                         ordering,
-                        operators: operators.clone(),
                         operator_signatures,
                         default: default.clone(),
                     },
@@ -768,7 +763,6 @@ impl TypeDef {
                 decode: None,
                 // A domain has the order and arithmetic of the type it is based on.
                 ordering: None,
-                operators: std::vec::Vec::new(),
                 operator_signatures: std::vec::Vec::new(),
                 default,
             },
@@ -1185,14 +1179,14 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
 
     let type_sqls: &[&str] = &[
         #[cfg(feature = "uuid")]
-        "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'",
-        "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+        "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value)",
+        "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END",
         #[cfg(feature = "json")]
         "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value",
+        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -1201,16 +1195,16 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         // the fraction outright, silently dropping precision on insert.
         // Caveat: Turso's `%f` directive is millisecond resolution, so PG's
         // microsecond inputs are clamped to 3 digits (`.123456` -> `.123`).
-        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'",
+        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value",
+        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value",
+        "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value",
+        "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END",
         "CREATE TYPE bigint(value integer) BASE integer",
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
         "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
+        "CREATE TYPE bytea(value blob) BASE blob",
         "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)",
     ];
 
@@ -7688,13 +7682,6 @@ impl Column {
     #[inline]
     pub fn type_ordering(&self) -> Option<TypeOrdering> {
         self.type_ordering
-    }
-    /// Whether an index on this column is ordered differently from how its
-    /// values compare. A custom type without an ordering is indexed by its
-    /// stored form, which does not sort like the values the column reads as,
-    /// so such an index can serve `=` but not a range or ORDER BY.
-    pub fn index_order_differs_from_value_order(&self, schema: &Schema, is_strict: bool) -> bool {
-        self.type_ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
     }
     /// Fill in what a column of a STRICT table gets from its custom type: the
     /// type, affinity and key order of the type it is stored as. Every path
