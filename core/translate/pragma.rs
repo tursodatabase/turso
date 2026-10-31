@@ -770,8 +770,10 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::ForeignKeys => {
-            let enabled = parse_pragma_enabled(&value);
-            connection.set_foreign_keys_enabled(enabled);
+            if connection.get_auto_commit() {
+                let enabled = parse_pragma_enabled(&value);
+                connection.set_foreign_keys_enabled(enabled);
+            }
             Ok(TransactionMode::None)
         }
         PragmaName::IAmADummy | PragmaName::RequireWhere => {
