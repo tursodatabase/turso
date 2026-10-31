@@ -1,7 +1,9 @@
 mod function;
 mod vtab;
 
-pub use function::{Aggregate, AggregateFunction, FunctionArity, ScalarCall, ScalarFunction};
+pub use function::{
+    Aggregate, AggregateFunction, FunctionArity, ReturnType, ScalarCall, ScalarFunction,
+};
 pub use turso_ext::{ConstraintInfo, ConstraintUsage, IndexInfo, OrderByInfo, VTabKind};
 pub use vtab::{TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
 

@@ -215,8 +215,8 @@ mod tests {
             db_path,
             OpenOptions::new(Arc::new(SqliteDialect)),
         )?;
-        let writer = db.connect(ConnectOpts::new())?;
-        let observer = db.connect(ConnectOpts::new())?;
+        let writer = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
+        let observer = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
         writer.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")?;
         writer.execute("BEGIN")?;

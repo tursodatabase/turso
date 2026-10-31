@@ -21,7 +21,7 @@ use turso_core::{
 fn open_conn(io: Arc<MemoryYieldIO>, path: &str) -> Arc<Connection> {
     Database::open_file(io, path, Arc::new(SqliteDialect))
         .unwrap()
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
         .unwrap()
 }
 

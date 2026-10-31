@@ -1716,7 +1716,9 @@ mod typed_value_order_tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(n numeric(10,2), a integer[], b text[]) STRICT")
             .unwrap();
         conn.execute("CREATE TABLE u(m numeric(10,2)) STRICT")

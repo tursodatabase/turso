@@ -384,7 +384,7 @@ impl FtsFixture {
             turso_core::OpenOptions::new(Arc::new(turso_core::SqliteDialect))
                 .db_opts(turso_core::DatabaseOpts::new().with_index_method(true)),
         )?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         conn.execute("BEGIN")?;
         conn.execute("SELECT count(*) FROM docs")?;
         let mut dumper = turso_core::index_method::fts::FtsBackingRowDumper::new(

@@ -459,11 +459,11 @@ fn test_pragma_vtab_query_with_limit_then_write(db: TempDatabase) {
 fn test_connection_pragma_waits_for_io() -> anyhow::Result<()> {
     let io = Arc::new(QueuedIo::new());
     let db = Database::open_file(io, "pragma-waits-for-io.db", Arc::new(SqliteDialect))?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     conn.execute("CREATE TABLE t1(a)")?;
     conn.execute("INSERT INTO t1 VALUES (1)")?;
     // A new connection starts with an empty page cache.
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     assert_that!(conn.pragma("integrity_check", 10)?)
         .is_equal_to(vec![vec![Value::from_text("ok")]]);
     Ok(())

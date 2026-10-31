@@ -315,7 +315,7 @@ impl Whopper {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let connection = database.connect(ConnectOpts::new())?;
+        let connection = database.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         check_fts_connection(&connection, self.context.enable_mvcc)?;
         let rows = query(
             &connection,

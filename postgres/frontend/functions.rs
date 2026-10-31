@@ -3,7 +3,8 @@ use crate::error::sqlstate_error;
 use crate::settings::SettingScope;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
-use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
+use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction};
+use turso_core::security::roles::RoleId;
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
@@ -22,6 +23,7 @@ pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
                 function.name().to_string(),
                 function.arity(),
                 function.is_deterministic(),
+                Some(function.return_type()),
                 *function,
             )
             .expect("PostgreSQL function declarations have valid argument counts"),
@@ -31,7 +33,7 @@ pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
 }
 
 macro_rules! scalar_functions {
-    ($($($variant:ident)|+($arity:expr, $deterministic:expr)),* $(,)?) => {
+    ($($($variant:ident)|+($arity:expr, $deterministic:expr, $return_type:ident)),* $(,)?) => {
         #[derive(Debug, Clone, Copy, strum::AsRefStr)]
         #[strum(serialize_all = "snake_case")]
         enum PgScalarFunction {
@@ -56,46 +58,54 @@ macro_rules! scalar_functions {
                     $($(Self::$variant)|+ => $deterministic,)*
                 }
             }
+
+            fn return_type(&self) -> ReturnType {
+                match self {
+                    $($(Self::$variant)|+ => ReturnType::$return_type,)*
+                }
+            }
         }
     };
 }
 
 scalar_functions! {
-    Acldefault(FunctionArity::Exact(2), true),
-    PgGetUserbyid(FunctionArity::Exact(1), true),
-    PgTableIsVisible | PgFunctionIsVisible | PgTypeIsVisible(FunctionArity::Exact(1), true),
-    PgEncodingToChar(FunctionArity::Exact(1), true),
-    PgGetFunctionResult | PgGetFunctionArguments | PgGetStatisticsobjdefColumns | PgRelationIsPublishable(
-        FunctionArity::Exact(1), true
+    Acldefault(FunctionArity::Exact(2), true, Text),
+    PgGetUserbyid(FunctionArity::Exact(1), false, Text),
+    PgTableIsVisible | PgFunctionIsVisible | PgTypeIsVisible(FunctionArity::Exact(1), true, Integer),
+    PgEncodingToChar(FunctionArity::Exact(1), true, Text),
+    PgGetFunctionResult | PgGetFunctionArguments | PgGetStatisticsobjdefColumns(
+        FunctionArity::Exact(1), true, Text
     ),
-    QuoteIdent(FunctionArity::Exact(1), true),
-    QuoteLiteral(FunctionArity::Exact(1), true),
-    FormatType(FunctionArity::OneOf(&[1, 2]), true),
-    PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), false),
-    PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), false),
-    PgGetTriggerdef(FunctionArity::OneOf(&[1, 2]), false),
-    ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
-    PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
-    ToChar(FunctionArity::Exact(2), true),
-    Age(FunctionArity::OneOf(&[1, 2]), false),
-    PgInputIsValid(FunctionArity::Exact(2), true),
-    Textlike(FunctionArity::Exact(2), true),
-    LikeEscape(FunctionArity::Exact(2), true),
-    SimilarToEscape(FunctionArity::OneOf(&[1, 2]), true),
-    Booleq(FunctionArity::Exact(2), true),
-    Boolne(FunctionArity::Exact(2), true),
-    ColDescription(FunctionArity::Exact(2), true),
-    SetConfig(FunctionArity::Exact(3), false),
-    CurrentSetting(FunctionArity::OneOf(&[1, 2]), false),
-    Version(FunctionArity::Exact(0), true),
-    CurrentDatabase(FunctionArity::Exact(0), false),
-    CurrentSchema(FunctionArity::Exact(0), true),
-    CurrentSchemas(FunctionArity::Exact(1), false),
-    PgBackendPid(FunctionArity::Exact(0), true),
-    PgIsInRecovery(FunctionArity::Exact(0), false),
-    PgLockAccessShare(FunctionArity::Exact(0), false),
-    PgLimitValue(FunctionArity::Exact(2), true),
-    Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false),
+    PgRelationIsPublishable(FunctionArity::Exact(1), true, Integer),
+    QuoteIdent(FunctionArity::Exact(1), true, Text),
+    QuoteLiteral(FunctionArity::Exact(1), true, Text),
+    FormatType(FunctionArity::OneOf(&[1, 2]), true, Text),
+    PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), false, Text),
+    PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), false, Text),
+    PgGetTriggerdef(FunctionArity::OneOf(&[1, 2]), false, Text),
+    ObjDescription(FunctionArity::OneOf(&[1, 2]), true, Text),
+    PgGetExpr(FunctionArity::OneOf(&[2, 3]), true, Text),
+    ToChar(FunctionArity::Exact(2), true, Text),
+    Age(FunctionArity::OneOf(&[1, 2]), false, Text),
+    PgInputIsValid(FunctionArity::Exact(2), true, Integer),
+    Textlike(FunctionArity::Exact(2), true, Integer),
+    LikeEscape(FunctionArity::Exact(2), true, Text),
+    SimilarToEscape(FunctionArity::OneOf(&[1, 2]), true, Text),
+    Booleq(FunctionArity::Exact(2), true, Integer),
+    Boolne(FunctionArity::Exact(2), true, Integer),
+    ColDescription(FunctionArity::Exact(2), true, Text),
+    SetConfig(FunctionArity::Exact(3), false, Text),
+    CurrentSetting(FunctionArity::OneOf(&[1, 2]), false, Text),
+    Version(FunctionArity::Exact(0), true, Text),
+    CurrentDatabase(FunctionArity::Exact(0), false, Text),
+    CurrentSchema(FunctionArity::Exact(0), true, Text),
+    CurrentSchemas(FunctionArity::Exact(1), false, Text),
+    CurrentUser | SessionUser(FunctionArity::Exact(0), false, Text),
+    PgBackendPid(FunctionArity::Exact(0), true, Integer),
+    PgIsInRecovery(FunctionArity::Exact(0), false, Text),
+    PgLockAccessShare(FunctionArity::Exact(0), false, Integer),
+    PgLimitValue(FunctionArity::Exact(2), true, Integer),
+    Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false, Text),
 }
 
 impl ScalarFunction for PgScalarFunction {
@@ -109,8 +119,10 @@ impl ScalarFunction for PgScalarFunction {
 impl ScalarCall for PgScalarFunction {
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         let value = match self {
-            Self::Acldefault => exec_acl_default(args)?,
-            Self::PgGetUserbyid => oid_arg(args, 0)?.map_or(Value::Null, exec_pg_get_user_by_id),
+            Self::Acldefault => exec_acl_default(connection, args)?,
+            Self::PgGetUserbyid => {
+                oid_arg(args, 0)?.map_or(Value::Null, |oid| exec_pg_get_user_by_id(connection, oid))
+            }
             Self::PgTableIsVisible | Self::PgFunctionIsVisible | Self::PgTypeIsVisible => {
                 oid_arg(args, 0)?.map_or(Value::Null, exec_pg_is_visible)
             }
@@ -156,6 +168,8 @@ impl ScalarCall for PgScalarFunction {
                 None => Value::Null,
             },
             Self::CurrentSchemas => exec_current_schemas(connection, args[0].get_value())?,
+            Self::CurrentUser => role_name(connection, connection.current_role()),
+            Self::SessionUser => role_name(connection, connection.session_role()),
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -233,7 +247,7 @@ fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Value> {
     Ok(Value::build_text(result))
 }
 
-fn exec_acl_default(args: &[Register]) -> Result<Value> {
+fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Value> {
     if matches!(args[0].get_value(), Value::Null) || matches!(args[1].get_value(), Value::Null) {
         return Ok(Value::Null);
     }
@@ -263,15 +277,7 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
-    // TODO: This hardcoded role mapping is temporary pg_dump compatibility.
-    // Replace it with a real role OID-to-name lookup later. Keep the numeric fallback for unknown OIDs.
-    let role = if owner == 10 {
-        "turso".to_string()
-    } else if owner == PG_DATABASE_OWNER_OID {
-        "pg_database_owner".to_string()
-    } else {
-        owner.to_string()
-    };
+    let role = acl_role_name(&role_name_by_oid(conn, owner).unwrap_or_else(|| owner.to_string()));
     let mut entries = Vec::with_capacity(2);
     if !public_privileges.is_empty() {
         entries.push(format!("={public_privileges}/{role}"));
@@ -280,7 +286,31 @@ fn exec_acl_default(args: &[Register]) -> Result<Value> {
         let grantee = if owner == 0 { "" } else { &role };
         entries.push(format!("{grantee}={owner_privileges}/{role}"));
     }
-    Ok(Value::build_text(format!("{{{}}}", entries.join(","))))
+    let elements: Vec<String> = entries.iter().map(|entry| array_element(entry)).collect();
+    Ok(Value::build_text(format!("{{{}}}", elements.join(","))))
+}
+
+fn acl_role_name(name: &str) -> String {
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return name.to_string();
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn array_element(element: &str) -> String {
+    let needs_quotes = element.is_empty()
+        || element.eq_ignore_ascii_case("NULL")
+        || element.chars().any(|c| {
+            matches!(
+                c,
+                '"' | '\\' | '{' | '}' | ',' | ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'
+            )
+        });
+    if !needs_quotes {
+        return element.to_string();
+    }
+    let escaped = element.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 #[derive(strum::EnumString)]
@@ -621,12 +651,27 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Value> {
     Ok(Value::from_i64(value))
 }
 
-fn exec_pg_get_user_by_id(oid: i64) -> Value {
-    Value::build_text(if oid == PG_DATABASE_OWNER_OID {
-        "pg_database_owner"
-    } else {
-        "turso"
-    })
+fn role_name(conn: &Connection, role: RoleId) -> Value {
+    let roles = conn.role_catalog();
+    let role = roles
+        .get(role)
+        .expect("the role of a connection is in its role catalog");
+    Value::build_text(role.name.clone())
+}
+
+fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> Value {
+    let name = role_name_by_oid(conn, oid).unwrap_or_else(|| format!("unknown (OID={oid})"));
+    Value::build_text(name)
+}
+
+fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
+    if oid == PG_DATABASE_OWNER_OID {
+        return Some("pg_database_owner".to_string());
+    }
+    conn.role_catalog()
+        .iter()
+        .find(|role| role.id != RoleId::PUBLIC && crate::catalog::role_oid(role.id) == oid)
+        .map(|role| role.name.clone())
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {

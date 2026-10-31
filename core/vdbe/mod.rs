@@ -1178,6 +1178,10 @@ pub struct ProgramState {
     /// When a constraint error occurs with FAIL resolve type in autocommit mode,
     /// we need to commit partial changes before returning the error.
     pub(crate) pending_fail_error: Option<LimboError>,
+    /// The role that `SetRole` switches the connection to once the statement
+    /// completes. An interrupted or failed statement leaves the role as it
+    /// was.
+    pub(crate) role_to_set: Option<crate::security::roles::RoleId>,
     /// A FAIL-mode error ends the statement without reaching the normal
     /// Halt completion, but keeps the rows written before it. Keep the error
     /// here while those rows reach the materialized views and their
@@ -1337,6 +1341,7 @@ impl ProgramState {
             n_total_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
+            role_to_set: None,
             pending_fail_prepare_error: None,
             halt_in_progress: false,
             pending_cdc_info: None,
@@ -1513,6 +1518,7 @@ impl ProgramState {
         // reset has exclusive access, so no lock or atomic store is needed.
         self.explain_state.get_mut().clear();
         self.pending_fail_error = None;
+        self.role_to_set = None;
         self.pending_fail_prepare_error = None;
         self.halt_in_progress = false;
         self.pending_cdc_info = None;
@@ -4529,7 +4535,9 @@ mod tests {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
                 crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);

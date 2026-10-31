@@ -20,7 +20,7 @@ fn native_scalar_accepts_only_declared_argument_counts() {
         FunctionArity::OneOf(&[1, usize::MAX]),
     ] {
         assert!(matches!(
-            ExternalFunc::new_native_scalar("invalid".into(), arity, false, NullToNine),
+            ExternalFunc::new_native_scalar("invalid".into(), arity, false, None, NullToNine),
             Err(LimboError::InvalidArgument(_))
         ));
     }
@@ -30,6 +30,7 @@ fn native_scalar_accepts_only_declared_argument_counts() {
                 "null_to_nine".into(),
                 FunctionArity::OneOf(&[1, 3]),
                 false,
+                None,
                 NullToNine,
             )
             .unwrap(),
@@ -67,6 +68,41 @@ fn native_scalar_accepts_only_declared_argument_counts() {
 }
 
 #[test]
+fn native_scalar_with_a_declared_return_type_can_be_called_in_a_strict_check_constraint() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "typed_nine".into(),
+                    FunctionArity::Exact(1),
+                    true,
+                    Some(ReturnType::Integer),
+                    NullToNine,
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "untyped_nine".into(),
+                    FunctionArity::Exact(1),
+                    true,
+                    None,
+                    NullToNine,
+                )
+                .unwrap(),
+            ),
+    );
+
+    conn.execute("CREATE TABLE typed (x INTEGER CHECK (x = typed_nine(NULL))) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO typed VALUES (9)").unwrap();
+    assert!(conn.execute("INSERT INTO typed VALUES (8)").is_err());
+    assert!(conn
+        .execute("CREATE TABLE untyped (x INTEGER CHECK (x = untyped_nine(NULL))) STRICT")
+        .is_err());
+}
+
+#[test]
 fn native_scalar_borrows_the_same_registers_across_io() {
     let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
     let args = [
@@ -78,6 +114,7 @@ fn native_scalar_borrows_the_same_registers_across_io() {
         "register_probe".into(),
         FunctionArity::Exact(2),
         false,
+        None,
         RegisterProbe {
             args_address: args.as_ptr() as usize,
             queue: queue.clone(),
@@ -100,12 +137,16 @@ fn native_scalar_receives_each_executing_connection() {
                 "connection_changes".into(),
                 FunctionArity::Exact(1),
                 false,
+                None,
                 ConnectionChanges,
             )
             .unwrap(),
         ),
     );
-    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+    let other = conn
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     conn.execute("CREATE TABLE t(x)").unwrap();
     conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
     other.execute("INSERT INTO t VALUES (4)").unwrap();
@@ -130,6 +171,7 @@ fn native_scalar_connection_context_survives_io_and_helper_queries() {
                 "connection_context_read".into(),
                 FunctionArity::Exact(1),
                 false,
+                None,
                 ConnectionContextRead {
                     queue: queue.clone(),
                 },
@@ -140,11 +182,17 @@ fn native_scalar_connection_context_survives_io_and_helper_queries() {
     let context = Arc::new(AtomicI64::new(7));
     let first = plain
         .db
-        .connect_with_context(crate::ConnectOpts::new(), context.clone())
+        .connect_with_context(
+            ConnectOpts::new(crate::SessionRole::Superuser),
+            context.clone(),
+        )
         .unwrap();
     let second = plain
         .db
-        .connect_with_context(crate::ConnectOpts::new(), Arc::new(AtomicI64::new(19)))
+        .connect_with_context(
+            ConnectOpts::new(crate::SessionRole::Superuser),
+            Arc::new(AtomicI64::new(19)),
+        )
         .unwrap();
     let mut statement = first.prepare("SELECT connection_context_read(1)").unwrap();
     assert!(matches!(statement.step().unwrap(), StepResult::IO));
@@ -236,6 +284,7 @@ fn native_scalar_preserves_unmatched_outer_join_rows() {
                 "null_to_nine".into(),
                 FunctionArity::Exact(1),
                 false,
+                None,
                 NullToNine,
             )
             .unwrap(),
@@ -266,6 +315,7 @@ fn native_scalar_helper_queries_resume_with_independent_call_state() {
                 "nested_sum".into(),
                 FunctionArity::Exact(1),
                 false,
+                None,
                 NestedSum {
                     queue: queue.clone(),
                 },
@@ -301,6 +351,7 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                             "nested_sum".into(),
                             FunctionArity::Exact(1),
                             false,
+                            None,
                             NestedSum {
                                 queue: queue.clone(),
                             },
@@ -404,7 +455,10 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                     );
                 }
                 conn.execute("INSERT INTO audit VALUES (504)").unwrap();
-                let other = conn.db.connect(ConnectOpts::new()).unwrap();
+                let other = conn
+                    .db
+                    .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                    .unwrap();
                 for table in ["parent", "child"] {
                     assert!(other
                         .prepare(format!("SELECT id FROM {table}"))
@@ -445,6 +499,7 @@ fn io_error_in_a_read_statement_rolls_back_the_transaction() {
                     "gated_seven".into(),
                     FunctionArity::Exact(1),
                     false,
+                    None,
                     GatedSeven {
                         queue: queue.clone(),
                     },
@@ -615,6 +670,7 @@ fn extension_constructors_validate_argument_counts() {
                     count => FunctionArity::Exact(count as usize),
                 },
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -740,6 +796,7 @@ fn scalar_calls_resume_independently_and_create_once() {
                 "DeLaYeD".into(),
                 FunctionArity::Exact(2),
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: created.clone(),
@@ -750,7 +807,10 @@ fn scalar_calls_resume_independently_and_create_once() {
         ),
     );
     let mut first = conn.prepare("SELECT delayed(7, 3)").unwrap();
-    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+    let other = conn
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     let mut second = other.prepare("SELECT delayed(2, 9)").unwrap();
     assert!(matches!(first.step().unwrap(), StepResult::IO));
     assert!(matches!(second.step().unwrap(), StepResult::IO));
@@ -777,6 +837,7 @@ fn resetting_a_pending_scalar_drops_it_and_starts_a_new_call() {
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: created.clone(),
@@ -805,6 +866,7 @@ fn scalar_error_after_io_drops_the_call_and_preserves_the_error() {
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -834,6 +896,7 @@ fn failed_completion_releases_the_pending_scalar() {
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -868,6 +931,7 @@ fn abort_releases_nested_trigger_calls_and_restores_trigger_state() {
                     "delayed".into(),
                     FunctionArity::Exact(2),
                     false,
+                    None,
                     DelayedScalar {
                         queue: queue.clone(),
                         created: Arc::new(AtomicUsize::new(0)),
@@ -973,7 +1037,10 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
         ]
     );
     assert_eq!(created.load(Ordering::SeqCst), 4);
-    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+    let other = conn
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     other.set_vdbe_trace(true);
     let mut empty = other.prepare("SELECT weighted(3, 7) WHERE 0").unwrap();
     assert_eq!(
@@ -1299,7 +1366,10 @@ fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl()
             collect(&mut stmt, &queue),
             vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
         );
-        let other = conn.db.connect(ConnectOpts::new()).unwrap();
+        let other = conn
+            .db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         other.execute("CREATE TABLE unrelated(value)").unwrap();
         stmt.reset().unwrap();
         assert_eq!(
@@ -1350,7 +1420,9 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
         let expected_rows = vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]];
         {
             let db = open();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             if mvcc {
                 conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
             }
@@ -1365,7 +1437,9 @@ fn native_table_function_views_survive_checkpoint_and_reopen() {
             assert_eq!(columns(&conn), expected_columns);
         }
         let db = open();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         assert_eq!(columns(&conn), expected_columns);
         let mut stmt = conn
             .prepare("SELECT * FROM native_view ORDER BY value")
@@ -1688,6 +1762,7 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
             "delayed".into(),
             FunctionArity::Exact(2),
             false,
+            None,
             DelayedScalar {
                 queue: queue.clone(),
                 created: created.clone(),
@@ -1727,6 +1802,7 @@ fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end(
                 "delayed".into(),
                 FunctionArity::Exact(2),
                 false,
+                None,
                 DelayedScalar {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
@@ -1805,7 +1881,10 @@ fn c_extensions_still_execute_with_native_registration() {
                     .unwrap(),
             ),
     );
-    let other = conn.db.connect(ConnectOpts::new()).unwrap();
+    let other = conn
+        .db
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap();
     assert_eq!(
         other
             .prepare("SELECT c_open_double(7)")
@@ -1919,7 +1998,7 @@ fn c_and_native_tables_share_cursor_dispatch() {
 fn connection(options: OpenOptions) -> Arc<Connection> {
     Database::open(Arc::new(MemoryIO::new()), ":memory:", options)
         .unwrap()
-        .connect(ConnectOpts::new())
+        .connect(ConnectOpts::new(crate::SessionRole::Superuser))
         .unwrap()
 }
 
