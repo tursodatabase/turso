@@ -2259,8 +2259,18 @@ impl Connection {
         use crate::Buffer;
 
         let buffer = Arc::new(Buffer::new_temporary(frame.len()));
-        let c = self.pager.load().wal_get_frame(frame_no, buffer.clone())?;
-        self.db.io.wait_for_completion(c)?;
+        let pager = self.pager.load();
+        let started_read_tx = !pager.holds_read_lock();
+        if started_read_tx {
+            pager.begin_read_tx()?;
+        }
+        let result = pager
+            .wal_get_frame(frame_no, buffer.clone())
+            .and_then(|c| self.db.io.wait_for_completion(c));
+        if started_read_tx {
+            pager.end_read_tx();
+        }
+        result?;
         frame.copy_from_slice(buffer.as_slice());
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
