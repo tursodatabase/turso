@@ -1393,7 +1393,13 @@ pub fn insn_to_row(
                     data.func.as_str().to_string()
                 }),
                 0,
-                format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
+                match data.skip_reg {
+                    Some(skip_reg) => format!(
+                        "accum=r[{}] step(r[{}]) r[{}]=kept value",
+                        data.acc_reg, data.col, skip_reg
+                    ),
+                    None => format!("accum=r[{}] step(r[{}])", data.acc_reg, data.col),
+                },
             ),
             Insn::AggInverse {
                 func,
