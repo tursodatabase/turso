@@ -2197,6 +2197,12 @@ fn translate_function_call_star_expr(
     }
 
     let func = func_type.unwrap();
+    if !matches!(func, Func::Agg(_) | Func::Window(_)) {
+        resolver
+            .catalog
+            .dialect
+            .check_star_call_of_plain_function(name.as_str())?;
+    }
 
     // Check if this function supports the (*) syntax by verifying it can be called with 0 args
     match &func {
