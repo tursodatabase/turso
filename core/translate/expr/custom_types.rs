@@ -305,9 +305,7 @@ pub(crate) fn emit_store_value(
     resolver: &Resolver,
 ) -> Result<()> {
     for type_def in chain {
-        if let Some(encode) = type_def.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
-        }
+        emit_encode(program, type_def, reg, resolver)?;
         emit_coerce(program, type_def, reg, type_params, resolver)?;
     }
     Ok(())
@@ -1018,11 +1016,22 @@ pub(crate) fn emit_stored_form(
         target_pc: skip_null,
     });
     for td in &ty.chain {
-        if let Some(encode) = td.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
-        }
+        emit_encode(program, td, reg, resolver)?;
     }
     program.preassign_label_to_next_insn(skip_null);
+    Ok(())
+}
+
+/// Runs the type's own ENCODE on the value in `reg`, if it has one.
+fn emit_encode(
+    program: &mut ProgramBuilder,
+    type_def: &TypeDef,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if let Some(encode) = type_def.encode() {
+        emit_type_expr(program, encode, reg, reg, resolver)?;
+    }
     Ok(())
 }
 

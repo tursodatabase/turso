@@ -989,6 +989,58 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
 
+@setup auth_functions
+test auth-uid-check-constraint-rejects-another-uuid {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = auth.uid()));
+    INSERT INTO owned VALUES ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22');
+}
+@sqlstate 23514
+expect error {
+    check constraint
+}
+
+@setup auth_functions
+test auth-uid-check-constraint-accepts-null {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = auth.uid()));
+    INSERT INTO owned VALUES (NULL);
+    SELECT count(*) FROM owned WHERE owner IS NULL;
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    1
+}
+
+# Same for UPDATE: the CHECK runs again on the new row.
+@setup auth_functions
+test auth-uid-check-constraint-runs-on-update {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = auth.uid()));
+    INSERT INTO owned VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    UPDATE owned SET owner = 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22';
+}
+@sqlstate 23514
+expect error {
+    check constraint
+}
+
+@setup auth_functions
+test auth-uid-finds-the-rows-of-a-uuid-column {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (id int, owner uuid);
+    INSERT INTO owned VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11');
+    INSERT INTO owned VALUES (2, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22');
+    SELECT id FROM owned WHERE owner = auth.uid();
+    CREATE INDEX owned_owner ON owned (owner);
+    SELECT id FROM owned WHERE owner = auth.uid();
+}
+expect {
+    a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+    1
+    1
+}
+
 # coalesce(), nullif() and CASE give auth.uid()'s value unchanged, so comparing
 # them with a uuid column works as well. tursopg cannot find the type of the
 # CASE, so it refuses that CHECK constraint.
@@ -1027,8 +1079,33 @@ expect {
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
     a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
 }
+# tursopg's CHECK type checker does not accept any CASE inside a comparison in a
+# STRICT table, whatever the types: `a text CHECK (a = CASE WHEN true THEN 'x' END)`
+# fails the same way.
 expect @tursopg error {
     cannot determine type of expression in CHECK constraint
+}
+
+@setup auth_functions
+test auth-uid-in-coalesce-in-a-check-constraint-rejects-another-uuid {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = coalesce(auth.uid(), 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')));
+    INSERT INTO owned VALUES ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22');
+}
+@sqlstate 23514
+expect error {
+    check constraint
+}
+
+@setup auth_functions
+test auth-uid-in-nullif-in-a-check-constraint-rejects-another-uuid {
+    SELECT set_config('request.jwt.claim.sub', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', false);
+    CREATE TABLE owned (owner uuid CHECK (owner = nullif(auth.uid(), 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')));
+    INSERT INTO owned VALUES ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22');
+}
+@sqlstate 23514
+expect error {
+    check constraint
 }
 
 # A CAST of auth.uid() to text compares text with text, so the CHECK constraint
