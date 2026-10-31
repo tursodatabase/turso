@@ -89,6 +89,9 @@ Returns a number that changes when another connection, in this process or anothe
 
 ```sql
 PRAGMA data_version;
+-- 0
+-- another connection commits
+PRAGMA data_version;
 -- 1
 ```
 
