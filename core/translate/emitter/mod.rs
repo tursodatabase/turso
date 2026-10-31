@@ -9,9 +9,9 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_stored_column, emit_table_column,
-        translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
-        WalkControl,
+        bind_and_rewrite_expr, emit_constraint_values_decode, emit_stored_column,
+        emit_table_column, translate_expr_no_constant_opt, walk_expr, BindingBehavior,
+        NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -2325,13 +2325,24 @@ fn emit_check_constraint_bytecode(
                 let col_regs: Vec<usize> = column_mappings.iter().map(|(_, r)| *r).collect();
                 let col_names: Vec<String> =
                     column_mappings.iter().map(|(n, _)| n.to_string()).collect();
+                let mut constraint_info = ConstraintInfo::check(
+                    table_name,
+                    check_constraint.name.clone(),
+                    col_regs,
+                    col_names,
+                );
+                if let Some(table) = referenced_tables
+                    .and_then(|tables| tables.joined_tables().first())
+                    .and_then(|joined_table| joined_table.table.btree())
+                {
+                    // Turn off the column register cache, or a column named
+                    // `value` would replace the `value` that DECODE reads.
+                    resolver.expr_to_reg_cache_enabled = false;
+                    emit_constraint_values_decode(program, resolver, &table, &mut constraint_info)?;
+                    resolver.enable_expr_to_reg_cache();
+                }
                 program.emit_insn(Insn::Halt {
-                    constraint_info: Some(Box::new(ConstraintInfo::check(
-                        table_name,
-                        check_constraint.name.clone(),
-                        col_regs,
-                        col_names,
-                    ))),
+                    constraint_info: Some(Box::new(constraint_info)),
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
                     on_error: halt_on_error,

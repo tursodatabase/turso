@@ -214,6 +214,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn constraint_errors_show_values(&self) -> bool {
+        true
+    }
+
     fn mod_of_integers_is_integer(&self) -> bool {
         true
     }

@@ -27,8 +27,8 @@ use crate::{
         },
         eqp::eqp_detail_for_table_op,
         expr::{
-            emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
-            emit_table_column, restore_returning_row_image_in_cache,
+            emit_constraint_values_decode, emit_dml_expr_index_value, emit_returning_results,
+            emit_returning_scan_back, emit_table_column, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
             NoConstantOptReason, ReturningBufferCtx,
         },
@@ -2115,12 +2115,21 @@ fn emit_update_insns<'a>(
                             accum
                         },
                     );
+                    let mut constraint_info = ConstraintInfo::unique_index(
+                        table_name,
+                        index,
+                        (idx_start_reg..idx_start_reg + num_cols).collect(),
+                    );
+                    if let Some(btree_table) = target_table.table.btree() {
+                        emit_constraint_values_decode(
+                            program,
+                            &t_ctx.resolver,
+                            &btree_table,
+                            &mut constraint_info,
+                        )?;
+                    }
                     program.emit_insn(Insn::Halt {
-                        constraint_info: Some(Box::new(ConstraintInfo::unique_index(
-                            table_name,
-                            index,
-                            (idx_start_reg..idx_start_reg + num_cols).collect(),
-                        ))),
+                        constraint_info: Some(Box::new(constraint_info)),
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
                         description: column_names,
                         on_error: program.constraint_halt_on_error(idx_conflict),

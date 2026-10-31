@@ -1907,3 +1907,26 @@ test mixed-case-table-alias-indexed-custom-type {
 expect {
     10.00
 }
+
+# SQLite's constraint messages do not show values, so a DECODE that fails on the
+# stored value must not replace the constraint error.
+@requires strict "uses STRICT tables"
+test unique-error-does-not-run-failing-decode {
+    CREATE TYPE abs_int BASE integer ENCODE value DECODE abs(value);
+    CREATE TABLE t (a abs_int UNIQUE) STRICT;
+    INSERT INTO t VALUES (-9223372036854775808);
+    INSERT INTO t VALUES (-9223372036854775808);
+}
+expect error {
+    UNIQUE constraint failed: t.a
+}
+
+@requires strict "uses STRICT tables"
+test check-error-does-not-run-failing-decode {
+    CREATE TYPE abs_int BASE integer ENCODE value DECODE abs(value);
+    CREATE TABLE t (a abs_int, n INTEGER CHECK (n > 0)) STRICT;
+    INSERT INTO t VALUES (-9223372036854775808, 0);
+}
+expect error {
+    CHECK constraint failed: n > 0
+}

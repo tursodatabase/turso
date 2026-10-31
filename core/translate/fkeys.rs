@@ -3,7 +3,9 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::namespace::NamespaceRef;
 use crate::translate::emitter::emit_columns_and_dependencies;
-use crate::translate::expr::{emit_stored_column, emit_table_column_for_dml};
+use crate::translate::expr::{
+    emit_constraint_values_decode, emit_stored_column, emit_table_column_for_dml,
+};
 use crate::translate::plan::ColumnMask;
 use crate::turso_assert;
 use crate::{
@@ -1416,7 +1418,9 @@ pub fn emit_fk_child_update_counters(
             // missing: violation (immediate HALT or deferred +1)
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            let constraint_info = (!fk_ref.fk.deferred).then(|| {
+            let constraint_info = if fk_ref.fk.deferred {
+                None
+            } else {
                 let regs = fk_ref
                     .fk
                     .child_columns
@@ -1430,8 +1434,10 @@ pub fn emit_fk_child_update_counters(
                         }
                     })
                     .collect();
-                Box::new(fk_constraint_info(&child_tbl.name, &fk_ref.fk, regs))
-            });
+                Some(Box::new(fk_constraint_info(
+                    program, resolver, child_tbl, &fk_ref.fk, regs,
+                )?))
+            };
             emit_fk_violation(program, &fk_ref.fk, constraint_info)?;
         } else {
             let parent_tbl = resolver
@@ -1479,7 +1485,9 @@ pub fn emit_fk_child_update_counters(
                 ncols,
                 |_p| Ok(()),
                 |p| {
-                    let constraint_info = (!fk_ref.fk.deferred).then(|| {
+                    let constraint_info = if fk_ref.fk.deferred {
+                        None
+                    } else {
                         let regs = fk_ref
                             .fk
                             .child_columns
@@ -1493,8 +1501,10 @@ pub fn emit_fk_child_update_counters(
                                 }
                             })
                             .collect();
-                        Box::new(fk_constraint_info(&child_tbl.name, &fk_ref.fk, regs))
-                    });
+                        Some(Box::new(fk_constraint_info(
+                            p, resolver, child_tbl, &fk_ref.fk, regs,
+                        )?))
+                    };
                     emit_fk_violation(p, &fk_ref.fk, constraint_info)?;
                     Ok(())
                 },
@@ -1509,14 +1519,26 @@ pub fn emit_fk_child_update_counters(
     Ok(())
 }
 
+/// Builds the error info for a missing parent row, and emits the decode of the
+/// child key values it reports. Emit it on the violation path only.
 pub(crate) fn fk_constraint_info(
-    child_table: &str,
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    child_table: &BTreeTable,
     fk: &ForeignKey,
     regs: Vec<usize>,
-) -> ConstraintInfo {
+) -> Result<ConstraintInfo> {
     let columns = fk.child_columns.to_vec();
     let name = fk.constraint_name.clone();
-    ConstraintInfo::fk(child_table, name, columns, regs, fk.parent_table.clone())
+    let mut info = ConstraintInfo::fk(
+        &child_table.name,
+        name,
+        columns,
+        regs,
+        fk.parent_table.clone(),
+    );
+    emit_constraint_values_decode(program, resolver, child_table, &mut info)?;
+    Ok(info)
 }
 
 /// Single FK existence check for NO ACTION/RESTRICT on DELETE.
