@@ -13,10 +13,11 @@ description = "Turso Rust API"
 workspace = true
 
 [features]
-default = ["mimalloc", "fts"]
+default = ["mimalloc", "fts", "simd"]
 mimalloc = ["dep:mimalloc"]
 pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
 fts = ["turso_sdk_kit/fts"]
+simd = ["turso_core/simd"]
 stacker = ["turso_core/stacker"]
 test_helper = ["turso_core/test_helper", "turso_sdk_kit/test_helper"]
 # Test-only: exposes the `memory_yield` VFS for stress/simulator harnesses.

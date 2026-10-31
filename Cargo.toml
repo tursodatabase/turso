@@ -118,7 +118,16 @@ turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.9.0-pre.2" }
 turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.9.0-pre.2" }
 limbo_completion = { path = "extensions/completion", version = "0.9.0-pre.2" }
 limbo_csv = { path = "extensions/csv", version = "0.9.0-pre.2" }
-turso_core = { path = "core", version = "0.9.0-pre.2" }
+turso_core = { path = "core", version = "0.9.0-pre.2", default-features = false, features = [
+    "fs",
+    "uuid",
+    "time",
+    "json",
+    "series",
+    "encryption",
+    "percentile",
+    "autovacuum",
+] }
 turso_sync_engine = { path = "sync/engine", version = "0.9.0-pre.2" }
 turso_ext = { path = "extensions/core", version = "0.9.0-pre.2" }
 turso_macros = { path = "macros", version = "0.9.0-pre.2" }
