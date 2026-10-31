@@ -218,6 +218,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn converts_strings_compared_with_custom_types(&self) -> bool {
+        true
+    }
+
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }

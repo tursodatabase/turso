@@ -1566,3 +1566,19 @@ test limit-text-that-is-not-a-number-is-an-error {
 expect error {
     invalid input syntax for type bigint: "abc"
 }
+
+test where-on-indexed-time-and-date-columns-converts-the-literal {
+    CREATE TABLE seek_m(x time PRIMARY KEY);
+    INSERT INTO seek_m VALUES ('12:00');
+    CREATE TABLE seek_d(d date PRIMARY KEY);
+    INSERT INTO seek_d VALUES ('2026-10-08');
+    SELECT count(*) FROM seek_m WHERE x = '12:00';
+    SELECT count(*) FROM seek_d WHERE d = '2026-10-08T00:00';
+    DELETE FROM seek_m WHERE x = '12:00';
+    SELECT count(*) FROM seek_m;
+}
+expect {
+    1
+    1
+    0
+}
