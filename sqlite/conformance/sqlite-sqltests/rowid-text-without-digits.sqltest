@@ -54,3 +54,7 @@ test cast-dot-to-numeric-is-zero {
 expect {
     0|0|0.0
 }
+# JS Number omits .0 for whole numbers
+expect @js {
+    0|0|0
+}
