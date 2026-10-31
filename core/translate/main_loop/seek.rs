@@ -58,9 +58,15 @@ pub(super) fn encode_seek_keys_for_custom_types(
             continue;
         };
         // A scan compares the key with the decoded column value. When DECODE
-        // returns the stored value unchanged, the key is compared as it is,
-        // so the seek must not encode it either.
-        if resolved.reads_stored_values_unchanged()
+        // returns the stored value unchanged and the dialect compares strings
+        // as they are, the key is compared as it is, so the seek must not
+        // encode it either. A dialect that converts strings to the column's
+        // type (PostgreSQL: `time_col = '12:00'`) needs the key encoded.
+        let compares_key_as_it_is = !resolver
+            .catalog
+            .dialect
+            .converts_strings_compared_with_custom_types();
+        if (compares_key_as_it_is && resolved.reads_stored_values_unchanged())
             || resolved.chain.iter().all(|td| td.encode().is_none())
         {
             continue;
