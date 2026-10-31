@@ -482,6 +482,55 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test function-call-abs-of-text-is-a-number {
+    -- abs converts text to a number first.
+    CREATE TABLE t(a TEXT CHECK(abs(a) < 100)) STRICT;
+    INSERT INTO t VALUES('-42');
+    SELECT a FROM t;
+}
+expect {
+    -42
+}
+
+@requires strict "uses STRICT tables"
+test function-call-coalesce-min-max-of-mixed-types {
+    -- coalesce, min and max may return any of their arguments, so with an
+    -- integer and a text argument the result may be either.
+    CREATE TABLE t(
+        a TEXT,
+        b INTEGER,
+        CHECK(coalesce(b, a) <> 'x'),
+        CHECK(ifnull(b, a) <> 'x'),
+        CHECK(min(b, a) <> 'x'),
+        CHECK(max(b, a) <> 'x')
+    ) STRICT;
+    INSERT INTO t VALUES('y', NULL);
+    SELECT a FROM t;
+}
+expect {
+    y
+}
+
+@requires strict "uses STRICT tables"
+test function-call-iif-else-value {
+    -- iif may return its last value, not only its first.
+    CREATE TABLE t(a TEXT, b INTEGER, CHECK(iif(b > 0, b, a) <> 'x')) STRICT;
+    INSERT INTO t VALUES('y', 0);
+    SELECT a FROM t;
+}
+expect {
+    y
+}
+
+@requires strict "uses STRICT tables"
+test function-call-coalesce-of-text-vs-integer-error {
+    CREATE TABLE t(a TEXT, b TEXT, CHECK(coalesce(a, b) > 1)) STRICT;
+}
+expect error {
+    type mismatch
+}
+
+@requires strict "uses STRICT tables"
 test function-call-upper-valid {
     CREATE TABLE t(a TEXT CHECK(upper(a) = a)) STRICT;
     INSERT INTO t VALUES('HELLO');

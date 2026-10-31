@@ -7,6 +7,16 @@
 # STRUCT basics
 # ============================================================================
 
+test struct-check-compares-with-struct-pack {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point CHECK (pos <> struct_pack(0, 0))) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    SELECT id FROM t;
+}
+expect {
+    1
+}
+
 test struct-basic-insert-select {
     CREATE TYPE point AS STRUCT(x INT, y INT);
     CREATE TABLE t(id INT, pos point) STRICT;
