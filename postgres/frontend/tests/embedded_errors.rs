@@ -54,42 +54,31 @@ fn embedded_statement_methods_format_postgres_errors() {
         let mut error = None;
         for _ in 0..100 {
             let result = match method {
-                0 => stmt.step().map(|_| ()).map_err(|e| e.to_string()),
-                1 => stmt
-                    .step_with_waker(std::task::Waker::noop())
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
-                2 => stmt.run_ignore_rows().map_err(|e| e.to_string()),
-                3 => stmt
-                    .run_collect_rows()
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
-                4 => stmt
-                    .run_with_row_callback(|_| Ok(()))
-                    .map_err(|e| e.to_string()),
-                5 => stmt
-                    .run_ignore_rows_nonblock()
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
-                6 => stmt
-                    .run_with_row_callback_nonblock(|_| Ok(()))
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
-                7 => stmt
-                    .run_one_step_blocking(|| Ok(()), || Ok(()))
-                    .map(|_| ())
-                    .map_err(|e| e.to_string()),
+                0 => stmt.step().map(|_| ()),
+                1 => stmt.step_with_waker(std::task::Waker::noop()).map(|_| ()),
+                2 => stmt.run_ignore_rows(),
+                3 => stmt.run_collect_rows().map(|_| ()),
+                4 => stmt.run_with_row_callback(|_| Ok(())),
+                5 => stmt.run_ignore_rows_nonblock().map(|_| ()),
+                6 => stmt.run_with_row_callback_nonblock(|_| Ok(())).map(|_| ()),
+                7 => stmt.run_one_step_blocking(|| Ok(()), || Ok(())).map(|_| ()),
                 _ => unreachable!(),
             };
-            if let Err(message) = result {
-                error = Some(message);
+            if let Err(e) = result {
+                error = Some(e);
                 break;
             }
             io.step().unwrap();
         }
+        let error = error.unwrap_or_else(|| panic!("method {method} must fail"));
         assert_eq!(
-            error.as_deref(),
-            Some("duplicate key value violates unique constraint \"t_pkey\""),
+            error.to_string(),
+            "duplicate key value violates unique constraint \"t_pkey\"",
+            "method {method}"
+        );
+        assert_eq!(
+            constraint_violation(&error).schema_name.as_deref(),
+            Some("public"),
             "method {method}"
         );
     }

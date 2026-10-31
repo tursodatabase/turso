@@ -457,7 +457,7 @@ impl Statement {
         match self
             .inner
             .run_ignore_rows_nonblock()
-            .map_err(|error| (*error).into())
+            .map_err(|error| statement_error(&self.inner, *error))
         {
             Ok(IOResult::Done(())) => self.finish(Ok(()), was_in_tx).map(|()| IOResult::Done(())),
             Err(e) => self.finish(Err(e), was_in_tx).map(|()| IOResult::Done(())),
