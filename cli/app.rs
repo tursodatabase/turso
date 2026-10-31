@@ -1536,7 +1536,7 @@ impl Limbo {
             _ => {}
         }
         let sql = format!(
-            "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view', 'trigger') AND (tbl_name = '{table_name}' OR name = '{table_name}') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 WHEN 'trigger' THEN 4 END, rowid"
+            "SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view', 'trigger') AND (tbl_name = '{table_name}' COLLATE NOCASE OR name = '{table_name}' COLLATE NOCASE) AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 WHEN 'trigger' THEN 4 END, rowid"
         );
 
         let mut found = false;
@@ -1648,7 +1648,7 @@ impl Limbo {
             let prefix = (name != "main").then_some(&name);
             let sql = match maybe_table {
                 Some(ref tbl_name) => format!(
-                    "SELECT name FROM {name}.sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' ORDER BY 1"
+                    "SELECT name FROM {name}.sqlite_schema WHERE type='index' AND tbl_name = '{tbl_name}' COLLATE NOCASE ORDER BY 1"
                 ),
                 None => format!("SELECT name FROM {name}.sqlite_schema WHERE type='index' ORDER BY 1"),
             };

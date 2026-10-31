@@ -178,18 +178,11 @@ fn emit_table_list_rows_for_schema(
     if let Some(filter_name) = filter_name {
         let lookup_name = normalize_table_pragma_lookup_name(database_id, filter_name);
         if let Some(table) = schema.get_table(namespace, &lookup_name) {
-            let (wr, strict) = match table.btree() {
-                Some(bt) => (!bt.has_rowid, bt.is_strict),
-                None => (false, false),
+            let (name, wr, strict) = match table.btree() {
+                Some(bt) => (bt.declared_name.clone(), !bt.has_rowid, bt.is_strict),
+                None => (table.get_name().to_string(), false, false),
             };
-            emit_table_row(
-                program,
-                table.get_name(),
-                "table",
-                table.columns().len(),
-                wr,
-                strict,
-            );
+            emit_table_row(program, &name, "table", table.columns().len(), wr, strict);
         } else if let Some(view) = schema.get_view(namespace, &lookup_name) {
             emit_table_row(
                 program,
@@ -209,7 +202,7 @@ fn emit_table_list_rows_for_schema(
         };
         emit_table_row(
             program,
-            &bt.name,
+            &bt.declared_name,
             "table",
             bt.columns().len(),
             !bt.has_rowid,

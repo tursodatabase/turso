@@ -491,6 +491,51 @@ fn test_drop_sqlite_created_mixed_case_autoincrement_table() -> anyhow::Result<(
     Ok(())
 }
 
+#[test]
+fn test_mixed_case_table_and_view_names_survive_reopen() -> anyhow::Result<()> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("test.db");
+    {
+        let db = TempDatabase::new_with_existent(&db_path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE \"Pk6\"(id INTEGER PRIMARY KEY AUTOINCREMENT, u TEXT UNIQUE)")?;
+        conn.execute("CREATE VIEW testView AS SELECT * FROM \"Pk6\"")?;
+        conn.execute("INSERT INTO pk6(u) VALUES ('a'), ('b')")?;
+        conn.close()?;
+    }
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    conn.execute("DELETE FROM PK6 WHERE u = 'b'")?;
+    conn.execute("INSERT INTO PK6(u) VALUES ('c')")?;
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM TESTVIEW ORDER BY id");
+    assert_eq!(rows, vec![(1, "a".into()), (3, "c".into())]);
+    let names: Vec<(String, String)> = conn.exec_rows(
+        "SELECT name, type FROM pragma_table_list WHERE name NOT LIKE 'sqlite%' \
+         AND name NOT LIKE '__turso%' ORDER BY name",
+    );
+    assert_eq!(
+        names,
+        vec![
+            ("Pk6".into(), "table".into()),
+            ("testView".into(), "view".into())
+        ]
+    );
+    conn.close()?;
+    drop(db);
+
+    let sqlite = rusqlite::Connection::open(&db_path)?;
+    let names: Vec<String> = sqlite
+        .prepare("SELECT name FROM sqlite_schema WHERE type IN ('table', 'view') ORDER BY name")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    assert!(names.contains(&"Pk6".to_string()), "{names:?}");
+    assert!(names.contains(&"testView".to_string()), "{names:?}");
+    drop(sqlite);
+    rusqlite_integrity_check(&db_path)?;
+    Ok(())
+}
+
 fn create_database_with_sqlite(
     sql: &str,
 ) -> anyhow::Result<(tempfile::TempDir, std::path::PathBuf)> {

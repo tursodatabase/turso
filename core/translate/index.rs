@@ -344,7 +344,7 @@ pub fn translate_create_index(
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
         &resolver.mangle_name(namespace, &idx_name),
-        &resolver.mangle_name(namespace, &tbl_name),
+        &resolver.mangle_name(namespace, &tbl.declared_name),
         root_page_reg,
         Some(sql),
     )?;

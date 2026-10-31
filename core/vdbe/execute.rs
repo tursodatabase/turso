@@ -11721,20 +11721,23 @@ pub fn op_function(
                     let row_namespace =
                         crate::namespace::demangle_name(supports_namespaces, &name).0;
 
-                    let new_name = if let Some(column) =
-                        &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
-                    {
-                        format!("sqlite_autoindex_{rename_to}_{column}")
-                    } else if name == rename_from {
-                        rename_to.clone()
+                    // Like SQLite, only the rows of the renamed table (matched
+                    // by tbl_name without regard to case) are renamed: the
+                    // table row, its automatic indexes and its triggers.
+                    let (new_name, new_tbl_name) = if tbl_name.eq_ignore_ascii_case(&rename_from) {
+                        let new_name = match entry_type.as_str() {
+                            "table" => original_rename_to.to_string(),
+                            "index" => match normalize_ident(&name)
+                                .strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
+                            {
+                                Some(suffix) => format!("sqlite_autoindex_{rename_to}_{suffix}"),
+                                None => name,
+                            },
+                            _ => name,
+                        };
+                        (new_name, original_rename_to.to_string())
                     } else {
-                        name
-                    };
-
-                    let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
-                    } else {
-                        tbl_name
+                        (name, tbl_name)
                     };
 
                     let new_sql = 'sql: {
@@ -17644,7 +17647,7 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
-                normalized_to.clone_into(&mut btree.declared_name);
+                to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);

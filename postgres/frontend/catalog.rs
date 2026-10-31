@@ -3589,7 +3589,9 @@ impl VirtualTableCursor for PgGetTableDefCursor {
             .run_with_row_callback_nonblock(|row| {
                 if let (Value::Text(name), Value::Text(sql)) = (row.get_value(0), row.get_value(1))
                 {
-                    sql_map.insert(name.as_str().to_string(), sql.as_str().to_string());
+                    // Schema rows keep the declared spelling; the map is keyed
+                    // by the case-folded name that `load_table_defs` looks up.
+                    sql_map.insert(name.as_str().to_ascii_lowercase(), sql.as_str().to_string());
                 }
                 Ok(())
             })?
