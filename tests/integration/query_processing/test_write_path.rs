@@ -1388,6 +1388,10 @@ pub fn test_reopen_database_wal_restart() {
 /// It is slightly fragile and can be removed if it will be unclear how to maintain it
 ///
 /// Here, we simulate BusySnapshot condition when during IO in between of begin_read_tx and begin_write_tx, another connection commited some change
+///
+/// On a fresh database that IO is the allocation of page 1, and the pager holds its init lock for the whole of it:
+/// a second connection starting its first write meanwhile gets Busy instead of allocating page 1 itself and committing,
+/// so nothing can commit in between any more and the first connection's WAL view stays current
 pub fn test_busy_snapshot_immediate() {
     let _ = env_logger::try_init();
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1406,28 +1410,33 @@ pub fn test_busy_snapshot_immediate() {
     let result = stmt1.step();
     assert!(matches!(result, Ok(StepResult::IO)));
 
-    // run stmt2 to completion and commit changes
+    // stmt2 can't begin its write while stmt1 is allocating first page - so it returns Busy
+    // (the IO is driven, but stmt1 is not stepped - so the first page stays unpublished)
+    tmp_db.io.step().unwrap();
+    let result = stmt2.step();
+    assert!(
+        matches!(result, Ok(StepResult::Busy)),
+        "unexpected result: {result:?}"
+    );
+    assert!(!conn2.is_db_initialized());
+    drop(stmt2);
+
+    // run stmt1 to completion and commit changes
     loop {
         tmp_db.io.step().unwrap();
-        let result = stmt2.step();
+        let result = stmt1.step();
         match result {
             Ok(StepResult::IO) => continue,
             Ok(StepResult::Done) => break,
             result => panic!("unexpected result: {result:?}"),
         }
     }
-    drop(stmt2);
-
-    // stmt1 WAL view is stale - so it is return Busy error
-    // (as we didn't have any transaction started before - turso return Busy result so top-level executor will retry statement implicitly)
-    let result = stmt1.step();
-    assert!(matches!(result, Ok(StepResult::Busy)));
     drop(stmt1);
 
-    conn1.execute("CREATE TABLE t1(x)").unwrap();
+    conn2.execute("CREATE TABLE t2(x)").unwrap();
 
     let rows = limbo_exec_rows(&conn1, "SELECT name FROM sqlite_master");
-    assert_that!(rows).is_equal_to(vec![row!["t2"], row!["t1"]]);
+    assert_that!(rows).is_equal_to(vec![row!["t1"], row!["t2"]]);
 }
 
 #[test]

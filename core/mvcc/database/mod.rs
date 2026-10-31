@@ -6513,7 +6513,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // header + schema_generation are re-read inside the clock callback below, not captured
             // here, so a passive publish (which swaps global_header + bumps schema_generation under
             // this same clock) cannot interleave between the capture and `txs.insert`.
-            self.get_new_transaction_database_header(&pager);
+            self.get_new_transaction_database_header(&pager)
+                .inspect_err(|_| unlock_checkpoint_guard())?;
             pager.mvcc_refresh_if_db_changed();
             let read_mark = WalPos::from_pair(pager.wal_pos());
             let mut schema_stale = false;
@@ -6627,7 +6628,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if let Some(existing_tx_id) = maybe_existing_tx_id {
             // Upgrade path: read the (possibly blocking) header now that all
             // locks are held, then apply it to the already-published txn.
-            let header = self.get_new_transaction_database_header(&pager);
+            let header = self
+                .get_new_transaction_database_header(&pager)
+                .inspect_err(|_| handle_err())?;
             // Re-fetch the Ref now that all blocking I/O is done. If the tx
             // vanished between the earlier validation and now (extraordinarily
             // narrow window — only checkpoint can remove a tx and it cannot
@@ -6731,7 +6734,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Ensure page 1 / global_header is initialized. The (possibly blocking) init I/O
         // happens here, BEFORE the clock lock; the header value itself is re-read inside the
         // clock callback below so it pairs atomically with begin_ts + schema_generation.
-        self.get_new_transaction_database_header(&pager);
+        self.get_new_transaction_database_header(&pager)
+            .inspect_err(|_| {
+                if !passive {
+                    self.blocking_checkpoint_lock.unlock();
+                }
+            })?;
 
         // Allocate begin_ts and publish the transaction into `txs` atomically
         // under the clock lock. This closes the "begin-publish window": between
@@ -6972,12 +6980,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.remove_tx(tx_id);
     }
 
-    fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> DatabaseHeader {
+    /// Fails with [LimboError::Busy] while another connection is allocating
+    /// page 1; callers release what they acquired and return it.
+    fn get_new_transaction_database_header(&self, pager: &Arc<Pager>) -> Result<DatabaseHeader> {
         if self.global_header.read().is_none() {
-            pager
-                .io
-                .block(|| pager.maybe_allocate_page1())
-                .expect("failed to allocate page1");
+            pager.io.block(|| pager.maybe_allocate_page1())?;
             let header = pager
                 .io
                 .block(|| pager.with_header(|header| *header))
@@ -6988,19 +6995,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 "get_transaction_database_header create: header={:?}",
                 header
             );
-            header
+            Ok(header)
         } else {
             let header = self
                 .global_header
                 .read()
                 .expect("global_header should be initialized");
             // The header could be stored, but not persisted yet
-            pager
-                .io
-                .block(|| pager.maybe_allocate_page1())
-                .expect("failed to allocate page1");
+            pager.io.block(|| pager.maybe_allocate_page1())?;
             tracing::debug!("get_transaction_database_header read: header={:?}", header);
-            header
+            Ok(header)
         }
     }
 
