@@ -419,7 +419,6 @@ fn resolve_func_return_type(
         ResultType::Declared(ReturnType::Text) => Ok(CheckExprType::Text),
         ResultType::Declared(ReturnType::Blob) => Ok(CheckExprType::Blob),
         ResultType::Declared(ReturnType::Custom(type_name)) => {
-            reject_value_unlike_stored_columns(name, type_name, resolver)?;
             resolve_type_name(type_name, resolver)
         }
         ResultType::Declared(ReturnType::Array) => Ok(CheckExprType::Any),
@@ -462,29 +461,6 @@ fn resolve_func_return_type(
         }
         ResultType::Unknown => Ok(CheckExprType::Any),
     }
-}
-
-/// A function that returns a value of a custom type returns it as a column
-/// read gives it, after DECODE, but a CHECK constraint sees the columns as they
-/// are stored. For a type whose DECODE changes the value, such as `uuid`
-/// stored as a blob and read as text, comparing the function's value with a
-/// column would never find them equal, so the CHECK constraint is refused.
-fn reject_value_unlike_stored_columns(
-    name: &str,
-    type_name: &str,
-    resolver: &CatalogContext,
-) -> Result<()> {
-    if let Some(resolved) = resolver.schema().resolve_type_unchecked(type_name)? {
-        if !resolved.is_domain() && !resolved.reads_stored_values_unchanged() {
-            bail_parse_error!(
-                "cannot compare {}() in a CHECK constraint: it returns {} values in a \
-                 different form than they are stored",
-                name,
-                type_name
-            );
-        }
-    }
-    Ok(())
 }
 
 /// The type of a function that returns one of several values: the type they
