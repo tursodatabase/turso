@@ -1,6 +1,7 @@
 import logging
 import os
 import sqlite3
+import sys
 
 import pytest
 import turso
@@ -1494,6 +1495,66 @@ def test_isolation_level_none_autocommit(provider, tmp_path):
     cur2.execute("SELECT COUNT(*) FROM test")
     count = cur2.fetchone()[0]
     assert count == 1
+    conn2.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_set_isolation_level_none_commits_pending_transaction(provider, tmp_path):
+    db_file = str(tmp_path / "switch_isolation_level.db")
+    conn = connect(provider, db_file)
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    assert conn.in_transaction
+    conn.isolation_level = None
+    assert not conn.in_transaction
+    conn.execute("INSERT INTO t VALUES (2)")
+    assert not conn.in_transaction
+    conn.close()
+
+    conn2 = connect(provider, db_file)
+    assert conn2.execute("SELECT v FROM t ORDER BY v").fetchall() == [(1,), (2,)]
+    conn2.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_isolation_level_rejects_values_that_are_not_transaction_modes(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    default_level = conn.isolation_level
+    with pytest.raises(ValueError):
+        conn.isolation_level = "FOO"
+    with pytest.raises(TypeError):
+        conn.isolation_level = 1
+    assert conn.isolation_level == default_level
+    with pytest.raises(ValueError):
+        (turso if provider == "turso" else sqlite3).connect(":memory:", isolation_level="FOO")
+
+    for level in ["", "deferred", "Immediate", "EXCLUSIVE"]:
+        conn.isolation_level = level
+        assert conn.isolation_level == level.upper()
+        conn.execute("INSERT INTO t VALUES (1)")
+        assert conn.in_transaction
+        conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_set_autocommit_true_commits_pending_transaction(provider, tmp_path):
+    if provider == "sqlite3" and sys.version_info < (3, 12):
+        pytest.skip("sqlite3.Connection.autocommit requires Python 3.12")
+    db_file = str(tmp_path / "switch_autocommit.db")
+    conn = connect(provider, db_file)
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    assert conn.in_transaction
+    conn.autocommit = True
+    assert not conn.in_transaction
+    conn.execute("INSERT INTO t VALUES (2)")
+    assert not conn.in_transaction
+    conn.close()
+
+    conn2 = connect(provider, db_file)
+    assert conn2.execute("SELECT v FROM t ORDER BY v").fetchall() == [(1,), (2,)]
     conn2.close()
 
 
