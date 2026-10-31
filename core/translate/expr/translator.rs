@@ -30,9 +30,6 @@ pub enum NoConstantOptReason {
     /// Each value reuses the same register, so hoisting would collapse
     /// all values into the last one.
     InListEphemeral,
-    /// The SELECT has a constant-false WHERE clause, so result expressions
-    /// must stay after the jump that skips producing rows.
-    FilteredResultRow,
 }
 
 /// Controls how binary expressions are emitted.
@@ -62,9 +59,9 @@ pub fn translate_expr_no_constant_opt(
         expr,
         deopt_reason
     );
-    let next_span_idx = program.constant_spans_next_idx();
+    let next_span_idx = program.constants_in_place_start();
     let translated = translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-    program.constant_spans_invalidate_after(next_span_idx);
+    program.constants_in_place_end(next_span_idx);
     Ok(translated)
 }
 
@@ -101,16 +98,29 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let constant_span = if expr.is_constant(resolver) {
-        if !program.constant_span_is_open() {
-            Some(program.constant_span_start())
+    let mut constant_span = None;
+    let mut run_once = None;
+    if expr.is_constant(resolver) {
+        if program.constant_span_is_open() {
+            // The parent expression is already hoisted together with this one.
+        } else if expression_can_fail_on_input(expr, &TypeEnv::new(referenced_tables, resolver)) {
+            // Like SQLite's sqlite3ExprCodeRunJustOnce(): a constant that can raise an
+            // error must not run before the code that uses it is reached, e.g.
+            // `SELECT abs(-9223372036854775808) FROM t` returns no rows when t is empty.
+            // Evaluate it in place, only the first time it is reached.
+            if !program.constants_in_place() {
+                let skip = program.allocate_label();
+                program.emit_insn(Insn::Once {
+                    target_pc_when_reentered: skip,
+                });
+                run_once = Some((skip, program.constants_in_place_start()));
+            }
         } else {
-            None
+            constant_span = Some(program.constant_span_start());
         }
     } else {
         program.constant_span_end_all();
-        None
-    };
+    }
 
     if let Some(cached) = resolver.resolve_cached_expr_reg(expr) {
         copy_cached_expr_reg(
@@ -133,6 +143,10 @@ pub fn translate_expr(
 
     if let Some(span) = constant_span {
         program.constant_span_end(span);
+    }
+    if let Some((skip, span_idx)) = run_once {
+        program.constants_in_place_end(span_idx);
+        program.preassign_label_to_next_insn(skip);
     }
 
     Ok(target_register)
