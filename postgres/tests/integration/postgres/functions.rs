@@ -689,6 +689,22 @@ fn test_pg_native_function_signatures_and_catalogs(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_pg_to_timestamp_returns_the_stored_form_of_a_timestamptz(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for (sql, expected) in [
+        ("SELECT to_timestamp(0)", "1970-01-01 00:00:00"),
+        ("SELECT to_timestamp(1.5)", "1970-01-01 00:00:01.5"),
+        (
+            "SELECT to_timestamp(1.123456)",
+            "1970-01-01 00:00:01.123456",
+        ),
+        ("SELECT typeof(to_timestamp(0))", "text"),
+    ] {
+        assert_eq!(query_text(&conn, sql), [expected], "{sql}");
+    }
+}
+
+#[turso_macros::test(mvcc)]
 fn test_pg_native_timestamps_are_registered_before_connection_wrapping(db: TempDatabase) {
     let conn = db.connect_limbo();
     for name in [
