@@ -1131,6 +1131,7 @@ class Cursor:
         return self
 
     def __next__(self) -> Any:
+        self._ensure_open()
         # Judge exhaustion on the raw row, not the factory result: a
         # row_factory that maps a row to None is a valid row value, and
         # treating it as exhaustion silently drops every later row.

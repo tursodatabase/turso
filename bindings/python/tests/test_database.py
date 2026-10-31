@@ -1465,6 +1465,12 @@ def test_row_factory_returning_none_during_iteration(provider):
     # fetchone keeps the DB-API contract: None only means no more rows.
     exhausted = conn.execute("SELECT x FROM t ORDER BY rowid")
     assert [exhausted.fetchone(), exhausted.fetchone(), exhausted.fetchone(), exhausted.fetchone()] == [1, None, 3, None]
+    # iteration must still fail on a closed cursor, exactly like sqlite3
+    cur = conn.cursor()
+    cur.close()
+    with pytest.raises(conn.ProgrammingError):
+        next(cur)
+
     conn.close()
 
 
