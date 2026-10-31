@@ -1,4 +1,6 @@
 use super::*;
+use crate::translate::expr::expr_type::TypeEnv;
+use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::NullsOrder;
@@ -184,8 +186,10 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     // soon as one shows up. `IS` matches NULL instead: keep the
                     // NULL in the seek register and let the index comparison
                     // find the rows whose key component is NULL.
-                    if !expr.is_nonnull(self.tables, &self.t_ctx.resolver)
-                        && !self.seek_def.is_null_matching_key_component(i)
+                    if !expr.is_nonnull(
+                        &TableMetadata::new(Some(self.tables)),
+                        &TypeEnv::new(Some(self.tables), &self.t_ctx.resolver),
+                    ) && !self.seek_def.is_null_matching_key_component(i)
                     {
                         self.program.emit_insn(Insn::IsNull {
                             reg,
@@ -357,7 +361,10 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         });
                     }
                 }
-                if !expr.is_nonnull(self.tables, &self.t_ctx.resolver) {
+                if !expr.is_nonnull(
+                    &TableMetadata::new(Some(self.tables)),
+                    &TypeEnv::new(Some(self.tables), &self.t_ctx.resolver),
+                ) {
                     self.program.emit_insn(Insn::IsNull {
                         reg: last_reg,
                         target_pc: self.loop_end,
