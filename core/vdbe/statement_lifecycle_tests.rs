@@ -9,7 +9,8 @@ use crate::sync::{Arc, Mutex};
 #[cfg(any(feature = "fts", feature = "io_memory_yield"))]
 use crate::StepResult;
 use crate::{
-    ConnectOpts, Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, Value,
+    ConnectOpts, Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, Statement,
+    Value,
 };
 
 #[derive(Debug)]
@@ -160,6 +161,18 @@ fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) {
 
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     let mut stmt = conn.prepare(query).unwrap();
+    collect_rows(&mut stmt)
+}
+
+// Same as `get_rows`, but prepared with internal origin so the query can see
+// the `__turso_internal_*` bookkeeping tables that are hidden from user scans.
+#[cfg(feature = "fts")]
+fn get_rows_internal(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
+    let mut stmt = conn.prepare_internal(query).unwrap();
+    collect_rows(&mut stmt)
+}
+
+fn collect_rows(stmt: &mut Statement) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
     stmt.run_with_row_callback(|row| {
         let values = row.get_values().cloned().collect::<Vec<_>>();
@@ -492,7 +505,7 @@ fn fts_backing_store_ddl_survives_a_yield_at_every_cursor_boundary() {
         Value::from_i64(10)
     );
     assert_eq!(
-        get_rows(
+        get_rows_internal(
             &conn,
             "SELECT count(*) FROM sqlite_schema WHERE name LIKE '%fts_dir_docs_fts%'"
         )[0][0],

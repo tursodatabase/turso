@@ -2477,7 +2477,12 @@ mod tests {
                     }
                 }
                 let mut rows = Vec::new();
-                let mut stmt = conn3.prepare("SELECT name FROM sqlite_master").unwrap();
+                // Internal origin so the listing still shows the
+                // `__turso_internal_*` autoincrement backing table that replay
+                // recreates; user scans hide it (issue #7980).
+                let mut stmt = conn3
+                    .prepare_internal("SELECT name FROM sqlite_master")
+                    .unwrap();
                 while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
                     rows.push(row.get_value(0).to_text().unwrap().to_string());
                 }

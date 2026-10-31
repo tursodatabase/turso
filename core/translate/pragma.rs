@@ -207,6 +207,11 @@ fn emit_table_list_rows_for_schema(
         let Some(bt) = table.btree() else {
             continue;
         };
+        // Skip Turso's internal bookkeeping tables, as the sqlite_master scan does, so
+        // PRAGMA table_list shows the same tables SQLite would.
+        if crate::schema::is_turso_internal_table(&bt.name) {
+            continue;
+        }
         emit_table_row(
             program,
             &bt.name,
@@ -679,6 +684,11 @@ fn update_pragma(
             schema_was_explicit,
             program,
         ),
+        PragmaName::ShowInternalSchema => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_show_internal_schema(enabled);
+            Ok(TransactionMode::None)
+        }
         PragmaName::FreelistCount => query_pragma(
             PragmaName::FreelistCount,
             resolver,
@@ -1671,6 +1681,14 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
 
+            Ok(TransactionMode::None)
+        }
+        PragmaName::ShowInternalSchema => {
+            let register = program.alloc_register();
+            let show = connection.get_show_internal_schema();
+            program.emit_int(show as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::VdbeTrace => Ok(TransactionMode::None),
