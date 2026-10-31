@@ -1078,7 +1078,7 @@ pub fn group_by_emit_row_phase<'a>(
     // Constants hoisted to the init section would cause the IfPos jump
     // (targeting label_agg_final) to land in the init block, which ends
     // with Goto back to the start of the program, creating an infinite loop.
-    let span_idx = program.constant_spans_next_idx();
+    let span_idx = program.constants_in_place_start();
 
     if let Some(having) = &group_by.having {
         emit_non_from_clause_subqueries_for_phase(
@@ -1138,7 +1138,7 @@ pub fn group_by_emit_row_phase<'a>(
             EmitOrderBy::sorter_insert(program, t_ctx, plan)?;
         }
     }
-    program.constant_spans_invalidate_after(span_idx);
+    program.constants_in_place_end(span_idx);
 
     program.emit_insn(Insn::Return {
         return_reg: registers.reg_subrtn_acc_output_return_offset,

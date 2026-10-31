@@ -29,3 +29,107 @@ test constant_overflowing_projection_still_errors_when_where_is_true {
 expect error {
     integer overflow
 }
+
+# A constant that can fail is evaluated where it is used, the first time that
+# code is reached, so a scan that reads no rows never evaluates it.
+setup empty-table {
+    CREATE TABLE t(a);
+}
+
+setup one-row {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES(0);
+}
+
+@setup empty-table
+test constant_overflowing_projection_skipped_on_empty_table {
+    SELECT abs(-9223372036854775808) FROM t;
+}
+expect {
+}
+
+@setup empty-table
+test constant_malformed_json_projection_skipped_on_empty_table {
+    SELECT json_extract('abc', '$[1]') FROM t;
+}
+expect {
+}
+
+@setup empty-table
+test constant_failing_where_term_skipped_on_empty_table {
+    SELECT a FROM t WHERE a = abs(-9223372036854775808);
+}
+expect {
+}
+
+@setup one-row
+test constant_overflowing_projection_still_errors_with_a_row {
+    SELECT abs(-9223372036854775808) FROM t;
+}
+expect error {
+    integer overflow
+}
+
+@setup one-row
+test constant_malformed_json_projection_still_errors_with_a_row {
+    SELECT json_extract('abc', '$[1]') FROM t;
+}
+expect error {
+    malformed JSON
+}
+
+@setup one-row
+test constant_in_case_branch_not_taken_is_skipped {
+    SELECT quote(CASE WHEN a THEN abs(-9223372036854775808) END) FROM t;
+}
+expect {
+    NULL
+}
+
+@setup one-row
+test constant_in_rows_filtered_by_where_is_skipped {
+    SELECT a + json_extract('abc', '$[1]') FROM t WHERE a > 5;
+}
+expect {
+}
+
+@setup empty-table
+test constant_in_aggregate_output_row_still_errors_on_empty_table {
+    SELECT count(*), abs(-9223372036854775808) FROM t;
+}
+expect error {
+    integer overflow
+}
+
+# A constant inner-join ON term is evaluated before the loops, like the same
+# term in WHERE, so it fails even when a table in the join is empty. With a
+# RIGHT JOIN in the query it stays in its right table's loop instead.
+setup empty-join-table {
+    CREATE TABLE t(a);
+    CREATE TABLE u(x);
+    INSERT INTO u VALUES(1);
+}
+
+@setup empty-join-table
+test constant_failing_inner_join_on_term_errors_with_empty_table {
+    SELECT * FROM u JOIN t ON abs(-9223372036854775808);
+}
+expect error {
+    integer overflow
+}
+
+@setup empty-join-table
+test constant_failing_cross_join_on_term_errors_with_empty_table {
+    SELECT * FROM t CROSS JOIN u ON json_extract('abc', '$');
+}
+expect error {
+    malformed JSON
+}
+
+@setup empty-join-table
+test constant_failing_inner_join_on_term_skipped_before_right_join {
+    SELECT * FROM t JOIN u ON abs(-9223372036854775808) RIGHT JOIN u AS w ON 1;
+}
+expect {
+    ||1
+}

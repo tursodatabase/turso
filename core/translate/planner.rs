@@ -2758,7 +2758,17 @@ pub fn determine_where_to_eval_term(
     if changes_per_call && !join_order.is_empty() {
         eval_at = eval_at.max(EvalAt::Loop(0));
     }
-    if let Some(origin) = term.origin.join_origin() {
+    // Like SQLite, an inner join's ON term is placed like a WHERE term unless the
+    // query has a RIGHT or FULL JOIN, whose unmatched-row pass needs the term in the
+    // right table's loop. So `u JOIN t ON abs(-9223372036854775808)` fails before
+    // the loops even when t is empty, as the same term in WHERE does.
+    let has_right_or_full_join =
+        table_references.is_some_and(TableReferences::has_right_or_full_join);
+    if let Some(origin) = term
+        .origin
+        .join_origin()
+        .filter(|origin| origin.is_outer() || has_right_or_full_join)
+    {
         // A materialized hash input can remove an inner join's right table.
         // The ON term then runs when all of its remaining tables are ready.
         if let Some(join_loop) =
