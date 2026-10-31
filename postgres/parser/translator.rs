@@ -150,6 +150,23 @@ impl PostgreSQLTranslator {
             });
         }
 
+        // DROP a, b and TRUNCATE a, b name several objects. PostgreSQL applies
+        // them atomically, so translate each object to its own statement; the
+        // prereqs run in the same savepoint as the last one. DROP SCHEMA keeps
+        // its own path, so leave multi-schema drops to the single-object branch.
+        if let NodeRef::DropStmt(drop) = &node.0 {
+            if drop.objects.len() > 1
+                && drop.remove_type != pg_query::protobuf::ObjectType::ObjectSchema as i32
+            {
+                return self.translate_multi_object_drop(drop);
+            }
+        }
+        if let NodeRef::TruncateStmt(truncate) = &node.0 {
+            if truncate.relations.len() > 1 {
+                return self.translate_multi_table_truncate(truncate);
+            }
+        }
+
         let cmd = match node.0 {
             NodeRef::ExplainStmt(explain) => self.translate_explain(explain)?,
             node => ast::Cmd::Stmt(self.translate_node(node)?),
@@ -157,6 +174,46 @@ impl PostgreSQLTranslator {
 
         Ok(TranslateResult {
             prereqs: vec![],
+            cmd,
+        })
+    }
+
+    /// Translate `DROP ... a, b, c` into one single-object DROP per object. All
+    /// but the last run as prereqs in the last one's savepoint, so the drop is
+    /// atomic like PostgreSQL's. Each clone keeps the original flags, so
+    /// IF EXISTS and an unsupported CASCADE are still handled per object.
+    fn translate_multi_object_drop(
+        &self,
+        drop: &pg_query::protobuf::DropStmt,
+    ) -> Result<TranslateResult, ParseError> {
+        let mut stmts = Vec::with_capacity(drop.objects.len());
+        for object in &drop.objects {
+            let mut single = drop.clone();
+            single.objects = vec![object.clone()];
+            stmts.push(self.translate_drop(&single)?);
+        }
+        let cmd = ast::Cmd::Stmt(stmts.pop().expect("more than one object"));
+        Ok(TranslateResult {
+            prereqs: stmts,
+            cmd,
+        })
+    }
+
+    /// Translate `TRUNCATE a, b` the same way: one DELETE per table, run
+    /// atomically. RESTART IDENTITY and CASCADE stay rejected per table.
+    fn translate_multi_table_truncate(
+        &self,
+        truncate: &pg_query::protobuf::TruncateStmt,
+    ) -> Result<TranslateResult, ParseError> {
+        let mut stmts = Vec::with_capacity(truncate.relations.len());
+        for relation in &truncate.relations {
+            let mut single = truncate.clone();
+            single.relations = vec![relation.clone()];
+            stmts.push(self.translate_truncate(&single)?);
+        }
+        let cmd = ast::Cmd::Stmt(stmts.pop().expect("more than one table"));
+        Ok(TranslateResult {
+            prereqs: stmts,
             cmd,
         })
     }
@@ -10929,10 +10986,15 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_drop_multiple_objects() {
-        assert_not_supported("DROP TABLE a, b", "several objects");
-        assert_not_supported("DROP INDEX IF EXISTS i1, i2", "several objects");
-        assert_not_supported("DROP VIEW v1, v2", "several objects");
+    fn drop_multiple_objects_translates() {
+        // Several objects become one single-object DROP each, run atomically.
+        assert_translates("DROP TABLE a, b");
+        assert_translates("DROP INDEX IF EXISTS i1, i2");
+        assert_translates("DROP VIEW v1, v2");
+        // CASCADE is still rejected, per object.
+        assert_not_supported("DROP TABLE a, b CASCADE", "CASCADE");
+        // DROP SCHEMA keeps its own path and is still rejected for several objects.
+        assert_not_supported("DROP SCHEMA a, b", "several objects");
     }
 
     #[test]
@@ -10963,9 +11025,11 @@ mod tests {
 
     #[test]
     fn fail_closed_truncate() {
-        assert_not_supported("TRUNCATE a, b", "several tables");
+        // Several tables become one DELETE each, run atomically.
+        assert_translates("TRUNCATE a, b");
         assert_not_supported("TRUNCATE t RESTART IDENTITY", "RESTART IDENTITY");
         assert_not_supported("TRUNCATE t CASCADE", "CASCADE");
+        assert_not_supported("TRUNCATE a, b RESTART IDENTITY", "RESTART IDENTITY");
         assert_translates("TRUNCATE TABLE t CONTINUE IDENTITY RESTRICT");
     }
 
