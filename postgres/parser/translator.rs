@@ -3082,8 +3082,8 @@ impl PostgreSQLTranslator {
             Some(pg_query::protobuf::node::Node::MinMaxExpr(minmax)) => {
                 use pg_query::protobuf::MinMaxOp;
                 let func_name = match MinMaxOp::try_from(minmax.op) {
-                    Ok(MinMaxOp::IsGreatest) => "MAX",
-                    Ok(MinMaxOp::IsLeast) => "MIN",
+                    Ok(MinMaxOp::IsGreatest) => "GREATEST",
+                    Ok(MinMaxOp::IsLeast) => "LEAST",
                     _ => return Err(ParseError::ParseError("MinMaxExpr: unsupported op".into())),
                 };
                 let args = minmax
@@ -9422,18 +9422,18 @@ mod tests {
                 assert_eq!(columns.len(), 2);
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::FunctionCall { name, args, .. } = &**expr {
-                        assert_eq!(name.as_str(), "MAX");
+                        assert_eq!(name.as_str(), "GREATEST");
                         assert_eq!(args.len(), 3);
                     } else {
-                        panic!("Expected MAX function call");
+                        panic!("Expected GREATEST function call");
                     }
                 }
                 if let ast::ResultColumn::Expr(expr, _) = &columns[1] {
                     if let ast::Expr::FunctionCall { name, args, .. } = &**expr {
-                        assert_eq!(name.as_str(), "MIN");
+                        assert_eq!(name.as_str(), "LEAST");
                         assert_eq!(args.len(), 2);
                     } else {
-                        panic!("Expected MIN function call");
+                        panic!("Expected LEAST function call");
                     }
                 }
             }

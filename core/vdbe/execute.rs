@@ -10678,6 +10678,31 @@ pub fn op_function(
                 })?;
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::Greatest => {
+                let collation = func.collation;
+                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                let result = Value::exec_max(
+                    reg_values
+                        .iter()
+                        .map(|v| v.get_value())
+                        .filter(|v| !matches!(v, Value::Null)),
+                    |a, b| Ok(collation.compare(a.as_value_ref(), b.as_value_ref())),
+                )?;
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::Least => {
+                let collation = func.collation;
+                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                let result = Value::exec_min(
+                    reg_values
+                        .iter()
+                        .map(|v| v.get_value())
+                        .filter(|v| !matches!(v, Value::Null)),
+                    |a, b| Ok(collation.compare(a.as_value_ref(), b.as_value_ref())),
+                )?;
+                state.registers[*dest].set_value(result);
+            }
+
             ScalarFunc::Nullif => {
                 let collation = func.collation;
                 let first_value = state.registers[*start_reg].get_value();

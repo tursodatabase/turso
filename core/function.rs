@@ -943,6 +943,8 @@ pub enum ScalarFunc {
     ConnTxnId,
     IsAutocommit,
     SequenceWatermark,
+    Greatest,
+    Least,
     // Test type functions (for custom type system testing)
     TestUintEncode,
     TestUintDecode,
@@ -1036,6 +1038,8 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Sign => true,
             ScalarFunc::Substr => true,
             ScalarFunc::Substring => true,
+            ScalarFunc::Greatest => true,
+            ScalarFunc::Least => true,
             ScalarFunc::Soundex => true,
             ScalarFunc::Date => false,
             ScalarFunc::Time => false,
@@ -1192,6 +1196,8 @@ impl Display for ScalarFunc {
             Self::Min => "min",
             Self::Max => "max",
             Self::Nullif => "nullif",
+            Self::Greatest => "greatest",
+            Self::Least => "least",
             Self::Sign => "sign",
             Self::Substr => "substr",
             Self::Substring => "substring",
@@ -1388,6 +1394,8 @@ impl ScalarFunc {
             | Self::IsAutocommit => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
+            Self::Greatest | Self::Least => &[-1],
+
             // SQL-standard string and math extensions
             Self::Gcd | Self::Lcm | Self::Repeat => &[2],
             Self::Lpad | Self::Rpad => &[2, 3],
@@ -1670,7 +1678,13 @@ impl Func {
     pub fn needs_collation(&self) -> bool {
         matches!(
             self,
-            Self::Scalar(ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif)
+            Self::Scalar(
+                ScalarFunc::Min
+                    | ScalarFunc::Max
+                    | ScalarFunc::Greatest
+                    | ScalarFunc::Least
+                    | ScalarFunc::Nullif,
+            )
         )
     }
 
@@ -1736,7 +1750,25 @@ impl Func {
     /// SQLite name table lives; kept on `Func` for the engine call sites
     /// that classify translated AST.
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
-        crate::dialect::sqlite::resolve_builtin_function(name, arg_count)
+        match name.to_ascii_lowercase().as_str() {
+            "greatest" => {
+                if arg_count < 1 {
+                    return Err(LimboError::ParseError(
+                        "greatest number of arguments to function {name}()".to_string(),
+                    ));
+                }
+                Ok(Some(Func::Scalar(ScalarFunc::Greatest)))
+            }
+            "least" => {
+                if arg_count < 1 {
+                    return Err(LimboError::ParseError(
+                        "least number of arguments to function {name}()".to_string(),
+                    ));
+                }
+                Ok(Some(Func::Scalar(ScalarFunc::Least)))
+            }
+            _ => crate::dialect::sqlite::resolve_builtin_function(name, arg_count),
+        }
     }
 
     /// Returns a list of all built-in functions for PRAGMA function_list.

@@ -8,8 +8,8 @@ use turso_core::{
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
-    Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
-    Value,
+    Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, ScalarFunc,
+    Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{RefAct, SortOrder};
@@ -178,7 +178,25 @@ impl Dialect for PostgresDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
+        match name.to_ascii_lowercase().as_str() {
+            "greatest" => {
+                if arg_count < 1 {
+                    return Err(LimboError::ParseError(
+                        "wrong number of arguments to function greatest()".to_string(),
+                    ));
+                }
+                Ok(Some(Func::Scalar(ScalarFunc::Greatest)))
+            }
+            "least" => {
+                if arg_count < 1 {
+                    return Err(LimboError::ParseError(
+                        "wrong number of arguments to function least()".to_string(),
+                    ));
+                }
+                Ok(Some(Func::Scalar(ScalarFunc::Least)))
+            }
+            _ => turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count),
+        }
     }
 
     fn requires_custom_types(&self) -> bool {

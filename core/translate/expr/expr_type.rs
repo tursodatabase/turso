@@ -840,7 +840,12 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
             1,
         ),
         Func::Scalar(
-            ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
+            ScalarFunc::Coalesce
+            | ScalarFunc::IfNull
+            | ScalarFunc::Max
+            | ScalarFunc::Min
+            | ScalarFunc::Greatest
+            | ScalarFunc::Least,
         )
         | Func::Agg(AggFunc::Max | AggFunc::Min) => {
             common_type(args.iter().map(|arg| arg.as_ref()), env)
