@@ -148,6 +148,144 @@ pub extern "C" fn turso_connection_last_insert_rowid(
     }
 }
 
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_connection_wal_disable_auto_actions(
+    connection: *const c::turso_connection_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => match connection.wal_disable_auto_actions() {
+            Ok(()) => c::turso_status_code_t::TURSO_OK,
+            Err(err) => unsafe { err.to_capi(error_opt_out) },
+        },
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_connection_wal_state(
+    connection: *const c::turso_connection_t,
+    max_frame_out: *mut u64,
+    checkpoint_seq_out: *mut u32,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    if max_frame_out.is_null() || checkpoint_seq_out.is_null() {
+        return unsafe {
+            rsapi::TursoError::Misuse("WAL state output pointers must not be null".to_string())
+                .to_capi(error_opt_out)
+        };
+    }
+    match connection.wal_state() {
+        Ok((max_frame, checkpoint_seq)) => {
+            unsafe {
+                *max_frame_out = max_frame;
+                *checkpoint_seq_out = checkpoint_seq;
+            }
+            c::turso_status_code_t::TURSO_OK
+        }
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_connection_wal_get_frame(
+    connection: *const c::turso_connection_t,
+    frame_no: u64,
+    frame: *mut u8,
+    frame_len: usize,
+    page_no_out: *mut u32,
+    db_size_out: *mut u32,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    if frame.is_null() || page_no_out.is_null() || db_size_out.is_null() {
+        return unsafe {
+            rsapi::TursoError::Misuse("WAL frame pointers must not be null".to_string())
+                .to_capi(error_opt_out)
+        };
+    }
+    let frame = unsafe { std::slice::from_raw_parts_mut(frame, frame_len) };
+    match connection.wal_get_frame(frame_no, frame) {
+        Ok((page_no, db_size)) => {
+            unsafe {
+                *page_no_out = page_no;
+                *db_size_out = db_size;
+            }
+            c::turso_status_code_t::TURSO_OK
+        }
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_connection_wal_insert_begin(
+    connection: *const c::turso_connection_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    match connection.wal_insert_begin() {
+        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_connection_wal_insert_frame(
+    connection: *const c::turso_connection_t,
+    frame_no: u64,
+    frame: *const u8,
+    frame_len: usize,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    if frame.is_null() {
+        return unsafe {
+            rsapi::TursoError::Misuse("WAL frame pointer must not be null".to_string())
+                .to_capi(error_opt_out)
+        };
+    }
+    let frame = unsafe { std::slice::from_raw_parts(frame, frame_len) };
+    match connection.wal_insert_frame(frame_no, frame) {
+        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_connection_wal_insert_end(
+    connection: *const c::turso_connection_t,
+    force_commit: bool,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    match connection.wal_insert_end(force_commit) {
+        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
 /// # Safety
 /// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
 #[no_mangle]

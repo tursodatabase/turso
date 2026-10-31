@@ -323,6 +323,78 @@ bool turso_connection_get_autocommit(const turso_connection_t *self);
 /** Get last insert rowid for the connection or 0 if no inserts happened before */
 int64_t turso_connection_last_insert_rowid(const turso_connection_t *self);
 
+/*
+ * Raw WAL access for external replication.
+ *
+ * These functions let a caller copy committed WAL frames out of a database and
+ * apply them to another one, as the sync engine does internally. They work
+ * only on databases in WAL journal mode: in MVCC mode recent changes live in
+ * the logical log, so every function except turso_connection_wal_insert_end
+ * fails with TURSO_MISUSE there. A WAL frame is a 24-byte frame header
+ * followed by one page.
+ */
+
+/** Stop this connection from checkpointing or restarting the WAL on its own,
+ * so the caller decides when frames leave the WAL. The setting lives on the
+ * connection and must be applied again after reconnecting. */
+turso_status_code_t turso_connection_wal_disable_auto_actions(
+    const turso_connection_t *self,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
+
+/** Get the number of the last frame in the WAL and the checkpoint sequence
+ * number. Frame numbers start at 1 again after a checkpoint restarts the WAL,
+ * which also changes the sequence number. */
+turso_status_code_t turso_connection_wal_state(
+    const turso_connection_t *self,
+    /** set to the last frame number in the WAL, 0 when the WAL is empty */
+    uint64_t *max_frame_out,
+    /** set to the WAL checkpoint sequence number */
+    uint32_t *checkpoint_seq_out,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
+
+/** Copy WAL frame `frame_no` (1-based), header included, into `frame`.
+ * `frame_len` must be the frame header size plus the page size. */
+turso_status_code_t turso_connection_wal_get_frame(
+    const turso_connection_t *self,
+    uint64_t frame_no,
+    uint8_t *frame,
+    size_t frame_len,
+    /** set to the page number stored in the frame */
+    uint32_t *page_no_out,
+    /** set to the database size in pages for a commit frame, 0 otherwise */
+    uint32_t *db_size_out,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
+
+/** Start a session that appends raw frames to the WAL. It holds a write
+ * transaction until turso_connection_wal_insert_end. */
+turso_status_code_t turso_connection_wal_insert_begin(
+    const turso_connection_t *self,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
+
+/** Write `frame` (header included) at position `frame_no` in the WAL. Writing a
+ * frame that already exists with the same content succeeds; different content
+ * or a gap in frame numbers fails. */
+turso_status_code_t turso_connection_wal_insert_frame(
+    const turso_connection_t *self,
+    uint64_t frame_no,
+    const uint8_t *frame,
+    size_t frame_len,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
+
+/** End the session started by turso_connection_wal_insert_begin. Changes not
+ * closed by a commit frame are rolled back, unless `force_commit` is set, in
+ * which case pending changes are committed first. */
+turso_status_code_t turso_connection_wal_insert_end(
+    const turso_connection_t *self,
+    bool force_commit,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
+
 
 /** Register or replace a per-connection managed scalar function. */
 turso_status_code_t turso_connection_register_scalar_function(
