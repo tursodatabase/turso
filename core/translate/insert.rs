@@ -4009,6 +4009,7 @@ pub fn emit_fk_child_insert_checks(
     })? {
         let is_self_ref = fk_ref.fk.parent_namespace == namespace.id
             && fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
+        let is_deferred = resolver.fk_is_deferred(&fk_ref.fk);
 
         // Short-circuit if any NEW component is NULL
         let fk_ok = program.allocate_label();
@@ -4076,8 +4077,8 @@ pub fn emit_fk_child_insert_checks(
             // Missing parent: counted for a deferred FK or a multi-row insert, otherwise Halt before Insert
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            if fk_ref.fk.deferred || inserting_multiple_rows {
-                emit_fk_violation(program, &fk_ref.fk, None)?;
+            if is_deferred || inserting_multiple_rows {
+                emit_fk_violation(program, is_deferred, None)?;
             } else {
                 let fk_col_regs: Vec<usize> = fk_ref
                     .fk
@@ -4196,8 +4197,8 @@ pub fn emit_fk_child_insert_checks(
                 |_p| Ok(()),
                 // on_not_found: counted for a deferred FK or a multi-row insert, otherwise Halt
                 |p| {
-                    if fk_ref.fk.deferred || inserting_multiple_rows {
-                        emit_fk_violation(p, &fk_ref.fk, None)?;
+                    if is_deferred || inserting_multiple_rows {
+                        emit_fk_violation(p, is_deferred, None)?;
                     } else {
                         let fk_col_regs: Vec<usize> = fk_ref
                             .fk
@@ -4326,14 +4327,15 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 .child_table
                 .name
                 .eq_ignore_ascii_case(&parent_table.name);
+        let is_deferred = resolver.fk_is_deferred(&pref.fk);
         // Skip only when it cannot repair anything: non-deferred and not self-referencing
-        if !force_immediate && !pref.fk.deferred && !is_self_ref {
+        if !force_immediate && !is_deferred && !is_self_ref {
             continue;
         }
         // Nothing to do if the parent counter is 0
         let skip_fk = program.allocate_label();
         program.emit_insn(Insn::FkIfZero {
-            deferred: pref.fk.deferred,
+            deferred: is_deferred,
             target_pc: skip_fk,
         });
 
@@ -4372,7 +4374,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             // Decrement once per matching child row
             index_scan_match_any(program, icur, probe_start, n_cols, new_row_rowid, |p| {
                 let next = p.allocate_label();
-                emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                emit_guarded_fk_decrement(p, next, is_deferred);
                 p.preassign_label_to_next_insn(next);
                 Ok(())
             })?;
@@ -4386,7 +4388,7 @@ pub fn emit_parent_side_fk_decrement_on_insert(
                 resolver,
                 |p| {
                     let next = p.allocate_label();
-                    emit_guarded_fk_decrement(p, next, pref.fk.deferred);
+                    emit_guarded_fk_decrement(p, next, is_deferred);
                     p.preassign_label_to_next_insn(next);
                     Ok(())
                 },

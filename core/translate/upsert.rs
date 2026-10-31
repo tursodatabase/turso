@@ -866,12 +866,9 @@ pub fn emit_upsert(
         }
         _ => crate::alloc::vec![],
     };
-    let has_parent_fk_checks = affected_parent_fks.iter().any(|fk| {
-        matches!(
-            fk.fk.on_update,
-            ast::RefAct::NoAction | ast::RefAct::Restrict
-        )
-    });
+    let has_parent_fk_checks = affected_parent_fks
+        .iter()
+        .any(|fk| resolver.fk_counts_children_of_old_parent_key(&fk.fk, fk.fk.on_update));
     let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
         matches!(
             fk.fk.on_update,

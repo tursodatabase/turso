@@ -404,6 +404,25 @@ PRAGMA foreign_keys = OFF;
 Foreign key enforcement is off by default for SQLite compatibility.
 Changing this setting is a no-op while a transaction or savepoint is open.
 
+### defer_foreign_keys
+
+Defers every foreign key check until the transaction commits, as if each foreign key
+were declared `DEFERRABLE INITIALLY DEFERRED`. `RESTRICT` actions are deferred too.
+
+```sql
+PRAGMA defer_foreign_keys;
+PRAGMA defer_foreign_keys = ON;
+PRAGMA defer_foreign_keys = OFF;
+```
+
+The setting is off by default and is turned off again when each transaction commits
+or rolls back. It is also turned off when a statement that reads the database, such as
+`SELECT * FROM t` or `PRAGMA journal_mode`, runs outside a transaction. Statements that
+read no table, such as `SELECT 1` or `SELECT * FROM (VALUES(1))`, leave it on.
+COMMIT still fails if violations remain. Turning the setting off forgets all violations
+counted so far in the transaction, including those of `DEFERRABLE INITIALLY DEFERRED`
+foreign keys.
+
 ### legacy_file_format
 
 Accepted and ignored. SQLite dropped the legacy file format and made this PRAGMA a
