@@ -2744,7 +2744,7 @@ pub fn emit_fk_drop_table_check(
                 p.emit_insn(Insn::FkCounter {
                     constraint_info: None,
                     increment_value: 1,
-                    deferred: resolver.defer_foreign_keys,
+                    deferred: resolver.fk_is_deferred(&fk_ref.fk),
                 });
                 Ok(())
             },

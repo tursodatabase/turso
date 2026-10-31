@@ -5205,6 +5205,27 @@ expect {
     0
 }
 
+# A DEFERRABLE INITIALLY DEFERRED child key lets DROP TABLE remove the parent
+# until COMMIT, so recreating the parent in the same transaction commits.
+test fk-deferred-drop-parent-table-recreated-before-commit {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1, 1);
+    BEGIN;
+    DROP TABLE p;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    INSERT INTO p VALUES(1);
+    COMMIT;
+    SELECT count(*) FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    1
+    1
+}
+
 # Like SQLite, statements that read the database file without opening a
 # transaction also turn the pragma off. `EXPLAIN SELECT 1` does not.
 test fk-defer-pragma-resets-after-statements-without-transaction {
