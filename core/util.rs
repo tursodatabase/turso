@@ -1675,8 +1675,7 @@ pub trait AstVisitor {
     /// leaves out its sub-expressions and the subqueries in them.
     fn expr(&mut self, expr: &ast::Expr) -> Result<WalkControl>;
 
-    /// Every table a FROM clause names, a statement writes to, a trigger is
-    /// on, or a trigger command writes to. The last two have no namespace.
+    /// Every table a FROM clause names.
     fn table(&mut self, _name: &ast::QualifiedName) -> Result<()> {
         Ok(())
     }
@@ -1813,20 +1812,18 @@ where
     visit_stmt(stmt, func)
 }
 
-/// Walk a statement: the tables it writes to and reads, and all of its
-/// expressions, including subqueries.
+/// Walk a statement: the tables it reads and all of its expressions,
+/// including subqueries.
 pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()> {
     match stmt {
         ast::Stmt::Select(select) => visit_select(select, visitor)?,
         ast::Stmt::Insert {
             with,
-            tbl_name,
             body,
             returning,
             ..
         } => {
             visit_with(with.as_ref(), visitor)?;
-            visitor.table(tbl_name)?;
             if let ast::InsertBody::Select(select, upsert) = body {
                 visit_select(select, visitor)?;
                 visit_upsert(upsert.as_deref(), visitor)?;
@@ -1835,7 +1832,6 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         }
         ast::Stmt::Update(update) => {
             visit_with(update.with.as_ref(), visitor)?;
-            visitor.table(&update.tbl_name)?;
             for set in &update.sets {
                 visit_expr_with_subqueries(&set.expr, visitor)?;
             }
@@ -1849,13 +1845,11 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         }
         ast::Stmt::Delete {
             with,
-            tbl_name,
             where_clause,
             returning,
             ..
         } => {
             visit_with(with.as_ref(), visitor)?;
-            visitor.table(tbl_name)?;
             if let Some(where_clause) = where_clause {
                 visit_expr_with_subqueries(where_clause, visitor)?;
             }
@@ -1914,11 +1908,8 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
     Ok(())
 }
 
-/// Walk a trigger: the table it is on, its WHEN clause and its commands.
+/// Walk a trigger: its WHEN clause and its commands.
 pub fn visit_trigger<V: AstVisitor>(trigger: &Trigger, visitor: &mut V) -> Result<()> {
-    visitor.table(&ast::QualifiedName::single(ast::Name::exact(
-        trigger.table_name.clone(),
-    )))?;
     if let Some(when_clause) = &trigger.when_clause {
         visit_expr_with_subqueries(when_clause, visitor)?;
     }
@@ -1931,13 +1922,11 @@ pub fn visit_trigger<V: AstVisitor>(trigger: &Trigger, visitor: &mut V) -> Resul
 fn visit_trigger_cmd<V: AstVisitor>(cmd: &ast::TriggerCmd, visitor: &mut V) -> Result<()> {
     match cmd {
         ast::TriggerCmd::Update {
-            tbl_name,
             sets,
             from,
             where_clause,
             ..
         } => {
-            visitor.table(&ast::QualifiedName::single(tbl_name.clone()))?;
             for set in sets {
                 visit_expr_with_subqueries(&set.expr, visitor)?;
             }
@@ -1949,22 +1938,19 @@ fn visit_trigger_cmd<V: AstVisitor>(cmd: &ast::TriggerCmd, visitor: &mut V) -> R
             }
         }
         ast::TriggerCmd::Insert {
-            tbl_name,
             select,
             upsert,
             returning,
             ..
         } => {
-            visitor.table(&ast::QualifiedName::single(tbl_name.clone()))?;
             visit_select(select, visitor)?;
             visit_upsert(upsert.as_deref(), visitor)?;
             visit_result_columns(returning, visitor)?;
         }
         ast::TriggerCmd::Delete {
-            tbl_name,
+            tbl_name: _,
             where_clause,
         } => {
-            visitor.table(&ast::QualifiedName::single(tbl_name.clone()))?;
             if let Some(where_clause) = where_clause {
                 visit_expr_with_subqueries(where_clause, visitor)?;
             }
