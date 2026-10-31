@@ -2242,20 +2242,40 @@ pub fn validate_select_for_views(
         },
     )?;
 
+    // Expression subqueries are checked here, in source order and interleaved
+    // with the window ORDER BY check, so the first problem in the text wins.
     walk_select_expressions(select_stmt, &mut |expr| {
-        if let ast::Expr::FunctionCall {
-            name,
-            order_by,
-            filter_over,
-            ..
-        } = expr
-        {
-            if !order_by.is_empty() && filter_over.over_clause.is_some() {
+        match expr {
+            ast::Expr::FunctionCall {
+                name,
+                order_by,
+                filter_over,
+                ..
+            } if !order_by.is_empty() && filter_over.over_clause.is_some() => {
                 crate::bail_parse_error!(
                     "ORDER BY may not be used with non-aggregate {}()",
                     name.as_str()
                 );
             }
+            ast::Expr::Subquery(subquery) | ast::Expr::Exists(subquery) => {
+                visit_select(
+                    subquery,
+                    &mut CrossDbReferences {
+                        resolver,
+                        view_database_id,
+                    },
+                )?;
+            }
+            ast::Expr::InSelect { rhs, .. } => {
+                visit_select(
+                    rhs,
+                    &mut CrossDbReferences {
+                        resolver,
+                        view_database_id,
+                    },
+                )?;
+            }
+            _ => {}
         }
         Ok(WalkControl::Continue)
     })
@@ -2269,8 +2289,18 @@ struct CrossDbReferences<'r, 'a> {
 }
 
 impl AstVisitor for CrossDbReferences<'_, '_> {
-    fn expr(&mut self, _expr: &ast::Expr) -> Result<WalkControl> {
-        Ok(WalkControl::Continue)
+    /// Checks one query level: its FROM clause, joins, FROM subqueries,
+    /// compounds and CTEs. Expression subqueries are left to
+    /// `validate_select_for_views`, which checks them in source order and
+    /// interleaved with the window ORDER BY check, so the first problem in
+    /// the text is the one reported.
+    fn expr(&mut self, expr: &ast::Expr) -> Result<WalkControl> {
+        Ok(match expr {
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+                WalkControl::SkipChildren
+            }
+            _ => WalkControl::Continue,
+        })
     }
 
     fn table(&mut self, name: &ast::QualifiedName) -> Result<()> {
