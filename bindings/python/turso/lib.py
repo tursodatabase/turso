@@ -1131,10 +1131,14 @@ class Cursor:
         return self
 
     def __next__(self) -> Any:
-        row = self.fetchone()
+        self._ensure_open()
+        # Judge exhaustion on the raw row, not the factory result: a
+        # row_factory that maps a row to None is a valid row value, and
+        # treating it as exhaustion silently drops every later row.
+        row = self._fetchone_tuple()
         if row is None:
             raise StopIteration
-        return row
+        return self._apply_row_factory(row)
 
 
 # Row goes THIRD

@@ -1448,6 +1448,33 @@ def test_custom_row_factory_callable(provider):
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_row_factory_returning_none_during_iteration(provider):
+    conn = connect(provider, ":memory:")
+
+    # A factory that maps each row to its first column: a NULL row maps to
+    # None, which must not terminate iteration.
+    conn.row_factory = lambda cursor, row: row[0]
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (x)")
+    cur.execute("INSERT INTO t VALUES (1)")
+    cur.execute("INSERT INTO t VALUES (NULL)")
+    cur.execute("INSERT INTO t VALUES (3)")
+
+    assert list(cur.execute("SELECT x FROM t ORDER BY rowid")) == [1, None, 3]
+    assert conn.execute("SELECT x FROM t ORDER BY rowid").fetchall() == [1, None, 3]
+    # fetchone keeps the DB-API contract: None only means no more rows.
+    exhausted = conn.execute("SELECT x FROM t ORDER BY rowid")
+    assert [exhausted.fetchone(), exhausted.fetchone(), exhausted.fetchone(), exhausted.fetchone()] == [1, None, 3, None]
+    # iteration must still fail on a closed cursor, exactly like sqlite3
+    cur = conn.cursor()
+    cur.close()
+    with pytest.raises(conn.ProgrammingError):
+        next(cur)
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_in_transaction_toggle_with_commit(provider):
     conn = connect(provider, ":memory:")
     cur = conn.cursor()
