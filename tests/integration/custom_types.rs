@@ -170,6 +170,37 @@ mod tests {
         assert_eq!(rows, vec![("ok".to_string(),)]);
     }
 
+    /// A file whose hidden key column names an order this build does not know
+    /// must give an error when opened, not stop the process.
+    #[test]
+    fn test_open_fails_when_hidden_key_column_names_unknown_order() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("unknown_hidden_key_order.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE __turso_internal_dbsp_state_v1_v(k __turso_key_order_bogus)",
+            )
+            .unwrap();
+
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let result = turso_core::Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new().with_views(true),
+            None,
+            Arc::new(turso_core::SqliteDialect),
+        );
+        let Err(err) = result else {
+            panic!("open must fail when a hidden key column names an unknown order");
+        };
+        assert!(
+            err.to_string().contains("unknown type order: bogus"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// Indexes on custom-type columns must keep their order after reopening:
     /// the stored-value order of a user type, and numeric's own order, both for
     /// column indexes and for expression indexes.

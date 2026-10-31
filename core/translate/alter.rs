@@ -1941,7 +1941,7 @@ pub fn translate_alter_table(
             let altered_table = if let Some(replacement_column) = &replacement_column {
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] = replacement_column.clone();
-                table.resolve_custom_types(resolver.schema());
+                table.resolve_custom_types(resolver.schema())?;
                 table.prepare_generated_columns()?;
                 let column_names: Vec<&str> = table
                     .columns()
