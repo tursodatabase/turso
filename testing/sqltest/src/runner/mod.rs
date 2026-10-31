@@ -937,6 +937,8 @@ pub struct RunnerConfig {
     /// Path to binary for cross-checking integrity (None = disabled).
     /// Used by tests annotated with `@cross-check-integrity`.
     pub cross_check_binary: Option<PathBuf>,
+    /// Stop the run at the first failed test or error
+    pub fail_fast: bool,
 }
 
 impl Default for RunnerConfig {
@@ -948,6 +950,7 @@ impl Default for RunnerConfig {
             snapshot_update_mode: SnapshotUpdateMode::Auto,
             snapshot_filter: None,
             cross_check_binary: None,
+            fail_fast: false,
         }
     }
 }
@@ -980,6 +983,11 @@ impl RunnerConfig {
 
     pub fn with_cross_check_binary(mut self, binary: PathBuf) -> Self {
         self.cross_check_binary = Some(binary);
+        self
+    }
+
+    pub fn with_fail_fast(mut self, fail_fast: bool) -> Self {
+        self.fail_fast = fail_fast;
         self
     }
 }
@@ -1287,6 +1295,9 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 on_result(result);
             }
         }
+        if self.config.fail_fast && !loaded.errors.is_empty() {
+            return Ok(loaded.errors);
+        }
 
         // Spawn ALL test tasks from ALL files at once into a single FuturesUnordered
         let mut all_futures: FuturesUnordered<tokio::task::JoinHandle<TestResult>> =
@@ -1342,12 +1353,22 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
             // Call the callback with each result as it completes
             on_result(&test_result);
 
+            let stop = self.config.fail_fast
+                && (test_result.outcome.is_failed() || test_result.outcome.is_error());
+
             // Use test_result.file for grouping
             let file_path = test_result.file.clone();
             results_by_file
                 .entry(file_path)
                 .or_default()
                 .push(test_result);
+
+            if stop {
+                for handle in all_futures.iter() {
+                    handle.abort();
+                }
+                break;
+            }
         }
 
         // Convert to FileResults
@@ -1478,6 +1499,7 @@ pub fn summarize(start: Instant, results: &[FileResult]) -> RunSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::rust::RustBackend;
 
     #[test]
     fn test_matches_filter_exact() {
@@ -1522,6 +1544,84 @@ mod tests {
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.skipped, 1);
         assert!(!summary.is_success());
+    }
+
+    #[tokio::test]
+    async fn fail_fast_runs_no_tests_when_a_file_does_not_parse() {
+        let broken = r#"
+@database :memory:
+
+test broken {
+"#;
+        let passes = r#"
+@database :memory:
+
+test passes {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("broken.sqltest"), broken).unwrap();
+        std::fs::write(dir.path().join("passes.sqltest"), passes).unwrap();
+        let config = RunnerConfig::default().with_fail_fast(true);
+        let runner = TestRunner::new(RustBackend::new()).with_config(config);
+
+        let results = runner
+            .run_paths(&[dir.path().to_path_buf()], |_| {})
+            .await
+            .unwrap();
+
+        let summary = summarize(Instant::now(), &results);
+        assert_eq!(summary.errors, 1);
+        assert_eq!(summary.total, 1);
+    }
+
+    #[tokio::test]
+    async fn fail_fast_stops_after_the_first_failed_test() {
+        let source = r#"
+@database :memory:
+
+test fails {
+    SELECT 1;
+}
+expect {
+    2
+}
+
+test passes-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test passes-2 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+        let loaded = LoadedTests {
+            files: vec![(
+                PathBuf::from("fail-fast.sqltest"),
+                crate::parse(source).unwrap(),
+            )],
+            errors: vec![],
+        };
+        let config = RunnerConfig::default()
+            .with_max_jobs(1)
+            .with_fail_fast(true);
+        let runner = TestRunner::new(RustBackend::new()).with_config(config);
+
+        let results = runner.run_loaded_tests(loaded, |_| {}).await.unwrap();
+
+        let summary = summarize(Instant::now(), &results);
+        assert_eq!(summary.failed, 1);
+        assert!(summary.total < 3, "ran {} of 3 tests", summary.total);
     }
 
     #[tokio::test]
