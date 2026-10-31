@@ -1509,6 +1509,79 @@ def test_in_transaction_toggle_with_commit(provider):
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "INSERT INTO t(nosuch) VALUES (1)",
+        "INSERT INTO nosuch VALUES (1)",
+        "UPDATE t SET",
+        "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+    ],
+)
+def test_dml_that_fails_to_prepare_does_not_begin_transaction(provider, sql, tmp_path):
+    db_file = str(tmp_path / "failed_dml.db")
+    conn = connect(provider, db_file)
+    conn.execute("CREATE TABLE t(v INTEGER)")
+    conn.commit()
+
+    with pytest.raises((sqlite3.Error, turso.Error)):
+        conn.execute(sql)
+    assert not conn.in_transaction
+    assert conn.execute("SELECT count(*) FROM t").fetchone() == (0,)
+
+    # Without an open transaction, a commit from another connection is visible
+    other = connect(provider, db_file)
+    other.execute("INSERT INTO t VALUES (1)")
+    other.commit()
+    other.close()
+    assert conn.execute("SELECT count(*) FROM t").fetchone() == (1,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+@pytest.mark.parametrize("sql", ["INSERT INTO t(nosuch) VALUES (?)", "INSERT INTO nosuch VALUES (?)"])
+def test_executemany_that_fails_to_prepare_does_not_begin_transaction(provider, sql):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t(v INTEGER)")
+    conn.commit()
+    with pytest.raises((sqlite3.Error, turso.Error)):
+        conn.executemany(sql, [(1,)])
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_executemany_with_non_iterable_parameters_does_not_begin_transaction(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t(v INTEGER)")
+    conn.commit()
+    with pytest.raises(TypeError):
+        conn.executemany("INSERT INTO t VALUES (?)", None)
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_failed_dml_with_immediate_isolation_does_not_hold_write_lock(provider, tmp_path):
+    db_file = str(tmp_path / "failed_dml_immediate.db")
+    conn = connect(provider, db_file)
+    conn.execute("CREATE TABLE t(v INTEGER)")
+    conn.commit()
+    conn.isolation_level = "IMMEDIATE"
+
+    with pytest.raises((sqlite3.Error, turso.Error)):
+        conn.execute("INSERT INTO t(nosuch) VALUES (1)")
+    assert not conn.in_transaction
+
+    other = connect(provider, db_file)
+    other.execute("INSERT INTO t VALUES (1)")
+    other.commit()
+    other.close()
+    assert conn.execute("SELECT count(*) FROM t").fetchone() == (1,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_isolation_level_none_autocommit(provider, tmp_path):
     db_file = tmp_path / "auto_commit.db"
 

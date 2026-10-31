@@ -976,7 +976,8 @@ class Cursor:
         self._ensure_open()
         self._reset_last_result()
 
-        # Prepare exactly one statement
+        # Prepare exactly one statement before the implicit BEGIN, so a statement
+        # that fails to prepare does not leave a transaction open (as in sqlite3)
         prepared = self._prepare_single_statement(sql)
 
         stmt = prepared.stmt
@@ -1044,15 +1045,17 @@ class Cursor:
             raise ProgrammingError("executemany() requires a single DML (INSERT/UPDATE/DELETE/REPLACE) statement")
         self._connection._finish_unfinished_writes()
 
-        # Implement legacy implicit transaction: same as execute()
-        self._maybe_implicit_begin(sql)
-
+        # A non-iterable argument must raise before the implicit BEGIN, as in sqlite3
+        parameters_iter = iter(seq_of_parameters)
         prepared = self._prepare_single_statement(sql)
         stmt = prepared.stmt
         try:
+            # Implement legacy implicit transaction: same as execute()
+            self._maybe_implicit_begin(sql)
+
             # For executemany, discard any rows produced (even if RETURNING was used)
             # Therefore we ALWAYS use execute() path per-iteration.
-            for parameters in seq_of_parameters:
+            for parameters in parameters_iter:
                 # Reset previous bindings and program memory before reusing
                 stmt.reset()
                 self._bind_params(stmt, parameters)
