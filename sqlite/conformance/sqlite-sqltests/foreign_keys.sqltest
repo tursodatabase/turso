@@ -4836,6 +4836,82 @@ snapshot fk-upsert-parent-key-with-cascade-child {
     INSERT INTO parent(id, k, v) VALUES (1, 10, 2) ON CONFLICT(id) DO UPDATE SET k = excluded.k;
 }
 
+# A parent DELETE where one child row references the parent through both a
+# CASCADE foreign key and an immediate NO ACTION foreign key must succeed: the
+# CASCADE removes the child, so at statement end no row references the deleted
+# parent. Turso used to fail with "FOREIGN KEY constraint failed" because the
+# NO ACTION check bumps the immediate violation counter, but the cascade that
+# clears the reference runs in a subprogram with its own counter, so the
+# decrement never reached the parent statement's counter (issue #9290).
+@cross-check-integrity
+test fk-delete-cascade-and-immediate-noaction-same-parent {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE c(pid REFERENCES p(id) ON DELETE CASCADE, pname REFERENCES p(name));
+    INSERT INTO p VALUES(1,'a');
+    INSERT INTO c VALUES(1,'a');
+    DELETE FROM p WHERE id=1;
+    SELECT count(*) FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+    0
+}
+
+# Same shape across several rows: the cascade subprogram fires for each deleted
+# parent row, and the shared immediate counter must net back to zero every time.
+@cross-check-integrity
+test fk-delete-cascade-and-immediate-noaction-multiple-rows {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE c(pid REFERENCES p(id) ON DELETE CASCADE, pname REFERENCES p(name));
+    INSERT INTO p VALUES(1,'a'),(2,'b'),(3,'c');
+    INSERT INTO c VALUES(1,'a'),(2,'b'),(3,'c');
+    DELETE FROM p WHERE id IN (1,3);
+    SELECT id FROM p ORDER BY id;
+    SELECT pid FROM c ORDER BY pid;
+}
+expect {
+    2
+    2
+}
+
+# The parent delete counts the NO ACTION child as a violation. Deleting the
+# rows of a different, CASCADE child table must not give that count back:
+# that FK was never counted, so the NO ACTION violation still stands.
+@cross-check-integrity
+test fk-delete-cascade-child-does-not-cancel-other-noaction-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE nc(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    CREATE TABLE cc(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO nc VALUES(1,1);
+    INSERT INTO cc VALUES(1,1),(2,1);
+    DELETE FROM p WHERE id=1;
+}
+expect error {
+}
+
+# Two children reference the same deleted parent through the NO ACTION FK
+# and are both removed by the CASCADE FK, while another table keeps a real
+# violation on a second deleted parent. Only the last of the two cascaded
+# children gives the count back, so the other violation still fails.
+@cross-check-integrity
+test fk-delete-cascade-siblings-do-not-cancel-unrelated-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE, pname REFERENCES p(name));
+    CREATE TABLE d(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO p VALUES(1,'a'),(2,'b');
+    INSERT INTO c VALUES(1,1,'a'),(2,1,'a');
+    INSERT INTO d VALUES(1,2);
+    DELETE FROM p WHERE id IN (1,2);
+}
+expect error {
+}
+
 test fk-delete-mixed-case-parent {
     PRAGMA foreign_keys = ON;
     CREATE TABLE "Mixed Parent" (id INTEGER PRIMARY KEY);

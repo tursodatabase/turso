@@ -1441,6 +1441,21 @@ impl Statement {
         self.has_returned_row = false;
     }
 
+    /// Statement-level immediate FK violation counter of this (sub)program.
+    /// Used by `op_program` to share one immediate counter between a parent
+    /// statement and its FK-action / trigger subprograms, which each run with
+    /// their own `ProgramState`.
+    pub fn fk_immediate_violations_during_stmt(&self) -> isize {
+        self.state.get_fk_immediate_violations_during_stmt()
+    }
+
+    /// Seed this subprogram's immediate FK violation counter with the parent
+    /// statement's running count, so guarded decrements inside the subprogram
+    /// see the real total instead of a fresh zero.
+    pub fn set_fk_immediate_violations_during_stmt(&self, v: isize) {
+        self.state.set_fk_immediate_violations_during_stmt(v);
+    }
+
     fn reset_internal(
         &mut self,
         max_registers: Option<usize>,

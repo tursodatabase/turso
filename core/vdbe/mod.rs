@@ -2007,6 +2007,14 @@ impl ProgramState {
         self.fk_immediate_violations_during_stmt
             .load(Ordering::Acquire)
     }
+    /// Overwrite the statement-level immediate FK violation counter. Used to
+    /// carry the parent statement's running count into an FK-action / trigger
+    /// subprogram (which runs with its own `ProgramState`) and back out, so the
+    /// whole statement shares one immediate counter as SQLite does.
+    pub fn set_fk_immediate_violations_during_stmt(&self, v: isize) {
+        self.fk_immediate_violations_during_stmt
+            .store(v, Ordering::Release);
+    }
 
     pub(crate) fn immediate_foreign_key_error(&self) -> LimboError {
         self.fk_immediate_violation.clone().unwrap_or_else(|| {
