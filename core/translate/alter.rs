@@ -603,7 +603,13 @@ fn emit_column_constraints_validation(
         check_constraints.extend(domain_checks);
     }
 
-    if !has_notnull && check_constraints.is_empty() {
+    let strict_virtual_type = if table.is_strict && column.is_virtual_generated() {
+        column.strict_value_type()
+    } else {
+        None
+    };
+
+    if !has_notnull && check_constraints.is_empty() && strict_virtual_type.is_none() {
         return Ok(());
     }
 
@@ -667,6 +673,23 @@ fn emit_column_constraints_validation(
         &resolved_table_arc,
     )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
+
+    if let Some(value_type) = strict_virtual_type {
+        let type_passed = program.allocate_label();
+        program.emit_insn(Insn::IsType {
+            reg: result_reg,
+            target_pc: type_passed,
+            value_type,
+        });
+        program.emit_insn(Insn::Halt {
+            constraint_info: None,
+            err_code: 1,
+            description: "type mismatch on DEFAULT".to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(type_passed);
+    }
 
     if !check_constraints.is_empty() {
         let table = Table::BTree(resolved_table_arc.clone());
