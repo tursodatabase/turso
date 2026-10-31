@@ -1517,6 +1517,17 @@ def test_executemany_that_fails_to_prepare_does_not_begin_transaction(provider, 
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_executemany_with_non_iterable_parameters_does_not_begin_transaction(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t(v INTEGER)")
+    conn.commit()
+    with pytest.raises(TypeError):
+        conn.executemany("INSERT INTO t VALUES (?)", None)
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_failed_dml_with_immediate_isolation_does_not_hold_write_lock(provider, tmp_path):
     db_file = str(tmp_path / "failed_dml_immediate.db")
     conn = connect(provider, db_file)
