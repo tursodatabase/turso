@@ -518,7 +518,6 @@ expect {
 }
 
 @setup filter_over_base
-@backend cli
 @skip-if sqlite "uses turso-only test_nondet_counter() to observe nondet dedup behavior"
 test filter-over-nondeterministic-subquery-filter-dedup {
     -- The nondeterministic call is inside the FILTER subquery. Repeated

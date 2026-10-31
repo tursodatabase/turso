@@ -1,6 +1,6 @@
 use crate::schema::{BTreeTable, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
 use crate::translate::expr::translate_expr;
-use crate::vdbe::builder::{DmlColumnContext, SelfTableContext};
+use crate::vdbe::builder::{DmlColumnContext, DmlRowForm, SelfTableContext};
 use crate::{Arc, Result};
 use turso_parser::ast;
 
@@ -18,7 +18,6 @@ pub fn compute_virtual_columns(
     let ctx = SelfTableContext::ForDML {
         dml_ctx: dml_ctx.clone(),
         table: Arc::clone(table),
-        uses_custom_type_operators: false,
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         for (idx, column) in columns.iter() {
@@ -47,9 +46,14 @@ pub(crate) fn emit_gencol_expr_from_registers(
     table: &Arc<BTreeTable>,
 ) -> Result<()> {
     let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::layout(columns, registers_start, rowid_reg, layout.clone()),
+        dml_ctx: DmlColumnContext::layout(
+            columns,
+            registers_start,
+            rowid_reg,
+            layout.clone(),
+            DmlRowForm::Stored,
+        ),
         table: Arc::clone(table),
-        uses_custom_type_operators: false,
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         translate_expr(program, None, expr, target_reg, resolver)?;

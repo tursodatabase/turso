@@ -11,6 +11,7 @@ use crate::translate::emitter::{
     Resolver, TranslateCtx,
 };
 use crate::translate::eqp::EqpDetail;
+use crate::translate::expr_context::ExprContext;
 use crate::translate::plan::{
     Plan, QueryDestination, RecursiveCtePlan, RecursiveCteQueueKey, SelectPlan,
 };
@@ -54,7 +55,8 @@ pub(crate) fn emit_recursive_cte(
                     order: SortOrder::Asc,
                     nulls_order: None,
                     pos_in_table: queue_index_columns.len(),
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
+                    explicit_collation: None,
                     default: None,
                     expr: None,
                 })?;
@@ -73,6 +75,7 @@ pub(crate) fn emit_recursive_cte(
                 nulls_order: None,
                 pos_in_table: queue_index_columns.len(),
                 collation,
+                explicit_collation: None,
                 default: None,
                 expr: None,
             })?;
@@ -86,13 +89,13 @@ pub(crate) fn emit_recursive_cte(
     queue_index_columns.try_push(IndexColumn::new(
         "sequence",
         queue_index_columns.len(),
-        CollationSeq::Binary,
+        CollationSeq::BINARY,
     ))?;
     for result_column_index in 0..num_result_columns {
         queue_index_columns.try_push(IndexColumn::new(
             format!("result-{result_column_index}"),
             queue_index_columns.len(),
-            CollationSeq::Binary,
+            CollationSeq::BINARY,
         ))?;
     }
 
@@ -129,6 +132,7 @@ pub(crate) fn emit_recursive_cte(
                     result_column_index,
                     resolver,
                 )?,
+                explicit_collation: None,
                 default: None,
                 expr: None,
             })?;
@@ -284,10 +288,13 @@ fn recursive_cte_result_column_collation(
                 .first()
                 .and_then(|row| row.get(result_column_index))
                 .unwrap_or(&select.result_columns[result_column_index].expr);
-            columns.push((expr, Some(&select.table_references)));
+            columns.push((
+                expr,
+                ExprContext::new(Some(&select.table_references), resolver),
+            ));
         }
     }
-    first_collation(columns, resolver)
+    first_collation(columns)
 }
 
 fn emit_recursive_cte_query(

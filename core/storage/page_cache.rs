@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
+use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap as HashMap;
 use tracing::trace;
 
@@ -353,6 +354,19 @@ impl PageCache {
             });
         }
 
+        self.remove_entry(key, entry_ptr, clean_page);
+        Ok(())
+    }
+
+    fn remove_entry(
+        &mut self,
+        key: PageCacheKey,
+        entry_ptr: *mut PageCacheEntry,
+        clean_page: bool,
+    ) {
+        let entry = unsafe { &mut *entry_ptr };
+        let page = &entry.page;
+
         // Track evictable count before removing
         let was_evictable = Self::counted_as_evictable(page);
 
@@ -383,8 +397,6 @@ impl PageCache {
         if was_evictable {
             self.evictable_count = self.evictable_count.saturating_sub(1);
         }
-
-        Ok(())
     }
 
     #[inline]
@@ -790,6 +802,43 @@ impl PageCache {
             self.delete(key)?;
         }
         Ok(())
+    }
+
+    /// Removes every page whose contents a rolled-back write transaction may
+    /// have changed: pages in `tx_dirty_pages`, dirty pages, pages with a read
+    /// in flight, and pages read from or written to a WAL frame newer than
+    /// `committed_max_frame`. It also removes pages that are not loaded or are
+    /// still pinned, because a failed statement can leave them behind. Callers
+    /// must invalidate cursors first.
+    #[aristo::intent(
+        "After rollback, every cached page holds committed data, is loaded, and is not pinned.",
+        verify = "full",
+        id = "rollback_leaves_only_committed_pages_in_cache"
+    )]
+    pub fn discard_uncommitted_pages(
+        &mut self,
+        tx_dirty_pages: &RoaringBitmap,
+        committed_max_frame: u64,
+    ) {
+        let uncommitted: Vec<(PageCacheKey, *mut PageCacheEntry)> = self
+            .map
+            .iter()
+            .filter(|(key, &entry_ptr)| {
+                let page = unsafe { &(*entry_ptr).page };
+                tx_dirty_pages.contains(key.0 as u32)
+                    || page.is_dirty()
+                    || page.is_locked()
+                    || !page.is_loaded()
+                    || page.is_pinned()
+                    || (page.has_wal_tag() && page.wal_tag_pair().0 > committed_max_frame)
+            })
+            .map(|(&key, &entry_ptr)| (key, entry_ptr))
+            .collect();
+        for (key, entry_ptr) in uncommitted {
+            let page = unsafe { (*entry_ptr).page.clone() };
+            self.remove_entry(key, entry_ptr, true);
+            page.clear_dirty();
+        }
     }
 
     #[cfg(test)]

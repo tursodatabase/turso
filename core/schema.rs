@@ -17,9 +17,10 @@ use crate::translate::expr::{
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord};
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
 use crate::{turso_assert, turso_debug_assert};
@@ -114,7 +115,8 @@ impl Trigger {
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::translate::collate::CollationSeq;
+use crate::translate::collate::{CollationSeq, TextCollation};
+use crate::translate::expr::expr_type::ExprType;
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
     column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
@@ -243,11 +245,158 @@ pub enum TypeDefKind {
         encode: Option<Box<ast::Expr>>,
         coerce: Option<Box<ast::Expr>>,
         decode: Option<Box<ast::Expr>>,
+        /// How values of the type compare, for built-in types that have their
+        /// own order, such as numeric. `None` compares the stored values as
+        /// SQLite does.
+        ordering: Option<TypeOrdering>,
         operators: std::vec::Vec<TypeOperator>,
+        /// How operators such as `+` and `-x` run on values of this type.
+        operator_signatures: std::vec::Vec<OperatorSignature>,
         default: Option<Box<ast::Expr>>,
     },
     Struct(StructDef),
     Union(UnionDef),
+}
+
+/// One way an operator runs when an operand has a custom type: `args[0] op
+/// args[1]`, or `op args[0]` for a prefix operator such as `-x`, runs `func`,
+/// or SQLite's operator when `func` is `None`.
+#[derive(Debug, Clone)]
+pub struct OperatorSignature {
+    /// One of [BINARY_OPERATORS] or [PREFIX_OPERATORS].
+    pub op: &'static str,
+    /// One operand for a prefix operator, two for a binary one.
+    pub args: std::vec::Vec<OperatorArg>,
+    pub func: Option<String>,
+    /// The type `func` returns. `None` when SQLite's operator runs.
+    pub result: Option<&'static str>,
+}
+/// An operand that a signature accepts. "This type" is the type that declares
+/// the signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorArg {
+    /// A literal that this type's ENCODE accepts. It is encoded before the call.
+    EncodableLiteral,
+    /// Any value of this type.
+    Value,
+    /// A value SQLite can compute with: anything without a custom type, or a
+    /// value of a type whose only way to run the operator is SQLite's.
+    PlainValue,
+    /// A `PlainValue` that is an integer, or whose type is not known before the
+    /// statement runs, such as a parameter. The function rejects anything else.
+    Integer,
+    /// A `PlainValue` that is neither a `Real` nor a blob.
+    Exact,
+    /// A REAL value: a REAL column, a CAST to REAL, arithmetic on two plain
+    /// values. A decimal written in the statement, such as `0.5`, `-0.5` or
+    /// the `0.5` of `(SELECT 0.5)`, is not one: as in PostgreSQL, it is an
+    /// exact number.
+    Real,
+}
+
+/// The operators whose function an operand's custom type decides. Comparisons
+/// are decided separately, and unary `+` gives its operand unchanged.
+pub const BINARY_OPERATORS: [&str; 9] = ["+", "-", "*", "/", "%", "&", "|", "<<", ">>"];
+pub const PREFIX_OPERATORS: [&str; 2] = ["-", "~"];
+
+/// The order of a built-in type whose stored values do not sort in the type's
+/// order: numeric is stored as a blob. Every other type, and every user type,
+/// sorts and compares by its stored value as SQLite does.
+fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
+    match type_name {
+        "numeric" => Some(TypeOrdering::Numeric),
+        _ => None,
+    }
+}
+
+/// Operators on built-in types. User types have none: `x + 1` on a user type is
+/// an error. The functions read plain values as they are, so nothing is encoded first:
+/// - `numeric op x` and `x op numeric` for `+ - * / %`, and `-numeric`, compute
+///   exactly, and the result is a numeric. Encoding a literal to the column's type would round it
+///   to the column's scale first (`n * 0.005` would be `n * 0.01`). With a REAL
+///   value `+ - * /` are SQLite's operators and give a REAL, as PostgreSQL gives
+///   double precision; `%` with a REAL value does not exist, as in PostgreSQL.
+/// - `date + integer`, `integer + date` and `date - integer` add or subtract
+///   days and give a date. `date - date` gives the number of days between them;
+///   a text literal on either side is encoded to a date first. Each signature
+///   has its own function, so its result type is known before the statement
+///   runs.
+/// - `smallint` and `bigint` store plain integers, so SQLite's operators run,
+///   including `-`, `~`, `&`, `|`, `<<` and `>>`.
+///
+/// Other built-in types have no operators, and these types have no others:
+/// `-date` and `numeric & 1` are errors, as in PostgreSQL.
+fn builtin_signatures(type_name: &str) -> std::vec::Vec<OperatorSignature> {
+    use OperatorArg::{EncodableLiteral, Exact, Integer, Real, Value};
+    let call = |op, args: &[OperatorArg], func: &str, result| OperatorSignature {
+        op,
+        args: args.to_vec(),
+        func: Some(func.to_string()),
+        result,
+    };
+    match type_name {
+        "numeric" => {
+            let mut signatures = std::vec::Vec::new();
+            for (op, func) in [
+                ("+", "numeric_add"),
+                ("-", "numeric_sub"),
+                ("*", "numeric_mul"),
+                ("/", "numeric_div"),
+                ("%", "numeric_mod"),
+            ] {
+                for args in [[Value, Value], [Value, Exact], [Exact, Value]] {
+                    signatures.push(call(op, &args, func, Some("numeric")));
+                }
+                if op != "%" {
+                    signatures.extend(sqlite_operator(op, Real));
+                }
+            }
+            signatures.push(call("-", &[Value], "numeric_neg", Some("numeric")));
+            signatures
+        }
+        "date" => std::vec![
+            call("+", &[Value, Integer], "date_plus", Some("date")),
+            call("+", &[Integer, Value], "date_plus", Some("date")),
+            call("-", &[Value, Value], "date_diff", Some("integer")),
+            call(
+                "-",
+                &[Value, EncodableLiteral],
+                "date_diff",
+                Some("integer")
+            ),
+            call(
+                "-",
+                &[EncodableLiteral, Value],
+                "date_diff",
+                Some("integer")
+            ),
+            call("-", &[Value, Integer], "date_minus", Some("date")),
+        ],
+        "smallint" | "bigint" => {
+            let binary = BINARY_OPERATORS
+                .into_iter()
+                .flat_map(|op| sqlite_operator(op, OperatorArg::PlainValue));
+            let prefix = PREFIX_OPERATORS.into_iter().map(|op| OperatorSignature {
+                op,
+                args: std::vec![Value],
+                func: None,
+                result: None,
+            });
+            binary.chain(prefix).collect()
+        }
+        _ => std::vec::Vec::new(),
+    }
+}
+
+/// SQLite's binary operator `op` on a value of the type and an operand `other`.
+fn sqlite_operator(op: &'static str, other: OperatorArg) -> [OperatorSignature; 2] {
+    use OperatorArg::Value;
+    [[Value, other], [other, Value]].map(|args| OperatorSignature {
+        op,
+        args: args.to_vec(),
+        func: None,
+        result: None,
+    })
 }
 
 /// Custom type definition, loaded from sqlite_turso_types
@@ -270,6 +419,19 @@ impl ResolvedType {
     /// Whether the leaf type is a domain.
     pub fn is_domain(&self) -> bool {
         self.chain[0].is_domain
+    }
+
+    /// The order values of the type compare in. A domain has the order of the
+    /// type it is based on.
+    pub fn ordering(&self) -> Option<TypeOrdering> {
+        self.base_type().and_then(|type_def| type_def.ordering())
+    }
+
+    /// The first type in the chain that is not a domain: the type itself, or
+    /// the type a domain is based on. None for a domain over a plain SQLite
+    /// type, such as `CREATE DOMAIN pos AS integer`.
+    pub fn base_type(&self) -> Option<&Arc<TypeDef>> {
+        self.chain.iter().find(|type_def| !type_def.is_domain)
     }
 
     pub fn reads_stored_values_unchanged(&self) -> bool {
@@ -380,10 +542,62 @@ impl TypeDef {
         }
     }
 
+    /// How values of the type compare, when it has its own order.
+    pub fn ordering(&self) -> Option<TypeOrdering> {
+        match &self.kind {
+            TypeDefKind::Custom { ordering, .. } => *ordering,
+            _ => None,
+        }
+    }
+
+    /// Whether ORDER BY and CREATE INDEX accept values of the type. A type
+    /// with its own order sorts in it. Otherwise values sort by their stored
+    /// value, which only keeps the order of the decoded values when the type
+    /// says so with OPERATOR '<' (or has no DECODE, so the two are the same).
+    pub fn is_sortable(&self) -> bool {
+        self.ordering().is_some()
+            || self.decode().is_none()
+            || self.operators().iter().any(|op| op.op == "<")
+    }
+
     /// Returns the operators (Custom types only, empty for Struct/Union).
     pub fn operators(&self) -> &[TypeOperator] {
         match &self.kind {
             TypeDefKind::Custom { operators, .. } => operators,
+            _ => &[],
+        }
+    }
+
+    /// Whether arithmetic with an integer or a decimal gives a value of this
+    /// type, as `numeric + 1` gives a numeric.
+    pub fn computes_with_exact_numbers(&self) -> bool {
+        self.all_operator_signatures().iter().any(|signature| {
+            signature.args.contains(&OperatorArg::Exact)
+                && signature
+                    .result
+                    .is_some_and(|result| result.eq_ignore_ascii_case(&self.name))
+        })
+    }
+
+    /// How `op` with `operand_count` operands can run on a value of this type,
+    /// most specific first.
+    pub fn operator_signatures<'a>(
+        &'a self,
+        op: &'a str,
+        operand_count: usize,
+    ) -> impl Iterator<Item = &'a OperatorSignature> {
+        self.all_operator_signatures()
+            .iter()
+            .filter(move |s| s.op == op && s.args.len() == operand_count)
+    }
+
+    /// Every operator signature of the type, declared or built in.
+    pub fn all_operator_signatures(&self) -> &[OperatorSignature] {
+        match &self.kind {
+            TypeDefKind::Custom {
+                operator_signatures,
+                ..
+            } => operator_signatures,
             _ => &[],
         }
     }
@@ -442,6 +656,11 @@ impl TypeDef {
                 // CREATE TYPE checks where type parameters are used. A type
                 // already stored by an earlier version is loaded unchecked, so
                 // the database still opens and DROP TYPE can remove it.
+                let (ordering, operator_signatures) = if is_builtin {
+                    (builtin_ordering(type_name), builtin_signatures(type_name))
+                } else {
+                    (None, std::vec::Vec::new())
+                };
                 Self {
                     name: type_name.to_string(),
                     is_builtin,
@@ -455,7 +674,9 @@ impl TypeDef {
                         encode: encode.clone(),
                         coerce: coerce.clone(),
                         decode: decode.clone(),
+                        ordering,
                         operators: operators.clone(),
+                        operator_signatures,
                         default: default.clone(),
                     },
                 }
@@ -545,7 +766,10 @@ impl TypeDef {
                 encode: None,
                 coerce: None,
                 decode: None,
+                // A domain has the order and arithmetic of the type it is based on.
+                ordering: None,
                 operators: std::vec::Vec::new(),
+                operator_signatures: std::vec::Vec::new(),
                 default,
             },
         }
@@ -644,6 +868,14 @@ pub enum MakeFromBtreePhase {
     /// driving the schema reparse).
     PopulatingSequencesRewind,
     PopulatingSequencesFetch,
+    /// Reading the CREATE TYPE statements stored in the types table, so that
+    /// indexes are built from tables whose columns already know their types.
+    LoadingTypesStart,
+    LoadingTypesRewind,
+    LoadingTypesFetch,
+    LoadingTypesAdvance,
+    /// Building materialized views and indexes, then ending the read.
+    BuildingIndexes,
     Done,
 }
 
@@ -659,6 +891,8 @@ pub struct MakeFromBtreeState {
     /// Cursor for the source currently being scanned (the back of
     /// `sequence_sources` is popped onto this when entering Rewind).
     sequence_cursor: Option<BTreeCursor>,
+    /// CREATE TYPE statements read from the types table.
+    type_sqls: Vec<String>,
 }
 
 impl Default for MakeFromBtreeState {
@@ -676,6 +910,7 @@ impl MakeFromBtreeState {
             read_tx_active: false,
             sequence_sources: vec![],
             sequence_cursor: None,
+            type_sqls: vec![],
         }
     }
 
@@ -849,6 +1084,10 @@ pub struct Schema {
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
 
+    /// Whether the database was opened with custom types enabled. Without
+    /// them, a schema that uses custom types is refused when it is loaded.
+    custom_types_enabled: bool,
+
     /// Whether the schema rows may hold the objects of namespaces
     /// under their mangled names, as the dialect of the database says.
     supports_namespaces: bool,
@@ -953,7 +1192,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
         "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '+' date_plus OPERATOR '-' date_minus OPERATOR '<'",
+        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -972,7 +1211,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
-        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)",
     ];
 
     for sql in type_sqls {
@@ -1055,6 +1294,7 @@ impl Schema {
             analyze_stats: AnalyzeStats::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
+            custom_types_enabled: enable_custom_types,
             supports_namespaces: dialect.supports_namespaces(),
             default_namespaces: dialect.default_namespaces(),
             namespace_names_loaded: !dialect.supports_namespaces(),
@@ -1578,6 +1818,34 @@ impl Schema {
         self.type_registry.get(&type_registry_key(type_name))
     }
 
+    /// The order values of `type_def` compare in. A domain has the order of
+    /// the type it is based on.
+    pub fn type_ordering(&self, type_def: &TypeDef) -> Option<TypeOrdering> {
+        if !type_def.is_domain {
+            return type_def.ordering();
+        }
+        self.resolve_type_unchecked(&type_def.name)
+            .ok()??
+            .ordering()
+    }
+
+    /// Fails when `element_type` has its own order, as numeric does. Array
+    /// elements compare by their stored form, which does not sort in the
+    /// type's order.
+    pub fn check_array_element_type(&self, element_type: &str) -> crate::Result<()> {
+        let Some(type_def) = self.get_type_def_unchecked(element_type) else {
+            return Ok(());
+        };
+        if self.type_ordering(type_def).is_some() {
+            crate::bail_parse_error!(
+                "arrays of type {} are not supported, because their elements would not compare in the order of {}",
+                type_def.name,
+                type_def.name
+            );
+        }
+        Ok(())
+    }
+
     /// Whether the column's values are encoded before they are stored: an array column, or a
     /// column whose type is a custom type of a STRICT table.
     pub fn column_has_custom_type(&self, column: &Column, is_strict: bool) -> bool {
@@ -1614,6 +1882,21 @@ impl Schema {
         }
         let (primitive, chain) = self.resolve_base_type_chain(type_name)?;
         Ok(Some(ResolvedType { primitive, chain }))
+    }
+
+    /// `type_def` itself, or the type a domain is based on: a domain stores,
+    /// sorts and computes with its values as that type does. None for a domain
+    /// over a plain SQLite type, such as `CREATE DOMAIN pos AS integer`.
+    pub fn without_domains(&self, type_def: &Arc<TypeDef>) -> Result<Option<Arc<TypeDef>>> {
+        if !type_def.is_domain {
+            return Ok(Some(type_def.clone()));
+        }
+        let resolved = self
+            .resolve_type_unchecked(&type_def.name)?
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("domain {} is not registered", type_def.name))
+            })?;
+        Ok(resolved.base_type().cloned())
     }
 
     /// Returns whether a domain in the column's type chain has NOT NULL, and the
@@ -1730,9 +2013,8 @@ impl Schema {
     }
 
     /// Load type definitions from CREATE TYPE SQL strings and resolve custom
-    /// type affinities on all STRICT tables. This is the shared entry point
-    /// used by both initial database open and schema reparse.
-    pub fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
+    /// type affinities on all STRICT tables.
+    fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
         for sql in type_sqls {
             self.add_type_from_sql(sql).map_err(|e| {
                 crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
@@ -1768,7 +2050,7 @@ impl Schema {
         {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
-            modified.resolve_custom_type_affinities(self);
+            modified.resolve_custom_types(self);
             modified.propagate_domain_constraints(self)?;
             tables.push((
                 namespace,
@@ -2508,6 +2790,8 @@ impl Schema {
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
     /// Returns IOResultOr<()> to allow async operation with external IO loop
+    /// With `load_custom_types`, the types stored in the types table are
+    /// loaded too.
     pub fn make_from_btree(
         &mut self,
         state: &mut MakeFromBtreeState,
@@ -2515,8 +2799,16 @@ impl Schema {
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
+        load_custom_types: bool,
     ) -> IOResultOr<()> {
-        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
+        let result = self.make_from_btree_internal(
+            state,
+            mv_cursor,
+            pager,
+            syms,
+            dialect,
+            load_custom_types,
+        );
         if result.is_err() {
             state.cleanup(pager);
         } else if let Ok(IOResult::Done(..)) = result {
@@ -2535,6 +2827,7 @@ impl Schema {
         pager: &Arc<Pager>,
         syms: &SymbolTable,
         dialect: &dyn crate::dialect::Dialect,
+        load_custom_types: bool,
     ) -> IOResultOr<()> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
@@ -2666,28 +2959,12 @@ impl Schema {
                 }
 
                 MakeFromBtreePhase::PopulatingSequencesRewind => {
-                    // Either no sources left → finalize, or pop the next
-                    // source and rewind its cursor.
+                    // Either no sources left → load the types, or pop the
+                    // next source and rewind its cursor.
                     if state.sequence_sources.is_empty() {
-                        pager.end_read_tx();
-                        state.read_tx_active = false;
-
-                        let acc = state
-                            .accumulators
-                            .take()
-                            .expect("accumulators must be initialized in Init phase");
-                        self.populate_materialized_views_then_indices(
-                            syms,
-                            acc.materialized_view_info,
-                            acc.dbsp_state_roots,
-                            acc.dbsp_state_index_roots,
-                            acc.from_sql_indexes,
-                            acc.automatic_indices,
-                            mv_cursor.is_some(),
-                        )?;
-
-                        state.phase = MakeFromBtreePhase::Done;
-                        return Ok(IOResult::Done(()));
+                        state.sequence_cursor = None;
+                        state.phase = MakeFromBtreePhase::LoadingTypesStart;
+                        continue;
                     }
                     // Drop any cursor from a previous source before opening
                     // the new one (Drop logic on the BTreeCursor releases
@@ -2744,6 +3021,89 @@ impl Schema {
                     state.phase = MakeFromBtreePhase::PopulatingSequencesRewind;
                 }
 
+                MakeFromBtreePhase::LoadingTypesStart => {
+                    let types_table = self
+                        .get_btree_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME)
+                        .filter(|_| load_custom_types);
+                    match types_table {
+                        // A types table created in MVCC mode and not yet
+                        // checkpointed has a negative root page and its rows
+                        // live only in the MVCC log, which the pager can't read.
+                        Some(table) if table.root_page > 0 => {
+                            state.cursor = Some(BTreeCursor::new_table(
+                                Arc::clone(pager),
+                                table.root_page,
+                                table.columns().len(),
+                            ));
+                            state.phase = MakeFromBtreePhase::LoadingTypesRewind;
+                        }
+                        _ => state.phase = MakeFromBtreePhase::BuildingIndexes,
+                    }
+                }
+
+                MakeFromBtreePhase::LoadingTypesRewind => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in LoadingTypesStart");
+                    return_if_io!(cursor.rewind());
+                    state.phase = MakeFromBtreePhase::LoadingTypesFetch;
+                }
+
+                MakeFromBtreePhase::LoadingTypesFetch => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in LoadingTypesStart");
+                    let Some(record) = return_if_io!(cursor.record()) else {
+                        state.cursor = None;
+                        state.phase = MakeFromBtreePhase::BuildingIndexes;
+                        continue;
+                    };
+                    // The types table is (name TEXT PRIMARY KEY, sql TEXT).
+                    let ValueRef::Text(sql) = record.get_value(1)? else {
+                        return Err(LimboError::Corrupt(format!(
+                            "{TURSO_TYPES_TABLE_NAME} contains a row without CREATE TYPE sql"
+                        ))
+                        .into());
+                    };
+                    state.type_sqls.push(sql.as_str().to_string());
+                    state.phase = MakeFromBtreePhase::LoadingTypesAdvance;
+                }
+
+                MakeFromBtreePhase::LoadingTypesAdvance => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in LoadingTypesStart");
+                    return_if_io!(cursor.next());
+                    state.phase = MakeFromBtreePhase::LoadingTypesFetch;
+                }
+
+                MakeFromBtreePhase::BuildingIndexes => {
+                    pager.end_read_tx();
+                    state.read_tx_active = false;
+
+                    let acc = state
+                        .accumulators
+                        .take()
+                        .expect("accumulators must be initialized in Init phase");
+                    let type_sqls = std::mem::replace(&mut state.type_sqls, vec![]);
+                    self.populate_types_views_then_indices(
+                        syms,
+                        &type_sqls,
+                        acc.materialized_view_info,
+                        acc.dbsp_state_roots,
+                        acc.dbsp_state_index_roots,
+                        acc.from_sql_indexes,
+                        acc.automatic_indices,
+                        mv_cursor.is_some(),
+                    )?;
+
+                    state.phase = MakeFromBtreePhase::Done;
+                    return Ok(IOResult::Done(()));
+                }
+
                 MakeFromBtreePhase::Done => {
                     return Ok(IOResult::Done(()));
                 }
@@ -2776,6 +3136,7 @@ impl Schema {
                 &unparsed_sql_from_index.sql,
                 unparsed_sql_from_index.root_page,
                 table.as_ref(),
+                self,
             )?;
             let index_name = self.demangle_name(&index.name).1.to_string();
             index.name = index_name;
@@ -3112,6 +3473,7 @@ impl Schema {
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
                 name: view_name.clone(),
+                declared_name: view_name.clone(),
                 root_page: main_root,
                 columns: cols,
                 primary_key_columns: vec![],
@@ -3214,8 +3576,13 @@ impl Schema {
         tables
     }
 
-    /// Populate materialized views and then indices from rows collected
-    /// while loading or reparsing `sqlite_schema`.
+    /// Load the CREATE TYPE statements `type_sqls`, then populate materialized
+    /// views and then indices from rows collected while loading or reparsing
+    /// `sqlite_schema`.
+    ///
+    /// Types must be loaded before indices: an index key column copies the
+    /// order of its table column's type when the index is built, and a table
+    /// column only knows its type once the type is loaded.
     ///
     /// Materialized views must be populated before indices: a materialized
     /// view's backing btree is only registered as a table here, and CREATE
@@ -3223,9 +3590,10 @@ impl Schema {
     /// any other table. Indexing it first would fail to find that table and
     /// report the schema as corrupt.
     #[allow(clippy::too_many_arguments)]
-    pub fn populate_materialized_views_then_indices(
+    pub fn populate_types_views_then_indices(
         &mut self,
         syms: &SymbolTable,
+        type_sqls: &[String],
         materialized_view_info: HashMap<String, StoredMaterializedView>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
@@ -3233,6 +3601,12 @@ impl Schema {
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
+        if !self.custom_types_enabled {
+            self.refuse_custom_types()?;
+        }
+        if !type_sqls.is_empty() {
+            self.load_type_definitions(type_sqls)?;
+        }
         if !self.namespace_names_loaded && !materialized_view_info.is_empty() {
             // A view body names tables by their namespace, so the views wait
             // for the names of the namespaces. No index is on a view: CREATE
@@ -3255,6 +3629,36 @@ impl Schema {
             dbsp_state_index_roots,
         )?;
         self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled)
+    }
+
+    /// Refuse a schema that uses custom types when they are not enabled.
+    /// Without them, a custom-type column would be read as its stored bytes,
+    /// and an index on it would be read and written in a different order
+    /// than the one it was built in.
+    fn refuse_custom_types(&self) -> Result<()> {
+        if self.has_table(NamespaceId::ROOT, TURSO_TYPES_TABLE_NAME) {
+            return Err(LimboError::ParseError(
+                "the database has a table of custom types (made by CREATE TYPE), which requires --experimental-custom-types flag"
+                    .to_string(),
+            ));
+        }
+        for table in self.all_tables() {
+            let Some(btree) = table.btree().filter(|btree| btree.is_strict) else {
+                continue;
+            };
+            if let Some(column) = btree
+                .columns
+                .iter()
+                .find(|column| column.is_array() || !is_builtin_strict_type(&column.ty_str))
+            {
+                return Err(LimboError::ParseError(format!(
+                    "column {}.{} has a custom type, which requires --experimental-custom-types flag",
+                    btree.name,
+                    column.name.as_deref().unwrap_or_default()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Yield (backing_table_name, sequence_name) for every backing table
@@ -3402,6 +3806,8 @@ impl Schema {
                     let (namespace, table_name) = self.demangle_name(&table.name);
                     if !namespace.is_root() {
                         table.name = table_name.to_string();
+                        table.declared_name =
+                            self.demangle_name(&table.declared_name).1.to_string();
                         self.add_namespace_of_object(namespace);
                     }
                     // Detect sequence-backing tables by name prefix.
@@ -3442,7 +3848,7 @@ impl Schema {
                         }
                     }
 
-                    table.resolve_custom_type_affinities(self);
+                    table.resolve_custom_types(self);
                     table.propagate_domain_constraints(self)?;
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = name.to_string();
@@ -3782,14 +4188,12 @@ impl Schema {
         let mut key_affinities: Vec<Affinity> = Vec::try_with_capacity_ext(parent_cols.len())?;
         for (pc, &cpos) in parent_cols.iter().zip(child_pos.iter()) {
             let (p, collation, parent_affinity) = match parent_tbl.get_column(pc) {
-                Some((i, column)) => (
-                    i,
-                    crate::translate::collate::column_collation(column)
-                        .unwrap_or(CollationSeq::Binary),
-                    column.affinity(),
-                ),
+                Some((i, column)) if column.is_rowid_alias() => {
+                    (i, CollationSeq::BINARY, column.affinity())
+                }
+                Some((i, column)) => (i, column.collation(), column.affinity()),
                 None if ROWID_STRS.iter().any(|r| pc.eq_ignore_ascii_case(r)) => {
-                    (0, CollationSeq::Binary, Affinity::Integer)
+                    (0, CollationSeq::BINARY, Affinity::Integer)
                 }
                 None => return Err(fk_mismatch_err(&child.name, &parent_tbl.name)),
             };
@@ -4063,6 +4467,7 @@ impl TryClone for BTreeTable {
         Ok(Self {
             root_page: self.root_page,
             name: self.name.clone(),
+            declared_name: self.declared_name.clone(),
             primary_key_columns: self.primary_key_columns.try_clone()?,
             primary_key_is_inline: self.primary_key_is_inline,
             columns: self.columns.try_clone()?,
@@ -4089,6 +4494,7 @@ impl TryClone for FromClauseSubquery {
             name: self.name.clone(),
             plan: self.plan.clone(),
             columns: self.columns.try_clone()?,
+            column_types: self.column_types.clone(),
             parenthesized_join_columns: self.parenthesized_join_columns.clone(),
             result_columns_start_reg: self.result_columns_start_reg,
             materialized_cursor_id: self.materialized_cursor_id,
@@ -4104,6 +4510,7 @@ impl TryClone for RecursiveCteInput {
         Ok(Self {
             name: self.name.clone(),
             columns: self.columns.try_clone()?,
+            column_types: self.column_types.clone(),
         })
     }
 }
@@ -4170,6 +4577,7 @@ impl TryClone for Schema {
             pending_materialized_views: self.pending_materialized_views.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
+            custom_types_enabled: self.custom_types_enabled,
         })
     }
 }
@@ -4531,7 +4939,7 @@ pub struct UniqueSet {
 pub struct UniqueSetColumn {
     pub name: String,
     pub sort_order: SortOrder,
-    pub collation: Option<CollationSeq>,
+    pub collation: Option<TextCollation>,
     pub nulls_order: Option<NullsOrder>,
 }
 
@@ -4698,6 +5106,7 @@ impl GeneratedColGraph {
 pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
+    pub declared_name: String,
     pub primary_key_columns: Vec<(String, SortOrder)>,
     pub primary_key_is_inline: bool,
     columns: Vec<Column>,
@@ -4776,6 +5185,7 @@ impl BTreeTable {
             );
         Self {
             root_page,
+            declared_name: name.clone(),
             name,
             primary_key_columns,
             primary_key_is_inline,
@@ -4865,26 +5275,17 @@ impl BTreeTable {
         Ok(Arc::new(modified))
     }
 
-    /// Override column type metadata for custom type columns so that
-    /// SQLite's name-based type/affinity rules use the BASE type
-    /// instead of the custom type name (e.g. "doubled" contains "DOUB"
-    /// which would incorrectly map to REAL instead of INTEGER).
-    pub fn resolve_custom_type_affinities(&mut self, schema: &Schema) {
+    /// Fill in what custom type columns get from their type:
+    /// - SQLite's name-based type/affinity rules use the BASE type instead of
+    ///   the custom type name (e.g. "doubled" contains "DOUB" which would
+    ///   incorrectly map to REAL instead of INTEGER).
+    /// - Keys on the column use the order of its type, when it has one.
+    pub fn resolve_custom_types(&mut self, schema: &Schema) {
         if !self.is_strict {
             return;
         }
         for col in &mut self.columns {
-            if col.is_array() {
-                // Arrays are stored as record-format blobs regardless of element type.
-                col.set_ty(Type::Blob);
-                col.override_affinity(Affinity::Blob);
-                continue;
-            }
-            if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) {
-                let (base_ty, _) = type_from_name(&resolved.primitive);
-                col.set_ty(base_ty);
-                col.override_affinity(Affinity::affinity(&resolved.primitive));
-            }
+            col.resolve_custom_type(schema);
         }
     }
 
@@ -5058,7 +5459,7 @@ impl BTreeTable {
                 sql.push_str(&ast::ColumnConstraint::Default(default.clone()).to_string());
             }
 
-            push_collation(&mut sql, column.collation_opt());
+            push_collation(&mut sql, column.text_collation());
 
             if let GeneratedType::Virtual { original_sql, .. } = &column.generated_type() {
                 if column.generated_always {
@@ -5264,7 +5665,7 @@ impl BTreeTable {
             })
     }
 
-    fn primary_key_constraint_collation(&self, column_name: &str) -> Option<CollationSeq> {
+    fn primary_key_constraint_collation(&self, column_name: &str) -> Option<TextCollation> {
         self.unique_sets
             .iter()
             .find(|unique_set| unique_set.is_primary_key)
@@ -5480,19 +5881,19 @@ fn push_on_conflict_clause(sql: &mut String, conflict_clause: Option<ResolveType
     });
 }
 
-fn push_collation(sql: &mut String, collation: Option<CollationSeq>) {
+fn push_collation(sql: &mut String, collation: Option<TextCollation>) {
     let Some(collation) = collation else {
         return;
     };
     match collation {
-        CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
-        CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
-        CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
-        CollationSeq::Locale(_) => {
+        TextCollation::Binary => sql.push_str(" COLLATE BINARY"),
+        TextCollation::NoCase => sql.push_str(" COLLATE NOCASE"),
+        TextCollation::Rtrim => sql.push_str(" COLLATE RTRIM"),
+        TextCollation::Locale(_) => {
             sql.push_str(" COLLATE ");
             sql.push_str(&quote_ident(&collation.name()));
         }
-        CollationSeq::Custom(_) => {
+        TextCollation::Custom(_) => {
             // Custom collation is not allowed in schema definitions
         }
     };
@@ -5540,6 +5941,10 @@ pub struct FromClauseSubquery {
     pub plan: Box<Plan>,
     /// The columns of the derived table.
     pub columns: Vec<Column>,
+    /// The type of each column, computed once when the subquery is planned.
+    /// Computing it on each reference would walk every nested subquery again,
+    /// which takes exponential time in the nesting depth.
+    pub(crate) column_types: Vec<ExprType>,
     /// Source names for a parenthesized join. SQLite stores these in
     /// `ExprList_item.zEName` when `selectExpander` handles `SF_NestedFrom`.
     ///
@@ -5645,6 +6050,9 @@ impl ParenthesizedJoinColumnSource {
 pub struct RecursiveCteInput {
     pub name: String,
     pub columns: Vec<Column>,
+    /// The type of each column: the type the CTE's first SELECT gives it, as in
+    /// PostgreSQL.
+    pub(crate) column_types: Vec<ExprType>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6020,10 +6428,10 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 /// Peel an optional `COLLATE` wrapper off a PRIMARY KEY / UNIQUE table
 /// constraint column, e.g. `PRIMARY KEY(a COLLATE NOCASE)`, returning the
 /// inner expression and the resolved collation.
-fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<CollationSeq>)> {
+fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<TextCollation>)> {
     match expr {
         Expr::Collate(inner, collation_name) => {
-            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+            let collation_seq = TextCollation::new(collation_name.as_str())?;
             if collation_seq.is_custom() {
                 crate::bail_parse_error!(
                     "custom collations are not supported in schema definitions"
@@ -6123,7 +6531,7 @@ pub fn create_table(
                         is_primary_key: true,
                         is_inline: false,
                         conflict_clause: *conflict_clause,
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     })?;
                 } else if let ast::TableConstraint::Unique {
                     columns,
@@ -6156,7 +6564,7 @@ pub fn create_table(
                         is_primary_key: false,
                         is_inline: false,
                         conflict_clause: *conflict_clause,
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     };
                     unique_sets_constraints.try_push(unique_set)?;
                 } else if let ast::TableConstraint::ForeignKey {
@@ -6201,7 +6609,7 @@ pub fn create_table(
                         None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
                     };
                     let fk = ForeignKey {
-                        constraint_name: c.name.as_ref().map(|n| normalize_ident(n.as_str())),
+                        constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                         parent_table,
                         parent_namespace,
                         parent_columns,
@@ -6349,10 +6757,7 @@ pub fn create_table(
                                 is_primary_key: true,
                                 is_inline: true,
                                 conflict_clause: *conflict_clause,
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
                         }
                         ast::ColumnConstraint::NotNull {
@@ -6382,14 +6787,11 @@ pub fn create_table(
                                 is_primary_key: false,
                                 is_inline: true,
                                 conflict_clause: *conflict,
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
-                            let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                            let collation_seq = TextCollation::new(collation_name.as_str())?;
                             if collation_seq.is_custom() {
                                 crate::bail_parse_error!(
                                     "custom collations are not supported in schema definitions"
@@ -6412,10 +6814,7 @@ pub fn create_table(
                             let (parent_namespace, parent_table) =
                                 demangle_name(supports_namespaces, &mangled_parent_table);
                             let fk = ForeignKey {
-                                constraint_name: c_def
-                                    .name
-                                    .as_ref()
-                                    .map(|n| normalize_ident(n.as_str())),
+                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                                 parent_table: parent_table.to_string(),
                                 parent_namespace,
                                 parent_columns: clause
@@ -6615,6 +7014,7 @@ pub fn create_table(
     let mut table = BTreeTable {
         root_page,
         name: table_name,
+        declared_name: tbl_name.to_owned(),
         has_rowid,
         primary_key_columns,
         primary_key_is_inline,
@@ -6907,7 +7307,11 @@ pub struct Column {
     /// The declared collation, or for a column of a subquery, view or CTE the
     /// collation of its expression. None means BINARY. Kept apart from
     /// `info` because a custom collation does not fit in its bits.
-    collation: Option<CollationSeq>,
+    collation: Option<TextCollation>,
+    /// The order of the column's type, when it has one (numeric, arrays).
+    /// Keys on the column use it instead of `collation`. Set from the schema's
+    /// types by `BTreeTable::resolve_custom_types`, never stored in the SQL.
+    type_ordering: Option<TypeOrdering>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -7034,7 +7438,7 @@ impl Column {
         default: Option<Box<Expr>>,
         generated: Option<Box<Expr>>,
         ty: Type,
-        col: Option<CollationSeq>,
+        col: Option<TextCollation>,
         coldef: ColDef,
     ) -> Self {
         let generated_type = match generated {
@@ -7064,6 +7468,7 @@ impl Column {
             generated_always: false,
             info,
             collation: col,
+            type_ordering: None,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -7105,7 +7510,7 @@ impl Column {
                     );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                    let collation_seq = TextCollation::new(collation_name.as_str())?;
                     if collation_seq.is_custom() {
                         crate::bail_parse_error!(
                             "custom collations are not supported in schema definitions"
@@ -7193,13 +7598,14 @@ impl Column {
         }
     }
 
+    /// The collation from the column's COLLATE clause, or for a column of a
+    /// subquery, view or CTE the collation of its expression by SQLite's
+    /// rules. None means BINARY. It applies to text only: comparisons use
+    /// [Self::collation], which gives the order of the column's type instead
+    /// when the type has one.
     #[inline]
-    pub fn collation_opt(&self) -> Option<CollationSeq> {
-        if self.has_explicit_collation() {
-            Some(self.collation())
-        } else {
-            None
-        }
+    pub fn text_collation(&self) -> Option<TextCollation> {
+        self.collation
     }
 
     #[inline]
@@ -7270,16 +7676,60 @@ impl Column {
     pub fn set_ty(&mut self, ty: Type) {
         self.info.set_ty(ty)
     }
+    /// How values of the column compare in keys: the order of its type when
+    /// it has one, otherwise the declared collation, BINARY when none.
     #[inline]
     pub fn collation(&self) -> CollationSeq {
-        self.collation.unwrap_or(CollationSeq::Binary)
+        match self.type_ordering {
+            Some(ordering) => CollationSeq::Type(ordering),
+            None => CollationSeq::Text(self.collation.unwrap_or(TextCollation::Binary)),
+        }
+    }
+    #[inline]
+    pub fn type_ordering(&self) -> Option<TypeOrdering> {
+        self.type_ordering
+    }
+    /// Whether an index on this column is ordered differently from how its
+    /// values compare. A custom type without an ordering is indexed by its
+    /// stored form, which does not sort like the values the column reads as,
+    /// so such an index can serve `=` but not a range or ORDER BY.
+    pub fn index_order_differs_from_value_order(&self, schema: &Schema, is_strict: bool) -> bool {
+        self.type_ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
+    }
+    /// Fill in what a column of a STRICT table gets from its custom type: the
+    /// type, affinity and key order of the type it is stored as. Every path
+    /// that adds a column to a STRICT table calls this, so a column added by
+    /// ALTER TABLE matches the same column read back from the schema.
+    pub fn resolve_custom_type(&mut self, schema: &Schema) {
+        if self.is_array() {
+            // Arrays are stored as record-format blobs regardless of element type.
+            self.set_ty(Type::Blob);
+            self.override_affinity(Affinity::Blob);
+            self.type_ordering = crate::translate::expr::expr_type::type_ordering(
+                &crate::translate::expr::expr_type::column_type(self, true, schema),
+                schema,
+            );
+            return;
+        }
+        if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&self.ty_str) {
+            let (base_ty, _) = type_from_name(&resolved.primitive);
+            self.set_ty(base_ty);
+            self.override_affinity(Affinity::affinity(&resolved.primitive));
+            self.type_ordering = resolved.ordering();
+        }
+    }
+    /// Set the key order of a derived table's column, which takes it from the
+    /// type of the expression the column comes from.
+    #[inline]
+    pub fn set_type_ordering(&mut self, ordering: Option<TypeOrdering>) {
+        self.type_ordering = ordering;
     }
     #[inline]
     pub fn has_explicit_collation(&self) -> bool {
         self.collation.is_some()
     }
     #[inline]
-    pub fn set_collation(&mut self, c: Option<CollationSeq>) {
+    pub fn set_collation(&mut self, c: Option<TextCollation>) {
         self.collation = c;
     }
     #[inline]
@@ -7386,6 +7836,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
     Ok(BTreeTable {
         root_page: 1,
         name: "sqlite_schema".to_string(),
+        declared_name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
         has_autoincrement: false,
@@ -7439,6 +7890,10 @@ pub struct IndexColumn {
     /// b.pos_in_table == 1
     pub pos_in_table: usize,
     pub collation: CollationSeq,
+    /// The COLLATE the index or constraint SQL names for this column, if any.
+    /// Reading the schema again keeps it even when the column's own
+    /// collation has changed since, as after ALTER COLUMN.
+    pub explicit_collation: Option<TextCollation>,
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
     pub expr: Option<Box<Expr>>,
@@ -7482,6 +7937,7 @@ impl IndexColumn {
             nulls_order: None,
             pos_in_table,
             collation,
+            explicit_collation: None,
             default: None,
             expr: None,
         }
@@ -7503,7 +7959,8 @@ impl IndexColumn {
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: CollationSeq::Binary,
+                collation: CollationSeq::BINARY,
+                explicit_collation: None,
                 default: None,
                 expr: None,
             })
@@ -7519,6 +7976,7 @@ impl Index {
         sql: &str,
         root_page: i64,
         table: &BTreeTable,
+        schema: &Schema,
     ) -> Result<Index> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
@@ -7534,7 +7992,7 @@ impl Index {
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
-                let index_columns = resolve_sorted_columns(table, &columns)?;
+                let index_columns = resolve_sorted_columns(table, &columns, schema, syms)?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");
@@ -7625,16 +8083,16 @@ impl Index {
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
+            let explicit_collation = constraint_columns.get(i).and_then(|c| c.collation);
             primary_keys
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col_name),
                     order: *order,
                     nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
-                    collation: constraint_columns
-                        .get(i)
-                        .and_then(|c| c.collation)
-                        .unwrap_or_else(|| column.collation()),
+                    collation: explicit_collation
+                        .map_or_else(|| column.collation(), CollationSeq::Text),
+                    explicit_collation,
                     default: column.default.clone(),
                     expr: None,
                 })
@@ -7681,16 +8139,16 @@ impl Index {
                     table.name
                 )));
             };
+            let explicit_collation = constraint_columns.get(i).and_then(|c| c.collation);
             unique_cols
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col.name.as_ref().unwrap()),
                     order: *sort_order,
                     nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
-                    collation: constraint_columns
-                        .get(i)
-                        .and_then(|c| c.collation)
-                        .unwrap_or_else(|| col.collation()),
+                    collation: explicit_collation
+                        .map_or_else(|| col.collation(), CollationSeq::Text),
+                    explicit_collation,
                     default: col.default.clone(),
                     expr: None,
                 })
@@ -7764,6 +8222,13 @@ impl Index {
                 return Ok(WalkControl::SkipChildren);
             }
             match e {
+                Expr::Literal(
+                    ast::Literal::CurrentDate
+                    | ast::Literal::CurrentTime
+                    | ast::Literal::CurrentTimestamp,
+                ) => {
+                    ok = false;
+                }
                 Expr::Literal(_) | Expr::RowId { .. } => {}
                 // Unqualified identifier: must be a column of the target table or ROWID
                 Expr::Id(n) => {
@@ -8015,6 +8480,7 @@ mod tests {
                         "CREATE INDEX i ON t (x)",
                         4,
                         t.as_ref(),
+                        &schema,
                     )
                     .unwrap(),
                 ),
@@ -8255,7 +8721,7 @@ mod tests {
                 None,
                 None,
                 Type::Numeric,
-                Some(CollationSeq::NoCase),
+                Some(TextCollation::NoCase),
                 ColDef {
                     flags,
                     notnull_conflict_clause: Some(ResolveType::Ignore),
@@ -8277,8 +8743,8 @@ mod tests {
             );
             assert_eq!(column.ty(), Type::Numeric, "{flags:?}");
             assert_eq!(
-                column.collation_opt(),
-                Some(CollationSeq::NoCase),
+                column.text_collation(),
+                Some(TextCollation::NoCase),
                 "{flags:?}"
             );
             assert_eq!(
@@ -8338,7 +8804,7 @@ mod tests {
                 assert_eq!(actual.default, expected.default, "{sql}");
                 assert_eq!(actual.ty(), expected.ty(), "{sql}");
                 assert_eq!(actual.affinity(), expected.affinity(), "{sql}");
-                assert_eq!(actual.collation_opt(), expected.collation_opt(), "{sql}");
+                assert_eq!(actual.text_collation(), expected.text_collation(), "{sql}");
                 assert_eq!(actual.primary_key(), expected.primary_key(), "{sql}");
                 assert_eq!(actual.is_rowid_alias(), expected.is_rowid_alias(), "{sql}");
                 assert_eq!(actual.notnull(), expected.notnull(), "{sql}");
@@ -8391,8 +8857,8 @@ mod tests {
         let sql = r#"CREATE TABLE t1 (a TEXT);"#;
         let table = BTreeTable::from_sql(sql, 0)?;
         let column = table.get_column("a").unwrap().1;
-        assert_eq!(column.collation(), CollationSeq::Binary);
-        assert_eq!(column.collation_opt(), None);
+        assert_eq!(column.collation(), CollationSeq::BINARY);
+        assert_eq!(column.text_collation(), None);
         Ok(())
     }
 
@@ -8847,6 +9313,7 @@ mod tests {
         let table = BTreeTable {
             root_page: 0,
             name: "t1".to_string(),
+            declared_name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
@@ -9677,7 +10144,7 @@ mod tests {
                 col.set_unique(enabled);
                 col.set_hidden(enabled);
                 col.set_ty(if enabled { Type::Real } else { Type::Null });
-                col.set_collation(enabled.then_some(CollationSeq::NoCase));
+                col.set_collation(enabled.then_some(TextCollation::NoCase));
                 col.set_array_dimensions(if enabled { 7 } else { 0 });
                 assert_eq!(col.affinity(), affinity);
             }
@@ -9686,7 +10153,7 @@ mod tests {
 
     #[test]
     fn test_named_unique_constraint_stores_constraint_name() {
-        let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT t_u_code_uq UNIQUE);"#;
+        let sql = r#"CREATE TABLE t_u (id INT, code TEXT CONSTRAINT "T_U Code UQ" UNIQUE);"#;
         let table = BTreeTable::from_sql(sql, 0).unwrap();
         let unique_set = table
             .unique_sets
@@ -9695,7 +10162,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             unique_set.constraint_name,
-            Some("t_u_code_uq".to_string()),
+            Some("T_U Code UQ".to_string()),
             "named UNIQUE constraint must store the constraint name"
         );
 
@@ -9710,7 +10177,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             index.constraint_name,
-            Some("t_u_code_uq".to_string()),
+            Some("T_U Code UQ".to_string()),
             "index built from named UNIQUE constraint must carry the constraint name"
         );
     }
@@ -9718,14 +10185,14 @@ mod tests {
     #[test]
     fn named_primary_and_foreign_keys_survive_sql_reconstruction() {
         for original_sql in [
-            "CREATE TABLE child (id INTEGER CONSTRAINT custom_pk PRIMARY KEY, pid INTEGER CONSTRAINT custom_fk REFERENCES parent(id))",
-            "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT custom_pk PRIMARY KEY (id, pid), CONSTRAINT custom_fk FOREIGN KEY (pid) REFERENCES parent(id))",
+            "CREATE TABLE child (id INTEGER CONSTRAINT \"Custom PK\" PRIMARY KEY, pid INTEGER CONSTRAINT \"Custom FK\" REFERENCES parent(id))",
+            "CREATE TABLE child (id TEXT, pid INTEGER, CONSTRAINT \"Custom PK\" PRIMARY KEY (id, pid), CONSTRAINT \"Custom FK\" FOREIGN KEY (pid) REFERENCES parent(id))",
         ] {
             let table = BTreeTable::from_sql(original_sql, 1).unwrap();
             let sql = table.to_sql();
             let restored = BTreeTable::from_sql(&sql, 1).unwrap();
-            assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("custom_pk"), "{sql}");
-            assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("custom_fk"), "{sql}");
+            assert_eq!(restored.primary_key_constraint_name.as_deref(), Some("Custom PK"), "{sql}");
+            assert_eq!(restored.foreign_keys[0].constraint_name.as_deref(), Some("Custom FK"), "{sql}");
         }
     }
 

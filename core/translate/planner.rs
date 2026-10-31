@@ -1913,7 +1913,8 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable, resolver: &Resolver)
             .mark_column_used(table_id, column_index);
     }
 
-    subquery.columns = query_output_columns(&subquery.plan, None, resolver)?;
+    (subquery.columns, subquery.column_types) =
+        query_output_columns(&subquery.plan, None, resolver)?;
     assert_eq!(subquery.columns.len(), join_columns.len());
     for column_index in 0..subquery.columns.len() {
         let original_name = subquery.columns[column_index]
@@ -2607,7 +2608,7 @@ pub fn parse_where(
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
-            rewrite_between_exprs(&mut expr.expr)?;
+            rewrite_between_exprs(&mut expr.expr, Some(resolver))?;
             bind_and_rewrite_expr(
                 &mut expr.expr,
                 Some(table_references),
@@ -2648,7 +2649,7 @@ pub fn parse_where(
     }
 }
 
-pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
+pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -> Result<()> {
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         if let Expr::Between {
             lhs,
@@ -2657,6 +2658,32 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
             end,
         } = e
         {
+            if is_literal_between_bound(start) && is_literal_between_bound(end) {
+                let mut lhs_has_subquery = false;
+                walk_expr(lhs, &mut |expr| {
+                    if matches!(
+                        expr,
+                        Expr::Subquery(_)
+                            | Expr::Exists(_)
+                            | Expr::InSelect { .. }
+                            | Expr::SubqueryResult { .. }
+                    ) {
+                        lhs_has_subquery = true;
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Ok(WalkControl::Continue)
+                })?;
+                let lhs_is_nondeterministic = match resolver {
+                    Some(resolver) => {
+                        expr_contains_nondeterministic_scalar_function(lhs, resolver)?
+                    }
+                    None => false,
+                };
+                if lhs_has_subquery || lhs_is_nondeterministic {
+                    return Ok(WalkControl::Continue);
+                }
+            }
+
             let lhs_expr = std::mem::take(lhs.as_mut());
             let start_expr = std::mem::take(start.as_mut());
             let end_expr = std::mem::take(end.as_mut());
@@ -2695,6 +2722,15 @@ pub fn rewrite_between_exprs(expr: &mut Expr) -> Result<()> {
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+fn is_literal_between_bound(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::Unary(_, inner) => is_literal_between_bound(inner),
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_literal_between_bound(&exprs[0]),
+        _ => false,
+    }
 }
 
 /**

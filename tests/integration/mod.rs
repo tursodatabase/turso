@@ -29,6 +29,7 @@ mod stmt_journal;
 mod stmt_readonly;
 mod storage;
 mod suspended_statement_checkpoint;
+mod transaction_errors;
 mod trigger;
 mod unreliable_io;
 mod views;

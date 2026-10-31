@@ -7,9 +7,10 @@ use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
 use crate::schema::BTreeTable;
 use crate::sync::Arc;
-use crate::translate::collate::{expr_collation, first_collation, CollationSeq};
+use crate::translate::collate::{first_collation, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, WalkControl};
+use crate::translate::expr_context::ExprContext;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::optimizer::unnest::rewrite_correlated_subqueries;
 use crate::translate::plan::{
@@ -430,7 +431,7 @@ fn build_select_plan_dag(
             (
                 vec![ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))],
                 vec![dag::KeyColumn {
-                    collation: CollationSeq::Binary,
+                    collation: CollationSeq::BINARY,
                     ambiguous: false,
                 }],
                 true,
@@ -629,10 +630,11 @@ fn key_column(
     tables: &TableReferences,
     resolver: &Resolver,
 ) -> Result<dag::KeyColumn> {
-    let collation = supported_key_collation(expr_collation(expr, Some(tables), resolver)?)?;
+    let collation =
+        supported_key_collation(ExprContext::new(Some(tables), resolver).expr_collation(expr)?)?;
     Ok(dag::KeyColumn {
         collation,
-        ambiguous: collation != CollationSeq::Binary || stored_affinity(expr, tables).is_none(),
+        ambiguous: collation != CollationSeq::BINARY || stored_affinity(expr, tables).is_none(),
     })
 }
 
@@ -645,15 +647,12 @@ fn set_op_key_column(
     index: usize,
     resolver: &Resolver,
 ) -> Result<dag::KeyColumn> {
-    let collation = supported_key_collation(first_collation(
-        branches.iter().map(|branch| {
-            (
-                &branch.result_columns[index].expr,
-                Some(&branch.table_references),
-            )
-        }),
-        resolver,
-    )?)?;
+    let collation = supported_key_collation(first_collation(branches.iter().map(|branch| {
+        (
+            &branch.result_columns[index].expr,
+            ExprContext::new(Some(&branch.table_references), resolver),
+        )
+    }))?)?;
     let affinities = branches
         .iter()
         .map(|branch| stored_affinity(&branch.result_columns[index].expr, &branch.table_references))
@@ -662,7 +661,7 @@ fn set_op_key_column(
         affinities.contains(&Some(Affinity::Integer)) && affinities.contains(&Some(Affinity::Real));
     Ok(dag::KeyColumn {
         collation,
-        ambiguous: collation != CollationSeq::Binary
+        ambiguous: collation != CollationSeq::BINARY
             || affinities.contains(&None)
             || mixes_integers_and_reals,
     })
@@ -1925,7 +1924,7 @@ fn match_counts_table_sql(table_name: &str, payload_width: usize) -> String {
 /// collations (which do not) are rejected at classify time.
 fn collate_clause(collation: CollationSeq) -> String {
     match collation {
-        CollationSeq::Binary => String::new(),
+        CollationSeq::BINARY => String::new(),
         other => format!(" COLLATE \"{}\"", other.name()),
     }
 }

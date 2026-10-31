@@ -1,7 +1,7 @@
 use crate::catalog::PG_DATABASE_OWNER_OID;
 use crate::error::sqlstate_error;
 use crate::settings::SettingScope;
-use chrono::Utc;
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
 use turso_core::types::IOResultOr;
@@ -77,9 +77,11 @@ scalar_functions! {
     ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
     PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
     ToChar(FunctionArity::Exact(2), true),
+    Age(FunctionArity::OneOf(&[1, 2]), false),
     PgInputIsValid(FunctionArity::Exact(2), true),
     Textlike(FunctionArity::Exact(2), true),
     LikeEscape(FunctionArity::Exact(2), true),
+    SimilarToEscape(FunctionArity::OneOf(&[1, 2]), true),
     Booleq(FunctionArity::Exact(2), true),
     Boolne(FunctionArity::Exact(2), true),
     ColDescription(FunctionArity::Exact(2), true),
@@ -136,9 +138,11 @@ impl ScalarCall for PgScalarFunction {
             }
             Self::PgGetExpr => exec_pg_get_expr(args)?,
             Self::ToChar => exec_to_char(args[0].get_value(), &text_arg(args, 1)),
+            Self::Age => exec_age(args)?,
             Self::PgInputIsValid => exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1)),
             Self::Textlike => exec_textlike(args)?,
             Self::LikeEscape => exec_like_escape(args)?,
+            Self::SimilarToEscape => exec_similar_to_escape(args)?,
             Self::Booleq => Value::from_i64((args[0].get_value() == args[1].get_value()) as i64),
             Self::Boolne => Value::from_i64((args[0].get_value() != args[1].get_value()) as i64),
             Self::SetConfig => exec_set_config(connection, args)?,
@@ -759,6 +763,28 @@ fn exec_like_escape(args: &[Register]) -> Result<Value> {
     Ok(Value::build_text(result))
 }
 
+/// Converts a SIMILAR TO pattern to a regular expression, as PostgreSQL's
+/// similar_to_escape() does. Without an ESCAPE argument, `\` is the escape.
+fn exec_similar_to_escape(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Null))
+    {
+        return Ok(Value::Null);
+    }
+    let pattern = args[0].get_value().to_string();
+    let escape = args
+        .get(1)
+        .map_or_else(|| "\\".to_string(), |arg| arg.get_value().to_string());
+    match turso_pg_parser::translator::similar_to_regex(&pattern, &escape) {
+        Ok(regex) => Ok(Value::build_text(regex)),
+        Err(turso_pg_parser::ParseError::Sqlstate { sqlstate, message }) => {
+            Err(sqlstate_error(sqlstate, message))
+        }
+        Err(error) => Err(LimboError::ParseError(error.to_string())),
+    }
+}
+
 fn exec_pg_encoding_to_char(encoding: i64) -> Value {
     let name = match encoding {
         6 => "UTF8",
@@ -853,6 +879,123 @@ fn exec_to_char(value: &Value, format: &str) -> Value {
 
     let result = pg_to_char_numeric(num, format);
     Value::build_text(result)
+}
+
+/// age(end, start) the way PostgreSQL's timestamp_age computes it: subtract the
+/// timestamps field by field and borrow from the next larger field, where a
+/// borrowed month is as long as the earlier timestamp's month. age(start)
+/// measures from midnight of the current date.
+fn exec_age(args: &[Register]) -> Result<Value> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.get_value(), Value::Numeric(_) | Value::Blob(_)))
+    {
+        let argument_types = args
+            .iter()
+            .map(|arg| match arg.get_value() {
+                Value::Null => "unknown",
+                Value::Numeric(Numeric::Integer(_)) => "integer",
+                Value::Numeric(Numeric::Float(_)) => "numeric",
+                Value::Text(_) => "timestamp",
+                Value::Blob(_) => "bytea",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(LimboError::InvalidArgument(format!(
+            "function age({argument_types}) does not exist"
+        )));
+    }
+    let mut timestamps = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg.get_value() {
+            Value::Text(text) => timestamps.push(parse_timestamp(text.as_str())?),
+            _ => return Ok(Value::Null),
+        }
+    }
+    let (end, start) = match timestamps[..] {
+        [start] => (Utc::now().date_naive().and_time(NaiveTime::MIN), start),
+        [end, start] => (end, start),
+        _ => unreachable!("age() is declared with one or two arguments"),
+    };
+    let (later, earlier, sign) = if end < start {
+        (start, end, -1)
+    } else {
+        (end, start, 1)
+    };
+
+    let micros_of_day = |t: NaiveDateTime| {
+        i64::from(t.num_seconds_from_midnight()) * 1_000_000 + i64::from(t.nanosecond() / 1000)
+    };
+    let mut micros = micros_of_day(later) - micros_of_day(earlier);
+    let mut days = i64::from(later.day()) - i64::from(earlier.day());
+    let mut months = i64::from(later.year() - earlier.year()) * 12 + i64::from(later.month())
+        - i64::from(earlier.month());
+    if micros < 0 {
+        micros += 86_400_000_000;
+        days -= 1;
+    }
+    if days < 0 {
+        days += i64::from(earlier.num_days_in_month());
+        months -= 1;
+    }
+    Ok(Value::build_text(format_interval(
+        sign * months,
+        sign * days,
+        sign * micros,
+    )))
+}
+
+/// Reads a timestamp in the form the timestamp type stores, `YYYY-MM-DD
+/// HH:MM:SS[.f]`, or a date in the form the date type stores, `YYYY-MM-DD`,
+/// as midnight of that day, since PostgreSQL casts a date to a timestamp.
+/// The timestamp type keeps an hour of 24 as written, so `24:00:00` is
+/// midnight at the end of the day.
+fn parse_timestamp(text: &str) -> Result<NaiveDateTime> {
+    let (text_without_hour_24, extra_days) = match text.split_once(" 24:") {
+        Some((date, time)) => (format!("{date} 00:{time}"), 1),
+        None => (text.to_string(), 0),
+    };
+    NaiveDateTime::parse_from_str(&text_without_hour_24, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| {
+            NaiveDate::parse_from_str(&text_without_hour_24, "%Y-%m-%d")
+                .map(|date| date.and_time(NaiveTime::MIN))
+        })
+        .ok()
+        .and_then(|timestamp| timestamp.checked_add_signed(TimeDelta::days(extra_days)))
+        .ok_or_else(|| {
+            LimboError::InvalidArgument(format!(
+                "invalid input syntax for type timestamp: \"{text}\""
+            ))
+        })
+}
+
+/// Formats an interval like PostgreSQL's interval_out with IntervalStyle
+/// postgres, e.g. `-1 years -9 mons -7 days -03:04:05.5`. All parts must have
+/// the same sign.
+fn format_interval(months: i64, days: i64, micros: i64) -> String {
+    let mut parts = Vec::new();
+    for (value, unit) in [(months / 12, "year"), (months % 12, "mon"), (days, "day")] {
+        if value != 0 {
+            let plural = if value == 1 { "" } else { "s" };
+            parts.push(format!("{value} {unit}{plural}"));
+        }
+    }
+    if parts.is_empty() || micros != 0 {
+        let sign = if micros < 0 { "-" } else { "" };
+        let seconds = micros.abs() / 1_000_000;
+        let mut time = format!(
+            "{sign}{:02}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        );
+        let fraction = micros.abs() % 1_000_000;
+        if fraction != 0 {
+            time.push_str(format!(".{fraction:06}").trim_end_matches('0'));
+        }
+        parts.push(time);
+    }
+    parts.join(" ")
 }
 
 /// pg_input_is_valid(text, type) → boolean

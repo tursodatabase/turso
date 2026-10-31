@@ -2363,8 +2363,11 @@ pub unsafe extern "C" fn sqlite3_column_decltype(
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
-    if let Some(val) = stmt.stmt.get_column_decltype(idx as usize) {
+    if let Some(val) = stmt.stmt.get_column_decltype(idx) {
         let c_string = CString::new(val).expect("CString::new failed");
         c_string.into_raw()
     } else {
@@ -2377,8 +2380,10 @@ pub unsafe extern "C" fn sqlite3_column_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     let binding = stmt.stmt.get_column_name(idx).into_owned();
     let val = binding.as_str();
@@ -2396,8 +2401,10 @@ pub unsafe extern "C" fn sqlite3_column_table_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     let binding = stmt
         .stmt
@@ -2412,6 +2419,14 @@ pub unsafe extern "C" fn sqlite3_column_table_name(
 
     let c_string = CString::new(val).expect("CString::new failed");
     c_string.into_raw()
+}
+
+/// Converts a C column index to `usize`, or returns None when it is outside
+/// the statement's result columns, as SQLite does for an out-of-range index.
+fn result_column_index(stmt: &sqlite3_stmt, idx: ffi::c_int) -> Option<usize> {
+    usize::try_from(idx)
+        .ok()
+        .filter(|&idx| idx < stmt.stmt.num_columns())
 }
 
 /// Returns the value at column `idx` of the current row, or None when there
@@ -3846,9 +3861,12 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     match err {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
+        // A Raise is a constraint error that carries its own conflict
+        // resolution, and SQLite reports it as SQLITE_CONSTRAINT.
         LimboError::Constraint(_)
         | LimboError::ConstraintViolation(_)
-        | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
+        | LimboError::ForeignKeyConstraint(_)
+        | LimboError::Raise(..) => SQLITE_CONSTRAINT,
         LimboError::DatabaseFull | LimboError::SequenceExhausted { .. } => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
@@ -3948,6 +3966,57 @@ mod tests {
             assert_eq!(msg, "UNIQUE constraint failed: u.a");
             sqlite3_finalize(stmt);
             sqlite3_close(db);
+        }
+    }
+
+    /// A constraint failure in an UPSERT's DO UPDATE arm, or in a trigger
+    /// fired under an explicit OR ABORT, carries its own conflict resolution.
+    /// It is still a constraint failure, so SQLite returns SQLITE_CONSTRAINT.
+    #[test]
+    fn test_constraint_failure_with_its_own_conflict_resolution_is_sqlite_constraint() {
+        // Each statement is stepped on its own: sqlite3_exec splits a
+        // CREATE TRIGGER body at its inner `;`.
+        let cases: [(&[&CStr], &CStr); 2] = [
+            (
+                &[
+                    c"CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, c INT UNIQUE)",
+                    c"INSERT INTO t VALUES (1,1,10), (2,2,20)",
+                ],
+                c"INSERT OR FAIL INTO t VALUES (10,5,50), (11,1,60) \
+                  ON CONFLICT(u) DO UPDATE SET c = 20",
+            ),
+            (
+                &[
+                    c"CREATE TABLE p(a INTEGER PRIMARY KEY, b INT)",
+                    c"CREATE TABLE log(x INT UNIQUE)",
+                    c"INSERT INTO log VALUES (7)",
+                    c"CREATE TRIGGER tp AFTER UPDATE ON p BEGIN INSERT INTO log VALUES (NEW.b); END",
+                    c"INSERT INTO p VALUES (1,1)",
+                ],
+                c"UPDATE OR ABORT p SET b = 7",
+            ),
+        ];
+        for (setup, failing) in cases {
+            unsafe {
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+                for sql in setup.iter().chain([&failing]) {
+                    let mut stmt = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                        SQLITE_OK,
+                        "{sql:?}"
+                    );
+                    let expected = if *sql == failing {
+                        SQLITE_CONSTRAINT
+                    } else {
+                        SQLITE_DONE
+                    };
+                    assert_eq!(sqlite3_step(stmt), expected, "{sql:?}");
+                    sqlite3_finalize(stmt);
+                }
+                sqlite3_close(db);
+            }
         }
     }
 

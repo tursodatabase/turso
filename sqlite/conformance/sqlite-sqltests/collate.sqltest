@@ -528,6 +528,20 @@ expect {
     1
 }
 
+# The first SELECT decides the collation even when its column has none: a
+# later SELECT's NOCASE column does not make the outer comparison NOCASE.
+test collate_union_all_first_branch_without_collation_is_binary {
+    CREATE TABLE u3(b TEXT COLLATE NOCASE);
+    INSERT INTO u3 VALUES ('A'), ('b');
+    SELECT 'eq', x FROM (SELECT 'A' x UNION ALL SELECT b FROM u3) WHERE x = 'a';
+    SELECT 'order', x FROM (SELECT 'a' x UNION ALL SELECT b FROM u3) ORDER BY x;
+}
+expect {
+    order|A
+    order|a
+    order|b
+}
+
 # --- CASE expression: NOCASE column in WHEN clause after hash join ---
 @cross-check-integrity
 test collate_case_when_nocase_after_join {

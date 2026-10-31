@@ -445,7 +445,7 @@ fn index_key_payload_allocation_uses_passed_allocator() {
         IndexInfo::new(
             [crate::types::KeyInfo {
                 sort_order: turso_parser::ast::SortOrder::Asc,
-                collation: crate::translate::collate::CollationSeq::Binary,
+                collation: crate::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
             false,
@@ -7925,6 +7925,7 @@ fn test_cursor_modification_during_scan() {
         )))
         .unwrap();
 
+    // `insert` leaves the cursor on the inserted row, so the scan continues after 3.
     let mut read_rowids = vec![];
     loop {
         let res = cursor.next().unwrap();
@@ -7944,7 +7945,7 @@ fn test_cursor_modification_during_scan() {
                 .to_int_or_panic(),
         );
     }
-    assert_eq!(read_rowids, vec![2, 3, 4, 5]);
+    assert_eq!(read_rowids, vec![4, 5]);
     let res = cursor.next().unwrap();
     assert!(matches!(res, IOResult::Done(())));
     assert!(!cursor.has_record());
@@ -8424,7 +8425,7 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
         crate::types::IndexInfo::new(
             crate::alloc::vec![crate::types::KeyInfo {
                 sort_order: turso_parser::ast::SortOrder::Asc,
-                collation: crate::translate::collate::CollationSeq::Binary,
+                collation: crate::translate::collate::CollationSeq::BINARY,
                 nulls_order: None,
             }],
             false,
@@ -9527,11 +9528,10 @@ fn test_commit_without_tx() {
 
     // expect error on trying to commit a non-existent interactive transaction
     let err = conn.execute("COMMIT").unwrap_err();
-    if let LimboError::TxError(e) = err {
-        assert_eq!(e, "cannot commit - no transaction is active");
-    } else {
-        panic!("Expected TxError");
-    }
+    assert!(
+        matches!(err, LimboError::NoActiveTransaction { .. }),
+        "expected NoActiveTransaction, got: {err:?}"
+    );
 }
 
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
@@ -14802,11 +14802,173 @@ fn test_index_scan_skips_its_own_delete_ahead_of_the_scan() {
     }
 }
 
-/// An index scan must follow `ROLLBACK TO` of its own transaction's writes
-/// ahead of the scan position, after a checkpoint: a rolled-back insert is not
-/// returned, and a row whose delete was rolled back is returned.
+/// A table or index scan must not return a B-tree row or index entry that its
+/// own transaction deletes, or changes the indexed value of, ahead of the scan
+/// position while the scan holds it as its next B-tree entry. The same write
+/// made and committed by another connection must stay hidden.
 #[test]
-fn test_index_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
+fn test_scan_skips_its_own_write_to_the_next_btree_entry() {
+    for write_from_other_connection in [false, true] {
+        for checkpoint in [true, false] {
+            for begin in ["BEGIN", "BEGIN CONCURRENT"] {
+                // Row 1 or 5 gets MVCC versions, so the scan's first row comes from
+                // MVCC and the B-tree row or entry after it has already been read.
+                for (scan_sql, updated_id, all_rows, writes) in [
+                    (
+                        "SELECT v FROM t WHERE v > ''",
+                        1,
+                        "a,b,c,d,e",
+                        [
+                            ("DELETE FROM t WHERE id = 2", "a,c,d,e"),
+                            ("UPDATE t SET v = 'bb' WHERE id = 2", "a,bb,c,d,e"),
+                        ],
+                    ),
+                    (
+                        "SELECT v FROM t WHERE v < 'z' ORDER BY v DESC",
+                        5,
+                        "e,d,c,b,a",
+                        [
+                            ("DELETE FROM t WHERE id = 4", "e,c,b,a"),
+                            ("UPDATE t SET v = 'dd' WHERE id = 4", "e,dd,c,b,a"),
+                        ],
+                    ),
+                    (
+                        "SELECT id FROM t NOT INDEXED",
+                        1,
+                        "1,2,3,4,5",
+                        [
+                            ("DELETE FROM t WHERE id = 2", "1,3,4,5"),
+                            ("UPDATE t SET v = 'bb' WHERE id = 2", "1,2,3,4,5"),
+                        ],
+                    ),
+                    (
+                        "SELECT id FROM t NOT INDEXED ORDER BY id DESC",
+                        5,
+                        "5,4,3,2,1",
+                        [
+                            ("DELETE FROM t WHERE id = 4", "5,3,2,1"),
+                            ("UPDATE t SET v = 'dd' WHERE id = 4", "5,4,3,2,1"),
+                        ],
+                    ),
+                ] {
+                    for (write, expected) in writes {
+                        let db = MvccTestDb::new();
+                        let conn = &db.conn;
+                        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                            .unwrap();
+                        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                            .unwrap();
+                        conn.execute("CREATE INDEX i ON t(v)").unwrap();
+                        conn.execute(
+                            "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
+                        )
+                        .unwrap();
+                        if checkpoint {
+                            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                        }
+                        conn.execute(format!("UPDATE t SET v = v WHERE id = {updated_id}"))
+                            .unwrap();
+                        conn.execute(begin).unwrap();
+                        let (writer, expected) = if write_from_other_connection {
+                            (db.db.connect(ConnectOpts::new()).unwrap(), all_rows)
+                        } else {
+                            (conn.clone(), expected)
+                        };
+                        assert_eq!(
+                            scan_with_write_after_rows(conn, scan_sql, 1, &writer, write),
+                            expected,
+                            "checkpoint={checkpoint} {begin} {write} \
+                             other_connection={write_from_other_connection} {scan_sql}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A table scan must return a row that its own transaction writes between the
+/// scan position and the next MVCC row the scan holds: a new or re-inserted
+/// rowid, or a new version of a B-tree row. It must not return that next MVCC
+/// row once the same transaction deletes it.
+#[test]
+fn test_table_scan_returns_its_own_write_before_the_next_mvcc_row() {
+    for checkpoint in [true, false] {
+        for begin in ["BEGIN", "BEGIN CONCURRENT"] {
+            // After the checkpoint the scan's first row comes from the B-tree,
+            // and the MVCC rows left by `setup` are ahead of it.
+            for (scan_sql, setup, write, expected) in [
+                (
+                    "SELECT id || v FROM t NOT INDEXED",
+                    "UPDATE t SET v = v WHERE id = 4",
+                    "UPDATE t SET v = 'bb' WHERE id = 2",
+                    "1a,2bb,3c,4d,5e",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED",
+                    "UPDATE t SET v = v WHERE id = 4",
+                    "DELETE FROM t WHERE id = 4",
+                    "1a,2b,3c,5e",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED",
+                    "DELETE FROM t WHERE id IN (2, 4)",
+                    "INSERT INTO t VALUES (2, 'x')",
+                    "1a,2x,3c,5e",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED",
+                    "DELETE FROM t WHERE id IN (2, 4)",
+                    "INSERT INTO t VALUES (6, 'f')",
+                    "1a,3c,5e,6f",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED ORDER BY id DESC",
+                    "UPDATE t SET v = v WHERE id = 2",
+                    "UPDATE t SET v = 'dd' WHERE id = 4",
+                    "5e,4dd,3c,2b,1a",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED ORDER BY id DESC",
+                    "UPDATE t SET v = v WHERE id = 2",
+                    "DELETE FROM t WHERE id = 2",
+                    "5e,4d,3c,1a",
+                ),
+                (
+                    "SELECT id || v FROM t NOT INDEXED ORDER BY id DESC",
+                    "DELETE FROM t WHERE id IN (2, 4)",
+                    "INSERT INTO t VALUES (4, 'x')",
+                    "5e,4x,3c,1a",
+                ),
+            ] {
+                let db = MvccTestDb::new();
+                let conn = &db.conn;
+                conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+                    .unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+                    .unwrap();
+                conn.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')")
+                    .unwrap();
+                if checkpoint {
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+                }
+                conn.execute(setup).unwrap();
+                conn.execute(begin).unwrap();
+                assert_eq!(
+                    scan_with_write_after_rows(conn, scan_sql, 1, conn, write),
+                    expected,
+                    "checkpoint={checkpoint} {begin} {setup}; {write}; {scan_sql}"
+                );
+            }
+        }
+    }
+}
+
+/// A table or index scan must follow `ROLLBACK TO` of its own transaction's
+/// writes ahead of the scan position, after a checkpoint: a rolled-back insert
+/// is not returned, and a row whose delete was rolled back is returned.
+#[test]
+fn test_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
     for begin in ["BEGIN", "BEGIN CONCURRENT"] {
         for (write_in_savepoint, asc, desc) in [
             (
@@ -14827,6 +14989,12 @@ fn test_index_scan_follows_rollback_to_savepoint_ahead_of_the_scan() {
                 ("SELECT quote(v), id FROM t WHERE v > ''", "3, 5", asc),
                 (
                     "SELECT quote(v), id FROM t WHERE v < 'z' ORDER BY v DESC",
+                    "1, 3",
+                    desc,
+                ),
+                ("SELECT quote(v), id FROM t NOT INDEXED", "3, 5", asc),
+                (
+                    "SELECT quote(v), id FROM t NOT INDEXED ORDER BY id DESC",
                     "1, 3",
                     desc,
                 ),
@@ -22026,10 +22194,10 @@ fn abandoned_exclusive_commit_should_not_block_subsequent_concurrent_writer() {
         other => panic!("tx should yield, got: {other:?}"),
     }
 
-    assert!(
-        matches!(conn_a.prepare("COMMIT").unwrap().step().err().unwrap(),
-            LimboError::TxError(msg) if msg == "cannot commit - no transaction is active")
-    );
+    assert!(matches!(
+        conn_a.prepare("COMMIT").unwrap().step().err().unwrap(),
+        LimboError::NoActiveTransaction { .. }
+    ));
 
     conn_b.execute("BEGIN CONCURRENT").unwrap();
     conn_b.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
@@ -22707,9 +22875,8 @@ fn test_sequence_write_conflict_rolls_back_outer_tx_and_rejects_commit() {
     );
 
     let commit = nextval_conn.execute("COMMIT");
-    let expected = "cannot commit - no transaction is active";
     assert!(
-        matches!(commit, Err(LimboError::TxError(ref msg)) if msg == expected),
+        matches!(commit, Err(LimboError::NoActiveTransaction { .. })),
         "COMMIT after conflict rollback must report no active transaction, got {commit:?}"
     );
 

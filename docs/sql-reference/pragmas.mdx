@@ -556,6 +556,9 @@ PRAGMA integrity_check(N);    -- check only the first N errors
 
 Returns `ok` if no problems are found, otherwise returns one row per error.
 
+For custom index methods, this checks the structure of their backing B-trees.
+It does not compare their custom records with table rows as it does for ordinary indexes.
+
 ### quick_check
 
 Performs a faster but less thorough integrity check than `integrity_check`.
