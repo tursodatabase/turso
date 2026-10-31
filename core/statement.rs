@@ -1632,6 +1632,11 @@ impl Statement {
         self.busy
     }
 
+    /// True once [Self::step] has returned a [StepResult::Row] since the last reset.
+    pub fn has_returned_row(&self) -> bool {
+        self.has_returned_row
+    }
+
     /// Internal method to get IO from a statement.
     /// Used by select internal crate
     ///
