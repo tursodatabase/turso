@@ -565,6 +565,33 @@ expect {
     999
 }
 
+test likelihood-exponent-and-parenthesized-probability {
+    SELECT likelihood(1, 625e-4);
+    SELECT likelihood(1, 1e0);
+    SELECT likelihood(1, (0.5));
+    SELECT likelihood(1, ((0.25)));
+}
+expect {
+    1
+    1
+    1
+    1
+}
+
+test likelihood-parenthesized-integer-probability-error {
+    SELECT likelihood(1, (1));
+}
+expect error {
+    second argument to likelihood\(\) must be
+}
+
+test likelihood-exponent-probability-out-of-range-error {
+    SELECT likelihood(1, 2e0);
+}
+expect error {
+    second argument to likelihood\(\) must be a constant between 0.0 and 1.0
+}
+
 test unhex-str-ab {
     SELECT unhex('6162');
 }
