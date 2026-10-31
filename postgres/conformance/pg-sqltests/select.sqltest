@@ -330,6 +330,189 @@ test select-cast-invalid-text-to-timestamp {
 @sqlstate 22007
 expect error {}
 
+test select-cast-int8-accepts-its-smallest-and-largest-values {
+    SELECT 9223372036854775807::int8, (-9223372036854775808)::bigint, int8(-9223372036854775808);
+}
+expect {
+    9223372036854775807|-9223372036854775808|-9223372036854775808
+}
+
+test select-cast-int8-rejects-literal-above-its-range {
+    SELECT 9223372036854775808::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-literal-below-its-range {
+    SELECT (-9223372036854775809)::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-int8-function-rejects-literal-above-its-range {
+    SELECT int8(9223372036854775808);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rounds-decimal-literals-before-checking-the-range {
+    SELECT 9223372036854775807.4::int8, (-9223372036854775808.4)::int8, 9.223372036854775807e18::int8;
+}
+expect {
+    9223372036854775807|-9223372036854775808|9223372036854775807
+}
+
+test select-cast-int8-rejects-decimal-literal-that-rounds-above-its-range {
+    SELECT 9223372036854775807.5::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-decimal-literal-that-rounds-below-its-range {
+    SELECT (-9223372036854775808.5)::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-exponent-literal-above-its-range {
+    SELECT 1e19::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-literal-with-underscores-above-its-range {
+    SELECT 9_223_372_036_854_775_808::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-accepts-zero-with-a-large-exponent {
+    SELECT 0e100::int8, 0.0e25::int8;
+}
+expect {
+    0|0
+}
+
+test select-cast-int8-accepts-largest-hex-literal {
+    SELECT 0x7fffffffffffffff::int8;
+}
+expect {
+    9223372036854775807
+}
+
+test select-cast-int8-rejects-hex-literal-above-its-range {
+    SELECT 0x8000000000000000::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-rejects-hex-literal-above-float8-range {
+    SELECT 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff::int8;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-out-of-range-literal-in-unused-column-default {
+    CREATE TABLE int8_default(a int8 DEFAULT 9223372036854775808::int8, b int);
+    INSERT INTO int8_default VALUES (5, 1);
+    SELECT * FROM int8_default;
+}
+expect {
+    5|1
+}
+
+test select-cast-int8-out-of-range-literal-in-used-column-default {
+    CREATE TABLE int8_default_used(a int8 DEFAULT CAST(9223372036854775808 AS bigint), b int);
+    INSERT INTO int8_default_used(b) VALUES (1);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-out-of-range-literal-in-check-constraint {
+    CREATE TABLE int8_check(a int8 CHECK (a < int8(9223372036854775808)));
+    INSERT INTO int8_check VALUES (5);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-as-bigint-rejects-literal-above-its-range {
+    SELECT CAST(9223372036854775808 AS bigint);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-out-of-range-literal-after-true-or-in-where {
+    SELECT 1 WHERE true OR 9223372036854775808::int8 = 1;
+}
+expect {
+    1
+}
+
+test select-cast-int8-out-of-range-literal-after-false-and-in-where {
+    SELECT 1 WHERE false AND 9223372036854775808::int8 = 1;
+}
+expect {}
+
+test select-cast-int8-out-of-range-literal-after-matching-column-in-where {
+    SELECT x FROM (SELECT 1 AS x) t WHERE x = 1 OR 9223372036854775808::int8 = 1;
+}
+expect {
+    1
+}
+
+test select-cast-int8-out-of-range-literal-checked-for-each-row-in-where {
+    SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) t WHERE x = 1 OR 9223372036854775808::int8 = 1;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-internal-int8-out-of-range-function-is-not-callable {
+    SELECT int8_out_of_range();
+}
+@sqlstate 42883
+expect error {}
+
+test select-cast-int8-rejects-signed-literal-above-its-range {
+    SELECT CAST(+9223372036854775808 AS int8);
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test select-cast-int8-out-of-range-literal-in-branch-that-never-runs {
+    SELECT coalesce(CASE WHEN false THEN 9223372036854775808::int8 END, 7);
+}
+expect {
+    7
+}
+
 test select-case-expression {
     SELECT CASE WHEN 1 < 2 THEN 'lt' ELSE 'ge' END;
 }

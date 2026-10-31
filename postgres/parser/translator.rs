@@ -2989,13 +2989,16 @@ impl PostgreSQLTranslator {
                 let arg = type_cast.arg.as_ref().ok_or_else(|| {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
-                let expr = Box::new(self.translate_expr(arg)?);
+                let mut expr = Box::new(self.translate_expr(arg)?);
                 let pg_type_name = type_cast
                     .type_name
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("TypeCast missing type name".into()))?;
                 if !pg_type_name.typmods.is_empty() {
                     return Err(not_supported("a type modifier in a cast"));
+                }
+                if extract_type_name_from_typename(pg_type_name)?.eq_ignore_ascii_case("int8") {
+                    expr = Box::new(int8_cast_operand(arg, *expr));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
                 Ok(ast::Expr::Cast {
@@ -3969,8 +3972,12 @@ impl PostgreSQLTranslator {
                         "DISTINCT, ORDER BY, FILTER or OVER on {func_name}()"
                     )));
                 }
+                let mut operand = args.into_iter().next().unwrap();
+                if func_name.eq_ignore_ascii_case("int8") {
+                    operand = Box::new(int8_cast_operand(&func_call.args[0], *operand));
+                }
                 return Ok(ast::Expr::Cast {
-                    expr: args.into_iter().next().unwrap(),
+                    expr: operand,
                     type_name: Some(ast::Type {
                         name: type_name.to_string(),
                         size: None,
@@ -6055,6 +6062,132 @@ fn json_type_or_raise(
     }
 }
 
+/// The operand of an int8 cast, made to raise "bigint out of range" when it is
+/// a numeric literal outside the bigint range, where `CAST(x AS INTEGER)` would
+/// clamp it. The literal is checked from its text, because a literal just past
+/// the range becomes a REAL equal to i64::MIN or 2^63.
+fn int8_cast_operand(arg: &pg_query::protobuf::Node, operand: ast::Expr) -> ast::Expr {
+    match numeric_literal_text(arg) {
+        Some(literal) if numeric_literal_exceeds_int8(literal) => {
+            function_call("int8_out_of_range", vec![])
+        }
+        _ => operand,
+    }
+}
+
+/// The text of a non-integer numeric literal, also when written with a unary
+/// plus. PostgreSQL's parser already folds a unary minus into the literal.
+fn numeric_literal_text(arg: &pg_query::protobuf::Node) -> Option<&str> {
+    use pg_query::protobuf::{a_const::Val, node::Node, AConst, AExprKind};
+    match arg.node.as_ref()? {
+        Node::AConst(AConst {
+            val: Some(Val::Fval(f)),
+            ..
+        }) => Some(&f.fval),
+        Node::AExpr(a_expr)
+            if a_expr.kind() == AExprKind::AexprOp
+                && a_expr.lexpr.is_none()
+                && matches!(
+                    a_expr.name.as_slice(),
+                    [pg_query::protobuf::Node {
+                        node: Some(Node::String(name)),
+                    }] if name.sval == "+"
+                ) =>
+        {
+            numeric_literal_text(a_expr.rexpr.as_ref()?)
+        }
+        _ => None,
+    }
+}
+
+/// Rounds half away from zero before the range check, like PostgreSQL's
+/// numeric to int8 cast.
+fn numeric_literal_exceeds_int8(literal: &str) -> bool {
+    let literal = non_decimal_literal_to_decimal(literal).replace('_', "");
+    let (negative, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, literal.as_str()),
+    };
+    let limit = if negative {
+        i64::MIN.unsigned_abs() as u128
+    } else {
+        i64::MAX as u128
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => match exponent.parse::<i64>() {
+            Ok(exponent) => (mantissa, exponent),
+            Err(_) => return false,
+        },
+        None => (unsigned, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if !int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let all_digits = format!("{int_part}{frac_part}");
+    let digits = all_digits.trim_start_matches('0').as_bytes();
+    if digits.is_empty() {
+        return false;
+    }
+    let int_len = (digits.len() as i64)
+        .saturating_sub(frac_part.len() as i64)
+        .saturating_add(exponent);
+    if int_len > 19 {
+        return true;
+    }
+    if int_len < 0 {
+        return false;
+    }
+    let int_len = int_len as usize;
+    let mut magnitude: u128 = 0;
+    for i in 0..int_len {
+        let digit = digits.get(i).map_or(0, |d| d - b'0');
+        magnitude = magnitude * 10 + digit as u128;
+    }
+    if digits.get(int_len).is_some_and(|&d| d >= b'5') {
+        magnitude += 1;
+    }
+    magnitude > limit
+}
+
+fn non_decimal_literal_to_decimal(literal: &str) -> String {
+    let (sign, unsigned) = match literal.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", literal),
+    };
+    let radix = match unsigned.get(..2) {
+        Some("0x" | "0X") => 16,
+        Some("0o" | "0O") => 8,
+        Some("0b" | "0B") => 2,
+        _ => return literal.to_string(),
+    };
+    let mut decimal_digits = vec![0u8];
+    for digit in unsigned[2..].chars().filter(|&c| c != '_') {
+        let mut carry = digit
+            .to_digit(radix)
+            .expect("PostgreSQL's lexer only accepts digits of the literal's radix");
+        for decimal_digit in decimal_digits.iter_mut() {
+            let value = *decimal_digit as u32 * radix + carry;
+            *decimal_digit = (value % 10) as u8;
+            carry = value / 10;
+        }
+        while carry > 0 {
+            decimal_digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    let magnitude: String = decimal_digits
+        .iter()
+        .rev()
+        .map(|&d| char::from(b'0' + d))
+        .collect();
+    format!("{sign}{magnitude}")
+}
+
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types. Other names are kept as
 /// written so that enums and domains resolve to their custom type.
@@ -7690,7 +7823,9 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
     // function tursopg provides has a lowercase name, so a quoted name like
     // "LOWER" names no function. Reject it here because core, like SQLite,
     // matches function names without regard to case.
-    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+    if name.bytes().any(|b| b.is_ascii_uppercase())
+        || FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS.contains(&name.as_str())
+    {
         return Err(ParseError::Sqlstate {
             sqlstate: SQLSTATE_UNDEFINED_FUNCTION,
             message: format!("no such function: {name}"),
@@ -7698,6 +7833,9 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
     }
     Ok(name)
 }
+
+/// tursopg functions that PostgreSQL does not have, so user SQL cannot call them.
+const FUNCTIONS_ONLY_THE_TRANSLATOR_CALLS: &[&str] = &["int8_out_of_range"];
 
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {
     match names {
