@@ -57,7 +57,8 @@ Database
 
 - `core/mvcc/mod.rs` - Module overview
 - `core/mvcc/database/mod.rs` - Main implementation (~3000 lines)
-- `core/mvcc/cursor.rs` - Merged MVCC + B-tree cursor
+- `core/mvcc/cursor.rs` - Merged MVCC + B-tree cursor for index cursors, write cursors and materialized views
+- `core/storage/btree/mvcc_reader.rs` - Read-only MVCC table cursor: a `BTreeCursor` that merges its cells with the version chains of the table
 - `core/mvcc/persistent_storage/logical_log.rs` - Disk format
 - `core/mvcc/database/checkpoint_state_machine.rs` - Checkpoint logic
 

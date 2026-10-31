@@ -209,7 +209,7 @@ fn index_key_matches_at_most_one_row(key: &[ValueRef<'_>], index_info: &IndexInf
 }
 
 #[cfg(any(test, injected_yields))]
-fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
+pub(crate) fn cursor_yield_key(tx_id: u64, table_id: MVTableId) -> u64 {
     // ASCII-ish "CURSORCR"
     // any large number will do
     const CURSOR_SELECTION_TAG: u64 = 0x4355_5253_4F52_4352;
