@@ -362,8 +362,9 @@ pub(super) fn automatic_index_terms(
     terms
 }
 
-/// Estimate selectivity for IN expressions given the number of values and table row count.
-fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
+/// Estimate selectivity for IN expressions given the number of values and the
+/// selectivity of an equality test on the same column.
+fn estimate_in_selectivity(in_list_len: f64, eq_selectivity: f64, not: bool) -> f64 {
     if not {
         // NOT IN: each value in the list excludes roughly 1/ndv of the rows.
         // Without ANALYZE stats we don't know ndv, so we use the equality
@@ -373,7 +374,7 @@ fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
         let per_value_sel = 0.1_f64; // matches sel_eq_unindexed default
         (1.0 - per_value_sel).powf(in_list_len).max(0.01)
     } else {
-        (in_list_len / row_count).min(1.0)
+        (in_list_len * eq_selectivity).min(1.0)
     }
 }
 
@@ -458,7 +459,18 @@ fn estimate_selectivity(
         ConstraintOperator::In {
             not,
             estimated_values,
-        } => estimate_in_selectivity(estimated_values, row_count as f64, not),
+        } => {
+            let eq_selectivity = estimate_selectivity(
+                schema,
+                table_reference,
+                column,
+                index,
+                ConstraintOperator::from(ast::Operator::Equals),
+                params,
+                is_rowid,
+            );
+            estimate_in_selectivity(estimated_values, eq_selectivity, not)
+        }
         _ => params.sel_other,
     }
 }
@@ -781,6 +793,18 @@ pub fn constraints_from_where_clause(
         let index_for_column = |column_pos| {
             selectivity_index_for_column(schema, table_reference, available_indexes, column_pos)
         };
+        let in_selectivity = |column_pos: Option<usize>, is_rowid: bool, operator| {
+            estimate_constraint_selectivity(
+                schema,
+                table_reference,
+                column_pos.map(|pos| &table_reference.table.columns()[pos]),
+                operator,
+                false,
+                column_pos.and_then(index_for_column),
+                params,
+                is_rowid,
+            )
+        };
 
         for (i, term) in where_clause.iter().enumerate() {
             let join_origin = term.origin.join_origin();
@@ -1081,7 +1105,10 @@ pub fn constraints_from_where_clause(
 
             // Handle IN list: col IN (val1, val2, ...)
             if let ast::Expr::InList { lhs, not, rhs } = &term.expr {
-                let estimated_values = rhs.len() as f64;
+                let operator = ConstraintOperator::In {
+                    not: *not,
+                    estimated_values: rhs.len() as f64,
+                };
                 let mut rhs_mask = TableMask::default();
                 for rhs_expr in rhs.iter() {
                     rhs_mask.union_with(&table_mask_from_expr(
@@ -1090,15 +1117,6 @@ pub fn constraints_from_where_clause(
                         subqueries,
                     )?)?;
                 }
-                let table_stats = schema.analyze_stats.table_stats(
-                    table_reference.namespace.id,
-                    table_reference.table.get_name(),
-                );
-                let row_count = table_stats
-                    .and_then(|s| s.row_count)
-                    .unwrap_or(params.rows_per_table_fallback as u64)
-                    as f64;
-                let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
                 // SQLite's `comparisonAffinity` for IN-list (`x IN (lit, ...)`)
                 // is the LHS column's affinity; the RHS literals are not folded.
                 let cmp_aff = Some(get_expr_affinity(
@@ -1120,15 +1138,12 @@ pub fn constraints_from_where_clause(
                         let is_rowid = rowid_alias_column == Some(*column);
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
-                            operator: ConstraintOperator::In {
-                                not: *not,
-                                estimated_values,
-                            },
+                            operator,
                             table_col_pos: Some(*column),
                             expr: None,
                             constraining_expr: None,
                             lhs_mask: rhs_mask,
-                            selectivity,
+                            selectivity: in_selectivity(Some(*column), is_rowid, operator),
                             usable: false, // IN uses a separate seek path, not the range-seek model
                             outer_join_compatible: can_use_before_null_extension(false),
                             is_rowid,
@@ -1140,15 +1155,12 @@ pub fn constraints_from_where_clause(
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
                         cs.constraints.push(Constraint {
                             where_clause_pos: (i, BinaryExprSide::Rhs),
-                            operator: ConstraintOperator::In {
-                                not: *not,
-                                estimated_values,
-                            },
+                            operator,
                             table_col_pos: rowid_alias_column,
                             expr: None,
                             constraining_expr: None,
                             lhs_mask: rhs_mask,
-                            selectivity,
+                            selectivity: in_selectivity(rowid_alias_column, true, operator),
                             usable: false,
                             outer_join_compatible: can_use_before_null_extension(false),
                             is_rowid: true,
@@ -1200,7 +1212,12 @@ pub fn constraints_from_where_clause(
                     let estimated_values = planned_rows
                         .map(|rows| rows.clamp(0.0, row_count.sqrt().max(1.0)))
                         .unwrap_or_else(|| params.in_subquery_rows.min(row_count));
-                    let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
+                    // `estimated_values` can reach sqrt(row_count). Multiplied by the
+                    // equality estimate, that would count an IN subquery on an
+                    // indexed column as matching the whole table, so count one
+                    // matching row per value until distinct values are estimated.
+                    let selectivity =
+                        estimate_in_selectivity(estimated_values, row_count.recip(), *not_in);
                     // SQLite's `comparisonAffinity` for IN-subquery combines the
                     // LHS column affinity with each result column via
                     // `sqlite3CompareAffinity` — that result is already cached on
