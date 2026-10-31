@@ -863,11 +863,18 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
             Some(ty) => negated_type(ty, env.schema()),
             None => any,
         },
+        // abs(x) is x or -x, so a custom type with its own `-`, such as
+        // numeric, keeps the type `-x` has. Any other custom type counts as
+        // the type it is stored as: abs of a uuid, stored as a blob, is a real.
         ResultType::RealForTextOtherwiseTheFirstArgumentsType => match first_argument() {
-            Some(ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob) | ExprType::Untyped) => {
-                ExprType::Builtin(BuiltinType::Real)
+            Some(ty) if matches!(ty, ExprType::Custom { .. }) => {
+                let negated = ast::Expr::Unary(ast::UnaryOperator::Negative, args[0].clone());
+                match custom_operator_type(&negated, core::slice::from_ref(&ty), env) {
+                    Some(ExprType::Unknown) | None => abs_of_stored_type(ty, env.schema()),
+                    Some(negated_type) => negated_type,
+                }
             }
-            Some(ty) => negated_type(ty, env.schema()),
+            Some(ty) => abs_of_stored_type(ty, env.schema()),
             None => any,
         },
         ResultType::RealForARealArgument => {
@@ -901,6 +908,17 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
             _ => any,
         },
         ResultType::Unknown => any,
+    }
+}
+
+/// The type of SQLite's abs() of a value of type `ty`: a real for text or a
+/// blob, which it converts to a number, and otherwise the type of `-x`.
+fn abs_of_stored_type(ty: ExprType, schema: &Schema) -> ExprType {
+    match sqlite_operand_type(ty.clone(), schema) {
+        ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob) | ExprType::Untyped => {
+            ExprType::Builtin(BuiltinType::Real)
+        }
+        _ => negated_type(ty, schema),
     }
 }
 
