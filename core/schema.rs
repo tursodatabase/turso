@@ -5385,7 +5385,7 @@ impl BTreeTable {
     /// For example, if a user creates a table like: `CREATE TABLE t              (x)`, we store it as
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
-        self.to_sql_as(&self.name)
+        self.to_sql_as(&self.declared_name)
     }
 
     /// The `CREATE TABLE` text of the table under `name`: the mangled name
