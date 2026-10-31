@@ -1628,3 +1628,21 @@ test random-divisor-is-not-an-integer {
 expect {
     ok
 }
+
+test now-compares-with-timestamp-columns {
+    CREATE TABLE b (ts timestamp, tz timestamptz);
+    INSERT INTO b VALUES ('2000-01-01 00:00:00', '2000-01-01 00:00:00+00:00');
+    SELECT count(*) FROM b WHERE tz < now() AND tz < current_timestamp AND ts < localtimestamp;
+}
+expect {
+    1
+}
+
+test current-date-compares-with-date-columns {
+    CREATE TABLE e (d date);
+    INSERT INTO e VALUES ('2000-01-01');
+    SELECT count(*) FROM e WHERE d < current_date AND d > current_date - 100000;
+}
+expect {
+    1
+}
