@@ -6943,6 +6943,31 @@ pub fn create_table(
                 }
                 cols.try_push(col)?;
             }
+
+            // SQLite resolves the child columns of a FOREIGN KEY constraint while the
+            // table is created and rejects names that are not columns of the table.
+            // Accepting them stores an invalid definition and defers the failure to
+            // every later INSERT with a misleading "foreign key mismatch" error.
+            for constraint in constraints {
+                let ast::TableConstraint::ForeignKey { columns, .. } = &constraint.constraint
+                else {
+                    continue;
+                };
+                for column in columns {
+                    let name = column.col_name.as_str();
+                    let known = cols.iter().any(|col| {
+                        col.name
+                            .as_deref()
+                            .is_some_and(|col_name| col_name.eq_ignore_ascii_case(name))
+                    });
+                    if !known {
+                        crate::bail_parse_error!(
+                            "unknown column \"{}\" in foreign key definition",
+                            name
+                        );
+                    }
+                }
+            }
         }
         CreateTableBody::AsSelect(_) => {
             crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
