@@ -18098,6 +18098,7 @@ pub fn op_alter_column(
         rename,
         rewritten_triggers,
         renamed_index_methods,
+        renamed_autoindexes,
     } = data.as_ref();
 
     let conn = program.connection.clone();
@@ -18272,6 +18273,12 @@ pub fn op_alter_column(
             {
                 idx.index_method = Some(attachment.clone());
             }
+            if let Some((_, new_index_name)) = renamed_autoindexes
+                .iter()
+                .find(|(old_index_name, _)| *old_index_name == idx.name)
+            {
+                idx.name.clone_from(new_index_name);
+            }
         }
 
         // Update unique_sets to reflect the renamed column
@@ -18308,6 +18315,25 @@ pub fn op_alter_column(
             btree
                 .check_constraints
                 .retain(|check| check.column.as_deref() != Some(new_name.as_str()));
+            if let Some(position) = btree
+                .unique_sets
+                .iter()
+                .position(|set| set.is_column_constraint_of(&new_name))
+            {
+                btree.unique_sets.remove(position);
+                // With `a UNIQUE PRIMARY KEY` the removed set is the UNIQUE one, so the
+                // primary key is checked by column rather than by the removed set.
+                if btree.primary_key_is_inline
+                    && btree
+                        .primary_key_columns
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(&new_name))
+                {
+                    btree.primary_key_columns.clear();
+                    btree.primary_key_is_inline = false;
+                    btree.primary_key_constraint_name = None;
+                }
+            }
             for constraint in &definition.constraints {
                 if let ast::ColumnConstraint::Check { expr, source } = &constraint.constraint {
                     btree

@@ -973,3 +973,146 @@ test alter-column-changes-the-collation-under-an-index-that-does-not-sort-by-it 
 expect {
     ok
 }
+
+# ALTER COLUMN replaces the whole column definition, so a PRIMARY KEY or UNIQUE
+# written in it goes away together with its automatic index.
+@cross-check-integrity
+test alter-column-drops-primary-key-and-its-automatic-index {
+    CREATE TABLE t (a text primary key, b text);
+    INSERT INTO t VALUES ('x', 'y');
+    ALTER TABLE t ALTER COLUMN a TO integer;
+    INSERT INTO t VALUES ('x', 'z');
+    SELECT type, name, sql FROM sqlite_schema;
+    SELECT * FROM t ORDER BY b;
+    PRAGMA integrity_check;
+}
+expect {
+    table|t|CREATE TABLE t (integer, b text)
+    x|y
+    x|z
+    ok
+}
+
+# SQLite names automatic indexes by the order of the constraints in CREATE TABLE,
+# so the indexes after the dropped one are renumbered.
+@cross-check-integrity
+test alter-column-drops-unique-and-renumbers-the-other-automatic-indexes {
+    CREATE TABLE t (a text unique, b text unique, c text, unique (b, c));
+    INSERT INTO t VALUES ('x', 'y', 'z');
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+    INSERT INTO t VALUES ('x', 'y2', 'z');
+    INSERT OR IGNORE INTO t VALUES ('x3', 'y', 'z3');
+    SELECT type, name FROM sqlite_schema ORDER BY name;
+    SELECT name FROM pragma_index_info('sqlite_autoindex_t_1');
+    SELECT name FROM pragma_index_info('sqlite_autoindex_t_2');
+    SELECT count(*) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    index|sqlite_autoindex_t_1
+    index|sqlite_autoindex_t_2
+    table|t
+    b
+    b
+    c
+    2
+    ok
+}
+
+# The index kept for `a UNIQUE, UNIQUE (a)` is built for the column constraint. Without
+# it, the table constraint would describe that index with its own sort order, ON
+# CONFLICT clause and automatic index number.
+test fail-alter-column-removes-unique-also-declared-at-table-level {
+    CREATE TABLE t (a text unique, b text unique, unique (a));
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+}
+expect error {
+    cannot ALTER COLUMN "a": a table constraint repeats its PRIMARY KEY or UNIQUE constraint
+}
+
+test fail-alter-column-removes-unique-also-declared-descending-at-table-level {
+    CREATE TABLE t (a text unique, b text, unique (a desc));
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+}
+expect error {
+    cannot ALTER COLUMN "a": a table constraint repeats its PRIMARY KEY or UNIQUE constraint
+}
+
+test fail-alter-column-removes-unique-on-conflict-also-declared-at-table-level {
+    CREATE TABLE t (a text unique on conflict ignore, b text, unique (a));
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+}
+expect error {
+    cannot ALTER COLUMN "a": a table constraint repeats its PRIMARY KEY or UNIQUE constraint
+}
+
+test fail-alter-column-removes-primary-key-also-declared-unique-at-table-level {
+    CREATE TABLE t (a text primary key, b text unique, unique (a));
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+}
+expect error {
+    cannot ALTER COLUMN "a": a table constraint repeats its PRIMARY KEY or UNIQUE constraint
+}
+
+test fail-alter-column-removes-unique-also-declared-as-table-primary-key {
+    CREATE TABLE t (a text unique, b text, primary key (a));
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+}
+expect error {
+    cannot ALTER COLUMN "a": a table constraint repeats its PRIMARY KEY or UNIQUE constraint
+}
+
+@cross-check-integrity
+test alter-column-renames-column-with-unique-also-declared-at-table-level {
+    CREATE TABLE t (a text unique, b text, unique (a));
+    ALTER TABLE t RENAME COLUMN a TO a2;
+    INSERT INTO t VALUES ('x', 1);
+    INSERT OR IGNORE INTO t VALUES ('x', 2);
+    SELECT type, name, sql FROM sqlite_schema;
+    SELECT count(*) FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    table|t|CREATE TABLE t (a2 text UNIQUE, b text, UNIQUE (a2))
+    index|sqlite_autoindex_t_1|
+    1
+    ok
+}
+
+# `a UNIQUE PRIMARY KEY` keeps one index, for UNIQUE, and the primary key goes with it.
+@cross-check-integrity
+test alter-column-drops-unique-primary-key {
+    CREATE TABLE t (a text unique primary key, b text);
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+    ALTER TABLE t ADD COLUMN c;
+    INSERT INTO t VALUES ('x', 1, 1);
+    INSERT INTO t VALUES ('x', 2, 2);
+    SELECT type, name, sql FROM sqlite_schema;
+    SELECT name, pk FROM pragma_table_info('t');
+    PRAGMA integrity_check;
+}
+expect {
+    table|t|CREATE TABLE t (a2 text, b text, c)
+    a2|0
+    b|0
+    c|0
+    ok
+}
+
+@skip-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
+test fail-alter-column-drops-primary-key-of-without-rowid-table {
+    CREATE TABLE t (a text primary key, b text) WITHOUT ROWID;
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+}
+expect error {
+    PRIMARY KEY missing on table t
+}
+
+@skip-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
+test fail-alter-column-drops-primary-key-also-declared-unique-of-without-rowid-table {
+    CREATE TABLE t (a text primary key, b text, unique (a)) WITHOUT ROWID;
+    ALTER TABLE t ALTER COLUMN a TO a2 text;
+}
+expect error {
+    PRIMARY KEY missing on table t
+}

@@ -4402,6 +4402,7 @@ impl TryClone for UniqueSet {
             columns: self.columns.try_clone()?,
             is_primary_key: self.is_primary_key,
             is_inline: self.is_inline,
+            repeated_by_table_constraint: self.repeated_by_table_constraint,
             conflict_clause: self.conflict_clause,
             constraint_name: self.constraint_name.clone(),
         })
@@ -4930,9 +4931,21 @@ pub struct UniqueSet {
     pub is_primary_key: bool,
     /// True if declared as an inline column constraint rather than a table-level constraint.
     pub is_inline: bool,
+    /// True if a table-level constraint on the same columns was merged into this one,
+    /// as in `a UNIQUE, UNIQUE (a)`.
+    pub repeated_by_table_constraint: bool,
     pub conflict_clause: Option<ResolveType>,
     /// Explicit constraint name from `CONSTRAINT name UNIQUE/PRIMARY KEY`, if given.
     pub constraint_name: Option<String>,
+}
+
+impl UniqueSet {
+    /// Whether this constraint is declared only in the definition of the column `column_name`.
+    pub fn is_column_constraint_of(&self, column_name: &str) -> bool {
+        self.is_inline
+            && !self.repeated_by_table_constraint
+            && self.columns[0].name.eq_ignore_ascii_case(column_name)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -6530,6 +6543,7 @@ pub fn create_table(
                         columns: pk_unique_set_columns,
                         is_primary_key: true,
                         is_inline: false,
+                        repeated_by_table_constraint: false,
                         conflict_clause: *conflict_clause,
                         constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     })?;
@@ -6563,6 +6577,7 @@ pub fn create_table(
                         columns: unique_columns,
                         is_primary_key: false,
                         is_inline: false,
+                        repeated_by_table_constraint: false,
                         conflict_clause: *conflict_clause,
                         constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     };
@@ -6756,6 +6771,7 @@ pub fn create_table(
                                 }]?,
                                 is_primary_key: true,
                                 is_inline: true,
+                                repeated_by_table_constraint: false,
                                 conflict_clause: *conflict_clause,
                                 constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
@@ -6786,6 +6802,7 @@ pub fn create_table(
                                 }]?,
                                 is_primary_key: false,
                                 is_inline: true,
+                                repeated_by_table_constraint: false,
                                 conflict_clause: *conflict,
                                 constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
@@ -7053,6 +7070,9 @@ pub fn create_table(
                                     "conflicting ON CONFLICT clauses specified"
                                 );
                             }
+                        }
+                        if unique_sets[i].is_inline && !unique_sets[j].is_inline {
+                            unique_sets[i].repeated_by_table_constraint = true;
                         }
                         unique_sets.remove(j);
                     } else {
