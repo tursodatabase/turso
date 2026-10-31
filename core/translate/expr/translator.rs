@@ -1187,6 +1187,59 @@ fn translate_function_call_expr(
             }
         },
         Func::Scalar(srf) => {
+            // These functions read a fixed number of argument registers, and
+            // their match arms below do not check the argument count.
+            if matches!(
+                srf,
+                ScalarFunc::ArrayElement
+                    | ScalarFunc::ArraySetElement
+                    | ScalarFunc::GetByte
+                    | ScalarFunc::SetByte
+                    | ScalarFunc::TestUintEncode
+                    | ScalarFunc::TestUintDecode
+                    | ScalarFunc::StringReverse
+                    | ScalarFunc::BooleanToInt
+                    | ScalarFunc::IntToBoolean
+                    | ScalarFunc::ValidateIpAddr
+                    | ScalarFunc::Gcd
+                    | ScalarFunc::Lcm
+                    | ScalarFunc::Repeat
+                    | ScalarFunc::Lpad
+                    | ScalarFunc::Rpad
+                    | ScalarFunc::NumericEncode
+                    | ScalarFunc::NumericDecode
+                    | ScalarFunc::NumericAdd
+                    | ScalarFunc::NumericSub
+                    | ScalarFunc::NumericMul
+                    | ScalarFunc::NumericDiv
+                    | ScalarFunc::NumericMod
+                    | ScalarFunc::NumericFit
+                    | ScalarFunc::NumericNeg
+                    | ScalarFunc::DatePlus
+                    | ScalarFunc::DateMinus
+                    | ScalarFunc::DateDiff
+                    | ScalarFunc::ArrayLength
+                    | ScalarFunc::ArrayAppend
+                    | ScalarFunc::ArrayPrepend
+                    | ScalarFunc::ArrayCat
+                    | ScalarFunc::ArrayRemove
+                    | ScalarFunc::ArrayContains
+                    | ScalarFunc::ArrayPosition
+                    | ScalarFunc::ArraySlice
+                    | ScalarFunc::StringToArray
+                    | ScalarFunc::ArrayToString
+                    | ScalarFunc::ArrayOverlap
+                    | ScalarFunc::ArrayContainsAll
+                    | ScalarFunc::NextVal
+                    | ScalarFunc::SetVal
+                    | ScalarFunc::CurrVal
+            ) && !srf.arities().contains(&(args.len() as i32))
+            {
+                crate::bail_parse_error!(
+                    "wrong number of arguments to function {}()",
+                    srf.to_string()
+                );
+            }
             match srf {
                 ScalarFunc::Cast => {
                     unreachable!("this is always ast::Expr::Cast")

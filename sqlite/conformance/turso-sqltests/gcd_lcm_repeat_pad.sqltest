@@ -190,3 +190,17 @@ test lcm_min_by_minus_one {
 expect error {
     integer overflow
 }
+
+test lpad_one_arg {
+    SELECT lpad('a');
+}
+expect error {
+    wrong number of arguments to function lpad()
+}
+
+test gcd_one_arg {
+    SELECT gcd(1);
+}
+expect error {
+    wrong number of arguments to function gcd()
+}

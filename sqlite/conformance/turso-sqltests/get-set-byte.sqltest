@@ -164,3 +164,17 @@ test set-byte-offset-negative {
 expect error {
     index -1 out of valid range, 0..4
 }
+
+test get-byte-no-args {
+    SELECT get_byte();
+}
+expect error {
+    wrong number of arguments to function get_byte()
+}
+
+test set-byte-one-arg {
+    SELECT set_byte(1);
+}
+expect error {
+    wrong number of arguments to function set_byte()
+}
