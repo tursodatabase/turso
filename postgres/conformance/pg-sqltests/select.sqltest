@@ -1582,3 +1582,103 @@ expect {
     1
     0
 }
+
+test intersect-all-keeps-the-smaller-count-of-each-row {
+    CREATE TABLE multiset_l (a int, b text);
+    CREATE TABLE multiset_r (a int, b text);
+    INSERT INTO multiset_l VALUES (1, 'x'), (1, 'x'), (1, 'x'), (2, 'y'), (NULL, NULL), (NULL, NULL), (3, 'z');
+    INSERT INTO multiset_r VALUES (1, 'x'), (1, 'x'), (2, 'y'), (2, 'y'), (NULL, NULL), (4, 'w');
+    SELECT a FROM multiset_l INTERSECT ALL SELECT a FROM multiset_r ORDER BY 1;
+}
+expect {
+    1
+    1
+    2
+    
+}
+
+test except-all-removes-one-left-row-per-right-row {
+    CREATE TABLE multiset_l (a int, b text);
+    CREATE TABLE multiset_r (a int, b text);
+    INSERT INTO multiset_l VALUES (1, 'x'), (1, 'x'), (1, 'x'), (2, 'y'), (NULL, NULL), (NULL, NULL), (3, 'z');
+    INSERT INTO multiset_r VALUES (1, 'x'), (1, 'x'), (2, 'y'), (2, 'y'), (NULL, NULL), (4, 'w');
+    SELECT a FROM multiset_l EXCEPT ALL SELECT a FROM multiset_r ORDER BY 1;
+}
+expect {
+    1
+    3
+    
+}
+
+test intersect-all-and-except-all-with-star-compare-whole-rows {
+    CREATE TABLE multiset_l (a int, b text);
+    CREATE TABLE multiset_r (a int, b text);
+    INSERT INTO multiset_l VALUES (1, 'x'), (1, 'x'), (1, 'y');
+    INSERT INTO multiset_r VALUES (1, 'x'), (1, 'z');
+    SELECT * FROM multiset_l INTERSECT ALL SELECT * FROM multiset_r ORDER BY 1, 2;
+    SELECT * FROM multiset_l EXCEPT ALL SELECT * FROM multiset_r ORDER BY 1, 2;
+}
+expect {
+    1|x
+    1|x
+    1|y
+}
+
+test intersect-all-and-except-all-chain-from-the-left {
+    CREATE TABLE multiset_a (x int);
+    CREATE TABLE multiset_b (x int);
+    INSERT INTO multiset_a VALUES (1), (1), (1), (2);
+    INSERT INTO multiset_b VALUES (1), (2), (2);
+    SELECT 'except-except', x FROM (SELECT x FROM multiset_a EXCEPT ALL SELECT x FROM multiset_b EXCEPT ALL SELECT x FROM multiset_b) s ORDER BY 2;
+    SELECT 'intersect-right', x FROM (SELECT x FROM multiset_a INTERSECT ALL (SELECT x FROM multiset_a INTERSECT ALL SELECT x FROM multiset_b)) s ORDER BY 2;
+    SELECT 'union-all-except', x FROM (SELECT x FROM multiset_a UNION ALL SELECT x FROM multiset_b EXCEPT ALL SELECT x FROM multiset_a) s ORDER BY 2;
+    SELECT 'except-union-all', x FROM (SELECT x FROM multiset_a EXCEPT ALL SELECT x FROM multiset_b UNION ALL SELECT x FROM multiset_b) s ORDER BY 2;
+    SELECT 'except-union', x FROM (SELECT x FROM multiset_a EXCEPT ALL SELECT x FROM multiset_b UNION SELECT x FROM multiset_b) s ORDER BY 2;
+}
+expect {
+    except-except|1
+    intersect-right|1
+    intersect-right|2
+    union-all-except|1
+    union-all-except|2
+    union-all-except|2
+    except-union-all|1
+    except-union-all|1
+    except-union-all|1
+    except-union-all|2
+    except-union-all|2
+    except-union|1
+    except-union|2
+}
+
+test intersect-all-and-except-all-with-limit-and-offset {
+    CREATE TABLE multiset_a (x int);
+    INSERT INTO multiset_a VALUES (1), (1), (1), (2);
+    SELECT x FROM multiset_a INTERSECT ALL SELECT x FROM multiset_a ORDER BY 1 LIMIT 2 OFFSET 1;
+    SELECT count(*) FROM (SELECT x FROM multiset_a INTERSECT ALL SELECT x FROM multiset_a LIMIT 2 OFFSET 3) s;
+    SELECT count(*) FROM (SELECT x FROM multiset_a EXCEPT ALL SELECT 1 LIMIT 2 OFFSET 2) s;
+}
+expect {
+    1
+    1
+    1
+    1
+}
+
+test intersect-all-and-except-all-in-subqueries-and-inserts {
+    CREATE TABLE multiset_a (x int);
+    CREATE TABLE multiset_out (x int);
+    INSERT INTO multiset_a VALUES (1), (1), (2);
+    INSERT INTO multiset_out SELECT x FROM multiset_a EXCEPT ALL SELECT 1;
+    SELECT x FROM multiset_out ORDER BY 1;
+    WITH c AS (SELECT x FROM multiset_a INTERSECT ALL SELECT 1) SELECT count(*) FROM c;
+    SELECT x FROM multiset_a WHERE x IN (SELECT x FROM multiset_a EXCEPT ALL SELECT 1) ORDER BY 1;
+}
+expect {
+    1
+    2
+    1
+    1
+    1
+    2
+}

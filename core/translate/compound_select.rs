@@ -10,7 +10,7 @@ use crate::translate::eqp::{EqpCompoundOp, EqpDetail, EqpSortMethod};
 use crate::translate::expr::translate_expr;
 use crate::translate::order_by::sorter_insert;
 use crate::translate::plan::{CompoundOrderByKey, Plan, QueryDestination, SelectPlan};
-use crate::translate::result_row::emit_columns_to_destination;
+use crate::translate::result_row::{emit_columns_to_destination, emit_delete_one_matching_entry};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{Insn, SorterOpenData};
 use crate::{emit_explain, LimboError};
@@ -463,6 +463,111 @@ fn emit_compound_select(
                     &intersect_destination,
                 )?;
             }
+            CompoundOperator::IntersectAll => {
+                let intersect_destination = right_most.query_destination.clone();
+
+                let (left_cursor_id, left_index) =
+                    create_collection_index(program, right_most, collations)?;
+                plan.query_destination = QueryDestination::EphemeralIndex {
+                    cursor_id: left_cursor_id,
+                    index: left_index.clone(),
+                    affinity_str: None,
+                    is_delete: false,
+                };
+
+                let (right_cursor_id, right_index) =
+                    create_collection_index(program, right_most, collations)?;
+                right_most.query_destination = QueryDestination::EphemeralIndex {
+                    cursor_id: right_cursor_id,
+                    index: right_index,
+                    affinity_str: None,
+                    is_delete: false,
+                };
+                emit_compound_select(
+                    program,
+                    left,
+                    plan,
+                    limit,
+                    offset,
+                    resolver,
+                    collations,
+                    None,
+                    None,
+                    reg_result_cols_start,
+                )?;
+
+                emit_explain!(
+                    program,
+                    true,
+                    EqpDetail::CompoundArm {
+                        op: EqpCompoundOp::Intersect,
+                        temp_btree: true,
+                    }
+                );
+                right_most_ctx.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
+                emit_query(program, right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
+                read_intersect_all_rows(
+                    program,
+                    left_cursor_id,
+                    &left_index,
+                    right_cursor_id,
+                    limit_ctx,
+                    offset_reg,
+                    reg_result_cols_start,
+                    &intersect_destination,
+                )?;
+            }
+            CompoundOperator::ExceptAll => {
+                let except_destination = right_most.query_destination.clone();
+                let (cursor_id, index) = create_collection_index(program, right_most, collations)?;
+                plan.query_destination = QueryDestination::EphemeralIndex {
+                    cursor_id,
+                    index: index.clone(),
+                    affinity_str: None,
+                    is_delete: false,
+                };
+                emit_compound_select(
+                    program,
+                    left,
+                    plan,
+                    limit,
+                    offset,
+                    resolver,
+                    collations,
+                    None,
+                    None,
+                    reg_result_cols_start,
+                )?;
+                right_most.query_destination = QueryDestination::EphemeralIndex {
+                    cursor_id,
+                    index: index.clone(),
+                    affinity_str: None,
+                    is_delete: true,
+                };
+                emit_explain!(
+                    program,
+                    true,
+                    EqpDetail::CompoundArm {
+                        op: EqpCompoundOp::Except,
+                        temp_btree: true,
+                    }
+                );
+                right_most_ctx.materialized_build_inputs =
+                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
+                emit_query(program, right_most, &mut right_most_ctx)?;
+                program.pop_current_parent_explain();
+                read_deduplicated_union_or_except_rows(
+                    program,
+                    cursor_id,
+                    &index,
+                    limit_ctx,
+                    offset_reg,
+                    reg_result_cols_start,
+                    &except_destination,
+                )?;
+            }
             CompoundOperator::Except => {
                 let except_destination = right_most.query_destination.clone();
                 let reused_index = destination_index_for_dedupe(&except_destination, collations);
@@ -755,6 +860,77 @@ fn read_intersect_rows(
     Ok(())
 }
 
+/// Emits the bytecode for reading the rows of INTERSECT ALL. Each left row removes one
+/// equal row from the right index, so a row comes out as many times as the smaller of
+/// its two counts.
+#[allow(clippy::too_many_arguments)]
+fn read_intersect_all_rows(
+    program: &mut ProgramBuilder,
+    left_cursor_id: usize,
+    index: &Index,
+    right_cursor_id: usize,
+    limit_ctx: Option<LimitCtx>,
+    offset_reg: Option<usize>,
+    reg_result_cols_start: Option<usize>,
+    query_destination: &QueryDestination,
+) -> crate::Result<()> {
+    let label_close = program.allocate_label();
+    let label_loop_start = program.allocate_label();
+    let label_next = program.allocate_label();
+    let column_count = index.columns.len();
+    let cols_start_reg =
+        reg_result_cols_start.unwrap_or_else(|| program.alloc_registers(column_count));
+    program.emit_insn(Insn::Rewind {
+        cursor_id: left_cursor_id,
+        pc_if_empty: label_close,
+    });
+    program.preassign_label_to_next_insn(label_loop_start);
+    for i in 0..column_count {
+        program.emit_insn(Insn::Column {
+            cursor_id: left_cursor_id,
+            column: i,
+            dest: cols_start_reg + i,
+            default: None,
+        });
+    }
+    emit_delete_one_matching_entry(
+        program,
+        right_cursor_id,
+        cols_start_reg,
+        column_count,
+        label_next,
+    );
+    if let Some(reg) = offset_reg {
+        program.emit_insn(Insn::IfPos {
+            reg,
+            target_pc: label_next,
+            decrement_by: 1,
+        });
+    }
+    emit_columns_to_destination(program, query_destination, cols_start_reg, column_count)?;
+    if let Some(limit_ctx) = limit_ctx {
+        program.emit_insn(Insn::DecrJumpZero {
+            reg: limit_ctx.reg_limit,
+            target_pc: label_close,
+        });
+    }
+    program.preassign_label_to_next_insn(label_next);
+    program.emit_insn(Insn::Next {
+        cursor_id: left_cursor_id,
+        pc_if_next: label_loop_start,
+        fullscan: false,
+        is_index: false,
+    });
+    program.preassign_label_to_next_insn(label_close);
+    program.emit_insn(Insn::Close {
+        cursor_id: right_cursor_id,
+    });
+    program.emit_insn(Insn::Close {
+        cursor_id: left_cursor_id,
+    });
+    Ok(())
+}
+
 /// Sets where a SELECT plan writes its rows, including each query in a compound SELECT.
 pub(crate) fn set_select_plan_destination(plan: &mut Plan, destination: &QueryDestination) {
     match plan {
@@ -777,7 +953,8 @@ pub(crate) fn set_select_plan_destination(plan: &mut Plan, destination: &QueryDe
 }
 
 /// Creates an ephemeral index for collecting all compound select results.
-/// Uses `has_rowid=true` to allow duplicate entries (needed for UNION ALL).
+/// Uses `has_rowid=true` to allow duplicate entries (needed for UNION ALL, EXCEPT ALL and
+/// INTERSECT ALL).
 fn create_collection_index(
     program: &mut ProgramBuilder,
     right_select: &SelectPlan,
@@ -799,7 +976,7 @@ fn create_collection_index(
         ephemeral: true,
         table_name: String::new(),
         unique: false,
-        has_rowid: true, // Allow duplicates for UNION ALL
+        has_rowid: true, // Allow duplicate rows
         where_clause: None,
         index_method: None,
         on_conflict: None,

@@ -1353,6 +1353,7 @@ impl PostgreSQLTranslator {
             .query
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE VIEW: missing query".into()))?;
+        reject_intersect_all_or_except_all(query_node, "a view")?;
         let select_stmt = match &query_node.node {
             Some(pg_query::protobuf::node::Node::SelectStmt(s)) => s,
             _ => {
@@ -1420,6 +1421,9 @@ impl PostgreSQLTranslator {
             .query
             .as_ref()
             .ok_or_else(|| ParseError::ParseError(format!("{label}: missing query")))?;
+        if objtype == ObjectType::ObjectMatview {
+            reject_intersect_all_or_except_all(query_node, "a materialized view")?;
+        }
         let select_stmt = match &query_node.node {
             Some(pg_query::protobuf::node::Node::SelectStmt(s)) => s,
             _ => {
@@ -7590,13 +7594,39 @@ fn compound_operator(
         (SetOperation::SetopUnion, false) => Ok(ast::CompoundOperator::Union),
         (SetOperation::SetopIntersect, false) => Ok(ast::CompoundOperator::Intersect),
         (SetOperation::SetopExcept, false) => Ok(ast::CompoundOperator::Except),
-        (SetOperation::SetopIntersect | SetOperation::SetopExcept, true) => {
-            Err(not_supported("INTERSECT ALL / EXCEPT ALL"))
-        }
+        (SetOperation::SetopIntersect, true) => Ok(ast::CompoundOperator::IntersectAll),
+        (SetOperation::SetopExcept, true) => Ok(ast::CompoundOperator::ExceptAll),
         (other, _) => Err(ParseError::ParseError(format!(
             "Unsupported set operation: {other:?}"
         ))),
     }
+}
+
+/// A view's SQL is stored as SQLite text and read back by the SQLite parser, which has
+/// no INTERSECT ALL or EXCEPT ALL, so such a view would stop loading.
+fn reject_intersect_all_or_except_all(
+    query: &pg_query::protobuf::Node,
+    context: &str,
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::SetOperation;
+    let Some(query) = query.node.as_ref() else {
+        return Ok(());
+    };
+    for (node, ..) in query.nodes() {
+        if let NodeRef::SelectStmt(select) = node {
+            if select.all
+                && matches!(
+                    select.op(),
+                    SetOperation::SetopIntersect | SetOperation::SetopExcept
+                )
+            {
+                return Err(not_supported(format!(
+                    "INTERSECT ALL / EXCEPT ALL in {context}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn translate_distinct_clause(
@@ -10523,6 +10553,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn view_with_intersect_all_or_except_all_is_rejected() {
+        for sql in [
+            "CREATE VIEW v AS SELECT 1 INTERSECT ALL SELECT 1",
+            "CREATE VIEW v AS SELECT 1 EXCEPT ALL SELECT 1",
+            "CREATE VIEW v AS SELECT * FROM (SELECT 1 EXCEPT ALL SELECT 1) s",
+            "CREATE VIEW v AS WITH c AS (SELECT 1 INTERSECT ALL SELECT 1) SELECT * FROM c",
+            "CREATE VIEW v AS SELECT 1 WHERE 1 IN (SELECT 1 EXCEPT ALL SELECT 1)",
+            "CREATE MATERIALIZED VIEW v AS SELECT 1 EXCEPT ALL SELECT 1",
+        ] {
+            assert_not_supported(sql, "INTERSECT ALL / EXCEPT ALL in");
+        }
+    }
+
     fn assert_not_supported(sql: &str, needle: &str) {
         let parsed = crate::parse(sql).unwrap();
         let err = PostgreSQLTranslator::new()
@@ -11157,18 +11201,12 @@ mod tests {
             translate_to_sql("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3"),
             "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3"
         );
-        assert_not_supported(
-            "SELECT 1 UNION (SELECT 1 EXCEPT ALL SELECT 1)",
-            "EXCEPT ALL",
+        assert_eq!(
+            translate_to_sql("SELECT 1 UNION (SELECT 1 EXCEPT ALL SELECT 1)"),
+            "SELECT 1 UNION SELECT * FROM (SELECT 1 EXCEPT ALL SELECT 1)"
         );
         assert_translates("SELECT 1 UNION ((SELECT 2 EXCEPT SELECT 1) UNION SELECT 3)");
         assert_translates("SELECT 1 UNION (SELECT 2 UNION (SELECT 3 UNION ALL SELECT 3))");
-    }
-
-    #[test]
-    fn fail_closed_intersect_except_all() {
-        assert_not_supported("SELECT 1 INTERSECT ALL SELECT 1", "INTERSECT ALL");
-        assert_not_supported("SELECT 1 EXCEPT ALL SELECT 1", "EXCEPT ALL");
     }
 
     #[test]
