@@ -150,6 +150,14 @@ export function encodeValue(value: any): Value {
   if (typeof value === 'string') {
     return { type: 'text', value };
   }
+
+  if (value instanceof Date) {
+    const timestamp = value.getTime();
+    if (!Number.isFinite(timestamp)) {
+      throw new Error('Invalid Date values cannot be passed as arguments');
+    }
+    return { type: 'integer', value: timestamp.toString() };
+  }
   
   if (value instanceof ArrayBuffer) {
     return { type: 'blob', base64: toBase64(new Uint8Array(value)) };
