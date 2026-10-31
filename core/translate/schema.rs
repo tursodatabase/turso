@@ -23,7 +23,7 @@ use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::select::{emit_select_plan, prepare_select_plan};
+use crate::translate::select::{emit_select_plan, is_parsed_as_zero, prepare_select_plan};
 use crate::translate::sequence::bind_sequence_names;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
@@ -1453,6 +1453,27 @@ pub fn translate_create_table(
     // https://github.com/sqlite/sqlite/blob/95f6df5b8d55e67d1e34d2bff217305a2f21b1fb/src/build.c#L1334C5-L1336C65
 
     let index_regs = collect_autoindexes(&body, program, &mangled_tbl_name, resolver)?;
+
+    // SQLite compiles `SELECT * FROM t` at the end of CREATE TABLE, after all other
+    // checks, and that fails on a RAISE outside a trigger. ALTER TABLE ADD COLUMN
+    // does not, so this check is not in `validate_generated_expr`. A RAISE that
+    // SQLite's parser already replaced with 0 is never compiled, so it is allowed.
+    if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = &body {
+        for constraint in columns.iter().flat_map(|c| &c.constraints) {
+            if let ast::ColumnConstraint::Generated { expr, .. } = &constraint.constraint {
+                walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                    if sqlite_parser_folds_to_zero(e) {
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    if matches!(e, ast::Expr::Raise(..)) {
+                        bail_parse_error!("RAISE() may only be used within a trigger-program");
+                    }
+                    Ok(WalkControl::Continue)
+                })?;
+            }
+        }
+    }
+
     if let Some(index_regs) = index_regs.as_ref() {
         for index_reg in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
@@ -1595,6 +1616,45 @@ pub fn translate_create_table(
     }
 
     Ok(())
+}
+
+/// Whether SQLite's parser replaces `expr` with the integer 0. Besides the cases of
+/// [is_parsed_as_zero], its sqlite3ExprAnd() replaces `X AND Y` with 0 when X or Y
+/// becomes 0 and neither of them calls a function.
+fn sqlite_parser_folds_to_zero(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            sqlite_parser_folds_to_zero(&exprs[0])
+        }
+        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
+            (sqlite_parser_folds_to_zero(lhs) || sqlite_parser_folds_to_zero(rhs))
+                && !calls_function(lhs)
+                && !calls_function(rhs)
+        }
+        _ => is_parsed_as_zero(expr),
+    }
+}
+
+/// Whether `expr` has a node that SQLite parses as a function call, outside of
+/// subqueries. LIKE, GLOB, MATCH, REGEXP, `->` and `->>` are function calls in SQLite.
+fn calls_function(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        found |= matches!(
+            e,
+            ast::Expr::FunctionCall { .. }
+                | ast::Expr::FunctionCallStar { .. }
+                | ast::Expr::Like { .. }
+                | ast::Expr::Binary(
+                    _,
+                    ast::Operator::ArrowRight | ast::Operator::ArrowRightShift,
+                    _
+                )
+        );
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression cannot fail");
+    found
 }
 
 /// Binds the sequences named in the column defaults of `body` to the
