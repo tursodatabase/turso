@@ -1603,3 +1603,11 @@ test booleq-plus-an-integer-errors {
 expect error {
     operator does not exist: boolean \+ integer
 }
+
+# booleq() returns boolean, so the client sees t and f, not 1 and 0.
+test booleq-prints-as-a-boolean {
+    SELECT booleq(true, true), booleq(true, false);
+}
+expect {
+    t|f
+}
