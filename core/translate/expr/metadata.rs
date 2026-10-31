@@ -50,19 +50,15 @@ pub(super) fn translate_between_expr(
 
     let lhs_reg = program.alloc_register();
     translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
-    let lower_reg = program.alloc_register();
-    let upper_reg = program.alloc_register();
     let next_comparison = program.allocate_label();
-    for (is_lower, expr, result_reg) in [
-        (true, &lower_expr, lower_reg),
-        (false, &upper_expr, upper_reg),
-    ] {
+    let mut result_regs = [0; 2];
+    for (index, expr) in [&lower_expr, &upper_expr].into_iter().enumerate() {
+        let is_lower = index == 0;
         let ast::Expr::Binary(lhs, op, bound) = expr else {
             unreachable!("BETWEEN terms must be comparisons");
         };
-        let bound_reg = program.alloc_register();
-        let next_span_idx = program.constant_spans_next_idx();
-        translate_expr(program, referenced_tables, bound, bound_reg, resolver)?;
+        let result_reg = program.alloc_register();
+        result_regs[index] = result_reg;
         // A comparison applies column affinity to its operands in place, so each one gets its own copy.
         let operand_reg = program.alloc_register();
         program.emit_insn(Insn::Copy {
@@ -70,6 +66,9 @@ pub(super) fn translate_between_expr(
             dst_reg: operand_reg,
             extra_amount: 0,
         });
+        let bound_reg = program.alloc_register();
+        let next_span_idx = program.constant_spans_next_idx();
+        translate_expr(program, referenced_tables, bound, bound_reg, resolver)?;
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
                 program,
@@ -124,6 +123,7 @@ pub(super) fn translate_between_expr(
     }
 
     if matches!(emit_mode, BinaryEmitMode::Value) {
+        let [lower_reg, upper_reg] = result_regs;
         program.emit_insn(match combine_op {
             ast::Operator::And => Insn::And {
                 lhs: lower_reg,
