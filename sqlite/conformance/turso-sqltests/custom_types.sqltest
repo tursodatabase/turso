@@ -927,6 +927,32 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test numeric-scale-rounds-half-away-from-zero {
+    CREATE TABLE t1(x numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1.005'), ('2.999'), ('0.995'), ('-1.005'), ('1.004');
+    SELECT x FROM t1;
+}
+expect {
+    1.01
+    3.00
+    1.00
+    -1.01
+    1.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-scale-comparison-does-not-round-the-operand {
+    CREATE TABLE t1(id integer, x numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, '3.34');
+    SELECT 'eq', id FROM t1 WHERE x = '3.335';
+    SELECT 'le', id FROM t1 WHERE x <= '3.335';
+    SELECT 'gt', id FROM t1 WHERE x > '3.335';
+}
+expect {
+    gt|1
+}
+
+@requires strict "uses STRICT tables"
 test order-by-numeric-type-with-lt {
     CREATE TABLE t1(val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (9);
