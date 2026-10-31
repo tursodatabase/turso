@@ -415,7 +415,7 @@ impl Statement {
         if self.rollback.is_some() {
             match self.step_rollback(None) {
                 Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
-                    return Ok(IOResult::IO(self.take_io_completions().unwrap()));
+                    return Ok(IOResult::IO(self.io_completions().unwrap()));
                 }
                 Ok(StepResult::Done) => {}
                 outcome => {
@@ -500,7 +500,7 @@ impl Statement {
                 StepResult::Done => return Ok(IOResult::Done(())),
                 StepResult::Row => callback(self.row().expect("row should be present"))?,
                 StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
-                    let completions = self.take_io_completions().unwrap_or_else(|| {
+                    let completions = self.io_completions().unwrap_or_else(|| {
                         turso_core::types::IOCompletions(turso_core::io::Completion::new_yield())
                     });
                     return Ok(IOResult::IO(completions));
@@ -531,14 +531,17 @@ impl Statement {
         }
     }
 
-    pub fn take_io_completions(&mut self) -> Option<turso_core::types::IOCompletions> {
-        if let Some(rollback) = &mut self.rollback {
-            return rollback.io_completions.take();
-        }
-        if let Some(exec) = &mut self.deferred {
-            return exec.io_completions.take();
-        }
-        self.inner.take_io_completions()
+    /// Clone the completion handle while retaining it for statement cleanup.
+    pub fn io_completions(&self) -> Option<turso_core::types::IOCompletions> {
+        let io = if let Some(rollback) = &self.rollback {
+            &rollback.io_completions
+        } else if let Some(exec) = &self.deferred {
+            &exec.io_completions
+        } else {
+            return self.inner.io_completions();
+        };
+        io.as_ref()
+            .map(|io| turso_core::types::IOCompletions(io.0.clone()))
     }
 
     pub fn clear_bindings(&mut self) {

@@ -1113,7 +1113,7 @@ fn serial_prerequisites_yield_to_the_caller() {
                 StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                     yields += 1;
                     if method < 2 {
-                        let completion = stmt.take_io_completions().unwrap();
+                        let completion = stmt.io_completions().unwrap();
                         assert!(completion.is_explicit_yield() || !completion.finished());
                     }
                     if matches!(result, StepResult::Yield) {
@@ -1246,7 +1246,7 @@ fn serial_prerequisites_clean_up_when_abandoned() {
         }
     }
 
-    for take_completion in [false, true] {
+    for read_completion in [false, true] {
         for reset in [false, true] {
             let io = Arc::new(CountedYieldIO::default());
             let db = turso_pg::open_database_with_io(
@@ -1259,8 +1259,9 @@ fn serial_prerequisites_clean_up_when_abandoned() {
             let conn = Connection::connect(&db).unwrap();
             let mut stmt = conn.prepare("CREATE TABLE t (a SERIAL, b SERIAL)").unwrap();
             assert!(matches!(stmt.step().unwrap(), StepResult::IO));
-            if take_completion {
-                assert!(!stmt.take_io_completions().unwrap().finished());
+            if read_completion {
+                assert!(!stmt.io_completions().unwrap().finished());
+                assert!(!stmt.io_completions().unwrap().finished());
             }
             if reset {
                 stmt.reset().unwrap();
@@ -1485,7 +1486,8 @@ fn session_statements_clean_up_when_abandoned() {
                             break;
                         }
                         StepResult::IO if pause_at == 0 => {
-                            assert!(!stmt.take_io_completions().unwrap().finished());
+                            assert!(!stmt.io_completions().unwrap().finished());
+                            assert!(!stmt.io_completions().unwrap().finished());
                             paused = true;
                             break;
                         }

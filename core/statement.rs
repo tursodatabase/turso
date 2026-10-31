@@ -401,6 +401,14 @@ impl Statement {
         self.state.io_completions.take()
     }
 
+    /// Clone the pending completion handle without removing it from the statement.
+    pub fn io_completions(&self) -> Option<crate::types::IOCompletions> {
+        self.state
+            .io_completions
+            .as_ref()
+            .map(|io| crate::types::IOCompletions(io.0.clone()))
+    }
+
     fn arm_query_timeout_if_needed(&mut self) {
         if !matches!(self.state.execution_state, ProgramExecutionState::Init)
             || self.state.query_deadline.is_some()

@@ -634,7 +634,6 @@ pub(crate) struct DeferredExecution {
     phase: DeferredPhase,
     active: Option<crate::Statement>,
     pub(crate) io_completions: Option<turso_core::types::IOCompletions>,
-    pending_io: Option<turso_core::io::Completion>,
     cleaning_up: bool,
     pub(crate) was_in_tx: Option<bool>,
     savepoint_open: bool,
@@ -651,7 +650,6 @@ impl DeferredExecution {
             phase: DeferredPhase::Start,
             active: None,
             io_completions: None,
-            pending_io: None,
             cleaning_up: false,
             was_in_tx: None,
             savepoint_open: false,
@@ -670,7 +668,6 @@ impl DeferredExecution {
             "deferred cleanup must finish before execution"
         );
         self.io_completions = None;
-        self.pending_io = None;
         loop {
             if self.phase == DeferredPhase::Done {
                 return self.error.clone().map_or(Ok(StepResult::Done), Err);
@@ -679,7 +676,6 @@ impl DeferredExecution {
                 Ok(IOResult::Done(())) => continue,
                 Ok(IOResult::IO(io)) => {
                     io.set_waker(waker);
-                    self.pending_io = Some(io.0.clone());
                     let result = if io.is_explicit_yield() {
                         StepResult::Yield
                     } else {
@@ -924,13 +920,13 @@ impl DeferredExecution {
 
     pub(crate) fn cleanup_nonblock(&mut self) -> Result<IOResult<()>> {
         if !self.cleaning_up {
-            if let Some(io) = &self.pending_io {
-                if !io.is_wait() && !io.finished() {
-                    return Ok(IOResult::IO(turso_core::types::IOCompletions(io.clone())));
+            if let Some(io) = &self.io_completions {
+                if !io.0.is_wait() && !io.finished() {
+                    return Ok(IOResult::IO(turso_core::types::IOCompletions(io.0.clone())));
                 }
             }
             let mut cleanup_error = self
-                .pending_io
+                .io_completions
                 .as_ref()
                 .and_then(|io| io.get_error())
                 .map(Into::into);
@@ -943,7 +939,6 @@ impl DeferredExecution {
                     }
                 }
             }
-            self.pending_io = None;
             self.error = cleanup_error;
             let active_result = self.active.as_mut().map_or(Ok(()), crate::Statement::reset);
             if let Err(error) = active_result {
