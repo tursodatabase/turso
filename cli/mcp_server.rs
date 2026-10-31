@@ -269,6 +269,12 @@ impl TursoMcpServer {
 
         match request.method.as_str() {
             "initialize" => self.handle_initialize(request),
+            "ping" => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: request.id,
+                result: Some(json!({})),
+                error: None,
+            },
             "tools/list" => self.handle_list_tools(request),
             "tools/call" => self.handle_call_tool(request),
             _ => JsonRpcResponse {
@@ -810,6 +816,17 @@ mod tests {
         server.execute_query(&query_arg(
             "SELECT order_id, status, priority FROM bench_orders ORDER BY order_id",
         ))
+    }
+
+    #[test]
+    fn ping_returns_empty_result() {
+        let server = memory_server();
+        let request: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap();
+
+        let response = serde_json::to_value(server.handle_request(request)).unwrap();
+
+        assert_eq!(response, json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
     }
 
     #[test]
