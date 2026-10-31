@@ -640,23 +640,17 @@ impl PrerequisiteExecution {
             };
         }
         if self.active.is_none() {
+            let sql = self.phase_sql();
             self.active = Some(match self.phase {
-                Savepoint => conn.prepare_sqlite(format!("SAVEPOINT \"{PG_STMT_SAVEPOINT}\""))?,
                 Prerequisite(index) => {
                     let stmt = &self.prereqs[index];
-                    conn.prepare_translated_stmt(stmt.clone(), &stmt.to_string())
+                    conn.prepare_translated_stmt(stmt.clone(), &sql)
                         .map_err(schema_error)?
                 }
                 Main => conn
-                    .prepare_translated_cmd(self.cmd.clone(), &self.sql)
+                    .prepare_translated_cmd(self.cmd.clone(), &sql)
                     .map_err(schema_error)?,
-                Release | RollbackRelease => {
-                    conn.prepare_sqlite(format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\""))?
-                }
-                Rollback if self.was_in_tx == Some(true) => {
-                    conn.prepare_sqlite(format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\""))?
-                }
-                Rollback => conn.prepare_sqlite("ROLLBACK")?,
+                Savepoint | Release | Rollback | RollbackRelease => conn.prepare_sqlite(&sql)?,
                 Start | CheckTarget | Done => unreachable!(),
             });
         }
@@ -708,6 +702,24 @@ impl PrerequisiteExecution {
             Start | Done => unreachable!(),
         };
         Ok(IOResult::Done(()))
+    }
+
+    fn phase_sql(&self) -> Cow<'_, str> {
+        use PrerequisitePhase::*;
+
+        match self.phase {
+            Savepoint => format!("SAVEPOINT \"{PG_STMT_SAVEPOINT}\"").into(),
+            Prerequisite(index) => self.prereqs[index].to_string().into(),
+            Main => Cow::Borrowed(&self.sql),
+            Release | RollbackRelease => {
+                format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\"").into()
+            }
+            Rollback if self.was_in_tx == Some(true) => {
+                format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\"").into()
+            }
+            Rollback => Cow::Borrowed("ROLLBACK"),
+            Start | CheckTarget | Done => unreachable!(),
+        }
     }
 
     fn fail(&mut self, error: LimboError) {
