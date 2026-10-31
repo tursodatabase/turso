@@ -1333,6 +1333,8 @@ mod tests {
             ("SELECT now()", Type::TIMESTAMPTZ),
             ("SELECT auth.uid()", Type::UUID),
             ("SELECT CAST(1 AS timestamptz)", Type::TIMESTAMPTZ),
+            ("SELECT random()", Type::FLOAT8),
+            ("SELECT random() * 10", Type::FLOAT8),
         ] {
             let mut stmt = conn.prepare(sql).unwrap();
             let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));

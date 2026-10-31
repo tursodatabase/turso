@@ -111,6 +111,10 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             0i64
         },
         "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
+        // A double precision number in [0, 1), unlike SQLite's random integer.
+        "random"(FunctionArity::Exact(0), false) => {
+            exec_random(connection.get_pager().io.generate_random_number())
+        },
         "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp"(
             FunctionArity::Variadic, false
         ) => Timestamptz(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()),
@@ -597,6 +601,13 @@ pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
         Err(_) if name.contains('.') => Some(Parameter::Custom(name)),
         Err(_) => None,
     }
+}
+
+/// Turns 64 random bits into a number in [0, 1). A double holds 53 bits of
+/// precision, so only the top 53 bits are used.
+fn exec_random(bits: i64) -> f64 {
+    let mantissa = (bits as u64) >> 11;
+    mantissa as f64 / (1_u64 << 53) as f64
 }
 
 /// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding

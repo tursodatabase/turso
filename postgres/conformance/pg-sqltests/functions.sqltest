@@ -1611,3 +1611,20 @@ test booleq-prints-as-a-boolean {
 expect {
     t|f
 }
+
+# random() returns a double precision number from 0 up to but not including 1,
+# so the value is usually not a whole number.
+test random-is-a-fraction-between-zero-and-one {
+    SELECT CASE WHEN r >= 0 AND r < 1 AND r <> floor(r) THEN 'ok' END FROM (SELECT random() AS r) AS t;
+}
+expect {
+    ok
+}
+
+# random() is double precision, so dividing by it is not an integer division.
+test random-divisor-is-not-an-integer {
+    SELECT CASE WHEN 1 / random() > 1 THEN 'ok' END;
+}
+expect {
+    ok
+}
