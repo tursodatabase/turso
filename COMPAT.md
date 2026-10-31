@@ -234,7 +234,7 @@ avoid this window.
 | PRAGMA data_version              | ❌ No         |                                              |
 | PRAGMA database_list             | ✅ Yes        |                                              |
 | PRAGMA default_cache_size        | Not Needed | deprecated in SQLite                         |
-| PRAGMA defer_foreign_keys        | ❌ No         |                                              |
+| PRAGMA defer_foreign_keys        | ✅ Yes        |                                              |
 | PRAGMA empty_result_callbacks    | Not Needed | deprecated in SQLite                         |
 | PRAGMA encoding                  | ✅ Yes        |                                              |
 | PRAGMA foreign_key_check         | ❌ No         |                                              |

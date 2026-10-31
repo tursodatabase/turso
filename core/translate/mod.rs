@@ -50,7 +50,7 @@ mod values;
 pub(crate) mod view;
 mod window;
 
-use crate::schema::Schema;
+use crate::schema::{Schema, Table};
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
@@ -142,6 +142,7 @@ pub fn translate(
         },
         search_path.as_deref(),
     );
+    resolver.defer_foreign_keys = connection.defer_foreign_keys();
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
@@ -557,8 +558,15 @@ fn translate_statement(
         }
     }
 
-    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
-    if is_select && !program.table_references.is_empty() {
+    // Indicate read operations so that in the epilogue we can emit the correct type of transaction.
+    // Like SQLite, a SELECT that reads only VALUES, CTEs or subqueries without tables starts none.
+    if is_select
+        && program
+            .table_references
+            .joined_tables()
+            .iter()
+            .any(|table| matches!(table.table, Table::BTree(_) | Table::Virtual(_)))
+    {
         program.begin_read_operation()?;
     }
 

@@ -555,6 +555,37 @@ fn test_stale_statement_uses_the_new_setting(tmp_db: TempDatabase) -> Result<()>
     Ok(())
 }
 
+/// A statement prepared before `PRAGMA defer_foreign_keys` changes is prepared
+/// again, also when COMMIT turns the pragma off.
+#[turso_macros::test(mvcc)]
+fn test_stale_statement_uses_defer_foreign_keys(tmp_db: TempDatabase) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE child (parent_id INTEGER REFERENCES parent(id))")?;
+    let mut insert = conn.prepare("INSERT INTO child VALUES (1)")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("PRAGMA defer_foreign_keys = ON")?;
+    insert.run_ignore_rows()?;
+    conn.execute("INSERT INTO parent VALUES (1)")?;
+    conn.execute("COMMIT")?;
+    assert_eq!(count_rows(&conn, "child")?, Value::from_i64(1));
+
+    conn.execute("DELETE FROM child")?;
+    conn.execute("DELETE FROM parent")?;
+    conn.execute("BEGIN")?;
+    insert.reset()?;
+    let err = insert.run_ignore_rows().unwrap_err();
+    assert!(
+        matches!(err, LimboError::ForeignKeyConstraint(_)),
+        "unexpected error: {err:?}"
+    );
+    conn.execute("ROLLBACK")?;
+    assert_eq!(count_rows(&conn, "child")?, Value::from_i64(0));
+    Ok(())
+}
+
 fn step_to_first_row(stmt: &mut turso_core::Statement) -> Result<Vec<Value>> {
     let row = stmt
         .run_one_step_blocking(|| Ok(()), || Ok(()))?

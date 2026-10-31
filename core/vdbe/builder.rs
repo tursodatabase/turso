@@ -401,6 +401,7 @@ impl ProgramBuilderFlags {
     const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
     const KEEP_ARRAY_RESULTS_AS_BLOBS: u16 = 1 << 9;
+    const READS_DATABASE_FILE: u16 = 1 << 10;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -472,6 +473,17 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_readonly(&mut self, v: bool) {
         self.set(Self::READONLY, v)
+    }
+
+    #[inline]
+    /// Whether the builder emitted an opcode that reads or writes a database
+    /// file, mirroring SQLite's `Vdbe.bIsReader`.
+    pub const fn reads_database_file(self) -> bool {
+        self.get(Self::READS_DATABASE_FILE)
+    }
+    #[inline]
+    pub const fn set_reads_database_file(&mut self, v: bool) {
+        self.set(Self::READS_DATABASE_FILE, v)
     }
 
     #[inline]
@@ -1347,6 +1359,8 @@ impl ProgramBuilder {
         tracing::trace!("");
         self.flags
             .set_readonly(self.flags.readonly() & insn.is_readonly());
+        self.flags
+            .set_reads_database_file(self.flags.reads_database_file() | insn.reads_database_file());
         // Any function can raise at runtime; see Self::may_abort.
         if matches!(insn, Insn::Function { .. }) {
             self.emitted_function_call = true;
@@ -2527,6 +2541,7 @@ impl ProgramBuilder {
             parameters: self.parameters,
             change_cnt_on,
             readonly: self.flags.readonly(),
+            reads_database_file: self.flags.reads_database_file(),
             result_columns: self.result_columns,
             result_column_types: self.result_column_types,
             table_references: self.table_references,
