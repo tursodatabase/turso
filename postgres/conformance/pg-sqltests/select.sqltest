@@ -403,6 +403,262 @@ expect {
     5
 }
 
+# <op> ANY/ALL (subquery) for operators other than the `=`/`<>` membership
+# forms. These keep PostgreSQL's three-valued result: a comparison against a
+# NULL row makes ANY unknown when no row is true, and ALL unknown when no row
+# is false. The CASE renders that as the text true/false/null so turso and a
+# real PostgreSQL server print the same rows.
+
+setup anyall_cmp {
+    CREATE TABLE nums (a int);
+    INSERT INTO nums VALUES (2), (4), (6);
+    CREATE TABLE nums_with_null (a int);
+    INSERT INTO nums_with_null VALUES (2), (NULL);
+    CREATE TABLE nums_empty (a int);
+}
+
+@setup anyall_cmp
+test gt-any-subquery-true {
+    SELECT CASE WHEN (5 > ANY (SELECT a FROM nums)) THEN 'true'
+                WHEN NOT (5 > ANY (SELECT a FROM nums)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    true
+}
+
+@setup anyall_cmp
+test gt-any-subquery-false {
+    SELECT CASE WHEN (1 > ANY (SELECT a FROM nums)) THEN 'true'
+                WHEN NOT (1 > ANY (SELECT a FROM nums)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    false
+}
+
+@setup anyall_cmp
+test gt-any-subquery-null-when-no-match-and-null-present {
+    SELECT CASE WHEN (1 > ANY (SELECT a FROM nums_with_null)) THEN 'true'
+                WHEN NOT (1 > ANY (SELECT a FROM nums_with_null)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    null
+}
+
+@setup anyall_cmp
+test gt-any-subquery-empty-is-false {
+    SELECT CASE WHEN (5 > ANY (SELECT a FROM nums_empty)) THEN 'true'
+                WHEN NOT (5 > ANY (SELECT a FROM nums_empty)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    false
+}
+
+@setup anyall_cmp
+test lt-all-subquery-true {
+    SELECT CASE WHEN (1 < ALL (SELECT a FROM nums)) THEN 'true'
+                WHEN NOT (1 < ALL (SELECT a FROM nums)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    true
+}
+
+@setup anyall_cmp
+test lt-all-subquery-false {
+    SELECT CASE WHEN (5 < ALL (SELECT a FROM nums)) THEN 'true'
+                WHEN NOT (5 < ALL (SELECT a FROM nums)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    false
+}
+
+@setup anyall_cmp
+test lt-all-subquery-null-when-no-counterexample-and-null-present {
+    SELECT CASE WHEN (1 < ALL (SELECT a FROM nums_with_null)) THEN 'true'
+                WHEN NOT (1 < ALL (SELECT a FROM nums_with_null)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    null
+}
+
+@setup anyall_cmp
+test lt-all-subquery-empty-is-true {
+    SELECT CASE WHEN (5 < ALL (SELECT a FROM nums_empty)) THEN 'true'
+                WHEN NOT (5 < ALL (SELECT a FROM nums_empty)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    true
+}
+
+@setup anyall_cmp
+test ge-all-subquery-true {
+    SELECT CASE WHEN (6 >= ALL (SELECT a FROM nums)) THEN 'true'
+                WHEN NOT (6 >= ALL (SELECT a FROM nums)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    true
+}
+
+@setup anyall_cmp
+test le-any-subquery-true {
+    SELECT CASE WHEN (2 <= ANY (SELECT a FROM nums)) THEN 'true'
+                WHEN NOT (2 <= ANY (SELECT a FROM nums)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    true
+}
+
+@setup anyall_cmp
+test ne-any-subquery-true {
+    SELECT CASE WHEN (2 <> ANY (SELECT a FROM nums)) THEN 'true'
+                WHEN NOT (2 <> ANY (SELECT a FROM nums)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    true
+}
+
+@setup anyall_cmp
+test eq-all-subquery-false {
+    SELECT CASE WHEN (2 = ALL (SELECT a FROM nums)) THEN 'true'
+                WHEN NOT (2 = ALL (SELECT a FROM nums)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    false
+}
+
+# `<> ALL (subquery)` is NOT IN and keeps the same NULL behavior.
+
+@setup anyall_cmp
+test ne-all-subquery-true {
+    SELECT CASE WHEN (3 <> ALL (SELECT a FROM nums)) THEN 'true'
+                WHEN NOT (3 <> ALL (SELECT a FROM nums)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    true
+}
+
+@setup anyall_cmp
+test ne-all-subquery-null-when-no-match-and-null-present {
+    SELECT CASE WHEN (1 <> ALL (SELECT a FROM nums_with_null)) THEN 'true'
+                WHEN NOT (1 <> ALL (SELECT a FROM nums_with_null)) THEN 'false'
+                ELSE 'null' END;
+}
+expect {
+    null
+}
+
+# Used in WHERE position the comparison filters rows like PostgreSQL.
+
+@setup anyall_cmp
+test gt-any-subquery-filters-rows {
+    SELECT a FROM nums WHERE a > ANY (SELECT 3 UNION SELECT 5) ORDER BY a;
+}
+expect {
+    4
+    6
+}
+
+@setup anyall_cmp
+test le-all-subquery-filters-rows {
+    SELECT a FROM nums WHERE a <= ALL (SELECT 4 UNION SELECT 6) ORDER BY a;
+}
+expect {
+    2
+    4
+}
+
+# turso evaluates the left-hand side inside a subquery it builds, where an
+# aggregate or window function would belong to that subquery. It rejects them
+# instead of returning wrong rows.
+
+@setup anyall_cmp
+@skip-if postgres "PostgreSQL supports an aggregate on the left of > ALL"
+test gt-all-subquery-rejects-aggregate-in-having {
+    SELECT a FROM nums GROUP BY a HAVING count(*) > ALL (SELECT a FROM nums WHERE a < 3);
+}
+@sqlstate 0A000
+expect error {
+}
+
+@setup anyall_cmp
+@skip-if postgres "PostgreSQL supports an aggregate on the left of > ANY"
+test gt-any-subquery-rejects-aggregate-in-select-list {
+    SELECT count(*) > ANY (SELECT a FROM nums) FROM nums;
+}
+@sqlstate 0A000
+expect error {
+}
+
+@setup anyall_cmp
+@skip-if postgres "PostgreSQL supports a window function on the left of < ANY"
+test lt-any-subquery-rejects-window-function {
+    SELECT row_number() OVER () < ANY (SELECT a FROM nums) FROM nums;
+}
+@sqlstate 0A000
+expect error {
+}
+
+@setup anyall_cmp
+@skip-if postgres "PostgreSQL supports stddev on the left of > ANY"
+test gt-any-subquery-rejects-stddev {
+    SELECT stddev(a) > ANY (SELECT 1) FROM nums;
+}
+@sqlstate 0A000
+expect error {
+}
+
+test gt-any-subquery-outer-column-named-like-generated-column {
+    SELECT x._turso_anyall_value FROM (SELECT 3 AS _turso_anyall_value) x
+    WHERE _turso_anyall_value > ANY (SELECT 1);
+}
+expect {
+    3
+}
+
+setup anyall_rows_table {
+    CREATE TABLE _turso_anyall_rows (a int);
+    INSERT INTO _turso_anyall_rows VALUES (1), (5);
+}
+
+@setup anyall_rows_table
+test gt-any-subquery-outer-table-named-like-generated-table {
+    SELECT _turso_anyall_rows.a FROM _turso_anyall_rows
+    WHERE _turso_anyall_rows.a > ANY (SELECT 2) ORDER BY 1;
+}
+expect {
+    5
+}
+
+@setup anyall_cmp
+test gt-all-subquery-allows-aggregate-in-scalar-subquery {
+    SELECT a FROM nums WHERE (SELECT max(a) FROM nums) > ALL (SELECT a FROM nums WHERE a < 6) ORDER BY a;
+}
+expect {
+    2
+    4
+    6
+}
+
+@setup anyall_cmp
+test gt-any-subquery-rejects-two-columns {
+    SELECT 1 > ANY (SELECT a, a FROM nums);
+}
+@sqlstate 42601
+expect error {
+}
+
 test exists-subquery-with-empty-select-list {
     SELECT a FROM (VALUES (1), (2)) AS t1(a)
     WHERE EXISTS (SELECT FROM (VALUES (2)) AS t2(b) WHERE t2.b > t1.a);
