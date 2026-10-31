@@ -19,8 +19,8 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_function_that_changes_within_statement,
-        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        BindingBehavior, WalkControl,
+        expr_contains_nondeterministic_scalar_function, expr_contains_subquery, expr_vector_size,
+        unwrap_parens, BindingBehavior, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -2664,9 +2664,8 @@ pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -
             };
             // A subquery in a bound runs before the comparisons, so a kept BETWEEN could not skip it
             // the way SQLite does. Such a BETWEEN is rewritten as before.
-            let bounds_have_subquery =
-                expr_contains_subquery(start)? || expr_contains_subquery(end)?;
-            if (expr_contains_subquery(lhs)? || lhs_is_nondeterministic) && !bounds_have_subquery {
+            let bounds_have_subquery = expr_contains_subquery(start) || expr_contains_subquery(end);
+            if (expr_contains_subquery(lhs) || lhs_is_nondeterministic) && !bounds_have_subquery {
                 return Ok(WalkControl::Continue);
             }
 
@@ -2708,24 +2707,6 @@ pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -
         Ok(WalkControl::Continue)
     })?;
     Ok(())
-}
-
-fn expr_contains_subquery(expr: &Expr) -> Result<bool> {
-    let mut found = false;
-    walk_expr(expr, &mut |expr| {
-        if matches!(
-            expr,
-            Expr::Subquery(_)
-                | Expr::Exists(_)
-                | Expr::InSelect { .. }
-                | Expr::SubqueryResult { .. }
-        ) {
-            found = true;
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
 }
 
 /**
