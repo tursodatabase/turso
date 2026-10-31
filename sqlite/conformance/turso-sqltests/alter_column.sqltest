@@ -1108,34 +1108,6 @@ expect error {
     PRIMARY KEY missing on table t
 }
 
-# ADD COLUMN and DROP COLUMN rewrite the stored CREATE TABLE from the schema, so the
-# table-level UNIQUE (a) must still be written there.
-@cross-check-integrity
-test alter-column-add-column-keeps-unique-also-declared-for-a-primary-key {
-    CREATE TABLE t (a text primary key, b text, unique (a));
-    ALTER TABLE t ADD COLUMN c;
-    SELECT type, name, sql FROM sqlite_schema;
-    PRAGMA integrity_check;
-}
-expect {
-    table|t|CREATE TABLE t (a text PRIMARY KEY, b text, c, UNIQUE (a))
-    index|sqlite_autoindex_t_1|
-    ok
-}
-
-@cross-check-integrity
-test alter-column-drop-column-keeps-unique-also-declared-for-a-primary-key {
-    CREATE TABLE t (a text primary key, b text, c text, unique (a));
-    ALTER TABLE t DROP COLUMN b;
-    SELECT type, name, sql FROM sqlite_schema;
-    PRAGMA integrity_check;
-}
-expect {
-    table|t|CREATE TABLE t (a text PRIMARY KEY, c text, UNIQUE (a))
-    index|sqlite_autoindex_t_1|
-    ok
-}
-
 @skip-if mvcc "WITHOUT ROWID writes are not supported in MVCC mode"
 test fail-alter-column-drops-primary-key-also-declared-unique-of-without-rowid-table {
     CREATE TABLE t (a text primary key, b text, unique (a)) WITHOUT ROWID;

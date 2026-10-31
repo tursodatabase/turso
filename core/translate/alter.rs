@@ -1856,13 +1856,9 @@ pub fn translate_alter_table(
             // Once the column constraint is gone, the stored CREATE TABLE describes that index
             // by the table constraint, which can sort differently, resolve conflicts
             // differently, and give the index another automatic index number.
-            let old_column = &btree.columns()[column_index];
             if !rename
-                && (old_column.unique()
-                    || (old_column.primary_key() && btree.primary_key_is_inline))
                 && btree.unique_sets.iter().any(|set| {
-                    !set.is_inline
-                        && set.columns.len() == 1
+                    set.repeated_by_table_constraint
                         && set.columns[0].name.eq_ignore_ascii_case(old_column_name)
                 })
             {
@@ -2246,7 +2242,7 @@ pub fn translate_alter_table(
                         rhs: dropped_name,
                         target_pc: keep_row,
                         flags: CmpInsFlags::default(),
-                        collation: CollationSeq::for_internal_values(),
+                        collation: CollationSeq::NOCASE,
                     });
                     program.emit_insn(Insn::Delete {
                         cursor_id,
@@ -2286,7 +2282,7 @@ pub fn translate_alter_table(
                         rhs: old_name,
                         target_pc: not_renamed,
                         flags: CmpInsFlags::default(),
-                        collation: CollationSeq::for_internal_values(),
+                        collation: CollationSeq::NOCASE,
                     });
                     program.emit_string8(resolver.mangle_name(namespace, new_name), out + 1);
                     program.preassign_label_to_next_insn(not_renamed);

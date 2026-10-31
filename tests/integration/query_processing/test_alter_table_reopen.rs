@@ -449,3 +449,51 @@ fn test_quoted_integer_primary_key_with_automatic_index_reopen() {
         conn.close().unwrap();
     }
 }
+
+/// SQLite names automatic indexes after the table name as written, so a table
+/// `Tt` created by sqlite3 has `sqlite_autoindex_Tt_1`. ALTER COLUMN must still
+/// find those rows to delete the dropped index and renumber the others.
+#[test]
+fn test_alter_column_drops_automatic_index_of_mixed_case_table_made_by_sqlite() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_column_mixed_case_autoindex.db");
+
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch("CREATE TABLE Tt(a TEXT UNIQUE, b TEXT UNIQUE, c TEXT UNIQUE);")
+        .unwrap();
+    drop(sqlite);
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("ALTER TABLE Tt ALTER COLUMN a TO a2 TEXT")
+            .unwrap();
+        conn.execute("INSERT INTO Tt VALUES ('x', 'y', 'z')")
+            .unwrap();
+        conn.execute("INSERT INTO Tt VALUES ('x', 'y2', 'z2')")
+            .unwrap();
+        assert!(conn
+            .execute("INSERT INTO Tt VALUES ('x2', 'y3', 'z')")
+            .is_err());
+        conn.close().unwrap();
+    }
+
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    let integrity: String = sqlite
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(integrity, "ok");
+    let mut stmt = sqlite
+        .prepare("SELECT lower(name) FROM sqlite_schema WHERE type = 'index' ORDER BY name")
+        .unwrap();
+    let indexes: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        indexes,
+        vec!["sqlite_autoindex_tt_1", "sqlite_autoindex_tt_2"]
+    );
+}

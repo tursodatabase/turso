@@ -4402,6 +4402,7 @@ impl TryClone for UniqueSet {
             columns: self.columns.try_clone()?,
             is_primary_key: self.is_primary_key,
             is_inline: self.is_inline,
+            repeated_by_table_constraint: self.repeated_by_table_constraint,
             conflict_clause: self.conflict_clause,
             constraint_name: self.constraint_name.clone(),
         })
@@ -4928,9 +4929,11 @@ impl PartialEq for Table {
 pub struct UniqueSet {
     pub columns: Vec<UniqueSetColumn>,
     pub is_primary_key: bool,
-    /// True if declared only as an inline column constraint, not also as a
-    /// table-level constraint on the same column.
+    /// True if declared as an inline column constraint rather than a table-level constraint.
     pub is_inline: bool,
+    /// True if a table-level constraint on the same columns was merged into this one,
+    /// as in `a UNIQUE, UNIQUE (a)`.
+    pub repeated_by_table_constraint: bool,
     pub conflict_clause: Option<ResolveType>,
     /// Explicit constraint name from `CONSTRAINT name UNIQUE/PRIMARY KEY`, if given.
     pub constraint_name: Option<String>,
@@ -4939,7 +4942,9 @@ pub struct UniqueSet {
 impl UniqueSet {
     /// Whether this constraint is declared only in the definition of the column `column_name`.
     pub fn is_column_constraint_of(&self, column_name: &str) -> bool {
-        self.is_inline && self.columns[0].name.eq_ignore_ascii_case(column_name)
+        self.is_inline
+            && !self.repeated_by_table_constraint
+            && self.columns[0].name.eq_ignore_ascii_case(column_name)
     }
 }
 
@@ -5522,17 +5527,22 @@ impl BTreeTable {
         // `sqlite_autoindex_<table>_<N>` numbering matches the original schema on reopen.
         let mut emitted_table_pk = false;
         for unique_set in &self.unique_sets {
-            if unique_set.is_primary_key && !needs_pk_inline {
-                if has_table_pk {
+            if unique_set.is_primary_key {
+                if !needs_pk_inline && has_table_pk {
                     push_table_pk(&mut sql);
                     emitted_table_pk = true;
                 }
                 continue;
             }
-            // The column definition already declares inline constraints. An inline
-            // PRIMARY KEY with `is_inline == false` was also declared as a table-level
-            // UNIQUE on the same column, which is written here.
-            if unique_set.is_inline {
+            // Skip inline unique constraints only when their column still carries `UNIQUE`
+            // (if an earlier `ALTER COLUMN` cleared `column.unique()` while keeping the
+            // `UniqueSet` and its autoindex, emit `UNIQUE (...)` so reopen consumes it).
+            if unique_set.is_inline
+                && unique_set.columns.len() == 1
+                && self
+                    .get_column(&unique_set.columns[0].name)
+                    .is_some_and(|(_, col)| col.unique())
+            {
                 continue;
             }
             sql.push_str(", ");
@@ -6533,6 +6543,7 @@ pub fn create_table(
                         columns: pk_unique_set_columns,
                         is_primary_key: true,
                         is_inline: false,
+                        repeated_by_table_constraint: false,
                         conflict_clause: *conflict_clause,
                         constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     })?;
@@ -6566,6 +6577,7 @@ pub fn create_table(
                         columns: unique_columns,
                         is_primary_key: false,
                         is_inline: false,
+                        repeated_by_table_constraint: false,
                         conflict_clause: *conflict_clause,
                         constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                     };
@@ -6759,6 +6771,7 @@ pub fn create_table(
                                 }]?,
                                 is_primary_key: true,
                                 is_inline: true,
+                                repeated_by_table_constraint: false,
                                 conflict_clause: *conflict_clause,
                                 constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
@@ -6789,6 +6802,7 @@ pub fn create_table(
                                 }]?,
                                 is_primary_key: false,
                                 is_inline: true,
+                                repeated_by_table_constraint: false,
                                 conflict_clause: *conflict,
                                 constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
                             })?;
@@ -7057,8 +7071,8 @@ pub fn create_table(
                                 );
                             }
                         }
-                        if !unique_sets[j].is_inline {
-                            unique_sets[i].is_inline = false;
+                        if unique_sets[i].is_inline && !unique_sets[j].is_inline {
+                            unique_sets[i].repeated_by_table_constraint = true;
                         }
                         unique_sets.remove(j);
                     } else {
