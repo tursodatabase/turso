@@ -300,6 +300,18 @@ expect {
     1.50
 }
 
+test table-numeric-column-rounds-extra-digits {
+    CREATE TABLE prices (id int PRIMARY KEY, val numeric(10,2));
+    INSERT INTO prices VALUES (1, 0.019), (2, 0.015), (3, -0.015), (4, '1.999');
+    SELECT id, val FROM prices ORDER BY id;
+}
+expect {
+    1|0.02
+    2|0.02
+    3|-0.02
+    4|2.00
+}
+
 test table-uuid-column-omitted-from-insert-is-null {
     CREATE TABLE t (id int PRIMARY KEY, u uuid);
     INSERT INTO t (id) VALUES (1);
