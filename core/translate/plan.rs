@@ -20,7 +20,7 @@ use crate::{
         planner::determine_where_to_eval_term,
     },
     types::SeekOp,
-    util::exprs_are_equivalent,
+    util::{exprs_are_equivalent, predicate_terms_are_equivalent},
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder, Subroutine},
@@ -3436,7 +3436,7 @@ impl JoinedTable {
             // Column `name` is not otherwise needed, so we can rely on the
             // expression value from the index and drop the table cursor.
             let matches_where_clause = if let Some(idx_where_clause) = &index.where_clause {
-                exprs_are_equivalent(idx_where_clause, &usage.normalized_expr)
+                predicate_terms_are_equivalent(idx_where_clause, &usage.normalized_expr)
             } else {
                 false
             };
