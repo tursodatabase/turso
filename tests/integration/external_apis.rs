@@ -1025,6 +1025,54 @@ unsafe extern "C" fn dotnet_case_sensitive_collation(
 
 #[turso_macros::test]
 #[serial]
+fn pragma_collation_list_lists_registered_collations_first(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation("zz_last".to_string(), 0, dotnet_nocase_collation, None);
+    conn.register_external_collation("aa_first".to_string(), 0, dotnet_nocase_collation, None);
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("PRAGMA collation_list");
+    assert_eq!(
+        rows,
+        vec![
+            (0, "aa_first".to_string()),
+            (1, "zz_last".to_string()),
+            (2, "RTRIM".to_string()),
+            (3, "NOCASE".to_string()),
+            (4, "BINARY".to_string()),
+        ]
+    );
+
+    conn.unregister_external_collation("aa_first");
+    conn.unregister_external_collation("zz_last");
+    let rows: Vec<(i64, String)> = conn.exec_rows("PRAGMA collation_list");
+    assert_eq!(rows.len(), 3);
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn pragma_collation_list_lists_a_replaced_builtin_once(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.register_external_collation("NOCASE".to_string(), 0, dotnet_nocase_collation, None);
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("PRAGMA collation_list");
+    assert_eq!(
+        rows,
+        vec![
+            (0, "nocase".to_string()),
+            (1, "RTRIM".to_string()),
+            (2, "BINARY".to_string()),
+        ]
+    );
+
+    conn.unregister_external_collation("NOCASE");
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
 fn custom_collations_cover_dotnet_create_collation_cases(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
