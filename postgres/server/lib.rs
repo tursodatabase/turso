@@ -671,11 +671,28 @@ fn bind_portal_parameters(
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
 /// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
-    let text = std::str::from_utf8(bytes).map_err(|e| {
-        PgWireError::UserError(Box::new(error_info(&format!(
-            "invalid UTF-8 in parameter: {e}"
-        ))))
-    })?;
+    // bytea parameters may legitimately contain non-UTF-8 bytes, so they must
+    // be handled before the text-format UTF-8 validation below.
+    if *pg_type == Type::BYTEA {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            if let Some(hex_str) = text.strip_prefix("\\x") {
+                let data = decode_hex(hex_str).map_err(|e| {
+                    PgWireError::UserError(Box::new(error_info(&format!(
+                        "invalid bytea hex parameter: {e}"
+                    ))))
+                })?;
+                return Ok(Value::from_blob(data));
+            }
+        }
+        return Ok(Value::from_blob(bytes.to_vec()));
+    }
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        // Non-UTF-8 parameter bytes: the client sent raw binary (e.g. a bytea
+        // payload). Binding it as a blob keeps binary data storable instead of
+        // failing the whole Bind.
+        Err(_) => return Ok(Value::from_blob(bytes.to_vec())),
+    };
 
     match *pg_type {
         Type::INT2 | Type::INT4 | Type::INT8 => {
@@ -701,20 +718,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 "invalid boolean parameter: {text}"
             ))))),
         },
-        Type::BYTEA => {
-            // PostgreSQL text format for bytea uses \x hex encoding
-            if let Some(hex_str) = text.strip_prefix("\\x") {
-                let data = decode_hex(hex_str).map_err(|e| {
-                    PgWireError::UserError(Box::new(error_info(&format!(
-                        "invalid bytea hex parameter: {e}"
-                    ))))
-                })?;
-                Ok(Value::from_blob(data))
-            } else {
-                // Raw bytes as-is
-                Ok(Value::from_blob(bytes.to_vec()))
-            }
-        }
+        Type::BYTEA => unreachable!("bytea handled before UTF-8 validation"),
         // UNKNOWN: try to infer type from text content (numeric-looking values
         // should be bound as numbers so comparisons with COUNT/SUM etc. work)
         Type::UNKNOWN => {
