@@ -12,16 +12,8 @@ use turso_core::{
 };
 
 use crate::error::in_failed_sql_transaction_error;
-use crate::session::PrerequisiteExecution;
+use crate::session::DeferredExecution;
 use crate::Result;
-
-pub(crate) type DeferredExec =
-    Box<dyn FnMut(&mut turso_core::Statement) -> turso_core::Result<()> + Send + Sync>;
-
-enum DeferredState {
-    Callback { exec: DeferredExec, completed: bool },
-    Prerequisites(Box<PrerequisiteExecution>),
-}
 
 /// How a statement interacts with PostgreSQL's aborted-transaction state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -127,8 +119,8 @@ struct TxTracking {
 pub(crate) type PostRunFn = Arc<dyn Fn(Result<()>) -> Result<()> + Send + Sync>;
 
 pub struct Statement {
-    inner: turso_core::Statement,
-    deferred: Option<DeferredState>,
+    pub(crate) inner: turso_core::Statement,
+    deferred: Option<Box<DeferredExecution>>,
     tx_tracking: Option<TxTracking>,
     commit_became_rollback: bool,
     /// Applied by all run/step methods after the core statement completes. Used
@@ -190,22 +182,15 @@ impl Statement {
         }
     }
 
-    pub(crate) fn with_deferred(inner: turso_core::Statement, exec: DeferredExec) -> Self {
+    pub(crate) fn with_deferred(inner: turso_core::Statement, exec: DeferredExecution) -> Self {
         let mut stmt = Self::new(inner);
-        stmt.deferred = Some(DeferredState::Callback {
-            exec,
-            completed: false,
-        });
+        stmt.deferred = Some(Box::new(exec));
         stmt
     }
 
-    pub(crate) fn with_prerequisites(
-        inner: turso_core::Statement,
-        exec: PrerequisiteExecution,
-    ) -> Self {
-        let mut stmt = Self::new(inner);
-        stmt.deferred = Some(DeferredState::Prerequisites(Box::new(exec)));
-        stmt
+    pub(crate) fn without_tx_tracking(mut self) -> Self {
+        self.tx_tracking = None;
+        self
     }
 
     pub(crate) fn with_tx_tracking(
@@ -308,10 +293,7 @@ impl Statement {
     }
 
     fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
-        let saved_tx = match &self.deferred {
-            Some(DeferredState::Prerequisites(exec)) => exec.was_in_tx,
-            _ => None,
-        };
+        let saved_tx = self.deferred.as_ref().and_then(|exec| exec.was_in_tx);
         let tx = match saved_tx {
             Some(was_in_tx) => Some(was_in_tx),
             None => self.tx_gate()?,
@@ -323,16 +305,7 @@ impl Statement {
             self.mark_query_start();
         }
         let result = match &mut self.deferred {
-            Some(DeferredState::Callback { exec, completed }) => {
-                if *completed {
-                    return Ok(StepResult::Done);
-                }
-                exec(&mut self.inner).map(|()| {
-                    *completed = true;
-                    StepResult::Done
-                })
-            }
-            Some(DeferredState::Prerequisites(exec)) => exec.step(&mut self.inner, waker),
+            Some(exec) => exec.step(&mut self.inner, waker),
             None => match waker {
                 Some(waker) => self.inner.step_with_waker(waker),
                 None => self.inner.step(),
@@ -369,10 +342,8 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        match &mut self.deferred {
-            Some(DeferredState::Callback { completed, .. }) => *completed = false,
-            Some(DeferredState::Prerequisites(exec)) => exec.reset()?,
-            None => {}
+        if let Some(exec) = &mut self.deferred {
+            exec.reset()?;
         }
         self.commit_became_rollback = false;
         self.inner.reset().map_err(Into::into)
@@ -504,7 +475,7 @@ impl Statement {
     }
 
     pub fn take_io_completions(&mut self) -> Option<turso_core::types::IOCompletions> {
-        if let Some(DeferredState::Prerequisites(exec)) = &mut self.deferred {
+        if let Some(exec) = &mut self.deferred {
             return exec.io_completions.take();
         }
         self.inner.take_io_completions()
@@ -515,7 +486,7 @@ impl Statement {
     }
 
     pub fn interrupt(&mut self) {
-        if let Some(DeferredState::Prerequisites(exec)) = &mut self.deferred {
+        if let Some(exec) = &mut self.deferred {
             exec.interrupted = true;
             return;
         }
@@ -535,14 +506,10 @@ impl Statement {
     }
 
     pub fn reset_best_effort(&mut self) {
-        match &mut self.deferred {
-            Some(DeferredState::Callback { completed, .. }) => *completed = false,
-            Some(DeferredState::Prerequisites(exec)) => {
-                if let Err(error) = exec.reset() {
-                    tracing::error!("Failed to reset PostgreSQL prerequisites: {error}");
-                }
+        if let Some(exec) = &mut self.deferred {
+            if let Err(error) = exec.reset() {
+                tracing::error!("Failed to reset PostgreSQL deferred statement: {error}");
             }
-            None => {}
         }
         self.inner.reset_best_effort();
     }

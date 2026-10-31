@@ -1287,6 +1287,236 @@ fn serial_prerequisites_rollback_conflicts_and_reset() {
     }
 }
 
+#[test]
+fn session_statements_yield_to_the_caller() {
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "session-yield.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    let mut create = conn
+        .prepare("CREATE SCHEMA app CREATE TABLE t (id SERIAL, payload INT UNIQUE)")
+        .unwrap();
+    assert!(conn.inner().qualifier("app").is_none());
+    drive_prerequisites(&io, &mut create).unwrap();
+    let data = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(data.path(), "13\n27\n").unwrap();
+    let mut copy = conn
+        .prepare(format!(
+            "COPY app.t (payload) FROM '{}'",
+            data.path().display()
+        ))
+        .unwrap();
+    drive_prerequisites(&io, &mut copy).unwrap();
+    assert_eq!(copy.n_change(), 2);
+    assert_eq!(
+        conn.prepare("SELECT id, payload FROM app.t ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(13)],
+            vec![Value::from_i64(2), Value::from_i64(27)],
+        ]
+    );
+    copy.reset().unwrap();
+    std::fs::write(data.path(), "41\n27\n").unwrap();
+    assert_eq!(
+        drive_prerequisites(&io, &mut copy).unwrap_err().sqlstate,
+        "23505"
+    );
+    assert_eq!(
+        conn.prepare("SELECT count(*) FROM app.t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(2)]]
+    );
+    copy.reset().unwrap();
+    std::fs::write(data.path(), "").unwrap();
+    drive_prerequisites(&io, &mut copy).unwrap();
+    assert_eq!(copy.n_change(), 0);
+    let mut invalid_copy = conn
+        .prepare(format!(
+            "COPY app.t (missing) FROM '{}'",
+            data.path().display()
+        ))
+        .unwrap();
+    assert!(drive_prerequisites(&io, &mut invalid_copy).is_err());
+    let mut drop_schema = conn.prepare("DROP SCHEMA app CASCADE").unwrap();
+    drive_prerequisites(&io, &mut drop_schema).unwrap();
+    assert!(conn.inner().qualifier("app").is_none());
+    create.reset().unwrap();
+    drive_prerequisites(&io, &mut create).unwrap();
+    let mut failure = conn
+        .prepare("CREATE SCHEMA failed CREATE TABLE t (v INT) CREATE TABLE t (v INT)")
+        .unwrap();
+    assert!(drive_prerequisites(&io, &mut failure).is_err());
+    assert!(conn.inner().qualifier("failed").is_none());
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+
+    for sql in ["RESET ALL", "DISCARD ALL"] {
+        conn.execute("SET search_path TO app").unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["app".to_string()]));
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["public".to_string()]));
+        conn.execute("SET search_path TO app").unwrap();
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["app".to_string()]));
+        stmt.reset().unwrap();
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["public".to_string()]));
+    }
+}
+
+#[test]
+fn session_statements_clean_up_when_abandoned() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use turso_core::IO;
+
+    let data = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(data.path(), "13\n27\n").unwrap();
+    for operation in 0..3 {
+        for action in 0..3 {
+            let mut exhausted = false;
+            for pause_at in 0..200 {
+                let io = Arc::new(CountedYieldIO::default());
+                let db = turso_pg::open_database_with_io(
+                    io.clone(),
+                    "session-abandoned.db",
+                    OpenFlags::default(),
+                    DatabaseOpts::new(),
+                )
+                .unwrap();
+                let conn = Connection::connect(&db).unwrap();
+                conn.inner().set_foreign_keys_enabled(true);
+                conn.execute("SET search_path TO public; CREATE TABLE kept (v INT)")
+                    .unwrap();
+                let create = "CREATE SCHEMA work CREATE TABLE t (id SERIAL PRIMARY KEY, payload INT) CREATE TABLE u (id INT REFERENCES work.t(id))";
+                if operation != 0 {
+                    conn.execute(create).unwrap();
+                }
+                if operation == 1 {
+                    conn.execute("BEGIN; INSERT INTO kept VALUES (42); SAVEPOINT user_sp")
+                        .unwrap();
+                }
+                let sql = match operation {
+                    0 => create.to_string(),
+                    1 => "DROP SCHEMA work CASCADE".to_string(),
+                    2 => format!("COPY work.t (payload) FROM '{}'", data.path().display()),
+                    _ => unreachable!(),
+                };
+                let mut stmt = conn.prepare(sql).unwrap();
+                let injector = Arc::new(NthYield::new(pause_at));
+                conn.inner().set_yield_injector(Some(injector.clone()));
+                let wakes = Arc::new(WakeCounter::default());
+                let waker = std::task::Waker::from(wakes.clone());
+                let mut paused = false;
+                loop {
+                    let before = io.steps.load(Relaxed);
+                    let result = stmt.step_with_waker(&waker).unwrap();
+                    assert_eq!(io.steps.load(Relaxed), before);
+                    assert_eq!(conn.inner().search_path(), Some(vec!["public".to_string()]));
+                    assert!(conn.inner().foreign_keys_enabled());
+                    match result {
+                        StepResult::Done => break,
+                        StepResult::Yield if injector.0.load(Relaxed) == 0 => {
+                            paused = true;
+                            break;
+                        }
+                        StepResult::IO if pause_at == 0 => {
+                            assert!(!stmt.take_io_completions().unwrap().finished());
+                            paused = true;
+                            break;
+                        }
+                        StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                            let before_wake = wakes.0.load(Relaxed);
+                            io.step().unwrap();
+                            if matches!(result, StepResult::IO) {
+                                assert!(wakes.0.load(Relaxed) > before_wake);
+                            }
+                        }
+                        other => panic!("unexpected result: {other:?}"),
+                    }
+                }
+                conn.inner().set_yield_injector(None);
+                if !paused {
+                    if pause_at == 0 {
+                        continue;
+                    }
+                    assert!(pause_at > 1, "operation {operation}, action {action}");
+                    exhausted = true;
+                    break;
+                }
+                match action {
+                    0 => drop(stmt),
+                    1 => {
+                        stmt.reset().unwrap();
+                        drop(stmt);
+                    }
+                    2 => {
+                        stmt.interrupt();
+                        if let Err(error) = drive_prerequisites(&io, &mut stmt) {
+                            assert_eq!(error.sqlstate, "57014");
+                            if operation == 1 {
+                                assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+                                conn.execute("ROLLBACK TO SAVEPOINT user_sp").unwrap();
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                if operation == 1 {
+                    assert_eq!(conn.transaction_state(), TransactionState::Active);
+                    conn.execute("COMMIT").unwrap();
+                    assert_eq!(
+                        conn.prepare("SELECT v FROM kept")
+                            .unwrap()
+                            .run_collect_rows()
+                            .unwrap(),
+                        vec![vec![Value::from_i64(42)]]
+                    );
+                }
+                assert_eq!(conn.transaction_state(), TransactionState::Idle);
+                let tables = conn
+                    .prepare("SELECT tablename FROM pg_tables WHERE schemaname = 'work'")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                let sequences = conn
+                    .prepare("SELECT sequencename FROM pg_sequences WHERE schemaname = 'work'")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                assert!(
+                    tables.is_empty() || tables.len() == 2,
+                    "operation {operation}, action {action}, pause {pause_at}: {tables:?}"
+                );
+                assert_eq!(sequences.len() * 2, tables.len());
+                assert_eq!(conn.inner().qualifier("work").is_some(), !tables.is_empty());
+                if operation == 2 {
+                    let rows = conn
+                        .prepare("SELECT payload FROM work.t ORDER BY payload")
+                        .unwrap()
+                        .run_collect_rows()
+                        .unwrap();
+                    assert!(
+                        rows.is_empty()
+                            || rows == vec![vec![Value::from_i64(13)], vec![Value::from_i64(27)]]
+                    );
+                }
+                conn.execute("INSERT INTO kept VALUES (99)").unwrap();
+            }
+            assert!(exhausted, "did not exhaust yield points");
+        }
+    }
+}
+
 fn drive_prerequisites(
     io: &CountedYieldIO,
     stmt: &mut turso_pg::Statement,
