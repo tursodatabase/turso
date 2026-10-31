@@ -1340,6 +1340,14 @@ impl ToTokens for CompoundOperator {
             }
             Self::Except => s.append(TK_EXCEPT, None),
             Self::Intersect => s.append(TK_INTERSECT, None),
+            Self::ExceptAll => {
+                s.append(TK_EXCEPT, None)?;
+                s.append(TK_ALL, None)
+            }
+            Self::IntersectAll => {
+                s.append(TK_INTERSECT, None)?;
+                s.append(TK_ALL, None)
+            }
         }
     }
 }

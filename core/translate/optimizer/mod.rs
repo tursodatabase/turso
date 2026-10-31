@@ -2152,8 +2152,12 @@ fn base_row_estimate(
                         ast::CompoundOperator::UnionAll | ast::CompoundOperator::Union => {
                             combined + rhs
                         }
-                        ast::CompoundOperator::Intersect => combined.min(rhs),
-                        ast::CompoundOperator::Except => combined,
+                        ast::CompoundOperator::Intersect | ast::CompoundOperator::IntersectAll => {
+                            combined.min(rhs)
+                        }
+                        ast::CompoundOperator::Except | ast::CompoundOperator::ExceptAll => {
+                            combined
+                        }
                     };
                 }
                 RowCountEstimate::AnalyzeStats(combined.max(1.0))
