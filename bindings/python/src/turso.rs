@@ -10,14 +10,14 @@
 //!  (e.g. the itertools library), since Python tends to be slow.
 use pyo3::{
     prelude::*,
-    types::{PyBytes, PyTuple},
+    types::{PyBytes, PyFloat, PyInt, PyTuple},
 };
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value};
 pub use turso_sdk_kit::IoBackend;
 
 use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyOverflowError};
 
 // support equality for status codes
 #[pyclass(eq, eq_int, skip_from_py_object)]
@@ -427,8 +427,12 @@ fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
         Ok(Value::Null)
     } else if let Ok(integer) = obj.extract::<i64>() {
         Ok(Value::from_i64(integer))
-    } else if let Ok(float) = obj.extract::<f64>() {
-        Ok(Value::from_f64(float))
+    } else if obj.is_instance_of::<PyInt>() {
+        Err(PyOverflowError::new_err(
+            "Python int too large to convert to SQLite INTEGER",
+        ))
+    } else if let Ok(float) = obj.cast::<PyFloat>() {
+        Ok(Value::from_f64(float.value()))
     } else if let Ok(string) = obj.extract::<String>() {
         Ok(Value::Text(string.into()))
     } else if let Ok(bytes) = obj.cast::<PyBytes>() {
