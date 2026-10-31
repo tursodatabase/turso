@@ -543,6 +543,7 @@ fn emit_delete_insns<'a>(
             TriggerEvent::Delete,
             None,
             &btree_table,
+            connection,
         )
     } else {
         false
@@ -948,6 +949,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerEvent::Delete,
             None,
             &btree_table,
+            connection,
         )
     } else {
         false
@@ -985,6 +987,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerTime::Before,
             None,
             &btree_table,
+            connection,
         );
         if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg
@@ -1051,6 +1054,7 @@ fn emit_delete_insns_when_triggers_present(
             TriggerTime::After,
             None,
             &btree_table,
+            connection,
         );
         if !relevant_triggers.is_empty() {
             let columns_start_reg = columns_start_reg

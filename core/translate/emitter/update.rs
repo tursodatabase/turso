@@ -1240,6 +1240,7 @@ fn emit_update_insns<'a>(
             TriggerEvent::Update,
             Some(&updated_column_names),
             &btree_table,
+            connection,
         )
     } else {
         false
@@ -1368,6 +1369,7 @@ fn emit_update_insns<'a>(
             TriggerTime::Before,
             Some(&updated_column_names),
             &btree_table,
+            connection,
         ),
         None => Vec::new(),
     };
@@ -1418,6 +1420,7 @@ fn emit_update_insns<'a>(
                 TriggerEvent::Update,
                 Some(&updated_column_names),
                 &btree_table,
+                connection,
             );
 
             let needs_old_registers =
@@ -2663,6 +2666,7 @@ fn emit_update_insns<'a>(
                     TriggerTime::After,
                     Some(&updated_column_names),
                     &btree_table,
+                    connection,
                 );
                 if !relevant_triggers.is_empty() {
                     let columns = target_table.table.columns();

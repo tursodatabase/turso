@@ -265,6 +265,7 @@ pub(crate) fn set_update_stmt_journal_flags(
         TriggerEvent::Update,
         Some(&updated_col_names),
         &btree_table,
+        connection,
     );
     let has_fks = table_has_fks(connection, resolver, namespace, btree_table.name.as_str());
 
