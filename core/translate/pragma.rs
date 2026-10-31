@@ -1116,8 +1116,6 @@ fn query_pragma(
             // 3 columns: seqno, cid, name
             program.alloc_registers(2);
 
-            // Like SQLite, start a read transaction only when the index exists.
-            let mut index_found = false;
             if let Some(index_name) = index_name {
                 let index_namespace = resolve_index_pragma_namespace(
                     resolver,
@@ -1131,7 +1129,6 @@ fn query_pragma(
                         index_namespace.id,
                         &index_name,
                     )? {
-                        index_found = true;
                         for (seqno, col) in index.columns.iter().enumerate() {
                             program.emit_int(seqno as i64, base_reg);
                             emit_index_column_cid_and_name(program, col, base_reg + 1);
@@ -1146,11 +1143,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(if index_found {
-                TransactionMode::Read
-            } else {
-                TransactionMode::None
-            })
+            Ok(TransactionMode::Read)
         }
         PragmaName::IndexXinfo => {
             let index_name = match value {
@@ -1162,8 +1155,6 @@ fn query_pragma(
             // 6 columns: seqno, cid, name, desc, coll, key
             program.alloc_registers(5);
 
-            // Like SQLite, start a read transaction only when the index exists.
-            let mut index_found = false;
             if let Some(index_name) = index_name {
                 let index_namespace = resolve_index_pragma_namespace(
                     resolver,
@@ -1177,7 +1168,6 @@ fn query_pragma(
                         index_namespace.id,
                         &index_name,
                     )? {
-                        index_found = true;
                         for (seqno, col) in index.columns.iter().enumerate() {
                             let desc = matches!(col.order, ast::SortOrder::Desc);
                             let coll = col.collation.to_string().to_uppercase();
@@ -1231,11 +1221,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(if index_found {
-                TransactionMode::Read
-            } else {
-                TransactionMode::None
-            })
+            Ok(TransactionMode::Read)
         }
         PragmaName::IndexList => {
             let table_name = match value {
@@ -1247,8 +1233,6 @@ fn query_pragma(
             // 5 columns: seq, name, unique, origin, partial
             program.alloc_registers(4);
 
-            // Like SQLite, start a read transaction only when the table exists.
-            let mut table_found = false;
             if let Some(table_name) = table_name {
                 let table_namespace = resolve_table_pragma_namespace(
                     resolver,
@@ -1258,7 +1242,6 @@ fn query_pragma(
                 )?;
                 resolver.with_schema(table_namespace.database_id, |schema| -> Result<()> {
                     if let Some(table) = schema.get_table(table_namespace.id, &table_name) {
-                        table_found = true;
                         let btree = table.btree();
                         let pk_cols: Vec<String> = btree
                             .as_ref()
@@ -1312,11 +1295,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(if table_found {
-                TransactionMode::Read
-            } else {
-                TransactionMode::None
-            })
+            Ok(TransactionMode::Read)
         }
         PragmaName::ForeignKeyList => {
             let table_name = match value {
@@ -1328,8 +1307,6 @@ fn query_pragma(
             // 8 columns: id, seq, table, from, to, on_update, on_delete, match
             program.alloc_registers(7);
 
-            // Like SQLite, start a read transaction only when the table has foreign keys.
-            let mut has_foreign_keys = false;
             if let Some(table_name) = table_name {
                 let table_name = table_name.as_str();
                 let table_namespace = resolve_table_pragma_namespace(
@@ -1346,7 +1323,6 @@ fn query_pragma(
                         return;
                     };
 
-                    has_foreign_keys = !table.foreign_keys.is_empty();
                     let mut foreign_keys = table.foreign_keys.iter().collect::<Vec<_>>();
                     foreign_keys.sort_by_key(|fk| std::cmp::Reverse(fk.decl_order));
 
@@ -1386,11 +1362,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(if has_foreign_keys {
-                TransactionMode::Read
-            } else {
-                TransactionMode::None
-            })
+            Ok(TransactionMode::Read)
         }
         PragmaName::TableList => {
             let name = match value {
@@ -1441,8 +1413,6 @@ fn query_pragma(
             let base_reg = register;
             // we need 6 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(5);
-            // Like SQLite, start a read transaction only when a table is named.
-            let table_named = name.is_some();
             if let Some(name) = name {
                 let table_namespace = resolve_table_pragma_namespace(
                     resolver,
@@ -1497,11 +1467,7 @@ fn query_pragma(
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
-            Ok(if table_named {
-                TransactionMode::Read
-            } else {
-                TransactionMode::None
-            })
+            Ok(TransactionMode::Read)
         }
         PragmaName::TableXinfo => {
             let name = match value {
@@ -1512,8 +1478,6 @@ fn query_pragma(
             let base_reg = register;
             // we need 7 registers, but first register was allocated at the beginning  of the "query_pragma" function
             program.alloc_registers(6);
-            // Like SQLite, start a read transaction only when a table is named.
-            let table_named = name.is_some();
             if let Some(name) = name {
                 let table_namespace = resolve_table_pragma_namespace(
                     resolver,
@@ -1576,11 +1540,7 @@ fn query_pragma(
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
-            Ok(if table_named {
-                TransactionMode::Read
-            } else {
-                TransactionMode::None
-            })
+            Ok(TransactionMode::Read)
         }
         PragmaName::UserVersion => {
             program.emit_insn(Insn::ReadCookie {

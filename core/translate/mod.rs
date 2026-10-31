@@ -50,7 +50,7 @@ mod values;
 pub(crate) mod view;
 mod window;
 
-use crate::schema::{Schema, Table};
+use crate::schema::Schema;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
@@ -558,15 +558,8 @@ fn translate_statement(
         }
     }
 
-    // Indicate read operations so that in the epilogue we can emit the correct type of transaction.
-    // Like SQLite, a SELECT that reads only VALUES, CTEs or subqueries without tables starts none.
-    if is_select
-        && program
-            .table_references
-            .joined_tables()
-            .iter()
-            .any(|table| matches!(table.table, Table::BTree(_) | Table::Virtual(_)))
-    {
+    // Indicate read operations so that in the epilogue we can emit the correct type of transaction
+    if is_select && !program.table_references.is_empty() {
         program.begin_read_operation()?;
     }
 

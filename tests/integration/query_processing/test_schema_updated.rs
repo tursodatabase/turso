@@ -157,7 +157,7 @@ fn test_rolled_back_schema_change_reprepares_statement(tmp_db: TempDatabase) -> 
 
 #[test]
 fn test_prepared_schema_pragmas_reprepare_after_ddl() -> Result<()> {
-    let cases: [(&[&str], &str, &[&str]); 7] = [
+    let cases: [(&[&str], &str, &[&str]); 11] = [
         (
             &["CREATE TABLE t1(a)"],
             "PRAGMA table_info(t1)",
@@ -195,6 +195,26 @@ fn test_prepared_schema_pragmas_reprepare_after_ddl() -> Result<()> {
             ],
             "PRAGMA foreign_key_list(t2)",
             &["DROP TABLE t2", "CREATE TABLE t2(b)"],
+        ),
+        (
+            &["CREATE TABLE t1(a)"],
+            "PRAGMA index_list(t2)",
+            &["CREATE TABLE t2(b)", "CREATE INDEX i1 ON t2(b)"],
+        ),
+        (
+            &["CREATE TABLE t1(a)"],
+            "PRAGMA index_info(i1)",
+            &["CREATE INDEX i1 ON t1(a)"],
+        ),
+        (
+            &["CREATE TABLE t1(a)"],
+            "PRAGMA index_xinfo(i1)",
+            &["CREATE INDEX i1 ON t1(a)"],
+        ),
+        (
+            &["CREATE TABLE t1(a PRIMARY KEY)", "CREATE TABLE t2(b)"],
+            "PRAGMA foreign_key_list(t2)",
+            &["DROP TABLE t2", "CREATE TABLE t2(b REFERENCES t1(a))"],
         ),
     ];
     for (setup, pragma, ddl) in cases {
