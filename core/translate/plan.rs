@@ -1048,6 +1048,8 @@ pub struct UpdatePlan {
     pub where_clause: Vec<WhereTerm>,
     /// Optional RETURNING clause.
     pub returning: Option<Vec<ResultSetColumn>>,
+    /// Columns and rowids of the FROM tables that RETURNING reads.
+    pub returning_from_values: Vec<ast::Expr>,
     /// Whether the WHERE clause is always false.
     pub contains_constant_false_condition: bool,
     pub indexes_to_update: Vec<Arc<Index>>,

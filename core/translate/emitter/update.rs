@@ -29,8 +29,8 @@ use crate::{
         expr::{
             emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
             emit_table_column, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            NoConstantOptReason, ReturningBufferCtx,
+            seed_returning_from_values_in_cache, seed_returning_row_image_in_cache, translate_expr,
+            translate_expr_no_constant_opt, NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
@@ -451,13 +451,20 @@ pub fn emit_program_for_update(
         }),
         "materialized UPDATE set clauses must stay attached to their original clause and read from scratch-table columns"
     );
+    let returning_tables_with_from = (!plan.returning_from_values.is_empty()).then(|| {
+        let mut tables = write_phase_tables.clone();
+        tables.extend(plan.from_tables.clone());
+        tables
+    });
     emit_update_insns(
         connection,
         &mut write_phase_tables,
+        returning_tables_with_from.as_ref(),
         &plan.set_clauses,
         plan.cdc_update_alter_statement.as_deref(),
         &plan.indexes_to_update,
         plan.returning.as_ref(),
+        &plan.returning_from_values,
         temp_cursor_id,
         &mut t_ctx,
         program,
@@ -493,6 +500,9 @@ pub fn emit_program_for_update(
 
     program.result_columns = plan.returning.unwrap_or_default();
     program.table_references.extend(write_phase_tables);
+    if !plan.returning_from_values.is_empty() {
+        program.table_references.extend(plan.from_tables);
+    }
     Ok(())
 }
 
@@ -1108,10 +1118,12 @@ fn emit_deferred_notnull_checks<'a>(
 fn emit_update_insns<'a>(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
+    returning_tables_with_from: Option<&TableReferences>,
     set_clauses: &[UpdateSetClause],
     cdc_update_alter_statement: Option<&str>,
     indexes_to_update: &[Arc<Index>],
     returning: Option<&'a Vec<ResultSetColumn>>,
+    returning_from_values: &[ast::Expr],
     temp_cursor_id: Option<usize>,
     t_ctx: &mut TranslateCtx<'a>,
     program: &mut ProgramBuilder,
@@ -2600,13 +2612,26 @@ fn emit_update_insns<'a>(
             // triggers, so an AFTER trigger that rewrites or deletes the row does not change
             // what RETURNING reports. The AFTER trigger is therefore fired at the end of this
             // block. CDC already captured the row right after the write, above.
+            let returning_tables = returning_tables_with_from.unwrap_or(table_references);
+            let from_values_cache_state = returning_tables_with_from
+                .map(|tables| {
+                    seed_returning_from_values_in_cache(
+                        program,
+                        tables,
+                        returning_from_values,
+                        temp_cursor_id.expect("UPDATE ... FROM always uses a scratch table"),
+                        set_clauses.len(),
+                        &mut t_ctx.resolver,
+                    )
+                })
+                .transpose()?;
             let has_post_write_returning_subqueries = non_from_clause_subqueries
                 .iter()
                 .any(|s| !s.has_been_evaluated() && s.is_post_write_returning());
             if has_post_write_returning_subqueries {
                 let cache_state = seed_returning_row_image_in_cache(
                     program,
-                    table_references,
+                    returning_tables,
                     start,
                     effective_rowid_reg,
                     &mut t_ctx.resolver,
@@ -2641,7 +2666,7 @@ fn emit_update_insns<'a>(
                 if !returning_columns.is_empty() {
                     emit_returning_results(
                         program,
-                        table_references,
+                        returning_tables,
                         returning_columns,
                         start,
                         effective_rowid_reg,
@@ -2650,6 +2675,9 @@ fn emit_update_insns<'a>(
                         &layout,
                     )?;
                 }
+            }
+            if let Some(cache_state) = from_values_cache_state {
+                restore_returning_row_image_in_cache(&mut t_ctx.resolver, cache_state);
             }
 
             // Fire AFTER UPDATE triggers last, after RETURNING has captured the row this
