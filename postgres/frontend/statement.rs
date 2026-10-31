@@ -329,6 +329,9 @@ impl Statement {
         };
         match &result {
             Ok(StepResult::Done) => self.note_execution_done(),
+            // The core reports interruption and lock contention as results
+            // rather than errors, but PostgreSQL treats query cancellation
+            // and lock timeouts as ordinary errors that abort the block.
             Err(_) | Ok(StepResult::Interrupt | StepResult::Busy) => {
                 if self.tx_tracking.as_ref().is_some_and(|t| {
                     matches!(t.role, TxRole::Commit | TxRole::Rollback) && !t.conn.get_auto_commit()
