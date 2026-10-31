@@ -466,6 +466,40 @@ def test_parameterized_query(provider):
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_int_parameter_outside_64_bit_range_is_rejected(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE ids (ext INTEGER UNIQUE)")
+    for value in (2**63, 2**63 + 1, -(2**63) - 1):
+        with pytest.raises(OverflowError, match="Python int too large to convert to SQLite INTEGER"):
+            cursor.execute("INSERT INTO ids VALUES (?)", (value,))
+
+    cursor.execute("INSERT INTO ids VALUES (?)", (2**63 - 1,))
+    cursor.execute("INSERT INTO ids VALUES (?)", (-(2**63),))
+    cursor.execute("SELECT ext, typeof(ext) FROM ids ORDER BY ext")
+    assert cursor.fetchall() == [(-(2**63), "integer"), (2**63 - 1, "integer")]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_decimal_parameter_is_rejected(provider):
+    import decimal
+
+    module = turso if provider == "turso" else sqlite3
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE t (x)")
+    with pytest.raises(module.DatabaseError):
+        cursor.execute("INSERT INTO t VALUES (?)", (decimal.Decimal("12345678901234567.89"),))
+
+    cursor.execute("SELECT count(*) FROM t")
+    assert cursor.fetchone() == (0,)
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_executemany_with_parameters(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()
