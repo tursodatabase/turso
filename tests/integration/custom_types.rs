@@ -140,6 +140,36 @@ mod tests {
         }
     }
 
+    /// A materialized view's hidden key columns must keep numeric's order after
+    /// reopening, so a later 1.500 joins the existing 1.5 key.
+    #[test]
+    fn test_matview_key_keeps_type_order_after_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("matview_type_order_reopen.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_views(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TABLE t(n numeric(10,2)) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1.5), (2)").unwrap();
+            conn.execute("CREATE MATERIALIZED VIEW v AS SELECT DISTINCT n FROM t")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO t VALUES (1.500), (3)").unwrap();
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM v");
+        assert_eq!(rows, vec![(3,)]);
+        let rows: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(rows, vec![("ok".to_string(),)]);
+    }
+
     /// Indexes on custom-type columns must keep their order after reopening:
     /// the stored-value order of a user type, and numeric's own order, both for
     /// column indexes and for expression indexes.

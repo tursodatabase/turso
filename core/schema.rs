@@ -153,6 +153,9 @@ pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 /// Hidden per-view value-multiset table backing MIN/MAX and DISTINCT
 /// aggregates.
 pub const DBSP_MULTISET_TABLE_PREFIX: &str = "__turso_internal_dbsp_multiset_v";
+/// Start of the declared type of a materialized view's hidden key column that
+/// compares in a type's order. The rest is the [TypeOrdering::name].
+pub const HIDDEN_KEY_ORDER_TYPE_PREFIX: &str = "__turso_key_order_";
 /// Hidden z-set integral for an operator output consumed as a join
 /// arrangement.
 pub const DBSP_ARRANGEMENT_TABLE_PREFIX: &str = "__turso_internal_dbsp_arrangement_v";
@@ -5280,7 +5283,16 @@ impl BTreeTable {
     ///   the custom type name (e.g. "doubled" contains "DOUB" which would
     ///   incorrectly map to REAL instead of INTEGER).
     /// - Keys on the column use the order of its type, when it has one.
+    /// - Key columns of a materialized view's hidden table use the type order
+    ///   they declare.
     pub fn resolve_custom_types(&mut self, schema: &Schema) {
+        if self.name.starts_with(DBSP_TABLE_PREFIX)
+            || self.name.starts_with(DBSP_MULTISET_TABLE_PREFIX)
+        {
+            for col in &mut self.columns {
+                col.resolve_hidden_key_order();
+            }
+        }
         if !self.is_strict {
             return;
         }
@@ -7717,6 +7729,22 @@ impl Column {
             self.override_affinity(Affinity::affinity(&resolved.primitive));
             self.type_ordering = resolved.ordering();
         }
+    }
+    /// Give a key column of a materialized view's hidden table the type order
+    /// it declares with [HIDDEN_KEY_ORDER_TYPE_PREFIX]. Like the table's other
+    /// columns, it stores values as they are.
+    fn resolve_hidden_key_order(&mut self) {
+        let Some(order_name) = self.ty_str.strip_prefix(HIDDEN_KEY_ORDER_TYPE_PREFIX) else {
+            return;
+        };
+        self.type_ordering = TypeOrdering::ALL
+            .into_iter()
+            .find(|ordering| ordering.name() == order_name);
+        turso_assert!(
+            self.type_ordering.is_some(),
+            "hidden key column declares an unknown type order"
+        );
+        self.override_affinity(Affinity::Blob);
     }
     /// Set the key order of a derived table's column, which takes it from the
     /// type of the expression the column comes from.
