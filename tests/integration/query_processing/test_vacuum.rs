@@ -1423,6 +1423,36 @@ fn test_vacuum_clears_pending_page_size(tmp_db: TempDatabase) -> anyhow::Result<
     Ok(())
 }
 
+/// In-place VACUUM copies page 1 from its temp database. Like SQLite, the
+/// copy must carry the source's file change counter plus one, not the temp
+/// database's own counter, so the counter never goes back to an older value.
+#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_increments_source_file_change_counter(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let checkpoint_and_read_counter = || -> anyhow::Result<u32> {
+        let rows: Vec<(i64, i64, i64)> = conn.exec_rows("PRAGMA wal_checkpoint(TRUNCATE)");
+        assert_eq!(rows, vec![(0, 0, 0)]);
+        let header = std::fs::read(&tmp_db.path)?;
+        let change_counter = u32::from_be_bytes(header[24..28].try_into().unwrap());
+        let version_valid_for = u32::from_be_bytes(header[92..96].try_into().unwrap());
+        assert_eq!(version_valid_for, change_counter);
+        Ok(change_counter)
+    };
+    // More commits than the temp database makes, so its counter is lower.
+    for i in 0..10 {
+        conn.execute(format!("CREATE TABLE t{i} (a INTEGER)"))?;
+    }
+    let before_vacuum = checkpoint_and_read_counter()?;
+
+    conn.execute("VACUUM")?;
+    let after_vacuum = checkpoint_and_read_counter()?;
+    assert_eq!(after_vacuum, before_vacuum + 1);
+
+    conn.execute("CREATE TABLE u (a INTEGER)")?;
+    assert_eq!(checkpoint_and_read_counter()?, after_vacuum + 1);
+    Ok(())
+}
+
 /// Test VACUUM INTO with edge cases: empty tables with indexes, completely empty database
 #[turso_macros::test(mvcc)]
 fn test_vacuum_into_empty_edge_cases(tmp_db: TempDatabase) -> anyhow::Result<()> {
