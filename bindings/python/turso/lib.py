@@ -199,8 +199,8 @@ class BatchResult:
     query_duration_ms: Optional[float] = None
 
 
-# Accepted values for the `mode` argument of Connection.batch and the
-# BEGIN statement each maps to.
+# Accepted values for the `mode` argument of Connection.batch and for
+# Connection.isolation_level, and the BEGIN statement each maps to.
 _BATCH_MODES = {
     "deferred": "BEGIN DEFERRED",
     "immediate": "BEGIN IMMEDIATE",
@@ -227,6 +227,20 @@ def _batch_begin_sql(mode: Optional[str]) -> Optional[str]:
             f"batch mode must be one of {sorted(_BATCH_MODES)} or None, got {mode!r}"
         )
     return begin_sql
+
+
+def _check_isolation_level(level: Optional[str]) -> Optional[str]:
+    """Return `level` in the uppercase form sqlite3 stores, or raise as sqlite3 does
+    for a value that is not a transaction mode."""
+    if level is None:
+        return None
+    if not isinstance(level, str):
+        raise TypeError("isolation_level must be str or None")
+    if level != "" and level.lower() not in _BATCH_MODES:
+        raise ValueError(
+            "isolation_level string must be '', 'DEFERRED', 'IMMEDIATE', 'EXCLUSIVE', or 'CONCURRENT'"
+        )
+    return level.upper()
 
 
 def _normalize_batch_statements(
@@ -388,7 +402,7 @@ class Connection:
         #   We'll use BEGIN DEFERRED after commit/rollback.
         # - "LEGACY": implicit transactions on DML when isolation_level is not None.
         self._autocommit_mode: object | bool = "LEGACY"
-        self.isolation_level: Optional[str] = isolation_level
+        self._isolation_level: Optional[str] = _check_isolation_level(isolation_level)
         self.row_factory: Callable[[Cursor, Row], object] | type[Row] | None = None
         self.text_factory: Any = str
         self.extra_io = extra_io
@@ -474,6 +488,17 @@ class Connection:
         except Exception as exc:  # noqa: BLE001
             raise _map_turso_exception(exc)
 
+    @property
+    def isolation_level(self) -> Optional[str]:
+        return self._isolation_level
+
+    @isolation_level.setter
+    def isolation_level(self, val: Optional[str]) -> None:
+        self._isolation_level = _check_isolation_level(val)
+        # As in sqlite3, switching to autocommit commits any pending transaction
+        if val is None:
+            self.commit()
+
     # Provide autocommit property for sqlite3-like API (optional)
     @property
     def autocommit(self) -> object | bool:
@@ -485,10 +510,11 @@ class Connection:
         if val not in (True, False, "LEGACY"):
             raise ProgrammingError("autocommit must be True, False, or 'LEGACY'")
         self._autocommit_mode = val
-        # If switching to False, ensure a transaction is open
-        if val is False:
+        if val is True:
+            if self.in_transaction:
+                self._exec_ddl_only("COMMIT")
+        elif val is False:
             self._ensure_transaction_open()
-        # If switching to True or LEGACY, nothing else to do immediately.
 
     def close(self) -> None:
         # In sqlite3: If autocommit is False, pending transaction is implicitly rolled back.
