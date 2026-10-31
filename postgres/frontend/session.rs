@@ -567,11 +567,9 @@ const PG_STMT_SAVEPOINT: &str = "__turso_pg_stmt";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeferredPhase {
     Start,
-    CheckTarget,
-    CopyColumns,
+    Inspect,
     Savepoint,
-    Statement(usize),
-    CopyRow(usize),
+    Execute,
     Release,
     Rollback,
     RollbackRelease,
@@ -605,26 +603,41 @@ enum CommandContext {
     DropSchema,
 }
 
+enum DeferredWork {
+    Prerequisites(PrerequisiteState),
+    Commands(CommandSequence),
+    Copy(CopyState),
+}
+
+struct PrerequisiteState {
+    commands: CommandSequence,
+    target_exists: bool,
+}
+
+struct CommandSequence {
+    statements: Vec<DeferredStatement>,
+    index: usize,
+}
+
+struct CopyState {
+    stmt: PgCopyFromStmt,
+    columns: usize,
+    rows: Vec<Vec<Option<String>>>,
+    sql: String,
+    index: usize,
+}
+
 pub(crate) struct DeferredExecution {
     pg_conn: Arc<PgConnectionInner>,
     operation: DeferredOperation,
-    statements: Vec<DeferredStatement>,
+    work: Option<DeferredWork>,
     phase: DeferredPhase,
     active: Option<crate::Statement>,
     pub(crate) io_completions: Option<turso_core::types::IOCompletions>,
     pub(crate) was_in_tx: Option<bool>,
     savepoint_open: bool,
-    target_exists: bool,
-    copy: CopyState,
     error: Option<LimboError>,
     pub(crate) interrupted: bool,
-}
-
-#[derive(Default)]
-struct CopyState {
-    columns: usize,
-    rows: Vec<Vec<Option<String>>>,
-    sql: String,
 }
 
 impl DeferredExecution {
@@ -632,14 +645,12 @@ impl DeferredExecution {
         Self {
             pg_conn: Arc::clone(pg_conn),
             operation,
-            statements: Vec::new(),
+            work: None,
             phase: DeferredPhase::Start,
             active: None,
             io_completions: None,
             was_in_tx: None,
             savepoint_open: false,
-            target_exists: false,
-            copy: CopyState::default(),
             error: None,
             interrupted: false,
         }
@@ -680,9 +691,8 @@ impl DeferredExecution {
                 self.start()?;
                 return Ok(IOResult::Done(()));
             }
-            Statement(index) => &self.statements[index].context,
-            CheckTarget | CopyColumns | Savepoint | CopyRow(_) | Release | Rollback
-            | RollbackRelease => &CommandContext::Default,
+            Execute => self.work.as_ref().unwrap().context(),
+            Inspect | Savepoint | Release | Rollback | RollbackRelease => &CommandContext::Default,
             Done => unreachable!(),
         };
         let conn = Arc::clone(&self.pg_conn.conn);
@@ -718,8 +728,8 @@ impl DeferredExecution {
         use DeferredPhase::*;
 
         match self.phase {
-            CheckTarget | CopyColumns => {}
-            Savepoint | Statement(_) | CopyRow(_) | Release | Rollback | RollbackRelease => {
+            Inspect => {}
+            Savepoint | Execute | Release | Rollback | RollbackRelease => {
                 if self.active.is_none() {
                     self.prepare_active()?;
                 }
@@ -735,15 +745,8 @@ impl DeferredExecution {
             _ => {}
         }
         let result = match self.phase {
-            CheckTarget => active.run_with_row_callback_nonblock(|row| {
-                self.target_exists = row.get_value(0) == &Value::from_i64(1);
-                Ok(())
-            }),
-            CopyColumns => active.run_with_row_callback_nonblock(|_| {
-                self.copy.columns += 1;
-                Ok(())
-            }),
-            Savepoint | Statement(_) | CopyRow(_) | Release | Rollback | RollbackRelease => {
+            Inspect => self.work.as_mut().unwrap().inspect_nonblock(active),
+            Savepoint | Execute | Release | Rollback | RollbackRelease => {
                 active.run_ignore_rows_nonblock()
             }
             Start | Done => unreachable!(),
@@ -758,7 +761,7 @@ impl DeferredExecution {
                 self.savepoint_open = true;
                 return Err(LimboError::Interrupt);
             }
-            CheckTarget | CopyColumns | Statement(_) | CopyRow(_) if self.interrupted => {
+            Inspect | Execute if self.interrupted => {
                 return Err(LimboError::Interrupt);
             }
             _ => {}
@@ -772,34 +775,23 @@ impl DeferredExecution {
 
         let conn = &self.pg_conn.conn;
         let sql = self.phase_sql();
-        self.active = Some(match self.phase {
-            Statement(index) => match &self.statements[index].command {
-                DeferredCommand::Translated(cmd, _) => crate::Statement::new(
-                    conn.prepare_translated_cmd(cmd.clone(), &sql)
-                        .map_err(schema_error)?,
-                ),
-                DeferredCommand::Namespace(stmt) => {
-                    crate::Statement::new(conn.prepare_namespace_stmt(stmt.clone())?)
-                }
-                DeferredCommand::Postgres(_) => {
-                    prepare_statement_inner(&self.pg_conn, &sql)?.without_tx_tracking()
-                }
-                DeferredCommand::Sqlite(_) => crate::Statement::new(conn.prepare_sqlite(&sql)?),
-            },
-            CopyRow(index) => {
-                let mut stmt = crate::Statement::new(conn.prepare_sqlite(&sql)?);
-                if self.copy.rows.is_empty() {
+        self.active = match self.phase {
+            Execute => {
+                let active = self
+                    .work
+                    .as_ref()
+                    .unwrap()
+                    .prepare_active(&self.pg_conn, &sql)?;
+                if active.is_none() {
                     self.phase = Release;
-                    return Ok(());
                 }
-                bind_copy_row(&mut stmt, &self.copy.rows[index])?;
-                stmt
+                active
             }
             Savepoint | Release | Rollback | RollbackRelease => {
-                crate::Statement::new(conn.prepare_sqlite(&sql)?)
+                Some(crate::Statement::new(conn.prepare_sqlite(&sql)?))
             }
-            Start | CheckTarget | CopyColumns | Done => unreachable!(),
-        });
+            Start | Inspect | Done => unreachable!(),
+        };
         Ok(())
     }
 
@@ -807,65 +799,38 @@ impl DeferredExecution {
         use DeferredPhase::*;
 
         self.phase = match self.phase {
-            CheckTarget => {
+            Inspect => {
                 self.active = None;
-                if self.target_exists {
-                    Statement(self.statements.len() - 1)
-                } else {
+                let needs_savepoint = self
+                    .work
+                    .as_mut()
+                    .unwrap()
+                    .finish_inspection(self.was_in_tx.unwrap())?;
+                if needs_savepoint {
                     Savepoint
+                } else {
+                    Execute
                 }
-            }
-            CopyColumns => {
-                self.active = None;
-                let DeferredOperation::Session(SessionStmt::CopyFrom(stmt)) = &self.operation
-                else {
-                    unreachable!()
-                };
-                let (sql, rows) = prepare_copy_rows(stmt, self.copy.columns)?;
-                self.copy.sql = sql;
-                self.copy.rows = rows;
-                if self.was_in_tx == Some(true) {
-                    return Err(LimboError::TransactionAlreadyActive);
-                }
-                Savepoint
             }
             Savepoint => {
                 self.active = None;
                 self.savepoint_open = true;
-                if matches!(
-                    self.operation,
-                    DeferredOperation::Session(SessionStmt::CopyFrom(_))
-                ) {
-                    CopyRow(0)
-                } else {
-                    Statement(0)
-                }
+                Execute
             }
-            Statement(index) if index + 1 < self.statements.len() => {
-                self.active = None;
-                Statement(index + 1)
-            }
-            Statement(_) => {
-                let active = self.active.take().unwrap();
-                if matches!(self.operation, DeferredOperation::Translated { .. }) {
-                    *inner = active.inner;
+            Execute => {
+                let done = self
+                    .work
+                    .as_mut()
+                    .unwrap()
+                    .finish_statement(&mut self.active, inner)?;
+                if !done {
+                    return Ok(());
                 }
                 if self.savepoint_open {
                     Release
                 } else {
                     Done
                 }
-            }
-            CopyRow(index) if index + 1 < self.copy.rows.len() => {
-                let active = self.active.as_mut().unwrap();
-                active.reset().map_err(crate::Error::into_core_error)?;
-                active.clear_bindings();
-                bind_copy_row(active, &self.copy.rows[index + 1])?;
-                CopyRow(index + 1)
-            }
-            CopyRow(_) => {
-                self.active = None;
-                Release
             }
             Rollback if self.was_in_tx == Some(true) => {
                 self.active = None;
@@ -874,13 +839,8 @@ impl DeferredExecution {
             Release | Rollback | RollbackRelease => {
                 self.active = None;
                 self.savepoint_open = false;
-                if self.phase == Release
-                    && matches!(
-                        self.operation,
-                        DeferredOperation::Session(SessionStmt::CopyFrom(_))
-                    )
-                {
-                    inner.set_n_change(self.copy.rows.len() as i64);
+                if self.phase == Release {
+                    self.work.as_ref().unwrap().complete(inner);
                 }
                 Done
             }
@@ -895,75 +855,12 @@ impl DeferredExecution {
         if self.interrupted {
             return Err(LimboError::Interrupt);
         }
-        self.phase = DeferredPhase::Savepoint;
-        match &self.operation {
-            DeferredOperation::Translated { prereqs, cmd, sql } => {
-                self.statements = prereqs
-                    .iter()
-                    .map(|stmt| DeferredStatement {
-                        command: DeferredCommand::Translated(
-                            ast::Cmd::Stmt(stmt.clone()),
-                            stmt.to_string(),
-                        ),
-                        context: CommandContext::Default,
-                    })
-                    .collect();
-                self.statements.push(DeferredStatement {
-                    command: DeferredCommand::Translated((**cmd).clone(), sql.clone()),
-                    context: CommandContext::Default,
-                });
-                self.active =
-                    prepare_create_table_target_check(conn, cmd)?.map(crate::Statement::new);
-                if self.active.is_some() {
-                    self.phase = DeferredPhase::CheckTarget;
-                }
-            }
-            DeferredOperation::Session(stmt) => match stmt {
-                SessionStmt::ResetAll | SessionStmt::DiscardAll => {
-                    if matches!(stmt, SessionStmt::DiscardAll) {
-                        discard_all(conn)?;
-                    } else {
-                        reset_all_settings(conn)?;
-                    }
-                    self.phase = DeferredPhase::Done;
-                }
-                SessionStmt::CreateSchema(stmt) => {
-                    if conn.is_tx_read_only() {
-                        return Err(LimboError::ReadOnly);
-                    }
-                    self.statements = create_schema_commands(conn, stmt)?;
-                    if self.statements.is_empty() {
-                        self.phase = DeferredPhase::Done;
-                    }
-                }
-                SessionStmt::DropSchema(stmt) => {
-                    if conn.is_tx_read_only() {
-                        return Err(LimboError::ReadOnly);
-                    }
-                    self.statements = drop_schema_commands(conn, stmt)?;
-                    if self.statements.is_empty() {
-                        self.phase = DeferredPhase::Done;
-                    }
-                }
-                SessionStmt::CopyFrom(stmt) => {
-                    self.active = Some(crate::Statement::new(prepare_copy_columns(
-                        conn,
-                        &stmt.table_name,
-                        stmt.schema_name.as_deref(),
-                    )?));
-                    self.phase = DeferredPhase::CopyColumns;
-                }
-                SessionStmt::RefreshMatview | SessionStmt::CommentOn => {
-                    if conn.is_tx_read_only() {
-                        return Err(LimboError::ReadOnly);
-                    }
-                    self.phase = DeferredPhase::Done;
-                }
-                SessionStmt::Set(_) | SessionStmt::SetTransaction | SessionStmt::Show(_) => {
-                    unreachable!()
-                }
-            },
-        }
+        self.work = self.operation.start(conn, &mut self.active)?;
+        self.phase = match &self.work {
+            None => DeferredPhase::Done,
+            Some(_) if self.active.is_some() => DeferredPhase::Inspect,
+            Some(_) => DeferredPhase::Savepoint,
+        };
         Ok(())
     }
 
@@ -972,13 +869,7 @@ impl DeferredExecution {
 
         match self.phase {
             Savepoint => format!("SAVEPOINT \"{PG_STMT_SAVEPOINT}\"").into(),
-            Statement(index) => match &self.statements[index].command {
-                DeferredCommand::Translated(_, sql)
-                | DeferredCommand::Sqlite(sql)
-                | DeferredCommand::Postgres(sql) => Cow::Borrowed(sql),
-                DeferredCommand::Namespace(stmt) => stmt.to_string().into(),
-            },
-            CopyRow(_) => Cow::Borrowed(&self.copy.sql),
+            Execute => self.work.as_ref().unwrap().sql(),
             Release | RollbackRelease => {
                 format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\"").into()
             }
@@ -986,7 +877,7 @@ impl DeferredExecution {
                 format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\"").into()
             }
             Rollback => Cow::Borrowed("ROLLBACK"),
-            Start | CheckTarget | CopyColumns | Done => unreachable!(),
+            Start | Inspect | Done => unreachable!(),
         }
     }
 
@@ -1040,13 +931,9 @@ impl DeferredExecution {
             result?;
         }
         self.phase = DeferredPhase::Start;
-        self.statements.clear();
-        self.copy.columns = 0;
-        self.copy.rows.clear();
-        self.copy.sql.clear();
+        self.work = None;
         self.was_in_tx = None;
         self.savepoint_open = false;
-        self.target_exists = false;
         self.error = None;
         self.interrupted = false;
         io_result.and(active_result)
@@ -1059,6 +946,268 @@ impl Drop for DeferredExecution {
             self.pg_conn.tx.abort();
             tracing::error!("Failed to clean up PostgreSQL deferred statement: {error}");
         }
+    }
+}
+
+impl DeferredOperation {
+    fn start(
+        &self,
+        conn: &Arc<Connection>,
+        active: &mut Option<crate::Statement>,
+    ) -> Result<Option<DeferredWork>> {
+        match self {
+            Self::Translated { prereqs, cmd, sql } => {
+                let mut statements: Vec<_> = prereqs
+                    .iter()
+                    .map(|stmt| DeferredStatement {
+                        command: DeferredCommand::Translated(
+                            ast::Cmd::Stmt(stmt.clone()),
+                            stmt.to_string(),
+                        ),
+                        context: CommandContext::Default,
+                    })
+                    .collect();
+                statements.push(DeferredStatement {
+                    command: DeferredCommand::Translated((**cmd).clone(), sql.clone()),
+                    context: CommandContext::Default,
+                });
+                *active = prepare_create_table_target_check(conn, cmd)?.map(crate::Statement::new);
+                Ok(Some(DeferredWork::Prerequisites(PrerequisiteState {
+                    commands: CommandSequence {
+                        statements,
+                        index: 0,
+                    },
+                    target_exists: false,
+                })))
+            }
+            Self::Session(stmt) => {
+                let statements = match stmt {
+                    SessionStmt::ResetAll => {
+                        reset_all_settings(conn)?;
+                        return Ok(None);
+                    }
+                    SessionStmt::DiscardAll => {
+                        discard_all(conn)?;
+                        return Ok(None);
+                    }
+                    SessionStmt::CreateSchema(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        create_schema_commands(conn, stmt)?
+                    }
+                    SessionStmt::DropSchema(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        drop_schema_commands(conn, stmt)?
+                    }
+                    SessionStmt::CopyFrom(stmt) => {
+                        *active = Some(crate::Statement::new(prepare_copy_columns(
+                            conn,
+                            &stmt.table_name,
+                            stmt.schema_name.as_deref(),
+                        )?));
+                        return Ok(Some(DeferredWork::Copy(CopyState {
+                            stmt: stmt.clone(),
+                            columns: 0,
+                            rows: Vec::new(),
+                            sql: String::new(),
+                            index: 0,
+                        })));
+                    }
+                    SessionStmt::RefreshMatview | SessionStmt::CommentOn => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        return Ok(None);
+                    }
+                    SessionStmt::Set(_) | SessionStmt::SetTransaction | SessionStmt::Show(_) => {
+                        unreachable!()
+                    }
+                };
+                if statements.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(DeferredWork::Commands(CommandSequence {
+                    statements,
+                    index: 0,
+                })))
+            }
+        }
+    }
+}
+
+impl DeferredWork {
+    fn context(&self) -> &CommandContext {
+        match self {
+            Self::Prerequisites(state) => &state.commands.current().context,
+            Self::Commands(commands) => &commands.current().context,
+            Self::Copy(_) => &CommandContext::Default,
+        }
+    }
+
+    fn inspect_nonblock(&mut self, active: &mut crate::Statement) -> crate::Result<IOResult<()>> {
+        match self {
+            Self::Prerequisites(state) => active.run_with_row_callback_nonblock(|row| {
+                state.target_exists = row.get_value(0) == &Value::from_i64(1);
+                Ok(())
+            }),
+            Self::Copy(state) => active.run_with_row_callback_nonblock(|_| {
+                state.columns += 1;
+                Ok(())
+            }),
+            Self::Commands(_) => unreachable!(),
+        }
+    }
+
+    fn prepare_active(
+        &self,
+        pg_conn: &Arc<PgConnectionInner>,
+        sql: &str,
+    ) -> Result<Option<crate::Statement>> {
+        match self {
+            Self::Prerequisites(state) => state.commands.prepare_active(pg_conn, sql).map(Some),
+            Self::Commands(commands) => commands.prepare_active(pg_conn, sql).map(Some),
+            Self::Copy(state) => state.prepare_active(&pg_conn.conn, sql),
+        }
+    }
+
+    fn finish_inspection(&mut self, was_in_tx: bool) -> Result<bool> {
+        match self {
+            Self::Prerequisites(state) => Ok(state.finish_inspection()),
+            Self::Copy(state) => {
+                state.finish_inspection(was_in_tx)?;
+                Ok(true)
+            }
+            Self::Commands(_) => unreachable!(),
+        }
+    }
+
+    fn finish_statement(
+        &mut self,
+        active: &mut Option<crate::Statement>,
+        inner: &mut Statement,
+    ) -> Result<bool> {
+        match self {
+            Self::Prerequisites(state) => {
+                let done = state.commands.advance();
+                let finished = active.take().unwrap();
+                if done {
+                    *inner = finished.inner;
+                }
+                Ok(done)
+            }
+            Self::Commands(commands) => {
+                *active = None;
+                Ok(commands.advance())
+            }
+            Self::Copy(state) => state.finish_statement(active),
+        }
+    }
+
+    fn complete(&self, inner: &mut Statement) {
+        match self {
+            Self::Copy(state) => inner.set_n_change(state.rows.len() as i64),
+            Self::Prerequisites(_) | Self::Commands(_) => {}
+        }
+    }
+
+    fn sql(&self) -> Cow<'_, str> {
+        match self {
+            Self::Prerequisites(state) => state.commands.sql(),
+            Self::Commands(commands) => commands.sql(),
+            Self::Copy(state) => Cow::Borrowed(&state.sql),
+        }
+    }
+}
+
+impl PrerequisiteState {
+    fn finish_inspection(&mut self) -> bool {
+        if self.target_exists {
+            self.commands.index = self.commands.statements.len() - 1;
+        }
+        !self.target_exists
+    }
+}
+
+impl CommandSequence {
+    fn prepare_active(
+        &self,
+        pg_conn: &Arc<PgConnectionInner>,
+        sql: &str,
+    ) -> Result<crate::Statement> {
+        let conn = &pg_conn.conn;
+        Ok(match &self.current().command {
+            DeferredCommand::Translated(cmd, _) => crate::Statement::new(
+                conn.prepare_translated_cmd(cmd.clone(), sql)
+                    .map_err(schema_error)?,
+            ),
+            DeferredCommand::Namespace(stmt) => {
+                crate::Statement::new(conn.prepare_namespace_stmt(stmt.clone())?)
+            }
+            DeferredCommand::Postgres(_) => {
+                prepare_statement_inner(pg_conn, sql)?.without_tx_tracking()
+            }
+            DeferredCommand::Sqlite(_) => crate::Statement::new(conn.prepare_sqlite(sql)?),
+        })
+    }
+
+    fn advance(&mut self) -> bool {
+        self.index += 1;
+        self.index == self.statements.len()
+    }
+
+    fn sql(&self) -> Cow<'_, str> {
+        match &self.current().command {
+            DeferredCommand::Translated(_, sql)
+            | DeferredCommand::Sqlite(sql)
+            | DeferredCommand::Postgres(sql) => Cow::Borrowed(sql),
+            DeferredCommand::Namespace(stmt) => stmt.to_string().into(),
+        }
+    }
+
+    fn current(&self) -> &DeferredStatement {
+        &self.statements[self.index]
+    }
+}
+
+impl CopyState {
+    fn prepare_active(
+        &self,
+        conn: &Arc<Connection>,
+        sql: &str,
+    ) -> Result<Option<crate::Statement>> {
+        let mut stmt = crate::Statement::new(conn.prepare_sqlite(sql)?);
+        if self.rows.is_empty() {
+            return Ok(None);
+        }
+        bind_copy_row(&mut stmt, &self.rows[self.index])?;
+        Ok(Some(stmt))
+    }
+
+    fn finish_inspection(&mut self, was_in_tx: bool) -> Result<()> {
+        let (sql, rows) = prepare_copy_rows(&self.stmt, self.columns)?;
+        self.sql = sql;
+        self.rows = rows;
+        if was_in_tx {
+            return Err(LimboError::TransactionAlreadyActive);
+        }
+        Ok(())
+    }
+
+    fn finish_statement(&mut self, active: &mut Option<crate::Statement>) -> Result<bool> {
+        let next = self.index + 1;
+        if next == self.rows.len() {
+            *active = None;
+            return Ok(true);
+        }
+        let active = active.as_mut().unwrap();
+        active.reset().map_err(crate::Error::into_core_error)?;
+        active.clear_bindings();
+        bind_copy_row(active, &self.rows[next])?;
+        self.index = next;
+        Ok(false)
     }
 }
 
