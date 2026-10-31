@@ -424,8 +424,10 @@ pub fn validate_precision_scale(
         return Ok(BigDecimal::new(BigInt::from(0), scale));
     }
 
-    // Round to the requested scale
-    let rounded = val.with_scale(scale);
+    // Round to the requested scale, half away from zero like PostgreSQL
+    // (0.015 -> 0.02, -0.015 -> -0.02). Rounding up can add a digit
+    // (9.999 -> 10.00), so check the precision afterwards.
+    let rounded = val.with_scale_round(scale, bigdecimal::RoundingMode::HalfUp);
 
     // Count total significant digits (excluding leading zeros)
     let (bigint, _) = rounded.as_bigint_and_exponent();

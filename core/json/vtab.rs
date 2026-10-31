@@ -408,8 +408,7 @@ impl JsonEachCursor {
                     traversal_state.parent_id,
                     self.path_to_current_value.cursor(),
                 );
-                self.path_to_current_value
-                    .push_object_key(&key.to_string()?)?;
+                self.path_to_current_value.push_object_key(&key)?;
                 let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
                     && self
                         .json
@@ -531,7 +530,7 @@ mod columns {
         fn key_representation(&self) -> Value {
             match self {
                 Key::Integer(ref i) => Value::from_i64(*i),
-                Key::String(ref s) => Value::Text(Text::new(s.to_owned().replace("\\\"", "\""))),
+                Key::String(ref s) => Value::Text(Text::new(s.to_owned())),
                 Key::None => Value::Null,
             }
         }
@@ -698,11 +697,12 @@ impl InPlaceJsonPath {
         self.push(format!("[{idx}]"));
     }
 
-    fn push_object_key(&mut self, key: &str) -> crate::Result<()> {
+    fn push_object_key(&mut self, key: &Jsonb) -> crate::Result<()> {
+        let key_text = key.to_string()?;
         // This follows SQLite's current quoting scheme, but it is not part of the stable API.
         // See https://sqlite.org/forum/forumpost?udc=1&name=be212a295ed8df4c
         // Keys must be properly quoted strings
-        let inner = key
+        let inner = key_text
             .strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
             .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
@@ -714,8 +714,18 @@ impl InPlaceJsonPath {
                 !first.is_ascii_alphabetic() || chars.any(|c| !c.is_ascii_alphanumeric())
             }
         };
-        let unquoted_if_necessary = if needs_quotes { key } else { inner };
-        self.last_element = Key::String(inner.to_owned());
+        let unquoted_if_necessary = if needs_quotes {
+            key_text.as_str()
+        } else {
+            inner
+        };
+        // Like the value column, decode a key with JSON5 escapes from its stored bytes:
+        // the JSON text rendering writes the JSON5 \v escape as \u0009.
+        self.last_element = Key::String(if key.element_type()? == jsonb::ElementType::TEXT5 {
+            key.scalar_string_value()?
+        } else {
+            jsonb::unescape_string(inner)
+        });
         self.push(format!(".{unquoted_if_necessary}"));
         Ok(())
     }
