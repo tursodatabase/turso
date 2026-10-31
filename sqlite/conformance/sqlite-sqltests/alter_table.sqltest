@@ -3612,3 +3612,31 @@ expect {
     1
     1
 }
+
+# The missing-table check on triggers follows SQLite's name resolution order:
+# a query level's FROM clause resolves before its SELECT list, so the FROM
+# table is the one the error names. SQLite qualifies the name (main.x) and
+# turso does not, so the expectation is the table name alone. A subquery
+# inside a named WINDOW frame bound is not checked, which is what SQLite does
+# too.
+
+test alter-table-reports-the-from-table-before-a-result-column-subquery {
+    CREATE TABLE t(a,b);
+    CREATE TABLE u(x);
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN SELECT (SELECT 1 FROM missing_in_subquery) FROM missing_in_from; END;
+    ALTER TABLE t DROP COLUMN b;
+}
+expect error {
+    missing_in_from
+}
+
+test alter-table-ignores-a-subquery-in-a-named-window-frame-bound {
+    CREATE TABLE t(a,b);
+    CREATE TABLE u(x);
+    CREATE TRIGGER tr AFTER INSERT ON u BEGIN SELECT sum(x) OVER w FROM u WINDOW w AS (ROWS BETWEEN 1 PRECEDING AND (SELECT 1 FROM missing_in_frame) FOLLOWING); END;
+    ALTER TABLE t RENAME TO t2;
+    SELECT 'ok';
+}
+expect {
+    ok
+}

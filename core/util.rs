@@ -1684,6 +1684,25 @@ pub trait AstVisitor {
     fn table_function(&mut self, _name: &ast::QualifiedName) -> Result<()> {
         Ok(())
     }
+
+    /// Visit in SQLite's name resolution order: each query level's FROM
+    /// clause before its SELECT list, and the left operand of `IN (SELECT ...)`
+    /// before the subquery. Off by default: the walk visits in source order so
+    /// that it also drives `?` / `:name` parameter numbering.
+    fn resolve_from_before_columns(&self) -> bool {
+        false
+    }
+
+    /// Descend into a named WINDOW clause's frame bounds. On by default.
+    fn enter_window_frame_bounds(&self) -> bool {
+        true
+    }
+
+    /// Report a trigger's own table and the target table of each of its
+    /// INSERT, UPDATE and DELETE commands through `table()`. Off by default.
+    fn report_target_tables(&self) -> bool {
+        false
+    }
 }
 
 impl<F> AstVisitor for F
@@ -1908,8 +1927,14 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
     Ok(())
 }
 
-/// Walk a trigger: its WHEN clause and its commands.
+/// Walk a trigger: its WHEN clause and its commands, and its own table first
+/// when the visitor asks for target tables.
 pub fn visit_trigger<V: AstVisitor>(trigger: &Trigger, visitor: &mut V) -> Result<()> {
+    if visitor.report_target_tables() {
+        visitor.table(&ast::QualifiedName::single(ast::Name::exact(
+            trigger.table_name.clone(),
+        )))?;
+    }
     if let Some(when_clause) = &trigger.when_clause {
         visit_expr_with_subqueries(when_clause, visitor)?;
     }
@@ -1922,35 +1947,54 @@ pub fn visit_trigger<V: AstVisitor>(trigger: &Trigger, visitor: &mut V) -> Resul
 fn visit_trigger_cmd<V: AstVisitor>(cmd: &ast::TriggerCmd, visitor: &mut V) -> Result<()> {
     match cmd {
         ast::TriggerCmd::Update {
+            tbl_name,
             sets,
             from,
             where_clause,
             ..
         } => {
+            if visitor.report_target_tables() {
+                visitor.table(&ast::QualifiedName::single(tbl_name.clone()))?;
+            }
+            // Name resolution sees the FROM clause before the SET expressions.
+            if visitor.resolve_from_before_columns() {
+                if let Some(from_clause) = from {
+                    visit_from_clause(from_clause, visitor)?;
+                }
+            }
             for set in sets {
                 visit_expr_with_subqueries(&set.expr, visitor)?;
             }
-            if let Some(from_clause) = from {
-                visit_from_clause(from_clause, visitor)?;
+            if !visitor.resolve_from_before_columns() {
+                if let Some(from_clause) = from {
+                    visit_from_clause(from_clause, visitor)?;
+                }
             }
             if let Some(where_clause) = where_clause {
                 visit_expr_with_subqueries(where_clause, visitor)?;
             }
         }
         ast::TriggerCmd::Insert {
+            tbl_name,
             select,
             upsert,
             returning,
             ..
         } => {
+            if visitor.report_target_tables() {
+                visitor.table(&ast::QualifiedName::single(tbl_name.clone()))?;
+            }
             visit_select(select, visitor)?;
             visit_upsert(upsert.as_deref(), visitor)?;
             visit_result_columns(returning, visitor)?;
         }
         ast::TriggerCmd::Delete {
-            tbl_name: _,
+            tbl_name,
             where_clause,
         } => {
+            if visitor.report_target_tables() {
+                visitor.table(&ast::QualifiedName::single(tbl_name.clone()))?;
+            }
             if let Some(where_clause) = where_clause {
                 visit_expr_with_subqueries(where_clause, visitor)?;
             }
@@ -2044,10 +2088,18 @@ fn visit_one_select<V: AstVisitor>(one_select: &ast::OneSelect, visitor: &mut V)
             window_clause,
             ..
         } => {
-            visit_result_columns(columns, visitor)?;
-
-            if let Some(from_clause) = from {
-                visit_from_clause(from_clause, visitor)?;
+            // Source order is SELECT list then FROM; name resolution is the
+            // reverse, which a visitor can ask for.
+            if visitor.resolve_from_before_columns() {
+                if let Some(from_clause) = from {
+                    visit_from_clause(from_clause, visitor)?;
+                }
+                visit_result_columns(columns, visitor)?;
+            } else {
+                visit_result_columns(columns, visitor)?;
+                if let Some(from_clause) = from {
+                    visit_from_clause(from_clause, visitor)?;
+                }
             }
 
             if let Some(where_expr) = where_clause {
@@ -2120,10 +2172,12 @@ fn visit_window<V: AstVisitor>(window: &ast::Window, visitor: &mut V) -> Result<
         visit_expr_with_subqueries(&sorted_col.expr, visitor)?;
     }
 
-    if let Some(frame_clause) = &window.frame_clause {
-        visit_frame_bound(&frame_clause.start, visitor)?;
-        if let Some(end_bound) = &frame_clause.end {
-            visit_frame_bound(end_bound, visitor)?;
+    if visitor.enter_window_frame_bounds() {
+        if let Some(frame_clause) = &window.frame_clause {
+            visit_frame_bound(&frame_clause.start, visitor)?;
+            if let Some(end_bound) = &frame_clause.end {
+                visit_frame_bound(end_bound, visitor)?;
+            }
         }
     }
 
@@ -2157,7 +2211,14 @@ pub fn visit_expr_with_subqueries<V: AstVisitor>(expr: &ast::Expr, visitor: &mut
                 ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
                     visit_select(select, visitor)?;
                 }
-                ast::Expr::InSelect { rhs, .. } => {
+                ast::Expr::InSelect { lhs, rhs, .. } => {
+                    if visitor.resolve_from_before_columns() {
+                        // Name resolution reaches the left operand before the
+                        // IN subquery; walk_expr would visit it after.
+                        visit_expr_with_subqueries(lhs, visitor)?;
+                        visit_select(rhs, visitor)?;
+                        return Ok(WalkControl::SkipChildren);
+                    }
                     visit_select(rhs, visitor)?;
                 }
                 _ => {}
