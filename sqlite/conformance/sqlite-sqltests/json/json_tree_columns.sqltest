@@ -381,3 +381,10 @@ test json-extract-with-fullkey-of-json5-name-with-raw-quote {
 expect {
     2
 }
+
+test json-each-fullkey-keeps-a-backslash-before-a-crlf-line-break-in-the-name {
+    SELECT hex(fullkey) FROM json_each('{"a\\' || char(13) || char(10) || 'b\\v":1}');
+}
+expect {
+    242E22615C0D0A625C7622
+}
