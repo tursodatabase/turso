@@ -336,7 +336,32 @@ impl<'a> CatalogContext<'a> {
                 )));
             }
         }
-        self.resolve_existing_table(qualified_name)
+        let namespace = self.resolve_existing_table(qualified_name)?;
+        self.reject_query_of_other_relation_kind(namespace, qualified_name.name.as_str())?;
+        Ok(namespace)
+    }
+
+    /// Fails when a namespace has an index or a sequence of the name where a
+    /// statement reads or writes a table.
+    fn reject_query_of_other_relation_kind(
+        &self,
+        namespace: NamespaceRef,
+        name: &str,
+    ) -> Result<()> {
+        if !self.dialect.supports_namespaces() {
+            return Ok(());
+        }
+        let name = normalize_ident(name);
+        let is_other_relation = self.with_schema(namespace.database_id, |schema| {
+            !Self::namespace_has_table_like_object(schema, namespace.id, &name)
+                && Self::namespace_has_relation(schema, namespace.id, &name)
+        });
+        if is_other_relation {
+            return Err(LimboError::ParseError(format!(
+                "cannot open relation \"{name}\""
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn resolve_existing_table_named(&self, table_name: &str) -> Result<NamespaceRef> {
@@ -384,7 +409,7 @@ impl<'a> CatalogContext<'a> {
         }
 
         let found =
-            self.find_unqualified_existing(table_name, Self::namespace_has_table_like_object);
+            self.find_unqualified_relation(table_name, Self::namespace_has_table_like_object);
         match found {
             Some(namespace)
                 if self.with_schema(namespace.database_id, |schema| {
@@ -428,7 +453,32 @@ impl<'a> CatalogContext<'a> {
         None
     }
 
-    fn namespace_has_table_like_object(
+    /// Like `find_unqualified_existing` for a relation. A search through
+    /// namespaces stops at the first one that has a relation of the name,
+    /// whatever its kind. A database has no namespaces in SQLite, where the
+    /// search goes through attached databases and looks for one kind.
+    fn find_unqualified_relation<F>(
+        &self,
+        object_name: &str,
+        namespace_has_object: F,
+    ) -> Option<NamespaceRef>
+    where
+        F: Fn(&Schema, NamespaceId, &str) -> bool,
+    {
+        if self.dialect.supports_namespaces() {
+            self.find_unqualified_existing(object_name, Self::namespace_has_relation)
+        } else {
+            self.find_unqualified_existing(object_name, namespace_has_object)
+        }
+    }
+
+    fn namespace_has_relation(schema: &Schema, namespace: NamespaceId, name: &str) -> bool {
+        Self::namespace_has_table_like_object(schema, namespace, name)
+            || Self::namespace_has_index(schema, namespace, name)
+            || schema.has_sequence(namespace, name)
+    }
+
+    pub(crate) fn namespace_has_table_like_object(
         schema: &Schema,
         namespace: NamespaceId,
         table_name: &str,
@@ -490,12 +540,24 @@ impl<'a> CatalogContext<'a> {
     /// namespace of the search order that has it, or the first namespace of
     /// the search order when none has it.
     pub(crate) fn resolve_existing_sequence(&self, seq_name: &str) -> Result<NamespaceRef> {
-        self.find_existing_sequence(seq_name)
-            .ok_or_else(|| LimboError::ParseError(format!("no such object: {seq_name}")))
+        let namespace = self
+            .find_existing_sequence(seq_name)
+            .ok_or_else(|| LimboError::ParseError(format!("no such object: {seq_name}")))?;
+        let is_other_relation = self.dialect.supports_namespaces()
+            && self.with_schema(namespace.database_id, |schema| {
+                !schema.has_sequence(namespace.id, seq_name)
+                    && Self::namespace_has_relation(schema, namespace.id, seq_name)
+            });
+        if is_other_relation {
+            return Err(LimboError::ParseError(format!(
+                "cannot open relation \"{seq_name}\""
+            )));
+        }
+        Ok(namespace)
     }
 
     pub(crate) fn find_existing_sequence(&self, seq_name: &str) -> Option<NamespaceRef> {
-        self.find_unqualified_existing(seq_name, |schema, namespace, seq_name| {
+        self.find_unqualified_relation(seq_name, |schema, namespace, seq_name| {
             schema.get_sequence(namespace, seq_name).is_some()
         })
     }

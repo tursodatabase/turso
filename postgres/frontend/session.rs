@@ -410,14 +410,19 @@ fn prepare_statement_inner(
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
     reject_catalog_dml(translated.cmd.stmt())?;
-    if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
-        reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
-    }
 
     let conn = Arc::clone(&pg_conn.conn);
     let tx = Arc::clone(&pg_conn.tx);
     let role = tx_role(translated.cmd.stmt());
     let post_run = tx_state_post_run(pg_conn, translated.cmd.stmt(), role);
+
+    if let Some(target) = drop_target(translated.cmd.stmt(), &parse_result) {
+        if target.if_exists && names_missing_schema(&conn, target.name) {
+            return Ok(crate::Statement::new(noop_statement(&conn)?)
+                .with_tx_tracking(conn, tx_aborted, role));
+        }
+        reject_drop_of_other_relation_kind(&conn, target.name, target.kind)?;
+    }
 
     if translated.prereqs.is_empty() {
         return pg_conn
@@ -793,33 +798,82 @@ fn relation_name_is_taken(
     Ok(taken)
 }
 
-/// PostgreSQL refuses DROP VIEW and DROP MATERIALIZED VIEW on a relation of
-/// another kind, but core's DROP VIEW drops both kinds of view. The relation
-/// is the first table or view named `view_name` in the databases that core
-/// looks it up in. A view is materialized when it has a root page.
-fn reject_drop_of_other_view_kind(
-    conn: &Arc<Connection>,
-    view_name: &ast::QualifiedName,
-    materialized: bool,
-) -> Result<()> {
-    let expected_kind = if materialized {
-        "materialized view"
-    } else {
-        "view"
+/// The relation that a DROP statement names.
+struct DropTarget<'a> {
+    name: &'a ast::QualifiedName,
+    if_exists: bool,
+    /// The kind of relation that the statement drops, with its article.
+    kind: &'static str,
+}
+
+fn drop_target<'a>(
+    stmt: &'a ast::Stmt,
+    parse_result: &turso_pg_parser::ParseResult,
+) -> Option<DropTarget<'a>> {
+    let (name, if_exists, kind) = match stmt {
+        ast::Stmt::DropTable {
+            tbl_name,
+            if_exists,
+        } => (tbl_name, *if_exists, "a table"),
+        ast::Stmt::DropIndex {
+            idx_name,
+            if_exists,
+        } => (idx_name, *if_exists, "an index"),
+        ast::Stmt::DropSequence {
+            seq_name,
+            if_exists,
+        } => (seq_name, *if_exists, "a sequence"),
+        ast::Stmt::DropView {
+            view_name,
+            if_exists,
+        } if is_drop_matview(parse_result) => (view_name, *if_exists, "a materialized view"),
+        ast::Stmt::DropView {
+            view_name,
+            if_exists,
+        } => (view_name, *if_exists, "a view"),
+        _ => return None,
     };
-    let schema = view_name.namespace.as_ref().map(|name| name.as_str());
+    Some(DropTarget {
+        name,
+        if_exists,
+        kind,
+    })
+}
+
+/// Core must fail on a namespace that does not exist, as SQLite does for a
+/// missing database, but PostgreSQL's DROP IF EXISTS does nothing.
+fn names_missing_schema(conn: &Arc<Connection>, name: &ast::QualifiedName) -> bool {
+    name.namespace
+        .as_ref()
+        .is_some_and(|schema| relation_lookup_namespaces(conn, Some(schema.as_str())).is_empty())
+}
+
+/// PostgreSQL keeps tables, views, indexes and sequences under one set of
+/// names per schema, and refuses a DROP statement on a relation of another
+/// kind, also with IF EXISTS. Core reports such a relation as missing, or does
+/// nothing with IF EXISTS. The relation is the first one named `name` in the
+/// schemas that it is looked up in.
+fn reject_drop_of_other_relation_kind(
+    conn: &Arc<Connection>,
+    name: &ast::QualifiedName,
+    expected_kind: &'static str,
+) -> Result<()> {
+    let schema = name.namespace.as_ref().map(|name| name.as_str());
     for namespace in relation_lookup_namespaces(conn, schema) {
         let database = database_of(conn, &namespace);
         let mut stmt = conn.prepare_sqlite(format!(
-            "SELECT CASE WHEN type = 'table' THEN 'table' \
-                         WHEN rootpage = 0 THEN 'view' \
-                         ELSE 'materialized view' END \
+            "SELECT CASE WHEN name COLLATE NOCASE <> ?1 THEN 'a sequence' \
+                         WHEN type = 'table' THEN 'a table' \
+                         WHEN type = 'index' THEN 'an index' \
+                         WHEN rootpage = 0 THEN 'a view' \
+                         ELSE 'a materialized view' END \
              FROM \"{database}\".sqlite_schema \
-             WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1"
+             WHERE type IN ('table', 'index', 'view') \
+             AND name COLLATE NOCASE IN (?1, '{SEQ_BACKING_TABLE_PREFIX}' || ?1)"
         ))?;
         stmt.bind_at(
             NonZero::new(1).unwrap(),
-            Value::build_text(namespace.mangle_name(view_name.name.as_str())),
+            Value::build_text(namespace.mangle_name(name.name.as_str())),
         )?;
         let Some(row) = stmt.run_collect_rows()?.into_iter().next() else {
             continue;
@@ -827,7 +881,7 @@ fn reject_drop_of_other_view_kind(
         if row[0] != Value::build_text(expected_kind) {
             return Err(sqlstate_error(
                 SQLSTATE_WRONG_OBJECT_TYPE,
-                format!("\"{}\" is not a {expected_kind}", view_name.name.as_str()),
+                format!("\"{}\" is not {expected_kind}", name.name.as_str()),
             ));
         }
         return Ok(());

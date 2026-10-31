@@ -4,8 +4,10 @@ use crate::schema::{BTreeCharacteristics, BTreeTable, SchemaObjectType};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
+use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::sequence::bind_sequence_names_in_select;
 use crate::translate::{
+    catalog::CatalogContext,
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
@@ -425,6 +427,7 @@ pub fn translate_create_view(
     let mut select_stmt = select_stmt.clone();
     if resolver.catalog.dialect.binds_names_at_create() {
         bind_sequence_names_in_select(&mut select_stmt, resolver)?;
+        bind_table_names_in_select(&mut select_stmt, &[], namespace, resolver)?;
     }
     let stored_view_name = resolver.mangle_name(namespace, &normalized_view_name);
     let sql = create_view_to_str(
@@ -476,6 +479,186 @@ pub fn translate_create_view(
     });
 
     Ok(())
+}
+
+/// Qualifies each table named without a schema in `select`, the body of a
+/// view of `view_namespace`, with the schema it resolves to now when that is
+/// another schema. An unqualified name in a stored view body is read in the
+/// view's own schema. `visible_ctes` are the CTEs that hide tables of their
+/// name here.
+fn bind_table_names_in_select(
+    select: &mut ast::Select,
+    visible_ctes: &[String],
+    view_namespace: NamespaceRef,
+    resolver: &Resolver,
+) -> Result<()> {
+    let mut ctes = visible_ctes.to_vec();
+    if let Some(with) = &mut select.with {
+        let names: Vec<String> = with
+            .ctes
+            .iter()
+            .map(|cte| normalize_ident(cte.tbl_name.as_str()))
+            .collect();
+        for (index, cte) in with.ctes.iter_mut().enumerate() {
+            // A CTE sees the ones before it, and all of them under RECURSIVE.
+            let seen = if with.recursive { names.len() } else { index };
+            let cte_scope: Vec<String> = ctes.iter().chain(&names[..seen]).cloned().collect();
+            bind_table_names_in_select(&mut cte.select, &cte_scope, view_namespace, resolver)?;
+        }
+        ctes.extend(names);
+    }
+    let binder = TableNameBinder {
+        ctes: &ctes,
+        view_namespace,
+        resolver,
+    };
+    binder.bind_one_select(&mut select.body.select)?;
+    for compound in &mut select.body.compounds {
+        binder.bind_one_select(&mut compound.select)?;
+    }
+    for column in &mut select.order_by {
+        binder.bind_expr(&mut column.expr)?;
+    }
+    if let Some(limit) = &mut select.limit {
+        binder.bind_expr(&mut limit.expr)?;
+        if let Some(offset) = &mut limit.offset {
+            binder.bind_expr(offset)?;
+        }
+    }
+    Ok(())
+}
+
+struct TableNameBinder<'a, 'b> {
+    ctes: &'a [String],
+    view_namespace: NamespaceRef,
+    resolver: &'a Resolver<'b>,
+}
+
+impl TableNameBinder<'_, '_> {
+    fn bind_one_select(&self, select: &mut ast::OneSelect) -> Result<()> {
+        match select {
+            ast::OneSelect::Select {
+                columns,
+                from,
+                where_clause,
+                group_by,
+                window_clause,
+                ..
+            } => {
+                if let Some(from) = from {
+                    self.bind_from_clause(from)?;
+                }
+                for column in columns {
+                    if let ast::ResultColumn::Expr(expr, _) = column {
+                        self.bind_expr(expr)?;
+                    }
+                }
+                if let Some(where_clause) = where_clause {
+                    self.bind_expr(where_clause)?;
+                }
+                if let Some(group_by) = group_by {
+                    for expr in &mut group_by.exprs {
+                        self.bind_expr(expr)?;
+                    }
+                    if let Some(having) = &mut group_by.having {
+                        self.bind_expr(having)?;
+                    }
+                }
+                for window in window_clause {
+                    for expr in &mut window.window.partition_by {
+                        self.bind_expr(expr)?;
+                    }
+                    for column in &mut window.window.order_by {
+                        self.bind_expr(&mut column.expr)?;
+                    }
+                }
+            }
+            ast::OneSelect::Values(rows) => {
+                for expr in rows.iter_mut().flatten() {
+                    self.bind_expr(expr)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_from_clause(&self, from: &mut ast::FromClause) -> Result<()> {
+        self.bind_select_table(&mut from.select)?;
+        for join in &mut from.joins {
+            self.bind_select_table(&mut join.table)?;
+            if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+                self.bind_expr(expr)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_select_table(&self, table: &mut ast::SelectTable) -> Result<()> {
+        match table {
+            ast::SelectTable::Table(name, _, _) => self.bind_table_name(name)?,
+            ast::SelectTable::TableCall(_, args, _) => {
+                for arg in args {
+                    self.bind_expr(arg)?;
+                }
+            }
+            ast::SelectTable::Select { select, .. } => {
+                bind_table_names_in_select(select, self.ctes, self.view_namespace, self.resolver)?;
+            }
+            ast::SelectTable::Sub(from, _) => self.bind_from_clause(from)?,
+        }
+        Ok(())
+    }
+
+    fn bind_expr(&self, expr: &mut ast::Expr) -> Result<()> {
+        walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
+            match expr {
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
+                    bind_table_names_in_select(
+                        select,
+                        self.ctes,
+                        self.view_namespace,
+                        self.resolver,
+                    )?;
+                }
+                ast::Expr::InSelect { rhs, .. } => {
+                    bind_table_names_in_select(rhs, self.ctes, self.view_namespace, self.resolver)?;
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        Ok(())
+    }
+
+    fn bind_table_name(&self, name: &mut ast::QualifiedName) -> Result<()> {
+        if name.namespace.is_some() {
+            return Ok(());
+        }
+        let table = normalize_ident(name.name.as_str());
+        if self.ctes.contains(&table) {
+            return Ok(());
+        }
+        let Some(namespace) = self.resolver.find_existing_table(name)? else {
+            return Ok(());
+        };
+        // The engine's virtual tables are in the root namespace, which has no
+        // name in the dialect, and are found from every namespace.
+        if namespace == self.view_namespace || namespace.id.is_root() {
+            return Ok(());
+        }
+        let exists = self.resolver.with_schema(namespace.database_id, |schema| {
+            CatalogContext::namespace_has_table_like_object(schema, namespace.id, &table)
+        });
+        if !exists {
+            return Ok(());
+        }
+        let namespace_name = self
+            .resolver
+            .name_of_namespace(namespace)
+            .expect("a namespace that has a table has a name");
+        name.namespace = Some(ast::Name::exact(namespace_name));
+        Ok(())
+    }
 }
 
 fn create_view_to_str(

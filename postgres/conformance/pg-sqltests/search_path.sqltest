@@ -721,3 +721,270 @@ test cte-hides-table-of-search-path {
 expect {
     2
 }
+
+test drop-table-stops-at-a-view-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE VIEW sp_dk_a.t AS SELECT 1 AS c;
+    CREATE TABLE sp_dk_b.t (x int);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP TABLE t;
+}
+@sqlstate 42809
+expect error {
+    "t" is not a table
+}
+
+test drop-table-if-exists-stops-at-a-view-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE VIEW sp_dk_a.t AS SELECT 1 AS c;
+    CREATE TABLE sp_dk_b.t (x int);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP TABLE IF EXISTS t;
+}
+@sqlstate 42809
+expect error {
+    "t" is not a table
+}
+
+test drop-index-stops-at-a-table-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_a.i (x int);
+    CREATE TABLE sp_dk_b.u (x int);
+    CREATE INDEX i ON sp_dk_b.u (x);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP INDEX IF EXISTS i;
+}
+@sqlstate 42809
+expect error {
+    "i" is not an index
+}
+
+test drop-sequence-stops-at-a-table-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_a.sq (x int);
+    CREATE SEQUENCE sp_dk_b.sq;
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP SEQUENCE sq;
+}
+@sqlstate 42809
+expect error {
+    "sq" is not a sequence
+}
+
+test drop-table-stops-at-a-sequence-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE SEQUENCE sp_dk_a.t;
+    CREATE TABLE sp_dk_b.t (x int);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP TABLE t;
+}
+@sqlstate 42809
+expect error {
+    "t" is not a table
+}
+
+test drop-of-another-kind-named-with-a-schema-fails {
+    CREATE SCHEMA sp_dk_a;
+    CREATE VIEW sp_dk_a.v AS SELECT 1 AS c;
+    DROP TABLE sp_dk_a.v;
+}
+@sqlstate 42809
+expect error {
+    "v" is not a table
+}
+
+test drop-finds-the-first-relation-of-its-kind-through-search-path {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_b.t (x int);
+    CREATE INDEX i ON sp_dk_b.t (x);
+    CREATE SEQUENCE sp_dk_b.sq;
+    SET search_path TO sp_dk_a, sp_dk_b;
+    DROP INDEX i;
+    DROP SEQUENCE sq;
+    DROP TABLE t;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'sp_dk_b';
+}
+expect {
+    0
+}
+
+test drop-if-exists-with-missing-schema-does-nothing {
+    DROP TABLE IF EXISTS sp_missing_ds.t;
+    DROP VIEW IF EXISTS sp_missing_ds.v;
+    DROP MATERIALIZED VIEW IF EXISTS sp_missing_ds.m;
+    DROP INDEX IF EXISTS sp_missing_ds.i;
+    DROP SEQUENCE IF EXISTS sp_missing_ds.s;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-with-missing-schema-fails {
+    DROP TABLE sp_missing_ds.t;
+}
+@sqlstate 3F000
+expect error {
+    schema "sp_missing_ds" does not exist
+}
+
+test nextval-stops-at-a-table-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_a.sq (x int);
+    CREATE SEQUENCE sp_dk_b.sq;
+    SET search_path TO sp_dk_a, sp_dk_b;
+    SELECT nextval('sq');
+}
+@sqlstate 42809
+expect error {
+    cannot open relation "sq"
+}
+
+test select-stops-at-an-index-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_a.u (x int);
+    CREATE INDEX t ON sp_dk_a.u (x);
+    CREATE TABLE sp_dk_b.t (y int);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    SELECT y FROM t;
+}
+@sqlstate 42809
+expect error {
+    cannot open relation "t"
+}
+
+test insert-stops-at-an-index-in-an-earlier-schema {
+    CREATE SCHEMA sp_dk_a;
+    CREATE SCHEMA sp_dk_b;
+    CREATE TABLE sp_dk_a.u (x int);
+    CREATE INDEX t ON sp_dk_a.u (x);
+    CREATE TABLE sp_dk_b.t (y int);
+    SET search_path TO sp_dk_a, sp_dk_b;
+    INSERT INTO t VALUES (1);
+}
+@sqlstate 42809
+expect error {
+    cannot open relation "t"
+}
+
+test view-reads-a-table-of-a-later-schema {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v AS SELECT t.x FROM t;
+    SELECT x FROM v;
+    SELECT x FROM sp_vw.v;
+}
+expect {
+    9
+    9
+}
+
+test view-keeps-its-table-when-search-path-changes {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v AS SELECT x FROM t;
+    CREATE TABLE sp_vw.t (x int);
+    INSERT INTO sp_vw.t VALUES (1);
+    SET search_path TO sp_vw;
+    SELECT x FROM v;
+}
+expect {
+    9
+}
+
+test view-of-a-named-schema-reads-the-table-the-search-path-finds {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    CREATE TABLE sp_vw.t (x int);
+    INSERT INTO sp_vw.t VALUES (1);
+    CREATE VIEW sp_vw.v AS SELECT x FROM t;
+    SELECT x FROM sp_vw.v;
+}
+expect {
+    9
+}
+
+test view-reads-tables-of-different-schemas {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.a (x int);
+    INSERT INTO public.a VALUES (1);
+    CREATE TABLE sp_vw.b (x int);
+    INSERT INTO sp_vw.b VALUES (1);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v AS SELECT a.x FROM a JOIN b ON a.x = b.x;
+    SELECT x FROM v;
+}
+expect {
+    1
+}
+
+test view-reads-a-later-schema-in-subqueries-and-ctes {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v1 AS SELECT x FROM (SELECT x FROM t) AS s;
+    CREATE VIEW v2 AS SELECT 1 AS c WHERE EXISTS (SELECT 1 FROM t);
+    CREATE VIEW v3 AS SELECT 2 AS c WHERE 9 IN (SELECT x FROM t);
+    CREATE VIEW v4 AS WITH c AS (SELECT x FROM t) SELECT x FROM c;
+    CREATE VIEW v5 AS SELECT (SELECT max(x) FROM t) AS m;
+    SELECT x FROM v1;
+    SELECT c FROM v2;
+    SELECT c FROM v3;
+    SELECT x FROM v4;
+    SELECT m FROM v5;
+}
+expect {
+    9
+    1
+    2
+    9
+    9
+}
+
+test view-reads-a-cte-named-like-a-table-of-a-later-schema {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v AS WITH t AS (SELECT 1 AS x) SELECT x FROM t;
+    SELECT x FROM v;
+}
+expect {
+    1
+}
+
+test view-cte-reads-a-table-of-its-own-name {
+    CREATE SCHEMA sp_vw;
+    CREATE TABLE public.t (x int);
+    INSERT INTO public.t VALUES (9);
+    SET search_path TO sp_vw, public;
+    CREATE VIEW v AS WITH t AS (SELECT x + 1 AS x FROM t) SELECT x FROM t;
+    SELECT x FROM v;
+}
+expect {
+    10
+}
+
+test view-reads-a-catalog-table-under-search-path {
+    CREATE SCHEMA sp_vw;
+    SET search_path TO sp_vw;
+    CREATE VIEW v AS SELECT count(*) AS c FROM pg_namespace WHERE nspname = 'sp_vw';
+    SELECT c FROM v;
+}
+expect {
+    1
+}
