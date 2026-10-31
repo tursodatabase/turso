@@ -703,56 +703,27 @@ impl DeferredExecution {
             self.start()?;
             return Ok(IOResult::Done(()));
         }
-        let conn = &self.pg_conn.conn;
         if self.active.is_none() {
-            let sql = self.phase_sql();
-            self.active = Some(match self.phase {
-                Statement(index) => match &self.statements[index] {
-                    DeferredCommand::Translated(cmd, _) => crate::Statement::new(
-                        conn.prepare_translated_cmd(cmd.clone(), &sql)
-                            .map_err(schema_error)?,
-                    ),
-                    DeferredCommand::Namespace(stmt) => {
-                        crate::Statement::new(conn.prepare_namespace_stmt(stmt.clone())?)
-                    }
-                    DeferredCommand::Postgres(_) => {
-                        prepare_statement_inner(&self.pg_conn, &sql)?.without_tx_tracking()
-                    }
-                    DeferredCommand::Sqlite(_) => crate::Statement::new(conn.prepare_sqlite(&sql)?),
-                },
-                CopyRow(index) => {
-                    let mut stmt = crate::Statement::new(conn.prepare_sqlite(&sql)?);
-                    if self.copy_rows.is_empty() {
-                        self.phase = Release;
-                        return Ok(IOResult::Done(()));
-                    }
-                    bind_copy_row(&mut stmt, &self.copy_rows[index])?;
-                    stmt
-                }
-                Savepoint | Release | Rollback | RollbackRelease => {
-                    crate::Statement::new(conn.prepare_sqlite(&sql)?)
-                }
-                Start | CheckTarget | CopyColumns | Done => unreachable!(),
-            });
+            self.prepare_active()?;
         }
-        let active = self.active.as_mut().unwrap();
+        let Some(active) = self.active.as_mut() else {
+            return Ok(IOResult::Done(()));
+        };
         if matches!(self.phase, Rollback | RollbackRelease) {
             active.set_query_timeout_override(Some(None));
         } else if self.interrupted {
             active.interrupt();
         }
-        let result = if self.phase == CheckTarget {
-            active.run_with_row_callback_nonblock(|row| {
+        let result = match self.phase {
+            CheckTarget => active.run_with_row_callback_nonblock(|row| {
                 self.target_exists = row.get_value(0) == &Value::from_i64(1);
                 Ok(())
-            })
-        } else if self.phase == CopyColumns {
-            active.run_with_row_callback_nonblock(|_| {
+            }),
+            CopyColumns => active.run_with_row_callback_nonblock(|_| {
                 self.copy_columns += 1;
                 Ok(())
-            })
-        } else {
-            active.run_ignore_rows_nonblock()
+            }),
+            _ => active.run_ignore_rows_nonblock(),
         }
         .map_err(crate::Error::into_core_error)?;
         if let IOResult::IO(io) = result {
@@ -764,25 +735,60 @@ impl DeferredExecution {
             }
             return Err(LimboError::Interrupt);
         }
-        if matches!(self.phase, Statement(index) if index + 1 == self.statements.len())
-            && matches!(self.operation, DeferredOperation::Translated { .. })
-        {
-            *inner = self.active.take().unwrap().inner;
-        } else if let CopyRow(index) = self.phase {
-            if index + 1 < self.copy_rows.len() {
-                active.reset().map_err(crate::Error::into_core_error)?;
-                active.clear_bindings();
-                bind_copy_row(active, &self.copy_rows[index + 1])?;
-            } else {
-                self.active = None;
+        self.finish_phase(inner)?;
+        Ok(IOResult::Done(()))
+    }
+
+    fn prepare_active(&mut self) -> Result<()> {
+        use DeferredPhase::*;
+
+        let conn = &self.pg_conn.conn;
+        let sql = self.phase_sql();
+        self.active = Some(match self.phase {
+            Statement(index) => match &self.statements[index] {
+                DeferredCommand::Translated(cmd, _) => crate::Statement::new(
+                    conn.prepare_translated_cmd(cmd.clone(), &sql)
+                        .map_err(schema_error)?,
+                ),
+                DeferredCommand::Namespace(stmt) => {
+                    crate::Statement::new(conn.prepare_namespace_stmt(stmt.clone())?)
+                }
+                DeferredCommand::Postgres(_) => {
+                    prepare_statement_inner(&self.pg_conn, &sql)?.without_tx_tracking()
+                }
+                DeferredCommand::Sqlite(_) => crate::Statement::new(conn.prepare_sqlite(&sql)?),
+            },
+            CopyRow(index) => {
+                let mut stmt = crate::Statement::new(conn.prepare_sqlite(&sql)?);
+                if self.copy_rows.is_empty() {
+                    self.phase = Release;
+                    return Ok(());
+                }
+                bind_copy_row(&mut stmt, &self.copy_rows[index])?;
+                stmt
             }
-        } else {
-            self.active = None;
-        }
+            Savepoint | Release | Rollback | RollbackRelease => {
+                crate::Statement::new(conn.prepare_sqlite(&sql)?)
+            }
+            Start | CheckTarget | CopyColumns | Done => unreachable!(),
+        });
+        Ok(())
+    }
+
+    fn finish_phase(&mut self, inner: &mut Statement) -> Result<()> {
+        use DeferredPhase::*;
+
         self.phase = match self.phase {
-            CheckTarget if self.target_exists => Statement(self.statements.len() - 1),
-            CheckTarget => Savepoint,
+            CheckTarget => {
+                self.active = None;
+                if self.target_exists {
+                    Statement(self.statements.len() - 1)
+                } else {
+                    Savepoint
+                }
+            }
             CopyColumns => {
+                self.active = None;
                 let DeferredOperation::Session(SessionStmt::CopyFrom(stmt)) = &self.operation
                 else {
                     unreachable!()
@@ -796,6 +802,7 @@ impl DeferredExecution {
                 Savepoint
             }
             Savepoint => {
+                self.active = None;
                 self.savepoint_open = true;
                 if matches!(
                     self.operation,
@@ -806,13 +813,38 @@ impl DeferredExecution {
                     Statement(0)
                 }
             }
-            Statement(index) if index + 1 < self.statements.len() => Statement(index + 1),
-            Statement(_) if self.savepoint_open => Release,
-            Statement(_) => Done,
-            CopyRow(index) if index + 1 < self.copy_rows.len() => CopyRow(index + 1),
-            CopyRow(_) => Release,
-            Rollback if self.was_in_tx == Some(true) => RollbackRelease,
+            Statement(index) if index + 1 < self.statements.len() => {
+                self.active = None;
+                Statement(index + 1)
+            }
+            Statement(_) => {
+                let active = self.active.take().unwrap();
+                if matches!(self.operation, DeferredOperation::Translated { .. }) {
+                    *inner = active.inner;
+                }
+                if self.savepoint_open {
+                    Release
+                } else {
+                    Done
+                }
+            }
+            CopyRow(index) if index + 1 < self.copy_rows.len() => {
+                let active = self.active.as_mut().unwrap();
+                active.reset().map_err(crate::Error::into_core_error)?;
+                active.clear_bindings();
+                bind_copy_row(active, &self.copy_rows[index + 1])?;
+                CopyRow(index + 1)
+            }
+            CopyRow(_) => {
+                self.active = None;
+                Release
+            }
+            Rollback if self.was_in_tx == Some(true) => {
+                self.active = None;
+                RollbackRelease
+            }
             Release | Rollback | RollbackRelease => {
+                self.active = None;
                 self.savepoint_open = false;
                 if self.phase == Release
                     && matches!(
@@ -826,7 +858,7 @@ impl DeferredExecution {
             }
             Start | Done => unreachable!(),
         };
-        Ok(IOResult::Done(()))
+        Ok(())
     }
 
     fn start(&mut self) -> Result<()> {
