@@ -589,6 +589,18 @@ expect {
     2|2|2
 }
 
+test table-add-column-sequence-default-on-custom-type-runs-once-per-row {
+    CREATE SEQUENCE s;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN y varchar(10) DEFAULT nextval('s');
+    SELECT x, y FROM t ORDER BY x;
+}
+expect {
+    1|1
+    2|2
+}
+
 test table-add-column-expression-default-fills-existing-rows {
     CREATE TABLE t (x int);
     INSERT INTO t VALUES (1), (2);

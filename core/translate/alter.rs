@@ -23,8 +23,8 @@ use crate::{
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{
-            emit_stored_column, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
-            NoConstantOptReason, WalkControl,
+            emit_store_value, emit_stored_column, translate_expr_no_constant_opt, walk_expr,
+            walk_expr_mut, NoConstantOptReason, WalkControl,
         },
         index::expression_type_ordering,
         plan::{
@@ -741,6 +741,65 @@ fn emit_column_constraints_validation(
     Ok(())
 }
 
+/// Store the DEFAULT of a newly added column as a value of the column's types
+/// (each type's ENCODE, then its COERCE) when the table has rows, so a DEFAULT
+/// they reject (e.g. too long for a `varchar(n)`) fails the ALTER TABLE instead
+/// of every later read of the column.
+fn emit_add_column_encode_validation(
+    program: &mut ProgramBuilder,
+    btree: &BTreeTable,
+    original_btree: &Arc<BTreeTable>,
+    column: &Column,
+    default_expr: Option<&ast::Expr>,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<()> {
+    let Some(default_expr) = default_expr.filter(|e| !crate::util::expr_contains_null(e)) else {
+        return Ok(());
+    };
+    let Some(resolved) = resolver
+        .schema()
+        .resolve_type(&column.ty_str, btree.is_strict)?
+    else {
+        return Ok(());
+    };
+
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id,
+        root_page: original_btree.root_page,
+        db: database_id,
+    });
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: skip_label,
+    });
+
+    // Table has rows: they would read the stored DEFAULT, so store it now and
+    // let any error raised by ENCODE or COERCE abort the statement. Not hoisted,
+    // since the value is stored in place in this register.
+    let default_reg = program.alloc_register();
+    translate_expr_no_constant_opt(
+        program,
+        None,
+        default_expr,
+        default_reg,
+        resolver,
+        NoConstantOptReason::CustomTypeEncode,
+    )?;
+    emit_store_value(
+        program,
+        &resolved.chain,
+        default_reg,
+        &column.ty_params,
+        resolver,
+    )?;
+
+    program.preassign_label_to_next_insn(skip_label);
+    Ok(())
+}
+
 pub fn translate_alter_table(
     alter: ast::AlterTable,
     resolver: &Resolver,
@@ -1451,6 +1510,21 @@ pub fn translate_alter_table(
 
                 if default_type_mismatch {
                     emit_add_column_default_type_validation(program, &original_btree, database_id)?;
+                }
+
+                // A default computed for each row is stored through the type
+                // chain by the rewrite below, and evaluating it here as well
+                // would run it one extra time (e.g. nextval()).
+                if !computes_default_for_existing_rows {
+                    emit_add_column_encode_validation(
+                        program,
+                        &btree,
+                        &original_btree,
+                        &column,
+                        effective_default,
+                        resolver,
+                        database_id,
+                    )?;
                 }
             }
 
