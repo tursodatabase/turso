@@ -627,6 +627,7 @@ where
     }
 
     /// Returns an entry with the specified `key`.
+    #[inline]
     pub fn get<'a: 'g, 'g, Q>(
         &'a self,
         key: &Q,
@@ -933,6 +934,7 @@ where
     ///
     /// This is unsafe because the returned nodes are bound to the lifetime of
     /// the `SkipList`, not the `Guard`.
+    #[inline(always)]
     fn search_bound<'a, Q>(
         &'a self,
         bound: Bound<&Q>,
