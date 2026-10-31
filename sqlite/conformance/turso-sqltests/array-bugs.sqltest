@@ -1,6 +1,50 @@
 @database :memory:
 @requires-file custom_types "array tests require custom types support"
 
+test array-copy-select-blob {
+    CREATE TABLE t1(id BLOB PRIMARY KEY, a BLOB[]) STRICT;
+    CREATE TABLE t2(id BLOB PRIMARY KEY, a BLOB[]) STRICT;
+    INSERT INTO t1 VALUES(x'babe', ARRAY[x'cafe']);
+    INSERT INTO t2 SELECT * FROM t1;
+    SELECT hex(a) FROM t2;
+}
+expect {
+    0210CAFE
+}
+
+test array-copy-select-blob-same-table {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a BLOB[]) STRICT;
+    INSERT INTO t1 VALUES(1, ARRAY[x'cafe']);
+    INSERT INTO t1 SELECT id + 1, a FROM t1 WHERE id = 1;
+    SELECT id, hex(a) FROM t1 ORDER BY id;
+}
+expect {
+    1|0210CAFE
+    2|0210CAFE
+}
+
+test array-copy-select-blob-sorted {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a BLOB[]) STRICT;
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a BLOB[]) STRICT;
+    INSERT INTO t1 VALUES(1, ARRAY[x'cafe']), (2, ARRAY[x'babe']);
+    INSERT INTO t2 SELECT * FROM t1 ORDER BY id % 2;
+    SELECT id, hex(a) FROM t2 ORDER BY id;
+}
+expect {
+    1|0210CAFE
+    2|0210BABE
+}
+
+test array-copy-select-returning-display {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER[]) STRICT;
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INTEGER[]) STRICT;
+    INSERT INTO t1 VALUES(1, ARRAY[1, 2]);
+    INSERT INTO t2 SELECT * FROM t1 RETURNING a;
+}
+expect {
+    {1,2}
+}
+
 test array-trailing-comma-rejected {
     CREATE TABLE tc1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
     INSERT INTO tc1 VALUES (1, '{1,2,}');

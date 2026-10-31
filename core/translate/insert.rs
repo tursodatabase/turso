@@ -2356,7 +2356,14 @@ fn init_source_emission<'a>(
                     coroutine_implementation_start: ctx.halt_label,
                 };
                 let num_result_cols = program.nested(|program| {
-                    translate_select(select, resolver, program, query_destination, connection)
+                    let keep_array_blobs = program.flags.keep_array_results_as_blobs();
+                    program.flags.set_keep_array_results_as_blobs(true);
+                    let result =
+                        translate_select(select, resolver, program, query_destination, connection);
+                    program
+                        .flags
+                        .set_keep_array_results_as_blobs(keep_array_blobs);
+                    result
                 })?;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(
