@@ -121,6 +121,98 @@ expect {
     2
 }
 
+@skip-if sqlite "uses the Turso test-only counter"
+test between-volatile-nonliteral-where {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE test_nondet_counter() % 2 BETWEEN a - a AND 0;
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test not-between-volatile-nonliteral-where {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE test_nondet_counter() % 2 NOT BETWEEN a - a AND 0;
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-volatile-nonliteral-delete {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    DELETE FROM t WHERE test_nondet_counter() % 2 BETWEEN a - a AND 0;
+    SELECT COUNT(*) FROM t;
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-volatile-nonliteral-update {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 0), (2, 0), (3, 0), (4, 0);
+    UPDATE t SET b = 1 WHERE test_nondet_counter() % 2 BETWEEN a - a AND 0;
+    SELECT SUM(b) FROM t;
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-volatile-nonliteral-subquery {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t
+    WHERE (SELECT test_nondet_counter() % 2 + t.a * 0) BETWEEN a - a AND 0;
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-volatile-equal-bound-value {
+    SELECT test_nondet_counter() BETWEEN test_nondet_counter() AND 10;
+    SELECT test_nondet_counter() NOT BETWEEN test_nondet_counter() AND 10;
+    SELECT test_nondet_counter();
+}
+expect {
+    0
+    1
+    4
+}
+
+test between-volatile-condition-skips-upper-bound {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE random() % 1 BETWEEN a AND json('bad');
+}
+expect {
+    0
+}
+
+test not-between-volatile-condition-skips-upper-bound {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE random() % 1 NOT BETWEEN a AND json('bad');
+}
+expect {
+    4
+}
+
+test between-volatile-value-evaluates-both-bounds {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    SELECT random() % 1 BETWEEN 1 AND json('bad') FROM t;
+}
+expect error {
+    malformed JSON
+}
+
 # Regression test: multi-index OR must not be used when NOT BETWEEN bounds depend
 # on scalar subquery results. The predicate below should evaluate to NULL for every
 # row (thus filter all rows), even with ORDER BY + LIMIT/OFFSET.
@@ -237,4 +329,24 @@ test between-deterministic-partial-index-predicate {
 expect {
     a
     bb
+}
+
+test between-row-value-in-select-list {
+    SELECT (1, 2) BETWEEN (0, 0) AND (3, 3), (1, 2) NOT BETWEEN (0, 0) AND (3, 3), (5, 2) BETWEEN (0, 0) AND (3, 3);
+}
+expect {
+    1|0|0
+}
+
+# A comparison applies the column affinity of one side to the other side. The two comparisons
+# of a BETWEEN must not see each other's converted value.
+test between-affinity-does-not-leak-between-comparisons {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, i INTEGER, r REAL, s TEXT);
+    INSERT INTO t VALUES (1, 1, 1.5, 'a'), (2, 2, 2.0, 'B'), (3, 0, -1.0, '');
+    SELECT id, i || '' BETWEEN r AND 2.5, (random() % 1) + i NOT BETWEEN s AND 0 FROM t ORDER BY id;
+}
+expect {
+    1|0|1
+    2|0|1
+    3|0|0
 }
