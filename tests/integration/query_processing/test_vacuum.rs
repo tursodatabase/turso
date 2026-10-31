@@ -3295,22 +3295,17 @@ fn test_vacuum_into_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<()
     Ok(())
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_vacuum_into_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    if conn
-        .execute(
-            "CREATE TABLE settings (
+    conn.execute(
+        "CREATE TABLE settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER
             ) STRICT, WITHOUT ROWID",
-        )
-        .is_err()
-    {
-        return Ok(());
-    }
+    )?;
 
     conn.execute("INSERT INTO settings VALUES ('theme', 'dark', 1704067200)")?;
     conn.execute("INSERT INTO settings VALUES ('language', 'en', 1704153600)")?;
@@ -4633,22 +4628,17 @@ fn test_plain_vacuum_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<(
     Ok(())
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_plain_vacuum_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    if conn
-        .execute(
-            "CREATE TABLE settings (
+    conn.execute(
+        "CREATE TABLE settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER
             ) STRICT, WITHOUT ROWID",
-        )
-        .is_err()
-    {
-        return Ok(());
-    }
+    )?;
 
     conn.execute("INSERT INTO settings VALUES ('theme', 'dark', 1704067200)")?;
     conn.execute("INSERT INTO settings VALUES ('language', 'en', 1704153600)")?;

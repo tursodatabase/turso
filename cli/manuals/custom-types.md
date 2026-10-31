@@ -43,7 +43,7 @@ DROP TYPE type_name;
 DROP TYPE IF EXISTS type_name;
 ```
 
-A type cannot be dropped while any table has a column using it.
+A type cannot be dropped while anything in the schema uses it: a column of that type, an expression that casts to it (in an index, CHECK constraint, generated column, column default, view, materialized view or trigger), or another type or domain that depends on it.
 
 ## Basic Examples
 

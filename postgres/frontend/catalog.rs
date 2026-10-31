@@ -229,6 +229,10 @@ impl Dialect for PostgresDialect {
     fn allows_qualified_columns_in_index_terms(&self) -> bool {
         true
     }
+
+    fn casts_nonzero_integer_to_true(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

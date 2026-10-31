@@ -275,7 +275,7 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
-            Self::Begin { typ, name } => {
+            Self::Begin { typ, name, .. } => {
                 s.append(TK_BEGIN, None)?;
                 if let Some(typ) = typ {
                     typ.to_tokens(s, context)?;
@@ -1744,6 +1744,9 @@ impl ToTokens for CreateTableBody {
                     }
                 }
                 if let Some(ref strict) = options.strict_text {
+                    if options.contains_without_rowid() {
+                        s.append(TK_COMMA, None)?;
+                    }
                     s.append(TK_ID, Some(strict))?;
                 }
                 Ok(())
