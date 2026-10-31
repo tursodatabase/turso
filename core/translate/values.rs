@@ -2,7 +2,8 @@ use crate::translate::emitter::TranslateCtx;
 use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 use crate::translate::plan::{QueryDestination, SelectPlan};
 use crate::translate::result_row::{
-    emit_columns_to_destination, emit_offset, emit_result_row_and_limit,
+    emit_columns_to_destination, emit_delete_one_matching_entry, emit_offset,
+    emit_result_row_and_limit,
 };
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn};
@@ -253,7 +254,11 @@ fn emit_values_to_index(
         );
     }
 
-    if *is_delete {
+    if *is_delete && index.has_rowid {
+        let label_not_found = program.allocate_label();
+        emit_delete_one_matching_entry(program, *cursor_id, start_reg, row_len, label_not_found);
+        program.preassign_label_to_next_insn(label_not_found);
+    } else if *is_delete {
         program.emit_insn(Insn::IdxDelete {
             start_reg,
             num_regs: row_len,
