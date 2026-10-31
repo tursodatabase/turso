@@ -360,6 +360,10 @@ impl PyTursoStatement {
             .map_err(turso_error_to_py_err)?;
         Ok(())
     }
+    /// Returns true if the statement does not write to the database, like sqlite3_stmt_readonly
+    pub fn is_readonly(&self) -> bool {
+        self.statement.is_readonly()
+    }
     /// Get column names of the statement
     pub fn columns(&self, py: Python) -> PyResult<Py<PyTuple>> {
         let columns_count = self.statement.column_count();

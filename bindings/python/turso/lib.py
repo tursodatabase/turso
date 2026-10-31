@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 import sys
+import weakref
+from collections import deque
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
@@ -392,6 +394,7 @@ class Connection:
         self.row_factory: Callable[[Cursor, Row], object] | type[Row] | None = None
         self.text_factory: Any = str
         self.extra_io = extra_io
+        self._cursors: weakref.WeakSet[Cursor] = weakref.WeakSet()
 
         # If autocommit is False, ensure a transaction is open
         if self._autocommit_mode is False:
@@ -522,12 +525,29 @@ class Connection:
                 # No-op in SQLite autocommit mode
                 return
             if self.in_transaction:
+                self._finish_unfinished_writes()
                 self._exec_ddl_only("ROLLBACK")
             if self._autocommit_mode is False:
                 # Re-open a transaction to maintain PEP 249 behavior
                 self._ensure_transaction_open()
         except Exception as exc:  # noqa: BLE001
             raise _map_turso_exception(exc)
+
+    def _finish_unfinished_writes(self) -> None:
+        """
+        Run every cursor's unfinished write statement (a DML ... RETURNING whose rows were
+        not all fetched) to its end, keeping its rows for later fetches.
+
+        Turso refuses ROLLBACK and a second write statement while a write statement is
+        unfinished; SQLite allows both. Like SQLite, Turso does all writes of a
+        DML ... RETURNING at its first step, so finishing it early changes no result.
+        """
+        for cursor in self._cursors:
+            if cursor._active_may_write:
+                rows = []
+                while (row := cursor._fetchone_tuple()) is not None:
+                    rows.append(row)
+                cursor._buffered_rows.extend(rows)
 
     def interrupt(self) -> None:
         """
@@ -759,15 +779,17 @@ class Connection:
         value: BaseException | None,
         traceback: TracebackType | None,
     ) -> bool:
-        # sqlite3 behavior: In context manager, if no exception -> commit, else rollback (legacy and PEP 249 modes)
-        try:
-            if type is None:
+        # sqlite3 behavior: In context manager, if no exception -> commit, else rollback (legacy and PEP 249 modes).
+        # A failed commit is rolled back and raised, so the transaction does not stay open.
+        if type is None:
+            try:
                 self.commit()
-            else:
+            except Exception:
                 self.rollback()
-        finally:
-            # Always propagate exceptions (returning False)
-            return False
+                raise
+        else:
+            self.rollback()
+        return False
 
 
 # Cursor goes SECOND
@@ -776,12 +798,15 @@ class Cursor:
 
     def __init__(self, connection: Connection, /) -> None:
         self._connection: Connection = connection
+        connection._cursors.add(self)
         self.arraysize = 1
         self.row_factory: Callable[[Cursor, Row], object] | type[Row] | None = connection.row_factory
 
         # State for the last executed statement
         self._active_stmt: Optional[PyTursoStatement] = None
         self._active_has_rows: bool = False
+        self._active_may_write: bool = False
+        self._buffered_rows: deque[tuple[Any, ...]] = deque()
         self._description: Optional[tuple[tuple[str, None, None, None, None, None, None], ...]] = None
         self._lastrowid: Optional[int] = None
         self._rowcount: int = -1
@@ -831,6 +856,8 @@ class Cursor:
                 pass
         self._active_stmt = None
         self._active_has_rows = False
+        self._active_may_write = False
+        self._buffered_rows.clear()
         self._description = None
         self._rowcount = -1
         # Do not reset lastrowid here; sqlite3 preserves lastrowid until next insert.
@@ -929,25 +956,37 @@ class Cursor:
         self._ensure_open()
         self._reset_last_result()
 
-        # Implement legacy implicit transactions if needed
-        self._maybe_implicit_begin(sql)
-
         # Prepare exactly one statement
         prepared = self._prepare_single_statement(sql)
 
         stmt = prepared.stmt
         try:
+            may_write = not stmt.is_readonly()
+            if may_write:
+                self._connection._finish_unfinished_writes()
+
+            # Implement legacy implicit transactions if needed
+            self._maybe_implicit_begin(sql)
+
             self._bind_params(stmt, parameters)
 
             if prepared.has_columns:
                 # Stepped statement (e.g., SELECT or DML with RETURNING)
                 self._active_stmt = stmt
                 self._active_has_rows = True
+                self._active_may_write = may_write
                 # Set description immediately (even if there are no rows)
                 self._description = tuple((name, None, None, None, None, None, None) for name in prepared.column_names)
                 # For statements that return rows, DB-API specifies rowcount is -1
                 self._rowcount = -1
                 # Do not compute lastrowid here
+                # A DML ... RETURNING must perform its write here even if its rows are
+                # never fetched, so step it once now, as sqlite3 does. A read is stepped
+                # on the first fetch, because Turso's ROLLBACK ends a started read.
+                if may_write:
+                    first_row = self._fetchone_tuple()
+                    if first_row is not None:
+                        self._buffered_rows.append(first_row)
             else:
                 # Executed statement (no rows returned)
                 result = _run_execute_with_io(stmt, self._connection.extra_io)
@@ -983,6 +1022,7 @@ class Cursor:
         # executemany only accepts DML; enforce this to match sqlite3 semantics
         if not _is_dml(sql):
             raise ProgrammingError("executemany() requires a single DML (INSERT/UPDATE/DELETE/REPLACE) statement")
+        self._connection._finish_unfinished_writes()
 
         # Implement legacy implicit transaction: same as execute()
         self._maybe_implicit_begin(sql)
@@ -1015,6 +1055,7 @@ class Cursor:
     def executescript(self, sql_script: str) -> "Cursor":
         self._ensure_open()
         self._reset_last_result()
+        self._connection._finish_unfinished_writes()
 
         # sqlite3 behavior: If autocommit is LEGACY and there is a pending transaction, implicitly COMMIT first
         if self._connection._autocommit_mode == "LEGACY" and self._connection.in_transaction:
@@ -1050,6 +1091,8 @@ class Cursor:
         """
         Fetch one row as a plain Python tuple, or return None if no more rows.
         """
+        if self._buffered_rows:
+            return self._buffered_rows.popleft()
         if not self._active_has_rows or self._active_stmt is None:
             return None
         try:
