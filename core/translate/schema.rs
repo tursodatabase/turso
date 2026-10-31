@@ -2748,7 +2748,7 @@ pub fn translate_drop_table(
             lhs: seq_table_name_reg,
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default().jump_if_null(),
             collation: CollationSeq::NOCASE,
         });
 
