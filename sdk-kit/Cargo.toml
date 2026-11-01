@@ -8,10 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["encryption", "pure-rust-crypto"]
+default = ["encryption", "pure-rust-crypto", "simd"]
 encryption = ["turso_core/encryption"]
 pure-rust-crypto = ["turso_core/pure-rust-crypto"]
 fts = ["turso_core/fts"]
+simd = ["turso_core/simd"]
 test_helper = ["turso_core/test_helper"]
 
 [lib]
@@ -20,7 +21,8 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 env_logger = { workspace = true, default-features = false }
-turso_core = { workspace = true, features = [
+turso_core = { path = "../core", version = "0.9.0-pre.2", default-features = false, features = [
+    "baseline",
     "conn_raw_api",
     "io_uring",
     "experimental_win_iocp",
