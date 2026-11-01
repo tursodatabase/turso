@@ -245,6 +245,10 @@ fn create_error(status: napi::Status, message: &str) -> napi::Error {
     Error::new(status, message)
 }
 
+// The message better-sqlite3 shows when it refuses a bind type.
+const REFUSED_BIND_TYPE_MESSAGE: &str =
+    "SQLite3 can only bind numbers, strings, bigints, buffers, and null";
+
 fn query_timeout_duration(timeout_ms: u32) -> Option<std::time::Duration> {
     if timeout_ms > 0 {
         Some(std::time::Duration::from_millis(timeout_ms as u64))
@@ -832,13 +836,18 @@ impl Statement {
                     }
                     turso_core::Value::Blob(bytes)
                 } else {
-                    let s = value.coerce_to_string()?.into_utf8()?;
-                    turso_core::Value::Text(s.as_str()?.to_owned().into())
+                    // Refuse the bind: a Date, Map, ArrayBuffer or plain object
+                    // would otherwise store as its toString() output, which
+                    // silently loses the caller's value (better-sqlite3 rejects
+                    // them the same way).
+                    return Err(create_error(Status::InvalidArg, REFUSED_BIND_TYPE_MESSAGE));
                 }
             }
             _ => {
-                let s = value.coerce_to_string()?.into_utf8()?;
-                turso_core::Value::Text(s.as_str()?.to_owned().into())
+                // Date and other objects type as Object, so this arm receives
+                // undefined, symbols, functions and externals, which
+                // better-sqlite3 also refuses to bind.
+                return Err(create_error(Status::InvalidArg, REFUSED_BIND_TYPE_MESSAGE));
             }
         };
 
