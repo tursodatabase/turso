@@ -26,6 +26,8 @@ public class TursoConnectionOptions
 
     public bool Pooling => _builder.Pooling;
 
+    public bool BinaryGuid => _builder.BinaryGuid;
+
     public string DataSource => _builder.DataSource;
 
     public string AuthToken => _builder.AuthToken;

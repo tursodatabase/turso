@@ -116,6 +116,8 @@ public partial class SqliteConnection : DbConnection
 
     internal bool IsSharedCache => _connectionOptions.Cache == SqliteCacheMode.Shared;
 
+    internal bool BinaryGuid => _connectionOptions.BinaryGUID;
+
     internal bool IsManagedConnection => _managedConnection is not null;
 
     private bool HasNativeCallbackHandle =>

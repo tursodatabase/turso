@@ -85,12 +85,23 @@ public class TursoParameter : DbParameter
     public override object? Value { get; set; }
     public override bool SourceColumnNullMapping { get; set; }
 
-    public TursoValue ToValue()
+    /// <summary>
+    /// Converts the parameter to a native value. A <see cref="Guid"/> becomes 36-character TEXT unless
+    /// <see cref="DbType"/> is <see cref="System.Data.DbType.Binary"/>, which makes it a 16-byte BLOB. With the
+    /// connection's Binary GUID option, a <see cref="Guid"/> also becomes a BLOB unless <see cref="DbType"/> is
+    /// <see cref="System.Data.DbType.Guid"/>.
+    /// </summary>
+    public TursoValue ToValue() => ToValue(binaryGuid: false);
+
+    internal TursoValue ToValue(bool binaryGuid)
     {
         if (Value is null)
             return new TursoValue { ValueType = TursoValueType.Null };
 
         var value = Value;
+        if (value is Guid guid && ((binaryGuid && DbType != DbType.Guid) || DbType == DbType.Binary))
+            return TursoValue.Blob(guid.ToByteArray());
+
         var valueType = value.GetType();
         if (valueType.IsEnum)
         {
