@@ -8,8 +8,8 @@ use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, GeneratedType, Schema, SchemaObjectType, Table, Trigger, Type,
-    TypeDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, Schema, SchemaObjectType, Table, Type, TypeDef,
+    SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -28,8 +28,8 @@ use crate::translate::sequence::bind_sequence_names;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
     column_declared_type, dequote, escape_sql_string_literal, is_builtin_strict_type,
-    normalize_ident, quote_identifier, walk_expr_with_subqueries, walk_select_expressions,
-    walk_trigger_cmd_expressions, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    normalize_ident, quote_identifier, walk_expr_with_subqueries, walk_schema_expressions,
+    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
@@ -3431,82 +3431,34 @@ pub fn translate_drop_type(
     Ok(())
 }
 
-/// Describes the first object in `schema` that uses the type, such as a column
-/// of that type or a view that casts to it.
+/// Describes the first object in `schema` that uses the type: a column of
+/// that type, or any stored expression that casts to it.
 fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
     for namespace in schema.namespace_ids() {
         for table in schema.tables(namespace) {
-            if let Some(type_use) = find_type_use_in_table(schema, namespace, table, registry_key)?
-            {
-                return Ok(Some(type_use));
-            }
-        }
-        for index in schema.indexes(namespace) {
-            let index_exprs = index
-                .columns
-                .iter()
-                .filter_map(|column| column.expr.as_deref())
-                .chain(index.where_clause.as_deref());
-            for expr in index_exprs {
-                if expr_casts_to_type(expr, registry_key)? {
-                    return Ok(Some(format!("index {}", index.name)));
+            for column in table.columns() {
+                if type_registry_key(&column.ty_str) == registry_key {
+                    return Ok(Some(format!(
+                        "column {} in table {}",
+                        column.name.as_deref().unwrap_or("?"),
+                        table.get_name()
+                    )));
                 }
             }
         }
-        for (name, view) in schema.views(namespace) {
-            if select_casts_to_type(&view.select_stmt, registry_key)? {
-                return Ok(Some(format!("view {name}")));
-            }
-        }
-        for trigger in schema.triggers(namespace) {
-            if trigger_casts_to_type(trigger, registry_key)? {
-                return Ok(Some(format!("trigger {}", trigger.name)));
-            }
-        }
     }
-    Ok(None)
-}
-
-fn find_type_use_in_table(
-    schema: &Schema,
-    namespace: NamespaceId,
-    table: &Table,
-    registry_key: &str,
-) -> Result<Option<String>> {
-    let table_name = table.get_name();
-    for column in table.columns() {
-        let column_name = column.name.as_deref().unwrap_or("?");
-        if type_registry_key(&column.ty_str) == registry_key {
-            return Ok(Some(format!("column {column_name} in table {table_name}")));
+    let mut type_use = None;
+    walk_schema_expressions(schema, &mut |owner, expr| {
+        if type_use.is_none() && is_cast_to_type(expr, registry_key) {
+            type_use = Some(owner.to_string());
         }
-        if let Some(default) = &column.default {
-            if expr_casts_to_type(default, registry_key)? {
-                return Ok(Some(format!(
-                    "the default of column {column_name} in table {table_name}"
-                )));
-            }
-        }
-        if let GeneratedType::Virtual { expr, .. } = column.generated_type() {
-            if expr_casts_to_type(expr, registry_key)? {
-                return Ok(Some(format!(
-                    "generated column {column_name} in table {table_name}"
-                )));
-            }
-        }
-    }
-    if let Table::BTree(btree) = table {
-        for check in &btree.check_constraints {
-            if expr_casts_to_type(&check.expr, registry_key)? {
-                return Ok(Some(format!("a CHECK constraint in table {table_name}")));
-            }
-        }
-    }
-    if let Some(view) = schema.get_materialized_view(namespace, table_name) {
-        if select_casts_to_type(&view.lock().select_stmt, registry_key)? {
-            return Ok(Some(format!("materialized view {table_name}")));
-        }
-    }
-    Ok(None)
+        Ok(if type_use.is_some() {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })?;
+    Ok(type_use)
 }
 
 fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
@@ -3540,29 +3492,6 @@ fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
         }
     }
     Ok(false)
-}
-
-fn select_casts_to_type(select: &ast::Select, registry_key: &str) -> Result<bool> {
-    let mut found = false;
-    walk_select_expressions(select, &mut |expr| {
-        found |= is_cast_to_type(expr, registry_key);
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(found)
-}
-
-fn trigger_casts_to_type(trigger: &Trigger, registry_key: &str) -> Result<bool> {
-    let mut found = match &trigger.when_clause {
-        Some(when_clause) => expr_casts_to_type(when_clause, registry_key)?,
-        None => false,
-    };
-    for command in &trigger.commands {
-        walk_trigger_cmd_expressions(command, &mut |expr| {
-            found |= is_cast_to_type(expr, registry_key);
-            Ok(WalkControl::Continue)
-        })?;
-    }
-    Ok(found)
 }
 
 fn expr_casts_to_type(expr: &ast::Expr, registry_key: &str) -> Result<bool> {
