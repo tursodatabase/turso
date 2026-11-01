@@ -693,6 +693,7 @@ fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
     resolver: &CatalogContext,
+    is_nested: bool,
 ) -> Result<()> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
         options,
@@ -832,33 +833,40 @@ fn validate(
             }
         }
 
-        let table = create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
-        if !table.has_rowid {
-            if table.has_autoincrement {
-                bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
+        // Rules for new tables only: VACUUM creates the tables the database
+        // already has as nested statements, and those may break these rules.
+        if !is_nested {
+            let mut table =
+                create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
+            if !table.has_rowid {
+                if table.has_autoincrement {
+                    bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
+                }
+                if table.primary_key_columns.is_empty() {
+                    bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
+                }
+                if table.unique_sets.iter().any(|us| !us.is_primary_key) {
+                    bail_parse_error!(
+                        "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
+                    );
+                }
+            } else if table.has_autoincrement {
+                // SQLite allows AUTOINCREMENT only on a key declared exactly as
+                // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size
+                // such as INTEGER(8) and an inline DESC are not. This is checked
+                // here rather than in `create_table` so that databases where older
+                // Turso versions stored such tables still open.
+                let (pk_name, pk_order) = &table.primary_key_columns[0];
+                let is_integer_primary_key = table.get_column(pk_name).is_some_and(|(_, col)| {
+                    col.ty_str.eq_ignore_ascii_case("INTEGER") && col.ty_params.is_empty()
+                }) && !(table.primary_key_is_inline
+                    && *pk_order == ast::SortOrder::Desc);
+                if !is_integer_primary_key {
+                    bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+                }
             }
-            if table.primary_key_columns.is_empty() {
-                bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
-            }
-            if table.unique_sets.iter().any(|us| !us.is_primary_key) {
-                bail_parse_error!(
-                    "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
-                );
-            }
-        } else if table.has_autoincrement {
-            // SQLite allows AUTOINCREMENT only on a key declared exactly as
-            // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size
-            // such as INTEGER(8) and an inline DESC are not. This is checked
-            // here rather than in `create_table` so that databases where older
-            // Turso versions stored such tables still open.
-            let (pk_name, pk_order) = &table.primary_key_columns[0];
-            let is_integer_primary_key = table.get_column(pk_name).is_some_and(|(_, col)| {
-                col.ty_str.eq_ignore_ascii_case("INTEGER") && col.ty_params.is_empty()
-            }) && !(table.primary_key_is_inline
-                && *pk_order == ast::SortOrder::Desc);
-            if !is_integer_primary_key {
-                bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
-            }
+            table.resolve_custom_types(resolver.schema());
+            table.check_collates_are_allowed()?;
         }
     }
     Ok(())
@@ -1222,7 +1230,12 @@ pub fn translate_create_table(
 
     // Like SQLite, the body is only checked when the table is really created,
     // so IF NOT EXISTS on an existing table succeeds whatever the body says.
-    validate(&body, &normalized_tbl_name, &resolver.catalog)?;
+    validate(
+        &body,
+        &normalized_tbl_name,
+        &resolver.catalog,
+        connection.is_nested_stmt(),
+    )?;
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
 

@@ -698,6 +698,23 @@ fn common_ordering(
     Ok(found)
 }
 
+/// How the values of a table or index column compare: the order of its type
+/// when it has one, otherwise the explicit COLLATE, if any. A type with its own
+/// order doesn't accept a COLLATE.
+pub(crate) fn key_collation(
+    explicit_collation: Option<TextCollation>,
+    ordering: Option<TypeOrdering>,
+) -> Result<Option<CollationSeq>> {
+    match (ordering, explicit_collation) {
+        (Some(ordering), Some(_)) => Err(LimboError::ParseError(format!(
+            "collations are not supported by type {}",
+            ordering.name()
+        ))),
+        (Some(ordering), None) => Ok(Some(CollationSeq::Type(ordering))),
+        (None, explicit_collation) => Ok(explicit_collation.map(CollationSeq::Text)),
+    }
+}
+
 fn cannot_compare(a: TypeOrdering, b: TypeOrdering) -> LimboError {
     LimboError::ParseError(format!(
         "cannot compare type {} with type {}",
