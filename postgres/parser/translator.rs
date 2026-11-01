@@ -6968,13 +6968,13 @@ pub fn try_extract_copy_from(
     }))
 }
 
-/// A statement that the PostgreSQL session runs itself instead of
+/// A statement that the PostgreSQL frontend runs itself instead of
 /// translating it: the translator refuses all of these. One variant per kind,
 /// so that callers which must decide something for each of them (the
-/// session runs them, a server classifies them) match it exhaustively and a
+/// frontend runs them, a server classifies them) match it exhaustively and a
 /// new kind is a compile error there instead of a statement that falls
 /// through.
-pub enum SessionStmt {
+pub enum FrontendStmt {
     /// SET, SET ... TO DEFAULT, SET ... FROM CURRENT or RESET of one parameter.
     Set(PgSetStmt),
     /// SET TRANSACTION or SET SESSION CHARACTERISTICS AS TRANSACTION.
@@ -6987,40 +6987,47 @@ pub enum SessionStmt {
     RefreshMatview,
     CommentOn,
     CopyFrom(PgCopyFromStmt),
+    CopyTo(crate::copy::CopyToStdout),
 }
 
-/// The statement of `parse_result` if the session runs it itself, `None` if
+/// The statement of `parse_result` if the frontend runs it itself, `None` if
 /// it is translated.
-pub fn session_stmt(parse_result: &ParseResult) -> Result<Option<SessionStmt>, ParseError> {
+pub fn frontend_stmt(
+    sql: &str,
+    parse_result: &ParseResult,
+) -> Result<Option<FrontendStmt>, ParseError> {
     if let Some(stmt) = try_extract_set(parse_result) {
-        return Ok(Some(SessionStmt::Set(stmt)));
+        return Ok(Some(FrontendStmt::Set(stmt)));
     }
     if check_set_transaction(parse_result)? {
-        return Ok(Some(SessionStmt::SetTransaction));
+        return Ok(Some(FrontendStmt::SetTransaction));
     }
     if let Some(stmt) = try_extract_show(parse_result) {
-        return Ok(Some(SessionStmt::Show(stmt)));
+        return Ok(Some(FrontendStmt::Show(stmt)));
     }
     if is_reset_all(parse_result) {
-        return Ok(Some(SessionStmt::ResetAll));
+        return Ok(Some(FrontendStmt::ResetAll));
     }
     if is_discard_all(parse_result) {
-        return Ok(Some(SessionStmt::DiscardAll));
+        return Ok(Some(FrontendStmt::DiscardAll));
     }
     if let Some(stmt) = try_extract_create_schema(parse_result)? {
-        return Ok(Some(SessionStmt::CreateSchema(stmt)));
+        return Ok(Some(FrontendStmt::CreateSchema(stmt)));
     }
     if let Some(stmt) = try_extract_drop_schema(parse_result) {
-        return Ok(Some(SessionStmt::DropSchema(stmt)));
+        return Ok(Some(FrontendStmt::DropSchema(stmt)));
     }
     if is_refresh_matview(parse_result)? {
-        return Ok(Some(SessionStmt::RefreshMatview));
+        return Ok(Some(FrontendStmt::RefreshMatview));
     }
     if is_comment_on(parse_result) {
-        return Ok(Some(SessionStmt::CommentOn));
+        return Ok(Some(FrontendStmt::CommentOn));
     }
     if let Some(stmt) = try_extract_copy_from(parse_result)? {
-        return Ok(Some(SessionStmt::CopyFrom(stmt)));
+        return Ok(Some(FrontendStmt::CopyFrom(stmt)));
+    }
+    if let Some(stmt) = crate::copy::try_extract_copy_to_stdout(sql, parse_result)? {
+        return Ok(Some(FrontendStmt::CopyTo(stmt)));
     }
     Ok(None)
 }
@@ -7734,20 +7741,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_stmt_names_each_kind_the_session_runs() {
+    fn frontend_stmt_names_each_kind_the_frontend_runs() {
         let kind = |sql: &str| {
             let parsed = crate::parse(sql).unwrap();
-            session_stmt(&parsed).unwrap().map(|stmt| match stmt {
-                SessionStmt::Set(_) => "set",
-                SessionStmt::SetTransaction => "set transaction",
-                SessionStmt::Show(_) => "show",
-                SessionStmt::ResetAll => "reset all",
-                SessionStmt::DiscardAll => "discard all",
-                SessionStmt::CreateSchema(_) => "create schema",
-                SessionStmt::DropSchema(_) => "drop schema",
-                SessionStmt::RefreshMatview => "refresh matview",
-                SessionStmt::CommentOn => "comment on",
-                SessionStmt::CopyFrom(_) => "copy from",
+            frontend_stmt(sql, &parsed).unwrap().map(|stmt| match stmt {
+                FrontendStmt::Set(_) => "set",
+                FrontendStmt::SetTransaction => "set transaction",
+                FrontendStmt::Show(_) => "show",
+                FrontendStmt::ResetAll => "reset all",
+                FrontendStmt::DiscardAll => "discard all",
+                FrontendStmt::CreateSchema(_) => "create schema",
+                FrontendStmt::DropSchema(_) => "drop schema",
+                FrontendStmt::RefreshMatview => "refresh matview",
+                FrontendStmt::CommentOn => "comment on",
+                FrontendStmt::CopyFrom(_) => "copy from",
+                FrontendStmt::CopyTo(_) => "copy to",
             })
         };
         for (sql, want) in [
@@ -7765,6 +7773,7 @@ mod tests {
             ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
             ("COMMENT ON TABLE t IS 'x'", "comment on"),
             ("COPY t FROM '/tmp/t.csv'", "copy from"),
+            ("COPY t TO STDOUT", "copy to"),
         ] {
             assert_eq!(kind(sql), Some(want), "{sql}");
         }
