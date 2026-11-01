@@ -37,7 +37,8 @@ use crate::{
     util::{
         check_expr_references_column, escape_sql_string_literal, is_builtin_strict_type,
         normalize_ident, parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
-        rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+        rewrite_trigger_cmd_table_refs, rewrite_view_for_table_rename,
+        rewrite_view_sql_for_column_rename,
     },
     vdbe::{
         affinity::Affinity,
@@ -817,6 +818,7 @@ pub fn translate_alter_table(
                 new_name_norm,
                 resolver,
                 connection,
+                input,
                 namespace,
             );
         }
@@ -1607,7 +1609,17 @@ pub fn translate_alter_table(
                 }
             }
 
-            let temp_schema_version = if !temp_triggers_to_rewrite.is_empty() {
+            let temp_views_to_rewrite = temp_views_for_table_rename(
+                resolver,
+                connection,
+                namespace,
+                &normalized_old_name,
+                new_name,
+            )?;
+
+            let temp_schema_version = if !temp_triggers_to_rewrite.is_empty()
+                || !temp_views_to_rewrite.is_empty()
+            {
                 let schema_cookie = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
                 program.begin_write_on_database(crate::TEMP_DB_ID, schema_cookie)?;
                 Some(schema_cookie)
@@ -1766,6 +1778,18 @@ pub fn translate_alter_table(
                 )?;
             }
 
+            for (view_name, new_sql) in temp_views_to_rewrite {
+                emit_view_sql_update(
+                    program,
+                    resolver,
+                    connection,
+                    input,
+                    crate::TEMP_DB_ID,
+                    &view_name,
+                    &new_sql,
+                )?;
+            }
+
             if let Some(temp_schema_version) = temp_schema_version {
                 program.emit_insn(Insn::SetCookie {
                     db: crate::TEMP_DB_ID,
@@ -1787,6 +1811,11 @@ pub fn translate_alter_table(
                 namespace: namespace.id,
                 from: table_name.to_owned(),
                 to: new_name.to_owned(),
+                temp_unqualified_names_table: temp_unqualified_name_is_table(
+                    resolver,
+                    &normalized_old_name,
+                    namespace,
+                )?,
             });
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
@@ -2269,35 +2298,14 @@ pub fn translate_alter_table(
 
             // Update view SQL for renamed columns
             for (view_database_id, view_name, new_sql) in views_to_rewrite {
-                let escaped_sql = escape_sql_string_literal(&new_sql);
-                let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
-                let update_stmt = format!(
-                    r#"
-                        UPDATE {view_schema_table}
-                        SET sql = '{escaped_sql}'
-                        WHERE name = '{view_name}' COLLATE NOCASE AND type = 'view'
-                    "#,
-                );
-
-                let mut parser = Parser::new(update_stmt.as_bytes());
-                let cmd = parser.next_cmd().map_err(|e| {
-                    LimboError::ParseError(format!(
-                        "failed to parse view update SQL for {view_name}: {e}"
-                    ))
-                })?;
-                let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
-                    return Err(LimboError::ParseError(format!(
-                        "failed to parse view update SQL for {view_name}",
-                    )));
-                };
-
-                translate_update_for_schema_change(
-                    update,
-                    resolver,
+                emit_view_sql_update(
                     program,
+                    resolver,
                     connection,
                     input,
-                    |_program| {},
+                    view_database_id,
+                    &view_name,
+                    &new_sql,
                 )?;
             }
 
@@ -2895,6 +2903,7 @@ fn non_virtual_affinity_str(table: &BTreeTable) -> String {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn translate_rename_virtual_table(
     program: &mut ProgramBuilder,
     vtab: Arc<VirtualTable>,
@@ -2902,6 +2911,7 @@ fn translate_rename_virtual_table(
     new_name_norm: String,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
+    input: &str,
     namespace: NamespaceRef,
 ) -> Result<()> {
     let database_id = namespace.database_id;
@@ -2988,6 +2998,36 @@ fn translate_rename_virtual_table(
         });
     });
 
+    let normalized_old_name = normalize_ident(old_name);
+    let temp_views_to_rewrite = temp_views_for_table_rename(
+        resolver,
+        connection,
+        namespace,
+        &normalized_old_name,
+        &new_name_norm,
+    )?;
+    if !temp_views_to_rewrite.is_empty() {
+        let temp_schema_version = resolver.with_schema(crate::TEMP_DB_ID, |s| s.schema_version);
+        program.begin_write_on_database(crate::TEMP_DB_ID, temp_schema_version)?;
+        for (view_name, new_sql) in temp_views_to_rewrite {
+            emit_view_sql_update(
+                program,
+                resolver,
+                connection,
+                input,
+                crate::TEMP_DB_ID,
+                &view_name,
+                &new_sql,
+            )?;
+        }
+        program.emit_insn(Insn::SetCookie {
+            db: crate::TEMP_DB_ID,
+            cookie: Cookie::SchemaVersion,
+            value: temp_schema_version as i32 + 1,
+            p5: 0,
+        });
+    }
+
     // Bump schema cookie
     program.emit_insn(Insn::SetCookie {
         db: database_id,
@@ -3001,6 +3041,11 @@ fn translate_rename_virtual_table(
         namespace: namespace.id,
         from: old_name.to_owned(),
         to: new_name_norm,
+        temp_unqualified_names_table: temp_unqualified_name_is_table(
+            resolver,
+            &normalized_old_name,
+            namespace,
+        )?,
     });
 
     program.emit_insn(Insn::Close {
@@ -3011,6 +3056,99 @@ fn translate_rename_virtual_table(
     });
 
     Ok(())
+}
+
+/// The TEMP views that read the table `normalized_old_name` of `namespace`,
+/// with their SQL after it is renamed to `new_name`.
+fn temp_views_for_table_rename(
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    namespace: NamespaceRef,
+    normalized_old_name: &str,
+    new_name: &str,
+) -> Result<Vec<(String, String)>> {
+    let database_id = namespace.database_id;
+    if database_id == crate::TEMP_DB_ID {
+        return Ok(Vec::new());
+    }
+    let renamed_db_name = resolver
+        .namespace_name(database_id)
+        .map(|name| normalize_ident(&name))
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "unknown database id {database_id} during ALTER TABLE"
+            ))
+        })?;
+    let unqualified_names_table =
+        temp_unqualified_name_is_table(resolver, normalized_old_name, namespace)?;
+    resolver.with_schema(crate::TEMP_DB_ID, |s| {
+        let mut rewrites = Vec::new();
+        for (view_name, view) in s.views(NamespaceId::ROOT) {
+            let Some(ast::Cmd::Stmt(stmt)) = connection.dialect().parse(&view.sql)?.0 else {
+                continue;
+            };
+            if let Some((new_sql, _)) = rewrite_view_for_table_rename(
+                stmt,
+                normalized_old_name,
+                new_name,
+                unqualified_names_table,
+                Some(std::slice::from_ref(&renamed_db_name)),
+            ) {
+                rewrites.push((view_name.to_string(), new_sql));
+            }
+        }
+        Ok(rewrites)
+    })
+}
+
+/// Whether a name without a qualifier in a TEMP view means the table
+/// `table_name` of `namespace`.
+fn temp_unqualified_name_is_table(
+    resolver: &Resolver,
+    table_name: &str,
+    namespace: NamespaceRef,
+) -> Result<bool> {
+    let found = resolver.resolve_unqualified_existing(table_name, |schema, namespace, name| {
+        schema.get_table(namespace, name).is_some()
+            || schema.get_view(namespace, name).is_some()
+            || schema.get_materialized_view(namespace, name).is_some()
+    })?;
+    Ok(found == namespace)
+}
+
+fn emit_view_sql_update(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    input: &str,
+    view_database_id: usize,
+    view_name: &str,
+    new_sql: &str,
+) -> Result<()> {
+    let escaped_sql = escape_sql_string_literal(new_sql);
+    let escaped_view_name = escape_sql_string_literal(view_name);
+    let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
+    let update_stmt = format!(
+        r#"
+            UPDATE {view_schema_table}
+            SET sql = '{escaped_sql}'
+            WHERE name = '{escaped_view_name}' COLLATE NOCASE AND type = 'view'
+        "#,
+    );
+
+    let mut parser = Parser::new(update_stmt.as_bytes());
+    let cmd = parser.next_cmd().map_err(|e| {
+        LimboError::ParseError(format!(
+            "failed to parse view update SQL for {view_name}: {e}"
+        ))
+    })?;
+    let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
+        return Err(LimboError::ParseError(format!(
+            "failed to parse view update SQL for {view_name}",
+        )));
+    };
+
+    translate_update_for_schema_change(update, resolver, program, connection, input, |_program| {})
 }
 
 /* Triggers must be rewritten when a column is renamed, and DROP COLUMN on table T must be forbidden if any trigger on T references the column.
