@@ -14,6 +14,10 @@ name = "stack-report"
 path = "src/stack_report.rs"
 
 [[bin]]
+name = "mvcc-row-memory"
+path = "src/mvcc_row_memory.rs"
+
+[[bin]]
 name = "fts-memory"
 path = "src/fts_memory.rs"
 required-features = ["fts"]

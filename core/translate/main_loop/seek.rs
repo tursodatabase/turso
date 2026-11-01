@@ -1,4 +1,6 @@
 use super::*;
+use crate::translate::expr::expr_type::TypeEnv;
+use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::NullsOrder;
@@ -18,7 +20,7 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
         .collect()
 }
 
-fn encode_seek_keys_for_custom_types(
+pub(super) fn encode_seek_keys_for_custom_types(
     program: &mut ProgramBuilder,
     tables: &TableReferences,
     seek_index: &Arc<Index>,
@@ -41,6 +43,10 @@ fn encode_seek_keys_for_custom_types(
             break;
         }
         let idx_col = &seek_index.columns[idx_col_pos];
+        // An expression column holds the expression's value, not the column's.
+        if idx_col.expr.is_some() {
+            continue;
+        }
         let table_col = match columns.get(idx_col.pos_in_table) {
             Some(c) => c,
             None => continue,
@@ -51,9 +57,24 @@ fn encode_seek_keys_for_custom_types(
         else {
             continue;
         };
-        if resolved.chain.iter().all(|td| td.encode().is_none()) {
+        // A scan compares the key with the decoded column value. When DECODE
+        // returns the stored value unchanged and the dialect compares strings
+        // as they are, the key is compared as it is, so the seek must not
+        // encode it either. A dialect that converts strings to the column's
+        // type (PostgreSQL: `time_col = '12:00'`) needs the key encoded.
+        let compares_key_as_it_is = !resolver
+            .catalog
+            .dialect
+            .converts_strings_compared_with_custom_types();
+        if (compares_key_as_it_is && resolved.reads_stored_values_unchanged())
+            || resolved.chain.iter().all(|td| td.encode().is_none())
+        {
             continue;
         }
+        // The index holds encoded values, so the key is encoded too. COERCE
+        // does not run: the column's limits apply to what it stores, not to
+        // what it is compared with. `n = 3.504` on a numeric(10,2) column
+        // matches no row instead of matching 3.50.
         let reg = start_reg + i;
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IsNull {
@@ -62,15 +83,7 @@ fn encode_seek_keys_for_custom_types(
         });
         for td in &resolved.chain {
             if let Some(encode_expr) = td.encode() {
-                crate::translate::expr::emit_type_expr(
-                    program,
-                    encode_expr,
-                    reg,
-                    reg,
-                    table_col,
-                    td,
-                    resolver,
-                )?;
+                crate::translate::expr::emit_type_expr(program, encode_expr, reg, reg, resolver)?;
             }
         }
         program.preassign_label_to_next_insn(skip_label);
@@ -184,8 +197,10 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     // soon as one shows up. `IS` matches NULL instead: keep the
                     // NULL in the seek register and let the index comparison
                     // find the rows whose key component is NULL.
-                    if !expr.is_nonnull(self.tables)
-                        && !self.seek_def.is_null_matching_key_component(i)
+                    if !expr.is_nonnull(
+                        &TableMetadata::new(Some(self.tables)),
+                        &TypeEnv::new(Some(self.tables), &self.t_ctx.resolver),
+                    ) && !self.seek_def.is_null_matching_key_component(i)
                     {
                         self.program.emit_insn(Insn::IsNull {
                             reg,
@@ -357,7 +372,10 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         });
                     }
                 }
-                if !expr.is_nonnull(self.tables) {
+                if !expr.is_nonnull(
+                    &TableMetadata::new(Some(self.tables)),
+                    &TypeEnv::new(Some(self.tables), &self.t_ctx.resolver),
+                ) {
                     self.program.emit_insn(Insn::IsNull {
                         reg: last_reg,
                         target_pc: self.loop_end,
@@ -428,7 +446,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::for_internal_values(),
             }),
             (false, SeekOp::GT) => self.program.emit_insn(Insn::Gt {
                 lhs: rowid_reg.unwrap(),
@@ -437,7 +455,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::for_internal_values(),
             }),
             (false, SeekOp::LE { .. }) => self.program.emit_insn(Insn::Le {
                 lhs: rowid_reg.unwrap(),
@@ -446,7 +464,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::for_internal_values(),
             }),
             (false, SeekOp::LT) => self.program.emit_insn(Insn::Lt {
                 lhs: rowid_reg.unwrap(),
@@ -455,7 +473,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 flags: CmpInsFlags::default()
                     .jump_if_null()
                     .with_affinity(affinity.unwrap()),
-                collation: self.program.curr_collation(),
+                collation: CollationSeq::for_internal_values(),
             }),
         }
         Ok(())

@@ -14,7 +14,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-`--SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+`--SEARCH t USING INTEGER PRIMARY KEY (rowid<?)
    `--CORRELATED SCALAR SUBQUERY 1
       `--SCAN t
 
@@ -26,7 +26,7 @@ addr  opcode         p1  p2  p3  p4          p5  comment
    3  Rewind          1  43   0               0  Rewind table t
    4  Integer         3   2   0               0  r[2]=3
    5    RowId         1   3   0               0  r[3]=t.rowid
-   6    Ge            3   2  43               0  if r[3]>=r[2] goto 43
+   6    Ge            3   2  43  Binary       0  if r[3]>=r[2] goto 43
    7    RowId         1   4   0               0  r[4]=t.rowid
    8    IsNull        4  43   0               0  if (r[4]==NULL) goto 43
    9    Null          0   5   0               0  r[5]=NULL

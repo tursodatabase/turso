@@ -31,7 +31,13 @@ DROP TYPE removes the named custom type from the database. The type must exist u
 
 ### Restrictions
 
-A type cannot be dropped while any table column uses it. All columns of that type must be removed or the table must be dropped before the type can be dropped.
+A type cannot be dropped while anything in the schema uses it:
+
+- a table column of that type
+- an expression that casts to it (`CAST(x AS type-name)`) in an expression index, a partial index, a CHECK constraint, a generated column, a column default, a view, a materialized view or a trigger
+- another type or domain based on it, with a field of that type, or with an expression that casts to it
+
+Remove those objects before dropping the type.
 
 ```sql
 CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -43,7 +49,7 @@ CREATE TABLE prices (
 
 -- This fails because the 'prices' table has a column of type 'cents'
 DROP TYPE cents;
--- Error: type 'cents' is in use
+-- Error: cannot drop type cents: used by column amount in table prices
 
 -- Drop the table first, then the type
 DROP TABLE prices;

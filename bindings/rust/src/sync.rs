@@ -123,7 +123,7 @@ pub struct Builder {
     enable_index_method: bool,
     enable_materialized_views: bool,
     enable_vacuum: bool,
-    enable_generated_columns: bool,
+    enable_autovacuum: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
 }
@@ -147,7 +147,7 @@ impl Builder {
             enable_index_method: false,
             enable_materialized_views: false,
             enable_vacuum: false,
-            enable_generated_columns: false,
+            enable_autovacuum: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
         }
@@ -192,11 +192,15 @@ impl Builder {
         self
     }
 
-    /// Enable the experimental `generated_columns` engine feature for the
-    /// synced database. Mirrors the local
-    /// [`crate::Builder::experimental_generated_columns`].
-    pub fn experimental_generated_columns(mut self, enable: bool) -> Self {
-        self.enable_generated_columns = enable;
+    /// Enable the experimental `autovacuum` engine feature for the synced database.
+    /// Mirrors the local [`crate::Builder::experimental_autovacuum`].
+    pub fn experimental_autovacuum(mut self, enable: bool) -> Self {
+        self.enable_autovacuum = enable;
+        self
+    }
+
+    /// Kept for backwards compatibility. Generated columns are now always enabled.
+    pub fn experimental_generated_columns(self, _enable: bool) -> Self {
         self
     }
 
@@ -328,8 +332,8 @@ impl Builder {
         if self.enable_vacuum {
             features.push("vacuum");
         }
-        if self.enable_generated_columns {
-            features.push("generated_columns");
+        if self.enable_autovacuum {
+            features.push("autovacuum");
         }
         if self.enable_multiprocess_wal {
             features.push("multiprocess_wal");
@@ -1067,6 +1071,14 @@ mod tests {
             None
         );
 
+        // Generated columns are always enabled, so the method adds nothing.
+        assert_eq!(
+            Builder::new_remote(":memory:")
+                .experimental_generated_columns(true)
+                .experimental_features_string(),
+            None
+        );
+
         // A single feature.
         assert_eq!(
             Builder::new_remote(":memory:")
@@ -1085,13 +1097,13 @@ mod tests {
                 .experimental_index_method(true)
                 .experimental_materialized_views(true)
                 .experimental_vacuum(true)
-                .experimental_generated_columns(true)
+                .experimental_autovacuum(true)
                 .experimental_multiprocess_wal(true)
                 .experimental_without_rowid(true)
                 .experimental_features_string()
                 .as_deref(),
             Some(
-                "attach,custom_types,index_method,views,vacuum,generated_columns,multiprocess_wal,without_rowid"
+                "attach,custom_types,index_method,views,vacuum,autovacuum,multiprocess_wal,without_rowid"
             )
         );
     }
@@ -1848,7 +1860,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "flaky, see https://github.com/tursodatabase/turso/issues/7087"]
     pub async fn test_sync_parallel_writes_with_sync_ops() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -1946,12 +1957,24 @@ mod tests {
         // Sequential writes: 3 more large inserts
         for i in 0..after_cnt {
             let data = format!("sequential_{i}_{payload}");
-            conn.execute(
-                "INSERT INTO test_data (payload) VALUES (?)",
-                crate::params::Params::Positional(vec![Value::Text(data)]),
-            )
-            .await
-            .unwrap();
+            // A running pull or checkpoint makes inserts fail with Busy right away.
+            loop {
+                let result = conn
+                    .execute(
+                        "INSERT INTO test_data (payload) VALUES (?)",
+                        crate::params::Params::Positional(vec![Value::Text(data.clone())]),
+                    )
+                    .await;
+                match result {
+                    Err(crate::Error::Busy(_)) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    result => {
+                        result.unwrap();
+                        break;
+                    }
+                }
+            }
         }
 
         // Signal sync task to stop and wait for it

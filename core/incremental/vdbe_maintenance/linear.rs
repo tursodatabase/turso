@@ -35,12 +35,13 @@ pub(super) fn emit_filter(
     )?;
 
     let syms = connection.syms.read();
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -69,13 +70,7 @@ pub(super) fn emit_filter(
         pc_if_empty: end_label,
     });
     program.preassign_label_to_next_insn(loop_label);
-    seed_ephemeral_stream_cache(
-        program,
-        input,
-        &binding_remap,
-        &table_references,
-        &mut resolver,
-    )?;
+    seed_ephemeral_stream_cache(program, input, &binding_remap, &mut resolver)?;
     let bound_predicate = remap_bound_expr(predicate, &binding_remap)?;
     translate_condition_expr(
         program,
@@ -387,12 +382,13 @@ fn emit_project_rows(
     );
 
     let syms = connection.syms.read();
+    let qualifiers = connection.qualifiers(schema);
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
         &connection.temp.database,
         connection.attached_databases(),
-        connection.namespaces(),
+        &qualifiers,
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
@@ -408,13 +404,7 @@ fn emit_project_rows(
         pc_if_empty: end_label,
     });
     program.preassign_label_to_next_insn(loop_label);
-    seed_ephemeral_stream_cache(
-        program,
-        input,
-        &binding_remap,
-        &table_references,
-        &mut resolver,
-    )?;
+    seed_ephemeral_stream_cache(program, input, &binding_remap, &mut resolver)?;
 
     turso_assert!(
         output.identity == input.identity

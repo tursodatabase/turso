@@ -1,4 +1,5 @@
 use super::*;
+use std::borrow::Cow;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn binary_expr_shared(
@@ -80,13 +81,34 @@ fn emit_row_valued_binary_expr(
         e1,
         e2,
         referenced_tables,
-        Some(resolver),
+        resolver,
     )?;
 
     if let BinaryEmitMode::Condition(metadata) = emit_mode {
         emit_cond_jump(program, metadata, target_register);
     }
     Ok(target_register)
+}
+
+/// Function instructions read contiguous registers start_reg..start_reg+arg_count.
+/// When both operands are equivalent the compiler reuses a single shared register,
+/// so copy it into a contiguous pair.
+fn contiguous_operands(program: &mut ProgramBuilder, lhs: usize, rhs: usize) -> usize {
+    if lhs != rhs {
+        return lhs;
+    }
+    let regs = program.alloc_registers(2);
+    program.emit_insn(Insn::Copy {
+        src_reg: lhs,
+        dst_reg: regs,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: lhs,
+        dst_reg: regs + 1,
+        extra_amount: 0,
+    });
+    regs
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -117,7 +139,7 @@ pub(super) fn emit_binary_expr_scalar(
                 e1,
                 e2,
                 referenced_tables,
-                Some(resolver),
+                resolver,
             )?,
             BinaryEmitMode::Condition(metadata) => emit_binary_condition_insn(
                 program,
@@ -129,52 +151,16 @@ pub(super) fn emit_binary_expr_scalar(
                 e2,
                 referenced_tables,
                 metadata,
-                Some(resolver),
+                resolver,
             )?,
-        }
-        if op.is_comparison() {
-            program.reset_collation();
         }
         Ok(target_register)
     } else {
         let e1_reg = program.alloc_registers(2);
         let e2_reg = e1_reg + 1;
 
-        program.reset_collation();
         translate_expr(program, referenced_tables, e1, e1_reg, resolver)?;
-        let left_collation_ctx = program.curr_collation_ctx();
-
-        program.reset_collation();
         translate_expr(program, referenced_tables, e2, e2_reg, resolver)?;
-        let right_collation_ctx = program.curr_collation_ctx();
-
-        /*
-         * The rules for determining which collating function to use for a binary comparison
-         * operator (=, <, >, <=, >=, !=, IS, and IS NOT) are as follows:
-         *
-         * 1. If either operand has an explicit collating function assignment using the postfix COLLATE operator,
-         * then the explicit collating function is used for comparison,
-         * with precedence to the collating function of the left operand.
-         *
-         * 2. If either operand is a column, then the collating function of that column is used
-         * with precedence to the left operand. For the purposes of the previous sentence,
-         * a column name preceded by one or more unary "+" operators and/or CAST operators is still considered a column name.
-         *
-         * 3. Otherwise, the BINARY collating function is used for comparison.
-         */
-        let collation_ctx = {
-            match (left_collation_ctx, right_collation_ctx) {
-                (Some((c_left, true)), _) => Some((c_left, true)),
-                (_, Some((c_right, true))) => Some((c_right, true)),
-                (Some((c_left, from_collate_left)), None) => Some((c_left, from_collate_left)),
-                (None, Some((c_right, from_collate_right))) => Some((c_right, from_collate_right)),
-                (Some((c_left, from_collate_left)), Some((_, false))) => {
-                    Some((c_left, from_collate_left))
-                }
-                _ => None,
-            }
-        };
-        program.set_collation(collation_ctx);
 
         match emit_mode {
             BinaryEmitMode::Value => emit_binary_insn(
@@ -186,7 +172,7 @@ pub(super) fn emit_binary_expr_scalar(
                 e1,
                 e2,
                 referenced_tables,
-                Some(resolver),
+                resolver,
             )?,
             BinaryEmitMode::Condition(metadata) => emit_binary_condition_insn(
                 program,
@@ -198,16 +184,8 @@ pub(super) fn emit_binary_expr_scalar(
                 e2,
                 referenced_tables,
                 metadata,
-                Some(resolver),
+                resolver,
             )?,
-        }
-        // Only reset collation for comparison operators, which consume it.
-        // Non-comparison operators (Concat, Add, etc.) must propagate the
-        // collation to the parent expression so that e.g.
-        //   (name COLLATE NOCASE || '') <> 'admin'
-        // correctly applies NOCASE to the Ne comparison.
-        if op.is_comparison() {
-            program.reset_collation();
         }
         Ok(target_register)
     }
@@ -224,13 +202,14 @@ pub(super) fn emit_binary_expr_row_valued(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
+    resolver: &Resolver,
 ) -> Result<()> {
     enum RowOrderingOp {
         Less,
         Greater,
     }
 
+    let metadata = ExprContext::new(referenced_tables, resolver);
     let mut emit_eq = |result_reg: usize, null_eq: bool| -> Result<()> {
         let null_seen_reg = if null_eq {
             None
@@ -246,13 +225,8 @@ pub(super) fn emit_binary_expr_row_valued(
         let done_label = program.allocate_label();
         for i in 0..arity {
             let next_label = program.allocate_label();
-            let (affinity, collation) = row_component_affinity_collation(
-                lhs_expr,
-                rhs_expr,
-                i,
-                referenced_tables,
-                resolver,
-            )?;
+            let (affinity, collation) =
+                row_component_affinity_collation(lhs_expr, rhs_expr, i, &metadata)?;
             program.emit_insn(Insn::Eq {
                 lhs: lhs_start + i,
                 rhs: rhs_start + i,
@@ -324,13 +298,8 @@ pub(super) fn emit_binary_expr_row_valued(
             let null_result_label = program.allocate_label();
             for i in 0..arity {
                 let next_cmp_label = program.allocate_label();
-                let (aff, collation) = row_component_affinity_collation(
-                    lhs_expr,
-                    rhs_expr,
-                    i,
-                    referenced_tables,
-                    resolver,
-                )?;
+                let (aff, collation) =
+                    row_component_affinity_collation(lhs_expr, rhs_expr, i, &metadata)?;
                 let lhs = lhs_start + i;
                 let rhs = rhs_start + i;
                 program.emit_insn(Insn::IsNull {
@@ -429,42 +398,51 @@ pub(super) fn invert_boolean_register(program: &mut ProgramBuilder, target_regis
     });
 }
 
-pub(super) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Option<&Expr>> {
-    match unwrap_parens(expr)? {
-        Expr::Parenthesized(exprs) if exprs.len() > 1 => Ok(exprs.get(idx).map(Box::as_ref)),
-        _ => Ok(None),
-    }
-}
-
 pub(super) fn row_component_affinity_collation(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     idx: usize,
-    referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
-) -> Result<(Affinity, Option<CollationSeq>)> {
-    // If one side is a decomposable row literal and the other is not, still prefer
-    // the component that is available instead of falling back both sides.
-    // TODO: when both sides are non-decomposable row sources (e.g. subquery row-values),
-    // this falls back to whole-expression affinity/collation and cannot distinguish
-    // per-component metadata.
-    let lhs_for_cmp = row_value_component_expr(lhs_expr, idx)?.unwrap_or(lhs_expr);
-    let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?.unwrap_or(rhs_expr);
+    metadata: &ExprContext<'_, '_>,
+) -> Result<(Affinity, CollationSeq)> {
+    let lhs_for_cmp = row_value_component_expr(lhs_expr, idx)?;
+    let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?;
     Ok((
-        comparison_affinity(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver),
-        comparison_collation(lhs_for_cmp, rhs_for_cmp, referenced_tables, resolver)?,
+        comparison_affinity(&*lhs_for_cmp, &*rhs_for_cmp, metadata),
+        comparison_collation(&lhs_for_cmp, &rhs_for_cmp, metadata)?,
     ))
 }
 
-pub(super) fn comparison_collation(
-    lhs_expr: &Expr,
-    rhs_expr: &Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
-) -> Result<Option<CollationSeq>> {
-    let empty_tables = TableReferences::default();
-    let tables = referenced_tables.unwrap_or(&empty_tables);
-    resolve_comparison_collseq_with_resolver(lhs_expr, rhs_expr, tables, resolver)
+/// Component `idx` of a row value: an element of `(a, b)`, or one column of a
+/// row subquery's result, so each component compares with its own type. A
+/// subquery column does not bring its text collation. Any other expression
+/// stands for itself.
+fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
+    match unwrap_parens(expr)? {
+        Expr::Parenthesized(exprs) if exprs.len() > 1 => {
+            Ok(exprs.get(idx).map_or(Cow::Borrowed(expr), |component| {
+                Cow::Borrowed(component.as_ref())
+            }))
+        }
+        Expr::SubqueryResult {
+            subquery_id,
+            lhs: None,
+            not_in,
+            query_type:
+                ast::SubqueryType::RowValue {
+                    result_reg_start,
+                    num_regs,
+                },
+        } if *num_regs > 1 && idx < *num_regs => Ok(Cow::Owned(Expr::SubqueryResult {
+            subquery_id: *subquery_id,
+            lhs: None,
+            not_in: *not_in,
+            query_type: ast::SubqueryType::RowValue {
+                result_reg_start: result_reg_start + idx,
+                num_regs: 1,
+            },
+        })),
+        _ => Ok(Cow::Borrowed(expr)),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -477,22 +455,15 @@ pub(super) fn emit_binary_insn(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
-    resolver: Option<&Resolver>,
+    resolver: &Resolver,
 ) -> Result<()> {
+    let metadata = ExprContext::new(referenced_tables, resolver);
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
-        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, resolver);
+        affinity = comparison_affinity(lhs_expr, rhs_expr, &metadata);
     }
-    let is_array_cmp =
-        expr_is_array(lhs_expr, referenced_tables) && expr_is_array(rhs_expr, referenced_tables);
-    let cmp_flags = || {
-        let f = CmpInsFlags::default().with_affinity(affinity);
-        if is_array_cmp {
-            f.array_cmp()
-        } else {
-            f
-        }
-    };
+    let collation = || comparison_collation(lhs_expr, rhs_expr, &metadata);
+    let cmp_flags = || CmpInsFlags::default().with_affinity(affinity);
 
     match op {
         ast::Operator::NotEquals => {
@@ -504,7 +475,7 @@ pub(super) fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: cmp_flags(),
-                    collation: program.curr_collation(),
+                    collation: collation()?,
                 },
                 target_register,
                 if_true_label,
@@ -521,7 +492,7 @@ pub(super) fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: cmp_flags(),
-                    collation: program.curr_collation(),
+                    collation: collation()?,
                 },
                 target_register,
                 if_true_label,
@@ -538,7 +509,7 @@ pub(super) fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: cmp_flags(),
-                    collation: program.curr_collation(),
+                    collation: collation()?,
                 },
                 target_register,
                 if_true_label,
@@ -555,7 +526,7 @@ pub(super) fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: cmp_flags(),
-                    collation: program.curr_collation(),
+                    collation: collation()?,
                 },
                 target_register,
                 if_true_label,
@@ -572,7 +543,7 @@ pub(super) fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: cmp_flags(),
-                    collation: program.curr_collation(),
+                    collation: collation()?,
                 },
                 target_register,
                 if_true_label,
@@ -589,7 +560,7 @@ pub(super) fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: cmp_flags(),
-                    collation: program.curr_collation(),
+                    collation: collation()?,
                 },
                 target_register,
                 if_true_label,
@@ -683,7 +654,7 @@ pub(super) fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: CmpInsFlags::default().null_eq().with_affinity(affinity),
-                    collation: program.curr_collation(),
+                    collation: collation()?,
                 },
                 target_register,
                 if_true_label,
@@ -698,7 +669,7 @@ pub(super) fn emit_binary_insn(
                     rhs,
                     target_pc: if_true_label,
                     flags: CmpInsFlags::default().null_eq().with_affinity(affinity),
-                    collation: program.curr_collation(),
+                    collation: collation()?,
                 },
                 target_register,
                 if_true_label,
@@ -711,20 +682,22 @@ pub(super) fn emit_binary_insn(
                 ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
                 _ => unreachable!(),
             };
+            let start = contiguous_operands(program, lhs, rhs);
 
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
-                start_reg: lhs,
+                start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
                     func: Func::Json(json_func),
                     arg_count: 2,
+                    collation: CollationSeq::BINARY,
                 },
             })
         }
         ast::Operator::Concat => {
-            if expr_is_array(lhs_expr, referenced_tables)
-                || expr_is_array(rhs_expr, referenced_tables)
+            if is_array(lhs_expr, referenced_tables, resolver)
+                || is_array(rhs_expr, referenced_tables, resolver)
             {
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
@@ -740,28 +713,8 @@ pub(super) fn emit_binary_insn(
             }
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
-            if let Some(r) = resolver {
-                r.require_custom_types("Array features")?;
-            }
-            // Function instructions read contiguous registers start_reg..start_reg+arg_count.
-            // When both operands are equivalent the compiler reuses a single shared register,
-            // so we must copy it into a contiguous pair.
-            let start = if lhs == rhs {
-                let regs = program.alloc_registers(2);
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs,
-                    extra_amount: 0,
-                });
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs + 1,
-                    extra_amount: 0,
-                });
-                regs
-            } else {
-                lhs
-            };
+            resolver.require_custom_types("Array features")?;
+            let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
                 ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
@@ -774,6 +727,7 @@ pub(super) fn emit_binary_insn(
                 func: FuncCtx {
                     func: Func::Scalar(func),
                     arg_count: 2,
+                    collation: CollationSeq::BINARY,
                 },
             });
         }
@@ -781,107 +735,6 @@ pub(super) fn emit_binary_insn(
     }
 
     Ok(())
-}
-
-/// Check if an expression is known to produce an array value.
-pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferences>) -> bool {
-    match expr {
-        Expr::Cast { type_name, .. } => {
-            type_name.as_ref().is_some_and(|ty| ty.array_dimensions > 0)
-        }
-        Expr::Column { table, column, .. } => {
-            if let Some(tables) = referenced_tables {
-                tables
-                    .find_table_by_internal_id(*table)
-                    .map(|(_, t)| t)
-                    .and_then(|t| t.get_column_at(*column))
-                    .is_some_and(|col| col.is_array())
-            } else {
-                false
-            }
-        }
-        Expr::FunctionCall { name, args, .. } => {
-            if let Ok(Some(f)) = Func::resolve_function(name.as_str(), args.len()) {
-                match &f {
-                    Func::Scalar(sf) if sf.returns_array_blob() => return true,
-                    Func::Agg(AggFunc::ArrayAgg) => return true,
-                    _ => {}
-                }
-            }
-            // Wrapper functions that pass through an array value
-            match name.as_str().to_lowercase().as_str() {
-                "coalesce" | "ifnull" | "min" | "max" => {
-                    args.iter().any(|a| expr_is_array(a, referenced_tables))
-                }
-                "iif" => {
-                    // args: condition, then_val, else_val
-                    args.get(1)
-                        .is_some_and(|a| expr_is_array(a, referenced_tables))
-                        || args
-                            .get(2)
-                            .is_some_and(|a| expr_is_array(a, referenced_tables))
-                }
-                "nullif" => args
-                    .first()
-                    .is_some_and(|a| expr_is_array(a, referenced_tables)),
-                "array_element" => {
-                    // Subscripting a multi-dim array yields a lower-dim array
-                    if let Some(tables) = referenced_tables {
-                        args.first()
-                            .is_some_and(|a| expr_array_dimensions(a, tables) > 1)
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            }
-        }
-        Expr::Array { .. } | Expr::Subscript { .. } => {
-            unreachable!("Array and Subscript are desugared into function calls by the parser")
-        }
-        Expr::Binary(lhs, ast::Operator::Concat, rhs) => {
-            expr_is_array(lhs, referenced_tables) || expr_is_array(rhs, referenced_tables)
-        }
-        Expr::Case {
-            when_then_pairs,
-            else_expr,
-            ..
-        } => {
-            when_then_pairs
-                .iter()
-                .any(|(_, then_expr)| expr_is_array(then_expr, referenced_tables))
-                || else_expr
-                    .as_ref()
-                    .is_some_and(|e| expr_is_array(e, referenced_tables))
-        }
-        _ => false,
-    }
-}
-
-/// Return the number of array dimensions for an expression, or 0 for non-array.
-pub(super) fn expr_array_dimensions(expr: &Expr, tables: &TableReferences) -> u32 {
-    match expr {
-        Expr::Column { table, column, .. } => tables
-            .find_table_by_internal_id(*table)
-            .map(|(_, t)| t)
-            .and_then(|t| t.get_column_at(*column))
-            .map(|col| col.array_dimensions())
-            .unwrap_or(0),
-        Expr::FunctionCall { name, args, .. }
-            if name.as_str().eq_ignore_ascii_case("array_element") =>
-        {
-            let d = args
-                .first()
-                .map(|a| expr_array_dimensions(a, tables))
-                .unwrap_or(0);
-            d.saturating_sub(1)
-        }
-        Expr::FunctionCall { name, .. } if name.as_str().eq_ignore_ascii_case("array") => 1,
-        Expr::Subscript { .. } | Expr::Array { .. } => {
-            unreachable!("Array and Subscript are desugared into function calls by the parser")
-        }
-        _ => 0,
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -895,12 +748,14 @@ pub(super) fn emit_binary_condition_insn(
     rhs_expr: &Expr,
     referenced_tables: Option<&TableReferences>,
     condition_metadata: ConditionMetadata,
-    resolver: Option<&Resolver>,
+    resolver: &Resolver,
 ) -> Result<()> {
+    let metadata = ExprContext::new(referenced_tables, resolver);
     let mut affinity = Affinity::Blob;
     if op.is_comparison() {
-        affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, resolver);
+        affinity = comparison_affinity(lhs_expr, rhs_expr, &metadata);
     }
+    let collation = || comparison_collation(lhs_expr, rhs_expr, &metadata);
 
     let opposite_op = match op {
         ast::Operator::NotEquals => ast::Operator::Equals,
@@ -931,9 +786,6 @@ pub(super) fn emit_binary_condition_insn(
     // When jump_if_condition_is_true: we jump on true, so set jump_if_null when NULL should also jump (e.g. CHECK constraints in integrity_check).
     // When !jump_if_condition_is_true: we jump on false, so set jump_if_null when NULL should also jump (standard SQL 3-valued logic).
     let mut flags = CmpInsFlags::default().with_affinity(affinity);
-    if expr_is_array(lhs_expr, referenced_tables) && expr_is_array(rhs_expr, referenced_tables) {
-        flags = flags.array_cmp();
-    }
     if condition_metadata.jump_if_condition_is_true {
         if condition_metadata.jump_target_when_null == condition_metadata.jump_target_when_true {
             flags = flags.jump_if_null()
@@ -974,7 +826,7 @@ pub(super) fn emit_binary_condition_insn(
                 rhs,
                 target_pc,
                 flags,
-                collation: program.curr_collation(),
+                collation: collation()?,
             });
         }
         ast::Operator::Equals => {
@@ -983,7 +835,7 @@ pub(super) fn emit_binary_condition_insn(
                 rhs,
                 target_pc,
                 flags,
-                collation: program.curr_collation(),
+                collation: collation()?,
             });
         }
         ast::Operator::Less => {
@@ -992,7 +844,7 @@ pub(super) fn emit_binary_condition_insn(
                 rhs,
                 target_pc,
                 flags,
-                collation: program.curr_collation(),
+                collation: collation()?,
             });
         }
         ast::Operator::LessEquals => {
@@ -1001,7 +853,7 @@ pub(super) fn emit_binary_condition_insn(
                 rhs,
                 target_pc,
                 flags,
-                collation: program.curr_collation(),
+                collation: collation()?,
             });
         }
         ast::Operator::Greater => {
@@ -1010,7 +862,7 @@ pub(super) fn emit_binary_condition_insn(
                 rhs,
                 target_pc,
                 flags,
-                collation: program.curr_collation(),
+                collation: collation()?,
             });
         }
         ast::Operator::GreaterEquals => {
@@ -1019,7 +871,7 @@ pub(super) fn emit_binary_condition_insn(
                 rhs,
                 target_pc,
                 flags,
-                collation: program.curr_collation(),
+                collation: collation()?,
             });
         }
         ast::Operator::Is => {
@@ -1028,7 +880,7 @@ pub(super) fn emit_binary_condition_insn(
                 rhs,
                 target_pc,
                 flags: flags.null_eq(),
-                collation: program.curr_collation(),
+                collation: collation()?,
             });
         }
         ast::Operator::IsNot => {
@@ -1037,7 +889,7 @@ pub(super) fn emit_binary_condition_insn(
                 rhs,
                 target_pc,
                 flags: flags.null_eq(),
-                collation: program.curr_collation(),
+                collation: collation()?,
             });
         }
         ast::Operator::Add => {
@@ -1135,21 +987,23 @@ pub(super) fn emit_binary_condition_insn(
                 ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
                 _ => unreachable!(),
             };
+            let start = contiguous_operands(program, lhs, rhs);
 
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
-                start_reg: lhs,
+                start_reg: start,
                 dest: target_register,
                 func: FuncCtx {
                     func: Func::Json(json_func),
                     arg_count: 2,
+                    collation: CollationSeq::BINARY,
                 },
             });
             eval_result(program, target_register);
         }
         ast::Operator::Concat => {
-            if expr_is_array(lhs_expr, referenced_tables)
-                || expr_is_array(rhs_expr, referenced_tables)
+            if is_array(lhs_expr, referenced_tables, resolver)
+                || is_array(rhs_expr, referenced_tables, resolver)
             {
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
@@ -1166,25 +1020,8 @@ pub(super) fn emit_binary_condition_insn(
             eval_result(program, target_register);
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
-            if let Some(r) = resolver {
-                r.require_custom_types("Array features")?;
-            }
-            let start = if lhs == rhs {
-                let regs = program.alloc_registers(2);
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs,
-                    extra_amount: 0,
-                });
-                program.emit_insn(Insn::Copy {
-                    src_reg: lhs,
-                    dst_reg: regs + 1,
-                    extra_amount: 0,
-                });
-                regs
-            } else {
-                lhs
-            };
+            resolver.require_custom_types("Array features")?;
+            let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
                 ast::Operator::ArrayOverlap => ScalarFunc::ArrayOverlap,
@@ -1197,6 +1034,7 @@ pub(super) fn emit_binary_condition_insn(
                 func: FuncCtx {
                     func: Func::Scalar(func),
                     arg_count: 2,
+                    collation: CollationSeq::BINARY,
                 },
             });
             eval_result(program, target_register);
@@ -1205,4 +1043,8 @@ pub(super) fn emit_binary_condition_insn(
     }
 
     Ok(())
+}
+
+fn is_array(expr: &Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> bool {
+    type_of(expr, &TypeEnv::new(referenced_tables, resolver)).is_array()
 }

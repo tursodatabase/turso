@@ -68,3 +68,104 @@ test avg-never-errors-on-overflow {
 expect {
     real|4.611686e+18
 }
+
+test sum-text-overflow-cleared-by-later-decimal {
+    WITH t(a) AS (VALUES('9223372036854775807'),('1'),('0.5'))
+    SELECT typeof(sum(a)), sum(a) = 9223372036854775808.0 FROM t;
+}
+expect {
+    real|1
+}
+
+test sum-text-overflow-cleared-by-later-non-number {
+    WITH t(a) AS (VALUES('9223372036854775807'),('1'),('abc'))
+    SELECT typeof(sum(a)), sum(a) = 9223372036854775808.0 FROM t;
+}
+expect {
+    real|1
+}
+
+test sum-text-overflow-cleared-by-later-decimal-with-trailing-text {
+    WITH t(a) AS (VALUES('9223372036854775807'),('1'),('0.5abc'))
+    SELECT typeof(sum(a)), sum(a) = 9223372036854775808.0 FROM t;
+}
+expect {
+    real|1
+}
+
+test sum-text-overflow-cleared-by-later-integer-with-trailing-text {
+    WITH t(a) AS (VALUES('9223372036854775807'),('1'),('1abc'))
+    SELECT typeof(sum(a)), sum(a) = 9223372036854775808.0 FROM t;
+}
+expect {
+    real|1
+}
+
+test sum-text-overflow-cleared-by-later-blob {
+    WITH t(a) AS (VALUES('9223372036854775807'),('1'),(x'31'))
+    SELECT typeof(sum(a)), sum(a) = 9223372036854775808.0 FROM t;
+}
+expect {
+    real|1
+}
+
+# The total keeps the low bits of the integers added before the overflow.
+test sum-text-overflow-keeps-low-bits {
+    WITH t(a) AS (VALUES('9223372036854775807'),('1'),('0.5'),('-9223372036854775807'))
+    SELECT sum(a) = 1.5 FROM t;
+}
+expect {
+    1
+}
+
+test sum-text-then-decimal-or-non-number-keeps-low-bits {
+    WITH t(a) AS (VALUES('9223372036854775807'),('0.5'),('-9223372036854775807'))
+    SELECT sum(a) = 0.5 FROM t;
+    WITH t(a) AS (VALUES('9223372036854775807'),('abc'),('-9223372036854775807'))
+    SELECT sum(a) = 0.0 FROM t;
+}
+expect {
+    1
+    1
+}
+
+# Text that only starts with a number, and a BLOB, are added as doubles.
+test sum-text-overflow-then-integer-with-trailing-text-adds-a-double {
+    WITH t(a) AS (VALUES('9223372036854775807'),('1'),('-9223372036854775807abc'))
+    SELECT typeof(sum(a)), sum(a) = 0.0 FROM t;
+}
+expect {
+    real|1
+}
+
+test sum-text-overflow-then-blob-adds-a-double {
+    WITH t(a) AS (VALUES('9223372036854775807'),('1'),(CAST('-9223372036854775807' AS BLOB)))
+    SELECT typeof(sum(a)), sum(a) = 0.0 FROM t;
+}
+expect {
+    real|1
+}
+
+test sum-integer-then-integer-with-trailing-text-adds-a-double {
+    WITH t(a) AS (VALUES('9223372036854775807'),('-9223372036854775807abc'))
+    SELECT typeof(sum(a)), sum(a) = -1.0 FROM t;
+}
+expect {
+    real|1
+}
+
+test sum-text-overflow-still-errors {
+    WITH t(a) AS (VALUES('9223372036854775807'),('1'))
+    SELECT sum(a) FROM t;
+}
+expect error {
+    integer overflow
+}
+
+test sum-overflow-with-null-still-errors {
+    WITH t(a) AS (VALUES(9223372036854775807),(1),(NULL))
+    SELECT sum(a) FROM t;
+}
+expect error {
+    integer overflow
+}

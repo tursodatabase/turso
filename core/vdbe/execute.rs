@@ -11,6 +11,8 @@ use crate::mvcc::database::{
     BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
 };
 use crate::mvcc::MvccClock;
+use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
+use crate::numeric::decimal::{numeric_from_value, MAX_FRACTION_DIGITS};
 use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
@@ -31,15 +33,16 @@ use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
 use crate::types::{
-    compare_immutable, compare_immutable_single, compare_record, AsValueRef, Extendable,
-    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    compare_immutable, compare_record, AsValueRef, Extendable, IOCompletions, IOResult,
+    ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_table_refs,
-    rewrite_view_sql_for_column_rename, trim_ascii_whitespace, RewrittenView,
+    rewrite_inline_col_fk_target_if_needed, rewrite_select_namespace_table_refs,
+    rewrite_select_table_refs, rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+    trim_ascii_whitespace, RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -54,7 +57,7 @@ use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
 use crate::vdbe::{
     decode_serial_type_into_register, registers_to_ref_values, DeferredSeekState, EndStatement,
-    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState,
+    OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup, VacuumOpState, WriteBaseline,
 };
 use crate::vector::{
     vector1bit, vector32, vector32_sparse, vector64, vector8, vector_concat, vector_distance_cos,
@@ -84,8 +87,8 @@ use crate::{
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
-            exec_date, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
-            exec_strftime, exec_time, exec_unixepoch,
+            exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full,
+            exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
         printf::exec_printf,
     },
@@ -150,7 +153,7 @@ impl OpenedBTree {
 
 use super::{
     array::{
-        array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
+        array_values_from_blob, compute_array_length, compute_array_length_at_dim,
         exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
         exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
         exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
@@ -158,7 +161,7 @@ use super::{
     },
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
-        IvmSumKind, RegisterOrLiteral, SortComparatorType, SorterOpenData,
+        IvmSumKind, RegisterOrLiteral, SorterOpenData,
     },
     CommitState,
 };
@@ -271,175 +274,6 @@ impl<T> OrOverflow<T> for Option<T> {
             None => Err(LimboError::IntegerOverflow),
         }
     }
-}
-
-/// Parse a Value (text, int, float, or blob) into a BigDecimal.
-fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
-    use bigdecimal::BigDecimal;
-    use std::str::FromStr;
-    match val {
-        Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
-        Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
-        Value::Text(t) => BigDecimal::from_str(&t.value)
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
-        Value::Blob(b) => crate::numeric::decimal::blob_to_bigdecimal(b),
-        _ => Err(LimboError::Constraint(format!(
-            "cannot convert to numeric: \"{val}\""
-        ))),
-    }
-}
-
-/// Create a sort comparator closure from a SortComparatorType enum.
-fn make_sort_comparator(
-    cmp_type: &SortComparatorType,
-) -> Result<crate::vdbe::sorter::SortComparator> {
-    use std::cmp::Ordering;
-    let cmp: crate::vdbe::sorter::SortComparator = match cmp_type {
-        SortComparatorType::NumericLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => {
-                        // Decode from ValueRef to Value for value_to_bigdecimal
-                        let a_val = a.to_owned()?;
-                        let b_val = b.to_owned()?;
-                        match (value_to_bigdecimal(&a_val), value_to_bigdecimal(&b_val)) {
-                            (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
-                            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                        }
-                    }
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::StringReverse => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                fn reverse_str(v: &ValueRef) -> String {
-                    match v {
-                        ValueRef::Text(t) => t.to_string().chars().rev().collect(),
-                        _ => String::new(),
-                    }
-                }
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => reverse_str(a).cmp(&reverse_str(b)),
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::TestUintLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                fn to_u64(v: &ValueRef) -> Option<u64> {
-                    match v {
-                        ValueRef::Null => None,
-                        ValueRef::Numeric(Numeric::Integer(i)) => {
-                            if *i >= 0 {
-                                Some(*i as u64)
-                            } else {
-                                None
-                            }
-                        }
-                        ValueRef::Text(t) => t.to_string().parse::<u64>().ok(),
-                        _ => None,
-                    }
-                }
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => match (to_u64(a), to_u64(b)) {
-                        (Some(a), Some(b)) => a.cmp(&b),
-                        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                    },
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::ArrayLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    (ValueRef::Blob(a_blob), ValueRef::Blob(b_blob)) => {
-                        crate::vdbe::array::compare_arrays(a_blob, b_blob)
-                            .unwrap_or(Ordering::Equal)
-                    }
-                    (ValueRef::Text(a_text), ValueRef::Text(b_text)) => {
-                        let a_vals = crate::vdbe::array::parse_text_array(a_text);
-                        let b_vals = crate::vdbe::array::parse_text_array(b_text);
-                        match (a_vals, b_vals) {
-                            (Some(av), Some(bv)) => {
-                                let a_blob = crate::vdbe::array::values_to_record_blob(&av)?;
-                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv)?;
-                                if let (Value::Blob(ab), Value::Blob(bb)) = (&a_blob, &b_blob) {
-                                    crate::vdbe::array::compare_arrays(ab, bb)
-                                        .unwrap_or(Ordering::Equal)
-                                } else {
-                                    Ordering::Equal
-                                }
-                            }
-                            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                        }
-                    }
-                    _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                };
-                Ok(res)
-            })
-        }
-    };
-    Ok(cmp)
-}
-
-/// Compare two values using the specified collation for text values.
-/// Non-text values are compared using their natural ordering.
-fn compare_with_collation(
-    lhs: &Value,
-    rhs: &Value,
-    collation: Option<CollationSeq>,
-    collation_comparator: &Option<crate::vdbe::sorter::SortComparator>,
-) -> Result<std::cmp::Ordering> {
-    Ok(match (lhs, rhs) {
-        (Value::Text(lhs_text), Value::Text(rhs_text)) => {
-            if let Some(comparator) = collation_comparator {
-                comparator(&lhs.as_ref(), &rhs.as_ref())?
-            } else if let Some(coll) = collation {
-                coll.compare_strings(lhs_text.as_str(), rhs_text.as_str())
-            } else {
-                lhs.cmp(rhs)
-            }
-        }
-        _ => lhs.cmp(rhs),
-    })
-}
-
-fn compare_with_program_collation<V1, V2>(
-    program: &Program,
-    lhs: V1,
-    rhs: V2,
-    collation: CollationSeq,
-) -> Result<std::cmp::Ordering>
-where
-    V1: AsValueRef,
-    V2: AsValueRef,
-{
-    let lhs = lhs.as_value_ref();
-    let rhs = rhs.as_value_ref();
-    if collation.is_custom() {
-        if let (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) = (lhs, rhs) {
-            return program.connection.compare_external_collation(
-                collation,
-                lhs_text.as_str(),
-                rhs_text.as_str(),
-            );
-        }
-    }
-    Ok(compare_immutable_single(lhs, rhs, collation))
 }
 
 fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool {
@@ -591,7 +425,14 @@ pub fn op_drop_index(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropIndex { index, db }, insn);
+    load_insn!(
+        DropIndex {
+            index,
+            db,
+            namespace
+        },
+        insn
+    );
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     conn.with_database_schema_mut(*db, |schema| {
@@ -601,7 +442,7 @@ pub fn op_drop_index(
         if is_mvcc && index.root_page > 0 {
             schema.dropped_root_pages.insert(index.root_page);
         }
-        schema.remove_index(index);
+        schema.remove_index(*namespace, index);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -713,13 +554,6 @@ pub fn op_checkpoint(
         },
         insn
     );
-    if !program.connection.auto_commit.load(Ordering::SeqCst) {
-        // TODO: sqlite returns "Runtime error: database table is locked (6)" when a table is in use
-        // when a checkpoint is attempted. We don't have table locks, so return TableLocked for any
-        // attempt to checkpoint in an interactive transaction. This does not end the transaction,
-        // however.
-        return Err(LimboError::TableLocked.into());
-    }
     if *database == crate::TEMP_DB_ID && program.connection.temp.database.read().is_none() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
@@ -727,6 +561,16 @@ pub fn op_checkpoint(
     }
 
     let pager = program.get_pager_from_database_index(database)?;
+    // Like SQLite, refuse only when this connection's open transaction has already
+    // read or written the database. After a plain BEGIN nothing is held yet, so the
+    // checkpoint runs. The error does not end the transaction.
+    if !program.connection.auto_commit.load(Ordering::SeqCst)
+        && (pager.holds_read_lock()
+            || pager.holds_write_lock()
+            || program.connection.get_mv_tx_for_db(*database).is_some())
+    {
+        return Err(LimboError::TableLocked.into());
+    }
     if !pager.has_wal() {
         set_not_in_wal_result(state, *dest);
         state.pc += 1;
@@ -1122,7 +966,7 @@ macro_rules! comparison_opcode {
     ($name:ident, $variant:ident, $op:expr, $jumps:expr) => {
         #[inline(always)]
         pub fn $name(
-            program: &Program,
+            _program: &Program,
             state: &mut ProgramState,
             insn: &Insn,
             _pager: &Arc<Pager>,
@@ -1141,12 +985,17 @@ macro_rules! comparison_opcode {
                 return Err(unresolved_branch_target(*target_pc));
             };
 
-            // Two integers compare directly: no NULL handling, affinity or collation.
+            // Two integers compare directly: no NULL handling, affinity or
+            // text collation. A type's order may place integers differently.
             if let (
                 Register::Value(Value::Numeric(Numeric::Integer(l))),
                 Register::Value(Value::Numeric(Numeric::Integer(r))),
-            ) = (&state.registers[*lhs], &state.registers[*rhs])
-            {
+                true,
+            ) = (
+                &state.registers[*lhs],
+                &state.registers[*rhs],
+                matches!(collation, CollationSeq::Text(_)),
+            ) {
                 let jumps = $jumps;
                 state.pc = if jumps(*l, *r) {
                     target_pc
@@ -1169,16 +1018,7 @@ macro_rules! comparison_opcode {
                     return Ok(InsnFunctionStepResult::Step);
                 }
             }
-            op_comparison_slow(
-                program,
-                state,
-                *lhs,
-                *rhs,
-                target_pc,
-                *flags,
-                collation.unwrap_or_default(),
-                $op,
-            )
+            op_comparison_slow(state, *lhs, *rhs, target_pc, *flags, *collation, $op)
         }
     };
 }
@@ -1195,12 +1035,9 @@ fn texts_compare_as_bytes(
     lhs: &Value,
     rhs: &Value,
     flags: crate::vdbe::insn::CmpInsFlags,
-    collation: Option<CollationSeq>,
+    collation: CollationSeq,
 ) -> bool {
-    if !matches!(
-        collation,
-        None | Some(CollationSeq::Binary | CollationSeq::Unset)
-    ) {
+    if collation != CollationSeq::BINARY {
         return false;
     }
     !flags.get_affinity().is_numeric()
@@ -1214,7 +1051,6 @@ fn texts_compare_as_bytes(
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn op_comparison_slow(
-    program: &Program,
     state: &mut ProgramState,
     lhs: usize,
     rhs: usize,
@@ -1249,26 +1085,12 @@ fn op_comparison_slow(
                 // expression translation only uses it with Eq/Ne, RANGE
                 // boundary tests use it with relational operators so that
                 // NULL peer groups compare consistently.
-                let order = compare_immutable_single(lhs_value, rhs_value, collation);
+                let order = collation.compare(lhs_value.as_value_ref(), rhs_value.as_value_ref());
                 comparison_matches_order(op, order)
             } else {
                 jump_if_null
             };
             take_jump_if!(should_jump);
-        }
-        (Value::Blob(lb), Value::Blob(rb)) if flags.has_array_cmp() => {
-            // Element-wise array comparison
-            if let Ok(ord) = compare_arrays(lb, rb) {
-                let should_jump = match op {
-                    ComparisonOp::Eq => ord.is_eq(),
-                    ComparisonOp::Ne => !ord.is_eq(),
-                    ComparisonOp::Lt => ord.is_lt(),
-                    ComparisonOp::Le => ord.is_le(),
-                    ComparisonOp::Gt => ord.is_gt(),
-                    ComparisonOp::Ge => ord.is_ge(),
-                };
-                take_jump_if!(should_jump);
-            }
         }
         (_, _) => {}
     }
@@ -1285,13 +1107,7 @@ fn op_comparison_slow(
     let rhs_for_compare = new_rhs
         .as_ref()
         .map_or(Either::Left(rhs_value), Either::Right);
-    let should_jump = if collation.is_custom() {
-        let order =
-            compare_with_program_collation(program, lhs_for_compare, rhs_for_compare, collation)?;
-        comparison_matches_order(op, order)
-    } else {
-        op.compare(lhs_for_compare, rhs_for_compare, collation)
-    };
+    let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation)?;
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
@@ -1976,6 +1792,8 @@ pub fn op_rewind(
         insn
     );
     assert!(pc_if_empty.is_offset());
+    // Like SQLite, positioning the cursor cancels a DeferredSeek still pending on it.
+    state.deferred_seeks[*cursor_id] = None;
     // Clear any bloom filter associated with this cursor so stale filter data
     // does not incorrectly reject valid matches in subsequent iterations.
     if let Some(filter) = state.get_bloom_filter_mut(*cursor_id) {
@@ -2017,6 +1835,8 @@ pub fn op_last(
         insn
     );
     assert!(pc_if_empty.is_offset());
+    // Like SQLite, positioning the cursor cancels a DeferredSeek still pending on it.
+    state.deferred_seeks[*cursor_id] = None;
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
         let cursor = cursor.as_btree_mut();
@@ -2752,21 +2572,11 @@ pub fn op_type_check(
             let offset = table_reference.logical_to_physical_column(column_idx);
             assert!(offset < *count);
             let reg = &mut state.registers[*start_reg + offset];
-            // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
-            if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
-            {
-                bail_constraint_error!(
-                    "NOT NULL constraint failed: {}.{} ({})",
-                    &table_reference.name,
-                    col.name.as_deref().unwrap_or(""),
-                    SQLITE_CONSTRAINT
-                )
-            } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
-                // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
-                return Ok(());
-            } else if matches!(reg.get_value(), Value::Null) {
-                // STRICT only enforces type affinity on non-NULL values.
-                // NULL is valid in any column without NOT NULL constraint.
+            if matches!(reg.get_value(), Value::Null) {
+                // STRICT only checks the type of non-NULL values. A NULL in a NOT NULL
+                // column, a PRIMARY KEY of a STRICT table included, is for the NOT NULL
+                // check, which also applies the statement's OR IGNORE or OR REPLACE.
+                // An INTEGER PRIMARY KEY gets its rowid later.
                 return Ok(());
             }
             if let Some(expected_type) = col.strict_value_type() {
@@ -4515,6 +4325,7 @@ fn begin_mvcc_tx(
                 pager.clone(),
                 expected_schema_generation,
                 checkpoint_read_guard,
+                connection.portable_logical_changes_enabled(),
             ),
         TransactionMode::Write => mv_store.begin_exclusive_tx_with_checkpoint_read_guard(
             pager.clone(),
@@ -5329,6 +5140,14 @@ pub fn op_transaction_inner(
                             "write statement started with view changes left by an earlier statement"
                         );
                         state.is_active_write = true;
+                        state.tx_read_only_at_start = program.connection.is_tx_read_only();
+                        if is_main_db {
+                            state.write_baseline = WriteBaseline::capture(
+                                mv_store.as_deref(),
+                                &program.connection,
+                                &pager,
+                            );
+                        }
                     }
                     if is_main_db && in_explicit_txn && state.has_stmt_transaction {
                         state.auto_txn_cleanup = TxnCleanup::RollbackSavepoint;
@@ -5395,7 +5214,8 @@ pub fn op_auto_commit(
         AutoCommit {
             auto_commit,
             rollback,
-            concurrent
+            concurrent,
+            read_only
         },
         insn
     );
@@ -5501,6 +5321,7 @@ pub fn op_auto_commit(
                 }
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_tx_read_only(false);
                 conn.set_cdc_transaction_id(-1);
             }
             TxOp::Commit => {
@@ -5521,6 +5342,7 @@ pub fn op_auto_commit(
                 check_deferred_fk_on_commit(&conn)?;
                 vtab_commit_all(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_tx_read_only(false);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
             TxOp::Begin => {
@@ -5554,23 +5376,15 @@ pub fn op_auto_commit(
                 // Read: a SELECT in autocommit mode is still open; leave as-is — the
                 //       next write inside the explicit transaction will upgrade to Write.
                 conn.auto_commit.store(false, Ordering::SeqCst);
+                conn.set_tx_read_only(*read_only);
                 return Ok(InsnFunctionStepResult::Done);
             }
         }
     } else {
         return match &tx_op {
-            TxOp::Begin => Err(LimboError::TxError(
-                "cannot start a transaction within a transaction".to_string(),
-            )
-            .into()),
-            TxOp::Commit => Err(LimboError::TxError(
-                "cannot commit - no transaction is active".to_string(),
-            )
-            .into()),
-            TxOp::Rollback => Err(LimboError::TxError(
-                "cannot rollback - no transaction is active".to_string(),
-            )
-            .into()),
+            TxOp::Begin => Err(LimboError::TransactionAlreadyActive.into()),
+            TxOp::Commit => Err(LimboError::NoActiveTransaction { op: "commit" }.into()),
+            TxOp::Rollback => Err(LimboError::NoActiveTransaction { op: "rollback" }.into()),
         };
     }
 
@@ -5915,6 +5729,7 @@ fn release_commit_insn() -> Insn {
         auto_commit: true,
         rollback: false,
         concurrent: false,
+        read_only: false,
     }
 }
 
@@ -6713,6 +6528,9 @@ pub fn op_seek(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
+    // Like SQLite, positioning the cursor cancels a DeferredSeek still pending on it.
+    // Otherwise RowId and Column would keep reading the row that seek saved.
+    state.deferred_seeks[*cursor_id] = None;
     let has_null_that_cannot_match = match insn {
         Insn::SeekGE {
             eq_only: true,
@@ -7589,7 +7407,6 @@ fn update_agg_payload(
     maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
-    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
 ) -> Result<()> {
     match func {
         AggFunc::Count => {
@@ -7762,15 +7579,7 @@ fn update_agg_payload(
                 return Ok(());
             }
             use std::cmp::Ordering;
-            let comparator = comparator()?;
-            // Use custom type comparator if available, otherwise fall back to collation
-            let cmp = if let Some(ref cmp_fn) = comparator {
-                let arg_ref = arg.as_ref();
-                let payload_ref = payload[0].as_ref();
-                cmp_fn(&arg_ref, &payload_ref)?
-            } else {
-                compare_with_collation(arg, &payload[0], Some(collation), &comparator)?
-            };
+            let cmp = collation.compare(arg.as_ref(), payload[0].as_ref());
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
                 AggFunc::Min => cmp == Ordering::Less,
@@ -7799,7 +7608,7 @@ fn update_agg_payload(
             let Value::Blob(separator_lengths) = separator_lengths_slot else {
                 unreachable!("GroupConcat separator queue is Blob");
             };
-            let first_term = matches!(acc, Value::Null);
+            let first_term = *count == 0;
             if first_term {
                 // Start an empty Text accumulator; append below without an
                 // intermediate String for Text inputs.
@@ -8334,8 +8143,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
         }
         AggFunc::Mode => {
             // payload: [0]=collation bits, [1]=count, [2..]=buffered values.
-            let collation =
-                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let collation = CollationSeq::from_bits(payload[0].as_int().unwrap_or(0) as u16)?;
             let count = payload[1].as_int().unwrap_or(0) as usize;
             if count == 0 || 2 + count > payload.len() {
                 Value::Null
@@ -8350,8 +8158,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             if matches!(payload[2], Value::Null) {
                 return Ok(Value::Null);
             }
-            let collation =
-                CollationSeq::from_storage_bits(payload[0].as_int().unwrap_or(0) as u16);
+            let collation = CollationSeq::from_bits(payload[0].as_int().unwrap_or(0) as u16)?;
             let count = payload[1].as_int().unwrap_or(0) as usize;
             let fraction = payload[2].as_float();
             if count == 0 {
@@ -8413,29 +8220,18 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
 /// Most frequent value of an ordered set (`mode() WITHIN GROUP (ORDER BY x)`).
 /// Ties are broken by the smallest value, matching PostgreSQL (the first value the
 /// ascending ordering would return).
-/// Compares two ordered-set values, honoring `collation` for text (built-in and locale
-/// collations are resolved without a connection; extension `Custom` collations fall back
-/// to BINARY, matching other connection-less comparison paths).
-fn ordered_set_compare(a: &Value, b: &Value, collation: CollationSeq) -> std::cmp::Ordering {
-    match (a, b) {
-        (Value::Text(lhs), Value::Text(rhs)) => {
-            collation.compare_strings(lhs.as_str(), rhs.as_str())
-        }
-        _ => a.cmp(b),
-    }
-}
-
 fn ordered_set_mode(values: &[Value], collation: CollationSeq) -> Value {
     // NULLs were already dropped at step time.
     let mut sorted: Vec<Value> = values.to_vec();
-    sorted.sort_by(|a, b| ordered_set_compare(a, b, collation));
+    sorted.sort_by(|a, b| collation.compare(a.as_value_ref(), b.as_value_ref()));
     let mut best_idx = 0usize;
     let mut best_count = 0usize;
     let mut i = 0;
     while i < sorted.len() {
         let mut j = i + 1;
         while j < sorted.len()
-            && ordered_set_compare(&sorted[j], &sorted[i], collation) == std::cmp::Ordering::Equal
+            && collation.compare(sorted[j].as_value_ref(), sorted[i].as_value_ref())
+                == std::cmp::Ordering::Equal
         {
             j += 1;
         }
@@ -8484,7 +8280,7 @@ fn ordered_set_percentile_cont(values: &[Value], fraction: f64) -> Value {
 /// distribution (`row / n`) is at least `fraction`.
 fn ordered_set_percentile_disc(values: &[Value], fraction: f64, collation: CollationSeq) -> Value {
     let mut sorted: Vec<Value> = values.to_vec();
-    sorted.sort_by(|a, b| ordered_set_compare(a, b, collation));
+    sorted.sort_by(|a, b| collation.compare(a.as_value_ref(), b.as_value_ref()));
     let n = sorted.len();
     let index = if fraction <= 0.0 {
         0
@@ -9075,7 +8871,6 @@ pub fn op_agg_inverse(
             col,
             delimiter: _,
             func,
-            comparator: _,
         },
         insn
     );
@@ -9336,9 +9131,15 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
                     "GroupConcat xInverse removes {remove_len} bytes from {accumulated_len}"
                 )));
             }
-            if remove_len >= accumulated_len {
+            if *count == 0 {
+                // No values remain, so the empty string cannot be told apart
+                // from "nothing accumulated" unless the accumulator is Null.
                 *acc = Value::Null;
                 separator_lengths.clear();
+            } else if remove_len >= accumulated_len {
+                // Empty values can still remain; keep the accumulator as Text
+                // so the next step appends a separator before its value.
+                text.value.to_mut().clear();
             } else {
                 text.value.to_mut().drain(..remove_len);
             }
@@ -9389,7 +9190,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
 }
 
 pub fn op_agg_step(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -9503,9 +9304,7 @@ pub fn op_agg_step(
                     }
                 }
             }
-            AggFunc::Min | AggFunc::Max
-                if data.comparator.is_none() && data.collation.is_none_or(|c| !c.is_custom()) =>
-            {
+            AggFunc::Min | AggFunc::Max if matches!(data.collation, CollationSeq::Text(_)) => {
                 if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
                     state.registers[data.col]
                 {
@@ -9529,17 +9328,16 @@ pub fn op_agg_step(
             _ => {}
         }
     }
-    op_agg_step_slow(program, state, data)
+    op_agg_step_slow(state, data)
 }
 
 #[inline(never)]
-fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepData) -> InsnResult {
+fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult {
     let AggStepData {
         acc_reg,
         col,
         delimiter,
         func,
-        comparator,
         collation,
     } = data;
 
@@ -9589,18 +9387,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
         state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
     }
 
-    let current_collation = collation.unwrap_or(CollationSeq::Binary);
-    let comparator_factory = move || -> Result<Option<crate::vdbe::sorter::SortComparator>> {
-        Ok(match comparator.as_ref() {
-            Some(comparator) => Some(make_sort_comparator(comparator)?),
-            None if current_collation.is_custom() => Some(
-                program
-                    .connection
-                    .make_collation_comparator(current_collation)?,
-            ),
-            None => None,
-        })
-    };
+    let collation = *collation;
 
     // Step the aggregate
     match func {
@@ -9641,14 +9428,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 .into());
             };
             let payload = agg.payload_vec_mut();
-            update_agg_payload(
-                func,
-                arg,
-                maybe_arg2.as_ref(),
-                payload,
-                current_collation,
-                comparator_factory,
-            )?;
+            update_agg_payload(func, arg, maybe_arg2.as_ref(), payload, collation)?;
         }
     };
 
@@ -9695,6 +9475,7 @@ pub fn op_agg_final(
             state,
             ext_func.finalize_aggregate(&mut state.registers[acc_reg])
         );
+        value.check_length_limit()?;
         state.registers[dest_reg].set_value(value);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -9716,6 +9497,7 @@ pub fn op_agg_final(
                     _ => finalize_agg_payload(func, payload)?,
                 },
             };
+            value.check_length_limit()?;
             if acc_reg == dest_reg {
                 let accumulator =
                     std::mem::replace(&mut state.registers[acc_reg], Register::Value(value));
@@ -9787,7 +9569,6 @@ pub fn op_sorter_open(
         cursor_id,
         columns: _,
         order_collations_nulls,
-        comparators,
     } = data.as_ref();
     // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
     let page_size = match pager.with_header(|header| header.page_size) {
@@ -9811,30 +9592,14 @@ pub fn op_sorter_open(
     for (ord, coll, nulls) in order_collations_nulls.iter() {
         // Preallocated for every ORDER BY term above, so these pushes cannot grow the vectors.
         order.push(*ord);
-        collations.push(coll.unwrap_or_default());
+        collations.push(*coll);
         nulls_orders.push(*nulls);
-    }
-    let mut sort_comparators =
-        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
-    for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
-        let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
-            Some(comparator) => Some(make_sort_comparator(comparator)?),
-            None => match coll {
-                Some(collation) if collation.is_custom() => {
-                    Some(program.connection.make_collation_comparator(*collation)?)
-                }
-                _ => None,
-            },
-        };
-        // Preallocated for every ORDER BY term above, so this push cannot grow the vector.
-        sort_comparators.push(comparator);
     }
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
         nulls_orders,
-        sort_comparators,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
@@ -10673,11 +10438,11 @@ pub fn op_function(
                 // to the schema). Resolve the sequence first so currval
                 // on a dropped sequence reports "does not exist" rather
                 // than silently returning the stale per-session value.
-                let (database_id, sequence) = program.connection.find_sequence(&seq_name)?;
-                match program
-                    .connection
-                    .get_sequence_currval(database_id, &sequence.name)
-                {
+                let (namespace, sequence) = program.connection.find_sequence(&seq_name)?;
+                match program.connection.get_sequence_currval(
+                    namespace.database_id,
+                    &mangle_name(namespace.id, &sequence.name),
+                ) {
                     Some(val) => {
                         state.registers[*dest].set_value(Value::from_i64(val));
                     }
@@ -10691,6 +10456,9 @@ pub fn op_function(
                 }
             }
             ScalarFunc::SetVal => {
+                if program.connection.is_tx_read_only() {
+                    return Err(LimboError::ReadOnly.into());
+                }
                 // Pre-write validation: argument type + range check. The
                 // translator emits this Function call before the inline
                 // DELETE-all + INSERT bytecode, so any error returned here
@@ -10819,17 +10587,20 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Random => {
-                state.registers[*dest].set_int(pager.io.generate_random_number());
+                let bits = pager.io.generate_random_number();
+                let value = Value::from_i64(bits);
+                state.registers[*dest].set_value(value);
             }
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => {
-                // Test-only: process-global atomic counter that increments on
-                // every evaluation. Used in sqltests to verify that the
-                // planner does not deduplicate equivalent SQL calls that
-                // contain nondeterministic functions.
-                static TEST_NONDET_COUNTER: std::sync::atomic::AtomicI64 =
-                    std::sync::atomic::AtomicI64::new(0);
-                let value = TEST_NONDET_COUNTER.fetch_add(1, Ordering::Relaxed);
+                // Test-only: per-connection counter that increments on every
+                // evaluation. Used in sqltests to verify that the planner does
+                // not deduplicate equivalent SQL calls that contain
+                // nondeterministic functions.
+                let value = program
+                    .connection
+                    .test_nondet_counter
+                    .fetch_add(1, Ordering::Relaxed);
                 state.registers[*dest].set_int(value);
             }
             ScalarFunc::Trim => {
@@ -10882,22 +10653,29 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Min => {
+                let collation = func.collation;
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest]
-                    .set_value(Value::exec_min(reg_values.iter().map(|v| v.get_value())));
+                let result = Value::exec_min(reg_values.iter().map(|v| v.get_value()), |a, b| {
+                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
+                })?;
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Max => {
+                let collation = func.collation;
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest]
-                    .set_value(Value::exec_max(reg_values.iter().map(|v| v.get_value())));
+                let result = Value::exec_max(reg_values.iter().map(|v| v.get_value()), |a, b| {
+                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
+                })?;
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Nullif => {
-                let first_value = &state.registers[*start_reg];
-                let second_value = &state.registers[*start_reg + 1];
-                state.registers[*dest].set_value(Value::exec_nullif(
-                    first_value.get_value(),
-                    second_value.get_value(),
-                ));
+                let collation = func.collation;
+                let first_value = state.registers[*start_reg].get_value();
+                let second_value = state.registers[*start_reg + 1].get_value();
+                let result = first_value.exec_nullif(second_value, |a, b| {
+                    Ok(collation.compare(a.as_value_ref(), b.as_value_ref()))
+                })?;
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Substr | ScalarFunc::Substring => {
                 let str_value = &state.registers[*start_reg];
@@ -11046,7 +10824,7 @@ pub fn op_function(
                     };
                     let table = {
                         let schema = program.connection.schema.read();
-                        match schema.get_table(table.as_str()) {
+                        match schema.get_table(NamespaceId::ROOT, table.as_str()) {
                             Some(table) => table,
                             None => {
                                 return Err(LimboError::InvalidArgument(format!(
@@ -11312,11 +11090,13 @@ pub fn op_function(
                         .into());
                     }
                 };
-                let (db_id, sequence) = program.connection.find_sequence(sequence_name)?;
+                let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
                 let watermark = program
                     .connection
-                    .mv_store_for_db(db_id)
-                    .and_then(|mv_store| mv_store.sequence_watermark(&sequence.name));
+                    .mv_store_for_db(namespace.database_id)
+                    .and_then(|mv_store| {
+                        mv_store.sequence_watermark(&mangle_name(namespace.id, &sequence.name))
+                    });
                 match watermark {
                     Some(watermark) => state.registers[*dest].set_int(watermark),
                     None => state.registers[*dest].set_value(Value::Null),
@@ -11369,59 +11149,6 @@ pub fn op_function(
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
                     other => other.clone(),
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TestUintAdd
-            | ScalarFunc::TestUintSub
-            | ScalarFunc::TestUintMul
-            | ScalarFunc::TestUintDiv => {
-                check_arg_count!(arg_count, 2);
-                let a = parse_test_uint(&state.registers[*start_reg])?;
-                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
-                let result = match (a, b) {
-                    (Some(a), Some(b)) => {
-                        let r = match scalar_func {
-                            ScalarFunc::TestUintAdd => a.checked_add(b),
-                            ScalarFunc::TestUintSub => a.checked_sub(b),
-                            ScalarFunc::TestUintMul => a.checked_mul(b),
-                            ScalarFunc::TestUintDiv => {
-                                if b == 0 {
-                                    None
-                                } else {
-                                    Some(a / b)
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-                        match r {
-                            Some(v) => Value::build_text(v.to_string()),
-                            None => {
-                                return Err(LimboError::InternalError(
-                                    "test_uint arithmetic overflow/underflow".to_string(),
-                                )
-                                .into());
-                            }
-                        }
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TestUintLt | ScalarFunc::TestUintEq => {
-                check_arg_count!(arg_count, 2);
-                let a = parse_test_uint(&state.registers[*start_reg])?;
-                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
-                let result = match (a, b) {
-                    (Some(a), Some(b)) => {
-                        let cmp = match scalar_func {
-                            ScalarFunc::TestUintLt => a < b,
-                            ScalarFunc::TestUintEq => a == b,
-                            _ => unreachable!(),
-                        };
-                        Value::from_i64(if cmp { 1 } else { 0 })
-                    }
-                    _ => Value::Null,
                 };
                 state.registers[*dest].set_value(result);
             }
@@ -11552,55 +11279,50 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::NumericEncode => {
+                check_arg_count!(arg_count, 1);
+                let result = match state.registers[*start_reg].get_value() {
+                    Value::Null => Value::Null,
+                    other => {
+                        let bd = numeric_from_value(other)?;
+                        Value::from_blob(crate::numeric::decimal::bigdecimal_to_blob(&bd))
+                    }
+                };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::NumericFit => {
                 check_arg_count!(arg_count, 3);
                 let val = &state.registers[*start_reg];
                 let precision_reg = &state.registers[*start_reg + 1];
                 let scale_reg = &state.registers[*start_reg + 2];
+                // COERCE runs on the value ENCODE stored, so the value is a
+                // stored numeric.
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
-                    other => {
+                    Value::Blob(stored) => {
                         use crate::numeric::decimal::{
-                            bigdecimal_to_blob, validate_precision_scale,
+                            bigdecimal_to_blob, blob_to_bigdecimal, validate_precision_scale,
                         };
-                        use bigdecimal::BigDecimal;
-                        use std::str::FromStr;
 
-                        let precision = match precision_reg.get_value() {
-                            Value::Numeric(Numeric::Integer(i)) => *i,
-                            _ => {
-                                return Err(LimboError::Constraint(
-                                    "numeric_encode: precision must be an integer".to_string(),
-                                )
-                                .into());
-                            }
+                        let bd = blob_to_bigdecimal(stored)?;
+                        let (
+                            Value::Numeric(Numeric::Integer(precision)),
+                            Value::Numeric(Numeric::Integer(scale)),
+                        ) = (precision_reg.get_value(), scale_reg.get_value())
+                        else {
+                            return Err(LimboError::Constraint(
+                                "numeric_fit: precision and scale must be integers".to_string(),
+                            )
+                            .into());
                         };
-                        let scale = match scale_reg.get_value() {
-                            Value::Numeric(Numeric::Integer(i)) => *i,
-                            _ => {
-                                return Err(LimboError::Constraint(
-                                    "numeric_encode: scale must be an integer".to_string(),
-                                )
-                                .into());
-                            }
-                        };
-                        let text = match other {
-                            Value::Numeric(Numeric::Integer(i)) => i.to_string(),
-                            Value::Numeric(Numeric::Float(f)) => f.to_string(),
-                            Value::Text(t) => t.value.to_string(),
-                            _ => {
-                                return Err(LimboError::Constraint(format!(
-                                    "invalid input for type numeric: \"{other}\""
-                                ))
-                                .into());
-                            }
-                        };
-                        let bd = BigDecimal::from_str(&text).map_err(|_| {
-                            LimboError::Constraint(format!(
-                                "invalid input for type numeric: \"{text}\""
-                            ))
-                        })?;
-                        let validated = validate_precision_scale(&bd, precision, scale)?;
-                        Value::from_blob(bigdecimal_to_blob(&validated))
+                        let fitted = validate_precision_scale(&bd, *precision, *scale)?;
+                        Value::from_blob(bigdecimal_to_blob(&fitted))
+                    }
+                    other => {
+                        return Err(LimboError::InternalError(format!(
+                            "numeric_fit expects a stored numeric, got {}",
+                            other.value_type()
+                        ))
+                        .into());
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -11626,20 +11348,30 @@ pub fn op_function(
             ScalarFunc::NumericAdd
             | ScalarFunc::NumericSub
             | ScalarFunc::NumericMul
-            | ScalarFunc::NumericDiv => {
+            | ScalarFunc::NumericDiv
+            | ScalarFunc::NumericMod => {
                 check_arg_count!(arg_count, 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();
                 let rhs_val = state.registers[*start_reg + 1].get_value().clone();
                 let result = match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = numeric_from_value(&lhs_val)?;
+                        let b = numeric_from_value(&rhs_val)?;
+                        // The result keeps every decimal of its operands, as in
+                        // PostgreSQL: 1.00 * 3 is 3.00 and 0.00 + 3 is 3.00. A
+                        // product may have more decimals than a numeric can hold,
+                        // so PostgreSQL rounds it to the most a numeric can hold.
+                        let (a_scale, b_scale) =
+                            (a.fractional_digit_count(), b.fractional_digit_count());
                         let res = match scalar_func {
-                            ScalarFunc::NumericAdd => a + b,
-                            ScalarFunc::NumericSub => a - b,
-                            ScalarFunc::NumericMul => a * b,
-                            ScalarFunc::NumericDiv => {
+                            ScalarFunc::NumericAdd => (a + b).with_scale(a_scale.max(b_scale)),
+                            ScalarFunc::NumericSub => (a - b).with_scale(a_scale.max(b_scale)),
+                            ScalarFunc::NumericMul => (a * b).with_scale_round(
+                                (a_scale + b_scale).min(MAX_FRACTION_DIGITS),
+                                bigdecimal::RoundingMode::HalfUp,
+                            ),
+                            ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
                                 use bigdecimal::Zero;
                                 if b.is_zero() {
                                     return Err(LimboError::Constraint(
@@ -11647,34 +11379,34 @@ pub fn op_function(
                                     )
                                     .into());
                                 }
-                                a / b
+                                if matches!(scalar_func, ScalarFunc::NumericDiv) {
+                                    a / b
+                                } else {
+                                    // The remainder has the dividend's sign.
+                                    (a % b).with_scale(a_scale.max(b_scale))
+                                }
                             }
                             _ => unreachable!(),
                         };
+                        crate::numeric::decimal::check_numeric_limits(&res)?;
                         Value::build_text(crate::numeric::decimal::format_numeric(&res))
                     }
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
-                check_arg_count!(arg_count, 2);
-                let lhs_val = state.registers[*start_reg].get_value().clone();
-                let rhs_val = state.registers[*start_reg + 1].get_value().clone();
-                match (&lhs_val, &rhs_val) {
-                    (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
-                    _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
-                        let cmp_result = match scalar_func {
-                            ScalarFunc::NumericLt => a < b,
-                            ScalarFunc::NumericEq => a == b,
-                            _ => unreachable!(),
-                        };
-                        state.registers[*dest].set_int(cmp_result as i64)
-                    }
+            ScalarFunc::NumericNeg => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value().clone();
+                let result = match val {
+                    Value::Null => Value::Null,
+                    // Negating keeps the decimal places: -(1.50) is -1.50.
+                    _ => Value::build_text(crate::numeric::decimal::format_numeric(
+                        &-numeric_from_value(&val)?,
+                    )),
                 };
+                state.registers[*dest].set_value(result);
             }
-            ScalarFunc::DatePlus | ScalarFunc::DateMinus => {
+            ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => {
                 check_arg_count!(arg_count, 2);
                 let lhs = state.registers[*start_reg].get_value();
                 let rhs = state.registers[*start_reg + 1].get_value();
@@ -11682,6 +11414,7 @@ pub fn op_function(
                 let result = match scalar_func {
                     ScalarFunc::DatePlus => exec_date_plus(&clock, lhs, rhs)?,
                     ScalarFunc::DateMinus => exec_date_minus(&clock, lhs, rhs)?,
+                    ScalarFunc::DateDiff => exec_date_diff(&clock, lhs, rhs)?,
                     _ => unreachable!(),
                 };
                 state.registers[*dest].set_value(result);
@@ -11984,6 +11717,9 @@ pub fn op_function(
                         }
                     };
                     let rename_to = normalize_ident(original_rename_to.as_str());
+                    let supports_namespaces = program.connection.dialect().supports_namespaces();
+                    let row_namespace =
+                        crate::namespace::demangle_name(supports_namespaces, &name).0;
 
                     let new_name = if let Some(column) =
                         &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
@@ -12005,7 +11741,6 @@ pub fn op_function(
                         let Value::Text(sql) = sql else {
                             break 'sql None;
                         };
-
                         let cmd = parse_schema_sql_for_alter(
                             program.connection.dialect().as_ref(),
                             entry_type.as_str(),
@@ -12259,6 +11994,30 @@ pub fn op_function(
                                     .to_string(),
                                 )
                             }
+                            view @ ast::Stmt::CreateView { .. } => {
+                                // The view text names the table as its own SQL
+                                // does: by its bare name, maybe with a qualifier.
+                                let (table_namespace, from) = crate::namespace::demangle_name(
+                                    supports_namespaces,
+                                    &rename_from,
+                                );
+                                let (_, to) = crate::namespace::demangle_name(
+                                    supports_namespaces,
+                                    original_rename_to.as_str(),
+                                );
+                                let qualifiers =
+                                    program.connection.with_schema(crate::MAIN_DB_ID, |schema| {
+                                        table_qualifiers(schema, table_namespace)
+                                    });
+                                rewrite_view_for_table_rename(
+                                    view,
+                                    from,
+                                    to,
+                                    row_namespace == table_namespace,
+                                    qualifiers.as_deref(),
+                                )
+                                .map(|(new_sql, _)| new_sql)
+                            }
                             _ => None,
                         }
                     };
@@ -12297,7 +12056,6 @@ pub fn op_function(
                         let Value::Text(sql) = sql else {
                             break 'sql None;
                         };
-
                         let cmd = parse_schema_sql_for_alter(
                             program.connection.dialect().as_ref(),
                             entry_type.as_str(),
@@ -12321,7 +12079,7 @@ pub fn op_function(
                                 idx_name,
                                 mut where_clause,
                                 using,
-                                with_clause,
+                                mut with_clause,
                             } => {
                                 if table != normalize_ident(tbl_name.as_str()) {
                                     break 'sql None;
@@ -12341,6 +12099,22 @@ pub fn op_function(
                                         &rename_from,
                                         column_def.col_name.as_str(),
                                     );
+                                }
+
+                                if let Some(using) = &using {
+                                    let syms = program.connection.syms.read();
+                                    let Some(index_method) = syms.index_methods.get(using.as_str())
+                                    else {
+                                        return Err(LimboError::InternalError(format!(
+                                            "index method {using} not found during ALTER TABLE RENAME COLUMN"
+                                        ))
+                                        .into());
+                                    };
+                                    index_method.rename_column_in_with_clause(
+                                        &mut with_clause,
+                                        &rename_from,
+                                        column_def.col_name.as_str(),
+                                    )?;
                                 }
 
                                 Some(
@@ -12628,6 +12402,7 @@ pub fn op_function(
             unreachable!("Window functions should not be handled here")
         }
     }
+    state.registers[*dest].get_value().check_length_limit()?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -12880,12 +12655,20 @@ fn change_log_route(
         _ => return Ok(None),
     };
     let schema = program.connection.schema.read();
-    // Check for dependent views before doing anything else: a plain write to
-    // a table with no materialized views is the overwhelmingly common case,
-    // and it must stay as cheap as it was before change-log routing existed,
-    // i.e. a single schema-map lookup rather than also resolving the
-    // schema-owned table descriptor and the is_materialized_view check below.
-    let dependent_views = schema.get_dependent_materialized_views(&cursor_table.name);
+    // Check for materialized views before doing anything else: a plain write
+    // to a database with no materialized views is the overwhelmingly common
+    // case, and it must stay as cheap as it was before change-log routing
+    // existed, rather than also resolving the schema-owned table descriptor
+    // and the is_materialized_view check below.
+    if !schema.has_materialized_views() {
+        return Ok(None);
+    }
+    let Some((namespace, _)) =
+        schema.btree_table_with_root(&cursor_table.name, cursor_table.root_page)
+    else {
+        return Ok(None);
+    };
+    let dependent_views = schema.get_dependent_materialized_views(namespace, &cursor_table.name);
     if dependent_views.is_empty() {
         return Ok(None);
     }
@@ -12893,19 +12676,10 @@ fn change_log_route(
     // descriptor that includes the trailing weight column. Resolve the bound
     // cursor back to the schema-owned descriptor so change capture always
     // deals in the relation's logical row shape.
-    let Some(table) = schema.get_btree_table(&cursor_table.name) else {
+    let Some(table) = schema.get_btree_table(namespace, &cursor_table.name) else {
         return Ok(None);
     };
-    // A zero root belongs to a cursor whose btree is assigned at runtime
-    // (CREATE) or to an ephemeral relation. Otherwise the root is part of the
-    // bound relation identity and must still match the current schema.
-    if cursor_table.root_page != 0 && cursor_table.root_page != table.root_page {
-        return Err(LimboError::InternalError(format!(
-            "changed btree {} has root {}, but the current schema binds it to root {}",
-            cursor_table.name, cursor_table.root_page, table.root_page
-        )));
-    }
-    let is_materialized_view = schema.is_materialized_view(&table.name);
+    let is_materialized_view = schema.is_materialized_view(namespace, &table.name);
     Ok(Some(ChangeLogRoute {
         table,
         dependent_views,
@@ -13032,6 +12806,35 @@ fn normalize_table_change_record(
     Ok(values)
 }
 
+/// The backstop behind the read-only transaction checks: the compile-time
+/// check rejects write statements and the sequence opcodes reject evaluated
+/// nextval/setval, but every database write must pass through a write opcode,
+/// so a write path that misses those checks fails here instead of writing.
+/// Ephemeral B-trees (sorters, materialized subqueries) are not database
+/// writes. Uses the mode captured when the statement started writing, so a
+/// statement already in flight when the transaction turns read-only keeps
+/// its mode, like a resumed portal in PostgreSQL.
+fn check_db_write_allowed(
+    program: &Program,
+    state: &ProgramState,
+    cursor_id: Option<usize>,
+) -> Result<(), Box<LimboError>> {
+    if !state.tx_read_only_at_start {
+        return Ok(());
+    }
+    if let Some(cursor_id) = cursor_id {
+        if program
+            .prepared()
+            .explain
+            .ephemeral_cursors
+            .contains(&cursor_id)
+        {
+            return Ok(());
+        }
+    }
+    Err(Box::new(LimboError::ReadOnly))
+}
+
 pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -13048,6 +12851,7 @@ pub fn op_insert(
         },
         insn
     );
+    check_db_write_allowed(program, state, Some(*cursor_id))?;
 
     loop {
         match state.active_op_state.insert().sub_state {
@@ -13511,6 +13315,7 @@ pub fn op_delete(
         },
         insn
     );
+    check_db_write_allowed(program, state, Some(*cursor_id))?;
 
     loop {
         match state.active_op_state.delete().sub_state {
@@ -13658,6 +13463,7 @@ pub fn op_idx_delete(
         },
         insn
     );
+    check_db_write_allowed(program, state, Some(*cursor_id))?;
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
         return_if_io!(
@@ -13782,6 +13588,7 @@ pub fn op_idx_insert(
         },
         *insn
     );
+    check_db_write_allowed(program, state, Some(cursor_id))?;
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[cursor_id] {
         let Some(start) = unpacked_start else {
@@ -14731,6 +14538,7 @@ pub fn op_create_btree(
 ) -> InsnResult {
     load_insn!(CreateBtree { db, root, flags }, insn);
 
+    check_db_write_allowed(program, state, None)?;
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
@@ -14912,6 +14720,7 @@ pub fn op_destroy(
         },
         insn
     );
+    check_db_write_allowed(program, state, None)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         // MVCC only does pager operations in checkpoint
@@ -14959,6 +14768,7 @@ pub fn op_clear_btree(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    check_db_write_allowed(program, state, None)?;
     match op_clear_btree_inner(program, state, insn, pager) {
         Ok(result) => Ok(result),
         Err(err) => {
@@ -15077,7 +14887,15 @@ pub fn op_drop_table(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropTable { db, table_name, .. }, insn);
+    load_insn!(
+        DropTable {
+            db,
+            namespace,
+            table_name,
+            ..
+        },
+        insn
+    );
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     {
@@ -15087,7 +14905,7 @@ pub fn op_drop_table(
             // to include them to avoid "page never used" false positives.
             if is_mvcc {
                 let table = schema
-                    .get_table(table_name)
+                    .get_table(*namespace, table_name)
                     .expect("DROP TABLE: table must exist in schema");
                 if let Some(btree) = table.btree() {
                     // Only track positive root pages (checkpointed tables).
@@ -15097,17 +14915,19 @@ pub fn op_drop_table(
                     }
                 }
                 // Capture index root pages (table may not have indexes)
-                if let Some(indexes) = schema.indexes.get(table_name) {
-                    for index in indexes.iter() {
-                        if index.root_page > 0 {
-                            schema.dropped_root_pages.insert(index.root_page);
-                        }
+                let index_root_pages: Vec<i64> = schema
+                    .indices_including_backing(*namespace, table_name)
+                    .map(|index| index.root_page)
+                    .collect();
+                for root_page in index_root_pages {
+                    if root_page > 0 {
+                        schema.dropped_root_pages.insert(root_page);
                     }
                 }
             }
-            schema.remove_indices_for_table(table_name);
-            schema.remove_triggers_for_table(table_name);
-            schema.remove_table(table_name);
+            schema.remove_indices_for_table(*namespace, table_name);
+            schema.remove_triggers_for_table(*namespace, table_name);
+            schema.remove_table(*namespace, table_name);
         })?;
         // SQLite also removes temp triggers that target the dropped table.
         // Only needed when dropping from a non-temp database. We must
@@ -15117,7 +14937,11 @@ pub fn op_drop_table(
         if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
             let dropped_db = *db;
             conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
-                temp_schema.remove_triggers_for_table_with_db(table_name, dropped_db);
+                temp_schema.remove_triggers_for_table_with_db(
+                    NamespaceId::ROOT,
+                    table_name,
+                    dropped_db,
+                );
             })?;
         }
     }
@@ -15131,11 +14955,18 @@ pub fn op_drop_view(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropView { db, view_name }, insn);
+    load_insn!(
+        DropView {
+            db,
+            namespace,
+            view_name
+        },
+        insn
+    );
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema.remove_view(view_name).ok();
-        schema.broken_views.remove(view_name);
+        schema.remove_view(*namespace, view_name).ok();
+        schema.remove_broken_view(*namespace, view_name);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -15165,6 +14996,7 @@ pub fn op_add_sequence(
     load_insn!(AddSequence { data }, insn);
     let AddSequenceData {
         db,
+        namespace,
         name,
         start,
         increment,
@@ -15182,9 +15014,7 @@ pub fn op_add_sequence(
     )?;
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema
-            .sequences
-            .insert(crate::util::normalize_ident(name), std::sync::Arc::new(seq));
+        schema.add_sequence(*namespace, seq);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -15196,7 +15026,14 @@ pub fn op_drop_sequence(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropSequence { db, seq_name }, insn);
+    load_insn!(
+        DropSequence {
+            db,
+            namespace,
+            seq_name
+        },
+        insn
+    );
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     conn.with_database_schema_mut(*db, |schema| {
@@ -15204,17 +15041,18 @@ pub fn op_drop_sequence(
         // The btree pages won't be freed until checkpoint, so integrity_check needs
         // to include them to avoid "page never used" false positives.
         if is_mvcc {
-            let backing_table_name =
-                crate::translate::sequence::sequence_backing_table_name(seq_name);
+            let backing_table_name = crate::translate::sequence::sequence_backing_table_name(
+                &mangle_name(*namespace, seq_name),
+            );
             let root_page = schema
-                .get_btree_table(&backing_table_name)
+                .get_btree_table(NamespaceId::ROOT, &backing_table_name)
                 .expect("DROP SEQUENCE: backing table must exist in schema")
                 .root_page;
             if root_page > 0 {
                 schema.dropped_root_pages.insert(root_page);
             }
         }
-        schema.remove_sequence(seq_name);
+        schema.remove_sequence(*namespace, seq_name);
     })?;
     // Drop this connection's stale currval. Otherwise a same-session
     // DROP SEQUENCE + CREATE SEQUENCE <same name> would let currval()
@@ -15222,7 +15060,44 @@ pub fn op_drop_sequence(
     // "not yet defined in this session" — covered by the regression
     // test `currval-after-drop-then-recreate-uses-new-sequence-currval`
     // in `sequence_adversarial.sqltest`.
-    conn.clear_sequence_currval(*db, seq_name);
+    conn.clear_sequence_currval(*db, &mangle_name(*namespace, seq_name));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_add_namespace(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        AddNamespace {
+            db,
+            namespace,
+            name
+        },
+        insn
+    );
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.name_namespace(*namespace, name);
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_drop_namespace(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(DropNamespace { db, namespace }, insn);
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.unname_namespace(*namespace);
+    })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -15262,6 +15137,7 @@ pub fn op_sequence_compute_next(
     load_insn!(
         SequenceComputeNext {
             db,
+            namespace,
             seq_name,
             in_value_reg,
             in_is_called_reg,
@@ -15273,7 +15149,7 @@ pub fn op_sequence_compute_next(
 
     let seq = program
         .connection
-        .with_schema(*db, |s| s.get_sequence(seq_name).cloned())
+        .with_schema(*db, |s| s.get_sequence(*namespace, seq_name).cloned())
         .ok_or_else(|| {
             crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
         })?;
@@ -15358,6 +15234,7 @@ pub fn op_set_sequence_currval(
     load_insn!(
         SetSequenceCurrval {
             db,
+            namespace,
             seq_name,
             value_reg,
         },
@@ -15375,7 +15252,7 @@ pub fn op_set_sequence_currval(
 
     program
         .connection
-        .set_sequence_currval(*db, seq_name, value);
+        .set_sequence_currval(*db, &mangle_name(*namespace, seq_name), value);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -15395,6 +15272,7 @@ pub fn op_sequence_track_allocation(
     load_insn!(
         SequenceTrackAllocation {
             db,
+            namespace,
             seq_name,
             value_reg,
         },
@@ -15413,17 +15291,18 @@ pub fn op_sequence_track_allocation(
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
         let seq = program
             .connection
-            .with_schema(*db, |s| s.get_sequence(seq_name).cloned())
+            .with_schema(*db, |s| s.get_sequence(*namespace, seq_name).cloned())
             .ok_or_else(|| {
                 crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist"))
             })?;
         let current_watermark =
             crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
-        mv_store.set_sequence_watermark(seq_name, current_watermark);
+        let mangled_seq_name = mangle_name(*namespace, seq_name);
+        mv_store.set_sequence_watermark(&mangled_seq_name, current_watermark);
 
         if let Some((tx_id, _)) = program.connection.get_mv_tx_for_db(*db) {
             if mv_store.is_tx_rollbackable(tx_id) {
-                mv_store.register_sequence_allocation(tx_id, seq_name, value)?;
+                mv_store.register_sequence_allocation(tx_id, &mangled_seq_name, value)?;
             }
         }
     }
@@ -15459,6 +15338,7 @@ pub fn op_sequence_register_allocation(
     load_insn!(
         SequenceRegisterAllocation {
             db,
+            namespace,
             seq_name,
             value_reg,
             saved_outer_reg,
@@ -15490,7 +15370,11 @@ pub fn op_sequence_register_allocation(
 
     if let Some(mv_store) = program.connection.mv_store_for_db(*db) {
         if mv_store.is_tx_rollbackable(outer_tx_id) {
-            mv_store.register_sequence_allocation(outer_tx_id, seq_name, value)?;
+            mv_store.register_sequence_allocation(
+                outer_tx_id,
+                &mangle_name(*namespace, seq_name),
+                value,
+            )?;
         }
     }
 
@@ -15588,6 +15472,9 @@ pub fn op_sequence_begin_inner_tx(
     );
 
     let conn = program.connection.clone();
+    if conn.is_tx_read_only() {
+        return Err(LimboError::ReadOnly.into());
+    }
     let Some(mv_store) = conn.mv_store_for_db(*db) else {
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
@@ -15607,7 +15494,12 @@ pub fn op_sequence_begin_inner_tx(
         }
     }
 
-    let inner_tx_id = mv_store.begin_tx(pager.clone())?;
+    let inner_tx_id = mv_store.begin_tx_with_schema_generation_and_checkpoint_read_guard(
+        pager.clone(),
+        None,
+        CheckpointReadLockState::NotHeld,
+        conn.portable_logical_changes_enabled(),
+    )?;
     conn.set_mv_tx_for_db(
         *db,
         Some((
@@ -15792,11 +15684,18 @@ pub fn op_drop_trigger(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(DropTrigger { db, trigger_name }, insn);
+    load_insn!(
+        DropTrigger {
+            db,
+            namespace,
+            trigger_name
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
-        schema.remove_trigger(trigger_name).ok();
+        schema.remove_trigger(*namespace, trigger_name).ok();
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -15888,7 +15787,7 @@ pub struct OpParseSchemaInner {
     automatic_indices: crate::HashMap<String, crate::alloc::Vec<(String, i64)>>,
     dbsp_state_roots: crate::HashMap<String, i64>,
     dbsp_state_index_roots: crate::HashMap<String, i64>,
-    materialized_view_info: crate::HashMap<String, (String, i64)>,
+    materialized_view_info: crate::HashMap<String, crate::schema::StoredMaterializedView>,
     trigger_target_database_id: Option<usize>,
     db: usize,
     previous_auto_commit: bool,
@@ -16040,7 +15939,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let schema = Schema::try_make_mut(&mut inner.schema_arc)?;
                 let syms = conn.syms.read();
                 let attached_resolver = |alias: &str| -> Option<usize> {
-                    conn.namespaces()
+                    conn.current_qualifiers()
                         .database_id(&crate::util::normalize_ident(alias))
                 };
                 schema.handle_schema_row(
@@ -16060,7 +15959,11 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 )?;
                 if ty == "trigger" {
                     if let Some(target_database_id) = inner.trigger_target_database_id {
-                        schema.set_trigger_target_database_id(name, target_database_id)?;
+                        schema.set_trigger_target_database_id(
+                            NamespaceId::ROOT,
+                            name,
+                            target_database_id,
+                        )?;
                     }
                 }
                 continue;
@@ -16087,8 +15990,10 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
-                let populate_result = schema.populate_materialized_views_then_indices(
+                // The schema already holds every stored type.
+                let populate_result = schema.populate_types_views_then_indices(
                     &syms,
+                    &[],
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,
@@ -16428,7 +16333,8 @@ pub fn op_populate_materialized_views(
             };
 
             let schema = conn.schema.read();
-            let Some(view_mutex) = schema.get_materialized_view(view_name) else {
+            let (namespace, name) = schema.demangle_name(view_name);
+            let Some(view_mutex) = schema.get_materialized_view(namespace, name) else {
                 return Err(LimboError::InternalError(format!(
                     "materialized view {view_name} missing from schema during population"
                 ))
@@ -16556,6 +16462,7 @@ pub fn op_set_cookie(
         },
         insn
     );
+    check_db_write_allowed(program, state, None)?;
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     if let Some(mv_store) = mv_store.as_ref() {
@@ -17673,7 +17580,15 @@ pub fn op_rename_table(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(RenameTable { db, from, to }, insn);
+    load_insn!(
+        RenameTable {
+            db,
+            namespace,
+            from,
+            to
+        },
+        insn
+    );
 
     let normalized_from = normalize_ident(from.as_str());
     let normalized_to = normalize_ident(to.as_str());
@@ -17681,23 +17596,25 @@ pub fn op_rename_table(
     let conn = program.connection.clone();
 
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
-        if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
-            let autoindex_prefix = format!("sqlite_autoindex_{normalized_from}_");
+        if let Some(mut indexes) = schema.take_indices(*namespace, &normalized_from) {
+            // An automatic index is named after the table's mangled name, the
+            // name its schema row has.
+            let mangled_from = crate::namespace::mangle_name(*namespace, &normalized_from);
+            let mangled_to = crate::namespace::mangle_name(*namespace, &normalized_to);
+            let autoindex_prefix = format!("sqlite_autoindex_{mangled_from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
-                // Rename autoindexes to match the new table name
                 if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
-                    index.name = format!("sqlite_autoindex_{normalized_to}_{suffix}");
+                    index.name = format!("sqlite_autoindex_{mangled_to}_{suffix}");
                 }
             });
 
-            schema.indexes.insert(normalized_to.to_owned(), indexes);
+            schema.insert_indices(*namespace, normalized_to.to_owned(), indexes);
         };
 
         let mut table = schema
-            .tables
-            .remove(&normalized_from)
+            .take_table(*namespace, &normalized_from)
             .expect("table being renamed should be in schema");
         #[cfg(feature = "conn_raw_api")]
         schema.unregister_table_root_page(table.as_ref());
@@ -17707,7 +17624,9 @@ pub fn op_rename_table(
                 // update this table's own foreign keys
                 for fk_arc in &mut btree.foreign_keys {
                     let fk = Arc::make_mut(fk_arc);
-                    if normalize_ident(&fk.parent_table) == normalized_from {
+                    if fk.parent_namespace == *namespace
+                        && normalize_ident(&fk.parent_table) == normalized_from
+                    {
                         fk.parent_table.clone_from(&normalized_to);
                     }
                 }
@@ -17725,6 +17644,7 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
+                normalized_to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
@@ -17734,17 +17654,19 @@ pub fn op_rename_table(
 
         #[cfg(feature = "conn_raw_api")]
         schema.register_table_root_page(&normalized_to, table.as_ref());
-        schema.tables.insert(normalized_to.to_owned(), table);
+        schema.insert_table(*namespace, normalized_to.to_owned(), table);
 
-        for (tname, t_arc) in schema.tables.iter_mut() {
+        for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
             // skip the table we just renamed
-            if normalize_ident(tname) == normalized_to {
+            if child_namespace == *namespace && normalize_ident(tname) == normalized_to {
                 continue;
             }
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
-                    if normalize_ident(&fk_arc.parent_table) == normalized_from {
+                    if fk_arc.parent_namespace == *namespace
+                        && normalize_ident(&fk_arc.parent_table) == normalized_from
+                    {
                         let fk = Arc::make_mut(fk_arc);
                         fk.parent_table.clone_from(&normalized_to);
                     }
@@ -17754,13 +17676,13 @@ pub fn op_rename_table(
 
         // Update triggers: move from old table name key to new, and update
         // each trigger's table_name field and body commands.
-        if let Some(mut triggers) = schema.triggers.remove(&normalized_from) {
+        if let Some(mut triggers) = schema.take_triggers(*namespace, &normalized_from) {
             for trigger_arc in &mut triggers {
                 let trigger = Arc::make_mut(trigger_arc);
                 normalized_to.clone_into(&mut trigger.table_name);
                 rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
-            schema.triggers.insert(normalized_to.to_owned(), triggers);
+            schema.insert_triggers(*namespace, normalized_to.to_owned(), triggers);
         }
 
         // If the renamed table owned an implicit AUTOINCREMENT sequence,
@@ -17775,9 +17697,13 @@ pub fn op_rename_table(
         // INSERT into the renamed table would error with "missing
         // implicit sequence for AUTOINCREMENT table" until the next
         // schema reparse.
-        let old_seq_name = crate::schema::autoincrement_sequence_name(&normalized_from);
-        if let Some(mut seq_arc) = schema.sequences.remove(&old_seq_name) {
-            let new_seq_name = crate::schema::autoincrement_sequence_name(&normalized_to);
+        let old_seq_name =
+            crate::schema::autoincrement_sequence_name(&mangle_name(*namespace, &normalized_from));
+        if let Some(mut seq_arc) = schema.take_sequence(NamespaceId::ROOT, &old_seq_name) {
+            let new_seq_name = crate::schema::autoincrement_sequence_name(&mangle_name(
+                *namespace,
+                &normalized_to,
+            ));
             // Mutate the Sequence's `name` field so its internal identity
             // tracks the new table. `seq.name` is used by the exhaustion
             // error message in `op_sequence_compute_next` and by the
@@ -17790,25 +17716,58 @@ pub fn op_rename_table(
                 crate::translate::sequence::sequence_backing_table_name(&old_seq_name);
             let new_backing_table =
                 crate::translate::sequence::sequence_backing_table_name(&new_seq_name);
-            schema.sequences.insert(new_seq_name, seq_arc);
-            if let Some(mut backing_arc) = schema.tables.remove(&old_backing_table) {
+            schema.insert_sequence(NamespaceId::ROOT, new_seq_name, seq_arc);
+            if let Some(mut backing_arc) = schema.take_table(NamespaceId::ROOT, &old_backing_table)
+            {
                 if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
-                    Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
+                    let btree = Arc::make_mut(btree_arc);
+                    btree.name.clone_from(&new_backing_table);
+                    btree.declared_name.clone_from(&new_backing_table);
                 }
-                schema.tables.insert(new_backing_table, backing_arc);
+                schema.insert_table(NamespaceId::ROOT, new_backing_table, backing_arc);
             }
         }
 
         // Also update triggers on OTHER tables that reference the renamed table
         // in their body commands (e.g., INSERT INTO old_name in a trigger on another table)
-        for (_, triggers) in schema.triggers.iter_mut() {
-            for trigger_arc in triggers.iter_mut() {
-                if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
+        for trigger_arc in schema.triggers_mut(*namespace) {
+            if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
+                continue;
+            }
+            let trigger = Arc::make_mut(trigger_arc);
+            rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+        }
+
+        let qualifiers = table_qualifiers(schema, *namespace);
+        let mut view_rewrites = Vec::new();
+        let view_namespaces: Vec<NamespaceId> = schema.namespace_ids().collect();
+        for view_namespace in view_namespaces {
+            for (view_name, view) in schema.views(view_namespace) {
+                if !sql_might_reference_identifier(&view.sql, &normalized_from) {
                     continue;
                 }
-                let trigger = Arc::make_mut(trigger_arc);
-                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
+                    continue;
+                };
+                if let Some(rewrite) = rewrite_view_for_table_rename(
+                    stmt,
+                    &normalized_from,
+                    to,
+                    view_namespace == *namespace,
+                    qualifiers.as_deref(),
+                ) {
+                    view_rewrites.push((view_namespace, view_name.to_string(), rewrite));
+                }
             }
+        }
+        for (view_namespace, view_name, (new_sql, new_select)) in view_rewrites {
+            let view = Arc::make_mut(
+                schema
+                    .view_mut(view_namespace, &view_name)
+                    .expect("view being rewritten should be in schema"),
+            );
+            view.sql = new_sql;
+            view.select_stmt = new_select;
         }
 
         Ok(())
@@ -17821,8 +17780,8 @@ pub fn op_rename_table(
             // move its TEMP triggers to the new name. Changing only the stored
             // SQL would leave them under the old name, so they would no longer
             // run.
-            let temp_shadows_old_name = schema.tables.contains_key(&normalized_from);
-            if let Some(triggers) = schema.triggers.remove(&normalized_from) {
+            let temp_shadows_old_name = schema.has_table(NamespaceId::ROOT, &normalized_from);
+            if let Some(triggers) = schema.take_triggers(NamespaceId::ROOT, &normalized_from) {
                 let mut triggers_to_keep = std::collections::VecDeque::new();
                 let mut triggers_to_rename = std::collections::VecDeque::new();
                 for mut trigger_arc in triggers {
@@ -17840,25 +17799,25 @@ pub fn op_rename_table(
                     }
                 }
                 if !triggers_to_keep.is_empty() {
-                    schema
-                        .triggers
-                        .insert(normalized_from.to_owned(), triggers_to_keep);
+                    schema.insert_triggers(
+                        NamespaceId::ROOT,
+                        normalized_from.to_owned(),
+                        triggers_to_keep,
+                    );
                 }
-                schema
-                    .triggers
-                    .entry(normalized_to.to_owned())
-                    .or_default()
-                    .extend(triggers_to_rename);
+                schema.append_triggers(
+                    NamespaceId::ROOT,
+                    normalized_to.to_owned(),
+                    triggers_to_rename,
+                );
             }
 
-            for triggers in schema.triggers.values_mut() {
-                for trigger_arc in triggers.iter_mut() {
-                    if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
-                        continue;
-                    }
-                    let trigger = Arc::make_mut(trigger_arc);
-                    rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+            for trigger_arc in schema.triggers_mut(NamespaceId::ROOT) {
+                if !sql_might_reference_identifier(&trigger_arc.sql, &normalized_from) {
+                    continue;
                 }
+                let trigger = Arc::make_mut(trigger_arc);
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
             Ok(())
         })??;
@@ -17866,6 +17825,66 @@ pub fn op_rename_table(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Renames the table `normalized_from` to `to` in a view. In a database
+/// with namespaces, `unqualified_names_table` says whether the view is in
+/// the table's namespace, and `table_qualifiers` are the names of that
+/// namespace; without namespaces both are ignored.
+fn rewrite_view_for_table_rename(
+    view: ast::Stmt,
+    normalized_from: &str,
+    to: &str,
+    unqualified_names_table: bool,
+    table_qualifiers: Option<&[String]>,
+) -> Option<(String, ast::Select)> {
+    let ast::Stmt::CreateView {
+        temporary,
+        if_not_exists,
+        view_name,
+        columns,
+        mut select,
+    } = view
+    else {
+        panic!("rewrite_view_for_table_rename called with a statement that is not CREATE VIEW");
+    };
+    let old_select = select.clone();
+    match table_qualifiers {
+        Some(qualifiers) => rewrite_select_namespace_table_refs(
+            &mut select,
+            normalized_from,
+            to,
+            unqualified_names_table,
+            qualifiers,
+        ),
+        None => rewrite_select_table_refs(&mut select, normalized_from, to),
+    }
+    if select == old_select {
+        return None;
+    }
+    let new_sql = ast::Stmt::CreateView {
+        temporary,
+        if_not_exists,
+        view_name,
+        columns,
+        select: select.clone(),
+    }
+    .to_string();
+    Some((new_sql, select))
+}
+
+/// The qualifiers that name `namespace` in the body of a view, or None when
+/// the database has no namespaces and any qualifier may name a table.
+fn table_qualifiers(schema: &Schema, namespace: NamespaceId) -> Option<Vec<String>> {
+    if !schema.supports_namespaces() {
+        return None;
+    }
+    let name = if namespace.is_root() {
+        Some("main")
+    } else {
+        schema.namespace_name(namespace)
+    };
+    Some(name.into_iter().map(str::to_string).collect())
 }
 
 pub fn op_drop_column(
@@ -17877,6 +17896,7 @@ pub fn op_drop_column(
     load_insn!(
         DropColumn {
             db,
+            namespace,
             table,
             column_index
         },
@@ -17889,8 +17909,7 @@ pub fn op_drop_column(
 
     let column_name = conn.with_schema(*db, |schema| {
         let table = schema
-            .tables
-            .get(&normalized_table_name)
+            .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
         table
             .get_column_at(*column_index)
@@ -17903,8 +17922,7 @@ pub fn op_drop_column(
 
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table = schema
-            .tables
-            .get_mut(&normalized_table_name)
+            .table_mut(*namespace, &normalized_table_name)
             .expect("table being renamed should be in schema");
 
         let table = Arc::get_mut(table).expect("this should be the only strong reference");
@@ -17928,17 +17946,15 @@ pub fn op_drop_column(
     })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
-        if let Some(indexes) = schema.indexes.get(&normalized_table_name) {
-            for index in indexes {
-                if index
-                    .columns
-                    .iter()
-                    .any(|column| column.pos_in_table == *column_index)
-                {
-                    return Err(LimboError::ParseError(format!(
-                        "cannot drop column \"{column_name}\": indexed"
-                    )));
-                }
+        for index in schema.indices_including_backing(*namespace, &normalized_table_name) {
+            if index
+                .columns
+                .iter()
+                .any(|column| column.pos_in_table == *column_index)
+            {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop column \"{column_name}\": indexed"
+                )));
             }
         }
         Ok(())
@@ -17948,28 +17964,26 @@ pub fn op_drop_column(
     // expressions, to account for the dropped column. For example, if the dropped column had index
     // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
-        if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
-            for index in indexes {
-                let index = Arc::make_mut(index);
-                for index_column in index.columns.iter_mut() {
-                    if index_column.pos_in_table != EXPR_INDEX_SENTINEL
-                        && index_column.pos_in_table > *column_index
-                    {
-                        index_column.pos_in_table -= 1;
-                    }
-                    if let Some(ref mut expr) = index_column.expr {
-                        crate::translate::expr::walk_expr_mut(expr, &mut |e| {
-                            if let ast::Expr::Column {
-                                table, column: c, ..
-                            } = e
-                            {
-                                if table.is_self_table() && *c > *column_index {
-                                    *c -= 1;
-                                }
+        for index in schema.indices_of_table_mut(*namespace, &normalized_table_name) {
+            let index = Arc::make_mut(index);
+            for index_column in index.columns.iter_mut() {
+                if index_column.pos_in_table != EXPR_INDEX_SENTINEL
+                    && index_column.pos_in_table > *column_index
+                {
+                    index_column.pos_in_table -= 1;
+                }
+                if let Some(ref mut expr) = index_column.expr {
+                    crate::translate::expr::walk_expr_mut(expr, &mut |e| {
+                        if let ast::Expr::Column {
+                            table, column: c, ..
+                        } = e
+                        {
+                            if table.is_self_table() && *c > *column_index {
+                                *c -= 1;
                             }
-                            Ok(crate::translate::expr::WalkControl::Continue)
-                        })?;
-                    }
+                        }
+                        Ok(crate::translate::expr::WalkControl::Continue)
+                    })?;
                 }
             }
         }
@@ -17977,8 +17991,8 @@ pub fn op_drop_column(
     })??;
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
-        for (view_name, view) in schema.views.iter() {
-            let view_select_sql = select_from_view_sql(&conn, *db, view_name);
+        for (view_name, view) in schema.views(*namespace) {
+            let view_select_sql = select_from_view_sql(&conn, *db, schema, *namespace, view_name);
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
@@ -17995,13 +18009,25 @@ pub fn op_drop_column(
 
 /// SQL that selects from the view `view_name` of database `db`, named with
 /// its database so the lookup does not go through the search path.
-fn select_from_view_sql(conn: &Connection, db: usize, view_name: &str) -> String {
-    let database_name = conn
-        .namespace_name(db)
-        .expect("the database of a view has a name");
+/// A statement that reads view `view_name` of `namespace` in database `db`,
+/// named so that it resolves without a search path: by the namespace's name
+/// when the namespace is stored, else by the database's name.
+fn select_from_view_sql(
+    conn: &Connection,
+    db: usize,
+    schema: &crate::schema::Schema,
+    namespace: NamespaceId,
+    view_name: &str,
+) -> String {
+    let qualifier = match schema.namespace_name(namespace) {
+        Some(namespace_name) => namespace_name.to_string(),
+        None => conn
+            .namespace_name(db)
+            .expect("the database of a view has a name"),
+    };
     format!(
         "SELECT * FROM \"{}\".\"{}\"",
-        database_name.replace('"', "\"\""),
+        qualifier.replace('"', "\"\""),
         view_name.replace('"', "\"\"")
     )
 }
@@ -18021,8 +18047,7 @@ pub fn op_add_column(
 
     conn.with_database_schema_mut(data.db, |schema| -> Result<()> {
         let table_ref = schema
-            .tables
-            .get_mut(&normalized_table_name)
+            .table_mut(data.namespace, &normalized_table_name)
             .expect("table being altered should be in schema");
 
         let table_ref = Arc::make_mut(table_ref);
@@ -18056,11 +18081,13 @@ pub fn op_alter_column(
     load_insn!(AlterColumn { data }, insn);
     let AlterColumnData {
         db,
+        namespace,
         table: table_name,
         column_index,
         definition,
         rename,
         rewritten_triggers,
+        renamed_index_methods,
     } = data.as_ref();
 
     let conn = program.connection.clone();
@@ -18068,8 +18095,7 @@ pub fn op_alter_column(
     let normalized_table_name = normalize_ident(table_name.as_str());
     let (old_column_name, is_strict) = conn.with_schema(*db, |schema| {
         let table = schema
-            .tables
-            .get(&normalized_table_name)
+            .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
         let old_column_name = table
             .get_column_at(*column_index)
@@ -18091,24 +18117,32 @@ pub fn op_alter_column(
         (false, crate::alloc::vec![])
     };
 
-    let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
+    let view_rewrites: Vec<(NamespaceRef, String, RewrittenView)> = if *rename {
         let target_db_name = conn.namespace_name(*db).ok_or_else(|| {
             LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
         })?;
         let mut all_rewrites = conn.with_schema(
             *db,
-            |schema| -> crate::Result<Vec<(usize, String, RewrittenView)>> {
+            |schema| -> crate::Result<Vec<(NamespaceRef, String, RewrittenView)>> {
                 let mut rewrites = Vec::new();
-                for (view_name, view) in schema.views.iter() {
+                for (view_name, view) in schema.views(*namespace) {
                     if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                         &view.sql,
                         schema,
+                        *namespace,
                         table_name.as_str(),
                         &target_db_name,
                         &old_column_name,
                         &new_name,
                     )? {
-                        rewrites.push((*db, view_name.clone(), rewritten));
+                        rewrites.push((
+                            NamespaceRef {
+                                database_id: *db,
+                                id: *namespace,
+                            },
+                            view_name.to_string(),
+                            rewritten,
+                        ));
                     }
                 }
                 Ok(rewrites)
@@ -18118,18 +18152,23 @@ pub fn op_alter_column(
         if *db != crate::TEMP_DB_ID {
             let temp_rewrites = conn.with_schema(
                 crate::TEMP_DB_ID,
-                |schema| -> crate::Result<Vec<(usize, String, RewrittenView)>> {
+                |schema| -> crate::Result<Vec<(NamespaceRef, String, RewrittenView)>> {
                     let mut rewrites = Vec::new();
-                    for (view_name, view) in schema.views.iter() {
+                    for (view_name, view) in schema.views(NamespaceId::ROOT) {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
                             &view.sql,
                             schema,
+                            NamespaceId::ROOT,
                             table_name.as_str(),
                             &target_db_name,
                             &old_column_name,
                             &new_name,
                         )? {
-                            rewrites.push((crate::TEMP_DB_ID, view_name.clone(), rewritten));
+                            rewrites.push((
+                                NamespaceRef::root_of(crate::TEMP_DB_ID),
+                                view_name.to_string(),
+                                rewritten,
+                            ));
                         }
                     }
                     Ok(rewrites)
@@ -18143,9 +18182,8 @@ pub fn op_alter_column(
     };
 
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
-        let table_arc = schema
-            .tables
-            .get_mut(&normalized_table_name)
+        let (table_arc, indexes) = schema
+            .table_with_indices_mut(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
         let table = Arc::make_mut(table_arc);
 
@@ -18191,34 +18229,38 @@ pub fn op_alter_column(
         btree.prepare_generated_columns()?;
 
         // Update this table's indexes that reference the old column.
-        if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
-            for idx in idxs {
-                let idx = Arc::make_mut(idx);
-                for ic in &mut idx.columns {
-                    if let Some(expr) = &mut ic.expr {
-                        rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
-                        if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
-                            ic.name = expr.to_string();
-                        }
-                    }
-                    if ic.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL {
-                        let table_column = btree
-                            .columns()
-                            .get(ic.pos_in_table)
-                            .expect("indexed column position should exist");
-                        if let Some(name) = &table_column.name {
-                            ic.name.clone_from(name);
-                        }
-                        ic.default.clone_from(&table_column.default);
-                        ic.expr = table_column
-                            .generated_expr()
-                            .map(|expr| Box::new(expr.clone()));
+        for idx in indexes {
+            let idx = Arc::make_mut(idx);
+            for ic in &mut idx.columns {
+                if let Some(expr) = &mut ic.expr {
+                    rename_identifiers(expr.as_mut(), &old_column_name, &new_name);
+                    if ic.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
+                        ic.name = expr.to_string();
                     }
                 }
-                // Update partial index WHERE clause column references
-                if let Some(ref mut wc) = idx.where_clause {
-                    rename_identifiers(wc, &old_column_name, &new_name);
+                if ic.pos_in_table != crate::schema::EXPR_INDEX_SENTINEL {
+                    let table_column = btree
+                        .columns()
+                        .get(ic.pos_in_table)
+                        .expect("indexed column position should exist");
+                    if let Some(name) = &table_column.name {
+                        ic.name.clone_from(name);
+                    }
+                    ic.default.clone_from(&table_column.default);
+                    ic.expr = table_column
+                        .generated_expr()
+                        .map(|expr| Box::new(expr.clone()));
                 }
+            }
+            // Update partial index WHERE clause column references
+            if let Some(ref mut wc) = idx.where_clause {
+                rename_identifiers(wc, &old_column_name, &new_name);
+            }
+            if let Some((_, attachment)) = renamed_index_methods
+                .iter()
+                .find(|(name, _)| *name == idx.name)
+            {
+                idx.index_method = Some(attachment.clone());
             }
         }
 
@@ -18284,7 +18326,9 @@ pub fn op_alter_column(
                 }
             }
             // parent side: if self-referencing, rename parent column too
-            if normalize_ident(&fk.parent_table) == normalized_table_name {
+            if fk.parent_namespace == *namespace
+                && normalize_ident(&fk.parent_table) == normalized_table_name
+            {
                 for pc in &mut fk.parent_columns {
                     if pc.eq_ignore_ascii_case(&old_column_name) {
                         pc.clone_from(&new_name);
@@ -18293,15 +18337,17 @@ pub fn op_alter_column(
             }
         }
 
-        // fix OTHER tables that reference this table as parent
-        for (tname, t_arc) in schema.tables.iter_mut() {
-            if normalize_ident(tname) == normalized_table_name {
+        // fix OTHER tables, of any namespace, that reference this table as parent
+        for (child_namespace, tname, t_arc) in schema.all_tables_mut() {
+            if child_namespace == *namespace && normalize_ident(tname) == normalized_table_name {
                 continue;
             }
             if let Table::BTree(ref mut child_btree_arc) = Arc::make_mut(t_arc) {
                 let child_btree = Arc::make_mut(child_btree_arc);
                 for fk_arc in &mut child_btree.foreign_keys {
-                    if normalize_ident(&fk_arc.parent_table) != normalized_table_name {
+                    if fk_arc.parent_namespace != *namespace
+                        || normalize_ident(&fk_arc.parent_table) != normalized_table_name
+                    {
                         continue;
                     }
                     let fk = Arc::make_mut(fk_arc);
@@ -18317,35 +18363,38 @@ pub fn op_alter_column(
     })??;
 
     if *rename {
-        for (trigger_db, trigger_name, sql) in rewritten_triggers {
-            conn.with_database_schema_mut(*trigger_db, |schema| {
-                replace_trigger_sql(schema, trigger_name, sql)
+        for (trigger_namespace, trigger_name, sql) in rewritten_triggers {
+            conn.with_database_schema_mut(trigger_namespace.database_id, |schema| {
+                replace_trigger_sql(schema, trigger_namespace.id, trigger_name, sql)
             })??;
         }
 
-        for (view_db, view_name, rewritten) in view_rewrites {
-            conn.with_database_schema_mut(view_db, move |schema| -> crate::Result<()> {
-                if let Some(view_arc) = schema.views.get_mut(&view_name) {
-                    let view = Arc::make_mut(view_arc);
-                    view.sql = rewritten.sql;
-                    view.select_stmt = rewritten.select_stmt;
-                    view.columns = rewritten.columns;
-                }
-                Ok(())
-            })??;
+        for (view_namespace, view_name, rewritten) in view_rewrites {
+            conn.with_database_schema_mut(
+                view_namespace.database_id,
+                move |schema| -> crate::Result<()> {
+                    if let Some(view_arc) = schema.view_mut(view_namespace.id, &view_name) {
+                        let view = Arc::make_mut(view_arc);
+                        view.sql = rewritten.sql;
+                        view.select_stmt = rewritten.select_stmt;
+                        view.columns = rewritten.columns;
+                    }
+                    Ok(())
+                },
+            )??;
         }
 
         if *db != crate::MAIN_DB_ID {
             conn.with_schema(*db, |schema| -> crate::Result<()> {
                 let table = schema
-                    .tables
-                    .get(&normalized_table_name)
+                    .get_table(*namespace, &normalized_table_name)
                     .expect("table being ALTERed should be in schema");
                 let _column = table
                     .get_column_at(*column_index)
                     .expect("column being ALTERed should be in schema");
-                for (view_name, view) in schema.views.iter() {
-                    let view_select_sql = select_from_view_sql(&conn, *db, view_name);
+                for (view_name, view) in schema.views(NamespaceId::ROOT) {
+                    let view_select_sql =
+                        select_from_view_sql(&conn, *db, schema, NamespaceId::ROOT, view_name);
                     let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                         LimboError::ParseError(format!(
                             "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
@@ -18362,7 +18411,12 @@ pub fn op_alter_column(
     Ok(InsnFunctionStepResult::Step)
 }
 
-fn replace_trigger_sql(schema: &mut Schema, trigger_name: &str, sql: &str) -> Result<()> {
+fn replace_trigger_sql(
+    schema: &mut Schema,
+    namespace: NamespaceId,
+    trigger_name: &str,
+    sql: &str,
+) -> Result<()> {
     let mut parser = Parser::new(sql.as_bytes());
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         event,
@@ -18376,10 +18430,7 @@ fn replace_trigger_sql(schema: &mut Schema, trigger_name: &str, sql: &str) -> Re
         )));
     };
     let trigger = schema
-        .triggers
-        .values_mut()
-        .flatten()
-        .find(|trigger| trigger.name == trigger_name)
+        .trigger_mut(namespace, trigger_name)
         .expect("rewritten trigger should be in schema");
     let trigger = Arc::make_mut(trigger);
     trigger.sql = sql.to_string();
@@ -18429,17 +18480,19 @@ fn handle_text_sum(
     match parsed_number {
         ParsedNumber::Integer(i) => {
             if is_approx {
+                sum_state.ovrfl = false;
                 sum_state.approx = true;
                 match acc {
                     Value::Null => {
                         *acc = Value::from_f64(i as f64);
                     }
                     Value::Numeric(Numeric::Integer(acc_i)) => {
-                        *acc = Value::from_f64(*acc_i as f64);
-                        apply_kbn_step_int(acc, i, sum_state);
+                        let prev = *acc_i;
+                        kbn_init_from_int(acc, prev, sum_state);
+                        apply_kbn_step(acc, i as f64, sum_state);
                     }
                     Value::Numeric(Numeric::Float(_)) => {
-                        apply_kbn_step_int(acc, i, sum_state);
+                        apply_kbn_step(acc, i as f64, sum_state);
                     }
                     _ => unreachable!(),
                 }
@@ -18451,10 +18504,10 @@ fn handle_text_sum(
                     Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(i) {
                         Some(sum) => *acc = Value::from_i64(sum),
                         None => {
-                            let acc_f = *acc_i as f64;
-                            *acc = Value::from_f64(acc_f);
+                            let prev = *acc_i;
                             sum_state.approx = true;
                             sum_state.ovrfl = true;
+                            kbn_init_from_int(acc, prev, sum_state);
                             apply_kbn_step_int(acc, i, sum_state);
                         }
                     },
@@ -18466,9 +18519,10 @@ fn handle_text_sum(
             }
         }
         ParsedNumber::Float(f) => {
+            sum_state.ovrfl = false;
             if !sum_state.approx {
                 if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
+                    kbn_init_from_int(acc, current_sum, sum_state);
                 } else if matches!(*acc, Value::Null) {
                     *acc = Value::from_f64(0.0);
                 }
@@ -18477,9 +18531,10 @@ fn handle_text_sum(
             apply_kbn_step(acc, f, sum_state);
         }
         ParsedNumber::None => {
+            sum_state.ovrfl = false;
             if !sum_state.approx {
                 if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
+                    kbn_init_from_int(acc, current_sum, sum_state);
                 } else if matches!(*acc, Value::Null) {
                     *acc = Value::from_f64(0.0);
                 }
@@ -19535,31 +19590,6 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     false
 }
 
-fn parse_test_uint(reg: &Register) -> Result<Option<u64>> {
-    match reg.get_value() {
-        Value::Null => Ok(None),
-        Value::Numeric(Numeric::Integer(i)) => {
-            if *i < 0 {
-                Err(LimboError::InternalError(
-                    "test_uint: negative value".to_string(),
-                ))
-            } else {
-                Ok(Some(*i as u64))
-            }
-        }
-        Value::Text(t) => {
-            let s = t.to_string();
-            let v = s
-                .parse::<u64>()
-                .map_err(|_| LimboError::InternalError(format!("test_uint: invalid uint: {s}")))?;
-            Ok(Some(v))
-        }
-        _ => Err(LimboError::InternalError(
-            "test_uint: unsupported type".to_string(),
-        )),
-    }
-}
-
 // Compat for applications that test for SQLite.
 fn execute_sqlite_version() -> String {
     crate::dialect::sqlite::SQLITE_VERSION.to_string()
@@ -20396,6 +20426,21 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                         .io
                         .block(|| pager.with_header(|header| header.reserved_space))?
                 };
+                // Like SQLite, a valid size from the last PRAGMA page_size wins over the
+                // source's, except when the source is in memory. A 512-byte page has too
+                // little usable space for more than 32 reserved bytes, so SQLite uses 1024.
+                let next_page_size = program.connection.next_page_size.load(Ordering::SeqCst);
+                let page_size =
+                    if PageSize::new(next_page_size).is_some() && !source_db.is_in_memory_db() {
+                        next_page_size
+                    } else {
+                        page_size
+                    };
+                let page_size = if reserved_space > 32 && page_size == 512 {
+                    1024
+                } else {
+                    page_size
+                };
 
                 // Mirror source feature flags to the output so schema replay
                 // can resolve custom types, generated columns, vtab modules, etc.
@@ -20728,7 +20773,7 @@ mod tests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![CollationSeq::BINARY],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             ..Default::default()
@@ -21387,8 +21432,7 @@ mod tests {
             &Value::Null,
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5)); // unchanged
@@ -21402,8 +21446,7 @@ mod tests {
             &Value::from_i64(42),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(6));
@@ -21423,8 +21466,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10));
@@ -21434,8 +21476,7 @@ mod tests {
             &Value::from_i64(5),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(15));
@@ -21455,8 +21496,7 @@ mod tests {
             &Value::Null,
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10)); // unchanged
@@ -21471,8 +21511,7 @@ mod tests {
             &Value::from_i64(5),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5));
@@ -21483,8 +21522,7 @@ mod tests {
             &Value::from_i64(3),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21495,8 +21533,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21515,8 +21552,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(10.0));
@@ -21527,8 +21563,7 @@ mod tests {
             &Value::from_i64(20),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(30.0));
@@ -21579,8 +21614,7 @@ mod tests {
             &Value::from_i64(9007199254740994),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         update_agg_payload(
@@ -21588,8 +21622,7 @@ mod tests {
             &Value::from_i64(-9007199254740993),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
 

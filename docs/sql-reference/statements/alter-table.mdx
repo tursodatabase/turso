@@ -73,6 +73,7 @@ ALTER TABLE table-name RENAME COLUMN old-column-name TO new-column-name;
 Renaming a column updates all references to the column in:
 
 - Indexes that reference the column (including expression indexes)
+- The `weights` option of FTS indexes
 - Triggers that reference the column
 - CHECK constraints that reference the column
 - Foreign key constraint definitions
@@ -85,6 +86,8 @@ A column rename fails if:
 - The new column name conflicts with an existing column in the same table.
 - A trigger on the table uses a qualified reference (e.g., `table_name.column_name`) to the column in its body.
 - A trigger's WHEN clause references the column.
+- An FTS index lists the column in its `weights` option and the new name cannot be written there, for example because it contains a comma or an equals sign.
+- The column is in an FTS index and the new name is one that an FTS index cannot include (see [FTS limitations](/docs/sql-reference/functions/fts#current-limitations)).
 
 ### Example
 
@@ -108,6 +111,10 @@ SELECT name, price FROM products;
 
 Add a new column to an existing table. The new column is always appended as the last column.
 
+For existing rows, a constant default uses the new column's affinity, just as it does
+for later inserts that omit the column. For example, `INT DEFAULT 5.0` reads as the
+integer `5`, while `REAL DEFAULT 5.0` reads as a real value.
+
 ```sql
 ALTER TABLE table-name ADD COLUMN column-name type [constraints];
 ```
@@ -125,8 +132,9 @@ A new column added with ADD COLUMN must satisfy these requirements:
 | `CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` defaults require an empty table | These non-deterministic values cannot be retroactively applied to existing rows |
 | CHECK constraints must hold for existing rows | With CHECK enforcement enabled, both new and existing table CHECK constraints are validated before the column is added |
 | No duplicate column name | The column name must not already exist in the table |
-| No `GENERATED ALWAYS AS` | Generated columns cannot be added via ALTER TABLE |
+| No `STORED` generated column | Only virtual [generated columns](/docs/sql-reference/statements/create-table#generated-always-as) can be added |
 | STRICT tables require an explicit type | The column type must be a valid STRICT type |
+| Virtual generated columns on STRICT tables must type-check against existing rows | If any existing row computes a value that cannot be losslessly stored under the declared type, the statement fails with `type mismatch on DEFAULT` |
 
 ### Supported Column Constraints
 
@@ -137,6 +145,7 @@ The following constraints are supported on added columns:
 - `CHECK (expression)`
 - `REFERENCES` (foreign key)
 - `COLLATE`
+- `GENERATED ALWAYS AS (expression)` (virtual generated columns)
 
 ### Examples
 

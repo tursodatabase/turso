@@ -29,6 +29,15 @@ impl PgSessionState {
         self.settings.lock().unwrap().contains(name)
     }
 
+    pub(crate) fn name_as_defined(&self, name: &str) -> Option<String> {
+        self.settings
+            .lock()
+            .unwrap()
+            .names_as_defined
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+    }
+
     fn update_settings(
         &self,
         conn: &Connection,
@@ -84,6 +93,10 @@ pub(crate) struct ConnectionSettings {
     current: SettingValues,
     memo_before_transaction: Option<SettingValues>,
     memo_before_statement: Option<SettingValues>,
+    /// Each parameter's name as written when it was first set, by
+    /// ascii-lowercase name. SHOW names its column this way. A rollback
+    /// keeps the parameter defined, so it keeps this name too.
+    names_as_defined: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -147,12 +160,19 @@ impl ConnectionSettings {
     }
 
     pub(crate) fn set(&mut self, name: &str, value: Option<String>, scope: SettingScope) {
-        self.current
-            .named
-            .entry(name.to_owned())
-            .or_default()
-            .set(value, scope);
+        let key = name.to_ascii_lowercase();
+        self.names_as_defined
+            .entry(key.clone())
+            .or_insert_with(|| name.to_owned());
+        self.current.named.entry(key).or_default().set(value, scope);
         self.current.has_transaction_values |= scope == SettingScope::Transaction;
+    }
+
+    /// Sets every named parameter to its default value for the session.
+    pub(crate) fn reset_all(&mut self) {
+        for setting in self.current.named.values_mut() {
+            setting.set(None, SettingScope::Session);
+        }
     }
 
     pub(crate) fn end_statement(
@@ -237,5 +257,264 @@ impl<T> Setting<T> {
 
     fn end_transaction(&mut self) {
         self.transaction_value = None;
+    }
+}
+
+pub(crate) enum ConfigParameter {
+    SearchPath,
+    ApplicationName,
+    Fixed(&'static FixedParameter),
+}
+
+pub(crate) enum Parameter<'a> {
+    BuiltIn(ConfigParameter),
+    Custom(&'a str),
+}
+
+pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
+    let parameter = if name.eq_ignore_ascii_case("search_path") {
+        ConfigParameter::SearchPath
+    } else if name.eq_ignore_ascii_case("application_name") {
+        ConfigParameter::ApplicationName
+    } else if let Some(parameter) = FIXED_PARAMETERS
+        .iter()
+        .find(|parameter| parameter.name.eq_ignore_ascii_case(name))
+    {
+        ConfigParameter::Fixed(parameter)
+    } else {
+        return name.contains('.').then_some(Parameter::Custom(name));
+    };
+    Some(Parameter::BuiltIn(parameter))
+}
+
+impl ConfigParameter {
+    pub(crate) fn set(
+        &self,
+        conn: &Connection,
+        value: Option<&str>,
+        scope: SettingScope,
+    ) -> turso_core::Result<String> {
+        match self {
+            Self::SearchPath => crate::session::set_search_path(conn, value, scope),
+            Self::ApplicationName => {
+                crate::session::session_state(conn)?.mutate(conn, |settings| {
+                    settings.set(self.name(), value.map(str::to_owned), scope);
+                });
+                Ok(value.unwrap_or_default().to_owned())
+            }
+            Self::Fixed(parameter) => {
+                if let Some(value) = value {
+                    parameter.validate(value)?;
+                }
+                Ok(parameter.value.to_owned())
+            }
+        }
+    }
+
+    pub(crate) fn get(&self, conn: &Connection) -> String {
+        match self {
+            Self::SearchPath => crate::session::search_path_setting(conn)
+                .unwrap_or_else(|| crate::session::DEFAULT_SEARCH_PATH.to_owned()),
+            Self::ApplicationName => conn
+                .context::<PgSessionState>()
+                .and_then(|state| state.setting(self.name()))
+                .unwrap_or_default(),
+            Self::Fixed(parameter) => parameter.value.to_owned(),
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::SearchPath => "search_path",
+            Self::ApplicationName => "application_name",
+            Self::Fixed(parameter) => parameter.name,
+        }
+    }
+
+    pub(crate) fn accepts_list(&self) -> bool {
+        matches!(
+            self,
+            Self::Fixed(FixedParameter {
+                validation: FixedValidation::DateStyle,
+                ..
+            })
+        )
+    }
+}
+
+pub(crate) struct FixedParameter {
+    name: &'static str,
+    value: &'static str,
+    validation: FixedValidation,
+}
+
+enum FixedValidation {
+    Exact,
+    Identifier,
+    Bool(bool),
+    DateStyle,
+    Encoding,
+    FloatDigits,
+}
+
+impl FixedParameter {
+    fn validate(&self, value: &str) -> turso_core::Result<()> {
+        let value_trimmed = value.trim();
+        let valid = match self.validation {
+            FixedValidation::Exact => value_trimmed.eq_ignore_ascii_case(self.value),
+            FixedValidation::Identifier => value == self.value,
+            FixedValidation::Bool(expected) => {
+                crate::functions::parse_pg_bool(value_trimmed) == Some(expected)
+            }
+            FixedValidation::DateStyle => {
+                let parts: Vec<_> = value_trimmed.split(',').map(str::trim).collect();
+                matches!(parts.as_slice(), [style] if style.eq_ignore_ascii_case("iso") || style.eq_ignore_ascii_case("mdy"))
+                    || matches!(parts.as_slice(), [style, order] if
+                        (style.eq_ignore_ascii_case("iso") && order.eq_ignore_ascii_case("mdy")) ||
+                        (style.eq_ignore_ascii_case("mdy") && order.eq_ignore_ascii_case("iso")))
+            }
+            FixedValidation::Encoding => ["UTF8", "UTF-8", "UNICODE"]
+                .iter()
+                .any(|encoding| value_trimmed.eq_ignore_ascii_case(encoding)),
+            FixedValidation::FloatDigits => matches!(value_trimmed.parse::<i32>(), Ok(1..=3)),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(crate::error::sqlstate_error(
+                turso_pg_parser::sqlstate::SQLSTATE_INVALID_PARAMETER_VALUE,
+                format!(
+                    "invalid value for parameter \"{}\": \"{value}\"; supported value is \"{}\"",
+                    self.name, self.value
+                ),
+            ))
+        }
+    }
+}
+
+// These fixed settings are mainly compatibility stubs for pg_dump, including
+// gateways that validate its SET commands through set_config. They report modes
+// already in effect; they do not implement configurable PostgreSQL behavior such
+// as timeouts, RLS, or alternate date formats. Unsupported values must error.
+const FIXED_PARAMETERS: &[FixedParameter] = &[
+    FixedParameter {
+        name: "DateStyle",
+        value: "ISO, MDY",
+        validation: FixedValidation::DateStyle,
+    },
+    FixedParameter {
+        name: "IntervalStyle",
+        value: "postgres",
+        validation: FixedValidation::Exact,
+    },
+    FixedParameter {
+        name: "client_encoding",
+        value: "UTF8",
+        validation: FixedValidation::Encoding,
+    },
+    FixedParameter {
+        name: "standard_conforming_strings",
+        value: "on",
+        validation: FixedValidation::Bool(true),
+    },
+    FixedParameter {
+        name: "extra_float_digits",
+        value: "1",
+        validation: FixedValidation::FloatDigits,
+    },
+    FixedParameter {
+        name: "statement_timeout",
+        value: "0",
+        validation: FixedValidation::Exact,
+    },
+    FixedParameter {
+        name: "lock_timeout",
+        value: "0",
+        validation: FixedValidation::Exact,
+    },
+    FixedParameter {
+        name: "idle_in_transaction_session_timeout",
+        value: "0",
+        validation: FixedValidation::Exact,
+    },
+    FixedParameter {
+        name: "transaction_timeout",
+        value: "0",
+        validation: FixedValidation::Exact,
+    },
+    FixedParameter {
+        name: "row_security",
+        value: "off",
+        validation: FixedValidation::Bool(false),
+    },
+    FixedParameter {
+        name: "quote_all_identifiers",
+        value: "off",
+        validation: FixedValidation::Bool(false),
+    },
+    FixedParameter {
+        name: "check_function_bodies",
+        value: "off",
+        validation: FixedValidation::Bool(false),
+    },
+    FixedParameter {
+        name: "synchronize_seqscans",
+        value: "off",
+        validation: FixedValidation::Bool(false),
+    },
+    FixedParameter {
+        name: "default_tablespace",
+        value: "",
+        validation: FixedValidation::Identifier,
+    },
+    FixedParameter {
+        name: "default_table_access_method",
+        value: "heap",
+        validation: FixedValidation::Identifier,
+    },
+    FixedParameter {
+        name: "xmloption",
+        value: "content",
+        validation: FixedValidation::Exact,
+    },
+    FixedParameter {
+        name: "client_min_messages",
+        value: "warning",
+        validation: FixedValidation::Exact,
+    },
+];
+
+#[cfg(test)]
+mod tests {
+    use super::{find_parameter, ConfigParameter, Parameter, FIXED_PARAMETERS};
+
+    #[test]
+    fn config_parameter_parses_sql_names() {
+        for name in ["search_path", "SEARCH_PATH", "SeArCh_PaTh"] {
+            assert!(
+                matches!(
+                    find_parameter(name),
+                    Some(Parameter::BuiltIn(ConfigParameter::SearchPath))
+                ),
+                "{name}"
+            );
+        }
+        for parameter in FIXED_PARAMETERS {
+            for name in [
+                parameter.name.to_ascii_lowercase(),
+                parameter.name.to_ascii_uppercase(),
+            ] {
+                assert!(
+                    matches!(
+                        find_parameter(&name),
+                        Some(Parameter::BuiltIn(ConfigParameter::Fixed(_)))
+                    ),
+                    "{name}"
+                );
+            }
+        }
+        for name in ["", "SearchPath", "search_path "] {
+            assert!(find_parameter(name).is_none(), "{name}");
+        }
     }
 }

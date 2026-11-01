@@ -168,7 +168,7 @@ fn test_pg_set_config_validates_arguments(db: TempDatabase) {
     for (sql, message) in [
         (
             "SELECT set_config('statement_timeout', '100', false)",
-            "unrecognized configuration parameter",
+            "invalid value for parameter",
         ),
         (
             "SELECT set_config(NULL, 'public', false)",
@@ -337,7 +337,6 @@ fn test_pg_local_search_path_ends_with_the_transaction(db: TempDatabase) {
 
     conn.execute("BEGIN").unwrap();
     conn.execute("SET LOCAL search_path TO missing").unwrap();
-    assert!(conn.prepare("SELECT v FROM config_items").is_err());
     assert_eq!(
         query_text(
             &conn,
@@ -345,6 +344,9 @@ fn test_pg_local_search_path_ends_with_the_transaction(db: TempDatabase) {
         ),
         ["missing"]
     );
+    // The failing SELECT aborts the transaction block, so COMMIT performs a
+    // rollback and the LOCAL setting ends with the transaction.
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
     conn.execute("COMMIT").unwrap();
     assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
     assert_eq!(
@@ -397,18 +399,18 @@ fn test_pg_failed_statement_undoes_its_setting_changes(db: TempDatabase) {
         ["\"$user\", public"]
     );
 
+    // In an explicit transaction, a constraint violation aborts the entire
+    // transaction (PostgreSQL 25P02 semantics). The set_config from the failed
+    // statement is undone, and the transaction must end with ROLLBACK or COMMIT
+    // before any further queries are allowed.
     conn.execute("BEGIN").unwrap();
     conn.execute("SELECT set_config('search_path', 'public', false)")
         .unwrap();
-    assert!(conn.execute(failing_change).is_err());
+    assert!(conn.execute(failing_change).is_err()); // tx is now aborted
+    conn.execute("ROLLBACK").unwrap(); // end the aborted transaction
     assert_eq!(
         query_text(&conn, "SELECT current_setting('search_path')"),
-        ["public"]
-    );
-    conn.execute("COMMIT").unwrap();
-    assert_eq!(
-        query_text(&conn, "SELECT current_setting('search_path')"),
-        ["public"]
+        ["\"$user\", public"] // ROLLBACK reverts session settings to pre-transaction state
     );
 }
 
@@ -772,4 +774,95 @@ fn test_pg_description_stubs_return_null(db: TempDatabase) {
     ] {
         assert_eq!(query_text(&conn, sql), ["NULL"], "{sql}");
     }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_builtin_settings_validate_all_entry_points(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    for (name, accepted, canonical, rejected) in [
+        ("DateStyle", "iso", "ISO, MDY", "ISO, DMY"),
+        ("IntervalStyle", "postgres", "postgres", "sql_standard"),
+        ("client_encoding", "unicode", "UTF8", "LATIN1"),
+        ("standard_conforming_strings", "true", "on", "off"),
+        ("extra_float_digits", "3", "1", "0"),
+        ("statement_timeout", "0", "0", "100"),
+        ("lock_timeout", "0", "0", "1"),
+        ("idle_in_transaction_session_timeout", "0", "0", "1"),
+        ("transaction_timeout", "0", "0", "1"),
+        ("row_security", "false", "off", "on"),
+        ("quote_all_identifiers", "false", "off", "on"),
+        ("check_function_bodies", "false", "off", "on"),
+        ("synchronize_seqscans", "false", "off", "on"),
+        ("default_tablespace", "", "", "other"),
+        ("default_tablespace", "", "", "   "),
+        ("default_table_access_method", "heap", "heap", "HEAP"),
+        ("DateStyle", " MDY, ISO ", "ISO, MDY", "ISO, YMD"),
+        ("default_table_access_method", "heap", "heap", "other"),
+        ("xmloption", "content", "content", "document"),
+        ("client_min_messages", "warning", "warning", "debug"),
+    ] {
+        assert_eq!(query_text(&conn, &format!("SHOW {name}")), [canonical]);
+        conn.execute(format!("SET {name} = '{accepted}'")).unwrap();
+        assert_eq!(
+            query_text(
+                &conn,
+                &format!("SELECT pg_catalog.set_config('{name}', '{accepted}', true)")
+            ),
+            [canonical]
+        );
+        assert_eq!(
+            query_text(&conn, &format!("SELECT current_setting('{name}')")),
+            [canonical]
+        );
+        for sql in [
+            format!("SET {name} = '{rejected}'"),
+            format!("SELECT set_config('{name}', '{rejected}', false)"),
+        ] {
+            let error = conn.execute(&sql).unwrap_err().to_string();
+            assert!(
+                error.contains("invalid value for parameter"),
+                "{sql}: {error}"
+            );
+        }
+        conn.execute(format!("RESET {name}")).unwrap();
+        conn.execute(format!("SET {name} TO DEFAULT")).unwrap();
+        assert_eq!(
+            query_text(&conn, &format!("SELECT set_config('{name}', NULL, false)")),
+            [canonical]
+        );
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_application_name_isolation_and_rollback(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let other = db.connect_postgres();
+    let mut set = conn.prepare("SET application_name = 'prepared'").unwrap();
+    assert_eq!(query_text(&conn, "SHOW application_name"), [""]);
+    set.run_collect_rows().unwrap();
+    assert_eq!(query_text(&conn, "SHOW application_name"), ["prepared"]);
+    assert_eq!(query_text(&other, "SHOW application_name"), [""]);
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SET application_name = 'session'").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("SET LOCAL application_name = 'local'")
+        .unwrap();
+    assert_eq!(query_text(&conn, "SHOW application_name"), ["local"]);
+    conn.execute("ROLLBACK TO s").unwrap();
+    assert_eq!(query_text(&conn, "SHOW application_name"), ["session"]);
+    conn.execute("COMMIT").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("RESET ALL").unwrap();
+    assert_eq!(query_text(&conn, "SHOW application_name"), [""]);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(query_text(&conn, "SHOW application_name"), ["session"]);
+    conn.execute("DISCARD ALL").unwrap();
+    assert_eq!(query_text(&conn, "SHOW application_name"), [""]);
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('unknown_builtin', true)"),
+        ["NULL"]
+    );
+    assert!(conn
+        .execute("SELECT current_setting('unknown_builtin')")
+        .is_err());
 }

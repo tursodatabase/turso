@@ -255,6 +255,7 @@ expect {
 test current-setting-unknown-parameter-errors {
     SELECT current_setting('no_such_setting');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -262,6 +263,7 @@ expect error {
 test current-setting-unknown-parameter-without-missing-ok-errors {
     SELECT current_setting('no_such_setting', false);
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -269,6 +271,7 @@ expect error {
 test current-setting-does-not-trim-the-parameter-name {
     SELECT current_setting('search_path ');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "search_path "
 }
@@ -276,21 +279,96 @@ expect error {
 test current-setting-integer-parameter-name-errors {
     SELECT current_setting(5);
 }
+@sqlstate 42883
 expect error {}
 
 test current-setting-text-missing-ok-errors {
     SELECT current_setting('search_path', 'x');
 }
+@sqlstate 22P02
 expect error {}
+
+test current-setting-missing-ok-accepts-boolean-text {
+    SELECT coalesce(current_setting('no_such_setting', 'yes'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', ' TRUE '), '<null>');
+}
+expect {
+    <null>
+    <null>
+}
+
+test current-setting-missing-ok-false-text-errors {
+    SELECT current_setting('no_such_setting', ' Off ');
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-missing-ok-accepts-the-start-of-a-boolean-word {
+    SELECT coalesce(current_setting('no_such_setting', 'tr'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', 'Y'), '<null>');
+    SELECT coalesce(current_setting('no_such_setting', 'tRu'), '<null>');
+}
+expect {
+    <null>
+    <null>
+    <null>
+}
+
+test current-setting-missing-ok-of-is-false {
+    SELECT current_setting('no_such_setting', 'of');
+}
+@sqlstate 42704
+expect error {
+    unrecognized configuration parameter "no_such_setting"
+}
+
+test current-setting-missing-ok-o-is-not-a-boolean {
+    SELECT current_setting('no_such_setting', 'o');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "o"
+}
+
+test current-setting-missing-ok-longer-than-a-boolean-word-errors {
+    SELECT current_setting('no_such_setting', 'truee');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type boolean: "truee"
+}
+
+test pg-input-is-valid-accepts-the-start-of-a-boolean-word {
+    SELECT CASE WHEN pg_input_is_valid('tr', 'bool') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid(' on ', 'bool') THEN 'valid' ELSE 'invalid' END;
+    SELECT CASE WHEN pg_input_is_valid('o', 'bool') THEN 'valid' ELSE 'invalid' END;
+}
+expect {
+    valid
+    valid
+    invalid
+}
+
+test current-setting-numeric-parameter-name-errors {
+    SELECT current_setting(5.5);
+}
+@sqlstate 42883
+expect error {
+    function current_setting\(numeric\) does not exist
+}
 
 test current-setting-without-arguments-errors {
     SELECT current_setting();
 }
+@sqlstate 42883
 expect error {}
 
 test current-setting-with-three-arguments-errors {
     SELECT current_setting('search_path', true, true);
 }
+@sqlstate 42883
 expect error {}
 
 test set-config-custom-parameter {
@@ -344,6 +422,7 @@ expect {
 test current-setting-undefined-custom-parameter-errors {
     SELECT current_setting('app.never_set');
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "app\.never_set"
 }
@@ -364,6 +443,7 @@ expect {
 test set-config-custom-parameter-name-with-an-empty-part-errors {
     SELECT set_config('app..user_id', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\.\.user_id"
 }
@@ -371,6 +451,7 @@ expect error {
 test set-config-custom-parameter-name-with-a-trailing-dot-errors {
     SELECT set_config('app.', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\."
 }
@@ -378,6 +459,7 @@ expect error {
 test set-config-custom-parameter-name-with-a-leading-digit-errors {
     SELECT set_config('app.1user', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\.1user"
 }
@@ -385,6 +467,7 @@ expect error {
 test set-config-custom-parameter-name-with-a-space-errors {
     SELECT set_config('app.user id', 'v', false);
 }
+@sqlstate 42602
 expect error {
     invalid configuration parameter name "app\.user id"
 }
@@ -392,6 +475,7 @@ expect error {
 test set-config-unknown-parameter-without-a-dot-errors {
     SELECT set_config('no_such_setting', 'v', false);
 }
+@sqlstate 42704
 expect error {
     unrecognized configuration parameter "no_such_setting"
 }
@@ -599,11 +683,13 @@ expect {
 test version-wrong-arity-errors {
     SELECT version(1);
 }
+@sqlstate 42883
 expect error {}
 
 test quote-ident-wrong-arity-errors {
     SELECT quote_ident();
 }
+@sqlstate 42883
 expect error {}
 
 test pg-get-expr-default-two-args {
@@ -633,11 +719,13 @@ test pg-get-expr-non-text-expression-errors {
     CREATE TABLE demo (id int DEFAULT 7, label text);
     SELECT pg_get_expr(42, 1::oid) FROM pg_attrdef;
 }
+@sqlstate 42883
 expect error {}
 
 test pg-get-expr-null-oid-does-not-hide-invalid-expression {
     SELECT pg_get_expr(42, NULL::oid);
 }
+@sqlstate 42883
 expect error {}
 
 @skip-if postgres "PostgreSQL prints (val > 0), and also lists the CHECK constraints of the information_schema domains"
@@ -747,26 +835,31 @@ expect {
 test acldefault-unknown-object-kind-errors {
     SELECT acldefault('?', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-empty-object-kind-errors {
     SELECT acldefault('', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-leading-space-object-kind-errors {
     SELECT acldefault(' r', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-uppercase-object-kind-errors {
     SELECT acldefault('R', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test acldefault-non-ascii-object-kind-errors {
     SELECT acldefault('é', 4294967294);
 }
+@sqlstate XX000
 expect error {}
 
 test format-type-expanded {
@@ -873,6 +966,7 @@ expect {
 test pg-options-to-table-null-element {
     SELECT * FROM pg_options_to_table(ARRAY['a=b', NULL]);
 }
+@sqlstate 22004
 expect error {
     null array element not allowed in this context
 }
@@ -1007,6 +1101,7 @@ expect {
 test json-to-record-requires-column-list {
     SELECT * FROM json_to_record('{"id":1}') AS _;
 }
+@sqlstate 42601
 expect error {
     a column definition list is required for functions returning "record"
 }
@@ -1036,6 +1131,7 @@ expect {
 test json-to-recordset-object-errors {
     SELECT * FROM json_to_recordset('{"a":1}') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call json_to_recordset on an object
 }
@@ -1043,6 +1139,7 @@ expect error {
 test json-to-recordset-scalar-errors {
     SELECT * FROM jsonb_to_recordset('5'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call jsonb_to_recordset on a non-array
 }
@@ -1050,6 +1147,7 @@ expect error {
 test json-to-recordset-json-scalar-errors {
     SELECT * FROM json_to_recordset('5') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call json_to_recordset on a scalar
 }
@@ -1057,6 +1155,7 @@ expect error {
 test json-to-recordset-non-object-element-errors {
     SELECT * FROM json_to_recordset('[{"a":1},5]') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     argument of json_to_recordset must be an array of objects
 }
@@ -1064,6 +1163,7 @@ expect error {
 test json-to-recordset-null-element-errors {
     SELECT * FROM jsonb_to_recordset('[null]'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     argument of jsonb_to_recordset must be an array of objects
 }
@@ -1071,6 +1171,7 @@ expect error {
 test json-to-record-array-errors {
     SELECT * FROM json_to_record('[{"a":1}]') AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call populate_composite on an array
 }
@@ -1078,6 +1179,7 @@ expect error {
 test json-to-record-scalar-errors {
     SELECT * FROM jsonb_to_record('null'::jsonb) AS _(a int);
 }
+@sqlstate 22023
 expect error {
     cannot call populate_composite on a scalar
 }
@@ -1099,6 +1201,16 @@ expect {
     <null>|<null>|<null>|-1
     <null>|"x"
     {"y":2}|"z"
+}
+
+test function-whose-name-starts-with-a-bracket-does-not-exist {
+    SELECT "[x"();
+}
+expect error {
+    function \[x\(\) does not exist
+}
+expect @tursopg error {
+    no such function: \[x
 }
 
 test mod-of-integers-is-integer {
@@ -1137,4 +1249,382 @@ test mod-with-null-is-null {
 }
 expect {
     <null>|<null>
+}
+
+test quoted-function-name-keeps-its-case {
+    SELECT "lower"('A');
+}
+expect {
+    a
+}
+
+test quoted-uppercase-scalar-function-name-errors {
+    SELECT "LOWER"('A');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-mixed-case-version-errors {
+    SELECT "Version"() IS NOT NULL;
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-current-setting-errors {
+    SELECT "CURRENT_SETTING"('search_path');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-count-star-errors {
+    SELECT "COUNT"(*);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-aggregate-errors {
+    SELECT "SUM"(1);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-mixed-case-window-function-errors {
+    SELECT "Row_Number"() OVER ();
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-type-cast-function-errors {
+    SELECT "FLOAT8"(1);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-schema-qualified-mixed-case-function-errors {
+    SELECT pg_catalog."Lower"('A');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-uppercase-table-function-in-from-errors {
+    SELECT * FROM "GENERATE_SERIES"(1, 2);
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-mixed-case-json-table-function-in-from-errors {
+    SELECT * FROM "Json_Each"('[1]');
+}
+@sqlstate 42883
+expect error {}
+
+test quoted-lowercase-table-function-in-from {
+    SELECT * FROM "generate_series"(1, 2);
+}
+expect {
+    1
+    2
+}
+
+test oid-functions-of-null-are-null {
+    SELECT pg_get_userbyid(NULL), pg_table_is_visible(NULL), pg_type_is_visible(NULL),
+           pg_function_is_visible(NULL), format_type(NULL, NULL), pg_get_constraintdef(NULL),
+           pg_get_indexdef(NULL);
+}
+expect {
+    ||||||
+}
+
+test format-type-accepts-quoted-oid {
+    SELECT format_type('23', NULL);
+}
+expect {
+    integer
+}
+
+test oid-function-of-invalid-oid-text-errors {
+    SELECT format_type('abc', NULL);
+}
+expect error {
+    invalid input syntax for type oid: "abc"
+}
+
+test oid-function-accepts-negative-oid-text {
+    SELECT CASE WHEN pg_get_indexdef('-1040') IS NULL THEN 1 ELSE 0 END;
+}
+expect {
+    1
+}
+
+test oid-function-accepts-hex-and-octal-oid-text {
+    SELECT format_type('0x17', NULL);
+    SELECT format_type('027', NULL);
+}
+expect {
+    integer
+    integer
+}
+
+test oid-function-of-out-of-range-oid-text-errors {
+    SELECT format_type('4294967296', NULL);
+}
+expect error {
+    value "4294967296" is out of range for type oid
+}
+
+test age-of-two-timestamps {
+    SELECT age('2026-10-08'::timestamp, '2025-01-01'::timestamp);
+}
+expect {
+    1 year 9 mons 7 days
+}
+
+test age-of-an-earlier-timestamp-is-negative {
+    SELECT age('2025-01-01'::timestamp, '2026-10-08 03:04:05.5'::timestamp);
+}
+expect {
+    -1 years -9 mons -7 days -03:04:05.5
+}
+
+test age-borrows-the-length-of-the-earlier-month {
+    SELECT age('2024-03-01'::timestamp, '2024-01-31'::timestamp),
+           age('2024-01-31'::timestamp, '2024-03-01'::timestamp);
+}
+expect {
+    1 mon 1 day|-1 mons -1 days
+}
+
+test age-borrows-a-day-for-the-time-part {
+    SELECT age('2026-10-08 01:00:00.25'::timestamp, '2026-10-07 23:30:00.5'::timestamp),
+           age('2023-03-01'::timestamp, '2022-01-31 01:00'::timestamp);
+}
+expect {
+    01:29:59.75|1 year 1 mon 23:00:00
+}
+
+test age-of-equal-timestamps-is-zero {
+    SELECT age('2026-10-08'::timestamp, '2026-10-08'::timestamp);
+}
+expect {
+    00:00:00
+}
+
+test age-of-timestamp-columns {
+    CREATE TABLE events (started timestamp, ended timestamp);
+    INSERT INTO events VALUES ('2025-01-01', '2026-10-08 03:04:05.5');
+    SELECT age(ended, started), age(started, ended) FROM events;
+}
+expect {
+    1 year 9 mons 7 days 03:04:05.5|-1 years -9 mons -7 days -03:04:05.5
+}
+
+test age-of-one-timestamp-counts-from-midnight-today {
+    SELECT age(current_date::timestamp);
+}
+expect {
+    00:00:00
+}
+
+test age-of-one-date-counts-from-midnight-today {
+    SELECT age(current_date);
+}
+expect {
+    00:00:00
+}
+
+test age-of-date-columns {
+    CREATE TABLE trips (started date, ended date);
+    INSERT INTO trips VALUES ('2025-01-01', '2026-10-08');
+    SELECT age(ended, started), age('2026-10-08 03:04:05'::timestamp, started) FROM trips;
+}
+expect {
+    1 year 9 mons 7 days|1 year 9 mons 7 days 03:04:05
+}
+
+test age-reads-untyped-text-as-a-timestamp {
+    SELECT age('2026-10-08', '2025-01-01 01:02'),
+           age('2026-10-08', '2025-01-01T01:02:03'),
+           age('2026-10-08', '2025-01-01 01:02:03.25');
+}
+expect {
+    1 year 9 mons 6 days 22:58:00|1 year 9 mons 6 days 22:57:57|1 year 9 mons 6 days 22:57:56.75
+}
+
+test age-reads-midnight-at-the-end-of-the-day {
+    SELECT age('2025-01-01 24:00:00', '2025-01-01'), age('2025-01-01 24:00', '2025-01-01');
+}
+expect {
+    1 day|1 day
+}
+
+test age-converts-a-zone-in-untyped-text-to-utc {
+    SELECT age('2026-10-08', '2025-01-01 01:02:03+00:00'),
+           age('2026-10-08', '2025-01-01 01:02:03+02:00'),
+           age('2026-10-08', '2025-01-01 01:02 -01:30'),
+           age('2026-10-08', '2025-01-01 01:02:03Z');
+}
+expect {
+    1 year 9 mons 6 days 22:57:57|1 year 9 mons 7 days 00:57:57|1 year 9 mons 6 days 21:28:00|1 year 9 mons 6 days 22:57:57
+}
+
+test age-of-a-two-digit-year-errors {
+    SELECT age('26-10-08', '2025-01-01');
+}
+expect error {
+    date/time field value out of range: "26-10-08"
+}
+expect @tursopg error {
+    invalid timestamp value
+}
+
+test age-of-a-zone-hour-out-of-range-errors {
+    SELECT age('2026-10-08 12:34:56+99:00', '2025-01-01');
+}
+expect error {
+    time zone displacement out of range: "2026-10-08 12:34:56\+99:00"
+}
+expect @tursopg error {
+    invalid timestamp value
+}
+
+test age-of-a-zone-minute-out-of-range-errors {
+    SELECT age('2026-10-08 12:34:56+05:61', '2025-01-01');
+}
+expect error {
+    time zone displacement out of range: "2026-10-08 12:34:56\+05:61"
+}
+expect @tursopg error {
+    invalid timestamp value
+}
+
+test age-of-integers-errors {
+    SELECT age(20261008, 20250101);
+}
+expect error {
+    function age\(integer, integer\) does not exist
+}
+
+test age-of-a-fraction-errors {
+    SELECT age(1.5, 2);
+}
+expect error {
+    function age\(numeric, integer\) does not exist
+}
+
+test age-of-an-integer-column-errors {
+    CREATE TABLE counters (n int);
+    INSERT INTO counters VALUES (8);
+    SELECT age(n) FROM counters;
+}
+expect error {
+    function age\(integer\) does not exist
+}
+
+test age-with-null-is-null {
+    SELECT coalesce(age(NULL, '2025-01-01'::timestamp)::text, '<null>'),
+           coalesce(age(NULL::timestamp)::text, '<null>');
+}
+expect {
+    <null>|<null>
+}
+
+test age-of-invalid-text-errors {
+    SELECT age('hello', '2025-01-01'::timestamp);
+}
+expect error {
+    invalid input syntax for type timestamp: "hello"
+}
+expect @tursopg error {
+    invalid timestamp value
+}
+
+test check-constraint-calls-a-text-function {
+    CREATE TABLE check_schema (s text CHECK (s = current_schema));
+    INSERT INTO check_schema VALUES ('public');
+    SELECT s FROM check_schema;
+}
+expect {
+    public
+}
+
+test check-constraint-calls-an-integer-function {
+    CREATE TABLE check_pid (pid int CHECK (pid = pg_backend_pid()));
+    INSERT INTO check_pid VALUES (pg_backend_pid());
+    SELECT count(*) FROM check_pid;
+}
+expect {
+    1
+}
+
+test timestamptz-column-compares-with-now {
+    CREATE TABLE events (at timestamptz);
+    INSERT INTO events VALUES ('2000-01-01 00:00:00+00:00');
+    SELECT count(*) FROM events WHERE at < now();
+}
+expect {
+    1
+}
+
+test now-plus-an-integer-errors {
+    SELECT now() + 1;
+}
+@sqlstate 42883
+expect error {
+    operator does not exist: timestamp with time zone \+ integer
+}
+expect @tursopg error {
+    operator does not exist: timestamptz \+ integer
+}
+
+test numeric-column-plus-round-and-mod-of-exact-numbers-is-exact {
+    -- round() and mod() of exact numbers give exact numbers, so the sums keep
+    -- the column's scale and are not floating-point.
+    CREATE TABLE prices (amount numeric(10,2));
+    INSERT INTO prices VALUES (0.1);
+    SELECT amount + round(0.2, 1), amount + mod(10, 4) FROM prices;
+}
+expect {
+    0.30|2.10
+}
+
+test check-constraint-compares-a-timestamptz-column-with-now {
+    CREATE TABLE past_events (at timestamptz CHECK (at <= now()));
+    INSERT INTO past_events VALUES ('2000-01-01 00:00:00+00:00');
+    SELECT count(*) FROM past_events;
+}
+expect {
+    1
+}
+
+# booleq() returns boolean, not integer, so it cannot be added to a number.
+test booleq-plus-an-integer-errors {
+    SELECT booleq(true, true) + 1;
+}
+expect error {
+    operator does not exist: boolean \+ integer
+}
+
+# booleq() returns boolean, so the client sees t and f, not 1 and 0.
+test booleq-prints-as-a-boolean {
+    SELECT booleq(true, true), booleq(true, false);
+}
+expect {
+    t|f
+}
+
+# random() returns a double precision number from 0 up to but not including 1,
+# so the value is usually not a whole number.
+test random-is-a-fraction-between-zero-and-one {
+    SELECT CASE WHEN r >= 0 AND r < 1 AND r <> floor(r) THEN 'ok' END FROM (SELECT random() AS r) AS t;
+}
+expect {
+    ok
+}
+
+# random() is double precision, so dividing by it is not an integer division.
+test random-divisor-is-not-an-integer {
+    SELECT CASE WHEN 1 / random() > 1 THEN 'ok' END;
+}
+expect {
+    ok
 }

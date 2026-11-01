@@ -104,6 +104,30 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test left-join-unmatched-encoded-column-with-default-is-null {
+    CREATE TABLE a(id INTEGER PRIMARY KEY) STRICT;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, v date DEFAULT '2000-01-01') STRICT;
+    INSERT INTO a VALUES (1);
+    SELECT a.id, b.v, b.v IS NULL FROM a LEFT JOIN b ON b.id = a.id;
+}
+expect {
+    1||1
+}
+
+@requires strict "uses STRICT tables"
+test left-join-unmatched-encoded-column-with-default-is-null-hash-join {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER) STRICT;
+    CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER, v date DEFAULT '2000-01-01') STRICT;
+    INSERT INTO a VALUES (1, 10), (2, 20);
+    INSERT INTO b VALUES (1, 10, '2024-01-15');
+    SELECT a.id, b.v, b.v IS NULL FROM a LEFT JOIN b ON b.k = a.k ORDER BY a.id;
+}
+expect {
+    1|2024-01-15|0
+    2||1
+}
+
+@requires strict "uses STRICT tables"
 test date-plus-minus-days {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
     INSERT INTO t1 VALUES (1, '2025-01-05'), (2, '2024-03-01'), (3, NULL);
@@ -204,6 +228,48 @@ test smallint-underflow {
     INSERT INTO t1 VALUES (-32769);
 }
 expect error {
+}
+
+@requires strict "uses STRICT tables"
+test smallint-compared-with-integer-out-of-its-range {
+    -- The range limits what a column stores, not what it is compared with.
+    CREATE TABLE t1(val smallint) STRICT;
+    INSERT INTO t1 VALUES (5);
+    SELECT val FROM t1 WHERE val < 100000;
+    SELECT val FROM t1 WHERE val IN (5, 100000);
+    SELECT val = 100000 FROM t1;
+}
+expect {
+    5
+    5
+    0
+}
+
+@requires strict "uses STRICT tables"
+test smallint-update-overflow {
+    CREATE TABLE t1(val smallint) STRICT;
+    INSERT INTO t1 VALUES (5);
+    UPDATE t1 SET val = 40000;
+}
+expect error {
+    integer out of range for smallint
+}
+
+test smallint-cast-out-of-range {
+    SELECT CAST(100000 AS smallint);
+}
+expect error {
+    integer out of range for smallint
+}
+
+# A CAST to a domain stores the value as the domain's base type does, so
+# smallint's range check runs.
+test smallint-cast-to-domain-out-of-range {
+    CREATE DOMAIN small_pos AS smallint CHECK (value > 0);
+    SELECT CAST(100000 AS small_pos);
+}
+expect error {
+    integer out of range for smallint
 }
 
 @requires strict "uses STRICT tables"
@@ -333,6 +399,50 @@ test numeric-precision-overflow {
 expect error {
 }
 
+# Extra fractional digits round half away from zero, like PostgreSQL.
+@requires strict "uses STRICT tables"
+test numeric-insert-rounds-extra-digits {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 0.019), (2, 0.015), (3, 1.999), (4, '0.019'), (5, -0.015), (6, '-1.994');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|0.02
+    2|0.02
+    3|2.00
+    4|0.02
+    5|-0.02
+    6|-1.99
+}
+
+@requires strict "uses STRICT tables"
+test numeric-update-rounds-extra-digits {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1.00');
+    UPDATE t1 SET val = '2.345';
+    SELECT val FROM t1;
+}
+expect {
+    2.35
+}
+
+@requires strict "uses STRICT tables"
+test numeric-cast-rounds-extra-digits {
+    SELECT numeric_decode(CAST(0.019 AS numeric(10,2))), numeric_decode(CAST('-2.345' AS numeric(10,2)));
+}
+expect {
+    0.02|-2.35
+}
+
+# Rounding up can add a digit to the left of the decimal point.
+@requires strict "uses STRICT tables"
+test numeric-rounding-overflows-precision {
+    CREATE TABLE t1(val numeric(3,2)) STRICT;
+    INSERT INTO t1 VALUES ('9.999');
+}
+expect error {
+}
+
 @requires strict "uses STRICT tables"
 test numeric-null {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
@@ -388,6 +498,41 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test numeric-modulo {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, '1.50');
+    INSERT INTO t1 VALUES (2, '-7.25');
+    SELECT val % 1, val % 0.3, 5 % val, val % val FROM t1 ORDER BY id;
+}
+expect {
+    0.50|0.00|0.50|0.00
+    -0.25|-0.05|5.00|0.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-negation {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, '1.50');
+    INSERT INTO t1 VALUES (2, '-7.25');
+    INSERT INTO t1 VALUES (3, NULL);
+    SELECT id, -val FROM t1 ORDER BY id;
+}
+expect {
+    1|-1.50
+    2|7.25
+    3|
+}
+
+@requires strict "uses STRICT tables"
+test numeric-modulo-by-zero {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1.50');
+    SELECT val % 0 FROM t1;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
 test numeric-less-than {
     CREATE TABLE t1(val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES ('1.00');
@@ -428,4 +573,108 @@ test numeric-invalid-input {
     INSERT INTO t1 VALUES ('not-a-number');
 }
 expect error {
+}
+
+@requires strict "uses STRICT tables"
+test numeric-input-ignores-surrounding-whitespace {
+    -- As in PostgreSQL, spaces, tabs and newlines around the number are
+    -- skipped, and text equal to a stored value apart from them compares equal.
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, ' 1.5 '), (2, char(9) || '2' || char(10));
+    SELECT id, val FROM t1 ORDER BY id;
+    SELECT id FROM t1 WHERE val = ' 2 ';
+    SELECT val + ' 1' FROM t1 WHERE id = 1;
+}
+expect {
+    1|1.50
+    2|2.00
+    2
+    2.50
+}
+
+@requires strict "uses STRICT tables"
+test numeric-limits-apply-to-the-value-not-the-text {
+    -- Zero has no digits, whatever its exponent, and leading zeros are not
+    -- digits of the value: PostgreSQL accepts both.
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('0e131073'), ('-0.0e200000');
+    SELECT val FROM t1;
+    SELECT val + '0e999999999', val + (hex(zeroblob(150000)) || '1') FROM t1 LIMIT 1;
+}
+expect {
+    0.00
+    0.00
+    0.00|1.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-limits-refuse-zero-with-too-many-decimals {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1);
+    SELECT val + '0e-20000' FROM t1;
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test numeric-input-rejects-space-inside-the-number {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1 .5');
+}
+expect error {
+    invalid input syntax for type numeric: "1 .5"
+}
+
+@requires strict "uses STRICT tables"
+test varchar-compare-with-longer-literal-with-and-without-index {
+    CREATE TABLE t1(v varchar(3)) STRICT;
+    CREATE TABLE t2(v varchar(3)) STRICT;
+    CREATE INDEX t2_v ON t2(v);
+    INSERT INTO t1 VALUES ('abc');
+    INSERT INTO t2 VALUES ('abc');
+    SELECT
+        (SELECT count(*) FROM t1 WHERE v = 'abcd'),
+        (SELECT count(*) FROM t2 WHERE v = 'abcd'),
+        (SELECT count(*) FROM t1 WHERE v < 'abcd'),
+        (SELECT count(*) FROM t2 WHERE v < 'abcd');
+}
+expect {
+    0|0|1|1
+}
+
+@requires strict "uses STRICT tables"
+test date-compare-with-other-text-with-and-without-index {
+    CREATE TABLE a(d date) STRICT;
+    CREATE TABLE b(d date) STRICT;
+    CREATE INDEX b_d ON b(d);
+    INSERT INTO a VALUES ('2026-10-08');
+    INSERT INTO b VALUES ('2026-10-08');
+    SELECT
+        (SELECT count(*) FROM a WHERE d = 'zzz'),
+        (SELECT count(*) FROM b WHERE d = 'zzz'),
+        (SELECT count(*) FROM a WHERE d = '2026-10-08T00:00'),
+        (SELECT count(*) FROM b WHERE d = '2026-10-08T00:00'),
+        (SELECT count(*) FROM a WHERE d IN ('zzz', '2026-10-08')),
+        (SELECT count(*) FROM b WHERE d IN ('zzz', '2026-10-08'));
+}
+expect {
+    0|0|0|0|1|1
+}
+
+@requires strict "uses STRICT tables"
+test timestamp-compare-with-other-text-with-and-without-index {
+    CREATE TABLE t1(ts timestamp) STRICT;
+    CREATE TABLE t2(ts timestamp) STRICT;
+    CREATE INDEX t2_ts ON t2(ts);
+    INSERT INTO t1 VALUES ('2026-10-08 12:00:00');
+    INSERT INTO t2 VALUES ('2026-10-08 12:00:00');
+    SELECT
+        (SELECT count(*) FROM t1 WHERE ts = '2026-10-08T12:00:00'),
+        (SELECT count(*) FROM t2 WHERE ts = '2026-10-08T12:00:00'),
+        (SELECT count(*) FROM t1 WHERE ts >= '2026-10-08T12:00'),
+        (SELECT count(*) FROM t2 WHERE ts >= '2026-10-08T12:00');
+}
+expect {
+    0|0|0|0
 }

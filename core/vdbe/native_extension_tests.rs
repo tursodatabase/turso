@@ -1,5 +1,6 @@
 use crate::alloc::TryClone;
 use crate::function::ExternalFunc;
+use crate::namespace::NamespaceId;
 use crate::native_ext::*;
 use crate::sync::{Arc, Mutex};
 use crate::types::{AggContext, ExternalAggState, IOCompletions, IOResultOr};
@@ -63,6 +64,39 @@ fn native_scalar_accepts_only_declared_argument_counts() {
             ("null_to_nine".into(), false, 3, false)
         ]
     );
+}
+
+#[test]
+fn native_scalar_returning_i64_can_be_called_in_a_strict_check_constraint() {
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "typed_nine".into(),
+                    FunctionArity::Exact(1),
+                    true,
+                    Nine,
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_native_scalar(
+                    "untyped_nine".into(),
+                    FunctionArity::Exact(1),
+                    true,
+                    NullToNine,
+                )
+                .unwrap(),
+            ),
+    );
+
+    conn.execute("CREATE TABLE typed (x INTEGER CHECK (x = typed_nine(NULL))) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO typed VALUES (9)").unwrap();
+    assert!(conn.execute("INSERT INTO typed VALUES (8)").is_err());
+    assert!(conn
+        .execute("CREATE TABLE untyped (x INTEGER CHECK (x = untyped_nine(NULL))) STRICT")
+        .is_err());
 }
 
 #[test]
@@ -137,10 +171,13 @@ fn native_scalar_connection_context_survives_io_and_helper_queries() {
         ),
     );
     let context = Arc::new(AtomicI64::new(7));
-    let first = plain.db.connect_with_context(context.clone()).unwrap();
+    let first = plain
+        .db
+        .connect_with_context(crate::ConnectOpts::new(), context.clone())
+        .unwrap();
     let second = plain
         .db
-        .connect_with_context(Arc::new(AtomicI64::new(19)))
+        .connect_with_context(crate::ConnectOpts::new(), Arc::new(AtomicI64::new(19)))
         .unwrap();
     let mut statement = first.prepare("SELECT connection_context_read(1)").unwrap();
     assert!(matches!(statement.step().unwrap(), StepResult::IO));
@@ -196,6 +233,8 @@ struct ConnectionContextCall {
 }
 
 impl ScalarCall for ConnectionContextCall {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if integer(args[0].get_value()) == 0 {
             let context = connection.context::<AtomicI64>().ok_or_else(|| {
@@ -387,8 +426,17 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                 }
                 assert!(!conn.is_nested_stmt(), "{mode}: {explicit}: {cancellation}");
                 assert!(conn.executing_triggers.read().is_empty());
+                // An I/O error rolls back the whole transaction, like SQLite
+                // on SQLITE_IOERR, so the explicit transaction (and its 503
+                // row) is already gone and COMMIT has nothing to commit.
+                let tx_survived = explicit && cancellation != "io_error";
                 if explicit {
-                    conn.execute("COMMIT").unwrap();
+                    let commit = conn.execute("COMMIT");
+                    assert_eq!(
+                        commit.is_ok(),
+                        tx_survived,
+                        "{mode}: {explicit}: {cancellation}: {commit:?}"
+                    );
                 }
                 conn.execute("INSERT INTO audit VALUES (504)").unwrap();
                 let other = conn.db.connect(ConnectOpts::new()).unwrap();
@@ -401,7 +449,7 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                         .is_empty());
                 }
                 let mut expected = vec![vec![Value::from_i64(501)], vec![Value::from_i64(502)]];
-                if explicit {
+                if tx_survived {
                     expected.push(vec![Value::from_i64(503)]);
                 }
                 expected.push(vec![Value::from_i64(504)]);
@@ -415,6 +463,91 @@ fn native_scalar_helper_queries_release_nested_trigger_state_on_cancellation() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn io_error_in_a_read_statement_rolls_back_the_transaction() {
+    // An I/O error may come from a cache spill of pages dirtied by earlier
+    // statements in the transaction, so even a failing read-only statement
+    // cannot vouch for the transaction's state: the whole transaction rolls
+    // back, like SQLite on SQLITE_IOERR.
+    for mode in ["wal", "mvcc"] {
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let conn = connection(
+            OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+                ExternalFunc::new_native_scalar(
+                    "gated_seven".into(),
+                    FunctionArity::Exact(1),
+                    false,
+                    GatedSeven {
+                        queue: queue.clone(),
+                    },
+                )
+                .unwrap(),
+            ),
+        );
+        conn.execute(format!("PRAGMA journal_mode = {mode}"))
+            .unwrap();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        let mut stmt = conn.prepare("SELECT gated_seven(x) FROM t").unwrap();
+        assert!(matches!(stmt.step().unwrap(), StepResult::IO), "{mode}");
+        queue
+            .lock()
+            .pop()
+            .unwrap()
+            .error(crate::CompletionError::Aborted);
+        assert!(
+            matches!(
+                stmt.step().unwrap_err(),
+                LimboError::CompletionError(crate::CompletionError::Aborted)
+            ),
+            "{mode}"
+        );
+        assert!(
+            conn.get_auto_commit(),
+            "{mode}: an I/O error must roll back the whole transaction"
+        );
+        drop(stmt);
+        assert!(conn.execute("COMMIT").is_err(), "{mode}");
+        let mut count = conn.prepare("SELECT count(*) FROM t").unwrap();
+        assert_eq!(
+            collect(&mut count, &queue),
+            vec![vec![Value::from_i64(0)]],
+            "{mode}: nothing from the rolled-back transaction may survive"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct GatedSeven {
+    queue: Arc<Mutex<Vec<Completion>>>,
+}
+
+impl ScalarFunction for GatedSeven {
+    type Call = GatedSevenCall;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(GatedSevenCall {
+            gate: Gate::new(self.queue.clone()),
+        })
+    }
+}
+
+struct GatedSevenCall {
+    gate: Gate,
+}
+
+impl ScalarCall for GatedSevenCall {
+    type Output = Value;
+
+    fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
+        if let Some(io) = self.gate.wait() {
+            return Ok(IOResult::IO(io));
+        }
+        Ok(IOResult::Done(Value::from_i64(7)))
     }
 }
 
@@ -441,6 +574,8 @@ struct RegisterProbeCall {
 }
 
 impl ScalarCall for RegisterProbeCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         assert_eq!(args.as_ptr() as usize, self.args_address);
         if let Some(io) = self.gate.wait() {
@@ -464,10 +599,31 @@ impl ScalarFunction for ConnectionChanges {
 }
 
 impl ScalarCall for ConnectionChanges {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         Ok(IOResult::Done(Value::from_i64(
             connection.changes() * 10 + integer(args[0].get_value()),
         )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Nine;
+
+impl ScalarFunction for Nine {
+    type Call = Self;
+
+    fn create_call(&self) -> Result<Self::Call> {
+        Ok(*self)
+    }
+}
+
+impl ScalarCall for Nine {
+    type Output = i64;
+
+    fn step(&mut self, _connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<i64> {
+        Ok(IOResult::Done(9))
     }
 }
 
@@ -485,6 +641,8 @@ impl ScalarFunction for NullToNine {
 struct NullToNineCall;
 
 impl ScalarCall for NullToNineCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         Ok(IOResult::Done(match args[0].get_value() {
             Value::Null => Value::from_i64(9),
@@ -1088,7 +1246,10 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
         )
         .unwrap();
     assert!(matches!(
-        schema.get_table("reloaded").unwrap().as_ref(),
+        schema
+            .get_table(NamespaceId::ROOT, "reloaded")
+            .unwrap()
+            .as_ref(),
         crate::schema::Table::Virtual(_)
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 5);
@@ -1325,13 +1486,50 @@ fn native_modules_require_trigger_permission_for_both_table_kinds() {
         } else {
             [("restricted_rows", false), ("allowed_rows", true)]
         } {
-            let table = conn.current_schema().get_table(name).unwrap();
+            let table = conn
+                .current_schema()
+                .get_table(NamespaceId::ROOT, name)
+                .unwrap();
             let crate::schema::Table::Virtual(table) = table.as_ref() else {
                 panic!("expected virtual table {name}");
             };
             assert_eq!(table.innocuous, expected, "{name}");
         }
     }
+}
+
+/// A view or trigger of an attached database resolves a name without a
+/// database in its own database, as SQLite's fixer binds it there, so it does
+/// not see a virtual table of main.
+#[test]
+fn view_and_trigger_of_attached_database_do_not_see_a_virtual_table_of_main() {
+    let module = RowsModule {
+        queue: Arc::new(Mutex::new(Vec::new())),
+        rows: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::new(Mutex::new(Vec::new())),
+        writable: false,
+    };
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(crate::DatabaseOpts::new().with_attach(true))
+            .native_module("rows", VTabKind::VirtualTable, InnocuousModule(module)),
+    );
+    conn.execute("CREATE VIRTUAL TABLE vt USING rows").unwrap();
+    conn.execute("ATTACH ':memory:' AS aux").unwrap();
+
+    // The name is resolved when the statement is prepared, so the module is
+    // never run.
+    conn.execute("CREATE VIEW aux.v AS SELECT * FROM vt")
+        .unwrap();
+    let err = conn.prepare("SELECT count(*) FROM aux.v").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
+
+    conn.execute("CREATE TABLE aux.t(x)").unwrap();
+    conn.execute("CREATE TABLE aux.log(x)").unwrap();
+    conn.execute("CREATE TRIGGER aux.tr AFTER INSERT ON t BEGIN INSERT INTO log SELECT count(*) FROM vt; END")
+        .unwrap();
+    let err = conn.prepare("INSERT INTO aux.t VALUES (1)").unwrap_err();
+    assert!(err.to_string().contains("no such table"), "{err}");
 }
 
 #[test]
@@ -1885,6 +2083,8 @@ struct DelayedCall {
 }
 
 impl ScalarCall for DelayedCall {
+    type Output = Value;
+
     fn step(&mut self, _connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if let Some(io) = self.gate.wait() {
             return Ok(IOResult::IO(io));
@@ -1929,6 +2129,8 @@ struct NestedSumCall {
 }
 
 impl ScalarCall for NestedSumCall {
+    type Output = Value;
+
     fn step(&mut self, connection: &Arc<Connection>, args: &[Register]) -> IOResultOr<Value> {
         if self.statement.is_none() {
             self.statement = Some(connection.prepare_internal("SELECT x FROM input_values")?);

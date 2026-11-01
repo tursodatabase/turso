@@ -1,0 +1,110 @@
+@database :memory:
+
+test add-default-integer-whole-real {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b INT DEFAULT 5.0;
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|5|integer
+    2|5|integer
+}
+
+test add-default-numeric-whole-real-text {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b NUMERIC DEFAULT '5.0';
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|5|integer
+    2|5|integer
+}
+
+test add-default-integer-negative-zero {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b INTEGER DEFAULT -0.0;
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|0|integer
+    2|0|integer
+}
+
+test add-default-numeric-fraction {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b NUMERIC DEFAULT 1.5;
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|1.5|real
+    2|1.5|real
+}
+
+test add-default-real-whole-real {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b REAL DEFAULT 5.0;
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, quote(b), typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|5.0|real
+    2|5.0|real
+}
+
+test add-default-text-whole-real {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b TEXT DEFAULT 5.0;
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, b, typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|5.0|text
+    2|5.0|text
+}
+
+test add-default-blob-whole-real {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b BLOB DEFAULT 5.0;
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, quote(b), typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|5.0|real
+    2|5.0|real
+}
+
+test add-default-integer-real-limits {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b INT DEFAULT 9223372036854775808.0;
+    ALTER TABLE t1 ADD COLUMN c INT DEFAULT -9223372036854775808.0;
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, typeof(b), typeof(c) FROM t1 ORDER BY a;
+}
+expect {
+    1|real|real
+    2|real|real
+}
+
+test add-default-strict-any-preserves-real {
+    CREATE TABLE t1(a INTEGER) STRICT;
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN b ANY DEFAULT 5.0;
+    INSERT INTO t1(a) VALUES(2);
+    SELECT a, quote(b), typeof(b) FROM t1 ORDER BY a;
+}
+expect {
+    1|5.0|real
+    2|5.0|real
+}

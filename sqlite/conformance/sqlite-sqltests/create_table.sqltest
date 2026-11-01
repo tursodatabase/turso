@@ -289,3 +289,22 @@ expect {
     C
 }
 
+# IF NOT EXISTS on an existing table does not check the body.
+test create_table_if_not_exists_skips_body_errors {
+    CREATE TABLE t(x);
+    CREATE TABLE IF NOT EXISTS t(a, a);
+    CREATE TABLE IF NOT EXISTS t(a INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+# Without IF NOT EXISTS, the existing table is reported before body errors.
+test create_table_existing_table_reported_before_body_errors {
+    CREATE TABLE t(x);
+    CREATE TABLE t(a, a);
+}
+expect error {
+    table t already exists
+}

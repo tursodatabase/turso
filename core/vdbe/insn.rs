@@ -11,6 +11,7 @@ pub fn to_u32(v: usize) -> u32 {
 
 use super::{execute, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::function::AccumulatorFunc;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::{
     schema::{BTreeTable, CheckConstraint, Column, ForeignKey, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
@@ -64,16 +65,6 @@ impl Subprogram {
     }
 }
 
-/// Known custom type comparator functions for sorting and MIN/MAX aggregates.
-/// These replace heap-allocated String names with a compact enum.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SortComparatorType {
-    NumericLt,
-    StringReverse,
-    TestUintLt,
-    ArrayLt,
-}
-
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CmpInsFlags(usize);
@@ -82,7 +73,6 @@ impl CmpInsFlags {
     const NULL_EQ: usize = 0x80;
     const JUMP_IF_NULL: usize = 0x10;
     const AFFINITY_MASK: usize = 0x47;
-    const ARRAY_CMP: usize = 0x100;
 
     fn has(&self, flag: usize) -> bool {
         (self.0 & flag) != 0
@@ -115,15 +105,6 @@ impl CmpInsFlags {
     pub fn get_affinity(&self) -> Affinity {
         let aff_code = (self.0 & Self::AFFINITY_MASK) as u8;
         Affinity::from_char_code(aff_code)
-    }
-
-    pub fn array_cmp(mut self) -> Self {
-        self.0 |= Self::ARRAY_CMP;
-        self
-    }
-
-    pub fn has_array_cmp(&self) -> bool {
-        self.has(Self::ARRAY_CMP)
     }
 }
 
@@ -301,6 +282,7 @@ impl From<BitSet> for NullMatchingMask {
 #[derive(Debug, Clone)]
 pub struct AddColumnData {
     pub db: usize,
+    pub namespace: NamespaceId,
     pub table: String,
     pub column: Column,
     pub check_constraints: Vec<CheckConstraint>,
@@ -311,11 +293,13 @@ pub struct AddColumnData {
 #[derive(Debug, Clone)]
 pub struct AlterColumnData {
     pub db: usize,
+    pub namespace: NamespaceId,
     pub table: String,
     pub column_index: usize,
     pub definition: turso_parser::ast::ColumnDefinition,
     pub rename: bool,
-    pub rewritten_triggers: Vec<(usize, String, String)>,
+    pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
+    pub renamed_index_methods: Vec<(String, Arc<dyn crate::index_method::IndexMethodAttachment>)>,
 }
 
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
@@ -332,6 +316,7 @@ pub struct IntegrityCkData {
 #[derive(Debug, Clone)]
 pub struct AddSequenceData {
     pub db: usize,
+    pub namespace: NamespaceId,
     pub name: String,
     pub start: i64,
     pub increment: i64,
@@ -348,12 +333,9 @@ pub struct SorterOpenData {
     /// Combined order, collation, and nulls ordering per column.
     pub order_collations_nulls: crate::alloc::Vec<(
         SortOrder,
-        Option<CollationSeq>,
+        CollationSeq,
         Option<turso_parser::ast::NullsOrder>,
     )>,
-    /// Per-column custom type comparators for ORDER BY sorting.
-    /// When present, the comparator is used instead of standard value comparison.
-    pub comparators: crate::alloc::Vec<Option<SortComparatorType>>,
 }
 
 /// Data for AggStep instruction (boxed to keep Insn small).
@@ -363,11 +345,9 @@ pub struct AggStepData {
     pub col: usize,
     pub delimiter: usize,
     pub func: AccumulatorFunc,
-    /// Optional custom type comparator for MIN/MAX aggregates.
-    pub comparator: Option<SortComparatorType>,
-    /// Collation for comparison-based aggregates (MIN/MAX), resolved at
-    /// translation time from the argument expression.
-    pub collation: Option<CollationSeq>,
+    /// The collation MIN, MAX, mode and percentile compare the argument with.
+    /// BINARY for the aggregates that do not compare values.
+    pub collation: CollationSeq,
 }
 
 /// Which of SUM, TOTAL, or AVG an `IvmSumFinalize` instruction computes. The
@@ -619,7 +599,7 @@ pub enum Insn {
         /// Without the jump_if_null flag it would not jump because the logical comparison "id != NULL" is never true.
         /// This flag indicates that if either is null we should still jump.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if they are not equal.
     Ne {
@@ -630,7 +610,7 @@ pub enum Insn {
         ///
         /// jump_if_null jumps if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is less than the right-hand side.
     Lt {
@@ -639,7 +619,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     Le {
         lhs: usize,
@@ -647,7 +627,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than the right-hand side.
     Gt {
@@ -656,7 +636,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Compare two registers and jump to the given PC if the left-hand side is greater than or equal to the right-hand side.
     Ge {
@@ -665,7 +645,7 @@ pub enum Insn {
         target_pc: BranchOffset,
         /// jump_if_null: Jump if either of the operands is null. Used for "jump when false" logic.
         flags: CmpInsFlags,
-        collation: Option<CollationSeq>,
+        collation: CollationSeq,
     },
     /// Jump to target_pc if r\[reg\] != 0 or (r\[reg\] == NULL && r\[jump_if_null\] != 0)
     If {
@@ -1194,6 +1174,9 @@ pub enum Insn {
         auto_commit: bool,
         rollback: bool,
         concurrent: bool,
+        /// True when this AutoCommit starts a READ ONLY transaction (auto_commit=false).
+        /// Ignored for commit/rollback (auto_commit=true).
+        read_only: bool,
     },
 
     /// Execute a named savepoint operation.
@@ -1410,7 +1393,6 @@ pub enum Insn {
         col: usize,
         delimiter: usize,
         func: AccumulatorFunc,
-        comparator: Option<SortComparatorType>,
     },
 
     AggFinal {
@@ -1742,6 +1724,8 @@ pub enum Insn {
     DropTable {
         ///  The database within which this b-tree needs to be dropped (P1).
         db: usize,
+        /// The namespace of the table being dropped.
+        namespace: NamespaceId,
         ///  unused register p2
         _p2: usize,
         ///  unused register p3
@@ -1752,12 +1736,16 @@ pub enum Insn {
     DropView {
         /// The database within which this view needs to be dropped
         db: usize,
+        /// The namespace of the view being dropped.
+        namespace: NamespaceId,
         /// The name of the view being dropped
         view_name: String,
     },
     DropIndex {
         ///  The database within which this index needs to be dropped (P1).
         db: usize,
+        /// The namespace of the index being dropped.
+        namespace: NamespaceId,
         //  The name of the index being dropped
         index: Arc<Index>,
     },
@@ -1765,6 +1753,8 @@ pub enum Insn {
     DropTrigger {
         /// The database within which this trigger needs to be dropped (P1).
         db: usize,
+        /// The namespace of the trigger being dropped.
+        namespace: NamespaceId,
         /// The name of the trigger being dropped
         trigger_name: String,
     },
@@ -1784,8 +1774,28 @@ pub enum Insn {
     DropSequence {
         /// The database within which this sequence needs to be dropped
         db: usize,
+        /// The namespace of the sequence being dropped.
+        namespace: NamespaceId,
         /// The name of the sequence being dropped
         seq_name: String,
+    },
+    /// Name a namespace in the in-memory schema, after CREATE SCHEMA
+    /// inserted its row into the namespaces table.
+    AddNamespace {
+        /// The database the namespace is stored in
+        db: usize,
+        /// The namespace being created
+        namespace: NamespaceId,
+        /// The name of the namespace
+        name: String,
+    },
+    /// Forget a namespace in the in-memory schema, after DROP SCHEMA
+    /// deleted its row.
+    DropNamespace {
+        /// The database the namespace is stored in
+        db: usize,
+        /// The namespace being dropped
+        namespace: NamespaceId,
     },
     /// Begin the autonomous inner transaction that wraps a sequence
     /// read-modify-write. The translator emits this immediately before
@@ -1851,6 +1861,7 @@ pub enum Insn {
     /// `LimboError::SequenceExhausted` on overflow when `cycle` is false.
     SequenceComputeNext {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         in_value_reg: usize,
         in_is_called_reg: usize,
@@ -1862,6 +1873,7 @@ pub enum Insn {
     /// register operation.
     SetSequenceCurrval {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         value_reg: usize,
     },
@@ -1869,6 +1881,7 @@ pub enum Insn {
     /// successful sequence RMW commit.
     SequenceTrackAllocation {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         value_reg: usize,
     },
@@ -1881,6 +1894,7 @@ pub enum Insn {
     /// closes.
     SequenceRegisterAllocation {
         db: usize,
+        namespace: NamespaceId,
         seq_name: String,
         value_reg: usize,
         /// Register holding the encoded saved outer mv_tx (the blob written
@@ -2113,11 +2127,13 @@ pub enum Insn {
     },
     RenameTable {
         db: usize,
+        namespace: NamespaceId,
         from: String,
         to: String,
     },
     DropColumn {
         db: usize,
+        namespace: NamespaceId,
         table: String,
         column_index: usize,
     },
@@ -2537,6 +2553,8 @@ impl InsnVariants {
             InsnVariants::DropType => execute::op_drop_type,
             InsnVariants::AddSequence => execute::op_add_sequence,
             InsnVariants::DropSequence => execute::op_drop_sequence,
+            InsnVariants::AddNamespace => execute::op_add_namespace,
+            InsnVariants::DropNamespace => execute::op_drop_namespace,
             InsnVariants::SequenceComputeNext => execute::op_sequence_compute_next,
             InsnVariants::SetSequenceCurrval => execute::op_set_sequence_currval,
             InsnVariants::SequenceTrackAllocation => execute::op_sequence_track_allocation,
@@ -2613,6 +2631,30 @@ impl InsnVariants {
 }
 
 impl Insn {
+    /// The collations this instruction compares values with.
+    #[cfg(test)]
+    pub(crate) fn collations(&self) -> Vec<CollationSeq> {
+        match self {
+            Insn::Eq { collation, .. }
+            | Insn::Ne { collation, .. }
+            | Insn::Lt { collation, .. }
+            | Insn::Le { collation, .. }
+            | Insn::Gt { collation, .. }
+            | Insn::Ge { collation, .. } => vec![*collation],
+            Insn::Compare { key_info, .. } => key_info.iter().map(|key| key.collation).collect(),
+            Insn::SorterOpen { data } => data
+                .order_collations_nulls
+                .iter()
+                .map(|(_, collation, _)| *collation)
+                .collect(),
+            Insn::AggStep { data } => vec![data.collation],
+            Insn::HashBuild { data } => data.collations.clone(),
+            Insn::HashDistinct { data } => data.collations.clone(),
+            Insn::Function { func, .. } => vec![func.collation],
+            _ => Vec::new(),
+        }
+    }
+
     // SAFETY: If the enumeration specifies a primitive representation,
     // then the discriminant may be reliably accessed via unsafe pointer casting
     #[inline(always)]
@@ -2630,6 +2672,9 @@ impl Insn {
     /// Returns true if this opcode cannot directly modify persistent database
     /// contents. This is used to compute PreparedProgram::readonly, mirroring
     /// SQLite's sqlite3_stmt_readonly() classification over compiled bytecode.
+    /// Row writes such as Insert and Delete are not listed: writing a table
+    /// needs a write Transaction, and the same opcodes also fill ephemeral
+    /// tables, as in a recursive CTE.
     pub fn is_readonly(&self) -> bool {
         match self {
             Self::Checkpoint { .. }
@@ -2641,10 +2686,6 @@ impl Insn {
                 tx_mode: TransactionMode::Write | TransactionMode::Concurrent,
                 ..
             }
-            | Self::Insert { .. }
-            | Self::Delete { .. }
-            | Self::IdxDelete { .. }
-            | Self::OpenWrite { .. }
             | Self::CreateBtree { .. }
             | Self::IndexMethodCreate { .. }
             | Self::IndexMethodDestroy { .. }
@@ -2658,6 +2699,8 @@ impl Insn {
             | Self::DropType { .. }
             | Self::AddSequence { .. }
             | Self::DropSequence { .. }
+            | Self::AddNamespace { .. }
+            | Self::DropNamespace { .. }
             | Self::SequenceComputeNext { .. }
             | Self::SetSequenceCurrval { .. }
             | Self::SequenceTrackAllocation { .. }

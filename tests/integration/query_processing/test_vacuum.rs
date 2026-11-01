@@ -10,7 +10,9 @@ use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
 use turso_core::SqliteDialect;
-use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, LimboError, StepResult, Value};
+use turso_core::{
+    ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, StepResult, Value,
+};
 use turso_parser::{ast::Cmd, parser::Parser};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,16 +211,16 @@ fn custom_type_sql_snapshot(conn: &Arc<Connection>) -> Vec<(String, String)> {
 
 fn create_custom_type_ordering_fixture(conn: &Arc<Connection>) -> anyhow::Result<()> {
     conn.execute(
-        "CREATE TYPE rev_cmp \
+        "CREATE TYPE rev \
          BASE text \
          ENCODE string_reverse(value) \
          DECODE string_reverse(value) \
-         OPERATOR '<' string_reverse",
+         OPERATOR '<'",
     )?;
     conn.execute(
         "CREATE TABLE words(
             id INTEGER PRIMARY KEY,
-            word rev_cmp NOT NULL DEFAULT 'banana'
+            word rev NOT NULL DEFAULT 'banana'
         ) STRICT",
     )?;
     conn.execute("CREATE INDEX words_word_idx ON words(word)")?;
@@ -241,18 +243,19 @@ fn assert_custom_type_ordering_fixture(conn: &Arc<Connection>) {
         ],
     );
 
+    // The index sorts the stored (reversed) text: ananab < elppa < yrrehc.
     let ordered: Vec<(i64, String)> = conn.exec_rows(
         "SELECT id, word FROM words INDEXED BY words_word_idx ORDER BY word ASC, id ASC",
     );
     assert_eq!(
         ordered,
         vec![
-            (2, "apple".to_string()),
             (3, "banana".to_string()),
             (4, "banana".to_string()),
+            (2, "apple".to_string()),
             (1, "cherry".to_string()),
         ],
-        "custom comparator order should survive when scanning the custom-type index",
+        "the stored-value order should survive when scanning the custom-type index",
     );
 
     let desc: Vec<(i64, String)> = conn.exec_rows(
@@ -262,11 +265,11 @@ fn assert_custom_type_ordering_fixture(conn: &Arc<Connection>) {
         desc,
         vec![
             (1, "cherry".to_string()),
+            (2, "apple".to_string()),
             (4, "banana".to_string()),
             (3, "banana".to_string()),
-            (2, "apple".to_string()),
         ],
-        "descending scans over the custom-type index should preserve comparator semantics",
+        "descending scans over the custom-type index should use the stored-value order",
     );
 }
 
@@ -274,7 +277,7 @@ fn assert_custom_type_reusable_for_new_schema(conn: &Arc<Connection>) -> anyhow:
     conn.execute(
         "CREATE TABLE extra_words(
             id INTEGER PRIMARY KEY,
-            word rev_cmp NOT NULL DEFAULT 'kiwi'
+            word rev NOT NULL DEFAULT 'kiwi'
         ) STRICT",
     )?;
     conn.execute("CREATE INDEX extra_words_word_idx ON extra_words(word)")?;
@@ -282,15 +285,16 @@ fn assert_custom_type_reusable_for_new_schema(conn: &Arc<Connection>) -> anyhow:
     conn.execute("INSERT INTO extra_words(id, word) VALUES (2, 'apricot')")?;
     conn.execute("INSERT INTO extra_words(id, word) VALUES (3, 'pear')")?;
 
+    // Stored (reversed) text: iwik < raep < tocirpa.
     let rows: Vec<(i64, String)> = conn.exec_rows(
         "SELECT id, word FROM extra_words INDEXED BY extra_words_word_idx ORDER BY word ASC, id ASC",
     );
     assert_eq!(
         rows,
         vec![
-            (2, "apricot".to_string()),
             (1, "kiwi".to_string()),
             (3, "pear".to_string()),
+            (2, "apricot".to_string()),
         ],
         "the preserved custom type should remain usable in new tables and indexes after VACUUM",
     );
@@ -1330,6 +1334,94 @@ fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result
         rows,
         vec![(1, "hello".to_string()), (2, "world".to_string())]
     );
+    Ok(())
+}
+
+/// PRAGMA page_size on an existing database leaves the source unchanged, but
+/// VACUUM INTO writes the output with the requested page size, like SQLite.
+#[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_into_uses_pending_page_size(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)")?;
+    let dest_dir = TempDir::new()?;
+
+    for page_size in [1024, 8192, 65536] {
+        conn.execute(format!("PRAGMA page_size = {page_size}"))?;
+        let dest_path = dest_dir.path().join(format!("vacuumed_{page_size}.db"));
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+        let source_page_size: Vec<(i64,)> = conn.exec_rows("PRAGMA page_size");
+        assert_eq!(source_page_size, vec![(4096,)]);
+
+        let dest_db = TempDatabase::new_with_existent(&dest_path);
+        let dest_conn = dest_db.connect_limbo();
+        let dest_page_size: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_size");
+        assert_eq!(dest_page_size, vec![(page_size,)]);
+        assert_eq!(run_integrity_check(&dest_conn), "ok");
+        let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t ORDER BY a");
+        assert_eq!(rows, vec![(1,), (2,), (3,)]);
+    }
+
+    // An invalid size replaces the earlier request, so the output keeps the source page size.
+    // 4294968320 is 2^32 + 1024: SQLite reads it as 0, not as 1024. SQLite reads 8.192e3
+    // from its leading digits, as 8.
+    for invalid_page_size in ["1000", "4294968320", "8.192e3"] {
+        conn.execute("PRAGMA page_size = 1024")?;
+        conn.execute(format!("PRAGMA page_size = {invalid_page_size}"))?;
+        let dest_path = dest_dir
+            .path()
+            .join(format!("vacuumed_{invalid_page_size}.db"));
+        conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+        let dest_db = TempDatabase::new_with_existent(&dest_path);
+        let dest_page_size: Vec<(i64,)> = dest_db.connect_limbo().exec_rows("PRAGMA page_size");
+        assert_eq!(dest_page_size, vec![(4096,)]);
+    }
+    Ok(())
+}
+
+/// Like SQLite, VACUUM INTO uses 1024 instead of a requested 512 when the source has
+/// more than 32 reserved bytes, so the output keeps enough usable space per page.
+#[turso_macros::test]
+fn test_vacuum_into_pending_page_size_512_with_large_reserved_space(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let source_db = TempDatabase::new_empty();
+    let conn = source_db.connect_limbo();
+    conn.set_reserved_bytes(33)?;
+    conn.execute("CREATE TABLE t (a INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+
+    conn.execute("PRAGMA page_size = 512")?;
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    let dest_page_size: Vec<(i64,)> = dest_conn.exec_rows("PRAGMA page_size");
+    assert_eq!(dest_page_size, vec![(1024,)]);
+    assert_eq!(run_integrity_check(&dest_conn), "ok");
+    let rows: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    Ok(())
+}
+
+/// Like SQLite, an in-place VACUUM of a WAL database drops the pending page size,
+/// so a later VACUUM INTO keeps the source page size.
+#[turso_macros::test(init_sql = "CREATE TABLE t (a INTEGER);")]
+fn test_vacuum_clears_pending_page_size(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("PRAGMA page_size = 1024")?;
+    conn.execute("VACUUM")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_page_size: Vec<(i64,)> = dest_db.connect_limbo().exec_rows("PRAGMA page_size");
+    assert_eq!(dest_page_size, vec![(4096,)]);
     Ok(())
 }
 
@@ -3205,22 +3297,17 @@ fn test_vacuum_into_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<()
     Ok(())
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_vacuum_into_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    if conn
-        .execute(
-            "CREATE TABLE settings (
+    conn.execute(
+        "CREATE TABLE settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER
             ) STRICT, WITHOUT ROWID",
-        )
-        .is_err()
-    {
-        return Ok(());
-    }
+    )?;
 
     conn.execute("INSERT INTO settings VALUES ('theme', 'dark', 1704067200)")?;
     conn.execute("INSERT INTO settings VALUES ('language', 'en', 1704153600)")?;
@@ -3717,7 +3804,7 @@ fn test_vacuum_into_preserves_sqlite_stat1(tmp_db: TempDatabase) -> anyhow::Resu
 #[test]
 fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let opts = turso_core::DatabaseOpts::new();
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 
@@ -3764,7 +3851,7 @@ fn test_vacuum_into_preserves_generated_columns() -> anyhow::Result<()> {
 #[test]
 fn test_vacuum_into_generated_column_with_rowid_and_deletes() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
-    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let opts = turso_core::DatabaseOpts::new();
     let tmp_db = TempDatabase::builder().with_opts(opts).build();
     let conn = tmp_db.connect_limbo();
 
@@ -3867,8 +3954,8 @@ fn test_vacuum_into_preserves_custom_types() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// VACUUM INTO must preserve custom types that carry non-monotonic encoders,
-/// custom comparators, and indexes. The copied destination must still order
+/// VACUUM INTO must preserve custom types that carry non-monotonic encoders
+/// and indexes on them. The copied destination must still order
 /// through the preserved index and remain usable for new schema objects that
 /// reference the copied type.
 #[test]
@@ -4170,8 +4257,7 @@ fn test_vacuum_into_preserves_vector_blobs(tmp_db: TempDatabase) -> anyhow::Resu
 /// Plain VACUUM must preserve generated column values.
 #[test]
 fn test_plain_vacuum_preserves_generated_columns() -> anyhow::Result<()> {
-    let opts = DatabaseOpts::new().with_generated_columns(true);
-    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let tmp_db = TempDatabase::new_empty();
     let conn = tmp_db.connect_limbo();
 
     conn.execute(
@@ -4280,8 +4366,73 @@ fn test_plain_vacuum_preserves_array_values() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// CREATE TABLE and ALTER TABLE reject a COLLATE on a column whose type has its
+/// own order, but a database written before that check can have one. VACUUM
+/// must keep such a table.
+#[test]
+fn test_vacuum_keeps_a_table_with_collate_on_numeric_column() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("collate_on_numeric.db");
+    let stored_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, n numeric (10, 2) COLLATE NOCASE, UNIQUE (n COLLATE RTRIM)) STRICT";
+    {
+        let sqlite_conn = SqliteConnection::open(&db_path)?;
+        sqlite_conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n numeric (10, 2) COLLATE NOCASE, UNIQUE (n COLLATE RTRIM));
+             PRAGMA writable_schema = ON;",
+        )?;
+        sqlite_conn.execute(
+            "UPDATE sqlite_schema SET sql = ?1 WHERE name = 't'",
+            [stored_sql],
+        )?;
+    }
+    let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1, 9.5), (2, 10.5)")?;
+
+    conn.execute("VACUUM")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t ORDER BY n DESC");
+    assert_eq!(rows, vec![(2,), (1,)]);
+    let schema: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+    assert_eq!(schema, vec![(stored_sql.to_string(),)]);
+    Ok(())
+}
+
+/// CREATE TABLE rejects AUTOINCREMENT on a key not declared INTEGER PRIMARY KEY,
+/// but a database written before that check can have one. VACUUM must keep such
+/// a table.
+#[test]
+fn test_vacuum_keeps_a_table_with_autoincrement_on_int_primary_key() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("autoincrement_on_int.db");
+    let stored_sql = "CREATE TABLE t (id INT PRIMARY KEY AUTOINCREMENT, v)";
+    {
+        let sqlite_conn = SqliteConnection::open(&db_path)?;
+        sqlite_conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+             INSERT INTO t (v) VALUES (1);
+             PRAGMA writable_schema = ON;",
+        )?;
+        sqlite_conn.execute(
+            "UPDATE sqlite_schema SET sql = ?1 WHERE name = 't'",
+            [stored_sql],
+        )?;
+    }
+    let tmp_db = TempDatabase::new_with_existent(&db_path);
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("VACUUM")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT v FROM t");
+    assert_eq!(rows, vec![(1,)]);
+    let schema: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+    assert_eq!(schema, vec![(stored_sql.to_string(),)]);
+    Ok(())
+}
+
 /// Plain VACUUM reparses the live schema on the same connection. Custom types
-/// that rely on a comparator-backed index must still order correctly after the
+/// with an index on a non-monotonic encoding must still order correctly after the
 /// rewrite, and the same connection must remain able to use that type in new
 /// DDL immediately afterward.
 #[test]
@@ -4544,22 +4695,17 @@ fn test_plain_vacuum_with_strict_table(tmp_db: TempDatabase) -> anyhow::Result<(
     Ok(())
 }
 
-#[turso_macros::test(mvcc)]
+#[turso_macros::test]
 fn test_plain_vacuum_with_strict_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    if conn
-        .execute(
-            "CREATE TABLE settings (
+    conn.execute(
+        "CREATE TABLE settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at INTEGER
             ) STRICT, WITHOUT ROWID",
-        )
-        .is_err()
-    {
-        return Ok(());
-    }
+    )?;
 
     conn.execute("INSERT INTO settings VALUES ('theme', 'dark', 1704067200)")?;
     conn.execute("INSERT INTO settings VALUES ('language', 'en', 1704153600)")?;
@@ -4697,6 +4843,39 @@ fn test_plain_vacuum_preserves_indexes(tmp_db: TempDatabase) -> anyhow::Result<(
         conn.exec_rows("SELECT a, b FROM t1 INDEXED BY idx_t1_b WHERE b = 'gamma'");
     assert_eq!(rows, vec![(3, "gamma".to_string())]);
 
+    Ok(())
+}
+
+/// Earlier Turso versions accepted `CREATE INDEX i ON t(t.a + 1)`, which new
+/// `CREATE INDEX` statements reject. VACUUM replays the stored index SQL, so it
+/// must still copy such an index.
+#[test]
+fn test_vacuum_keeps_index_with_qualified_column() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("qualified-index.db");
+    let sqlite_conn = SqliteConnection::open(&db_path)?;
+    sqlite_conn.execute_batch(
+        "CREATE TABLE t(a, b);
+         CREATE INDEX i ON t(a + 1);
+         INSERT INTO t VALUES (1, 2), (5, 6);
+         PRAGMA writable_schema = ON;
+         UPDATE sqlite_schema SET sql = 'CREATE INDEX i ON t(t.a + 1)' WHERE name = 'i';",
+    )?;
+    drop(sqlite_conn);
+    let tmp_db = TempDatabase::new_with_existent(&db_path);
+    let conn = tmp_db.connect_limbo();
+
+    let dest_path = temp_dir.path().join("qualified-index-dest.db");
+    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+    conn.execute("VACUUM")?;
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+
+    for conn in [&conn, &dest_conn] {
+        assert_eq!(run_integrity_check(conn), "ok");
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT b FROM t INDEXED BY i WHERE a + 1 = 6");
+        assert_eq!(rows, vec![(6,)]);
+    }
     Ok(())
 }
 
@@ -5135,7 +5314,7 @@ fn test_plain_vacuum_rejects_active_statement(tmp_db: TempDatabase) -> anyhow::R
     let err = conn.execute("VACUUM").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Transaction error: cannot VACUUM - SQL statements in progress",
+        "cannot VACUUM - SQL statements in progress",
         "unexpected error: {err}"
     );
 
@@ -5640,11 +5819,15 @@ fn test_plain_vacuum_encrypted() -> anyhow::Result<()> {
     conn.execute(format!("PRAGMA hexkey = '{HEXKEY}'"))?;
     conn.execute("PRAGMA cipher = 'aegis256'")?;
 
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
-    for i in 0..150 {
-        conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", "z".repeat(80)))?;
-    }
-    conn.execute("DELETE FROM t WHERE id >= 30")?;
+    let fill = |conn: &Arc<Connection>| -> anyhow::Result<()> {
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+        for i in 0..150 {
+            conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", "z".repeat(80)))?;
+        }
+        conn.execute("DELETE FROM t WHERE id >= 30")?;
+        Ok(())
+    };
+    fill(&conn)?;
 
     conn.execute("VACUUM")?;
     assert_eq!(run_integrity_check(&conn), "ok");
@@ -5658,6 +5841,27 @@ fn test_plain_vacuum_encrypted() -> anyhow::Result<()> {
     let last: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t WHERE id = 29");
     assert_eq!(last.len(), 1);
     assert_eq!(last[0], (29, "z".repeat(80)));
+
+    // dbhash of the vacuumed database matches a plain database with the same rows. Close
+    // the database first: it was encrypted with PRAGMAs, so its open `Database` has no
+    // cipher set and cannot take a key from a new connection.
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+    let vacuumed_hash = turso_dbhash::hash_database(
+        path.to_str().unwrap(),
+        &turso_dbhash::DbHashOptions {
+            encryption: Some(EncryptionOpts {
+                cipher: "aegis256".to_string(),
+                hexkey: HEXKEY.to_string(),
+            }),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(vacuumed_hash.rows_hashed, 30);
+    let plain_db = TempDatabase::new_empty();
+    fill(&plain_db.connect_limbo())?;
+    assert_eq!(vacuumed_hash.hash, compute_dbhash(&plain_db).hash);
 
     Ok(())
 }
@@ -6194,7 +6398,7 @@ fn test_mvcc_plain_vacuum_requires_checkpointed_image() -> anyhow::Result<()> {
     let err = conn.execute("VACUUM").unwrap_err();
     assert_eq!(
         err.to_string(),
-        "Transaction error: cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first",
+        "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first",
         "MVCC VACUUM must reject uncheckpointed logical changes"
     );
 

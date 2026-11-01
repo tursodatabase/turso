@@ -320,6 +320,17 @@ expect error {
     sequence name "__turso_internal_autoincrement_pwned" is reserved for internal AUTOINCREMENT use
 }
 
+test create-sequence-may-be-named-like-a-table-of-the-engine {
+    CREATE SEQUENCE sqlite_s;
+    CREATE SEQUENCE __turso_internal_seq_x;
+    SELECT nextval('sqlite_s');
+    SELECT nextval('__turso_internal_seq_x');
+}
+expect {
+    1
+    1
+}
+
 test qualified-sequence-name-may-contain-a-dot {
     CREATE SEQUENCE "a.b" START WITH 5;
     SELECT nextval('main.a.b');
@@ -334,4 +345,21 @@ expect {
     20
     21
     21
+}
+
+# A trigger body resolves names without a qualifier in the trigger's own
+# database, but a sequence named with another database is that database's.
+test trigger-body-finds-a-sequence-of-another-database {
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.s;
+    CREATE TABLE t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (nextval('aux.s')); END;
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (2);
+    SELECT * FROM log;
+}
+expect {
+    1
+    2
 }

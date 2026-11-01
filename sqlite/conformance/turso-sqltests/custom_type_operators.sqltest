@@ -4,255 +4,6 @@
 
 
 @requires strict "uses STRICT tables"
-test op-setup-same-type-both-columns {
-    -- Both columns are the same custom type → operator fires.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10, 5);
-    INSERT INTO t1 VALUES (2, 3, 7);
-    SELECT id, a + b FROM t1 ORDER BY id;
-}
-expect {
-    1|15
-    2|10
-}
-
-@requires strict "uses STRICT tables"
-test op-same-type-where-eq {
-    -- WHERE with = between two custom type columns.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10, 10);
-    INSERT INTO t1 VALUES (2, 3, 7);
-    INSERT INTO t1 VALUES (3, 5, 5);
-    SELECT id FROM t1 WHERE a = b ORDER BY id;
-}
-expect {
-    1
-    3
-}
-
-@requires strict "uses STRICT tables"
-test op-same-type-where-lt {
-    -- WHERE with < between two custom type columns.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 3, 10);
-    INSERT INTO t1 VALUES (2, 20, 5);
-    INSERT INTO t1 VALUES (3, 1, 1);
-    SELECT id FROM t1 WHERE a < b ORDER BY id;
-}
-expect {
-    1
-}
-
-
-@requires strict "uses STRICT tables"
-test op-literal-add-integer {
-    -- Integer literal + custom type column (value any).
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    SELECT id, val + 5 FROM t1 ORDER BY id;
-}
-expect {
-    1|15
-    2|25
-    3|35
-}
-
-@requires strict "uses STRICT tables"
-test op-literal-eq-multi-rows {
-    -- Literal comparison with = across multiple rows.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 42);
-    INSERT INTO t1 VALUES (3, 42);
-    INSERT INTO t1 VALUES (4, 99);
-    SELECT id FROM t1 WHERE val = 42 ORDER BY id;
-}
-expect {
-    2
-    3
-}
-
-@requires strict "uses STRICT tables"
-test op-literal-lt-multi-rows {
-    -- Literal comparison with < across multiple rows (no clobbering).
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 3);
-    INSERT INTO t1 VALUES (2, 10);
-    INSERT INTO t1 VALUES (3, 7);
-    INSERT INTO t1 VALUES (4, 1);
-    SELECT id, val FROM t1 WHERE val < 5 ORDER BY id;
-}
-expect {
-    1|3
-    4|1
-}
-
-@requires strict "uses STRICT tables"
-test op-reversed-literal-plus-column {
-    -- Reversed: literal + custom_type_column → operator fires with swapped args.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    SELECT id, 5 + val FROM t1 ORDER BY id;
-}
-expect {
-    1|15
-    2|25
-    3|35
-}
-
-
-@requires strict "uses STRICT tables"
-test op-derived-gt-literal {
-    -- > derived from swap_args(<)
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 3);
-    SELECT id FROM t1 WHERE val > 9 ORDER BY id;
-}
-expect {
-    1
-    3
-}
-
-@requires strict "uses STRICT tables"
-test op-derived-gte-literal {
-    -- >= derived from NOT(<)
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 3);
-    SELECT id FROM t1 WHERE val >= 9 ORDER BY id;
-}
-expect {
-    1
-    2
-    3
-}
-
-@requires strict "uses STRICT tables"
-test op-derived-lte-literal {
-    -- <= derived from NOT(swap_args(<))
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 3);
-    SELECT id FROM t1 WHERE val <= 50 ORDER BY id;
-}
-expect {
-    2
-    3
-    4
-}
-
-@requires strict "uses STRICT tables"
-test op-derived-neq-literal {
-    -- != derived from NOT(=)
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    SELECT id FROM t1 WHERE val != 9 ORDER BY id;
-}
-expect {
-    1
-    3
-}
-
-@requires strict "uses STRICT tables"
-test op-derived-gt-between-columns {
-    -- > between two custom type columns.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 20, 5);
-    INSERT INTO t1 VALUES (2, 3, 10);
-    INSERT INTO t1 VALUES (3, 7, 7);
-    SELECT id FROM t1 WHERE a > b ORDER BY id;
-}
-expect {
-    1
-}
-
-
-@requires strict "uses STRICT tables"
 test op-numeric-add-literal-multi-row {
     -- numeric(10,2) + integer literal across multiple rows.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
@@ -287,12 +38,13 @@ test op-numeric-mul-literal-multi-row {
     INSERT INTO t1 VALUES (1, 10);
     INSERT INTO t1 VALUES (2, 3);
     INSERT INTO t1 VALUES (3, -5);
+    -- The literal is not rounded to the column's scale first, so the scale stays 2.
     SELECT id, val * 3 FROM t1 ORDER BY id;
 }
 expect {
-    1|30.0000
-    2|9.0000
-    3|-15.0000
+    1|30.00
+    2|9.00
+    3|-15.00
 }
 
 @requires strict "uses STRICT tables"
@@ -303,8 +55,55 @@ test op-numeric-div-literal-multi-row {
     SELECT id, val / 10 FROM t1 ORDER BY id;
 }
 expect {
-    1|10
-    2|3
+    1|10.00
+    2|3.00
+}
+
+# As in PostgreSQL, numeric with a REAL value gives a REAL, while a decimal
+# literal such as 0.005 or -0.005 is exact and gives a numeric.
+@requires strict "uses STRICT tables"
+test op-numeric-with-real-is-real {
+    CREATE TABLE t1(n numeric(10,2), r real) STRICT;
+    INSERT INTO t1 VALUES (0.10, 0.2);
+    SELECT n + r, typeof(n + r), n * r, r - n, n / r, n + CAST(1 AS REAL), n * -0.005, typeof(n * -0.005) FROM t1;
+}
+expect {
+    0.3|real|0.02|0.1|0.5|1.1|-0.00050|text
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-mod-real-error {
+    CREATE TABLE t1(n numeric(10,2), r real) STRICT;
+    INSERT INTO t1 VALUES (0.10, 0.2);
+    SELECT n % r FROM t1;
+}
+expect error {
+    operator does not exist: numeric % real
+}
+
+# Remainders follow PostgreSQL: the sign of the dividend, and the scale of
+# the operand with more decimals.
+@requires strict "uses STRICT tables"
+test op-numeric-mod {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 3.5), (2, -7.5), (3, 1), (4, NULL);
+    SELECT id, val % 2, val % 0.3, val % -2, 10 % val FROM t1 ORDER BY id;
+}
+expect {
+    1|1.50|0.20|1.50|3.00
+    2|-1.50|0.00|-1.50|2.50
+    3|1.00|0.10|1.00|0.00
+    4||||
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-mod-by-zero {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1);
+    SELECT val % 0 FROM t1;
+}
+expect error {
+    division by zero
 }
 
 @requires strict "uses STRICT tables"
@@ -409,6 +208,31 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test op-numeric-compare-non-literal-multi-row {
+    -- The other operand is compared as a number, not rounded to the column's scale.
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2), i INTEGER) STRICT;
+    INSERT INTO t1 VALUES (1, 1.5, 1);
+    INSERT INTO t1 VALUES (2, 2, 2);
+    INSERT INTO t1 VALUES (3, 1.5, 3);
+    SELECT id FROM t1 WHERE val = 1.5 + 0 ORDER BY id;
+    SELECT id FROM t1 WHERE val = (SELECT 1.5) ORDER BY id;
+    SELECT id FROM t1 WHERE val > i ORDER BY id;
+    SELECT id FROM t1 WHERE val = i + 0.5 ORDER BY id;
+    SELECT id FROM t1 WHERE val != 1.504 + 0 ORDER BY id;
+}
+expect {
+    1
+    3
+    1
+    3
+    1
+    1
+    1
+    2
+    3
+}
+
+@requires strict "uses STRICT tables"
 test op-numeric-add-both-columns {
     -- Both columns are numeric → operator fires, no encoding needed.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, a numeric(10,2), b numeric(10,2)) STRICT;
@@ -435,275 +259,46 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-test op-different-types-no-override {
-    -- Different custom types: standard operator, not overridden.
+test op-different-types-error {
+    -- A user type has no arithmetic, with its own type or another.
     CREATE TYPE type_a(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add;
+        DECODE test_uint_decode(value);
     CREATE TYPE type_b(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add;
+        DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, a type_a, b type_b) STRICT;
     INSERT INTO t1 VALUES (1, 10, 5);
-    -- Standard + on integers: 10 + 5 = 15 (but decoded first)
     SELECT a + b FROM t1;
 }
-expect {
-    15
+expect error {
+    operator does not exist: type_a \+ type_b
 }
 
 
 @requires strict "uses STRICT tables"
-test op-standard-plus-custom-no-override {
+test op-integer-column-plus-custom-error {
     CREATE TYPE test_uint(value any) BASE text
         ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add;
+        DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, int_col INTEGER, custom_col test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 10, 5);
-    -- int_col is standard INTEGER, custom_col is test_uint → standard +.
     SELECT int_col + custom_col FROM t1;
 }
-expect {
-    15
+expect error {
+    operator does not exist: integer \+ test_uint
 }
 
 
 @requires strict "uses STRICT tables"
-test op-decoding-type-plus-non-literal-no-override {
-    -- DECODE changes the stored value, so an operand that is not a literal
-    -- cannot be passed to the operator next to it: standard + is used.
-    CREATE TYPE cents(value integer) BASE integer
-        ENCODE value * 100
-        DECODE value / 100
-        OPERATOR '+' max;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, c cents, i INTEGER) STRICT;
-    INSERT INTO t1 VALUES (1, 5, 7);
-    SELECT c + i, i + c, c + (7) FROM t1;
+test op-numeric-plus-integer-column {
+    -- numeric with an integer computes exactly; with a REAL it gives a REAL.
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, n numeric(10,2), i INTEGER, r REAL) STRICT;
+    INSERT INTO t1 VALUES (1, 1.5, 7, 0.25);
+    SELECT n + i, i + n, n * r FROM t1;
 }
 expect {
-    12|12|12
-}
-
-@requires strict "uses STRICT tables"
-test op-numeric-plus-integer-column-no-override {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, n numeric(10,2), i INTEGER) STRICT;
-    INSERT INTO t1 VALUES (1, 1.5, 7);
-    SELECT n + i, i + n FROM t1;
-}
-expect {
-    8.5|8.5
-}
-
-@requires strict "uses STRICT tables"
-test op-order-by-custom-lt {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 3);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 10);
-    SELECT id, val FROM t1 ORDER BY val;
-}
-expect {
-    2|3
-    4|10
-    3|50
-    1|100
-}
-
-@requires strict "uses STRICT tables"
-test op-order-by-custom-lt-desc {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 3);
-    INSERT INTO t1 VALUES (3, 50);
-    SELECT id, val FROM t1 ORDER BY val DESC;
-}
-expect {
-    1|100
-    3|50
-    2|3
-}
-
-
-@requires strict "uses STRICT tables"
-test op-null-literal-no-override {
-    -- NULL literal: operator should not fire (NULL has no type).
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    SELECT val + NULL FROM t1;
-}
-expect {
-
-}
-
-@requires strict "uses STRICT tables"
-test op-null-column-value {
-    -- Column value is NULL: operator should handle gracefully.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, NULL);
-    INSERT INTO t1 VALUES (2, 42);
-    SELECT id, val + 5 FROM t1 ORDER BY id;
-}
-expect {
-    1|
-    2|47
-}
-
-
-@requires strict "uses STRICT tables"
-test op-nested-expression {
-    -- (a + b) + c: inner fires (both custom type columns), outer may or may not.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, a test_uint, b test_uint, c test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10, 20, 30);
-    -- test_uint_add returns an integer, so (a + b) is not a custom type column.
-    -- The inner (a + b) fires the operator. The outer falls back to standard +.
-    SELECT (a + b) + c FROM t1;
-}
-expect {
-    60
-}
-
-
-@requires strict "uses STRICT tables"
-test op-backward-compat-old-syntax {
-    -- Old syntax: OPERATOR 'op' (type) -> func_name
-    CREATE TYPE test_uint_old(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' (test_uint_old) -> test_uint_add
-        OPERATOR '<' (test_uint_old) -> test_uint_lt
-        OPERATOR '=' (test_uint_old) -> test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint_old) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    SELECT val + 5 FROM t1 ORDER BY id;
-}
-expect {
-    15
-    25
-}
-
-
-@requires strict "uses STRICT tables"
-test op-value-integer-with-integer-literal {
-    -- value type is "integer", integer literal → compatible → operator fires.
-    CREATE TYPE my_int(value integer) BASE integer
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val my_int) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    SELECT id FROM t1 WHERE val = 10;
-}
-expect {
-    1
-}
-
-@requires strict "uses STRICT tables"
-test op-value-integer-with-text-literal-fallback {
-    -- value type is "integer", text literal → NOT compatible → standard operator.
-    CREATE TYPE my_int(value integer) BASE integer
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val my_int) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    -- Standard = compares integer 10 with text '10' → SQLite rules apply.
-    SELECT id FROM t1 WHERE val = '10';
-}
-expect {
-    1
-}
-
-
-@requires strict "uses STRICT tables"
-test op-many-rows-lt {
-    -- 8 rows to stress-test register handling across iterations.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 1);
-    INSERT INTO t1 VALUES (2, 2);
-    INSERT INTO t1 VALUES (3, 3);
-    INSERT INTO t1 VALUES (4, 4);
-    INSERT INTO t1 VALUES (5, 5);
-    INSERT INTO t1 VALUES (6, 6);
-    INSERT INTO t1 VALUES (7, 7);
-    INSERT INTO t1 VALUES (8, 8);
-    SELECT id FROM t1 WHERE val < 5 ORDER BY id;
-}
-expect {
-    1
-    2
-    3
-    4
-}
-
-@requires strict "uses STRICT tables"
-test op-many-rows-add {
-    -- 8 rows: addition across many iterations.
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    INSERT INTO t1 VALUES (4, 40);
-    INSERT INTO t1 VALUES (5, 50);
-    INSERT INTO t1 VALUES (6, 60);
-    INSERT INTO t1 VALUES (7, 70);
-    INSERT INTO t1 VALUES (8, 80);
-    SELECT id, val + 100 FROM t1 ORDER BY id;
-}
-expect {
-    1|110
-    2|120
-    3|130
-    4|140
-    5|150
-    6|160
-    7|170
-    8|180
+    8.50|8.50|0.375
 }
 
 @requires strict "uses STRICT tables"
@@ -728,29 +323,6 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-test op-where-and-order-by-combined {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 3);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 10);
-    INSERT INTO t1 VALUES (5, 7);
-    SELECT id, val FROM t1 WHERE val > 5 ORDER BY val;
-}
-expect {
-    5|7
-    4|10
-    3|50
-    1|100
-}
-
-@requires strict "uses STRICT tables"
 test op-numeric-where-and-order-by {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     INSERT INTO t1 VALUES (1, 100);
@@ -769,42 +341,772 @@ expect {
 
 
 @requires strict "uses STRICT tables"
-test op-reversed-literal-lt {
-    -- 5 < val → should use custom operator (literal on LHS).
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 3);
-    INSERT INTO t1 VALUES (2, 10);
-    INSERT INTO t1 VALUES (3, 5);
-    INSERT INTO t1 VALUES (4, 100);
-    SELECT id FROM t1 WHERE 5 < val ORDER BY id;
+test op-numeric-literal-not-rounded-to-column-scale {
+    -- The literal is not converted to numeric(10,2) first: that would round
+    -- 0.005 to 0.01 and 0.001 to 0.00, and reject 123456789012.
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 1.5);
+    SELECT n * 0.005, n + 0.001, n + 123456789012 FROM t1;
 }
 expect {
-    2
+    0.00750|1.501|123456789013.50
+}
+
+@requires strict "uses STRICT tables"
+test op-nested-sum-of-numeric-columns {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a numeric(10,2), b numeric(10,2), c numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 0.1, 0.2, 0.3);
+    SELECT a + b + c, a - b - c FROM t1;
+}
+expect {
+    0.60|-0.40
+}
+
+@requires strict "uses STRICT tables"
+test op-date-arithmetic {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date, e date) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-02-28', '2024-01-01');
+    SELECT d + 2, 2 + d, d - 1, d - e, d - '2024-01-01' FROM t1;
+}
+expect {
+    2024-03-01|2024-03-01|2024-02-27|58|58
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-date-error {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-02-28');
+    SELECT d + d FROM t1;
+}
+expect error {
+    operator does not exist: date \+ date
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-plus-date-error {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, n numeric(10,2), d date) STRICT;
+    INSERT INTO t1 VALUES (1, 1, '2024-02-28');
+    SELECT n + d FROM t1;
+}
+expect error {
+    operator does not exist: numeric \+ date
+}
+
+@requires strict "uses STRICT tables"
+test op-custom-arithmetic-in-dml {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, n numeric(10,2), d date) STRICT;
+    INSERT INTO t1 VALUES (1, 1.5, '2024-01-10');
+    UPDATE t1 SET n = n * 2.555, d = d + 1 WHERE d + 1 = '2024-01-11';
+    INSERT INTO t1 SELECT 2, n + 0.25, d - 10 FROM t1;
+    INSERT INTO t1 SELECT 3, n + 1, d - 20 FROM t1 WHERE id = 1;
+    DELETE FROM t1 WHERE d + 10 < '2024-01-02';
+    SELECT id, n, d FROM t1 ORDER BY id;
+}
+expect {
+    1|3.83|2024-01-11
+    2|4.08|2024-01-01
+}
+
+@requires strict "uses STRICT tables"
+test op-custom-arithmetic-in-trigger-and-returning {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    CREATE TABLE log(n numeric(10,2)) STRICT;
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES (new.n * 0.01); END;
+    INSERT INTO t1 VALUES (1, 150) RETURNING n + 0.005;
+    SELECT n FROM log;
+}
+expect {
+    150.005
+    1.50
+}
+
+@requires strict "uses STRICT tables"
+test op-correlated-count-does-not-run-division-for-other-rows {
+    -- Unnesting the subquery must not evaluate n / m for t1 rows that the
+    -- correlation excludes: m is 0 there.
+    CREATE TABLE o(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO o VALUES (1);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, oid INTEGER, n numeric(10,2), m numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 1, 4, 2), (2, 99, 1, 0);
+    SELECT id FROM o WHERE (SELECT count(*) FROM t1 WHERE t1.oid = o.id AND t1.n / t1.m > 1) > 0;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test op-nested-builtin-arithmetic {
+    -- The result of n + 1 is a numeric and the result of d + 7 is a date, so the
+    -- outer operator uses their functions too.
+    CREATE TABLE t1(n numeric(10,2), d date) STRICT;
+    INSERT INTO t1 VALUES (1.5, '2024-01-05');
+    SELECT (n + 1) * 2, (d + 1) + 1, (d + 7) - d FROM t1;
+}
+expect {
+    5.00|2024-01-07|7
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-date-value {
+    CREATE TABLE t1(d date) STRICT;
+    INSERT INTO t1 VALUES ('2024-01-05');
+    SELECT '2024-01-10' - d, CAST(date('2024-02-01') AS date) - d, CAST(d AS date) - d FROM t1;
+}
+expect {
+    5|27|0
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-value-of-unknown-type-error {
+    -- substr() returns a value of the type of its first argument, and a string
+    -- literal has no type, so substr(...) - d could be a date minus days or a
+    -- date minus a date. Casting it says which.
+    CREATE TABLE t1(d date) STRICT;
+    INSERT INTO t1 VALUES ('2024-01-05');
+    SELECT substr('2024-02-01', 1) - d FROM t1;
+}
+expect error {
+    operator does not exist: value - date
+}
+
+@requires strict "uses STRICT tables"
+test op-text-minus-date-error {
+    -- date() returns text, and no operator subtracts a date from text.
+    CREATE TABLE t1(d date) STRICT;
+    INSERT INTO t1 VALUES ('2024-01-05');
+    SELECT date('2024-02-01') - d FROM t1;
+}
+expect error {
+    operator does not exist: text - date
+}
+
+@requires strict "uses STRICT tables"
+test op-domain-uses-base-type-operators {
+    CREATE DOMAIN day AS date;
+    CREATE DOMAIN pos AS integer CHECK (value > 0);
+    CREATE TABLE t1(d day, p pos) STRICT;
+    INSERT INTO t1 VALUES ('2024-01-05', 5);
+    SELECT d + 1, d - d, p + 1 FROM t1;
+}
+expect {
+    2024-01-06|0|6
+}
+
+@requires strict "uses STRICT tables"
+test op-smallint-bigint-use-sqlite-operators {
+    CREATE TABLE t1(s smallint, b bigint, n numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (3, 4, 1.5);
+    SELECT s + b, s * 2, 10 - s, b / 3, n + s FROM t1;
+}
+expect {
+    7|6|7|1|4.50
+}
+
+@requires strict "uses STRICT tables"
+test op-undeclared-date-operator-error {
+    -- date has no *, so this is an error, not SQLite's * on the date string.
+    CREATE TABLE t1(d date) STRICT;
+    INSERT INTO t1 VALUES ('2024-01-05');
+    SELECT d * 2 FROM t1;
+}
+expect error {
+    operator does not exist: date \* integer
+}
+
+@requires strict "uses STRICT tables"
+test op-type-without-arithmetic-error {
+    CREATE TABLE t1(ts timestamp) STRICT;
+    INSERT INTO t1 VALUES ('2024-01-05 10:00:00');
+    SELECT ts + 1 FROM t1;
+}
+expect error {
+    operator does not exist: timestamp \+ integer
+}
+
+@requires strict "uses STRICT tables"
+test op-custom-arithmetic-on-trigger-and-upsert-values {
+    -- NEW, OLD and excluded hold the column's value, so their operators are the
+    -- column's. SQLite's + would turn '2024-01-05' + 1 into 2025, which the date
+    -- type then reads as a day number.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE TABLE l(d date) STRICT;
+    CREATE TRIGGER ti AFTER INSERT ON t WHEN NEW.d + 1 = '2024-01-06' BEGIN
+        INSERT INTO l VALUES (NEW.d + 1);
+        INSERT INTO l SELECT NEW.d - 1;
+    END;
+    CREATE TRIGGER tu AFTER UPDATE ON t BEGIN
+        INSERT INTO l VALUES (OLD.d + 10);
+    END;
+    INSERT INTO t VALUES (1, '2024-01-05');
+    INSERT INTO t VALUES (1, '2024-02-01') ON CONFLICT(id) DO UPDATE SET d = excluded.d + 1 WHERE excluded.d - t.d = 27;
+    SELECT 't', d FROM t;
+    SELECT 'l', d FROM l ORDER BY d;
+}
+expect {
+    t|2024-02-02
+    l|2024-01-04
+    l|2024-01-06
+    l|2024-01-15
+}
+
+@requires strict "uses STRICT tables"
+test op-user-type-without-operators-error {
+    -- A user type has no operators. SQLite's + on its decoded value might happen
+    -- to be right here, but not for a type whose values aren't numbers.
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(x cents) STRICT;
+    INSERT INTO t1 VALUES (5);
+    SELECT x + 1 FROM t1;
+}
+expect error {
+    operator does not exist: cents \+ integer
+}
+
+@requires strict "uses STRICT tables"
+test op-expression-index-on-custom-arithmetic-is-used {
+    -- The query's d + 1 becomes the same date function call as the index's d + 1.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE INDEX i ON t(d + 1);
+    INSERT INTO t VALUES (1, '2024-01-01'), (2, '2024-03-01');
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE d + 1 = '2024-01-02';
+    SELECT id FROM t WHERE d + 1 = '2024-01-02';
+}
+expect {
+    1|0|0|SEARCH t USING INDEX i (d + 1=?)
+    1
+}
+
+@requires strict "uses STRICT tables"
+test op-generated-column-uses-type-operators {
+    CREATE TABLE t(d date, next_day ANY AS (d + 1)) STRICT;
+    INSERT INTO t(d) VALUES ('2024-01-01');
+    SELECT next_day FROM t;
+}
+expect {
+    2024-01-02
+}
+
+@requires strict "uses STRICT tables"
+test op-date-arithmetic-on-arithmetic-result {
+    -- d - 5 is a date, so adding 1 adds a day; (d + 5) - d is a number of days.
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-01');
+    SELECT (d - 5) + 1, (d + 5) - d FROM t;
+}
+expect {
+    2023-12-28|5
+}
+
+@requires strict "uses STRICT tables"
+test op-partial-index-on-custom-arithmetic-is-used {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE INDEX i ON t(d) WHERE d + 1 = '2024-01-02';
+    INSERT INTO t VALUES (1, '2024-01-01'), (2, '2024-03-01');
+    EXPLAIN QUERY PLAN SELECT d FROM t WHERE d + 1 = '2024-01-02';
+    SELECT d FROM t WHERE d + 1 = '2024-01-02';
+}
+expect {
+    1|0|0|SCAN t USING COVERING INDEX i
+    2024-01-01
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-value-of-unknown-type-subtracts-days {
+    -- x may hold anything, so d - x subtracts days and rejects anything else
+    -- when it runs.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date, x ANY) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05', 3), (2, '2024-01-05', '2024-01-01');
+    SELECT d - x FROM t WHERE id = 1;
+    SELECT d - x FROM t WHERE id = 2;
+}
+expect error {
+    only an integer number of days can be subtracted from a date
+}
+
+@requires strict "uses STRICT tables"
+test op-create-type-rejects-arithmetic-operator {
+    CREATE TYPE stamp(value text) BASE text OPERATOR '+' datetime;
+}
+expect error {
+    CREATE TYPE does not accept OPERATOR
+}
+
+@requires strict "uses STRICT tables"
+test op-create-type-rejects-operator-without-function {
+    CREATE TYPE u(value integer) BASE integer OPERATOR '+';
+}
+expect error {
+    CREATE TYPE does not accept OPERATOR
+}
+
+@requires strict "uses STRICT tables"
+test op-in-subquery-runs-failing-arithmetic-on-every-row {
+    -- IN runs its subquery to the end, so the second row's d + 1 fails even
+    -- though the first row already matched.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-01'), (2, '9999-12-31');
+    CREATE TABLE o(k INTEGER, v INTEGER) STRICT;
+    INSERT INTO o VALUES (0, 1);
+    SELECT v FROM o WHERE v IN (SELECT id FROM t WHERE d + 1 > '2000-01-01' AND t.id > o.k);
+}
+expect error {
+    date out of range
+}
+
+@requires strict "uses STRICT tables"
+test op-parenthesized-column-uses-type-operator {
+    -- (d), +d and d COLLATE x give d's value unchanged, so they run the same
+    -- operator as d.
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-01-05');
+    SELECT d + 1, (d) + 1, +d + (1), d COLLATE BINARY + 1 FROM t1;
+}
+expect {
+    2024-01-06|2024-01-06|2024-01-06|2024-01-06
+}
+
+@requires strict "uses STRICT tables"
+test op-date-with-wrapped-null-or-literal {
+    -- Parentheses, COLLATE and unary + give their operand unchanged.
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    SELECT d + (NULL) IS NULL, (NULL) + d IS NULL, d + NULL COLLATE BINARY IS NULL,
+        d - ('2024-01-01'), d - '2024-01-01' COLLATE NOCASE, d - +'2024-01-01' FROM t;
+}
+expect {
+    1|1|1|4|4|4
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-subquery-and-coalesce {
+    -- A string literal mixed with a date is a date, and a subquery's column has
+    -- the type of what it selects.
+    CREATE TABLE t(d date) STRICT;
+    CREATE TABLE u(e date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    INSERT INTO u VALUES ('2024-01-01');
+    SELECT d - (SELECT e FROM u), d - coalesce(d, '2024-01-01'),
+        (d - (SELECT e FROM u)) + 1, d - (SELECT e - 1 FROM u) FROM t;
+}
+expect {
+    4|0|5|5
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-derived-table-cte-and-view-columns {
+    CREATE TABLE t(d date) STRICT;
+    CREATE TABLE u(e date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    INSERT INTO u VALUES ('2024-01-01');
+    CREATE VIEW v AS SELECT e AS x FROM u;
+    SELECT d - x FROM t, (SELECT e AS x FROM u);
+    SELECT d - x FROM t, (SELECT e AS x FROM u UNION ALL SELECT e - 1 FROM u) ORDER BY 1;
+    WITH c(x) AS (SELECT e FROM u) SELECT d - x FROM t, c;
+    SELECT d - x FROM t, v;
+}
+expect {
+    4
+    4
+    5
+    4
     4
 }
 
 @requires strict "uses STRICT tables"
-test op-reversed-literal-eq {
-    -- 42 = val → should use custom operator (literal on LHS).
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    INSERT INTO t1 VALUES (2, 99);
-    INSERT INTO t1 VALUES (3, 42);
-    SELECT id FROM t1 WHERE 42 = val ORDER BY id;
+test op-date-in-update-row-value-subquery {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    CREATE TABLE u(e date) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-05');
+    INSERT INTO u VALUES ('2024-01-01');
+    UPDATE t SET (id, d) = (SELECT 2, e + 3 FROM u);
+    SELECT id, d FROM t;
 }
 expect {
-    1
-    3
+    2|2024-01-04
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-result-keeps-operand-decimals {
+    -- As in PostgreSQL: a product has the decimals of both operands, a sum or
+    -- difference those of the operand with more.
+    CREATE TABLE g(n numeric(10,2)) STRICT;
+    INSERT INTO g VALUES (1.00), (0.00);
+    SELECT n * 3, n * 3.5, 3 * n, n + 3, n - 1 FROM g;
+}
+expect {
+    3.00|3.500|3.00|4.00|0.00
+    0.00|0.000|0.00|3.00|-1.00
+}
+
+@requires strict "uses STRICT tables"
+test op-date-full-join-using-column {
+    CREATE TABLE t(d date) STRICT;
+    CREATE TABLE u(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    INSERT INTO u VALUES ('2024-01-05');
+    SELECT d - 1 FROM t FULL JOIN u USING (d);
+}
+expect {
+    2024-01-04
+}
+
+@requires strict "uses STRICT tables"
+test op-date-in-recursive-cte {
+    -- The recursive SELECT reads the CTE's columns with the types the first
+    -- SELECT gives them.
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-05');
+    WITH RECURSIVE r(x, i) AS (
+        SELECT d, 0 FROM t UNION ALL SELECT x + 1, i + 1 FROM r WHERE i < 2
+    ) SELECT x, x - 1 FROM r;
+}
+expect {
+    2024-01-05|2024-01-04
+    2024-01-06|2024-01-05
+    2024-01-07|2024-01-06
+}
+
+@requires strict "uses STRICT tables"
+test op-date-struct-field {
+    CREATE TYPE p AS STRUCT(d date, n integer);
+    CREATE TABLE s(v p) STRICT;
+    INSERT INTO s VALUES (struct_pack('2024-01-05', 1));
+    SELECT v.d - 1 FROM s;
+}
+expect {
+    2024-01-04
+}
+
+
+@requires strict "uses STRICT tables"
+test op-numeric-huge-exponent-in-arithmetic-errors {
+    -- '1e100000000' parses into a small value, but adding it would write out
+    -- a hundred million digits. PostgreSQL allows 131072 digits before the
+    -- decimal point.
+    CREATE TABLE t(n numeric(10,2), x text) STRICT;
+    INSERT INTO t VALUES (1, '1e100000000');
+    SELECT n + x FROM t;
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-tiny-exponent-in-arithmetic-errors {
+    CREATE TABLE t(n numeric(10,2), x text) STRICT;
+    INSERT INTO t VALUES (1, '1e-100000000');
+    SELECT n * x FROM t;
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-largest-exponent-errors {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT n + '1e9223372036854775807' FROM t;
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-very-long-text-errors-without-parsing {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT n + replace(hex(zeroblob(800000)), '0', '1') FROM t;
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-huge-exponent-on-insert-errors {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES ('1e100000000');
+}
+expect error {
+    value overflows numeric format
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-text-that-is-not-a-number-errors {
+    CREATE TABLE t(n numeric(10,2), x text) STRICT;
+    INSERT INTO t VALUES (1, 'abc');
+    SELECT n + x FROM t;
+}
+expect error {
+    invalid input syntax for type numeric: "abc"
+}
+
+# As in PostgreSQL, a product keeps the decimals of both operands but at most
+# 16383 of them, the most a numeric can have. It is rounded to that many.
+@requires strict "uses STRICT tables"
+test op-numeric-mul-rounds-to-largest-scale {
+    CREATE TABLE t(a numeric(20000,10000), b numeric(20000,16383), c numeric(2,1)) STRICT;
+    INSERT INTO t VALUES ('1e-10000', '5e-16383', 0.1);
+    SELECT length(a * a), length(b * c), substr(b * c, -3), substr(b * c * c, -3) FROM t;
+}
+expect {
+    16385|16385|001|000
+}
+
+# A blob is not a number, as in PostgreSQL, where numeric + bytea and date +
+# bytea do not exist. It must not be read as a stored numeric.
+@requires strict "uses STRICT tables"
+test op-numeric-plus-blob-column-error {
+    CREATE TABLE t(n numeric(10,2), b blob) STRICT;
+    INSERT INTO t VALUES (1, x'0102');
+    SELECT n + b FROM t;
+}
+expect error {
+    operator does not exist: numeric \+ blob
+}
+
+@requires strict "uses STRICT tables"
+test op-blob-literal-times-numeric-error {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT x'01' * n FROM t;
+}
+expect error {
+    operator does not exist: blob \* numeric
+}
+
+# A column of type ANY may hold a blob that is only known when the statement
+# runs. Even a blob holding a stored numeric is not a number.
+@requires strict "uses STRICT tables"
+test op-numeric-plus-blob-in-any-column-error {
+    CREATE TABLE t(n numeric(10,2), x ANY) STRICT;
+    INSERT INTO t VALUES (1, numeric_encode('5.5'));
+    SELECT n + x FROM t;
+}
+expect error {
+    a blob is not a number
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-plus-cast-to-blob-error {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1);
+    SELECT n + CAST('1' AS BLOB) FROM t;
+}
+expect error {
+    operator does not exist: numeric \+ blob
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-blob-column-error {
+    CREATE TABLE t(d date, b blob) STRICT;
+    INSERT INTO t VALUES ('2024-01-01', x'0102');
+    SELECT d + b FROM t;
+}
+expect error {
+    operator does not exist: date \+ blob
+}
+
+# A decimal number written in the statement is exact wherever it is written, as
+# in PostgreSQL: inside a subquery, coalesce, abs, CASE, max, a derived table or
+# a CTE it still gives a numeric result, not a REAL one.
+@requires strict "uses STRICT tables"
+test op-numeric-decimal-literal-inside-expressions-is-exact {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (0.1);
+    SELECT n + (SELECT 0.2) - 0.3, n + coalesce(0.2, 0) - 0.3, n + abs(-0.2) - 0.3, n + CASE WHEN n > 0 THEN 0.2 ELSE 0 END - 0.3, n + (SELECT max(0.2)) - 0.3, n - (-0.2) - 0.5 FROM t;
+    SELECT t.n + x.v - 0.3 FROM t, (SELECT 0.2 AS v) x;
+    WITH c(v) AS (SELECT 0.2) SELECT n + v - 0.3 FROM t, c;
+}
+expect {
+    0.00|0.00|0.00|0.00|0.00|-0.20
+    0.00
+    0.00
+}
+
+# A REAL value stays REAL wherever it comes from, as double precision does in
+# PostgreSQL. So does arithmetic on two plain values, which SQLite computes as
+# a REAL.
+@requires strict "uses STRICT tables"
+test op-numeric-real-inside-expressions-is-real {
+    CREATE TABLE t(n numeric(10,2), r real) STRICT;
+    INSERT INTO t VALUES (0.1, 0.2);
+    SELECT typeof(n + (SELECT r)), typeof(n + coalesce(r, 0)), typeof(n + (SELECT CAST(0.2 AS REAL))), typeof(n + (0.1 + 0.2)) FROM t;
+}
+expect {
+    real|real|real|real
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-decimal-in-subquery-error {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-01');
+    SELECT d + (SELECT 0.5) FROM t;
+}
+expect error {
+    operator does not exist: date \+ numeric
+}
+
+# Unary minus, ~, &, |, << and >> on a custom type are decided like + - * / %:
+# the type's function runs them, or they are an error. numeric and smallint
+# declare SQLite's operators for them, so -n is the REAL -3.5, as on main.
+# TODO: -n gives the numeric -3.50, as in PostgreSQL, once every comparison
+# uses numeric's order; a numeric text result compares as text in IN, CASE,
+# min/max and index seeks today.
+@requires strict "uses STRICT tables"
+test op-numeric-and-smallint-unary-and-bitwise {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), s smallint) STRICT;
+    INSERT INTO t VALUES (1, 3.50, 5), (2, NULL, NULL), (3, -0.25, -1);
+    SELECT -n, -n % 2, -n * 2, -(-n), - -n, +n, -s, ~s, s & 3, s | 4, s << 2, s >> 1 FROM t ORDER BY id;
+}
+expect {
+    -3.50|-1.50|-7.00|3.50|3.50|3.50|-5|-6|1|5|20|2
+    |||||||||||
+    0.25|0.25|0.50|-0.25|-0.25|-0.25|1|0|3|-1|-4|-1
+}
+
+@requires strict "uses STRICT tables"
+test op-date-negate-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT -d FROM t;
+}
+expect error {
+    operator does not exist: - date
+}
+
+@requires strict "uses STRICT tables"
+test op-date-bitwise-and-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT d & 1 FROM t;
+}
+expect error {
+    operator does not exist: date & integer
+}
+
+@requires strict "uses STRICT tables"
+test op-date-shift-left-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT d << 1 FROM t;
+}
+expect error {
+    operator does not exist: date << integer
+}
+
+@requires strict "uses STRICT tables"
+test op-date-bitwise-not-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT ~d FROM t;
+}
+expect error {
+    operator does not exist: ~ date
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-bitwise-or-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT n | 1 FROM t;
+}
+expect error {
+    operator does not exist: numeric \\| integer
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-bitwise-not-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT ~n FROM t;
+}
+expect error {
+    operator does not exist: ~ numeric
+}
+
+@requires strict "uses STRICT tables"
+test op-integer-shift-right-numeric-error {
+    CREATE TABLE t(n numeric(10,2), d date) STRICT;
+    INSERT INTO t VALUES (3.50, '2024-01-01');
+    SELECT 1 >> n FROM t;
+}
+expect error {
+    operator does not exist: integer >> numeric
+}
+
+# A user type has no operators.
+@requires strict "uses STRICT tables"
+test op-user-type-negate-error {
+    CREATE TYPE test_uint(value any) BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value);
+    CREATE TABLE t(a test_uint) STRICT;
+    INSERT INTO t VALUES (10);
+    SELECT -a FROM t;
+}
+expect error {
+    operator does not exist: - test_uint
+}
+
+# smallint and bigint run SQLite's operators, but not on a numeric: the
+# numeric's function runs, whichever side the numeric is on.
+@requires strict "uses STRICT tables"
+test op-smallint-and-bigint-with-numeric {
+    CREATE TABLE t(s smallint, b bigint, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 2, 3.50);
+    SELECT s - n, n - s, s + n, s * n, b - n, b * n FROM t;
+}
+expect {
+    -2.50|2.50|4.50|3.50|-1.50|7.00
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-result-compares-as-numeric {
+    -- An operator result on a numeric compares as a number, and the literal
+    -- is not rounded to a scale the result does not have. From PostgreSQL.
+    CREATE TABLE t(n numeric(10,2), i integer) STRICT;
+    INSERT INTO t VALUES (3.50, 10);
+    SELECT (n - 10) > 0, -n < 0, n + 100 > 5, (n - i) > 0, n * 2 = 7, -n < i FROM t;
+    SELECT n = 3.5, n - 1 = 2.5, n - 1 = 2.504 FROM t;
+}
+expect {
+    0|1|1|0|1|1
+    1|1|0
+}
+
+# -n compares as a number wherever values are compared, with and without an
+# index. From PostgreSQL.
+@requires strict "uses STRICT tables"
+test op-numeric-negation-compares-as-number {
+    CREATE TABLE t(n numeric(10,2), i integer) STRICT;
+    INSERT INTO t VALUES (3.50, 10), (0.50, 1);
+    SELECT -n IN (-3.5), CASE -n WHEN -3.5 THEN 'y' ELSE 'n' END, nullif(-n, -3.5) IS NULL FROM t ORDER BY i DESC;
+    SELECT max(-n) = -0.5, min(-n) = -3.5 FROM t;
+    CREATE INDEX t_neg ON t(-n);
+    SELECT i FROM t WHERE -n = -3.5;
+}
+expect {
+    1|y|1
+    0|n|0
+    1|1
+    10
+}
+
+@requires strict "uses STRICT tables"
+test unchanged-decode-type-compares-literal-as-is-with-and-without-index {
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE plain(x upper_text) STRICT;
+    CREATE TABLE indexed(x upper_text PRIMARY KEY) STRICT;
+    INSERT INTO plain VALUES ('hello');
+    INSERT INTO indexed VALUES ('hello');
+    SELECT
+        (SELECT count(*) FROM plain WHERE x = 'hello'),
+        (SELECT count(*) FROM indexed WHERE x = 'hello'),
+        (SELECT count(*) FROM plain WHERE x = 'HELLO'),
+        (SELECT count(*) FROM indexed WHERE x = 'HELLO'),
+        (SELECT count(*) FROM plain WHERE x IN ('hello', 'HELLO')),
+        (SELECT count(*) FROM indexed WHERE x IN ('hello', 'HELLO'));
+}
+expect {
+    0|0|1|1|1|1
 }

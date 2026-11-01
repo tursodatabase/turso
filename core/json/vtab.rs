@@ -252,6 +252,11 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         }
         let root_path = match args.get(1) {
             None => Cow::Borrowed("$"),
+            // Like SQLite, a NULL path is an empty result once the JSON has parsed.
+            Some(Value::Null) => {
+                convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+                return Ok(false);
+            }
             Some(path) => json_path_text(path.as_value_ref()).ok_or_else(|| {
                 LimboError::InvalidArgument("root path should be text".to_owned())
             })?,
@@ -403,8 +408,7 @@ impl JsonEachCursor {
                     traversal_state.parent_id,
                     self.path_to_current_value.cursor(),
                 );
-                self.path_to_current_value
-                    .push_object_key(&key.to_string()?)?;
+                self.path_to_current_value.push_object_key(&key)?;
                 let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
                     && self
                         .json
@@ -526,7 +530,7 @@ mod columns {
         fn key_representation(&self) -> Value {
             match self {
                 Key::Integer(ref i) => Value::from_i64(*i),
-                Key::String(ref s) => Value::Text(Text::new(s.to_owned().replace("\\\"", "\""))),
+                Key::String(ref s) => Value::Text(Text::new(s.to_owned())),
                 Key::None => Value::Null,
             }
         }
@@ -693,26 +697,67 @@ impl InPlaceJsonPath {
         self.push(format!("[{idx}]"));
     }
 
-    fn push_object_key(&mut self, key: &str) -> crate::Result<()> {
-        // This follows SQLite's current quoting scheme, but it is not part of the stable API.
-        // See https://sqlite.org/forum/forumpost?udc=1&name=be212a295ed8df4c
+    fn push_object_key(&mut self, key: &Jsonb) -> crate::Result<()> {
+        let key_text = key.to_string()?;
         // Keys must be properly quoted strings
-        let inner = key
+        let inner = key_text
             .strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
             .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
+        if key.element_type()? != jsonb::ElementType::TEXT5 {
+            self.last_element = Key::String(jsonb::unescape_string(inner));
+            self.push_object_name(inner);
+            return Ok(());
+        }
+        // The JSON text rendering of a key with JSON5 escapes rewrites them (\v becomes \u0009),
+        // so read the key from its stored bytes, as the value column does. SQLite copies them.
+        let stored = key.scalar_payload_text()?;
+        self.last_element = Key::String(jsonb::unescape_string(&stored));
+        // A raw control character (jsonb_object() stores one where SQLite stores an escape) or a
+        // raw quote keeps the rendering: SQLite's path for a raw quote cannot be read back.
+        let name = if Self::needs_json_text_rendering(&stored) {
+            inner
+        } else {
+            &stored
+        };
+        self.push_object_name(name);
+        Ok(())
+    }
 
-        let mut chars = inner.chars();
+    fn push_object_name(&mut self, name: &str) {
+        // This follows SQLite's current quoting scheme, but it is not part of the stable API.
+        // See https://sqlite.org/forum/forumpost?udc=1&name=be212a295ed8df4c
+        let mut chars = name.chars();
         let needs_quotes = match chars.next() {
             None => true,
             Some(first) => {
                 !first.is_ascii_alphabetic() || chars.any(|c| !c.is_ascii_alphanumeric())
             }
         };
-        let unquoted_if_necessary = if needs_quotes { key } else { inner };
-        self.last_element = Key::String(inner.to_owned());
-        self.push(format!(".{unquoted_if_necessary}"));
-        Ok(())
+        self.push(if needs_quotes {
+            format!(".\"{name}\"")
+        } else {
+            format!(".{name}")
+        });
+    }
+
+    /// True when a stored name holds a control character or a double quote that is not part of
+    /// a backslash escape.
+    fn needs_json_text_rendering(name: &str) -> bool {
+        let mut bytes = name.bytes().peekable();
+        while let Some(byte) = bytes.next() {
+            match byte {
+                // The byte after a backslash belongs to the escape, even a line break.
+                b'\\' => {
+                    if bytes.next() == Some(b'\r') {
+                        bytes.next_if_eq(&b'\n');
+                    }
+                }
+                b'"' | 0..=0x1F => return true,
+                _ => {}
+            }
+        }
+        false
     }
 
     fn push(&mut self, element: String) {

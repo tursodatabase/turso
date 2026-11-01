@@ -173,7 +173,7 @@ pub struct Builder {
     enable_index_method: bool,
     enable_materialized_views: bool,
     enable_vacuum: bool,
-    enable_generated_columns: bool,
+    enable_autovacuum: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
     enable_mvcc_passive_checkpoint: bool,
@@ -194,7 +194,7 @@ impl Builder {
             enable_index_method: false,
             enable_materialized_views: false,
             enable_vacuum: false,
-            enable_generated_columns: false,
+            enable_autovacuum: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
             enable_mvcc_passive_checkpoint: false,
@@ -234,8 +234,8 @@ impl Builder {
         self
     }
 
-    pub fn experimental_generated_columns(mut self, gencols_enabled: bool) -> Self {
-        self.enable_generated_columns = gencols_enabled;
+    /// Kept for backwards compatibility. Generated columns are now always enabled.
+    pub fn experimental_generated_columns(self, _gencols_enabled: bool) -> Self {
         self
     }
 
@@ -251,6 +251,11 @@ impl Builder {
 
     pub fn experimental_vacuum(mut self, enabled: bool) -> Self {
         self.enable_vacuum = enabled;
+        self
+    }
+
+    pub fn experimental_autovacuum(mut self, enabled: bool) -> Self {
+        self.enable_autovacuum = enabled;
         self
     }
 
@@ -306,8 +311,8 @@ impl Builder {
         if self.enable_vacuum {
             features.push("vacuum");
         }
-        if self.enable_generated_columns {
-            features.push("generated_columns");
+        if self.enable_autovacuum {
+            features.push("autovacuum");
         }
         if self.enable_multiprocess_wal {
             features.push("multiprocess_wal");
@@ -400,37 +405,30 @@ impl Future for Execute {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match self.stmt.step(None, cx)? {
-            Poll::Ready(_) => {
-                let n_change = self.stmt.inner.lock().unwrap().n_change();
-                Poll::Ready(Ok(n_change as u64))
+        loop {
+            match self.stmt.step(0, cx)? {
+                Poll::Ready(Some(_)) => continue,
+                Poll::Ready(None) => {
+                    let n_change = self.stmt.inner.lock().unwrap().n_change();
+                    return Poll::Ready(Ok(n_change as u64));
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl Statement {
-    fn step(
-        &self,
-        columns: Option<usize>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<Option<Row>>> {
+    fn step(&self, columns: usize, cx: &mut std::task::Context<'_>) -> Poll<Result<Option<Row>>> {
         let mut stmt = self.inner.lock().unwrap();
         match stmt.step(Some(cx.waker()))? {
             turso_sdk_kit::rsapi::TursoStatusCode::Row => {
-                if let Some(columns) = columns {
-                    let mut values = Vec::with_capacity(columns);
-                    for i in 0..columns {
-                        let value = stmt.row_value(i)?;
-                        values.push(value);
-                    }
-                    Poll::Ready(Ok(Some(Row { values })))
-                } else {
-                    Poll::Ready(Err(Error::Misuse(
-                        "unexpected row during execution".to_string(),
-                    )))
+                let mut values = Vec::with_capacity(columns);
+                for i in 0..columns {
+                    let value = stmt.row_value(i)?;
+                    values.push(value);
                 }
+                Poll::Ready(Ok(Some(Row { values })))
             }
             turso_sdk_kit::rsapi::TursoStatusCode::Done => Poll::Ready(Ok(None)),
             turso_sdk_kit::rsapi::TursoStatusCode::Io => {
@@ -944,6 +942,45 @@ mod tests {
             wal_size as f64 / 1024.0
         );
         assert!(wal_size > 0, "WAL file should exist and be non-empty");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builder_experimental_autovacuum() -> Result<()> {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        {
+            let db = Builder::new_local(db_path)
+                .experimental_autovacuum(true)
+                .build()
+                .await?;
+            let conn = db.connect()?;
+            conn.execute("PRAGMA auto_vacuum = FULL;", ()).await?;
+            conn.execute("CREATE TABLE t(x);", ()).await?;
+            conn.execute("INSERT INTO t VALUES (1);", ()).await?;
+        }
+
+        {
+            let db = Builder::new_local(db_path).build().await?;
+            let conn = db.connect()?;
+            let result = conn.execute("INSERT INTO t VALUES (2);", ()).await;
+            assert!(matches!(result, Err(Error::Readonly(_))));
+        }
+
+        {
+            let db = Builder::new_local(db_path)
+                .experimental_autovacuum(true)
+                .build()
+                .await?;
+            let conn = db.connect()?;
+            conn.execute("INSERT INTO t VALUES (2);", ()).await?;
+
+            let mut rows = conn.query("SELECT count(*) FROM t;", ()).await?;
+            let row = rows.next().await?.unwrap();
+            assert_eq!(row.get_value(0)?, Value::Integer(2));
+        }
 
         Ok(())
     }

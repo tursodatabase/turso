@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 
+const SQLSTATE_PLACEMENT_ERROR: &str =
+    "@sqlstate must come directly before an `expect error` block";
+
 /// Helper enum for parsing test, snapshot or matrix blocks with decorators
 enum TestOrSnapshot {
     Test(TestCase),
@@ -165,6 +168,9 @@ impl Parser {
                             self.add_setup(&mut setups, name, setup)?
                         }
                     }
+                }
+                Some(Token::AtSqlstate) => {
+                    return Err(self.error(SQLSTATE_PLACEMENT_ERROR.to_string()));
                 }
                 Some(token) => {
                     return Err(self.error(format!("unexpected token: {token}")));
@@ -468,7 +474,8 @@ impl Parser {
                 let mut default_expectation: Option<Expectation> = None;
                 let mut overrides: HashMap<ast::Backend, Expectation> = HashMap::new();
 
-                while matches!(self.peek(), Some(Token::Expect)) {
+                while matches!(self.peek(), Some(Token::Expect | Token::AtSqlstate)) {
+                    let sqlstate = self.parse_sqlstate_directive()?;
                     self.expect_token(Token::Expect)?;
 
                     // Check for backend qualifier: expect @js { ... }
@@ -484,7 +491,7 @@ impl Parser {
                             None
                         };
 
-                    let expectation = self.parse_expectation()?;
+                    let expectation = self.parse_expectation(sqlstate)?;
 
                     if let Some(b) = backend_qualifier {
                         if overrides.contains_key(&b) {
@@ -527,6 +534,7 @@ impl Parser {
                     },
                 }))
             }
+            Some(Token::AtSqlstate) => Err(self.error(SQLSTATE_PLACEMENT_ERROR.to_string())),
             Some(token) => Err(self.error(format!(
                 "expected 'test', 'snapshot' or 'matrix' after decorators, got {token}"
             ))),
@@ -536,7 +544,47 @@ impl Parser {
         }
     }
 
-    fn parse_expectation(&mut self) -> Result<Expectation, ParseError> {
+    /// Parses an optional `@sqlstate <code>` line before an `expect` block.
+    fn parse_sqlstate_directive(&mut self) -> Result<Option<String>, ParseError> {
+        if !matches!(self.peek(), Some(Token::AtSqlstate)) {
+            return Ok(None);
+        }
+        self.advance();
+        let code = self.expect_sqlstate_code()?;
+        self.skip_newlines_and_comments();
+        if !matches!(self.peek(), Some(Token::Expect)) {
+            return Err(self.error(SQLSTATE_PLACEMENT_ERROR.to_string()));
+        }
+        Ok(Some(code))
+    }
+
+    fn expect_sqlstate_code(&mut self) -> Result<String, ParseError> {
+        let code = match self.peek() {
+            Some(Token::DigitWord(code) | Token::Identifier(code)) => code.clone(),
+            Some(token) => {
+                return Err(self.error(format!("expected a SQLSTATE after @sqlstate, got {token}")));
+            }
+            None => {
+                return Err(self.error("expected a SQLSTATE after @sqlstate, got EOF".to_string()));
+            }
+        };
+        let is_sqlstate = code.len() == 5
+            && code
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase());
+        if !is_sqlstate {
+            return Err(self.error(format!(
+                "invalid SQLSTATE '{code}': a SQLSTATE has 5 characters, each 0-9 or A-Z"
+            )));
+        }
+        self.advance();
+        Ok(code)
+    }
+
+    fn parse_expectation(&mut self, sqlstate: Option<String>) -> Result<Expectation, ParseError> {
+        if sqlstate.is_some() && !matches!(self.peek(), Some(Token::Error)) {
+            return Err(self.error(SQLSTATE_PLACEMENT_ERROR.to_string()));
+        }
         match self.peek() {
             Some(Token::Error) => {
                 self.advance();
@@ -546,7 +594,7 @@ impl Parser {
                 } else {
                     Some(content)
                 };
-                Ok(Expectation::Error(pattern))
+                Ok(Expectation::Error { sqlstate, pattern })
             }
             Some(Token::Pattern) => {
                 self.advance();
@@ -624,8 +672,12 @@ impl Parser {
                 self.advance();
                 Ok(ast::Capability::CustomTypes)
             }
+            Some(Token::IndexMethod) => {
+                self.advance();
+                Ok(ast::Capability::IndexMethod)
+            }
             Some(token) => Err(self.error(format!(
-                "expected capability (trigger, strict, materialized_views, custom_types), got {token}"
+                "expected capability (trigger, strict, materialized_views, custom_types, index_method), got {token}"
             ))),
             None => Err(self.error("expected capability, got EOF".to_string())),
         }
@@ -1151,10 +1203,13 @@ expect error {
         );
         assert_eq!(
             test.expectations.default,
-            Expectation::Error(Some(format!(
-                "Parse error: Expression tree is too large \\(maximum depth {}\\)",
-                turso_parser::MAX_EXPR_DEPTH
-            )))
+            Expectation::Error {
+                sqlstate: None,
+                pattern: Some(format!(
+                    "Parse error: Expression tree is too large \\(maximum depth {}\\)",
+                    turso_parser::MAX_EXPR_DEPTH
+                )),
+            }
         );
     }
 
@@ -1195,7 +1250,10 @@ expect error {
         let file = parse(input).unwrap();
         assert!(matches!(
             file.tests[0].expectations.default,
-            Expectation::Error(Some(_))
+            Expectation::Error {
+                sqlstate: None,
+                pattern: Some(_)
+            }
         ));
     }
 
@@ -1658,14 +1716,128 @@ expect @cli error {
         // Check default is Error
         assert!(matches!(
             &file.tests[0].expectations.default,
-            Expectation::Error(Some(s)) if s.contains("no such table")
+            Expectation::Error { pattern: Some(s), .. } if s.contains("no such table")
         ));
 
         // Check CLI-specific override
         assert!(matches!(
             file.tests[0].expectations.for_backend(ast::Backend::Cli),
-            Expectation::Error(Some(s)) if s.contains("table not found")
+            Expectation::Error { pattern: Some(s), .. } if s.contains("table not found")
         ));
+    }
+
+    #[test]
+    fn test_parse_sqlstate_applies_to_the_next_expect_block() {
+        let input = r#"
+@database :memory:
+
+test missing-table {
+    SELECT * FROM missing;
+}
+@sqlstate 42P01
+expect error {
+    relation "missing" does not exist
+}
+expect @tursopg error {
+    no such table
+}
+@sqlstate XX000
+expect @postgres error {
+}
+"#;
+
+        let file = parse(input).unwrap();
+        let expectations = &file.tests[0].expectations;
+        assert_eq!(
+            expectations.default,
+            Expectation::Error {
+                sqlstate: Some("42P01".to_string()),
+                pattern: Some("relation \"missing\" does not exist".to_string()),
+            }
+        );
+        assert_eq!(
+            expectations.for_backend(ast::Backend::Tursopg),
+            &Expectation::Error {
+                sqlstate: None,
+                pattern: Some("no such table".to_string()),
+            }
+        );
+        assert_eq!(
+            expectations.for_backend(ast::Backend::Postgres),
+            &Expectation::Error {
+                sqlstate: Some("XX000".to_string()),
+                pattern: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_sqlstate_rejects_a_code_that_is_not_five_digits_or_uppercase_letters() {
+        for code in ["4201", "42P011", "42p01", "\"42P01\""] {
+            let input = format!(
+                "@database :memory:\n\ntest t {{\n    SELECT 1;\n}}\n@sqlstate {code}\nexpect error {{\n}}\n"
+            );
+            assert!(parse(&input).is_err(), "accepted @sqlstate {code}");
+        }
+    }
+
+    #[test]
+    fn test_parse_sqlstate_rejects_an_expect_block_that_is_not_an_error() {
+        let input = r#"
+@database :memory:
+
+test t {
+    SELECT 1;
+}
+@sqlstate 42P01
+expect {
+    1
+}
+"#;
+
+        let error = parse(input).unwrap_err().to_string();
+        assert!(error.contains("directly before"), "{error}");
+    }
+
+    #[test]
+    fn test_parse_sqlstate_rejects_a_position_before_the_test() {
+        let input = r#"
+@database :memory:
+
+@sqlstate 42P01
+test t {
+    SELECT * FROM missing;
+}
+expect error {
+}
+"#;
+
+        let error = parse(input).unwrap_err().to_string();
+        assert!(error.contains("directly before"), "{error}");
+    }
+
+    #[test]
+    fn test_parse_sqlstate_rejects_a_position_without_an_expect_block_after_it() {
+        let input = r#"
+@database :memory:
+
+test t {
+    SELECT * FROM missing;
+}
+expect error {
+}
+@sqlstate 42P01
+
+test u {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let error = parse(input).unwrap_err().to_string();
+        assert!(error.contains("directly before"), "{error}");
     }
 
     #[test]

@@ -528,6 +528,20 @@ trait WalCoordination: Debug + Send + Sync {
     /// Enumerate the latest visible frame per page in the requested frame range.
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)>;
 
+    fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
+        Ok(self.find_frame(page_id, min_frame, max_frame, frame_watermark))
+    }
+
+    fn try_iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Result<Vec<(u64, u64)>> {
+        Ok(self.iter_latest_frames(min_frame, max_frame))
+    }
+
     /// Read the current checkpoint epoch used to tag cached WAL pages.
     fn checkpoint_epoch(&self) -> u32;
 
@@ -693,7 +707,7 @@ pub trait Wal: Debug + Send + Sync {
 
     /// Read a raw WAL frame with its on-disk header and page body decoded by
     /// the configured encryption context or external page codec.
-    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion>;
+    fn read_frame_raw(&self, frame_id: u64, frame: Arc<Buffer>) -> Result<Completion>;
 
     /// Write an in-memory page as a WAL frame.
     ///
@@ -773,6 +787,8 @@ pub trait Wal: Debug + Send + Sync {
     fn is_dirty(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
+    /// The epoch that pages read from this WAL are tagged with, see `Page::set_wal_tag`.
+    fn checkpoint_epoch(&self) -> u32;
     fn get_max_frame(&self) -> u64;
     /// This connection's frozen `(checkpoint_seq, max_frame)`: for a reader it is the WAL read
     /// mark installed at `begin_read_tx`; for a writer it is the position after its last commit.
@@ -2051,6 +2067,29 @@ impl WalCoordination for ShmWalCoordination {
             return self.fallback.iter_latest_frames(min_frame, max_frame);
         }
         self.authority.iter_latest_frames(min_frame, max_frame)
+    }
+
+    fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
+        if self.authority.frame_index_overflowed() {
+            return self
+                .fallback
+                .try_find_frame(page_id, min_frame, max_frame, frame_watermark);
+        }
+        self.authority
+            .try_find_frame(page_id, min_frame, max_frame, frame_watermark)
+    }
+
+    fn try_iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Result<Vec<(u64, u64)>> {
+        if self.authority.frame_index_overflowed() {
+            return self.fallback.try_iter_latest_frames(min_frame, max_frame);
+        }
+        self.authority.try_iter_latest_frames(min_frame, max_frame)
     }
 
     fn checkpoint_epoch(&self) -> u32 {
@@ -3548,8 +3587,15 @@ impl Wal for WalFile {
             if !self.coordination.try_begin_write_tx() {
                 return Err(LimboError::Busy);
             }
-            let db_changed =
-                self.db_changed_against(self.load_coordination_snapshot(), self.connection_state());
+            // A checkpoint that only advanced nbackfills leaves our snapshot current: the
+            // backfilled frames stay in the WAL while we hold our read lock, and commits do
+            // not publish nbackfills. SQLite also leaves nBackfill out of this comparison.
+            let local_state = self.connection_state();
+            let shared_snapshot = WalSnapshot {
+                nbackfills: local_state.snapshot.nbackfills,
+                ..self.load_coordination_snapshot()
+            };
+            let db_changed = self.db_changed_against(shared_snapshot, local_state);
             if db_changed {
                 // Snapshot is stale, give up and let caller retry from scratch.
                 // Return BusySnapshot instead of Busy so the caller knows it must
@@ -3558,7 +3604,7 @@ impl Wal for WalFile {
                 tracing::debug!(
                     "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
                     self.max_frame.load(Ordering::Acquire),
-                    self.load_coordination_snapshot().max_frame
+                    shared_snapshot.max_frame
                 );
                 self.coordination.end_write_tx();
                 return Err(LimboError::BusySnapshot);
@@ -3695,9 +3741,9 @@ impl Wal for WalFile {
             min_frame,
             max_frame
         );
-        let frame = self
-            .coordination
-            .find_frame(page_id, min_frame, max_frame, frame_watermark);
+        let frame =
+            self.coordination
+                .try_find_frame(page_id, min_frame, max_frame, frame_watermark)?;
         if let Some(frame) = frame {
             tracing::debug!(
                 "find_frame(page_id={}, frame_watermark={:?}): found frame={}",
@@ -3926,9 +3972,7 @@ impl Wal for WalFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    // todo(sivukhin): change API to accept Buffer or some other owned type
-    // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
-    fn read_frame_raw(&self, frame_id: u64, frame: &mut [u8]) -> Result<Completion> {
+    fn read_frame_raw(&self, frame_id: u64, frame: Arc<Buffer>) -> Result<Completion> {
         tracing::debug!("read_frame_raw({})", frame_id);
         let offset = self.frame_offset(frame_id);
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + self.page_size() as usize;
@@ -3938,10 +3982,6 @@ impl Wal for WalFile {
                 frame.len()
             )));
         }
-
-        // HACK: *mut u8 can't be Sent between threads safely, cast it to usize then
-        // for the time of writing this comment - this is *safe* as all callers immediately call synchronous method wait_for_completion and hold necessary references
-        let (frame_ptr, frame_len) = (frame.as_mut_ptr() as usize, frame.len());
 
         let page_transform = self.io_ctx.read().page_transform().clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
@@ -3959,10 +3999,7 @@ impl Wal for WalFile {
                     actual: bytes_read as usize,
                 });
             }
-            let frame_ptr = frame_ptr as *mut u8;
-            let frame_ref: &mut [u8] =
-                unsafe { std::slice::from_raw_parts_mut(frame_ptr, frame_len) };
-
+            let frame_ref = frame.as_mut_slice();
             frame_ref[..WAL_FRAME_HEADER_SIZE]
                 .copy_from_slice(&buf.as_slice()[..WAL_FRAME_HEADER_SIZE]);
             let (header, raw_page) = sqlite3_ondisk::parse_wal_frame_header(buf.as_slice());
@@ -4229,6 +4266,10 @@ impl Wal for WalFile {
         self.load_coordination_snapshot().checkpoint_seq
     }
 
+    fn checkpoint_epoch(&self) -> u32 {
+        self.coordination.checkpoint_epoch()
+    }
+
     fn get_max_frame(&self) -> u64 {
         self.max_frame.load(Ordering::Acquire)
     }
@@ -4410,7 +4451,9 @@ impl Wal for WalFile {
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
         let frame_count = self.get_max_frame();
         let page_size = self.page_size();
-        let mut frame = vec![0u8; page_size as usize + WAL_FRAME_HEADER_SIZE];
+        let frame = Arc::new(Buffer::new_temporary(
+            page_size as usize + WAL_FRAME_HEADER_SIZE,
+        ));
         let mut seen = FxHashSet::default();
         turso_assert!(
             frame_count >= frame_watermark,
@@ -4419,9 +4462,9 @@ impl Wal for WalFile {
         );
         let mut pages = Vec::with_capacity((frame_count - frame_watermark) as usize);
         for frame_no in frame_watermark + 1..=frame_count {
-            let c = self.read_frame_raw(frame_no, &mut frame)?;
+            let c = self.read_frame_raw(frame_no, frame.clone())?;
             self.io.wait_for_completion(c)?;
-            let (header, _) = sqlite3_ondisk::parse_wal_frame_header(&frame);
+            let (header, _) = sqlite3_ondisk::parse_wal_frame_header(frame.as_slice());
             if seen.insert(header.page_number) {
                 pages.push(header.page_number);
             }
@@ -5029,7 +5072,7 @@ impl WalFile {
                         Vec::new()
                     } else {
                         self.coordination
-                            .iter_latest_frames(oc_min_frame, oc_max_frame)
+                            .try_iter_latest_frames(oc_min_frame, oc_max_frame)?
                     };
                     // sort by frame_id for read locality
                     to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
@@ -5836,9 +5879,7 @@ impl WalFileShared {
             return sqlite3_ondisk::build_shared_wal(&file, io);
         }
         if snapshot.max_frame > snapshot.nbackfills
-            && authority
-                .iter_latest_frames(0, snapshot.max_frame)
-                .is_empty()
+            && !authority.has_visible_frame(snapshot.max_frame)?
         {
             tracing::debug!(
                 max_frame = snapshot.max_frame,
@@ -6982,10 +7023,15 @@ pub mod test {
         wal.write_frame_raw(buffer_pool, 1, 44, 0, &expected, FileSyncType::Fsync)
             .unwrap();
 
-        let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
-        let completion = wal.read_frame_raw(1, &mut frame).unwrap();
+        let frame = Arc::new(Buffer::new_temporary(
+            WAL_FRAME_HEADER_SIZE + page_size as usize,
+        ));
+        let completion = wal.read_frame_raw(1, frame.clone()).unwrap();
         io.wait_for_completion(completion).unwrap();
-        assert_eq!(&frame[WAL_FRAME_HEADER_SIZE..], expected.as_slice());
+        assert_eq!(
+            &frame.as_slice()[WAL_FRAME_HEADER_SIZE..],
+            expected.as_slice()
+        );
     }
 
     #[test]
@@ -7037,8 +7083,8 @@ pub mod test {
 
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + page_size as usize;
         for frame_len in [expected_frame_len - 1, expected_frame_len + 1] {
-            let mut frame = vec![0; frame_len];
-            match wal.read_frame_raw(1, &mut frame) {
+            let frame = Arc::new(Buffer::new_temporary(frame_len));
+            match wal.read_frame_raw(1, frame) {
                 Err(LimboError::InvalidArgument(message)) => assert_eq!(
                     message,
                     format!(
@@ -7081,10 +7127,15 @@ pub mod test {
         wal.write_frame_raw(buffer_pool, 1, 44, 0, &expected, FileSyncType::Fsync)
             .unwrap();
 
-        let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
-        let completion = wal.read_frame_raw(1, &mut frame).unwrap();
+        let frame = Arc::new(Buffer::new_temporary(
+            WAL_FRAME_HEADER_SIZE + page_size as usize,
+        ));
+        let completion = wal.read_frame_raw(1, frame.clone()).unwrap();
         io.wait_for_completion(completion).unwrap();
-        assert_eq!(&frame[WAL_FRAME_HEADER_SIZE..], expected.as_slice());
+        assert_eq!(
+            &frame.as_slice()[WAL_FRAME_HEADER_SIZE..],
+            expected.as_slice()
+        );
     }
 
     #[cfg(feature = "checksum")]
@@ -7117,8 +7168,10 @@ pub mod test {
         let source_pages = vec![page_with_pattern(43, 0x43, &buffer_pool)];
         append_test_pages(&io, &wal, page_size, &source_pages);
 
-        let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
-        let c = wal.read_frame_raw(1, &mut frame).unwrap();
+        let frame = Arc::new(Buffer::new_temporary(
+            WAL_FRAME_HEADER_SIZE + page_size as usize,
+        ));
+        let c = wal.read_frame_raw(1, frame).unwrap();
         let err = wait_for_completion_error(&io, c);
 
         assert!(matches!(

@@ -17,7 +17,10 @@ name = "turso_core"
 path = "lib.rs"
 
 [features]
-default = [
+default = ["baseline", "simd"]
+# Everything a normal build needs, without the SimSIMD C library. Crates that
+# must build without SimSIMD use `default-features = false, features = ["baseline"]`.
+baseline = [
     "fs",
     "uuid",
     "time",
@@ -26,7 +29,6 @@ default = [
     "encryption",
     "percentile",
     "autovacuum",
-    "simd",
 ]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
@@ -219,6 +221,7 @@ harness = false
 [[bench]]
 name = "mvcc_benchmark"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
 name = "mvcc_recovery_benchmark"
