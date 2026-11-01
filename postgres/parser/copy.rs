@@ -43,6 +43,9 @@ pub(crate) fn try_extract_copy_to_stdout(
     let table = copy.relation.as_ref().ok_or_else(|| {
         ParseError::ParseError("COPY TO STDOUT only supports a table, not a query".to_owned())
     })?;
+    // pg_query's protobuf represents both TO STDOUT (a null filename in PostgreSQL)
+    // and TO '' as an empty string. Scan the SQL to reject the empty filename
+    // instead of treating it as STDOUT.
     let scanned = pg_query::scan(sql).map_err(|error| ParseError::ParseError(error.to_string()))?;
     let destination = scanned
         .tokens
