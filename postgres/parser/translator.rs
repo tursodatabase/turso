@@ -150,6 +150,16 @@ impl PostgreSQLTranslator {
             });
         }
 
+        // ALTER TABLE t ADD COLUMN a, ADD COLUMN b names several subcommands.
+        // PostgreSQL applies them atomically, so translate each subcommand to
+        // its own ALTER statement; the prereqs run in the same savepoint as the
+        // last one, so an error on a later subcommand rolls back the earlier ones.
+        if let NodeRef::AlterTableStmt(alter) = &node.0 {
+            if alter.cmds.len() > 1 {
+                return self.translate_multi_subcommand_alter(alter);
+            }
+        }
+
         let cmd = match node.0 {
             NodeRef::ExplainStmt(explain) => self.translate_explain(explain)?,
             node => ast::Cmd::Stmt(self.translate_node(node)?),
@@ -824,6 +834,28 @@ impl PostgreSQLTranslator {
                 txn.kind
             ))),
         }
+    }
+
+    /// Translate `ALTER TABLE t <sub1>, <sub2>, ...` into one single-subcommand
+    /// ALTER per subcommand. All but the last run as prereqs in the last one's
+    /// savepoint, so the change is atomic like PostgreSQL's: an error on a later
+    /// subcommand leaves the earlier ones rolled back. Each clone keeps the table
+    /// name and flags, so an unsupported subcommand is still rejected per command.
+    fn translate_multi_subcommand_alter(
+        &self,
+        alter: &pg_query::protobuf::AlterTableStmt,
+    ) -> Result<TranslateResult, ParseError> {
+        let mut stmts = Vec::with_capacity(alter.cmds.len());
+        for cmd in &alter.cmds {
+            let mut single = alter.clone();
+            single.cmds = vec![cmd.clone()];
+            stmts.push(self.translate_alter_table(&single)?);
+        }
+        let cmd = ast::Cmd::Stmt(stmts.pop().expect("more than one subcommand"));
+        Ok(TranslateResult {
+            prereqs: stmts,
+            cmd,
+        })
     }
 
     fn translate_alter_table(
@@ -10802,10 +10834,21 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_alter_table_multiple_subcommands() {
+    fn alter_table_multiple_subcommands_translate() {
+        // Several subcommands become one single-subcommand ALTER each, run
+        // atomically.
+        assert_translates("ALTER TABLE t ADD COLUMN a int, ADD COLUMN b int");
+        assert_translates("ALTER TABLE t ADD COLUMN a int, DROP COLUMN b");
+        assert_translates("ALTER TABLE t DROP COLUMN a, DROP COLUMN b, ADD COLUMN c text");
+        // An unsupported subcommand among several is still rejected, even when it
+        // is not the first one, so the whole ALTER fails closed.
         assert_not_supported(
-            "ALTER TABLE t ADD COLUMN a int, ADD COLUMN b int",
-            "multiple subcommands",
+            "ALTER TABLE t ADD COLUMN a int, ADD COLUMN b int CHECK (b > 0)",
+            "CHECK",
+        );
+        assert_not_supported(
+            "ALTER TABLE t ADD COLUMN a int, ADD CONSTRAINT ck CHECK (a > 0)",
+            "ADD CONSTRAINT",
         );
     }
 

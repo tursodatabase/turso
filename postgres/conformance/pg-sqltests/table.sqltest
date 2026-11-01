@@ -676,3 +676,27 @@ expect {
     1|public
     2|public
 }
+
+# ALTER TABLE can carry several subcommands, which PostgreSQL applies
+# atomically. The frontend translates each subcommand into its own ALTER and
+# runs them in one savepoint.
+
+test alter-several-subcommands {
+    CREATE TABLE t (id int);
+    ALTER TABLE t ADD COLUMN a int, ADD COLUMN b text;
+    INSERT INTO t (id, a, b) VALUES (1, 10, 'x');
+    SELECT id, a, b FROM t;
+}
+expect {
+    1|10|x
+}
+
+test alter-mixed-add-and-drop-subcommands {
+    CREATE TABLE t (id int, old int);
+    ALTER TABLE t ADD COLUMN a int, DROP COLUMN old;
+    INSERT INTO t (id, a) VALUES (1, 2);
+    SELECT id, a FROM t;
+}
+expect {
+    1|2
+}

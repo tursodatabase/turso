@@ -4559,3 +4559,45 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
         ]
     );
 }
+
+// ALTER TABLE with several subcommands runs each single-subcommand ALTER in one
+// savepoint, so a failing subcommand rolls the whole statement back, like
+// PostgreSQL: the earlier subcommands leave no trace.
+#[turso_macros::test(mvcc)]
+fn test_postgres_multi_alter_subcommands_is_atomic(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER)").unwrap();
+    assert!(
+        conn.execute("ALTER TABLE t ADD COLUMN a INTEGER, DROP COLUMN missing_col")
+            .is_err(),
+        "dropping a missing column should fail the whole ALTER"
+    );
+    // The ADD COLUMN a was rolled back, so inserting into it fails.
+    assert!(
+        conn.execute("INSERT INTO t (id, a) VALUES (1, 2)").is_err(),
+        "column a must not exist after the rolled-back ALTER"
+    );
+}
+
+// Several supported subcommands all take effect in one statement.
+#[turso_macros::test(mvcc)]
+fn test_postgres_multi_alter_subcommands_apply(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER, old INTEGER)")
+        .unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN a INTEGER, ADD COLUMN b TEXT, DROP COLUMN old")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, a, b) VALUES (1, 10, 'x')")
+        .unwrap();
+    assert_eq!(
+        conn.prepare("SELECT id, a, b FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![
+            Value::from_i64(1),
+            Value::from_i64(10),
+            Value::build_text("x")
+        ]],
+    );
+}
