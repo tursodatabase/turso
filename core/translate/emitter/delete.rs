@@ -376,7 +376,7 @@ pub fn emit_fk_child_decrement_on_delete(
     for fk_ref in resolver.with_schema(database_id, |s| {
         s.resolved_fks_for_child(namespace.id, child_table_name, None)
     })? {
-        if !fk_ref.fk.deferred {
+        if !resolver.fk_is_deferred(&fk_ref.fk) {
             continue;
         }
         let child_positions: Vec<usize> = fk_ref

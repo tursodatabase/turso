@@ -1354,9 +1354,11 @@ fn emit_update_insns<'a>(
         )?,
         _ => crate::alloc::vec![],
     };
-    let has_parent_fk_checks = affected_parent_fks
-        .iter()
-        .any(|fk| matches!(fk.fk.on_update, RefAct::NoAction | RefAct::Restrict));
+    let has_parent_fk_checks = affected_parent_fks.iter().any(|fk| {
+        t_ctx
+            .resolver
+            .fk_counts_children_of_old_parent_key(&fk.fk, fk.fk.on_update)
+    });
     let has_parent_fk_actions = affected_parent_fks.iter().any(|fk| {
         matches!(
             fk.fk.on_update,

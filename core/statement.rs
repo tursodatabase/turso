@@ -684,6 +684,10 @@ impl Statement {
             self.release_active_root_if_counted(!matches!(res, Ok(StepResult::Done)));
         }
 
+        if matches!(res, Ok(StepResult::Done)) || res.is_err() {
+            self.program.reset_defer_foreign_keys_after_statement();
+        }
+
         // If the bytecode aborted between SequenceBeginInnerTx and
         // SequenceCommitInnerTx, the connection's mv_tx is still pointing
         // at the orphan inner; subsequent statements (e.g. reparse_schema

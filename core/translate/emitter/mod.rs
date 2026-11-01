@@ -28,8 +28,8 @@ use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
-    Table, EXPR_INDEX_SENTINEL,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, ForeignKey, GeneratedType, Index,
+    IndexColumn, Schema, Table, EXPR_INDEX_SENTINEL,
 };
 use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
 use crate::translate::fkeys::FkActionCompileStack;
@@ -54,7 +54,7 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 use turso_parser::ast::{
-    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
+    self, Expr, Literal, RefAct, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
 
 pub(crate) mod delete;
@@ -167,6 +167,8 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    /// Whether `PRAGMA defer_foreign_keys` is on for the connection.
+    pub defer_foreign_keys: bool,
     #[cfg(feature = "simulator")]
     subquery_unnesting_mode: crate::SubqueryUnnestingMode,
     /// Foreign-key action programs currently being compiled by this resolver.
@@ -383,6 +385,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(None),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml,
+            defer_foreign_keys: false,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -403,6 +406,26 @@ impl<'a> Resolver<'a> {
         self.subquery_unnesting_mode
     }
 
+    /// Whether violations of `fk` are counted until the transaction commits
+    /// instead of failing the statement.
+    pub fn fk_is_deferred(&self, fk: &ForeignKey) -> bool {
+        fk.deferred || self.defer_foreign_keys
+    }
+
+    /// Whether `action` makes a foreign key violation fail at once. Like
+    /// SQLite, `PRAGMA defer_foreign_keys` defers RESTRICT actions too.
+    pub fn fk_action_is_restrict(&self, action: RefAct) -> bool {
+        action == RefAct::Restrict && !self.defer_foreign_keys
+    }
+
+    /// Whether removing or changing a parent key counts the child rows that
+    /// still reference the old key. Like SQLite, a deferred key counts them
+    /// even when a CASCADE, SET NULL or SET DEFAULT action then changes those
+    /// rows, because each such change subtracts one from the deferred count.
+    pub fn fk_counts_children_of_old_parent_key(&self, fk: &ForeignKey, action: RefAct) -> bool {
+        matches!(action, RefAct::NoAction | RefAct::Restrict) || self.fk_is_deferred(fk)
+    }
+
     pub fn has_temp_database(&self) -> bool {
         self.catalog.has_temp_database()
     }
@@ -417,6 +440,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
+            defer_foreign_keys: self.defer_foreign_keys,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -433,6 +457,7 @@ impl<'a> Resolver<'a> {
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             dqs_dml: self.dqs_dml,
+            defer_foreign_keys: self.defer_foreign_keys,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),

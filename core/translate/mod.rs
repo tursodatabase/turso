@@ -142,6 +142,7 @@ pub fn translate(
         },
         search_path.as_deref(),
     );
+    resolver.defer_foreign_keys = connection.defer_foreign_keys();
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
