@@ -458,14 +458,26 @@ expect {
 
 @requires strict "uses STRICT tables"
 test op-date-minus-value-of-unknown-type-error {
-    -- date() may return any value, so date() - d could be a date minus days or
-    -- a date minus a date. Casting it says which.
+    -- substr() returns a value of the type of its first argument, and a string
+    -- literal has no type, so substr(...) - d could be a date minus days or a
+    -- date minus a date. Casting it says which.
+    CREATE TABLE t1(d date) STRICT;
+    INSERT INTO t1 VALUES ('2024-01-05');
+    SELECT substr('2024-02-01', 1) - d FROM t1;
+}
+expect error {
+    operator does not exist: value - date
+}
+
+@requires strict "uses STRICT tables"
+test op-text-minus-date-error {
+    -- date() returns text, and no operator subtracts a date from text.
     CREATE TABLE t1(d date) STRICT;
     INSERT INTO t1 VALUES ('2024-01-05');
     SELECT date('2024-02-01') - d FROM t1;
 }
 expect error {
-    operator does not exist: value - date
+    operator does not exist: text - date
 }
 
 @requires strict "uses STRICT tables"
@@ -1078,4 +1090,23 @@ expect {
     0|n|0
     1|1
     10
+}
+
+@requires strict "uses STRICT tables"
+test unchanged-decode-type-compares-literal-as-is-with-and-without-index {
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE plain(x upper_text) STRICT;
+    CREATE TABLE indexed(x upper_text PRIMARY KEY) STRICT;
+    INSERT INTO plain VALUES ('hello');
+    INSERT INTO indexed VALUES ('hello');
+    SELECT
+        (SELECT count(*) FROM plain WHERE x = 'hello'),
+        (SELECT count(*) FROM indexed WHERE x = 'hello'),
+        (SELECT count(*) FROM plain WHERE x = 'HELLO'),
+        (SELECT count(*) FROM indexed WHERE x = 'HELLO'),
+        (SELECT count(*) FROM plain WHERE x IN ('hello', 'HELLO')),
+        (SELECT count(*) FROM indexed WHERE x IN ('hello', 'HELLO'));
+}
+expect {
+    0|0|1|1|1|1
 }

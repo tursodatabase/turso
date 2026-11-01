@@ -21,6 +21,7 @@ use crate::{
         ForeignKey, FromDefinitionFlags, Index, Schema, Table, EXPR_INDEX_SENTINEL,
     },
     translate::{
+        collate::key_collation,
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{
             emit_stored_column, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
@@ -322,7 +323,7 @@ fn emit_rename_sqlite_sequence_entry(
             lhs: sequence_name_reg,
             rhs: row_name_to_replace_reg,
             target_pc: continue_loop_label,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default().jump_if_null(),
             collation: CollationSeq::for_internal_values(),
         });
 
@@ -402,7 +403,7 @@ fn emit_delete_sqlite_sequence_entry(
             lhs: sequence_name_reg,
             rhs: row_name_to_delete_reg,
             target_pc: continue_loop_label,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default().jump_if_null(),
             collation: CollationSeq::for_internal_values(),
         });
 
@@ -603,7 +604,13 @@ fn emit_column_constraints_validation(
         check_constraints.extend(domain_checks);
     }
 
-    if !has_notnull && check_constraints.is_empty() {
+    let strict_virtual_type = if table.is_strict && column.is_virtual_generated() {
+        column.strict_value_type()
+    } else {
+        None
+    };
+
+    if !has_notnull && check_constraints.is_empty() && strict_virtual_type.is_none() {
         return Ok(());
     }
 
@@ -667,6 +674,23 @@ fn emit_column_constraints_validation(
         &resolved_table_arc,
     )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
+
+    if let Some(value_type) = strict_virtual_type {
+        let type_passed = program.allocate_label();
+        program.emit_insn(Insn::IsType {
+            reg: result_reg,
+            target_pc: type_passed,
+            value_type,
+        });
+        program.emit_insn(Insn::Halt {
+            constraint_info: None,
+            err_code: 1,
+            description: "type mismatch on DEFAULT".to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(type_passed);
+    }
 
     if !check_constraints.is_empty() {
         let table = Table::BTree(resolved_table_arc.clone());
@@ -1240,6 +1264,7 @@ pub fn translate_alter_table(
             }
             if btree.is_strict {
                 column.resolve_custom_type(resolver.schema());
+                key_collation(column.text_collation(), column.type_ordering())?;
             }
 
             // If a column has no explicit DEFAULT but its custom type defines
@@ -1942,6 +1967,8 @@ pub fn translate_alter_table(
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] = replacement_column.clone();
                 table.resolve_custom_types(resolver.schema())?;
+                let column = &table.columns()[column_index];
+                key_collation(column.text_collation(), column.type_ordering())?;
                 table.prepare_generated_columns()?;
                 let column_names: Vec<&str> = table
                     .columns()

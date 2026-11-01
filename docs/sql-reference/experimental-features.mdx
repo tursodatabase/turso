@@ -64,6 +64,7 @@ let db = Builder::new_local("database.db")
     .experimental_custom_types(true)
     .experimental_index_method(true)
     .experimental_vacuum(true)
+    .experimental_autovacuum(true)
     .experimental_attach(true)
     .experimental_multiprocess_wal(true)
     .build()?;

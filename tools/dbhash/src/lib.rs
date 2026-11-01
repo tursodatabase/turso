@@ -12,7 +12,8 @@ use turso_core::SqliteDialect;
 use sha1::{Digest, Sha1};
 use std::num::NonZero;
 use turso_core::{
-    ConnectOpts, Database, DatabaseOpts, LimboError, OpenFlags, PlatformIO, StepResult, Value, IO,
+    ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, LimboError, OpenFlags,
+    PlatformIO, StepResult, Value, IO,
 };
 
 pub use encoder::encode_value;
@@ -27,6 +28,10 @@ pub struct DbHashOptions {
     pub without_schema: bool,
     /// If true, print each value to stderr as it's hashed.
     pub debug_trace: bool,
+    /// Cipher and key of an encrypted database. Hashing fails if this process already has
+    /// the database open and it was encrypted with `PRAGMA cipher`/`PRAGMA hexkey`: that
+    /// open `Database` has no cipher set, so a new connection cannot use the key.
+    pub encryption: Option<EncryptionOpts>,
 }
 
 #[derive(Debug)]
@@ -60,16 +65,26 @@ pub fn hash_database_with_database_opts(
         !(options.schema_only && options.without_schema),
         "`schema_only` and `without_schema` cannot both be true"
     );
+    let database_opts = if options.encryption.is_some() {
+        database_opts.with_encryption(true)
+    } else {
+        database_opts
+    };
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
     let db = Database::open_file_with_flags(
         io.clone(),
         path,
         OpenFlags::default(),
         database_opts,
-        None,
+        options.encryption.clone(),
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let encryption_key = options
+        .encryption
+        .as_ref()
+        .map(|encryption| EncryptionKey::from_hex_string(&encryption.hexkey))
+        .transpose()?;
+    let conn = db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?;
 
     let mut hasher = Sha1::new();
     let mut tables_hashed = 0;

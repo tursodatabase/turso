@@ -195,7 +195,7 @@ impl ExprProperties for TableMetadata<'_> {
         None
     }
 
-    fn subquery_affinity(&self, _query: TableInternalId, _result_reg: usize) -> Option<Affinity> {
-        None
+    fn subquery_affinity(&self, query: TableInternalId, _result_reg: usize) -> Option<Affinity> {
+        self.tables?.scalar_subquery_affinity(query)
     }
 }

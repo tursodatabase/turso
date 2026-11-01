@@ -662,19 +662,68 @@ fn runtime_error_in_explicit_transaction_aborts_it() {
 
 #[test]
 fn commit_of_aborted_transaction_rolls_back() {
-    let (_io, conn) = pg_connection();
+    use std::sync::atomic::Ordering::Relaxed;
+    use turso_core::IO;
+
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "aborted-block.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
     conn.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
-    conn.execute("BEGIN").unwrap();
-    conn.execute("INSERT INTO t VALUES (1)").unwrap();
-    let _err = exec_err(&conn, "SELECT 1/0");
-    conn.execute("COMMIT").unwrap();
-    let mut stmt = conn.prepare("SELECT COUNT(*) FROM t").unwrap();
-    let rows = stmt.run_collect_rows().unwrap();
-    assert_eq!(
-        rows[0][0],
-        Value::from_i64(0),
-        "COMMIT after aborted tx must roll back — no rows should be committed"
-    );
+    let waker = std::task::Waker::from(Arc::new(WakeCounter::default()));
+    for sql in ["COMMIT", "ROLLBACK"] {
+        let mut end = conn.prepare(sql).unwrap();
+        conn.execute("BEGIN; INSERT INTO t VALUES (1)").unwrap();
+        assert_eq!(exec_err(&conn, "SELECT 1/0").sqlstate, "22012");
+        loop {
+            let before = io.steps.load(Relaxed);
+            let result = end.step_with_waker(&waker).unwrap();
+            assert_eq!(
+                io.steps.load(Relaxed),
+                before,
+                "aborted block cleanup pumped I/O"
+            );
+            match result {
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+                    assert_eq!(end.command_tag_override(), None);
+                    io.step().unwrap();
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+        assert_eq!(
+            end.command_tag_override(),
+            (sql == "COMMIT").then_some("ROLLBACK")
+        );
+        assert_eq!(conn.transaction_state(), TransactionState::Idle);
+        assert_eq!(
+            conn.prepare("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()[0][0],
+            Value::from_i64(0)
+        );
+        end.reset().unwrap();
+        conn.execute("BEGIN; INSERT INTO t VALUES (2)").unwrap();
+        drive_prerequisites(&io, &mut end).unwrap();
+        assert_eq!(end.command_tag_override(), None);
+        let count = if sql == "COMMIT" { 1 } else { 0 };
+        assert_eq!(
+            conn.prepare("SELECT COUNT(*) FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()[0][0],
+            Value::from_i64(count)
+        );
+        conn.execute("DELETE FROM t").unwrap();
+    }
 }
 
 #[test]
@@ -888,6 +937,115 @@ fn copy_to_stdout_is_rejected_while_aborted() {
 }
 
 #[test]
+fn copy_text_encoding_returns_one_record_per_row() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use turso_core::IO;
+
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "copy-encoding.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    conn.execute("CREATE TABLE t (b BOOLEAN, n BIGINT, f FLOAT8, s TEXT, a INT[], z TIMESTAMPTZ, ts TIMESTAMP, data BYTEA)").unwrap();
+    conn.execute(r#"INSERT INTO t VALUES
+        (true, -17, 1.25, E'\\N\t\n\r\b\f\013é', ARRAY[2,7], '2026-10-31 12:34:56', '2026-10-31 12:34:56', NULL),
+        (false, 0, 1e100, '', ARRAY[]::INT[], NULL, NULL, NULL),
+        (NULL, NULL, -1e-100, NULL, NULL, NULL, NULL, NULL)"#).unwrap();
+    let mut update = conn
+        .prepare("UPDATE t SET data = $1 WHERE n = -17")
+        .unwrap();
+    update
+        .bind_at(
+            std::num::NonZero::new(1).unwrap(),
+            Value::from_blob(vec![0, 255]),
+        )
+        .unwrap();
+    update.run_ignore_rows().unwrap();
+    conn.inner()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    conn.inner().get_pager().clear_page_cache(false);
+    let mut stmt = conn.prepare("COPY t TO STDOUT").unwrap();
+    let encoder = turso_pg::CopyTextEncoder::new(&stmt);
+    let expected = [
+        "t\t-17\t1.25\t\\\\N\\t\\n\\r\\b\\f\\vé\t{2,7}\t2026-10-31 12:34:56+00\t2026-10-31 12:34:56\t\\\\x00ff\n",
+        "f\t0\t1e100\t\t{}\t\\N\t\\N\t\\N\n",
+        "\\N\t\\N\t-1e-100\t\\N\t\\N\t\\N\t\\N\t\\N\n",
+    ];
+    let mut rows = 0;
+    let mut yields = 0;
+    let mut output = Vec::new();
+    loop {
+        let before = io.steps.load(Relaxed);
+        let result = stmt.step().unwrap();
+        assert_eq!(io.steps.load(Relaxed), before, "COPY pumped I/O");
+        match result {
+            StepResult::Row => {
+                output.clear();
+                encoder.encode_row(stmt.row().unwrap(), &mut output);
+                assert_eq!(output, expected[rows].as_bytes());
+                assert_eq!(io.steps.load(Relaxed), before, "encoding pumped I/O");
+                rows += 1;
+            }
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                yields += 1;
+                io.step().unwrap();
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected COPY result: {other:?}"),
+        }
+    }
+    assert_eq!(rows, expected.len());
+    assert!(yields > 0);
+}
+
+#[test]
+fn embedded_copy_returns_values_in_column_order() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE SCHEMA exports").unwrap();
+    conn.execute("CREATE TABLE exports.items (id INT, name TEXT, enabled BOOLEAN)")
+        .unwrap();
+    conn.execute("SET search_path TO exports").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO items VALUES (7, E'a\tb', true), (19, NULL, false)")
+        .unwrap();
+
+    for sql in [
+        "COPY items (name, enabled, id) TO STDOUT",
+        "COPY exports.items (name, enabled, id) TO STDOUT WITH (FORMAT text)",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![
+                vec![
+                    Value::from_text("a\tb"),
+                    Value::from_i64(1),
+                    Value::from_i64(7)
+                ],
+                vec![Value::Null, Value::from_i64(0), Value::from_i64(19)],
+            ],
+            "{sql}"
+        );
+        assert_eq!(conn.transaction_state(), TransactionState::Active);
+    }
+
+    assert!(conn
+        .prepare("COPY items TO STDOUT WITH (FORMAT csv)")
+        .is_err());
+    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+    let error = conn.prepare("COPY items TO STDOUT").err().unwrap();
+    assert_eq!(error.sqlstate, "25P02");
+    conn.execute("ROLLBACK").unwrap();
+    let mut stmt = conn.prepare("COPY items TO STDOUT").unwrap();
+    assert!(stmt.run_collect_rows().unwrap().is_empty());
+}
+
+#[test]
 fn and_chain_is_rejected_in_every_transaction_state() {
     // PostgreSQL's COMMIT/ROLLBACK AND CHAIN ends the transaction and starts
     // a new one with the same characteristics — on an aborted block too
@@ -940,9 +1098,14 @@ fn preparing_commit_while_aborted_has_no_side_effects() {
 fn failed_commit_returns_the_session_to_idle() {
     // A schema change committed by another connection makes this
     // connection's COMMIT fail with a schema conflict.
-    let (_io, db) =
-        turso_pg::open_database(":memory:", None, OpenFlags::default(), DatabaseOpts::new())
-            .unwrap();
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "failed-commit.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
     let conn = Connection::connect(&db).unwrap();
     let ddl_conn = Connection::connect(&db).unwrap();
     conn.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
@@ -950,7 +1113,8 @@ fn failed_commit_returns_the_session_to_idle() {
     conn.execute("BEGIN").unwrap();
     conn.execute("INSERT INTO t VALUES (2, 0)").unwrap();
     ddl_conn.execute("ALTER TABLE t ADD COLUMN w INT").unwrap();
-    let e = exec_err(&conn, "COMMIT");
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    let e = drive_prerequisites(&io, &mut commit).unwrap_err();
     assert_eq!(e.sqlstate, "40001");
     assert_eq!(
         conn.transaction_state(),
@@ -997,6 +1161,719 @@ fn transaction_rolled_back_by_the_core_still_reports_aborted() {
     conn2.execute("ROLLBACK").unwrap();
     assert_eq!(conn2.transaction_state(), TransactionState::Idle);
     conn1.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn serial_prerequisites_yield_to_the_caller() {
+    use turso_core::{IOResult, IO};
+
+    for method in 0..4 {
+        let io = Arc::new(CountedYieldIO::default());
+        let db = turso_pg::open_database_with_io(
+            io.clone(),
+            "serial-yield.db",
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        let mut stmt = conn
+            .prepare("CREATE TABLE t (a SERIAL, b SERIAL, payload INT)")
+            .unwrap();
+        conn.inner()
+            .set_yield_injector(Some(Arc::new(NthYield::new(4))));
+        let wakes = Arc::new(WakeCounter::default());
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut yields = 0;
+        let mut explicit_yields = 0;
+        loop {
+            let before = io.steps.load(std::sync::atomic::Ordering::Relaxed);
+            let result = match method {
+                0 => stmt.step(),
+                1 => stmt.step_with_waker(&waker),
+                2 | 3 => {
+                    let result = if method == 2 {
+                        stmt.run_ignore_rows_nonblock()
+                    } else {
+                        stmt.run_with_row_callback_nonblock(|_| panic!("DDL returned a row"))
+                    };
+                    result.map(|result| match result {
+                        IOResult::Done(()) => StepResult::Done,
+                        IOResult::IO(completion) => {
+                            assert!(completion.is_explicit_yield() || !completion.finished());
+                            if completion.is_explicit_yield() {
+                                StepResult::Yield
+                            } else {
+                                StepResult::IO
+                            }
+                        }
+                    })
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                io.steps.load(std::sync::atomic::Ordering::Relaxed),
+                before,
+                "method {method} pumped I/O inside the nonblocking call"
+            );
+            let result = result.unwrap();
+            match result {
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    yields += 1;
+                    if method < 2 {
+                        let completion = stmt.io_completions().unwrap();
+                        assert!(completion.is_explicit_yield() || !completion.finished());
+                    }
+                    if matches!(result, StepResult::Yield) {
+                        explicit_yields += 1;
+                    }
+                    let before_wake = wakes.0.load(std::sync::atomic::Ordering::Relaxed);
+                    io.step().unwrap();
+                    if method == 1 && matches!(result, StepResult::IO) {
+                        assert!(wakes.0.load(std::sync::atomic::Ordering::Relaxed) > before_wake);
+                    }
+                }
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+        assert!(yields > 0);
+        assert!(explicit_yields > 0);
+        conn.inner().set_yield_injector(None);
+        assert_eq!(conn.transaction_state(), TransactionState::Idle);
+        conn.execute("INSERT INTO t (payload) VALUES (42)").unwrap();
+        assert_eq!(
+            conn.prepare("SELECT a, b FROM t")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(1), Value::from_i64(1)]]
+        );
+        assert_eq!(
+            conn.prepare("SELECT sequencename FROM pg_sequences ORDER BY sequencename")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![
+                vec![Value::build_text("t_a_seq")],
+                vec![Value::build_text("t_b_seq")]
+            ]
+        );
+    }
+}
+
+#[test]
+fn serial_prerequisites_clean_up_when_abandoned() {
+    use turso_core::IO;
+
+    for action in 0..3 {
+        for pause_at in 1..200 {
+            let io = Arc::new(CountedYieldIO::default());
+            let db = turso_pg::open_database_with_io(
+                io.clone(),
+                "abandoned.db",
+                OpenFlags::default(),
+                DatabaseOpts::new(),
+            )
+            .unwrap();
+            let conn = Connection::connect(&db).unwrap();
+            conn.execute(
+                "CREATE TABLE kept (v INT); BEGIN; INSERT INTO kept VALUES (42); SAVEPOINT user_sp",
+            )
+            .unwrap();
+            let mut stmt = conn.prepare("CREATE TABLE t (a SERIAL, b SERIAL)").unwrap();
+            let injector = Arc::new(NthYield::new(pause_at));
+            conn.inner().set_yield_injector(Some(injector.clone()));
+            let mut paused = false;
+            loop {
+                let before = io.steps.load(std::sync::atomic::Ordering::Relaxed);
+                let result = stmt.step().unwrap();
+                assert_eq!(io.steps.load(std::sync::atomic::Ordering::Relaxed), before);
+                match result {
+                    StepResult::Done => break,
+                    StepResult::Yield
+                        if injector.0.load(std::sync::atomic::Ordering::Relaxed) == 0 =>
+                    {
+                        paused = true;
+                        break;
+                    }
+                    StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                        io.step().unwrap()
+                    }
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            }
+            conn.inner().set_yield_injector(None);
+            if !paused {
+                assert!(pause_at > 1);
+                break;
+            }
+            match action {
+                0 => drop(stmt),
+                1 => {
+                    stmt.reset().unwrap();
+                    drop(stmt);
+                }
+                2 => {
+                    stmt.interrupt();
+                    let error = drive_prerequisites(&io, &mut stmt)
+                        .expect_err(&format!("pause {pause_at}"));
+                    assert_eq!(error.sqlstate, "57014", "pause {pause_at}: {error}");
+                    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+                    conn.execute("ROLLBACK TO SAVEPOINT user_sp").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                conn.transaction_state(),
+                TransactionState::Active,
+                "action {action}, pause {pause_at}"
+            );
+            assert!(
+                conn.prepare("SELECT sequencename FROM pg_sequences")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap()
+                    .is_empty(),
+                "action {action}, pause {pause_at}"
+            );
+            assert!(conn
+                .prepare("SELECT tablename FROM pg_tables WHERE tablename = 't'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .is_empty());
+            conn.execute("COMMIT").unwrap();
+            assert_eq!(
+                conn.prepare("SELECT v FROM kept")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![vec![Value::from_i64(42)]]
+            );
+            assert!(pause_at < 199, "did not exhaust yield points");
+        }
+    }
+
+    for read_completion in [false, true] {
+        for reset in [false, true] {
+            let io = Arc::new(CountedYieldIO::default());
+            let db = turso_pg::open_database_with_io(
+                io.clone(),
+                "pending.db",
+                OpenFlags::default(),
+                DatabaseOpts::new(),
+            )
+            .unwrap();
+            let conn = Connection::connect(&db).unwrap();
+            let mut stmt = conn.prepare("CREATE TABLE t (a SERIAL, b SERIAL)").unwrap();
+            assert!(matches!(stmt.step().unwrap(), StepResult::IO));
+            if read_completion {
+                assert!(!stmt.io_completions().unwrap().finished());
+                assert!(!stmt.io_completions().unwrap().finished());
+            }
+            if reset {
+                stmt.reset().unwrap();
+            }
+            drop(stmt);
+            assert_eq!(conn.transaction_state(), TransactionState::Idle);
+            let tables = conn
+                .prepare("SELECT tablename FROM pg_tables WHERE tablename = 't'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            let sequences = conn
+                .prepare("SELECT sequencename FROM pg_sequences")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(sequences.len(), 2 * tables.len());
+            conn.execute("CREATE TABLE usable (v INT)").unwrap();
+        }
+    }
+}
+
+#[test]
+fn serial_prerequisites_rollback_conflicts_and_reset() {
+    for explicit_tx in [false, true] {
+        let io = Arc::new(CountedYieldIO::default());
+        let db = turso_pg::open_database_with_io(
+            io.clone(),
+            "conflict.db",
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = Connection::connect(&db).unwrap();
+        if explicit_tx {
+            conn.execute("BEGIN; SAVEPOINT user_sp").unwrap();
+        }
+        let mut stmt = conn.prepare("CREATE TABLE t (a SERIAL, b SERIAL)").unwrap();
+        conn.execute("CREATE TABLE t (v INT)").unwrap();
+        conn.inner()
+            .set_yield_injector(Some(Arc::new(NthYield::new(4))));
+        let error = drive_prerequisites(&io, &mut stmt).unwrap_err();
+        conn.inner().set_yield_injector(None);
+        assert_eq!(error.sqlstate, "42P07");
+        if explicit_tx {
+            assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+            conn.execute("ROLLBACK TO SAVEPOINT user_sp").unwrap();
+        } else {
+            assert_eq!(conn.transaction_state(), TransactionState::Idle);
+            conn.execute("DROP TABLE t").unwrap();
+        }
+        assert!(conn
+            .prepare("SELECT sequencename FROM pg_sequences")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
+        stmt.reset().unwrap();
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        let mut noop = conn
+            .prepare("CREATE TABLE IF NOT EXISTS t (extra SERIAL)")
+            .unwrap();
+        drive_prerequisites(&io, &mut noop).unwrap();
+        noop.reset().unwrap();
+        drive_prerequisites(&io, &mut noop).unwrap();
+        assert_eq!(
+            conn.prepare("SELECT sequencename FROM pg_sequences ORDER BY sequencename")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![
+                vec![Value::build_text("t_a_seq")],
+                vec![Value::build_text("t_b_seq")]
+            ]
+        );
+        if explicit_tx {
+            conn.execute("COMMIT").unwrap();
+        }
+    }
+}
+
+#[test]
+fn session_statements_yield_to_the_caller() {
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "session-yield.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    let mut create = conn
+        .prepare("CREATE SCHEMA app CREATE TABLE t (id SERIAL, payload INT UNIQUE)")
+        .unwrap();
+    assert!(conn.inner().qualifier("app").is_none());
+    drive_prerequisites(&io, &mut create).unwrap();
+    let data = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(data.path(), "13\n27\n").unwrap();
+    let mut copy = conn
+        .prepare(format!(
+            "COPY app.t (payload) FROM '{}'",
+            data.path().display()
+        ))
+        .unwrap();
+    drive_prerequisites(&io, &mut copy).unwrap();
+    assert_eq!(copy.n_change(), 2);
+    assert_eq!(
+        conn.prepare("SELECT id, payload FROM app.t ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(13)],
+            vec![Value::from_i64(2), Value::from_i64(27)],
+        ]
+    );
+    copy.reset().unwrap();
+    std::fs::write(data.path(), "41\n27\n").unwrap();
+    assert_eq!(
+        drive_prerequisites(&io, &mut copy).unwrap_err().sqlstate,
+        "23505"
+    );
+    assert_eq!(
+        conn.prepare("SELECT count(*) FROM app.t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(2)]]
+    );
+    copy.reset().unwrap();
+    std::fs::write(data.path(), "").unwrap();
+    drive_prerequisites(&io, &mut copy).unwrap();
+    assert_eq!(copy.n_change(), 0);
+    let mut invalid_copy = conn
+        .prepare(format!(
+            "COPY app.t (missing) FROM '{}'",
+            data.path().display()
+        ))
+        .unwrap();
+    assert!(drive_prerequisites(&io, &mut invalid_copy).is_err());
+    let mut drop_schema = conn.prepare("DROP SCHEMA app CASCADE").unwrap();
+    drive_prerequisites(&io, &mut drop_schema).unwrap();
+    assert!(conn.inner().qualifier("app").is_none());
+    create.reset().unwrap();
+    drive_prerequisites(&io, &mut create).unwrap();
+    let mut failure = conn
+        .prepare("CREATE SCHEMA failed CREATE TABLE t (v INT) CREATE TABLE t (v INT)")
+        .unwrap();
+    assert!(drive_prerequisites(&io, &mut failure).is_err());
+    assert!(conn.inner().qualifier("failed").is_none());
+    assert_eq!(conn.transaction_state(), TransactionState::Idle);
+
+    for sql in ["RESET ALL", "DISCARD ALL"] {
+        conn.execute("SET search_path TO app").unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["app".to_string()]));
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["public".to_string()]));
+        conn.execute("SET search_path TO app").unwrap();
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["app".to_string()]));
+        stmt.reset().unwrap();
+        drive_prerequisites(&io, &mut stmt).unwrap();
+        assert_eq!(conn.inner().search_path(), Some(vec!["public".to_string()]));
+    }
+}
+
+#[test]
+fn session_statements_clean_up_when_abandoned() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use turso_core::IO;
+
+    let data = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(data.path(), "13\n27\n").unwrap();
+    for operation in 0..3 {
+        for action in 0..6 {
+            let mut exhausted = false;
+            for pause_at in 0..200 {
+                let io = Arc::new(CountedYieldIO::default());
+                let db = turso_pg::open_database_with_io(
+                    io.clone(),
+                    "session-abandoned.db",
+                    OpenFlags::default(),
+                    DatabaseOpts::new(),
+                )
+                .unwrap();
+                let conn = Connection::connect(&db).unwrap();
+                conn.inner().set_foreign_keys_enabled(true);
+                conn.execute("SET search_path TO public; CREATE TABLE kept (v INT)")
+                    .unwrap();
+                let create = "CREATE SCHEMA work CREATE TABLE t (id SERIAL PRIMARY KEY, payload INT) CREATE TABLE u (id INT REFERENCES work.t(id))";
+                if operation != 0 {
+                    conn.execute(create).unwrap();
+                }
+                if operation == 1 {
+                    conn.execute("BEGIN; INSERT INTO kept VALUES (42); SAVEPOINT user_sp")
+                        .unwrap();
+                }
+                let sql = match operation {
+                    0 => create.to_string(),
+                    1 => "DROP SCHEMA work CASCADE".to_string(),
+                    2 => format!("COPY work.t (payload) FROM '{}'", data.path().display()),
+                    _ => unreachable!(),
+                };
+                let mut stmt = conn.prepare(sql).unwrap();
+                let injector = Arc::new(NthYield::new(pause_at));
+                conn.inner().set_yield_injector(Some(injector.clone()));
+                let wakes = Arc::new(WakeCounter::default());
+                let waker = std::task::Waker::from(wakes.clone());
+                let mut paused = false;
+                loop {
+                    let before = io.steps.load(Relaxed);
+                    let result = stmt.step_with_waker(&waker).unwrap();
+                    assert_eq!(io.steps.load(Relaxed), before);
+                    assert_eq!(conn.inner().search_path(), Some(vec!["public".to_string()]));
+                    assert!(conn.inner().foreign_keys_enabled());
+                    match result {
+                        StepResult::Done => break,
+                        StepResult::Yield if injector.0.load(Relaxed) == 0 => {
+                            paused = true;
+                            break;
+                        }
+                        StepResult::IO if pause_at == 0 => {
+                            assert!(!stmt.io_completions().unwrap().finished());
+                            assert!(!stmt.io_completions().unwrap().finished());
+                            paused = true;
+                            break;
+                        }
+                        StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                            let before_wake = wakes.0.load(Relaxed);
+                            io.step().unwrap();
+                            if matches!(result, StepResult::IO) {
+                                assert!(wakes.0.load(Relaxed) > before_wake);
+                            }
+                        }
+                        other => panic!("unexpected result: {other:?}"),
+                    }
+                }
+                conn.inner().set_yield_injector(None);
+                if !paused {
+                    if pause_at == 0 {
+                        continue;
+                    }
+                    assert!(pause_at > 1, "operation {operation}, action {action}");
+                    exhausted = true;
+                    break;
+                }
+                match action {
+                    0 => drop(stmt),
+                    1 => {
+                        stmt.reset().unwrap();
+                        drop(stmt);
+                    }
+                    2 => {
+                        stmt.interrupt();
+                        if let Err(error) = drive_prerequisites(&io, &mut stmt) {
+                            assert_eq!(error.sqlstate, "57014");
+                            if operation == 1 {
+                                assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+                                conn.execute("ROLLBACK TO SAVEPOINT user_sp").unwrap();
+                            }
+                        }
+                    }
+                    3 | 4 => {
+                        loop {
+                            let before = io.steps.load(Relaxed);
+                            let result = stmt.cleanup_nonblock().unwrap();
+                            assert_eq!(io.steps.load(Relaxed), before, "cleanup pumped I/O");
+                            assert_eq!(
+                                conn.inner().search_path(),
+                                Some(vec!["public".to_string()])
+                            );
+                            assert!(conn.inner().foreign_keys_enabled());
+                            match result {
+                                turso_core::IOResult::Done(()) => break,
+                                turso_core::IOResult::IO(completion) => {
+                                    completion.set_waker(Some(&waker));
+                                    let pending = !completion.finished();
+                                    let before_wake = wakes.0.load(Relaxed);
+                                    io.step().unwrap();
+                                    if pending {
+                                        assert!(wakes.0.load(Relaxed) > before_wake);
+                                    }
+                                }
+                            }
+                        }
+                        let before = io.steps.load(Relaxed);
+                        if action == 3 {
+                            stmt.reset().unwrap();
+                        }
+                        drop(stmt);
+                        assert_eq!(
+                            io.steps.load(Relaxed),
+                            before,
+                            "reset/drop repeated cleanup I/O"
+                        );
+                    }
+                    5 => {
+                        let before = io.steps.load(Relaxed);
+                        let _ = stmt.cleanup_nonblock().unwrap();
+                        assert_eq!(io.steps.load(Relaxed), before);
+                        drop(stmt);
+                    }
+                    _ => unreachable!(),
+                }
+                if operation == 1 {
+                    assert_eq!(conn.transaction_state(), TransactionState::Active);
+                    conn.execute("COMMIT").unwrap();
+                    assert_eq!(
+                        conn.prepare("SELECT v FROM kept")
+                            .unwrap()
+                            .run_collect_rows()
+                            .unwrap(),
+                        vec![vec![Value::from_i64(42)]]
+                    );
+                }
+                assert_eq!(conn.transaction_state(), TransactionState::Idle);
+                let tables = conn
+                    .prepare("SELECT tablename FROM pg_tables WHERE schemaname = 'work'")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                let sequences = conn
+                    .prepare("SELECT sequencename FROM pg_sequences WHERE schemaname = 'work'")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                assert!(
+                    tables.is_empty() || tables.len() == 2,
+                    "operation {operation}, action {action}, pause {pause_at}: {tables:?}"
+                );
+                assert_eq!(sequences.len() * 2, tables.len());
+                assert_eq!(conn.inner().qualifier("work").is_some(), !tables.is_empty());
+                if operation == 2 {
+                    let rows = conn
+                        .prepare("SELECT payload FROM work.t ORDER BY payload")
+                        .unwrap()
+                        .run_collect_rows()
+                        .unwrap();
+                    assert!(
+                        rows.is_empty()
+                            || rows == vec![vec![Value::from_i64(13)], vec![Value::from_i64(27)]]
+                    );
+                }
+                conn.execute("INSERT INTO kept VALUES (99)").unwrap();
+            }
+            assert!(exhausted, "did not exhaust yield points");
+        }
+    }
+}
+
+#[test]
+fn catalog_checks_do_not_execute_during_prepare() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "catalog-prepare.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    let other = Connection::connect(&db).unwrap();
+    conn.execute("CREATE TABLE t (v INT); CREATE VIEW v AS SELECT v FROM t")
+        .unwrap();
+    other.execute("CREATE SEQUENCE t_v_idx; ALTER TABLE t ADD COLUMN w INT DEFAULT 9; INSERT INTO t (v) VALUES (7)")
+        .unwrap();
+    let spec = turso_pg_parser::copy::parse_copy_to_stdout("COPY t TO STDOUT")
+        .unwrap()
+        .unwrap();
+    conn.inner()
+        .set_yield_injector(Some(Arc::new(NthYield::new(1))));
+    let before = io.steps.load(Relaxed);
+    let mut copy = conn.prepare_copy_to_stdout(&spec).unwrap();
+    assert_eq!(
+        io.steps.load(Relaxed),
+        before,
+        "COPY preparation pumped I/O"
+    );
+    conn.inner().set_yield_injector(None);
+    assert_eq!(
+        copy.run_collect_rows().unwrap(),
+        vec![vec![Value::from_i64(7), Value::from_i64(9)]]
+    );
+    drop(copy);
+    for sql in ["CREATE INDEX ON t (v)", "DROP VIEW v", "DROP VIEW t"] {
+        conn.inner()
+            .set_yield_injector(Some(Arc::new(NthYield::new(1))));
+        let before = io.steps.load(Relaxed);
+        let result = conn.prepare(sql);
+        assert_eq!(io.steps.load(Relaxed), before, "{sql} pumped I/O");
+        conn.inner().set_yield_injector(None);
+        if sql == "DROP VIEW t" {
+            assert_eq!(result.err().unwrap().sqlstate, "42809");
+        } else {
+            drive_prerequisites(&io, &mut result.unwrap()).unwrap();
+        }
+    }
+    assert_eq!(
+        conn.prepare("SELECT indexname FROM pg_indexes WHERE tablename = 't'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::build_text("t_v_idx1")]]
+    );
+}
+
+fn drive_prerequisites(
+    io: &CountedYieldIO,
+    stmt: &mut turso_pg::Statement,
+) -> turso_pg::Result<()> {
+    use turso_core::{IOResult, IO};
+    loop {
+        let before = io.steps.load(std::sync::atomic::Ordering::Relaxed);
+        let result = stmt.run_ignore_rows_nonblock();
+        assert_eq!(
+            io.steps.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "nonblocking execution pumped I/O"
+        );
+        match result? {
+            IOResult::Done(()) => return Ok(()),
+            IOResult::IO(_) => io.step().unwrap(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NthYield(std::sync::atomic::AtomicUsize);
+
+impl NthYield {
+    fn new(n: usize) -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(n))
+    }
+}
+
+impl turso_core::mvcc::yield_points::YieldInjector for NthYield {
+    fn should_yield(
+        &self,
+        _instance: u64,
+        _key: u64,
+        _point: turso_core::mvcc::yield_points::YieldPoint,
+    ) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.0.fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1)) == Ok(1)
+    }
+}
+
+#[derive(Default)]
+struct WakeCounter(std::sync::atomic::AtomicUsize);
+
+impl std::task::Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct CountedYieldIO {
+    inner: turso_core::io::MemoryYieldIO,
+    steps: std::sync::atomic::AtomicUsize,
+}
+
+impl turso_core::Clock for CountedYieldIO {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl turso_core::IO for CountedYieldIO {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        self.inner.open_file(path, flags, direct)
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        self.inner.file_id(path)
+    }
+
+    fn supports_shared_wal_coordination(&self) -> bool {
+        false
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.step()
+    }
 }
 
 fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>) {

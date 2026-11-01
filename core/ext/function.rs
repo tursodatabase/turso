@@ -1,6 +1,8 @@
 use crate::alloc::TryClone;
 use crate::function::{ExtFunc, ExternalFunc};
-use crate::native_ext::{AggregateFunction, ExtensionState, FunctionArity, ScalarFunction};
+use crate::native_ext::{
+    AggregateFunction, ExtensionState, FunctionArity, ScalarCall, ScalarFunction, ScalarReturn,
+};
 use crate::sync::Arc;
 use crate::types::{AggContext, ExternalAggState, IOResultOr};
 use crate::{Connection, IOResult, OpenOptions, Register, Result, Value};
@@ -27,6 +29,7 @@ impl ExternalFunc {
             func: ExtFunc::NativeScalar {
                 arity,
                 deterministic,
+                return_type: <<F::Call as ScalarCall>::Output as ScalarReturn>::TYPE,
                 function: Arc::new(function),
             },
         })

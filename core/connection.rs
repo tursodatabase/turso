@@ -813,7 +813,7 @@ impl Connection {
     }
 
     /// Returns true once the per-connection temp database has been created.
-    pub(crate) fn has_temp_database(&self) -> bool {
+    pub fn has_temp_database(&self) -> bool {
         self.temp.database.read().is_some()
     }
 
@@ -3246,7 +3246,7 @@ impl Connection {
     }
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
-    pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
+    pub fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
         self.current_qualifiers()
             .database_id(&crate::util::normalize_ident(name))
             .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}")))
@@ -3443,7 +3443,7 @@ impl Connection {
     /// Prepares CREATE SCHEMA or DROP SCHEMA. No dialect parses their text, so
     /// preparing the statement again, after another connection changes the
     /// schema, translates the statement itself.
-    fn prepare_namespace_stmt(
+    pub fn prepare_namespace_stmt(
         self: &Arc<Self>,
         statement: turso_parser::ast::Stmt,
     ) -> Result<Statement> {
@@ -3490,7 +3490,7 @@ impl Connection {
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning
-    pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
+    pub fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
             crate::MAIN_DB_ID => {
                 let schema = self.schema.read();

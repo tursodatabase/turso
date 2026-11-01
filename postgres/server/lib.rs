@@ -269,19 +269,20 @@ where
         .run_one_step_blocking(|| Ok(()), || Ok(()))
         .map_err(pg_error)?
         .is_some();
-    let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-    let column_count = i16::try_from(fields.len())
+    let encoder = turso_pg::CopyTextEncoder::new(&stmt);
+    let column_count = i16::try_from(stmt.num_columns())
         .map_err(|error| PgWireError::UserError(Box::new(error_info(&error.to_string()))))?;
     client
         .send(PgWireBackendMessage::CopyOutResponse(CopyOutResponse::new(
             0,
             column_count,
-            vec![0; fields.len()],
+            vec![0; stmt.num_columns()],
         )))
         .await?;
     let mut row_count = 0;
     while has_row {
-        let data = encode_copy_row(stmt.row().expect("COPY row is present"), fields.clone())?;
+        let mut data = Vec::new();
+        encoder.encode_row(stmt.row().expect("COPY row is present"), &mut data);
         client
             .send(PgWireBackendMessage::CopyData(CopyData::new(data.into())))
             .await?;
@@ -295,46 +296,6 @@ where
         .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
         .await?;
     send_execution_response(client, Tag::new("COPY").with_rows(row_count)).await
-}
-
-fn encode_copy_row(row: &turso_core::Row, fields: Arc<Vec<FieldInfo>>) -> PgWireResult<Vec<u8>> {
-    assert_eq!(row.len(), fields.len());
-    let mut encoder = DataRowEncoder::new(fields.clone());
-    for (value, field) in row.get_values().zip(fields.iter()) {
-        encode_value(&mut encoder, value, field.datatype())
-            .map_err(|error| PgWireError::UserError(Box::new(error_info(&error.to_string()))))?;
-    }
-    let row = encoder.finish()?;
-    let mut values = row.data.as_ref();
-    let mut output = Vec::new();
-    for index in 0..fields.len() {
-        if index > 0 {
-            output.push(b'\t');
-        }
-        let (length, remaining) = values.split_at(4);
-        let length = i32::from_be_bytes(length.try_into().unwrap());
-        values = remaining;
-        if length == -1 {
-            output.extend_from_slice(b"\\N");
-            continue;
-        }
-        assert!(length >= 0);
-        for byte in &values[..length as usize] {
-            match byte {
-                b'\\' => output.extend_from_slice(b"\\\\"),
-                b'\t' => output.extend_from_slice(b"\\t"),
-                b'\n' => output.extend_from_slice(b"\\n"),
-                b'\r' => output.extend_from_slice(b"\\r"),
-                8 => output.extend_from_slice(b"\\b"),
-                12 => output.extend_from_slice(b"\\f"),
-                11 => output.extend_from_slice(b"\\v"),
-                byte => output.push(*byte),
-            }
-        }
-        values = &values[length as usize..];
-    }
-    output.push(b'\n');
-    Ok(output)
 }
 
 #[async_trait]
@@ -1314,6 +1275,40 @@ mod tests {
             let fields = build_field_info(&stmt, &Format::UnifiedText);
             assert_eq!(*fields[0].datatype(), Type::INT4, "{sql}");
         }
+    }
+
+    #[test]
+    fn test_functions_that_return_a_custom_type_are_described_as_that_type() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute("SELECT set_config('request.jwt.claim.sub', '11111111-2222-3333-4444-555555555555', false)")
+            .unwrap();
+        for (sql, expected_type) in [
+            ("SELECT booleq(true, true)", Type::BOOL),
+            ("SELECT now()", Type::TIMESTAMPTZ),
+            ("SELECT auth.uid()", Type::UUID),
+            ("SELECT CAST(1 AS timestamptz)", Type::TIMESTAMPTZ),
+            ("SELECT random()", Type::FLOAT8),
+            ("SELECT random() * 10", Type::FLOAT8),
+        ] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+            assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
+            let _ = stmt.run_collect_rows().unwrap();
+        }
+
+        let mut stmt = conn.prepare("SELECT booleq(true, true)").unwrap();
+        let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+        let rows = stmt.run_collect_rows().unwrap();
+        let mut encoder = DataRowEncoder::new(fields.clone());
+        encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+        assert_eq!(&encoder.finish().unwrap().data[..], b"\0\0\0\x01t");
     }
 
     #[test]

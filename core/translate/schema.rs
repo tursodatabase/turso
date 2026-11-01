@@ -3,7 +3,7 @@ use crate::HashMap;
 use crate::LimboError;
 
 use crate::ext::VTabImpl;
-use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
+use crate::function::{Deterministic, Func, MathFunc, ReturnType, ScalarFunc};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
@@ -398,7 +398,7 @@ fn resolve_check_expr_type(
     }
 }
 
-/// Resolve the return type of a built-in function for CHECK constraint type checking.
+/// Resolve the return type of a function for CHECK constraint type checking.
 fn resolve_func_return_type(
     func: &Func,
     name: &str,
@@ -406,12 +406,36 @@ fn resolve_func_return_type(
     columns: &[&ast::ColumnDefinition],
     resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
+    if let Func::Agg(_) = func {
+        bail_parse_error!("misuse of aggregate function {}()", name);
+    }
+    match func.return_type() {
+        Some(ReturnType::Integer) => return Ok(CheckExprType::Integer),
+        Some(ReturnType::Real) => return Ok(CheckExprType::Real),
+        Some(ReturnType::Text) => return Ok(CheckExprType::Text),
+        Some(ReturnType::Blob) => return Ok(CheckExprType::Blob),
+        Some(ReturnType::Custom(type_name)) => {
+            reject_value_unlike_stored_columns(name, type_name, resolver)?;
+            return resolve_type_name(type_name, resolver);
+        }
+        Some(ReturnType::Array) => return Ok(CheckExprType::Any),
+        None => {}
+    }
     match func {
         Func::Scalar(sf) => resolve_scalar_func_return_type(sf, args, columns, resolver),
-        Func::Math(mf) => resolve_math_func_return_type(mf),
-        #[cfg(feature = "json")]
-        Func::Json(jf) => resolve_json_func_return_type(jf),
-        Func::Agg(_) => bail_parse_error!("misuse of aggregate function {}()", name),
+        // ceil, floor and trunc give an integer for an integer and a real for
+        // a real. A text argument is first converted to a number, which may
+        // be either. SQLite's other math functions return a real.
+        Func::Math(MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc) => {
+            match args.first() {
+                Some(arg) => Ok(match resolve_check_expr_type(arg, columns, resolver)? {
+                    ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null) => ty,
+                    _ => CheckExprType::Any,
+                }),
+                None => Ok(CheckExprType::Any),
+            }
+        }
+        Func::Math(_) => Ok(CheckExprType::Real),
         Func::External(_) => {
             bail_parse_error!(
                 "cannot determine return type of function {}() in CHECK constraint; \
@@ -424,7 +448,31 @@ fn resolve_func_return_type(
     }
 }
 
-/// Resolve the return type of a scalar function.
+/// A function that returns a value of a custom type returns it as a column
+/// read gives it, after DECODE, but a CHECK constraint sees the columns as they
+/// are stored. For a type whose DECODE changes the value, such as `uuid`
+/// stored as a blob and read as text, comparing the function's value with a
+/// column would never find them equal, so the CHECK constraint is refused.
+fn reject_value_unlike_stored_columns(
+    name: &str,
+    type_name: &str,
+    resolver: &CatalogContext,
+) -> Result<()> {
+    if let Some(resolved) = resolver.schema().resolve_type_unchecked(type_name)? {
+        if !resolved.is_domain() && !resolved.reads_stored_values_unchanged() {
+            bail_parse_error!(
+                "cannot compare {}() in a CHECK constraint: it returns {} values in a \
+                 different form than they are stored",
+                name,
+                type_name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the return type of a scalar function that declares none, because
+/// its type depends on its arguments.
 fn resolve_scalar_func_return_type(
     func: &ScalarFunc,
     args: &[Box<ast::Expr>],
@@ -432,66 +480,27 @@ fn resolve_scalar_func_return_type(
     resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
     match func {
-        // Functions that always return INTEGER
-        ScalarFunc::Length
-        | ScalarFunc::OctetLength
-        | ScalarFunc::Instr
-        | ScalarFunc::Unicode
-        | ScalarFunc::Sign
-        | ScalarFunc::Random
-        | ScalarFunc::Changes
-        | ScalarFunc::TotalChanges
-        | ScalarFunc::LastInsertRowid
-        | ScalarFunc::Glob
-        | ScalarFunc::Like
-        | ScalarFunc::Likely
-        | ScalarFunc::Unlikely
-        | ScalarFunc::Likelihood
-        | ScalarFunc::BooleanToInt
-        | ScalarFunc::IntToBoolean
-        | ScalarFunc::IsAutocommit
-        | ScalarFunc::ConnTxnId
-        | ScalarFunc::ValidateIpAddr
-        | ScalarFunc::GetByte
-        | ScalarFunc::UnixEpoch => Ok(CheckExprType::Integer),
-
-        // Functions that always return TEXT
-        ScalarFunc::Upper
-        | ScalarFunc::Lower
-        | ScalarFunc::Trim
-        | ScalarFunc::LTrim
-        | ScalarFunc::RTrim
-        | ScalarFunc::Hex
-        | ScalarFunc::Soundex
-        | ScalarFunc::Quote
-        | ScalarFunc::Replace
-        | ScalarFunc::Substr
-        | ScalarFunc::Substring
-        | ScalarFunc::Char
-        | ScalarFunc::Concat
-        | ScalarFunc::ConcatWs
-        | ScalarFunc::Typeof
-        | ScalarFunc::SqliteVersion
-        | ScalarFunc::TursoVersion
-        | ScalarFunc::SqliteSourceId
-        | ScalarFunc::Date
-        | ScalarFunc::Time
-        | ScalarFunc::DateTime
-        | ScalarFunc::StrfTime
-        | ScalarFunc::TimeDiff
-        | ScalarFunc::Printf
-        | ScalarFunc::StringReverse => Ok(CheckExprType::Text),
-
-        // Functions that always return REAL
-        ScalarFunc::Round | ScalarFunc::JulianDay => Ok(CheckExprType::Real),
-
-        // Functions that always return BLOB
-        ScalarFunc::RandomBlob | ScalarFunc::ZeroBlob | ScalarFunc::Unhex | ScalarFunc::SetByte => {
-            Ok(CheckExprType::Blob)
+        // substr returns a blob for a blob and text for a number or text.
+        ScalarFunc::Substr | ScalarFunc::Substring => {
+            let Some(arg) = args.first() else {
+                return Ok(CheckExprType::Any);
+            };
+            Ok(match resolve_check_expr_type(arg, columns, resolver)? {
+                ty @ (CheckExprType::Blob | CheckExprType::Any | CheckExprType::Null) => ty,
+                // The stored value of a custom type may be a blob.
+                CheckExprType::CustomType(_) => CheckExprType::Any,
+                CheckExprType::Integer | CheckExprType::Real | CheckExprType::Text => {
+                    CheckExprType::Text
+                }
+            })
         }
 
-        // Functions whose return type depends on arguments
-        ScalarFunc::Abs | ScalarFunc::Nullif => {
+        // The type of the first argument: likely(x) is x.
+        ScalarFunc::Abs
+        | ScalarFunc::Nullif
+        | ScalarFunc::Likely
+        | ScalarFunc::Unlikely
+        | ScalarFunc::Likelihood => {
             if let Some(arg) = args.first() {
                 resolve_check_expr_type(arg, columns, resolver)
             } else {
@@ -508,6 +517,9 @@ fn resolve_scalar_func_return_type(
             }
             Ok(CheckExprType::Null)
         }
+
+        // SQLite's round() always returns a real.
+        ScalarFunc::Round => Ok(CheckExprType::Real),
 
         ScalarFunc::Min | ScalarFunc::Max => {
             if let Some(first) = args.first() {
@@ -526,74 +538,7 @@ fn resolve_scalar_func_return_type(
             }
         }
 
-        // Internal/custom type functions
-        ScalarFunc::TestUintEncode
-        | ScalarFunc::TestUintDecode
-        | ScalarFunc::NumericEncode
-        | ScalarFunc::NumericFit
-        | ScalarFunc::NumericDecode
-        | ScalarFunc::NumericAdd
-        | ScalarFunc::NumericSub
-        | ScalarFunc::NumericMul
-        | ScalarFunc::NumericDiv
-        | ScalarFunc::NumericMod
-        | ScalarFunc::NumericNeg => Ok(CheckExprType::Blob),
-
-        // Remaining functions — treat as ANY
         _ => Ok(CheckExprType::Any),
-    }
-}
-
-/// Resolve the return type of a math function.
-fn resolve_math_func_return_type(func: &MathFunc) -> Result<CheckExprType> {
-    match func {
-        // Floor/ceil/trunc return INTEGER for integer inputs, but always produce numeric results
-        MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc => {
-            Ok(CheckExprType::Integer)
-        }
-        // All other math functions return REAL
-        _ => Ok(CheckExprType::Real),
-    }
-}
-
-/// Resolve the return type of a JSON function.
-#[cfg(feature = "json")]
-fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<CheckExprType> {
-    use crate::function::JsonFunc;
-    match func {
-        // Functions that return TEXT (JSON text)
-        JsonFunc::Json
-        | JsonFunc::JsonArray
-        | JsonFunc::JsonObject
-        | JsonFunc::JsonPatch
-        | JsonFunc::JsonRemove
-        | JsonFunc::JsonReplace
-        | JsonFunc::JsonInsert
-        | JsonFunc::JsonSet
-        | JsonFunc::JsonPretty
-        | JsonFunc::JsonQuote
-        | JsonFunc::JsonType => Ok(CheckExprType::Text),
-
-        // Functions that return BLOB (JSONB binary)
-        JsonFunc::Jsonb
-        | JsonFunc::JsonbArray
-        | JsonFunc::JsonbObject
-        | JsonFunc::JsonbPatch
-        | JsonFunc::JsonbRemove
-        | JsonFunc::JsonbReplace
-        | JsonFunc::JsonbInsert
-        | JsonFunc::JsonbSet => Ok(CheckExprType::Blob),
-
-        // Functions that return INTEGER
-        JsonFunc::JsonArrayLength | JsonFunc::JsonErrorPosition | JsonFunc::JsonValid => {
-            Ok(CheckExprType::Integer)
-        }
-
-        // Extract functions can return any type
-        JsonFunc::JsonExtract
-        | JsonFunc::JsonbExtract
-        | JsonFunc::JsonArrowExtract
-        | JsonFunc::JsonArrowShiftExtract => Ok(CheckExprType::Any),
     }
 }
 
@@ -748,6 +693,7 @@ fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
     resolver: &CatalogContext,
+    is_nested: bool,
 ) -> Result<()> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
         options,
@@ -887,33 +833,40 @@ fn validate(
             }
         }
 
-        let table = create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
-        if !table.has_rowid {
-            if table.has_autoincrement {
-                bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
+        // Rules for new tables only: VACUUM creates the tables the database
+        // already has as nested statements, and those may break these rules.
+        if !is_nested {
+            let mut table =
+                create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
+            if !table.has_rowid {
+                if table.has_autoincrement {
+                    bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
+                }
+                if table.primary_key_columns.is_empty() {
+                    bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
+                }
+                if table.unique_sets.iter().any(|us| !us.is_primary_key) {
+                    bail_parse_error!(
+                        "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
+                    );
+                }
+            } else if table.has_autoincrement {
+                // SQLite allows AUTOINCREMENT only on a key declared exactly as
+                // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size
+                // such as INTEGER(8) and an inline DESC are not. This is checked
+                // here rather than in `create_table` so that databases where older
+                // Turso versions stored such tables still open.
+                let (pk_name, pk_order) = &table.primary_key_columns[0];
+                let is_integer_primary_key = table.get_column(pk_name).is_some_and(|(_, col)| {
+                    col.ty_str.eq_ignore_ascii_case("INTEGER") && col.ty_params.is_empty()
+                }) && !(table.primary_key_is_inline
+                    && *pk_order == ast::SortOrder::Desc);
+                if !is_integer_primary_key {
+                    bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+                }
             }
-            if table.primary_key_columns.is_empty() {
-                bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
-            }
-            if table.unique_sets.iter().any(|us| !us.is_primary_key) {
-                bail_parse_error!(
-                    "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
-                );
-            }
-        } else if table.has_autoincrement {
-            // SQLite allows AUTOINCREMENT only on a key declared exactly as
-            // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size
-            // such as INTEGER(8) and an inline DESC are not. This is checked
-            // here rather than in `create_table` so that databases where older
-            // Turso versions stored such tables still open.
-            let (pk_name, pk_order) = &table.primary_key_columns[0];
-            let is_integer_primary_key = table.get_column(pk_name).is_some_and(|(_, col)| {
-                col.ty_str.eq_ignore_ascii_case("INTEGER") && col.ty_params.is_empty()
-            }) && !(table.primary_key_is_inline
-                && *pk_order == ast::SortOrder::Desc);
-            if !is_integer_primary_key {
-                bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
-            }
+            table.resolve_custom_types(resolver.schema());
+            table.check_collates_are_allowed()?;
         }
     }
     Ok(())
@@ -1277,7 +1230,12 @@ pub fn translate_create_table(
 
     // Like SQLite, the body is only checked when the table is really created,
     // so IF NOT EXISTS on an existing table succeeds whatever the body says.
-    validate(&body, &normalized_tbl_name, &resolver.catalog)?;
+    validate(
+        &body,
+        &normalized_tbl_name,
+        &resolver.catalog,
+        connection.is_nested_stmt(),
+    )?;
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
 
@@ -2748,7 +2706,7 @@ pub fn translate_drop_table(
             lhs: seq_table_name_reg,
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
-            flags: CmpInsFlags::default(),
+            flags: CmpInsFlags::default().jump_if_null(),
             collation: CollationSeq::NOCASE,
         });
 

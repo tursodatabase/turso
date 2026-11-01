@@ -3,14 +3,18 @@ use std::borrow::Cow;
 use std::num::NonZero;
 use std::str;
 use std::sync::Arc;
+use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
-use crate::functions::{find_parameter, ConfigParameter, Parameter};
-use crate::settings::{ConnectionSettings, PgSessionState, SettingScope};
+use crate::settings::{
+    find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SettingScope,
+};
 use crate::statement::{PgTxState, PostRunFn, TxRole};
-use turso_core::schema::{Table, SEQ_BACKING_TABLE_PREFIX};
-use turso_core::{Connection, LimboError, Qualifier, Result, Statement, Value};
+use turso_core::schema::Table;
+use turso_core::{
+    Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
+};
 use turso_parser::ast::{self};
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
@@ -20,10 +24,10 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
-    execution_takes_snapshot, is_drop_matview, is_tx_exit_stmt, session_stmt,
+    execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
-    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo, PgSetValue,
-    PgShowStmt, PostgreSQLTranslator, SessionStmt,
+    FrontendStmt, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo,
+    PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 use turso_pg_parser::ParseError;
 
@@ -374,7 +378,7 @@ fn prepare_statement_inner(
     // query, for every kind of statement this function returns.
     let marks_query_start = execution_takes_snapshot(&parse_result);
 
-    if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
+    if let Some(stmt) = try_prepare_special(pg_conn, sql, &parse_result)? {
         return Ok(stmt
             .with_tx_tracking(
                 Arc::clone(&pg_conn.conn),
@@ -447,14 +451,16 @@ fn prepare_statement_inner(
         .conn
         .prepare_translated_cmd(cmd.clone(), &sql)
         .map_err(schema_error)?;
-    let pg_conn = Arc::clone(pg_conn);
-    let prereqs = translated.prereqs;
-    let sql_owned = sql.into_owned();
     Ok(crate::Statement::with_deferred(
         inner,
-        Box::new(move |inner| {
-            execute_cmd_with_prereqs(&pg_conn, &prereqs, &cmd, &sql_owned, inner)
-        }),
+        DeferredExecution::new(
+            pg_conn,
+            DeferredOperation::Translated {
+                prereqs: translated.prereqs,
+                cmd: Box::new(cmd),
+                sql: sql.into_owned(),
+            },
+        ),
     )
     .with_tx_tracking(conn, tx, role)
     .with_query_start_marking(marks_query_start)
@@ -559,65 +565,715 @@ fn tx_role(stmt: &ast::Stmt) -> TxRole {
 
 const PG_STMT_SAVEPOINT: &str = "__turso_pg_stmt";
 
-fn execute_cmd_with_prereqs(
-    pg_conn: &Arc<PgConnectionInner>,
-    prereqs: &[ast::Stmt],
-    cmd: &ast::Cmd,
-    sql: &str,
-    inner: &mut Statement,
-) -> Result<()> {
-    let conn = &pg_conn.conn;
-    if create_table_if_not_exists_target_present(conn, cmd)? {
-        *inner = conn
-            .prepare_translated_cmd(cmd.clone(), sql)
-            .map_err(schema_error)?;
-        return inner.run_ignore_rows();
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeferredPhase {
+    Start,
+    Inspect,
+    Savepoint,
+    Execute,
+    Release,
+    Rollback,
+    RollbackRelease,
+    Done,
+}
+
+enum DeferredOperation {
+    Translated {
+        prereqs: Vec<ast::Stmt>,
+        cmd: Box<ast::Cmd>,
+        sql: String,
+    },
+    Frontend(FrontendStmt),
+}
+
+enum DeferredCommand {
+    Translated(ast::Cmd, String),
+    Namespace(ast::Stmt),
+    Postgres(String),
+    Sqlite(String),
+}
+
+struct DeferredStatement {
+    command: DeferredCommand,
+    context: CommandContext,
+}
+
+enum CommandContext {
+    Default,
+    SchemaElement { schema: String },
+    DropSchema,
+}
+
+enum DeferredWork {
+    Prerequisites(PrerequisiteState),
+    Commands(CommandSequence),
+    Copy(CopyState),
+}
+
+struct PrerequisiteState {
+    commands: CommandSequence,
+    target_exists: bool,
+}
+
+struct CommandSequence {
+    statements: Vec<DeferredStatement>,
+    index: usize,
+}
+
+struct CopyState {
+    stmt: PgCopyFromStmt,
+    columns: usize,
+    rows: Vec<Vec<Option<String>>>,
+    sql: String,
+    index: usize,
+}
+
+pub(crate) struct DeferredExecution {
+    pg_conn: Arc<PgConnectionInner>,
+    operation: DeferredOperation,
+    work: Option<DeferredWork>,
+    phase: DeferredPhase,
+    active: Option<crate::Statement>,
+    pub(crate) io_completions: Option<turso_core::types::IOCompletions>,
+    cleaning_up: bool,
+    pub(crate) was_in_tx: Option<bool>,
+    savepoint_open: bool,
+    error: Option<LimboError>,
+    pub(crate) interrupted: bool,
+}
+
+impl DeferredExecution {
+    fn new(pg_conn: &Arc<PgConnectionInner>, operation: DeferredOperation) -> Self {
+        Self {
+            pg_conn: Arc::clone(pg_conn),
+            operation,
+            work: None,
+            phase: DeferredPhase::Start,
+            active: None,
+            io_completions: None,
+            cleaning_up: false,
+            was_in_tx: None,
+            savepoint_open: false,
+            error: None,
+            interrupted: false,
+        }
     }
 
-    let started_in_autocommit = conn.get_auto_commit();
-    let begin_sp = format!("SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-    let release_sp = format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-    execute_sqlite(conn, begin_sp)?;
-    let result = (|| {
-        for prereq in prereqs {
-            let input = prereq.to_string();
-            let mut stmt = conn
-                .prepare_translated_stmt(prereq.clone(), &input)
-                .map_err(schema_error)?;
-            stmt.run_ignore_rows()?;
-        }
-        *inner = conn
-            .prepare_translated_cmd(cmd.clone(), sql)
-            .map_err(schema_error)?;
-        inner.run_ignore_rows()
-    })();
-
-    match result {
-        Ok(()) => execute_sqlite(conn, release_sp),
-        Err(err) => {
-            if started_in_autocommit {
-                let _ = execute_sqlite(conn, "ROLLBACK");
-            } else {
-                let rollback_sp = format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\"");
-                let _ = execute_sqlite(conn, rollback_sp);
-                let _ = execute_sqlite(conn, release_sp);
+    pub(crate) fn step(
+        &mut self,
+        inner: &mut Statement,
+        waker: Option<&Waker>,
+    ) -> Result<StepResult> {
+        assert!(
+            !self.cleaning_up,
+            "deferred cleanup must finish before execution"
+        );
+        self.io_completions = None;
+        loop {
+            if self.phase == DeferredPhase::Done {
+                return self.error.clone().map_or(Ok(StepResult::Done), Err);
             }
-            Err(err)
+            match self.run_phase(inner) {
+                Ok(IOResult::Done(())) => continue,
+                Ok(IOResult::IO(io)) => {
+                    io.set_waker(waker);
+                    let result = if io.is_explicit_yield() {
+                        StepResult::Yield
+                    } else {
+                        StepResult::IO
+                    };
+                    self.io_completions = Some(io);
+                    return Ok(result);
+                }
+                Err(error) => self.fail(error),
+            }
+        }
+    }
+
+    fn run_phase(&mut self, inner: &mut Statement) -> Result<IOResult<()>> {
+        use DeferredPhase::*;
+
+        let context = match self.phase {
+            Start => {
+                self.start()?;
+                return Ok(IOResult::Done(()));
+            }
+            Execute => self.work.as_ref().unwrap().context(),
+            Inspect | Savepoint | Release | Rollback | RollbackRelease => &CommandContext::Default,
+            Done => unreachable!(),
+        };
+        let conn = Arc::clone(&self.pg_conn.conn);
+        match context {
+            CommandContext::Default => self.run_phase_inner(inner),
+            CommandContext::SchemaElement { schema } => {
+                let setting = search_path_setting(&conn);
+                let mut path = turso_pg_parser::quote_identifier(schema);
+                let rest = setting.as_deref().unwrap_or(DEFAULT_SEARCH_PATH).trim();
+                if !rest.is_empty() {
+                    path = format!("{path}, {rest}");
+                }
+                set_search_path(&conn, Some(&path), SettingScope::Session)?;
+                let result = self.run_phase_inner(inner);
+                set_search_path(&conn, setting.as_deref(), SettingScope::Session)?;
+                result
+            }
+            CommandContext::DropSchema => {
+                let foreign_keys_enabled = conn.foreign_keys_enabled();
+                if foreign_keys_enabled {
+                    conn.set_foreign_keys_enabled(false);
+                }
+                let result = self.run_phase_inner(inner);
+                if foreign_keys_enabled {
+                    conn.set_foreign_keys_enabled(true);
+                }
+                result
+            }
+        }
+    }
+
+    fn run_phase_inner(&mut self, inner: &mut Statement) -> Result<IOResult<()>> {
+        use DeferredPhase::*;
+
+        match self.phase {
+            Inspect => {}
+            Savepoint | Execute | Release | Rollback | RollbackRelease => {
+                if self.active.is_none() {
+                    self.prepare_active()?;
+                }
+            }
+            Start | Done => unreachable!(),
+        }
+        let Some(active) = self.active.as_mut() else {
+            return Ok(IOResult::Done(()));
+        };
+        match self.phase {
+            Rollback | RollbackRelease => active.set_query_timeout_override(Some(None)),
+            _ if self.interrupted => active.interrupt(),
+            _ => {}
+        }
+        let result = match self.phase {
+            Inspect => self.work.as_mut().unwrap().inspect_nonblock(active),
+            Savepoint | Execute | Release | Rollback | RollbackRelease => {
+                active.run_ignore_rows_nonblock()
+            }
+            Start | Done => unreachable!(),
+        }
+        .map_err(crate::Error::into_core_error)?;
+        match result {
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            IOResult::Done(()) => {}
+        }
+        match self.phase {
+            Savepoint if self.interrupted => {
+                self.savepoint_open = true;
+                return Err(LimboError::Interrupt);
+            }
+            Inspect | Execute if self.interrupted => {
+                return Err(LimboError::Interrupt);
+            }
+            _ => {}
+        }
+        self.finish_phase(inner)?;
+        Ok(IOResult::Done(()))
+    }
+
+    fn prepare_active(&mut self) -> Result<()> {
+        use DeferredPhase::*;
+
+        let conn = &self.pg_conn.conn;
+        let sql = self.phase_sql();
+        self.active = match self.phase {
+            Execute => {
+                let active = self
+                    .work
+                    .as_ref()
+                    .unwrap()
+                    .prepare_active(&self.pg_conn, &sql)?;
+                if active.is_none() {
+                    self.phase = Release;
+                }
+                active
+            }
+            Savepoint | Release | Rollback | RollbackRelease => {
+                Some(crate::Statement::new(conn.prepare_sqlite(&sql)?))
+            }
+            Start | Inspect | Done => unreachable!(),
+        };
+        Ok(())
+    }
+
+    fn finish_phase(&mut self, inner: &mut Statement) -> Result<()> {
+        use DeferredPhase::*;
+
+        self.phase = match self.phase {
+            Inspect => {
+                self.active = None;
+                let needs_savepoint = self
+                    .work
+                    .as_mut()
+                    .unwrap()
+                    .finish_inspection(self.was_in_tx.unwrap())?;
+                if needs_savepoint {
+                    Savepoint
+                } else {
+                    Execute
+                }
+            }
+            Savepoint => {
+                self.active = None;
+                self.savepoint_open = true;
+                Execute
+            }
+            Execute => {
+                let done = self
+                    .work
+                    .as_mut()
+                    .unwrap()
+                    .finish_statement(&mut self.active, inner)?;
+                if !done {
+                    return Ok(());
+                }
+                if self.savepoint_open {
+                    Release
+                } else {
+                    Done
+                }
+            }
+            Rollback if self.was_in_tx == Some(true) => {
+                self.active = None;
+                RollbackRelease
+            }
+            Release | Rollback | RollbackRelease => {
+                self.active = None;
+                self.savepoint_open = false;
+                if self.phase == Release {
+                    self.work.as_ref().unwrap().complete(inner);
+                }
+                Done
+            }
+            Start | Done => unreachable!(),
+        };
+        Ok(())
+    }
+
+    fn start(&mut self) -> Result<()> {
+        let conn = &self.pg_conn.conn;
+        self.was_in_tx = Some(!conn.get_auto_commit());
+        if self.interrupted {
+            return Err(LimboError::Interrupt);
+        }
+        self.work = self.operation.start(conn, &mut self.active)?;
+        self.phase = match &self.work {
+            None => DeferredPhase::Done,
+            Some(_) if self.active.is_some() => DeferredPhase::Inspect,
+            Some(_) => DeferredPhase::Savepoint,
+        };
+        Ok(())
+    }
+
+    fn phase_sql(&self) -> Cow<'_, str> {
+        use DeferredPhase::*;
+
+        match self.phase {
+            Savepoint => format!("SAVEPOINT \"{PG_STMT_SAVEPOINT}\"").into(),
+            Execute => self.work.as_ref().unwrap().sql(),
+            Release | RollbackRelease => {
+                format!("RELEASE SAVEPOINT \"{PG_STMT_SAVEPOINT}\"").into()
+            }
+            Rollback if self.was_in_tx == Some(true) => {
+                format!("ROLLBACK TO SAVEPOINT \"{PG_STMT_SAVEPOINT}\"").into()
+            }
+            Rollback => Cow::Borrowed("ROLLBACK"),
+            Start | Inspect | Done => unreachable!(),
+        }
+    }
+
+    fn fail(&mut self, error: LimboError) {
+        let cleaning_up = matches!(
+            self.phase,
+            DeferredPhase::Rollback | DeferredPhase::RollbackRelease
+        );
+        self.active = None;
+        self.error = Some(error);
+        if self.pg_conn.conn.get_auto_commit() {
+            self.savepoint_open = false;
+        }
+        self.phase = if self.savepoint_open && !cleaning_up {
+            DeferredPhase::Rollback
+        } else {
+            if self.savepoint_open {
+                self.pg_conn.tx.abort();
+            }
+            DeferredPhase::Done
+        };
+    }
+
+    pub(crate) fn reset(&mut self) -> Result<()> {
+        loop {
+            match self.cleanup_nonblock()? {
+                IOResult::Done(()) => return Ok(()),
+                IOResult::IO(io) => {
+                    io.wait(self.active.as_ref().unwrap()._io())?;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn cleanup_nonblock(&mut self) -> Result<IOResult<()>> {
+        if !self.cleaning_up {
+            if let Some(io) = &self.io_completions {
+                if !io.0.is_wait() && !io.finished() {
+                    return Ok(IOResult::IO(turso_core::types::IOCompletions(io.0.clone())));
+                }
+            }
+            let mut cleanup_error = self
+                .io_completions
+                .as_ref()
+                .and_then(|io| io.get_error())
+                .map(Into::into);
+            if let Some(active) = self.active.as_mut() {
+                match active.cleanup_nonblock() {
+                    Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                    Ok(IOResult::Done(())) => {}
+                    Err(error) => {
+                        cleanup_error.get_or_insert(error.into_core_error());
+                    }
+                }
+            }
+            self.error = cleanup_error;
+            let active_result = self.active.as_mut().map_or(Ok(()), crate::Statement::reset);
+            if let Err(error) = active_result {
+                self.error.get_or_insert(error.into_core_error());
+            }
+            self.active = None;
+            self.io_completions = None;
+            self.cleaning_up = true;
+            self.phase = if self.savepoint_open && !self.pg_conn.conn.get_auto_commit() {
+                DeferredPhase::Rollback
+            } else {
+                DeferredPhase::Done
+            };
+        }
+        while self.phase != DeferredPhase::Done {
+            if self.active.is_none() {
+                if let Err(error) = self.prepare_active() {
+                    self.fail(error);
+                    continue;
+                }
+            }
+            let active = self.active.as_mut().unwrap();
+            active.set_query_timeout_override(Some(None));
+            match active.run_ignore_rows_nonblock() {
+                Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                Ok(IOResult::Done(())) => {
+                    self.active = None;
+                    self.phase =
+                        if self.phase == DeferredPhase::Rollback && self.was_in_tx == Some(true) {
+                            DeferredPhase::RollbackRelease
+                        } else {
+                            self.savepoint_open = false;
+                            DeferredPhase::Done
+                        };
+                }
+                Err(error) => self.fail(error.into_core_error()),
+            }
+        }
+        let result = self.error.take().map_or(Ok(()), Err);
+        self.phase = DeferredPhase::Start;
+        self.work = None;
+        self.was_in_tx = None;
+        self.savepoint_open = false;
+        self.interrupted = false;
+        self.cleaning_up = false;
+        result.map(|()| IOResult::Done(()))
+    }
+}
+
+impl Drop for DeferredExecution {
+    fn drop(&mut self) {
+        if let Err(error) = self.reset() {
+            self.pg_conn.tx.abort();
+            tracing::error!("Failed to clean up PostgreSQL deferred statement: {error}");
         }
     }
 }
 
-fn create_table_if_not_exists_target_present(
+impl DeferredOperation {
+    fn start(
+        &self,
+        conn: &Arc<Connection>,
+        active: &mut Option<crate::Statement>,
+    ) -> Result<Option<DeferredWork>> {
+        match self {
+            Self::Translated { prereqs, cmd, sql } => {
+                let mut statements: Vec<_> = prereqs
+                    .iter()
+                    .map(|stmt| DeferredStatement {
+                        command: DeferredCommand::Translated(
+                            ast::Cmd::Stmt(stmt.clone()),
+                            stmt.to_string(),
+                        ),
+                        context: CommandContext::Default,
+                    })
+                    .collect();
+                statements.push(DeferredStatement {
+                    command: DeferredCommand::Translated((**cmd).clone(), sql.clone()),
+                    context: CommandContext::Default,
+                });
+                *active = prepare_create_table_target_check(conn, cmd)?.map(crate::Statement::new);
+                Ok(Some(DeferredWork::Prerequisites(PrerequisiteState {
+                    commands: CommandSequence {
+                        statements,
+                        index: 0,
+                    },
+                    target_exists: false,
+                })))
+            }
+            Self::Frontend(stmt) => {
+                let statements = match stmt {
+                    FrontendStmt::ResetAll => {
+                        reset_all_settings(conn)?;
+                        return Ok(None);
+                    }
+                    FrontendStmt::DiscardAll => {
+                        discard_all(conn)?;
+                        return Ok(None);
+                    }
+                    FrontendStmt::CreateSchema(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        create_schema_commands(conn, stmt)?
+                    }
+                    FrontendStmt::DropSchema(stmt) => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        drop_schema_commands(conn, stmt)?
+                    }
+                    FrontendStmt::CopyFrom(stmt) => {
+                        *active = Some(crate::Statement::new(prepare_copy_columns(
+                            conn,
+                            &stmt.table_name,
+                            stmt.schema_name.as_deref(),
+                        )?));
+                        return Ok(Some(DeferredWork::Copy(CopyState {
+                            stmt: stmt.clone(),
+                            columns: 0,
+                            rows: Vec::new(),
+                            sql: String::new(),
+                            index: 0,
+                        })));
+                    }
+                    FrontendStmt::RefreshMatview | FrontendStmt::CommentOn => {
+                        if conn.is_tx_read_only() {
+                            return Err(LimboError::ReadOnly);
+                        }
+                        return Ok(None);
+                    }
+                    FrontendStmt::Set(_)
+                    | FrontendStmt::SetTransaction
+                    | FrontendStmt::Show(_)
+                    | FrontendStmt::CopyTo(_) => {
+                        unreachable!()
+                    }
+                };
+                if statements.is_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(DeferredWork::Commands(CommandSequence {
+                    statements,
+                    index: 0,
+                })))
+            }
+        }
+    }
+}
+
+impl DeferredWork {
+    fn context(&self) -> &CommandContext {
+        match self {
+            Self::Prerequisites(state) => &state.commands.current().context,
+            Self::Commands(commands) => &commands.current().context,
+            Self::Copy(_) => &CommandContext::Default,
+        }
+    }
+
+    fn inspect_nonblock(&mut self, active: &mut crate::Statement) -> crate::Result<IOResult<()>> {
+        match self {
+            Self::Prerequisites(state) => active.run_with_row_callback_nonblock(|row| {
+                state.target_exists = row.get_value(0) == &Value::from_i64(1);
+                Ok(())
+            }),
+            Self::Copy(state) => active.run_with_row_callback_nonblock(|_| {
+                state.columns += 1;
+                Ok(())
+            }),
+            Self::Commands(_) => unreachable!(),
+        }
+    }
+
+    fn prepare_active(
+        &self,
+        pg_conn: &Arc<PgConnectionInner>,
+        sql: &str,
+    ) -> Result<Option<crate::Statement>> {
+        match self {
+            Self::Prerequisites(state) => state.commands.prepare_active(pg_conn, sql).map(Some),
+            Self::Commands(commands) => commands.prepare_active(pg_conn, sql).map(Some),
+            Self::Copy(state) => state.prepare_active(&pg_conn.conn, sql),
+        }
+    }
+
+    fn finish_inspection(&mut self, was_in_tx: bool) -> Result<bool> {
+        match self {
+            Self::Prerequisites(state) => Ok(state.finish_inspection()),
+            Self::Copy(state) => {
+                state.finish_inspection(was_in_tx)?;
+                Ok(true)
+            }
+            Self::Commands(_) => unreachable!(),
+        }
+    }
+
+    fn finish_statement(
+        &mut self,
+        active: &mut Option<crate::Statement>,
+        inner: &mut Statement,
+    ) -> Result<bool> {
+        match self {
+            Self::Prerequisites(state) => {
+                let done = state.commands.advance();
+                let finished = active.take().unwrap();
+                if done {
+                    *inner = finished.inner;
+                }
+                Ok(done)
+            }
+            Self::Commands(commands) => {
+                *active = None;
+                Ok(commands.advance())
+            }
+            Self::Copy(state) => state.finish_statement(active),
+        }
+    }
+
+    fn complete(&self, inner: &mut Statement) {
+        match self {
+            Self::Copy(state) => inner.set_n_change(state.rows.len() as i64),
+            Self::Prerequisites(_) | Self::Commands(_) => {}
+        }
+    }
+
+    fn sql(&self) -> Cow<'_, str> {
+        match self {
+            Self::Prerequisites(state) => state.commands.sql(),
+            Self::Commands(commands) => commands.sql(),
+            Self::Copy(state) => Cow::Borrowed(&state.sql),
+        }
+    }
+}
+
+impl PrerequisiteState {
+    fn finish_inspection(&mut self) -> bool {
+        if self.target_exists {
+            self.commands.index = self.commands.statements.len() - 1;
+        }
+        !self.target_exists
+    }
+}
+
+impl CommandSequence {
+    fn prepare_active(
+        &self,
+        pg_conn: &Arc<PgConnectionInner>,
+        sql: &str,
+    ) -> Result<crate::Statement> {
+        let conn = &pg_conn.conn;
+        Ok(match &self.current().command {
+            DeferredCommand::Translated(cmd, _) => crate::Statement::new(
+                conn.prepare_translated_cmd(cmd.clone(), sql)
+                    .map_err(schema_error)?,
+            ),
+            DeferredCommand::Namespace(stmt) => {
+                crate::Statement::new(conn.prepare_namespace_stmt(stmt.clone())?)
+            }
+            DeferredCommand::Postgres(_) => {
+                prepare_statement_inner(pg_conn, sql)?.without_tx_tracking()
+            }
+            DeferredCommand::Sqlite(_) => crate::Statement::new(conn.prepare_sqlite(sql)?),
+        })
+    }
+
+    fn advance(&mut self) -> bool {
+        self.index += 1;
+        self.index == self.statements.len()
+    }
+
+    fn sql(&self) -> Cow<'_, str> {
+        match &self.current().command {
+            DeferredCommand::Translated(_, sql)
+            | DeferredCommand::Sqlite(sql)
+            | DeferredCommand::Postgres(sql) => Cow::Borrowed(sql),
+            DeferredCommand::Namespace(stmt) => stmt.to_string().into(),
+        }
+    }
+
+    fn current(&self) -> &DeferredStatement {
+        &self.statements[self.index]
+    }
+}
+
+impl CopyState {
+    fn prepare_active(
+        &self,
+        conn: &Arc<Connection>,
+        sql: &str,
+    ) -> Result<Option<crate::Statement>> {
+        let mut stmt = crate::Statement::new(conn.prepare_sqlite(sql)?);
+        if self.rows.is_empty() {
+            return Ok(None);
+        }
+        bind_copy_row(&mut stmt, &self.rows[self.index])?;
+        Ok(Some(stmt))
+    }
+
+    fn finish_inspection(&mut self, was_in_tx: bool) -> Result<()> {
+        let (sql, rows) = prepare_copy_rows(&self.stmt, self.columns)?;
+        self.sql = sql;
+        self.rows = rows;
+        if was_in_tx {
+            return Err(LimboError::TransactionAlreadyActive);
+        }
+        Ok(())
+    }
+
+    fn finish_statement(&mut self, active: &mut Option<crate::Statement>) -> Result<bool> {
+        let next = self.index + 1;
+        if next == self.rows.len() {
+            *active = None;
+            return Ok(true);
+        }
+        let active = active.as_mut().unwrap();
+        active.reset().map_err(crate::Error::into_core_error)?;
+        active.clear_bindings();
+        bind_copy_row(active, &self.rows[next])?;
+        self.index = next;
+        Ok(false)
+    }
+}
+
+fn prepare_create_table_target_check(
     conn: &Arc<Connection>,
     cmd: &ast::Cmd,
-) -> Result<bool> {
+) -> Result<Option<Statement>> {
     let ast::Cmd::Stmt(ast::Stmt::CreateTable {
         if_not_exists: true,
         tbl_name,
         ..
     }) = cmd
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let default_schema;
     let schema = match &tbl_name.namespace {
@@ -628,7 +1284,7 @@ fn create_table_if_not_exists_target_present(
         }
     };
     let Some(namespace) = relation_lookup_namespaces(conn, schema).into_iter().next() else {
-        return Ok(false);
+        return Ok(None);
     };
     let database = database_of(conn, &namespace);
     let mut stmt = conn.prepare_sqlite(format!(
@@ -639,11 +1295,7 @@ fn create_table_if_not_exists_target_present(
         NonZero::new(1).unwrap(),
         Value::build_text(namespace.mangle_name(tbl_name.name.as_str())),
     )?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(rows
-        .first()
-        .and_then(|row| row.first())
-        .is_some_and(|val| *val == Value::from_i64(1)))
+    Ok(Some(stmt))
 }
 
 /// `sql` with each table that a foreign key names replaced by the name the
@@ -767,26 +1419,20 @@ fn relation_name_is_taken(
     let namespaces = relation_lookup_namespaces(conn, schema);
     let mut taken = false;
     for namespace in namespaces {
-        let database = database_of(conn, &namespace);
-        let mut stmt = conn.prepare_sqlite(format!(
-            "SELECT \
-             EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
-                     WHERE type = 'table' AND name COLLATE NOCASE = ?1), \
-             EXISTS (SELECT 1 FROM \"{database}\".sqlite_schema \
-                     WHERE type IN ('table', 'index', 'view') \
-                     AND name COLLATE NOCASE IN (?2, '{SEQ_BACKING_TABLE_PREFIX}' || ?2))"
-        ))?;
-        stmt.bind_at(
-            NonZero::new(1).unwrap(),
-            Value::build_text(namespace.mangle_name(table)),
-        )?;
-        stmt.bind_at(
-            NonZero::new(2).unwrap(),
-            Value::build_text(namespace.mangle_name(name)),
-        )?;
-        let row = &stmt.run_collect_rows()?[0];
-        taken = row[1] == Value::from_i64(1);
-        if row[0] == Value::from_i64(1) {
+        let (table_exists, name_exists) = conn.with_schema(namespace.database_id(), |schema| {
+            let ns = namespace.target.id;
+            (
+                schema.get_table(ns, table).is_some() && !schema.is_materialized_view(ns, table),
+                schema.get_table(ns, name).is_some()
+                    || schema.get_view(ns, name).is_some()
+                    || schema.has_sequence(ns, name)
+                    || schema
+                        .indexes(ns)
+                        .any(|index| index.name.eq_ignore_ascii_case(name)),
+            )
+        });
+        taken = name_exists;
+        if table_exists {
             break;
         }
     }
@@ -809,22 +1455,23 @@ fn reject_drop_of_other_view_kind(
     };
     let schema = view_name.namespace.as_ref().map(|name| name.as_str());
     for namespace in relation_lookup_namespaces(conn, schema) {
-        let database = database_of(conn, &namespace);
-        let mut stmt = conn.prepare_sqlite(format!(
-            "SELECT CASE WHEN type = 'table' THEN 'table' \
-                         WHEN rootpage = 0 THEN 'view' \
-                         ELSE 'materialized view' END \
-             FROM \"{database}\".sqlite_schema \
-             WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1"
-        ))?;
-        stmt.bind_at(
-            NonZero::new(1).unwrap(),
-            Value::build_text(namespace.mangle_name(view_name.name.as_str())),
-        )?;
-        let Some(row) = stmt.run_collect_rows()?.into_iter().next() else {
+        let kind = conn.with_schema(namespace.database_id(), |schema| {
+            let ns = namespace.target.id;
+            let name = view_name.name.as_str();
+            if schema.is_materialized_view(ns, name) {
+                Some("materialized view")
+            } else if schema.get_view(ns, name).is_some() {
+                Some("view")
+            } else if schema.get_table(ns, name).is_some() {
+                Some("table")
+            } else {
+                None
+            }
+        });
+        let Some(kind) = kind else {
             continue;
         };
-        if row[0] != Value::build_text(expected_kind) {
+        if kind != expected_kind {
             return Err(sqlstate_error(
                 SQLSTATE_WRONG_OBJECT_TYPE,
                 format!("\"{}\" is not a {expected_kind}", view_name.name.as_str()),
@@ -941,66 +1588,33 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
 
 fn try_prepare_special(
     pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
     parse_result: &turso_pg_parser::ParseResult,
 ) -> Result<Option<crate::Statement>> {
-    let Some(stmt) = session_stmt(parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
+    let Some(stmt) =
+        frontend_stmt(sql, parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     else {
         return Ok(None);
     };
     let stmt = match stmt {
-        SessionStmt::Set(set_stmt) => crate::Statement::new(handle_pg_set(pg_conn, &set_stmt)?),
-        SessionStmt::SetTransaction => prepare_set_transaction(pg_conn, parse_result)?,
-        SessionStmt::RefreshMatview | SessionStmt::CommentOn => noop_write_statement(pg_conn)?,
-        SessionStmt::Show(show_stmt) => crate::Statement::new(handle_pg_show(pg_conn, &show_stmt)?),
-        SessionStmt::ResetAll => {
-            let conn = Arc::clone(&pg_conn.conn);
-            crate::Statement::with_deferred(
-                noop_statement(&pg_conn.conn)?,
-                Box::new(move |_inner| reset_all_settings(&conn)),
-            )
+        FrontendStmt::Set(set_stmt) => crate::Statement::new(handle_pg_set(pg_conn, &set_stmt)?),
+        FrontendStmt::SetTransaction => prepare_set_transaction(pg_conn, parse_result)?,
+        FrontendStmt::Show(show_stmt) => {
+            crate::Statement::new(handle_pg_show(pg_conn, &show_stmt)?)
         }
-        SessionStmt::DiscardAll => {
-            let conn = Arc::clone(&pg_conn.conn);
-            crate::Statement::with_deferred(
-                noop_statement(&pg_conn.conn)?,
-                Box::new(move |_inner| discard_all(&conn)),
-            )
+        FrontendStmt::CopyTo(copy) => {
+            crate::Statement::new(crate::copy::prepare_copy_to_stdout(&pg_conn.conn, &copy)?)
         }
-        SessionStmt::CreateSchema(stmt) => {
-            let pg_conn = Arc::clone(pg_conn);
-            crate::Statement::with_deferred(
-                noop_statement(&pg_conn.conn)?,
-                Box::new(move |_inner| {
-                    if pg_conn.conn.is_tx_read_only() {
-                        return Err(LimboError::ReadOnly);
-                    }
-                    handle_pg_create_schema(&pg_conn, &stmt)
-                }),
-            )
-        }
-        SessionStmt::DropSchema(stmt) => {
-            let conn = Arc::clone(&pg_conn.conn);
-            crate::Statement::with_deferred(
-                noop_statement(&pg_conn.conn)?,
-                Box::new(move |_inner| {
-                    if conn.is_tx_read_only() {
-                        return Err(LimboError::ReadOnly);
-                    }
-                    handle_pg_drop_schema(&conn, &stmt)
-                }),
-            )
-        }
-        SessionStmt::CopyFrom(stmt) => {
-            let conn = Arc::clone(&pg_conn.conn);
-            crate::Statement::with_deferred(
-                noop_statement(&pg_conn.conn)?,
-                Box::new(move |inner| {
-                    let rows_inserted = handle_pg_copy_from(&conn, &stmt)?;
-                    inner.set_n_change(rows_inserted as i64);
-                    Ok(())
-                }),
-            )
-        }
+        stmt @ (FrontendStmt::ResetAll
+        | FrontendStmt::DiscardAll
+        | FrontendStmt::CreateSchema(_)
+        | FrontendStmt::DropSchema(_)
+        | FrontendStmt::CopyFrom(_)
+        | FrontendStmt::RefreshMatview
+        | FrontendStmt::CommentOn) => crate::Statement::with_deferred(
+            noop_statement(&pg_conn.conn)?,
+            DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
+        ),
     };
     Ok(Some(stmt))
 }
@@ -1022,23 +1636,6 @@ fn translation_error(conn: &Arc<Connection>, error: ParseError) -> LimboError {
             sqlstate_error(SQLSTATE_FEATURE_NOT_SUPPORTED, error.to_string())
         }
     }
-}
-
-/// COMMENT ON and REFRESH MATERIALIZED VIEW are accepted as no-ops, but
-/// PostgreSQL still rejects them inside a read-only transaction and they
-/// count as the transaction's first query.
-fn noop_write_statement(pg_conn: &Arc<PgConnectionInner>) -> Result<crate::Statement> {
-    let inner = noop_statement(&pg_conn.conn)?;
-    let conn = Arc::clone(&pg_conn.conn);
-    Ok(crate::Statement::with_deferred(
-        inner,
-        Box::new(move |_inner| {
-            if conn.is_tx_read_only() {
-                return Err(LimboError::ReadOnly);
-            }
-            Ok(())
-        }),
-    ))
 }
 
 /// PostgreSQL applies SET TRANSACTION only inside a transaction block;
@@ -1066,11 +1663,6 @@ fn prepare_set_transaction(
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
     conn.prepare("SELECT 0 WHERE 0")
-}
-
-fn execute_sqlite(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-    let mut stmt = conn.prepare_sqlite(sql)?;
-    stmt.run_ignore_rows()
 }
 
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
@@ -1104,8 +1696,25 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 ))
             }
         },
-        (None, PgSetTo::Values(values)) if set_value_already_in_effect(name, values) => {
-            return noop_statement(&pg_conn.conn);
+        (Some(Parameter::BuiltIn(parameter)), PgSetTo::Values(values)) => {
+            if values.len() != 1 && !parameter.accepts_list() {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_PARAMETER_VALUE,
+                    format!("SET {name} takes only one argument"),
+                ));
+            }
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    PgSetValue::Identifier(s)
+                    | PgSetValue::StringLiteral(s)
+                    | PgSetValue::Number(s) => Ok(s.as_str()),
+                    PgSetValue::Bool(true) => Ok("on"),
+                    PgSetValue::Bool(false) => Ok("off"),
+                    _ => Err(LimboError::ParseError("incorrect format".to_string())),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            quote(&values.join(", "))
         }
         (None, to) => {
             let command = match to {
@@ -1126,62 +1735,12 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     ))
 }
 
-fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
-    let Some(values) = values
-        .iter()
-        .map(|value| match value {
-            PgSetValue::Identifier(s) | PgSetValue::StringLiteral(s) | PgSetValue::Number(s) => {
-                Some(s.to_ascii_lowercase())
-            }
-            PgSetValue::Bool(b) => Some(if *b { "on" } else { "off" }.to_string()),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    let value = values.join(", ");
-    let is_on = matches!(value.as_str(), "on" | "true" | "1");
-    let is_off = matches!(value.as_str(), "off" | "false" | "0");
-    match name.to_ascii_lowercase().as_str() {
-        "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
-            value == "0"
-        }
-        "datestyle" => matches!(value.as_str(), "iso" | "iso, mdy" | "iso, ymd" | "iso, dmy"),
-        "intervalstyle" => value == "postgres",
-        "client_encoding" => matches!(value.as_str(), "utf8" | "utf-8" | "unicode"),
-        "extra_float_digits" => matches!(value.as_str(), "1" | "2" | "3"),
-        "standard_conforming_strings" => is_on,
-        "row_security" | "quote_all_identifiers" => is_off,
-        "check_function_bodies" | "synchronize_seqscans" => is_on || is_off,
-        "default_tablespace" => value.is_empty(),
-        "default_table_access_method" => value == "heap",
-        "transaction_timeout" => value == "0",
-        "xmloption" => value == "content",
-        "application_name" => true,
-        "client_min_messages" => matches!(
-            value.as_str(),
-            "debug5"
-                | "debug4"
-                | "debug3"
-                | "debug2"
-                | "debug1"
-                | "debug"
-                | "log"
-                | "notice"
-                | "warning"
-                | "error"
-        ),
-        _ => false,
-    }
-}
-
 fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> Result<Statement> {
     let name = &show_stmt.name;
     // PostgreSQL names the column after the parameter, not after the name
     // SHOW was given.
     let column = match find_parameter(name) {
-        Some(Parameter::BuiltIn(ConfigParameter::SearchPath)) => SEARCH_PATH_SETTING.to_owned(),
+        Some(Parameter::BuiltIn(parameter)) => parameter.name().to_owned(),
         Some(Parameter::Custom(_)) => session_state(&pg_conn.conn)?
             .name_as_defined(name)
             .unwrap_or_else(|| name.clone()),
@@ -1226,7 +1785,7 @@ pub(crate) fn set_search_path(
     conn: &Connection,
     value: Option<&str>,
     scope: SettingScope,
-) -> Result<Value> {
+) -> Result<String> {
     let mut path = parse_search_path(value.unwrap_or(DEFAULT_SEARCH_PATH))?;
     path.retain(|name| name != "$user" && !is_core_database_name(name));
     session_state(conn)?.mutate(conn, |settings| {
@@ -1234,9 +1793,7 @@ pub(crate) fn set_search_path(
         settings.set(SEARCH_PATH_SETTING, value.map(str::to_owned), scope);
     });
     conn.set_search_path(Some(path));
-    Ok(Value::build_text(
-        value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned(),
-    ))
+    Ok(value.unwrap_or(DEFAULT_SEARCH_PATH).to_owned())
 }
 
 /// `main` and `temp` name databases in core, not PostgreSQL schemas, so a
@@ -1255,7 +1812,7 @@ pub(crate) fn set_custom_parameter(
     name: &str,
     value: Option<&str>,
     scope: SettingScope,
-) -> Result<Value> {
+) -> Result<String> {
     if !is_valid_custom_parameter_name(name) {
         return Err(sqlstate_error(
             SQLSTATE_INVALID_NAME,
@@ -1265,7 +1822,7 @@ pub(crate) fn set_custom_parameter(
     session_state(conn)?.mutate(conn, |settings| {
         settings.set(name, value.map(str::to_owned), scope)
     });
-    Ok(Value::build_text(value.unwrap_or_default().to_owned()))
+    Ok(value.unwrap_or_default().to_owned())
 }
 
 pub(crate) fn custom_parameter(conn: &Connection, name: &str) -> Option<String> {
@@ -1276,7 +1833,7 @@ pub(crate) fn custom_parameter(conn: &Connection, name: &str) -> Option<String> 
         .then(|| state.setting(&name).unwrap_or_default())
 }
 
-fn session_state(conn: &Connection) -> Result<&PgSessionState> {
+pub(crate) fn session_state(conn: &Connection) -> Result<&PgSessionState> {
     conn.context::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })
@@ -1330,15 +1887,14 @@ fn search_path_parser<'src>() -> impl Parser<'src, &'src str, Vec<String>, extra
         .padded_by(whitespace)
 }
 
-fn handle_pg_create_schema(
-    pg_conn: &Arc<PgConnectionInner>,
+fn create_schema_commands(
+    conn: &Arc<Connection>,
     stmt: &PgCreateSchemaStmt,
-) -> Result<()> {
-    let conn = &pg_conn.conn;
+) -> Result<Vec<DeferredStatement>> {
     let name = stmt.name.to_lowercase();
     if conn.qualifier(&name).is_some() {
         if stmt.if_not_exists {
-            return Ok(());
+            return Ok(Vec::new());
         }
         return Err(LimboError::ParseError(format!(
             "schema \"{name}\" already exists"
@@ -1359,42 +1915,29 @@ fn handle_pg_create_schema(
         ));
     }
 
-    conn.create_namespace(&name)?;
-    if stmt.elements.is_empty() {
-        return Ok(());
-    }
-    let setting = search_path_setting(conn);
-    let mut search_path = turso_pg_parser::quote_identifier(&name);
-    let rest = setting.as_deref().unwrap_or(DEFAULT_SEARCH_PATH).trim();
-    if !rest.is_empty() {
-        search_path = format!("{search_path}, {rest}");
-    }
-    set_search_path(conn, Some(&search_path), SettingScope::Session)?;
-    let result = stmt.elements.iter().try_for_each(|sql| {
-        prepare_statement(pg_conn, sql)?
-            .run_ignore_rows()
-            .map_err(crate::Error::into_core_error)
-    });
-    set_search_path(conn, setting.as_deref(), SettingScope::Session)?;
-    if let Err(err) = result {
-        handle_pg_drop_schema(
-            conn,
-            &PgDropSchemaStmt {
-                name,
-                if_exists: false,
-                cascade: true,
-            },
-        )?;
-        return Err(err);
-    }
-    Ok(())
+    let mut commands = vec![DeferredStatement {
+        command: DeferredCommand::Namespace(ast::Stmt::CreateSchema {
+            name: ast::Name::exact(name.clone()),
+        }),
+        context: CommandContext::Default,
+    }];
+    commands.extend(stmt.elements.iter().map(|sql| DeferredStatement {
+        command: DeferredCommand::Postgres(sql.clone()),
+        context: CommandContext::SchemaElement {
+            schema: name.clone(),
+        },
+    }));
+    Ok(commands)
 }
 
-fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
+fn drop_schema_commands(
+    conn: &Arc<Connection>,
+    stmt: &PgDropSchemaStmt,
+) -> Result<Vec<DeferredStatement>> {
     let name = stmt.name.to_lowercase();
     if !schema_exists(conn, &name) {
         if stmt.if_exists {
-            return Ok(());
+            return Ok(Vec::new());
         }
         return Err(LimboError::ParseError(format!(
             "schema \"{name}\" does not exist"
@@ -1409,24 +1952,20 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
         ));
     }
 
-    without_foreign_keys(conn, || {
-        for object in &objects {
-            execute_sqlite(conn, object.drop_sql(&name))?;
-        }
-        Ok(())
-    })?;
-    conn.drop_namespace(&name)
-}
-
-/// Runs `f` with foreign keys not enforced. DROP SCHEMA ... CASCADE drops
-/// the foreign keys of the tables that it drops along with the tables, so
-/// they must not stop the drops or delete rows.
-fn without_foreign_keys(conn: &Arc<Connection>, f: impl FnOnce() -> Result<()>) -> Result<()> {
-    let enabled = conn.foreign_keys_enabled();
-    conn.set_foreign_keys_enabled(false);
-    let result = f();
-    conn.set_foreign_keys_enabled(enabled);
-    result
+    let mut commands: Vec<_> = objects
+        .iter()
+        .map(|object| DeferredStatement {
+            command: DeferredCommand::Sqlite(object.drop_sql(&name)),
+            context: CommandContext::DropSchema,
+        })
+        .collect();
+    commands.push(DeferredStatement {
+        command: DeferredCommand::Namespace(ast::Stmt::DropSchema {
+            name: ast::Name::exact(name),
+        }),
+        context: CommandContext::DropSchema,
+    });
+    Ok(commands)
 }
 
 /// An object of a schema, which DROP SCHEMA ... CASCADE drops.
@@ -1512,7 +2051,10 @@ fn schema_exists(conn: &Connection, schema_name: &str) -> bool {
         .is_some_and(|namespace| !namespace.is_database())
 }
 
-fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
+fn prepare_copy_rows(
+    stmt: &PgCopyFromStmt,
+    column_count: usize,
+) -> Result<(String, Vec<Vec<Option<String>>>)> {
     let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
     })?;
@@ -1521,8 +2063,7 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
         Some(schema) => format!("\"{schema}\".\"{}\"", stmt.table_name),
         None => format!("\"{}\"", stmt.table_name),
     };
-    let column_names = get_table_columns(conn, &stmt.table_name, stmt.schema_name.as_deref())?;
-    if column_names.is_empty() {
+    if column_count == 0 {
         return Err(LimboError::ParseError(format!(
             "COPY FROM: table '{}' not found or has no columns",
             stmt.table_name
@@ -1538,7 +2079,7 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
                 .join(", ");
             (format!(" ({col_list})"), cols.len())
         }
-        None => (String::new(), column_names.len()),
+        None => (String::new(), column_count),
     };
 
     let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
@@ -1552,45 +2093,25 @@ fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<
     let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
 
     let rows = parse_copy_text_format(&data, delimiter, null_string, num_columns, stmt.header)?;
-
-    let rows_inserted = rows.len();
-    let mut begin = conn.prepare_sqlite("BEGIN CONCURRENT")?;
-    begin.run_ignore_rows()?;
-
-    let result = (|| {
-        let mut insert_stmt = conn.prepare_sqlite(&insert_sql)?;
-        for row in &rows {
-            for (i, val) in row.iter().enumerate() {
-                let index = NonZero::new(i + 1).unwrap();
-                match val {
-                    Some(s) => insert_stmt.bind_at(index, Value::build_text(s.clone()))?,
-                    None => insert_stmt.bind_at(index, Value::Null)?,
-                }
-            }
-            insert_stmt.run_ignore_rows()?;
-            insert_stmt.reset()?;
-            insert_stmt.clear_bindings();
-        }
-
-        let mut commit = conn.prepare_sqlite("COMMIT")?;
-        commit.run_ignore_rows()?;
-        Ok(rows_inserted)
-    })();
-
-    if result.is_err() {
-        if let Ok(mut rollback) = conn.prepare_sqlite("ROLLBACK") {
-            let _ = rollback.run_ignore_rows();
-        }
-    }
-
-    result
+    Ok((insert_sql, rows))
 }
 
-fn get_table_columns(
+fn bind_copy_row(stmt: &mut crate::Statement, row: &[Option<String>]) -> Result<()> {
+    for (index, value) in row.iter().enumerate() {
+        let value = value
+            .as_ref()
+            .map_or(Value::Null, |s| Value::build_text(s.clone()));
+        stmt.bind_at(NonZero::new(index + 1).unwrap(), value)
+            .map_err(crate::Error::into_core_error)?;
+    }
+    Ok(())
+}
+
+fn prepare_copy_columns(
     conn: &Arc<Connection>,
     table_name: &str,
     schema_name: Option<&str>,
-) -> Result<Vec<String>> {
+) -> Result<Statement> {
     // The pragma runs as an engine statement, without the search path, so
     // a table named without a schema is looked up here, as a query would.
     let schema = match schema_name {
@@ -1609,15 +2130,7 @@ fn get_table_columns(
         Some(schema) => format!("PRAGMA \"{schema}\".table_info('{table_name}')"),
         None => format!("PRAGMA table_info('{table_name}')"),
     };
-    let mut stmt = conn.prepare_internal(&sql)?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| match row.get(1) {
-            Some(Value::Text(t)) => Some(t.as_str().to_string()),
-            _ => None,
-        })
-        .collect())
+    conn.prepare_internal(&sql)
 }
 
 #[cfg(test)]
@@ -2202,10 +2715,7 @@ mod tests {
         let conn = test_connection();
         conn.execute("CREATE TABLE t (a int)").unwrap();
         conn.execute("BEGIN READ ONLY").unwrap();
-        let spec = turso_pg_parser::copy::parse_copy_to_stdout("COPY t TO STDOUT")
-            .unwrap()
-            .unwrap();
-        let mut stmt = conn.prepare_copy_to_stdout(&spec).unwrap();
+        let mut stmt = conn.prepare("COPY t TO STDOUT").unwrap();
         stmt.run_ignore_rows().unwrap();
         drop(stmt);
         let err = conn.execute("SET TRANSACTION READ WRITE").unwrap_err();

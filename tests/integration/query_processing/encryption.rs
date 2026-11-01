@@ -1,5 +1,6 @@
 use crate::common::{
-    do_flush, run_query, run_query_on_row, ExecRows, TempDatabase, TempDatabaseBuilder,
+    compute_dbhash, compute_dbhash_with_options, do_flush, run_query, run_query_on_row, ExecRows,
+    TempDatabase, TempDatabaseBuilder,
 };
 use asserting::prelude::*;
 use rand::{rng, RngCore};
@@ -1146,6 +1147,25 @@ fn test_vacuum_into_unencrypts(tmp_db: TempDatabase) -> anyhow::Result<()> {
         assert_eq!(rows[0].1, "this was encrypted");
     }
 
+    // 5. Prove the destination has the same content as the encrypted source.
+    // Close the source first: it was encrypted with PRAGMAs, so its open `Database`
+    // has no cipher set and cannot take a key from a new connection.
+    let source_path = tmp_db.path.clone();
+    drop(tmp_db);
+    let source_hash = turso_dbhash::hash_database(
+        source_path.to_str().unwrap(),
+        &turso_dbhash::DbHashOptions {
+            encryption: Some(EncryptionOpts {
+                cipher: cipher.to_string(),
+                hexkey: hexkey.to_string(),
+            }),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(source_hash.rows_hashed, 1);
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    assert_eq!(compute_dbhash(&dest_db).hash, source_hash.hash);
+
     Ok(())
 }
 
@@ -1321,6 +1341,29 @@ fn test_encrypted_db_with_data_then_enable_mvcc() -> anyhow::Result<()> {
             vec!["before mvcc", "after mvcc"]
         );
     }
+
+    // Phase 4: dbhash reads the encrypted MVCC database and gets the same hash for `test`
+    // as a plain database with the same rows. The filter leaves out the MVCC metadata table.
+    let plain_db = TempDatabase::new_empty();
+    let plain_conn = plain_db.connect_limbo();
+    plain_conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")?;
+    plain_conn.execute("INSERT INTO test (value) VALUES ('before mvcc'), ('after mvcc')")?;
+    let hash_opts = turso_dbhash::DbHashOptions {
+        table_filter: Some("test".to_string()),
+        ..Default::default()
+    };
+    let encrypted_hash = turso_dbhash::hash_database(
+        db_path_str,
+        &turso_dbhash::DbHashOptions {
+            encryption: enc_opts,
+            ..hash_opts.clone()
+        },
+    )?;
+    assert_eq!(encrypted_hash.rows_hashed, 2);
+    assert_eq!(
+        encrypted_hash.hash,
+        compute_dbhash_with_options(&plain_db, &hash_opts).hash
+    );
 
     Ok(())
 }

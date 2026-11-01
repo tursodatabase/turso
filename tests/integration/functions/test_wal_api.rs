@@ -1123,7 +1123,12 @@ fn wal_insert_end_drops_frames_of_concurrent_writer() {
     while !updates.is_finished() {
         if session.wal_insert_begin().is_ok() {
             let _: Vec<(i64,)> = session.exec_rows("SELECT count(*) FROM big WHERE length(x) > 0");
-            session.wal_insert_end(false).unwrap();
+            // The session is already over when `Busy` comes back: it is the
+            // read lock for the schema cookie check, which can lose to the writer.
+            match session.wal_insert_end(false) {
+                Ok(()) | Err(LimboError::Busy) => {}
+                Err(err) => panic!("wal_insert_end failed: {err:?}"),
+            }
         }
     }
     updates.join().unwrap();

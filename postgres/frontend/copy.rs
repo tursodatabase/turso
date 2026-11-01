@@ -1,4 +1,4 @@
-//! COPY FROM text format parser.
+//! COPY text encoding and parsing.
 //!
 //! Implements PostgreSQL's default COPY text format:
 //! - One row per line (`\n`)
@@ -9,11 +9,109 @@
 //! - Empty field = empty string (not NULL)
 //! - Lines starting with `\.` = end of data
 
-use std::num::NonZero;
+mod pgwire_text;
 
-use crate::session::{database_of, relation_lookup_namespaces};
-use turso_core::{LimboError, Result, Value};
+use crate::session::relation_lookup_namespaces;
+use turso_core::{ColumnTypeKind, LimboError, Numeric, Result, Row, Value};
 use turso_pg_parser::{copy::CopyToStdout, quote_identifier};
+
+pub struct CopyTextEncoder {
+    columns: Vec<CopyTextType>,
+}
+
+enum CopyTextType {
+    Plain,
+    Boolean,
+    TimestampTz,
+    ByteaArray,
+}
+
+impl CopyTextEncoder {
+    pub fn new(stmt: &crate::Statement) -> Self {
+        let columns = (0..stmt.num_columns())
+            .map(|index| {
+                let Some(info) = stmt.get_column_type_info(index).ok().flatten() else {
+                    return CopyTextType::Plain;
+                };
+                if matches!(info.kind, ColumnTypeKind::Struct | ColumnTypeKind::Union) {
+                    return CopyTextType::Plain;
+                }
+                std::iter::once(info.declared_name.as_str())
+                    .chain(info.base_type.as_deref())
+                    .find_map(|name| {
+                        match (name.to_ascii_uppercase().as_str(), info.array_dimensions) {
+                            ("BOOL" | "BOOLEAN", 0) => Some(CopyTextType::Boolean),
+                            ("TIMESTAMPTZ", 0) => Some(CopyTextType::TimestampTz),
+                            ("BLOB" | "BYTEA", 1..) => Some(CopyTextType::ByteaArray),
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or(CopyTextType::Plain)
+            })
+            .collect();
+        Self { columns }
+    }
+
+    /// Append one COPY text record, including its trailing newline.
+    pub fn encode_row(&self, row: &Row, output: &mut Vec<u8>) {
+        assert_eq!(row.len(), self.columns.len());
+        let mut bytea = Vec::new();
+        for (index, (value, ty)) in row.get_values().zip(&self.columns).enumerate() {
+            if index > 0 {
+                output.push(b'\t');
+            }
+            match value {
+                Value::Null => output.extend_from_slice(b"\\N"),
+                Value::Numeric(Numeric::Integer(value)) => {
+                    if matches!(ty, CopyTextType::Boolean) {
+                        pgwire_text::encode_bool(*value != 0, output);
+                    } else {
+                        pgwire_text::encode_integer(*value, output);
+                    }
+                }
+                Value::Numeric(Numeric::Float(value)) => {
+                    output.extend_from_slice(pgwire_text::format_f64(f64::from(*value)).as_bytes());
+                }
+                Value::Text(text) => {
+                    let text = text.value.as_ref();
+                    escape_copy_text(text.as_bytes(), output);
+                    if matches!(ty, CopyTextType::TimestampTz)
+                        && !text.contains('+')
+                        && !text.contains('Z')
+                        && !text.ends_with("-00")
+                    {
+                        output.extend_from_slice(b"+00");
+                    }
+                }
+                Value::Blob(bytes) => {
+                    bytea.clear();
+                    pgwire_text::encode_bytea(
+                        bytes,
+                        matches!(ty, CopyTextType::ByteaArray),
+                        &mut bytea,
+                    );
+                    escape_copy_text(&bytea, output);
+                }
+            }
+        }
+        output.push(b'\n');
+    }
+}
+
+fn escape_copy_text(bytes: &[u8], output: &mut Vec<u8>) {
+    for byte in bytes {
+        match byte {
+            b'\\' => output.extend_from_slice(b"\\\\"),
+            b'\t' => output.extend_from_slice(b"\\t"),
+            b'\n' => output.extend_from_slice(b"\\n"),
+            b'\r' => output.extend_from_slice(b"\\r"),
+            8 => output.extend_from_slice(b"\\b"),
+            12 => output.extend_from_slice(b"\\f"),
+            11 => output.extend_from_slice(b"\\v"),
+            byte => output.push(*byte),
+        }
+    }
+}
 
 pub(crate) fn prepare_copy_to_stdout(
     conn: &std::sync::Arc<turso_core::Connection>,
@@ -21,29 +119,23 @@ pub(crate) fn prepare_copy_to_stdout(
 ) -> Result<turso_core::Statement> {
     let mut found = None;
     for namespace in relation_lookup_namespaces(conn, spec.schema.as_deref()) {
-        let mut stmt = conn.prepare_sqlite(format!(
-            "SELECT type, rootpage, sql FROM {}.sqlite_schema \
-             WHERE type IN ('table', 'view') AND name COLLATE NOCASE = ?1",
-            quote_identifier(&database_of(conn, &namespace))
-        ))?;
-        stmt.bind_at(
-            NonZero::new(1).unwrap(),
-            Value::build_text(namespace.mangle_name(&spec.table)),
-        )?;
-        let mut table = None;
-        stmt.run_with_row_callback(|row| {
-            let kind = row.get::<String>(0)?;
-            let root_page = row.get::<i64>(1)?;
-            if kind != "table" || root_page == 0 {
+        let table = conn.with_schema(namespace.database_id(), |schema| {
+            let ns = namespace.target.id;
+            if schema.get_view(ns, &spec.table).is_some()
+                || schema.is_materialized_view(ns, &spec.table)
+            {
                 return Err(LimboError::ParseError(
                     "COPY TO STDOUT requires a plain table".to_owned(),
                 ));
             }
-            table = Some(
-                conn.dialect()
-                    .parse_table_sql(&row.get::<String>(2)?, root_page)?,
-            );
-            Ok(())
+            schema
+                .get_table(ns, &spec.table)
+                .map(|table| {
+                    table.btree().ok_or_else(|| {
+                        LimboError::ParseError("COPY TO STDOUT requires a plain table".to_owned())
+                    })
+                })
+                .transpose()
         })?;
         if let Some(table) = table {
             found = Some((namespace, table));

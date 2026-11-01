@@ -1,58 +1,35 @@
-use std::sync::Arc;
-
 use crate::error::sqlstate_error;
-use turso_core::native_ext::{FunctionArity, ScalarCall, ScalarFunction};
-use turso_core::types::IOResultOr;
-use turso_core::{Connection, ExternalFunc, IOResult, OpenOptions, Register, Result, Value};
+use crate::functions::{pg_scalar_function, Uuid};
+use turso_core::native_ext::FunctionArity;
+use turso_core::{Connection, OpenOptions, Result};
 use turso_pg_parser::sqlstate::{
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
-pub(crate) fn register_functions(mut options: OpenOptions) -> OpenOptions {
-    for (name, function) in [
-        ("auth.uid", AuthFunction::Uid),
-        ("auth.email", AuthFunction::Email),
-        ("auth.jwt", AuthFunction::Jwt),
-    ] {
-        options = options.extension_function(
-            ExternalFunc::new_native_scalar(
-                name.to_string(),
-                FunctionArity::Exact(0),
-                false,
-                function,
-            )
-            .expect("auth function declarations have a valid argument count"),
-        );
-    }
+pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     options
-}
-
-#[derive(Debug, Clone, Copy)]
-enum AuthFunction {
-    Uid,
-    Email,
-    Jwt,
-}
-
-impl ScalarFunction for AuthFunction {
-    type Call = Self;
-
-    fn create_call(&self) -> Result<Self::Call> {
-        Ok(*self)
-    }
-}
-
-impl ScalarCall for AuthFunction {
-    fn step(&mut self, connection: &Arc<Connection>, _args: &[Register]) -> IOResultOr<Value> {
-        let value = match self {
-            Self::Uid => claim(connection, "request.jwt.claim.sub", "sub")?
-                .map(|sub| canonical_uuid(&sub))
-                .transpose()?,
-            Self::Email => claim(connection, "request.jwt.claim.email", "email")?,
-            Self::Jwt => jwt(connection)?,
-        };
-        Ok(IOResult::Done(value.map_or(Value::Null, Value::build_text)))
-    }
+        .extension_function(pg_scalar_function(
+            "auth.uid",
+            FunctionArity::Exact(0),
+            false,
+            |connection, _| {
+                claim(connection, "request.jwt.claim.sub", "sub")?
+                    .map(|sub| canonical_uuid(&sub).map(Uuid))
+                    .transpose()
+            },
+        ))
+        .extension_function(pg_scalar_function(
+            "auth.email",
+            FunctionArity::Exact(0),
+            false,
+            |connection, _| claim(connection, "request.jwt.claim.email", "email"),
+        ))
+        .extension_function(pg_scalar_function(
+            "auth.jwt",
+            FunctionArity::Exact(0),
+            false,
+            |connection, _| jwt(connection),
+        ))
 }
 
 fn claim(conn: &Connection, setting_name: &str, claim_name: &str) -> Result<Option<String>> {
