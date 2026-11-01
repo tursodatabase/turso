@@ -341,3 +341,89 @@ test where-string-float-prefix {
 expect {
     1
 }
+
+# SQLite replaces `x AND 0` with 0 when one operand is the integer literal 0,
+# so the other operand never runs. The shapes below behave the same in the
+# SQLite these tests run against (3.50.4) and in the current SQLite; the ones
+# only newer SQLite folds (a function call operand, OR with 1, TRUE/FALSE)
+# are in turso-sqltests/and-or-constant-fold.sqltest.
+
+test and-with-a-constant-false-operand-never-runs-the-other-operand {
+    SELECT 0 AND (SELECT abs(-9223372036854775807 - 1)), (SELECT abs(-9223372036854775807 - 1)) AND 0, typeof((SELECT abs(-9223372036854775807 - 1)) AND 0);
+    SELECT CASE WHEN (SELECT abs(-9223372036854775807 - 1)) AND 0 THEN 'y' ELSE 'n' END, CASE (SELECT abs(-9223372036854775807 - 1)) AND 0 WHEN 0 THEN 'z' END;
+    SELECT 0x0 AND (SELECT abs(-9223372036854775807 - 1)), ((0)) AND (SELECT abs(-9223372036854775807 - 1)), 00 AND (SELECT abs(-9223372036854775807 - 1));
+    SELECT NOT ((SELECT abs(-9223372036854775807 - 1)) AND 0), ((SELECT abs(-9223372036854775807 - 1)) AND 0) OR 1.5, 0 AND (1 OR (SELECT abs(-9223372036854775807 - 1))), (SELECT abs(-9223372036854775807 - 1)) AND 1 AND 0;
+    SELECT coalesce(NULL, (SELECT abs(-9223372036854775807 - 1)) AND 0), iif(0 AND (SELECT abs(-9223372036854775807 - 1)), 'y', 'n');
+    SELECT 0 AND -(SELECT abs(-9223372036854775807 - 1)), 0 AND ((SELECT abs(-9223372036854775807 - 1)) + 1), 0 AND CAST((SELECT abs(-9223372036854775807 - 1)) AS TEXT), 0 AND (SELECT abs(-9223372036854775807 - 1)) IN (1, 2), 0 AND EXISTS (SELECT abs(-9223372036854775807 - 1));
+}
+expect {
+    0|0|integer
+    n|z
+    0|0|0
+    1|1|0|0
+    0|n
+    0|0|0|0|0
+}
+
+test and-with-a-constant-false-operand-folds-in-every-clause {
+    CREATE TABLE fold(a);
+    INSERT INTO fold VALUES (5);
+    SELECT a AND 0, a OR 1, 0 AND a, 1 OR a, a AND 1, a OR 0 FROM fold;
+    SELECT 0 AND (SELECT abs(-9223372036854775807 - 1)) FROM fold;
+    SELECT 1 FROM fold WHERE a OR 1;
+    SELECT 1 FROM fold WHERE (SELECT abs(-9223372036854775807 - 1)) OR 1;
+    SELECT 1 FROM fold WHERE (SELECT abs(-9223372036854775807 - 1)) AND 0;
+    SELECT 1 WHERE (SELECT abs(-9223372036854775807 - 1)) AND 0;
+    SELECT a FROM fold WHERE CASE WHEN (SELECT abs(-9223372036854775807 - 1)) AND 0 THEN 1 ELSE 1 END;
+    SELECT 1 OR a FROM fold ORDER BY a OR 1;
+    UPDATE fold SET a = (SELECT abs(-9223372036854775807 - 1)) AND 0 RETURNING a;
+    INSERT INTO fold VALUES ((SELECT abs(-9223372036854775807 - 1)) AND 0) RETURNING a;
+}
+expect {
+    0|1|0|1|1|1
+    0
+    1
+    1
+    5
+    1
+    0
+    0
+}
+
+# A float, a string, NULL, a COLLATE, a unary sign or an integer that does not
+# fit in 32 bits is not folded, so the other operand runs.
+
+test and-or-with-a-float-operand-runs-the-other-operand {
+    SELECT 1.5 OR json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test and-or-with-a-large-integer-operand-runs-the-other-operand {
+    SELECT 2147483648 OR json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test and-or-with-a-collated-operand-runs-the-other-operand {
+    SELECT (0 COLLATE NOCASE) AND json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test and-or-with-a-signed-operand-runs-the-other-operand {
+    SELECT -1 OR json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test and-or-with-a-null-operand-runs-the-other-operand {
+    SELECT NULL AND json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}

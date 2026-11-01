@@ -603,6 +603,31 @@ pub fn bind_and_rewrite_expr<'a>(
             Ok(WalkControl::Continue)
         },
     )?;
+    fold_and_or_with_constant_operand(top_level_expr)
+}
+
+/// SQLite replaces `x AND 0` with 0 and `x OR 1` with 1 when one operand is
+/// an integer literal or TRUE/FALSE, so the other operand never runs:
+/// `SELECT 1 OR json_extract('bare', '$.a')` is 1 and
+/// `CASE WHEN (SELECT abs(-9223372036854775807 - 1)) AND 0 ...` does not run
+/// the subquery. This runs after binding, so names in the dropped operand are
+/// still checked, and before subquery planning, so the subquery is never
+/// planned or emitted.
+fn fold_and_or_with_constant_operand(expr: &mut ast::Expr) -> Result<()> {
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
+        let Expr::Binary(lhs, op @ (ast::Operator::And | ast::Operator::Or), rhs) = expr else {
+            return Ok(WalkControl::Continue);
+        };
+        let deciding_value = *op == ast::Operator::Or;
+        if literal_truth_value(lhs) == Some(deciding_value)
+            || literal_truth_value(rhs) == Some(deciding_value)
+        {
+            let folded = if deciding_value { "1" } else { "0" };
+            *expr = Expr::Literal(ast::Literal::Numeric(folded.to_string()));
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 
