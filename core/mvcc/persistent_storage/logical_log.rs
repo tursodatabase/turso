@@ -593,7 +593,10 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
-    pending_header_upgrade: Option<(LogHeader, Completion)>,
+    /// A header write whose result has not been looked at yet. Its header
+    /// becomes `header` once the write succeeded; see
+    /// `publish_finished_header_write`.
+    pending_header_write: Option<(LogHeader, Completion)>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
@@ -626,7 +629,7 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
-            pending_header_upgrade: None,
+            pending_header_write: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
@@ -652,7 +655,7 @@ impl LogicalLog {
     }
 
     pub(crate) fn set_header(&mut self, header: LogHeader) {
-        self.discard_pending_header_upgrade();
+        self.finish_pending_header_write();
         self.running_crc = derive_initial_crc(header.salt);
         self.header = Some(header);
     }
@@ -678,6 +681,7 @@ impl LogicalLog {
         advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
+        self.finish_pending_header_write();
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
         self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
@@ -917,15 +921,9 @@ impl LogicalLog {
             return Ok(None);
         }
 
-        if let Some((header, c)) = self.pending_header_upgrade.take() {
-            if !c.finished() {
-                self.pending_header_upgrade = Some((header, c.clone()));
-                return Ok(Some(c));
-            }
-            if c.succeeded() {
-                self.header = Some(header);
-                return Ok(None);
-            }
+        self.publish_finished_header_write();
+        if let Some((_, c)) = &self.pending_header_write {
+            return Ok(Some(c.clone()));
         }
 
         let header = self.header.as_ref().ok_or_else(|| {
@@ -939,8 +937,7 @@ impl LogicalLog {
         let mut upgraded_header = header.clone();
         upgraded_header.version = LOG_VERSION;
 
-        let (upgraded_header, c) = self.write_header(upgraded_header, None)?;
-        self.pending_header_upgrade = Some((upgraded_header, c.clone()));
+        let c = self.write_header_and_publish_on_success(upgraded_header, None)?;
         Ok(Some(c))
     }
 
@@ -1001,9 +998,23 @@ impl LogicalLog {
         ))
     }
 
-    /// Writes the header and returns it with its CRC filled in. The caller
-    /// decides when the returned header becomes the in-memory header. The
-    /// write is added to `group`, when given, before it is submitted.
+    /// Writes `header` to the start of the file. It becomes the in-memory
+    /// header only after the write succeeded: right away when the file
+    /// completes the write synchronously, otherwise the next time the log
+    /// looks at its header. The write is added to `group`, when given, before
+    /// it is submitted.
+    fn write_header_and_publish_on_success(
+        &mut self,
+        header: LogHeader,
+        group: Option<&mut CompletionGroup>,
+    ) -> Result<Completion> {
+        let (header, c) = self.write_header(header, group)?;
+        self.pending_header_write = Some((header, c.clone()));
+        self.publish_finished_header_write();
+        Ok(c)
+    }
+
+    /// Issues the header write and returns the header with its CRC filled in.
     fn write_header(
         &self,
         mut header: LogHeader,
@@ -1038,18 +1049,17 @@ impl LogicalLog {
     }
 
     pub fn update_header(&mut self) -> Result<Completion> {
-        self.discard_pending_header_upgrade();
+        self.finish_pending_header_write();
         let header = self.current_or_new_header()?;
-        let (header, c) = self.write_header(header, None)?;
-        self.header = Some(header);
-        Ok(c)
+        self.write_header_and_publish_on_success(header, None)
     }
 
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
     fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
-        self.pending_header_upgrade = None;
+        self.publish_finished_header_write();
+        self.pending_header_write = None;
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
         self.running_crc = derive_initial_crc(header.salt);
@@ -1095,15 +1105,18 @@ impl LogicalLog {
     pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames from before the reset cannot validate
         // against this new CRC chain.
-        self.discard_pending_header_upgrade();
+        self.finish_pending_header_write();
         let mut header = self.current_or_new_header()?;
-        header.salt = self.io.generate_random_number() as u64;
-        self.running_crc = derive_initial_crc(header.salt);
+        // The log is empty after the reset, so the CRC chain restarts from the
+        // header salt: the current salt until the new header is written, the
+        // new salt once that write succeeded.
+        self.offset = 0;
         self.pending_running_crc = None;
+        self.running_crc = derive_initial_crc(header.salt);
+        header.salt = self.io.generate_random_number() as u64;
 
         let mut group = CompletionGroup::new(|_| {});
-        let (header, _header_c) = self.write_header(header, Some(&mut group))?;
-        self.header = Some(header);
+        let _header_c = self.write_header_and_publish_on_success(header, Some(&mut group))?;
         let c = Completion::new_trunc(move |result| {
             if let Err(err) = result {
                 tracing::error!("logical_log_truncate failed: {}", err);
@@ -1111,17 +1124,42 @@ impl LogicalLog {
         });
         group.add(&c);
         let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
-        self.offset = 0;
         Ok(group.build())
     }
 
-    fn discard_pending_header_upgrade(&mut self) {
-        if let Some((_, c)) = self.pending_header_upgrade.take() {
-            turso_assert!(
-                c.finished(),
-                "logical log header was rewritten while a header upgrade write was in flight"
-            );
+    /// Publishes a finished header write and checks that none is still in
+    /// flight. Used before the header is read or rewritten by a path that
+    /// never runs while a header write is in progress.
+    fn finish_pending_header_write(&mut self) {
+        self.publish_finished_header_write();
+        turso_assert!(
+            self.pending_header_write.is_none(),
+            "logical log header was used while a header write was in flight"
+        );
+    }
+
+    /// Makes the header of a finished, successful header write the in-memory
+    /// header. A failed write leaves the in-memory header as it was, so no
+    /// later frame is chained against a header the file never received. A
+    /// write still in flight stays pending.
+    #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
+    fn publish_finished_header_write(&mut self) {
+        let Some((header, c)) = self.pending_header_write.take() else {
+            return;
+        };
+        if !c.finished() {
+            self.pending_header_write = Some((header, c));
+            return;
         }
+        if !c.succeeded() {
+            return;
+        }
+        if self.offset == 0 {
+            // No frame is chained yet, so the CRC chain starts from this
+            // header's salt.
+            self.running_crc = derive_initial_crc(header.salt);
+        }
+        self.header = Some(header);
     }
 }
 
@@ -7394,6 +7432,91 @@ mod tests {
         let bytes = read_file_bytes(inner, &io);
         let header = LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap();
         assert_eq!(header.version, LOG_VERSION);
+    }
+
+    /// What this test checks: a header write that fails leaves the log without
+    /// an in-memory header, and the retry publishes the header the file holds.
+    #[test]
+    fn test_failed_header_write_keeps_header_unpublished_until_retry_succeeds() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("failed-header-update.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeaderWriteFailingFile {
+            inner: inner.clone(),
+            fail_header_write: std::sync::atomic::AtomicBool::new(true),
+        });
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let c = log.update_header().unwrap();
+        assert!(io.wait_for_completion(c).is_err());
+        assert!(
+            log.header().is_none(),
+            "a header whose write failed must not be published"
+        );
+        assert_eq!(inner.size().unwrap(), 0);
+
+        file.fail_header_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let c = log.update_header().unwrap();
+        io.wait_for_completion(c).unwrap();
+        let published = log.header().unwrap().clone();
+        let bytes = read_file_bytes(inner, &io);
+        let on_disk = LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap();
+        assert_eq!(published.version, on_disk.version);
+        assert_eq!(published.salt, on_disk.salt);
+        assert_eq!(log.running_crc, derive_initial_crc(on_disk.salt));
+    }
+
+    /// What this test checks: a fresh-header reset whose header write fails
+    /// keeps the header and CRC seed the file still holds, and a later reset
+    /// publishes the new salt only once it is on disk.
+    #[test]
+    fn test_failed_fresh_header_reset_keeps_current_header_and_crc_seed() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("failed-fresh-header-reset.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeaderWriteFailingFile {
+            inner: inner.clone(),
+            fail_header_write: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "visible", 10)],
+            None,
+        );
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+        let before = log.header().unwrap().clone();
+
+        file.fail_header_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let c = log.reset_to_fresh_header().unwrap();
+        assert!(io.wait_for_completion(c).is_err());
+        assert_eq!(log.header().unwrap().salt, before.salt);
+        assert_eq!(log.offset, 0);
+        assert_eq!(log.running_crc, derive_initial_crc(before.salt));
+        let bytes = read_file_bytes(inner.clone(), &io);
+        assert_eq!(bytes.len(), LOG_HDR_SIZE);
+        assert_eq!(LogHeader::decode(&bytes).unwrap().salt, before.salt);
+
+        file.fail_header_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let c = log.reset_to_fresh_header().unwrap();
+        io.wait_for_completion(c).unwrap();
+        let after = log.header().unwrap().clone();
+        assert_ne!(after.salt, before.salt);
+        assert_eq!(log.running_crc, derive_initial_crc(after.salt));
+        let bytes = read_file_bytes(inner, &io);
+        assert_eq!(
+            LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap().salt,
+            after.salt
+        );
     }
 
     #[cfg(feature = "conn_raw_api")]
