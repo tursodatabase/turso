@@ -11186,7 +11186,7 @@ pub fn op_function(
                 let input = state.registers[*start_reg].get_value();
                 let count = state.registers[*start_reg + 1].get_value();
                 state.registers[*dest]
-                    .set_value(crate::functions::string::exec_repeat(input, count));
+                    .set_value(crate::functions::string::exec_repeat(input, count)?);
             }
             ScalarFunc::Lpad => {
                 let input = state.registers[*start_reg].get_value();
@@ -11197,7 +11197,7 @@ pub fn op_function(
                     None
                 };
                 state.registers[*dest]
-                    .set_value(crate::functions::string::exec_lpad(input, length, fill));
+                    .set_value(crate::functions::string::exec_lpad(input, length, fill)?);
             }
             ScalarFunc::Rpad => {
                 let input = state.registers[*start_reg].get_value();
@@ -11208,7 +11208,7 @@ pub fn op_function(
                     None
                 };
                 state.registers[*dest]
-                    .set_value(crate::functions::string::exec_rpad(input, length, fill));
+                    .set_value(crate::functions::string::exec_rpad(input, length, fill)?);
             }
             ScalarFunc::BooleanToInt => {
                 check_arg_count!(arg_count, 1);
