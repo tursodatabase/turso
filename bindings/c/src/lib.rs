@@ -3782,11 +3782,25 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
     };
 
     // For now, we only support the main database
-    if db_name != "main" {
+    if !db_name.eq_ignore_ascii_case("main") {
         rc = SQLITE_ERROR;
     } else {
-        // Handle column name (can be NULL to just check table existence)
-        if !z_column_name.is_null() {
+        let schema_prefix = if z_db_name.is_null() { "" } else { "main." };
+        let quoted_table_name = format!("\"{}\"", table_name.replace('"', "\"\""));
+        let table = db_inner
+            .conn
+            .pragma_query(&format!("{schema_prefix}table_list({quoted_table_name})"))
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter().find(|row| {
+                    !matches!(&row[2], turso_core::Value::Text(object_type)
+                        if object_type.as_str() == "view")
+                })
+            });
+
+        if table.is_none() {
+            rc = SQLITE_ERROR;
+        } else if !z_column_name.is_null() {
             let column_name = match CStr::from_ptr(z_column_name).to_str() {
                 Ok(s) => s,
                 Err(_) => return SQLITE_MISUSE,
@@ -3795,7 +3809,7 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
             // Use pragma table_info to get column information
             match db_inner
                 .conn
-                .pragma_query(&format!("table_info({table_name})"))
+                .pragma_query(&format!("{schema_prefix}table_info({quoted_table_name})"))
             {
                 Ok(rows) => {
                     let mut found_column = false;
@@ -3804,7 +3818,7 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
                             turso_core::Value::Text(text) => text.as_str(),
                             _ => return SQLITE_ERROR,
                         }; // name column
-                        if col_name == column_name {
+                        if col_name.eq_ignore_ascii_case(column_name) {
                             // Found the column, extract metadata
                             let col_type: String = match &row[2] {
                                 turso_core::Value::Text(text) => text.as_str().to_string(),
@@ -3831,12 +3845,12 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
                     }
 
                     if !found_column {
-                        // Check if it's a rowid reference
-                        if column_name == "rowid"
-                            || column_name == "oid"
-                            || column_name == "_rowid_"
-                        {
-                            // For rowid columns, return INTEGER type
+                        let rowid_alias = column_name.eq_ignore_ascii_case("rowid")
+                            || column_name.eq_ignore_ascii_case("oid")
+                            || column_name.eq_ignore_ascii_case("_rowid_");
+                        let table_has_rowid = rowid_alias
+                            && table.as_ref().is_some_and(|row| row[4].as_int() == Some(0));
+                        if table_has_rowid {
                             z_data_type = CString::new("INTEGER")
                                 .expect("CString::new failed")
                                 .into_raw();
