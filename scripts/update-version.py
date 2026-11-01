@@ -3,11 +3,11 @@
 Script to update version in workspace Cargo manifests, package.json,
 package-lock.json, gradle.properties, and Directory.Build.props files for the
 Turso project. This script updates all occurrences of the version in the
-workspace configuration, updates the JavaScript and WebAssembly bindings
-package.json and package-lock.json files, updates the Java bindings
-gradle.properties file, updates the .NET bindings Directory.Build.props file,
-uses cargo update to update Cargo.lock, creates a git commit, and adds a
-version tag.
+workspace configuration, updates path dependency versions in member manifests,
+updates the JavaScript and WebAssembly bindings package.json and
+package-lock.json files, updates the Java bindings gradle.properties file,
+updates the .NET bindings Directory.Build.props file, uses cargo update to
+update Cargo.lock, creates a git commit, and adds a version tag.
 """
 
 import argparse
@@ -129,6 +129,58 @@ def update_cargo_toml(new_version):
         return True
     except Exception:
         sys.exit(1)
+
+
+def update_member_cargo_toml(current_version, new_version):
+    """Update path dependency versions in member manifests to the new version."""
+    root_path = Path("Cargo.toml")
+    version_pattern = r'(version\s*=\s*)"' + re.escape(current_version) + r'"'
+
+    for cargo_path in iter_cargo_toml_files():
+        if cargo_path.resolve() == root_path.resolve():
+            continue
+        content = cargo_path.read_text()
+        for name, _ in typed_path_dependencies(content):
+            entry_pattern = rf"(?m)^{re.escape(name)}\s*=\s*\{{[^}}]*\}}"
+            content = re.sub(
+                entry_pattern,
+                lambda match: re.sub(
+                    version_pattern, rf'\1"{new_version}"', match[0]
+                ),
+                content,
+            )
+        remaining = [
+            (name, version)
+            for name, version in typed_path_dependencies(content)
+            if version != new_version
+        ]
+        if remaining:
+            print(
+                f"Error: could not update path dependencies in {cargo_path}: {remaining}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cargo_path.write_text(content)
+    return True
+
+
+def typed_path_dependencies(manifest):
+    """Yield (name, version) for dependencies declared with both a path and a version."""
+
+    def walk(table):
+        for name, value in table.items():
+            if not isinstance(value, dict):
+                continue
+            if "path" in value and "version" in value:
+                yield name, value["version"]
+            else:
+                yield from walk(value)
+
+    data = tomllib.loads(manifest)
+    for section in ("dependencies", "dev-dependencies", "build-dependencies", "target"):
+        table = data.get(section)
+        if isinstance(table, dict):
+            yield from walk(table)
 
 
 def update_package_json(dir_path, new_version):  # noqa: C901
@@ -331,9 +383,12 @@ def create_git_commit_and_tag(version):
 def main():
     args = parse_args()
     new_version = args.version
+    current_version = extract_current_version(Path("Cargo.toml").read_text())
 
     if not update_cargo_toml(new_version):
         sys.exit("Error updating Cargo.toml")
+    if not update_member_cargo_toml(current_version, new_version):
+        sys.exit("Error updating member Cargo.toml files")
     if not update_all_packages(new_version):
         sys.exit("Error updating npm packages")
     if not update_gradle_properties(new_version):
