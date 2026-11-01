@@ -1527,7 +1527,7 @@ impl ScalarFunc {
             | Self::GetByte
             | Self::TimeDiff => &[2],
             // 3-arg
-            Self::Iif | Self::Replace | Self::SetByte => &[3],
+            Self::Replace | Self::SetByte => &[3],
             // Multi-arity (one row per valid arity)
             Self::Like => &[2, 3],
             Self::Trim | Self::LTrim | Self::RTrim | Self::Round | Self::Unhex => &[1, 2],
@@ -1535,6 +1535,7 @@ impl ScalarFunc {
             // Truly variable-arg
             Self::Char
             | Self::Coalesce
+            | Self::Iif
             | Self::Concat
             | Self::ConcatWs
             | Self::Date
@@ -1547,17 +1548,17 @@ impl ScalarFunc {
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
             Self::LoadExtension => &[-1],
-            // Internal functions — arity doesn't matter since they're filtered out
+            // Internal functions that cannot be called by name
             Self::Cast
             | Self::StatInit
             | Self::StatPush
             | Self::StatGet
             | Self::Attach
-            | Self::Detach
-            | Self::TableColumnsJsonArray
-            | Self::BinRecordJsonObject
-            | Self::ConnTxnId
-            | Self::IsAutocommit => &[0],
+            | Self::Detach => &[0],
+            // Internal functions that can be called by name
+            Self::IsAutocommit => &[0],
+            Self::TableColumnsJsonArray | Self::ConnTxnId => &[1],
+            Self::BinRecordJsonObject => &[2],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
             // SQL-standard string and math extensions
@@ -1964,11 +1965,15 @@ impl Func {
         false
     }
     /// Resolve a built-in function name. Thin wrapper over
-    /// [`crate::dialect::sqlite::resolve_builtin_function`], where the
+    /// [`crate::dialect::sqlite::resolve_builtin_function_name`], where the
     /// SQLite name table lives; kept on `Func` for the engine call sites
     /// that classify translated AST.
+    ///
+    /// Does not reject a wrong argument count for a scalar function: schema
+    /// loading uses this, and a schema written by an older Turso that accepted
+    /// such a call must still load. Translating the call rejects it.
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
-        crate::dialect::sqlite::resolve_builtin_function(name, arg_count)
+        crate::dialect::sqlite::resolve_builtin_function_name(name, arg_count)
     }
 
     /// Returns a list of all built-in functions for PRAGMA function_list.
@@ -2049,7 +2054,7 @@ impl Func {
         funcs.push(FunctionListEntry {
             name: "if".into(),
             func_type: "s",
-            narg: 3,
+            narg: -1,
             deterministic: true,
         });
 

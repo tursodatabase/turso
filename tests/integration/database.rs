@@ -1,3 +1,4 @@
+use crate::common::ExecRows;
 use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
@@ -197,6 +198,46 @@ fn test_open_refuses_file_with_postgres_table() {
         panic!("expected malformed schema error, got {err:?}");
     };
     assert_that!(msg).contains("malformed database schema");
+}
+
+/// Earlier Turso versions accepted built-in function calls with an argument
+/// count the function does not take, such as `lpad` with 4 arguments, in
+/// generated columns and expression indexes. A database with such a schema must
+/// still open; only statements that evaluate the call fail.
+#[test]
+fn test_open_file_with_wrong_argument_count_in_schema() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("wrong_arg_count.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE g(a, b AS (upper(a)));
+             CREATE TABLE i(a);
+             CREATE INDEX ia ON i(upper(a));
+             INSERT INTO g(a) VALUES ('x');
+             INSERT INTO i VALUES ('y');
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = 'CREATE TABLE g(a, b AS (lpad(a, 3, ''x'', ''y'')))'
+              WHERE name = 'g';
+             UPDATE sqlite_schema SET sql = 'CREATE INDEX ia ON i(lpad(a, 3, ''x'', ''y''))'
+              WHERE name = 'ia';",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    let db = crate::common::TempDatabase::new_with_existent(&path);
+    let conn = db.connect_limbo();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT 1");
+    assert_eq!(rows, vec![(1,)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM g");
+    assert_eq!(rows, vec![("x".to_string(),)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM i");
+    assert_eq!(rows, vec![("y".to_string(),)]);
+
+    for sql in ["SELECT b FROM g", "INSERT INTO i VALUES ('z')"] {
+        let err = conn.execute(sql).unwrap_err();
+        assert_that!(err.to_string()).contains("wrong number of arguments to function lpad()");
+    }
 }
 
 /// Regression test: TursoConnection.close() must finalize outstanding statements

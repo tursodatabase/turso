@@ -715,6 +715,9 @@ fn validate(
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
                     ast::ColumnConstraint::Default(expr) => validate_default_expr(expr, col_i)?,
+                    ast::ColumnConstraint::Generated { expr, .. } => {
+                        validate_generated_function_calls(expr, resolver)?;
+                    }
                     ast::ColumnConstraint::Collate { collation_name } => {
                         let collation = resolver.resolve_collation(collation_name.as_str())?;
                         if collation.is_custom() {
@@ -869,6 +872,22 @@ fn validate(
             table.check_collates_are_allowed()?;
         }
     }
+    Ok(())
+}
+
+/// Rejects a function call in a generated column expression whose argument
+/// count the function does not take. `validate_generated_expr` does not check
+/// counts because it also runs when the schema loads.
+pub(crate) fn validate_generated_function_calls(
+    expr: &ast::Expr,
+    resolver: &CatalogContext,
+) -> Result<()> {
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::FunctionCall { name, args, .. } = e {
+            resolver.resolve_function(name.as_str(), args.len())?;
+        }
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 

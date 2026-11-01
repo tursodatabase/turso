@@ -616,7 +616,20 @@ pub(crate) fn validate_function_tail(
     if !has_order_by && filter_over.filter_clause.is_none() && filter_over.over_clause.is_none() {
         return Ok(());
     }
-    match resolver.resolve_function(name, arg_count)? {
+    let func = match resolver.resolve_function(name, arg_count) {
+        Ok(func) => func,
+        // SQLite reports OVER on a scalar function before a wrong argument count.
+        Err(err) if filter_over.over_clause.is_some() => {
+            match crate::dialect::sqlite::resolve_builtin_function_name(name, arg_count) {
+                Ok(Some(Func::Scalar(_))) => {
+                    crate::bail_parse_error!("{} may not be used as a window function", name)
+                }
+                _ => return Err(err),
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    match func {
         Some(Func::Agg(_) | Func::Window(_)) | None => Ok(()),
         Some(Func::External(func)) if func.func.is_aggregate() => Ok(()),
         _ if has_order_by => {
