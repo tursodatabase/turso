@@ -1911,13 +1911,37 @@ impl PostgreSQLTranslator {
 
         let order_by = self.translate_order_by(&select.sort_clause)?;
 
-        let distinctness = translate_distinct_clause(&select.distinct_clause)?;
-
         let group_by = self.translate_group_by(&select.group_clause, &select.having_clause)?;
 
         let window_clause = self.translate_window_clause(&select.window_clause)?;
 
         let limit = self.translate_select_limit(select)?;
+
+        let with = self.translate_with_clause(&select.with_clause)?;
+
+        // DISTINCT ON (PostgreSQL): a plain DISTINCT has a single empty node in
+        // the distinct clause, while DISTINCT ON carries the ON expressions.
+        if select.distinct_clause.iter().any(|n| n.node.is_some()) {
+            let mut on_exprs = Vec::new();
+            for node in &select.distinct_clause {
+                if node.node.is_some() {
+                    on_exprs.push(self.translate_expr(node)?);
+                }
+            }
+            return self.translate_distinct_on(
+                on_exprs,
+                result_columns,
+                from_clause,
+                where_clause,
+                group_by,
+                window_clause,
+                order_by,
+                limit,
+                with,
+            );
+        }
+
+        let distinctness = translate_distinct_clause(&select.distinct_clause)?;
 
         let one_select = ast::OneSelect::Select {
             distinctness,
@@ -1933,12 +1957,188 @@ impl PostgreSQLTranslator {
             compounds: vec![],
         };
 
-        let with = self.translate_with_clause(&select.with_clause)?;
-
         Ok(ast::Select {
             with,
             body: select_body,
             order_by,
+            limit,
+        })
+    }
+
+    /// Rewrite `SELECT DISTINCT ON (e1, ...) cols ... ORDER BY ...` into a
+    /// window query that keeps the first row of each `(e1, ...)` group:
+    ///
+    /// ```sql
+    /// SELECT cols FROM (
+    ///     SELECT cols, row_number() OVER (PARTITION BY e1, ... ORDER BY <order by>) AS rn
+    ///     FROM ... WHERE ... GROUP BY ...
+    /// ) WHERE rn = 1 ORDER BY <order by> LIMIT ...
+    /// ```
+    ///
+    /// PostgreSQL requires the DISTINCT ON expressions to match the leftmost
+    /// ORDER BY expressions, and picks an arbitrary row per group when there is
+    /// no ORDER BY. A bare `*` is rejected because the outer query would need the
+    /// catalog to list the subquery's columns; every other column already has a
+    /// name (the frontend gives an unaliased expression PostgreSQL's "?column?").
+    #[allow(clippy::too_many_arguments)]
+    fn translate_distinct_on(
+        &self,
+        on_exprs: Vec<ast::Expr>,
+        result_columns: Vec<ast::ResultColumn>,
+        from: Option<ast::FromClause>,
+        where_clause: Option<ast::Expr>,
+        group_by: Option<GroupBy>,
+        window_clause: Vec<ast::WindowDef>,
+        order_by: Vec<ast::SortedColumn>,
+        limit: Option<ast::Limit>,
+        with: Option<ast::With>,
+    ) -> Result<ast::Select, ParseError> {
+        const RN: &str = "__turso_distinct_on_rn";
+
+        // The outer query re-selects each column by the name the subquery gives
+        // it: a plain column keeps its own name, and every expression keeps its
+        // alias (the frontend adds an implicit one when the query omits it). A
+        // `*` has no such per-column name.
+        let mut outer_columns = Vec::with_capacity(result_columns.len());
+        for column in &result_columns {
+            let name = match column {
+                ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => {
+                    return Err(not_supported("SELECT DISTINCT ON with *"));
+                }
+                ast::ResultColumn::Expr(_, Some(alias)) => alias.name().clone(),
+                // The frontend aliases every expression, so an unaliased column
+                // here is a bare column reference; anything else has no name.
+                ast::ResultColumn::Expr(expr, None) => match expr.as_ref() {
+                    ast::Expr::Id(name) => name.clone(),
+                    ast::Expr::Qualified(_, name) => name.clone(),
+                    ast::Expr::DoublyQualified(_, _, name) => name.clone(),
+                    _ => return Err(not_supported("SELECT DISTINCT ON with an unnamed column")),
+                },
+            };
+            outer_columns.push(ast::ResultColumn::Expr(Box::new(ast::Expr::Id(name)), None));
+        }
+
+        // PostgreSQL rejects DISTINCT ON expressions that are not the leftmost
+        // ORDER BY expressions (SQLSTATE 42P10).
+        if !order_by.is_empty() {
+            let leading = order_by.len() >= on_exprs.len()
+                && on_exprs.iter().all(|e| {
+                    order_by[..on_exprs.len()]
+                        .iter()
+                        .any(|s| s.expr.as_ref() == e)
+                })
+                && order_by[..on_exprs.len()]
+                    .iter()
+                    .all(|s| on_exprs.iter().any(|e| e == s.expr.as_ref()));
+            if !leading {
+                return Err(ParseError::Sqlstate {
+                    sqlstate: SQLSTATE_INVALID_COLUMN_REFERENCE,
+                    message:
+                        "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+                            .to_string(),
+                });
+            }
+        }
+
+        // The window orders by the query's ORDER BY, so row 1 is the row
+        // PostgreSQL keeps. Without an ORDER BY the pick is arbitrary, which
+        // PostgreSQL also leaves unspecified, so order by the ON expressions.
+        let window_order = if order_by.is_empty() {
+            on_exprs
+                .iter()
+                .map(|e| ast::SortedColumn {
+                    expr: Box::new(e.clone()),
+                    order: None,
+                    nulls: None,
+                })
+                .collect()
+        } else {
+            order_by.clone()
+        };
+
+        // The inner query keeps every selected column, adds a helper column for
+        // each ORDER BY expression so the outer query can re-order by it, and
+        // adds the row number.
+        let mut inner_columns = result_columns;
+        let mut outer_order = Vec::with_capacity(order_by.len());
+        for (i, sorted) in order_by.iter().enumerate() {
+            let helper = exact_name(format!("__turso_distinct_on_ord_{i}"));
+            inner_columns.push(ast::ResultColumn::Expr(
+                sorted.expr.clone(),
+                Some(ast::As::As(helper.clone())),
+            ));
+            outer_order.push(ast::SortedColumn {
+                expr: Box::new(ast::Expr::Id(helper)),
+                order: sorted.order,
+                nulls: sorted.nulls,
+            });
+        }
+        let row_number = ast::Expr::FunctionCall {
+            name: exact_name("row_number"),
+            distinctness: None,
+            args: vec![],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: ast::FunctionTail {
+                filter_clause: None,
+                over_clause: Some(Box::new(ast::Over::Window(ast::Window {
+                    base: None,
+                    partition_by: on_exprs.into_iter().map(Box::new).collect(),
+                    order_by: window_order,
+                    frame_clause: None,
+                }))),
+            },
+        };
+        inner_columns.push(ast::ResultColumn::Expr(
+            Box::new(row_number),
+            Some(ast::As::As(exact_name(RN))),
+        ));
+
+        let inner = ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: inner_columns,
+                    from,
+                    where_clause: where_clause.map(Box::new),
+                    group_by,
+                    window_clause,
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let keep_first = ast::Expr::Binary(
+            Box::new(ast::Expr::Id(exact_name(RN))),
+            ast::Operator::Equals,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+        );
+        let outer = ast::OneSelect::Select {
+            distinctness: None,
+            columns: outer_columns,
+            from: Some(ast::FromClause {
+                select: Box::new(ast::SelectTable::Select {
+                    select: inner,
+                    alias: None,
+                    lateral: false,
+                }),
+                joins: vec![],
+            }),
+            where_clause: Some(Box::new(keep_first)),
+            group_by: None,
+            window_clause: vec![],
+        };
+
+        Ok(ast::Select {
+            with,
+            body: ast::SelectBody {
+                select: outer,
+                compounds: vec![],
+            },
+            order_by: outer_order,
             limit,
         })
     }
@@ -11238,16 +11438,24 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_distinct_on() {
+    fn distinct_on_rewrites_a_column_list_and_fails_closed_otherwise() {
+        // A column or expression list with the ON expressions leading ORDER BY
+        // is rewritten with row_number(). An unaliased expression keeps the name
+        // the frontend already gave it (PostgreSQL's "?column?"), so it works too.
+        assert_translates("SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b");
+        assert_translates("SELECT DISTINCT ON (a) a, b * 2 AS c FROM t ORDER BY a");
+        assert_translates("SELECT DISTINCT ON (a) a + b FROM t ORDER BY a");
+        assert_translates("SELECT DISTINCT a, b FROM t");
+        // A bare * has no column names for the outer query to select.
         assert_not_supported(
-            "SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b",
-            "DISTINCT ON",
+            "SELECT DISTINCT ON (a) * FROM t ORDER BY a",
+            "DISTINCT ON with *",
         );
+        // DISTINCT ON in a compound-select leaf is still rejected.
         assert_not_supported(
             "SELECT DISTINCT ON (a) a FROM t UNION SELECT 1",
             "DISTINCT ON",
         );
-        assert_translates("SELECT DISTINCT a, b FROM t");
     }
 
     #[test]
