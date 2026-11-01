@@ -16,6 +16,54 @@ expect {
 }
 
 @cross-check-integrity
+test alter-table-rename-mixed-case-table-in-other-case {
+    CREATE TABLE "Pk6"(a UNIQUE);
+    ALTER TABLE pk6 RENAME TO r;
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name;
+}
+expect {
+    table|r|r
+    index|sqlite_autoindex_r_1|r
+}
+
+@cross-check-integrity
+test alter-table-rename-to-mixed-case-name {
+    CREATE TABLE t(a, b);
+    CREATE INDEX ti ON t(b);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;
+    ALTER TABLE t RENAME TO "NewName";
+    INSERT INTO NEWNAME VALUES (1, 2);
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name;
+    SELECT name FROM pragma_table_list WHERE name = 'newname' COLLATE NOCASE;
+    SELECT * FROM newname;
+}
+expect {
+    table|NewName|NewName
+    index|ti|NewName
+    trigger|tr|NewName
+    NewName
+    1|2
+}
+
+@cross-check-integrity
+test alter-table-rename-leaves-rows-of-other-tables {
+    CREATE TABLE a(x UNIQUE);
+    CREATE TABLE a_b(y UNIQUE);
+    CREATE TABLE u(c);
+    CREATE TRIGGER a AFTER INSERT ON u BEGIN SELECT 1; END;
+    ALTER TABLE a RENAME TO z;
+    SELECT type, name, tbl_name FROM sqlite_schema ORDER BY rowid;
+}
+expect {
+    table|z|z
+    index|sqlite_autoindex_z_1|z
+    table|a_b|a_b
+    index|sqlite_autoindex_a_b_1|a_b
+    table|u|u
+    trigger|a|u
+}
+
+@cross-check-integrity
 test alter-table-rename-table {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY, u);
     ALTER TABLE t1 RENAME TO t2;

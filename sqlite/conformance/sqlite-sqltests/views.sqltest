@@ -550,3 +550,14 @@ expect {
     1|1
     2|3
 }
+
+@cross-check-integrity
+test view-drop-mixed-case-name-in-other-case {
+    CREATE TABLE t(a);
+    CREATE VIEW testView AS SELECT a FROM t;
+    DROP VIEW TESTVIEW;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'view';
+}
+expect {
+    0
+}
