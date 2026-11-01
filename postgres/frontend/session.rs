@@ -15,7 +15,6 @@ use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
 use turso_parser::ast::{self};
-use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
@@ -1071,7 +1070,10 @@ impl DeferredOperation {
                         }
                         return Ok(None);
                     }
-                    SessionStmt::Set(_) | SessionStmt::SetTransaction | SessionStmt::Show(_) => {
+                    SessionStmt::Set(_)
+                    | SessionStmt::SetTransaction
+                    | SessionStmt::Show(_)
+                    | SessionStmt::CopyTo(_) => {
                         unreachable!()
                     }
                 };
@@ -1588,16 +1590,8 @@ fn try_prepare_special(
     sql: &str,
     parse_result: &turso_pg_parser::ParseResult,
 ) -> Result<Option<crate::Statement>> {
-    if CommandTag::of(parse_result) == CommandTag::Copy {
-        if let Some(copy) = turso_pg_parser::copy::parse_copy_to_stdout(sql)
-            .map_err(|e| translation_error(&pg_conn.conn, e))?
-        {
-            return crate::copy::prepare_copy_to_stdout(&pg_conn.conn, &copy)
-                .map(crate::Statement::new)
-                .map(Some);
-        }
-    }
-    let Some(stmt) = session_stmt(parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
+    let Some(stmt) =
+        session_stmt(sql, parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     else {
         return Ok(None);
     };
@@ -1605,6 +1599,9 @@ fn try_prepare_special(
         SessionStmt::Set(set_stmt) => crate::Statement::new(handle_pg_set(pg_conn, &set_stmt)?),
         SessionStmt::SetTransaction => prepare_set_transaction(pg_conn, parse_result)?,
         SessionStmt::Show(show_stmt) => crate::Statement::new(handle_pg_show(pg_conn, &show_stmt)?),
+        SessionStmt::CopyTo(copy) => {
+            crate::Statement::new(crate::copy::prepare_copy_to_stdout(&pg_conn.conn, &copy)?)
+        }
         stmt @ (SessionStmt::ResetAll
         | SessionStmt::DiscardAll
         | SessionStmt::CreateSchema(_)

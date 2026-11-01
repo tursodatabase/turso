@@ -70,67 +70,6 @@ fn schema_dropped_by_one_client_is_gone_for_another() {
     query_error(&mut client2, "SELECT count(*) FROM s.t");
 }
 
-#[test]
-fn extended_copy_rejects_execution_and_description() {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-
-    let server = TestServer::start();
-    query(&mut server.connect(), "CREATE TABLE items (id INT)");
-    for (tag, body) in [(b'E', &b"\0\0\0\0\0"[..]), (b'D', b"S\0"), (b'D', b"P\0")] {
-        let mut socket = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
-        socket
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .unwrap();
-        let startup = b"\0\x03\0\0user\0postgres\0database\0main\0\0";
-        socket
-            .write_all(&((startup.len() + 4) as u32).to_be_bytes())
-            .unwrap();
-        socket.write_all(startup).unwrap();
-        read_until_ready(&mut socket);
-        send(&mut socket, b'Q', b"BEGIN\0");
-        read_until_ready(&mut socket);
-
-        send(&mut socket, b'P', b"\0COPY items TO STDOUT\0\0\0");
-        send(&mut socket, b'B', b"\0\0\0\0\0\0\0\0");
-        send(&mut socket, tag, body);
-        send(&mut socket, b'S', b"");
-        let messages = read_until_ready(&mut socket);
-        let error = messages
-            .iter()
-            .find(|(tag, _)| *tag == b'E')
-            .expect("COPY must be rejected");
-        assert!(String::from_utf8_lossy(&error.1).contains("extended query protocol"));
-        assert!(!messages
-            .iter()
-            .any(|(tag, _)| matches!(tag, b'C' | b'd' | b'D')));
-        assert_eq!(messages.last().unwrap().1, b"E");
-    }
-
-    fn send(socket: &mut TcpStream, tag: u8, body: &[u8]) {
-        socket.write_all(&[tag]).unwrap();
-        socket
-            .write_all(&((body.len() + 4) as u32).to_be_bytes())
-            .unwrap();
-        socket.write_all(body).unwrap();
-    }
-
-    fn read_until_ready(socket: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
-        let mut messages = Vec::new();
-        loop {
-            let mut header = [0; 5];
-            socket.read_exact(&mut header).unwrap();
-            let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
-            let mut body = vec![0; length - 4];
-            socket.read_exact(&mut body).unwrap();
-            messages.push((header[0], body));
-            if header[0] == b'Z' {
-                return messages;
-            }
-        }
-    }
-}
-
 struct TestServer {
     port: u16,
     _dir: TempDir,

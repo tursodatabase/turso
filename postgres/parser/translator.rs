@@ -6987,11 +6987,15 @@ pub enum SessionStmt {
     RefreshMatview,
     CommentOn,
     CopyFrom(PgCopyFromStmt),
+    CopyTo(crate::copy::CopyToStdout),
 }
 
 /// The statement of `parse_result` if the session runs it itself, `None` if
 /// it is translated.
-pub fn session_stmt(parse_result: &ParseResult) -> Result<Option<SessionStmt>, ParseError> {
+pub fn session_stmt(
+    sql: &str,
+    parse_result: &ParseResult,
+) -> Result<Option<SessionStmt>, ParseError> {
     if let Some(stmt) = try_extract_set(parse_result) {
         return Ok(Some(SessionStmt::Set(stmt)));
     }
@@ -7021,6 +7025,9 @@ pub fn session_stmt(parse_result: &ParseResult) -> Result<Option<SessionStmt>, P
     }
     if let Some(stmt) = try_extract_copy_from(parse_result)? {
         return Ok(Some(SessionStmt::CopyFrom(stmt)));
+    }
+    if let Some(stmt) = crate::copy::try_extract_copy_to_stdout(sql, parse_result)? {
+        return Ok(Some(SessionStmt::CopyTo(stmt)));
     }
     Ok(None)
 }
@@ -7737,7 +7744,7 @@ mod tests {
     fn session_stmt_names_each_kind_the_session_runs() {
         let kind = |sql: &str| {
             let parsed = crate::parse(sql).unwrap();
-            session_stmt(&parsed).unwrap().map(|stmt| match stmt {
+            session_stmt(sql, &parsed).unwrap().map(|stmt| match stmt {
                 SessionStmt::Set(_) => "set",
                 SessionStmt::SetTransaction => "set transaction",
                 SessionStmt::Show(_) => "show",
@@ -7748,6 +7755,7 @@ mod tests {
                 SessionStmt::RefreshMatview => "refresh matview",
                 SessionStmt::CommentOn => "comment on",
                 SessionStmt::CopyFrom(_) => "copy from",
+                SessionStmt::CopyTo(_) => "copy to",
             })
         };
         for (sql, want) in [
@@ -7765,6 +7773,7 @@ mod tests {
             ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
             ("COMMENT ON TABLE t IS 'x'", "comment on"),
             ("COPY t FROM '/tmp/t.csv'", "copy from"),
+            ("COPY t TO STDOUT", "copy to"),
         ] {
             assert_eq!(kind(sql), Some(want), "{sql}");
         }

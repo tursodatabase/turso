@@ -11,17 +11,24 @@ pub struct CopyToStdout {
 
 pub fn parse_copy_to_stdout(sql: &str) -> Result<Option<CopyToStdout>, ParseError> {
     let parsed = crate::parse(sql)?;
-    let statement = match parsed.protobuf.stmts.as_slice() {
-        [] => return Ok(None),
-        [statement] => statement,
-        _ => return Err(ParseError::ParseError("expected one statement".to_owned())),
-    };
-    let Some(Node::CopyStmt(copy)) = statement.stmt.as_ref().and_then(|stmt| stmt.node.as_ref())
-    else {
+    if parsed.protobuf.stmts.len() > 1 {
+        return Err(ParseError::ParseError("expected one statement".to_owned()));
+    }
+    try_extract_copy_to_stdout(sql, &parsed)
+}
+
+pub(crate) fn try_extract_copy_to_stdout(
+    sql: &str,
+    parsed: &crate::ParseResult,
+) -> Result<Option<CopyToStdout>, ParseError> {
+    let Some(Node::CopyStmt(copy)) = crate::first_statement(parsed) else {
         return Ok(None);
     };
     if copy.is_from {
         return Ok(None);
+    }
+    if parsed.protobuf.stmts.len() > 1 {
+        return Err(ParseError::ParseError("expected one statement".to_owned()));
     }
     if copy.is_program {
         return Err(ParseError::ParseError(
