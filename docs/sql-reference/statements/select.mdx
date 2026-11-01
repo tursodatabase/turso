@@ -122,6 +122,8 @@ SELECT * FROM logs WHERE message REGEXP '^ERROR:';
 
 ### Range and Membership Tests
 
+When the left-hand expression of `BETWEEN` or `NOT BETWEEN` calls a nondeterministic function such as `random()`, it is evaluated once. This does not hold when a bound contains a subquery or when the left-hand side is a row value.
+
 ```sql
 -- BETWEEN (inclusive on both ends)
 SELECT * FROM orders WHERE total BETWEEN 100 AND 500;

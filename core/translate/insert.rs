@@ -21,9 +21,9 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
-            process_returning_clause, restore_returning_row_image_in_cache,
+            expr_contains_subquery, process_returning_clause, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
+            BindingBehavior, NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
             build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
@@ -2056,24 +2056,6 @@ struct BoundInsertResult {
     values: Vec<Box<Expr>>,
     upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)>,
     inserting_multiple_rows: bool,
-}
-
-/// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
-/// This is used to detect when single-row VALUES should be routed through the
-/// multi-row path which has proper subquery handling.
-fn expr_contains_subquery(expr: &Expr) -> bool {
-    let mut found_subquery = false;
-    let _ = walk_expr(expr, &mut |e| {
-        if matches!(
-            e,
-            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
-        ) {
-            found_subquery = true;
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    });
-    found_subquery
 }
 
 /// Resolve `Expr::Default` in a VALUES row by replacing it with the column's

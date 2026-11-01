@@ -19,8 +19,8 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_function_that_changes_within_statement,
-        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        BindingBehavior, WalkControl,
+        expr_contains_nondeterministic_scalar_function, expr_contains_subquery, expr_vector_size,
+        unwrap_parens, BindingBehavior, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -2658,30 +2658,15 @@ pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -
             end,
         } = e
         {
-            if is_literal_between_bound(start) && is_literal_between_bound(end) {
-                let mut lhs_has_subquery = false;
-                walk_expr(lhs, &mut |expr| {
-                    if matches!(
-                        expr,
-                        Expr::Subquery(_)
-                            | Expr::Exists(_)
-                            | Expr::InSelect { .. }
-                            | Expr::SubqueryResult { .. }
-                    ) {
-                        lhs_has_subquery = true;
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                    Ok(WalkControl::Continue)
-                })?;
-                let lhs_is_nondeterministic = match resolver {
-                    Some(resolver) => {
-                        expr_contains_nondeterministic_scalar_function(lhs, resolver)?
-                    }
-                    None => false,
-                };
-                if lhs_has_subquery || lhs_is_nondeterministic {
-                    return Ok(WalkControl::Continue);
-                }
+            let lhs_is_nondeterministic = match resolver {
+                Some(resolver) => expr_contains_nondeterministic_scalar_function(lhs, resolver)?,
+                None => false,
+            };
+            // A subquery in a bound runs before the comparisons, so a kept BETWEEN could not skip it
+            // the way SQLite does. Such a BETWEEN is rewritten as before.
+            let bounds_have_subquery = expr_contains_subquery(start) || expr_contains_subquery(end);
+            if (expr_contains_subquery(lhs) || lhs_is_nondeterministic) && !bounds_have_subquery {
+                return Ok(WalkControl::Continue);
             }
 
             let lhs_expr = std::mem::take(lhs.as_mut());
@@ -2722,15 +2707,6 @@ pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -
         Ok(WalkControl::Continue)
     })?;
     Ok(())
-}
-
-fn is_literal_between_bound(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal(_) => true,
-        Expr::Unary(_, inner) => is_literal_between_bound(inner),
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_literal_between_bound(&exprs[0]),
-        _ => false,
-    }
 }
 
 /**
