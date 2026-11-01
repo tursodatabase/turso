@@ -84,12 +84,26 @@ expect {
     51
 }
 
-# Error on nonexistent schema
+# A sequence in a schema that does not exist is a missing sequence
 test sequence-nonexistent-schema-errors {
     SELECT nextval('bogus.my_seq');
 }
 expect error {
-    no such database: bogus
+    sequence "bogus.my_seq" does not exist
+}
+
+test sequence-nonexistent-schema-currval-errors {
+    SELECT currval('bogus.my_seq');
+}
+expect error {
+    sequence "bogus.my_seq" does not exist
+}
+
+test sequence-nonexistent-schema-setval-errors {
+    SELECT setval('bogus.my_seq', 1);
+}
+expect error {
+    sequence "bogus.my_seq" does not exist
 }
 
 # Error on nonexistent sequence in valid schema
@@ -160,4 +174,28 @@ expect {
     1|m1
     2|m2
     3|m3
+}
+
+test computed-sequence-name-is-found-in-an-attached-database {
+    ATTACH DATABASE ':memory:' AS aux;
+    CREATE SEQUENCE aux.only_aux START 5;
+    SELECT nextval('only_aux');
+    SELECT currval('only_' || 'aux');
+}
+expect {
+    5
+    5
+}
+
+test currval-does-not-survive-detach-and-reuse-of-the-database-id {
+    ATTACH DATABASE ':memory:' AS a;
+    CREATE SEQUENCE a.s START 17;
+    SELECT nextval('a.s');
+    DETACH DATABASE a;
+    ATTACH DATABASE ':memory:' AS b;
+    CREATE SEQUENCE b.s;
+    SELECT currval('b.s');
+}
+expect error {
+    currval of sequence "s" is not yet defined in this session
 }

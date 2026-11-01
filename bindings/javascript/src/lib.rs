@@ -274,14 +274,14 @@ pub fn apply_experimental_features(
     for feature in experimental {
         opts = match feature.as_str() {
             "views" => opts.with_views(true),
-            "strict" => opts, // strict is always enabled, kept for backwards compatibility
+            // always enabled, kept for backwards compatibility
+            "strict" | "generated_columns" => opts,
             "custom_types" => opts.with_custom_types(true),
             "encryption" => opts.with_encryption(true),
             "index_method" => opts.with_index_method(true),
             "autovacuum" => opts.with_autovacuum(true),
             "vacuum" => opts.with_vacuum(true),
             "attach" => opts.with_attach(true),
-            "generated_columns" => opts.with_generated_columns(true),
             "multiprocess_wal" => opts.with_multiprocess_wal(true),
             "without_rowid" => opts.with_without_rowid(true),
             _ => opts,
@@ -1076,7 +1076,6 @@ mod tests {
             "vacuum",
             "encryption",
             "attach",
-            "generated_columns",
             "multiprocess_wal",
             "without_rowid",
         ]
@@ -1091,15 +1090,18 @@ mod tests {
         assert!(opts.enable_vacuum);
         assert!(opts.enable_encryption);
         assert!(opts.enable_attach);
-        assert!(opts.enable_generated_columns);
         assert!(opts.enable_multiprocess_wal);
         assert!(opts.enable_without_rowid);
 
-        // `strict` and unknown names are no-ops.
+        // `strict`, `generated_columns` and unknown names are no-ops.
         assert_eq!(
             apply_experimental_features(
                 turso_core::DatabaseOpts::new(),
-                &["strict".to_string(), "unknown".to_string()]
+                &[
+                    "strict".to_string(),
+                    "generated_columns".to_string(),
+                    "unknown".to_string()
+                ]
             ),
             turso_core::DatabaseOpts::new()
         );

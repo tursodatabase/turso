@@ -9,6 +9,7 @@
 //! SQLite one namespace per database, are in [`attach`].
 
 pub mod attach;
+use crate::namespace::NamespaceId;
 use crate::pragma::PragmaVirtualTable;
 use crate::schema::{BTreeTable, Schema, Table};
 use crate::sync::Arc;
@@ -163,7 +164,8 @@ pub fn register_builtin_catalog(
     enable_custom_types: bool,
 ) -> crate::Result<()> {
     for vtab in pragma_vtabs() {
-        schema.tables.insert(
+        schema.insert_table(
+            NamespaceId::ROOT,
             vtab.name.to_owned(),
             Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
         );
@@ -234,7 +236,6 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         }
         "group_concat" => {
             if arg_count != 1 && arg_count != 2 {
-                println!("{arg_count}");
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
             }
             Ok(Some(Func::Agg(AggFunc::GroupConcat)))
@@ -533,12 +534,6 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         // Test type functions (for custom type system testing)
         "test_uint_encode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintEncode))),
         "test_uint_decode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintDecode))),
-        "test_uint_add" => Ok(Some(Func::Scalar(ScalarFunc::TestUintAdd))),
-        "test_uint_sub" => Ok(Some(Func::Scalar(ScalarFunc::TestUintSub))),
-        "test_uint_mul" => Ok(Some(Func::Scalar(ScalarFunc::TestUintMul))),
-        "test_uint_div" => Ok(Some(Func::Scalar(ScalarFunc::TestUintDiv))),
-        "test_uint_lt" => Ok(Some(Func::Scalar(ScalarFunc::TestUintLt))),
-        "test_uint_eq" => Ok(Some(Func::Scalar(ScalarFunc::TestUintEq))),
         #[cfg(feature = "test_helper")]
         "test_nondet_counter" => Ok(Some(Func::Scalar(ScalarFunc::TestNondetCounter))),
         "string_reverse" | "reverse" => Ok(Some(Func::Scalar(ScalarFunc::StringReverse))),
@@ -552,15 +547,17 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "int_to_boolean" => Ok(Some(Func::Scalar(ScalarFunc::IntToBoolean))),
         "validate_ipaddr" => Ok(Some(Func::Scalar(ScalarFunc::ValidateIpAddr))),
         "numeric_encode" => Ok(Some(Func::Scalar(ScalarFunc::NumericEncode))),
+        "numeric_fit" => Ok(Some(Func::Scalar(ScalarFunc::NumericFit))),
         "numeric_decode" => Ok(Some(Func::Scalar(ScalarFunc::NumericDecode))),
         "numeric_add" => Ok(Some(Func::Scalar(ScalarFunc::NumericAdd))),
         "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),
         "numeric_mul" => Ok(Some(Func::Scalar(ScalarFunc::NumericMul))),
         "numeric_div" => Ok(Some(Func::Scalar(ScalarFunc::NumericDiv))),
-        "numeric_lt" => Ok(Some(Func::Scalar(ScalarFunc::NumericLt))),
-        "numeric_eq" => Ok(Some(Func::Scalar(ScalarFunc::NumericEq))),
+        "numeric_mod" => Ok(Some(Func::Scalar(ScalarFunc::NumericMod))),
+        "numeric_neg" => Ok(Some(Func::Scalar(ScalarFunc::NumericNeg))),
         "date_plus" => Ok(Some(Func::Scalar(ScalarFunc::DatePlus))),
         "date_minus" => Ok(Some(Func::Scalar(ScalarFunc::DateMinus))),
+        "date_diff" => Ok(Some(Func::Scalar(ScalarFunc::DateDiff))),
         // Array construction / element access (desugared from syntax)
         "array" => Ok(Some(Func::Scalar(ScalarFunc::Array))),
         "array_element" => Ok(Some(Func::Scalar(ScalarFunc::ArrayElement))),

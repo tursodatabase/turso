@@ -48,7 +48,6 @@ pub fn emit_table_column_for_dml(
         &SelfTableContext::ForDML {
             dml_ctx: dml_column_context,
             table: Arc::clone(table),
-            uses_custom_type_operators: false,
         },
         None,
         column,
@@ -72,11 +71,37 @@ pub(super) fn do_emit_table_column(
 ) -> Result<()> {
     match column.generated_type() {
         GeneratedType::Virtual { expr, .. } => {
+            let end_column_emission = match self_table_context {
+                SelfTableContext::ForSelect { .. } => {
+                    let end = program.allocate_label();
+                    program.emit_insn(Insn::IfNullRow {
+                        cursor_id,
+                        target_pc: end,
+                        dest: target_register,
+                    });
+                    Some(end)
+                }
+                SelfTableContext::ForDML { .. } => None,
+            };
             resolver.with_self_table_context(program, Some(self_table_context), |program, _| {
-                translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                if end_column_emission.is_some() {
+                    translate_expr_no_constant_opt(
+                        program,
+                        referenced_tables,
+                        expr,
+                        target_register,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                } else {
+                    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                }
                 Ok(())
             })?;
             program.emit_column_affinity(target_register, column.affinity());
+            if let Some(end) = end_column_emission {
+                program.preassign_label_to_next_insn(end);
+            }
         }
         _ => {
             emit_stored_column(program, cursor_id, column_index, target_register, resolver)?;
@@ -104,7 +129,7 @@ pub fn emit_stored_column(
         resolved
             .chain
             .iter()
-            .any(|td| td.encode().is_some())
+            .any(|td| td.has_encode_or_coerce())
             .then_some((table, column, default_expr))
     });
     let Some((table, column, default_expr)) = encoded_default else {

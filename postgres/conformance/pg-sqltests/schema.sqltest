@@ -5,6 +5,7 @@
 test create-schema-rejects-names-that-start-with-pg {
     CREATE SCHEMA pg_app;
 }
+@sqlstate 42939
 expect error {
     unacceptable schema name "pg_app"
 }
@@ -16,6 +17,7 @@ test drop-schema-with-objects-errors {
     CREATE TABLE drop_needs_cascade.t (x int);
     DROP SCHEMA drop_needs_cascade;
 }
+@sqlstate 2BP01
 expect error {
     because other objects depend on it
 }
@@ -24,6 +26,7 @@ test drop-schema-public-with-only-views-errors {
     CREATE VIEW v AS SELECT 1 AS x;
     DROP SCHEMA public;
 }
+@sqlstate 2BP01
 expect error {
     because other objects depend on it
 }
@@ -59,4 +62,379 @@ test drop-schema-public-cascade-drops-its-objects {
 }
 expect {
     0
+}
+
+test create-schema-creates-its-elements-in-the-new-schema {
+    CREATE SCHEMA IF NOT EXISTS create_elements;
+    DROP SCHEMA create_elements CASCADE;
+    CREATE SCHEMA create_elements
+        CREATE VIEW v AS SELECT a FROM t
+        CREATE TABLE t (a int)
+        CREATE INDEX t_a ON t (a)
+        CREATE SEQUENCE seq;
+    INSERT INTO create_elements.t VALUES (nextval('create_elements.seq') + 41);
+    SELECT a FROM create_elements.v;
+    SHOW search_path;
+}
+expect {
+    42
+    "$user", public
+}
+
+test create-schema-rejects-elements-in-another-schema {
+    CREATE SCHEMA create_elsewhere CREATE TABLE public.t (a int);
+}
+@sqlstate 42P15
+expect error {
+    different from the one being created
+}
+
+# Both tests create the same schema: on an in-memory server each must get its
+# own empty schema, not a file left by the other test.
+test create-schema-starts-empty {
+    CREATE SCHEMA fresh;
+    CREATE TABLE fresh.t (x int);
+    INSERT INTO fresh.t VALUES (42);
+    SELECT x FROM fresh.t;
+}
+expect {
+    42
+}
+
+test create-schema-starts-empty-in-another-database {
+    CREATE SCHEMA fresh;
+    CREATE TABLE fresh.t (x int);
+    SELECT count(*) FROM fresh.t;
+}
+expect {
+    0
+}
+
+test tables-of-two-schemas-with-the-same-name {
+    CREATE SCHEMA a;
+    CREATE SCHEMA b;
+    CREATE TABLE a.t (v text);
+    CREATE TABLE b.t (v text);
+    CREATE TABLE t (v text);
+    INSERT INTO a.t VALUES ('a');
+    INSERT INTO b.t VALUES ('b');
+    INSERT INTO t VALUES ('public');
+    SELECT v FROM a.t UNION ALL SELECT v FROM b.t UNION ALL SELECT v FROM public.t;
+}
+expect {
+    a
+    b
+    public
+}
+
+test schema-and-table-qualified-columns {
+    CREATE SCHEMA app;
+    CREATE TABLE app.items (id int, label text);
+    INSERT INTO app.items VALUES (1, 'a'), (2, 'b');
+    SELECT app.items.label, items.id FROM app.items ORDER BY id;
+}
+expect {
+    a|1
+    b|2
+}
+
+test update-and-delete-with-table-qualified-columns {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1), (2);
+    UPDATE app.t SET x = t.x * 10 WHERE t.x = 1;
+    DELETE FROM app.t WHERE t.x = 2;
+    SELECT x FROM app.t;
+}
+expect {
+    10
+}
+
+test create-table-in-missing-schema-errors {
+    CREATE TABLE missing_schema.t (x int);
+}
+expect error {
+    schema "missing_schema" does not exist
+}
+
+test index-names-are-per-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE t (x int);
+    CREATE TABLE app.t (x int);
+    CREATE INDEX t_x ON t (x);
+    CREATE INDEX t_x ON app.t (x);
+    DROP INDEX app.t_x;
+    DROP INDEX t_x;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test rename-table-in-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    ALTER TABLE app.t RENAME TO u;
+    SELECT x FROM app.u;
+}
+expect {
+    1
+}
+
+test rename-table-keeps-the-views-that-read-it {
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW v AS SELECT x FROM t;
+    CREATE VIEW v2 AS SELECT x FROM public.t;
+    ALTER TABLE t RENAME TO u;
+    SELECT x FROM v;
+    SELECT x FROM v2;
+}
+expect {
+    1
+    1
+}
+
+test rename-table-leaves-views-of-a-table-of-the-same-name-in-another-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE t (x int);
+    INSERT INTO t VALUES (1);
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (2);
+    CREATE VIEW app.v AS SELECT x FROM public.t;
+    CREATE VIEW app.w AS SELECT x FROM app.t;
+    ALTER TABLE t RENAME TO u;
+    SELECT x FROM app.v;
+    SELECT x FROM app.w;
+}
+expect {
+    1
+    2
+}
+
+test create-sequence-may-be-named-like-a-table-of-the-engine {
+    CREATE SEQUENCE sqlite_s;
+    SELECT nextval('sqlite_s');
+}
+expect {
+    1
+}
+
+test foreign-key-to-the-table-being-created-names-that-table {
+    CREATE SCHEMA app;
+    CREATE TABLE c (id int PRIMARY KEY);
+    SET search_path TO app, public;
+    CREATE TABLE c (id int PRIMARY KEY, p int REFERENCES c (id));
+    SELECT CASE WHEN confrelid = conrelid THEN 'itself' ELSE 'another table' END
+    FROM pg_constraint WHERE contype = 'f';
+}
+expect {
+    itself
+}
+
+test sequence-in-schema {
+    CREATE SCHEMA app;
+    CREATE SEQUENCE app.s;
+    CREATE SEQUENCE s START 10;
+    SELECT nextval('app.s');
+    SELECT nextval('app.s');
+    SELECT nextval('s');
+    SELECT currval('app.s');
+}
+expect {
+    1
+    2
+    10
+    2
+}
+
+test catalogs-report-schema-of-objects {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    CREATE INDEX t_x ON app.t (x);
+    CREATE SEQUENCE app.s;
+    SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname IN ('t', 't_x') ORDER BY c.relname;
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename = 't';
+    SELECT schemaname, tablename, indexname FROM pg_indexes WHERE indexname = 't_x';
+    SELECT schemaname, sequencename FROM pg_sequences WHERE sequencename = 's';
+}
+expect {
+    app|t
+    app|t_x
+    app|t
+    app|t|t_x
+    app|s
+}
+
+test serial-columns-in-schema-and-public {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (id serial, label text);
+    CREATE TABLE t (id serial, label text);
+    INSERT INTO app.t (label) VALUES ('a'), ('b');
+    INSERT INTO t (label) VALUES ('c');
+    SELECT id, label FROM app.t UNION ALL SELECT id, label FROM t ORDER BY label;
+}
+expect {
+    1|a
+    2|b
+    1|c
+}
+
+test view-in-schema-finds-its-tables-without-a-schema-name {
+    CREATE SCHEMA app;
+    SET search_path TO app;
+    CREATE TABLE t (a int);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW v AS SELECT a FROM t;
+    SET search_path TO public;
+    SELECT a FROM app.v;
+}
+expect {
+    1
+}
+
+test tables-of-schemas-with-dotted-names-stay-apart {
+    CREATE SCHEMA dotted;
+    CREATE SCHEMA "dotted.sub";
+    CREATE TABLE dotted."sub.t" (a int);
+    CREATE TABLE "dotted.sub".t (b int);
+    INSERT INTO dotted."sub.t" VALUES (1);
+    INSERT INTO "dotted.sub".t VALUES (2);
+    SELECT a FROM dotted."sub.t";
+    SELECT b FROM "dotted.sub".t;
+    SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname LIKE 'dotted%' ORDER BY n.nspname;
+}
+expect {
+    1
+    2
+    dotted|sub.t
+    dotted.sub|t
+}
+
+test a-public-table-named-like-a-schema-table-is-not-in-the-schema {
+    CREATE SCHEMA likeschema;
+    CREATE TABLE public."likeschema.x" (a int);
+    SELECT * FROM likeschema.x;
+}
+expect error {
+    likeschema.x
+}
+
+test drop-schema-cascade-leaves-a-public-table-named-like-its-tables {
+    CREATE SCHEMA dropped;
+    CREATE TABLE public."dropped.x" (a int);
+    INSERT INTO public."dropped.x" VALUES (1);
+    CREATE TABLE dropped.x (a int);
+    DROP SCHEMA dropped CASCADE;
+    SELECT a FROM public."dropped.x";
+    SELECT schemaname, tablename FROM pg_tables WHERE tablename LIKE 'dropped%' OR tablename = 'x';
+}
+expect {
+    1
+    public|dropped.x
+}
+
+test same-named-tables-in-two-schemas-keep-their-own-indexes {
+    CREATE SCHEMA a;
+    CREATE SCHEMA b;
+    CREATE TABLE a.t (x int PRIMARY KEY, note text);
+    CREATE TABLE b.t (x int PRIMARY KEY, note text);
+    CREATE INDEX t_note ON a.t (note);
+    CREATE INDEX t_note ON b.t (note);
+    INSERT INTO a.t VALUES (1, 'a');
+    INSERT INTO b.t VALUES (1, 'b');
+    SELECT count(*) FROM a.t WHERE note = 'a';
+    SELECT count(*) FROM b.t WHERE note = 'a';
+    SELECT (SELECT count(*) FROM a.t) + (SELECT count(*) FROM b.t);
+}
+expect {
+    1
+    0
+    2
+}
+
+test foreign-key-between-tables-of-a-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.parents (id int PRIMARY KEY);
+    CREATE TABLE app.children (parent_id int REFERENCES app.parents (id));
+    INSERT INTO app.parents VALUES (1);
+    INSERT INTO app.children VALUES (1);
+    SELECT count(*) FROM app.children;
+}
+expect {
+    1
+}
+
+test drop-column-of-a-table-of-a-schema-that-has-a-view {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int, y int);
+    INSERT INTO app.t VALUES (1, 2);
+    CREATE VIEW app.v AS SELECT x FROM app.t;
+    ALTER TABLE app.t DROP COLUMN y;
+    SELECT * FROM app.v;
+}
+expect {
+    1
+}
+
+test rename-column-of-a-table-of-a-schema-read-by-a-view-naming-the-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    CREATE VIEW app.v AS SELECT x FROM app.t;
+    ALTER TABLE app.t RENAME COLUMN x TO z;
+    SELECT * FROM app.v;
+}
+expect {
+    1
+}
+
+test rename-column-of-a-table-of-a-schema-read-by-a-view-in-the-schema {
+    CREATE SCHEMA app;
+    CREATE TABLE app.t (x int);
+    INSERT INTO app.t VALUES (1);
+    SET search_path TO app;
+    CREATE VIEW v AS SELECT x FROM t;
+    ALTER TABLE t RENAME COLUMN x TO z;
+    SELECT * FROM v;
+}
+expect {
+    1
+}
+
+test rename-table-with-an-automatic-index-frees-the-old-name {
+    CREATE TABLE t (id int UNIQUE);
+    ALTER TABLE t RENAME TO u;
+    CREATE TABLE t (id int UNIQUE);
+    SELECT tablename, count(*) FROM pg_indexes WHERE tablename IN ('t', 'u') GROUP BY tablename ORDER BY tablename;
+}
+expect {
+    t|1
+    u|1
+}
+
+test drop-sequence-clears-the-session-currval {
+    CREATE SEQUENCE s;
+    SELECT nextval('s');
+    DROP SEQUENCE s;
+    CREATE SEQUENCE s;
+    SELECT currval('s');
+}
+expect error {
+    currval of sequence "s" is not yet defined in this session
+}
+
+test main-does-not-name-a-schema {
+    CREATE TABLE main.t (x int);
+}
+expect error {
+    schema "main" does not exist
+}
+
+test temp-does-not-name-a-schema {
+    CREATE TABLE temp.t (x int);
+}
+expect error {
+    schema "temp" does not exist
 }

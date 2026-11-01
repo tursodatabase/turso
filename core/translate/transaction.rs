@@ -3,11 +3,12 @@ use crate::translate::emitter::{emit_cdc_explicit_commit_insns, Resolver, Transa
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::Result;
-use turso_parser::ast::{Name, TransactionType};
+use turso_parser::ast::{AccessMode, Name, TransactionType};
 
 pub fn translate_tx_begin(
     tx_type: Option<TransactionType>,
     _tx_name: Option<Name>,
+    access_mode: Option<AccessMode>,
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
@@ -18,6 +19,7 @@ pub fn translate_tx_begin(
     });
     let schema = resolver.schema();
     let tx_type = tx_type.unwrap_or(TransactionType::Deferred);
+    let read_only = matches!(access_mode, Some(AccessMode::ReadOnly));
     match tx_type {
         TransactionType::Deferred => {
             // SQLite emits only AutoCommit for deferred — no
@@ -25,6 +27,8 @@ pub fn translate_tx_begin(
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
+                concurrent: false,
+                read_only,
             });
         }
         TransactionType::Immediate | TransactionType::Exclusive => {
@@ -54,34 +58,19 @@ pub fn translate_tx_begin(
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
+                concurrent: false,
+                read_only,
             });
         }
         TransactionType::Concurrent => {
-            program.emit_insn(Insn::Transaction {
-                db: crate::MAIN_DB_ID,
-                tx_mode: TransactionMode::Concurrent,
-                schema_cookie: schema.schema_version,
-            });
-            // Temp has no MVCC, so it uses a plain write lock even in
-            // Concurrent mode. The op_transaction handler detects this via
-            // `mv_store_for_db(TEMP) == None` and skips the MVCC path.
-            let temp_schema_cookie = temp_schema_cookie(resolver);
-            program.emit_insn(Insn::Transaction {
-                db: crate::TEMP_DB_ID,
-                tx_mode: TransactionMode::Write,
-                schema_cookie: temp_schema_cookie,
-            });
-            for db_id in resolver.attached_database_ids_in_search_order()? {
-                let cookie = resolver.with_schema(db_id, |s| s.schema_version);
-                program.emit_insn(Insn::Transaction {
-                    db: db_id,
-                    tx_mode: TransactionMode::Write,
-                    schema_cookie: cookie,
-                });
-            }
+            // Like SQLite's begin-concurrent, BEGIN CONCURRENT is a deferred
+            // transaction: nothing is opened here, and the first statement
+            // materializes the MVCC transaction in concurrent mode.
             program.emit_insn(Insn::AutoCommit {
                 auto_commit: false,
                 rollback: false,
+                concurrent: true,
+                read_only,
             });
         }
     }
@@ -115,6 +104,8 @@ pub fn translate_tx_commit(
     program.emit_insn(Insn::AutoCommit {
         auto_commit: true,
         rollback: false,
+        concurrent: false,
+        read_only: false,
     });
     Ok(())
 }

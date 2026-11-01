@@ -24,3 +24,17 @@ expect {
     real|real|real|1.0
     integer|integer|integer|1
 }
+
+test json-real-format {
+    CREATE TABLE ordered_json_reals(v REAL);
+    INSERT INTO ordered_json_reals VALUES (-573353.6912624366), (440020.30658628535);
+    SELECT json_group_array(v) FROM (SELECT v FROM ordered_json_reals ORDER BY v);
+    SELECT json_group_array(json_array(v)) FROM (SELECT v FROM ordered_json_reals ORDER BY v);
+    SELECT json_array(v), json_quote(v), json_object('v', v) FROM ordered_json_reals ORDER BY v;
+}
+expect {
+    [-573353.691262437,440020.306586285]
+    [[-573353.691262437],[440020.306586285]]
+    [-573353.691262437]|-573353.691262437|{"v":-573353.691262437}
+    [440020.306586285]|440020.306586285|{"v":440020.306586285}
+}

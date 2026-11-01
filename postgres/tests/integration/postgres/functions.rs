@@ -183,14 +183,6 @@ fn test_pg_set_config_validates_arguments(db: TempDatabase) {
             "set_config requires a boolean",
         ),
         (
-            "SELECT set_config('search_path', '', true)",
-            "transaction-local settings are not supported",
-        ),
-        (
-            "SET LOCAL search_path TO missing",
-            "transaction-local settings are not supported",
-        ),
-        (
             "SELECT set_config('search_path', 'public,', false)",
             "invalid value for parameter",
         ),
@@ -256,6 +248,183 @@ fn test_pg_current_setting_reports_default_without_session_state(db: TempDatabas
             .run_collect_rows()
             .unwrap(),
         vec![vec![Value::build_text("\"$user\", public")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_custom_parameters_belong_to_one_connection(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let other = db.connect_postgres();
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('app.user_id', '42', false)"),
+        ["42"]
+    );
+    assert_eq!(
+        query_text(&conn.clone(), "SELECT current_setting('app.user_id')"),
+        ["42"]
+    );
+    assert_eq!(
+        query_text(&other, "SELECT current_setting('app.user_id', true)"),
+        ["NULL"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_local_custom_parameter_ends_with_its_statement_in_autocommit_mode(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    assert_eq!(
+        conn.prepare(
+            "SELECT set_config('app.user_id', '42', true), current_setting('app.user_id')"
+        )
+        .unwrap()
+        .run_collect_rows()
+        .unwrap(),
+        vec![vec![Value::build_text("42"), Value::build_text("42")]]
+    );
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('app.user_id')"),
+        [""]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_local_custom_parameter_ends_for_statements_prepared_before_the_transaction(
+    db: TempDatabase,
+) {
+    let conn = db.connect_postgres();
+    let mut setter = conn
+        .prepare("SELECT set_config('app.user_id', '42', true)")
+        .unwrap();
+    let mut reader = conn
+        .prepare("SELECT current_setting('app.user_id', true)")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    setter.run_ignore_rows().unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("42")]]
+    );
+    conn.execute("COMMIT").unwrap();
+    reader.reset().unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("")]]
+    );
+
+    conn.execute("BEGIN").unwrap();
+    setter.reset().unwrap();
+    setter.run_ignore_rows().unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    reader.reset().unwrap();
+    assert_eq!(
+        reader.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_local_search_path_ends_with_the_transaction(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE config_items (v INT)").unwrap();
+    conn.execute("INSERT INTO config_items VALUES (17)")
+        .unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT set_config('search_path', 'missing', true)"),
+        ["missing"]
+    );
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SET LOCAL search_path TO missing").unwrap();
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT setting FROM pg_settings WHERE name = 'search_path'"
+        ),
+        ["missing"]
+    );
+    // The failing SELECT aborts the transaction block, so COMMIT performs a
+    // rollback and the LOCAL setting ends with the transaction.
+    assert!(conn.prepare("SELECT v FROM config_items").is_err());
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(query_integer(&conn, "SELECT v FROM config_items"), [17]);
+    assert_eq!(
+        query_text(
+            &conn,
+            "SELECT setting FROM pg_settings WHERE name = 'search_path'"
+        ),
+        ["\"$user\", public"]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_statement_prepared_with_a_local_search_path_uses_the_search_path_after_commit(
+    db: TempDatabase,
+) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SCHEMA other").unwrap();
+    conn.execute("CREATE TABLE demo (label TEXT)").unwrap();
+    conn.execute("INSERT INTO demo VALUES ('from public')")
+        .unwrap();
+    conn.execute("CREATE TABLE other.demo (label TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO other.demo VALUES ('from other')")
+        .unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SET LOCAL search_path TO other").unwrap();
+    let mut prepared_in_transaction = conn.prepare("SELECT label FROM demo").unwrap();
+    assert_eq!(query_text(&conn, "SELECT label FROM demo"), ["from other"]);
+    conn.execute("COMMIT").unwrap();
+
+    assert_eq!(
+        prepared_in_transaction.run_collect_rows().unwrap(),
+        vec![vec![Value::build_text("from public")]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_failed_statement_undoes_its_setting_changes(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE unique_values (v TEXT PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO unique_values VALUES ('missing')")
+        .unwrap();
+    let failing_change =
+        "INSERT INTO unique_values VALUES (set_config('search_path', 'missing', false))";
+    assert!(conn.execute(failing_change).is_err());
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('search_path')"),
+        ["\"$user\", public"]
+    );
+
+    // In an explicit transaction, a constraint violation aborts the entire
+    // transaction (PostgreSQL 25P02 semantics). The set_config from the failed
+    // statement is undone, and the transaction must end with ROLLBACK or COMMIT
+    // before any further queries are allowed.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SELECT set_config('search_path', 'public', false)")
+        .unwrap();
+    assert!(conn.execute(failing_change).is_err()); // tx is now aborted
+    conn.execute("ROLLBACK").unwrap(); // end the aborted transaction
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('search_path')"),
+        ["\"$user\", public"] // ROLLBACK reverts session settings to pre-transaction state
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pg_setting_change_stays_when_its_statement_is_reset_after_a_row(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    let mut stmt = conn
+        .prepare("SELECT set_config('search_path', 'public', false)")
+        .unwrap();
+    assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+    stmt.reset().unwrap();
+    assert_eq!(
+        query_text(&conn, "SELECT current_setting('search_path')"),
+        ["public"]
     );
 }
 
@@ -359,7 +528,9 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
     // PostgreSQL names unaliased function-call and keyword columns after the
     // function, casts after the cast expression or else the target type,
     // coalesce/greatest/least/nullif after the keyword, CASE after its ELSE
-    // expression or else `case`, and other unaliased expressions `?column?`
+    // expression or else `case`, ARRAY[] after the keyword, COLLATE and
+    // subscripts after the expression they wrap, and other unaliased
+    // expressions `?column?`
     for (sql, expected) in [
         ("SELECT version()", "version"),
         ("SELECT pg_catalog.version()", "version"),
@@ -383,7 +554,7 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
         ("SELECT 1::int", "int4"),
         ("SELECT CAST(1 AS integer)", "int4"),
         ("SELECT int '5'", "int4"),
-        ("SELECT '2'::varchar(3)", "varchar"),
+        ("SELECT '2'::varchar", "varchar"),
         ("SELECT 1::int::text", "text"),
         ("SELECT (1 + 1)::int", "int4"),
         ("SELECT * FROM (SELECT 1::bigint) AS s", "int8"),
@@ -403,6 +574,12 @@ fn test_pg_derived_result_column_names(db: TempDatabase) {
             "SELECT CASE WHEN true THEN 1 ELSE CASE WHEN true THEN 1 ELSE abs(1) END END",
             "abs",
         ),
+        ("SELECT ARRAY[1]", "array"),
+        ("SELECT (ARRAY[1])[1]", "array"),
+        ("SELECT (ARRAY[1]::int[])[1]", "array"),
+        ("SELECT lower('a') COLLATE \"C\"", "lower"),
+        ("SELECT 'a'::text COLLATE \"C\"", "text"),
+        ("SELECT 'a' COLLATE \"C\"", "?column?"),
     ] {
         let stmt = conn.prepare(sql).unwrap();
         assert_eq!(stmt.get_column_name(0), expected, "{sql}");

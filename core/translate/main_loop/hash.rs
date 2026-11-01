@@ -3,6 +3,7 @@ use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
 use crate::translate::expr::{comparison_affinity, maybe_apply_affinity};
+use crate::translate::expr_context::{ExprContext, TableMetadata};
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
@@ -97,12 +98,15 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
         for join_key in &self.hash_join_op.join_keys {
             let build_expr = join_key.get_build_expr(self.predicates);
             let probe_expr = join_key.get_probe_expr(self.predicates);
-            let affinity =
-                comparison_affinity(build_expr, probe_expr, Some(self.table_references), None);
+            let affinity = comparison_affinity(
+                build_expr,
+                probe_expr,
+                &TableMetadata::new(Some(self.table_references)),
+            );
             key_affinities.push(affinity.aff_mask());
         }
 
-        let collations: Vec<CollationSeq> = self
+        let collations = self
             .hash_join_op
             .join_keys
             .iter()
@@ -117,20 +121,16 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
                         join_key.get_build_expr(self.predicates),
                     ),
                 };
-                resolve_comparison_collseq_with_symbols(
+                comparison_collation(
                     original_lhs,
                     original_rhs,
-                    self.table_references,
-                    Some(self.t_ctx.resolver.symbol_table),
+                    &ExprContext::new(Some(self.table_references), &self.t_ctx.resolver),
                 )
-                .unwrap_or(CollationSeq::Binary)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let use_bloom_filter = self.hash_join_op.use_bloom_filter
-            && collations
-                .iter()
-                .all(|c| matches!(*c, CollationSeq::Binary | CollationSeq::Unset));
+            && collations.iter().all(|c| *c == CollationSeq::BINARY);
 
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
         let (payload_columns, payload_signature_columns, uses_materialized_keys_and_payload) =
@@ -282,7 +282,7 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             planner.program.emit_insn(Insn::OpenRead {
                 cursor_id: planner.hash_build_cursor_id,
                 root_page: btree.root_page,
-                db: build_table.database_id,
+                db: build_table.namespace.database_id,
             });
         }
 
@@ -647,7 +647,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                 self.program.emit_insn(Insn::OpenRead {
                     cursor_id,
                     root_page: btree.root_page,
-                    db: build_table.database_id,
+                    db: build_table.namespace.database_id,
                 });
                 cursor_id
             })
@@ -672,11 +672,10 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         let hash_table_id: usize = build_table.internal_id.into();
         let num_keys = self.hash_join_op.join_keys.len();
 
-        // A prior probe pass must not hide unmatched build rows in this pass.
-        if self.hash_join_op.join_type.keeps_unmatched_build_rows() {
-            self.program
-                .emit_insn(Insn::HashResetMatched { hash_table_id });
-        }
+        // The build runs once; every pass through this loop probes it again and
+        // must not see probe rows, grace progress or matched marks of a prior pass.
+        self.program
+            .emit_insn(Insn::HashProbeInit { hash_table_id });
 
         self.program.emit_insn(Insn::Rewind {
             cursor_id: self.probe_cursor_id,
@@ -841,7 +840,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         if build_table_cursor_id.is_some() && !payload_has_build_rowid && !build_table_is_live {
             self.t_ctx
                 .resolver
-                .cache_expr_reg(Cow::Owned(rowid_expr), match_reg, false, None);
+                .cache_expr_reg(Cow::Owned(rowid_expr), match_reg, false);
         }
         if let Some(payload_reg) = payload_dest_reg {
             for (i, payload) in payload_columns.iter().enumerate() {
@@ -873,19 +872,13 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
                     continue;
                 }
                 if is_column {
-                    self.t_ctx.resolver.cache_scalar_expr_reg(
-                        Cow::Owned(expr),
-                        payload_reg + i,
-                        true,
-                        self.table_references,
-                    )?;
+                    self.t_ctx
+                        .resolver
+                        .cache_expr_reg(Cow::Owned(expr), payload_reg + i, true);
                 } else {
-                    self.t_ctx.resolver.cache_expr_reg(
-                        Cow::Owned(expr),
-                        payload_reg + i,
-                        false,
-                        None,
-                    );
+                    self.t_ctx
+                        .resolver
+                        .cache_expr_reg(Cow::Owned(expr), payload_reg + i, false);
                 }
             }
         } else if let Some(build_table_cursor_id) =

@@ -124,18 +124,18 @@ use turso_parser::ast::{
     self, Expr, FunctionTail, Name, SortOrder, TableInternalId, UnaryOperator,
 };
 
+use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::Plan;
 
 use crate::function::AggFunc;
 use crate::schema::Table;
 use crate::sync::Arc;
 use crate::translate::{
-    collate::get_collseq_from_expr,
     emitter::Resolver,
     expr::{
         expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-        expr_references_subquery_id, expression_can_fail_on_input, get_expr_affinity, walk_expr,
-        walk_expr_mut, WalkControl,
+        expr_references_subquery_id, expr_type::TypeEnv, expression_can_fail_on_input,
+        get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
     },
     plan::{
         plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinOrigin, JoinType, JoinedTable,
@@ -307,8 +307,14 @@ fn try_rewrite_in(
     // any inner WHERE expression can fail. JSON is only one example; the same
     // rule applies to any function or operator that can return an error.
     if inner_plan.result_columns.len() != 1
-        || expression_can_fail_on_input(&left)
-        || expression_can_fail_on_input(&right)
+        || expression_can_fail_on_input(
+            &left,
+            &TypeEnv::new(Some(&plan.table_references), resolver),
+        )
+        || expression_can_fail_on_input(
+            &right,
+            &TypeEnv::new(Some(&inner_plan.table_references), resolver),
+        )
     {
         return Ok(false);
     }
@@ -553,7 +559,7 @@ fn try_rewrite_single_value_aggregate(
         let Some(pair) = read_column_pair(&term.expr, &outer_table_ids, &inner_table_ids) else {
             return Ok(None);
         };
-        if !column_pair_compares_the_same(&pair, &inner_plan.table_references)? {
+        if !column_pair_compares_the_same(&pair, &inner_plan.table_references, resolver)? {
             return Ok(None);
         }
         pairs.push(pair);
@@ -562,7 +568,7 @@ fn try_rewrite_single_value_aggregate(
         return Ok(None);
     }
 
-    if !aggregate_can_run_for_unused_rows(inner_plan) {
+    if !aggregate_can_run_for_unused_rows(inner_plan, resolver) {
         return rewrite_aggregate_as_join_then_group(plan, subquery_index, subquery_id, resolver);
     }
 
@@ -616,6 +622,7 @@ fn try_rewrite_single_value_aggregate(
             lateral: false,
         }),
         subquery_id,
+        resolver,
     )?;
     // A scalar subquery result has no text order. Do not give its replacement
     // the text order of the grouped table's first result column.
@@ -983,7 +990,7 @@ fn can_rewrite_single_value_aggregate(plan: &SelectPlan, resolver: &Resolver<'_>
 /// safe for unused keys. The caller then tries join-first, which computes only
 /// keys requested by outer rows. If join-first does not support this kind of
 /// query, the correlated subquery stays unchanged.
-fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
+fn aggregate_can_run_for_unused_rows(plan: &SelectPlan, resolver: &Resolver<'_>) -> bool {
     if !plan.aggregates.iter().all(|aggregate| {
         matches!(
             aggregate.func,
@@ -1001,11 +1008,12 @@ fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
     let aggregate_expressions = plan
         .aggregates
         .iter()
-        .flat_map(|aggregate| aggregate.args.iter().chain(aggregate.filter_expr.iter()));
+        .flat_map(|aggregate| aggregate.input_exprs());
     let filter_expressions = plan.where_clause.iter().map(|term| &term.expr);
+    let env = TypeEnv::new(Some(&plan.table_references), resolver);
     !aggregate_expressions
         .chain(filter_expressions)
-        .any(expression_can_fail_on_input)
+        .any(|expr| expression_can_fail_on_input(expr, &env))
 }
 
 /// Return the result for no input rows, if it is known.
@@ -1121,15 +1129,21 @@ fn read_column_pair(
 /// to both. Either case would return the outer row twice. Use the grouped form
 /// only when both columns use the same number/text conversion rule and the same
 /// text order.
-fn column_pair_compares_the_same(pair: &ColumnPair, tables: &TableReferences) -> Result<bool> {
-    if get_expr_affinity(&pair.inner, Some(tables), None)
-        != get_expr_affinity(&pair.outer, Some(tables), None)
+fn column_pair_compares_the_same(
+    pair: &ColumnPair,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<bool> {
+    let affinity_metadata = TableMetadata::new(Some(tables));
+    if get_expr_affinity(&pair.inner, &affinity_metadata)
+        != get_expr_affinity(&pair.outer, &affinity_metadata)
     {
         return Ok(false);
     }
 
-    let inner_collation = get_collseq_from_expr(&pair.inner, tables)?.unwrap_or_default();
-    let outer_collation = get_collseq_from_expr(&pair.outer, tables)?.unwrap_or_default();
+    let collation_metadata = super::ExprContext::new(Some(tables), resolver);
+    let inner_collation = collation_metadata.expr_collation(&pair.inner)?;
+    let outer_collation = collation_metadata.expr_collation(&pair.outer)?;
     Ok(inner_collation == outer_collation)
 }
 
@@ -1282,8 +1296,9 @@ fn can_rewrite_as_semi_join(plan: &SelectPlan, resolver: &Resolver<'_>) -> Resul
         return Ok(false);
     }
 
+    let env = TypeEnv::new(Some(&plan.table_references), resolver);
     for term in &plan.where_clause {
-        if expression_can_fail_on_input(&term.expr)
+        if expression_can_fail_on_input(&term.expr, &env)
             || expr_contains_nondeterministic_scalar_function(&term.expr, resolver)?
         {
             return Ok(false);

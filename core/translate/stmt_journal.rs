@@ -21,6 +21,7 @@
 //! Both flags default to `true` (conservative). Each DML translate path calls
 //! into this module to set them to `false` when safe.
 
+use crate::namespace::NamespaceRef;
 use crate::translate::emitter::Resolver;
 use crate::translate::plan::{ColumnMask, DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
@@ -58,12 +59,38 @@ pub(crate) fn any_effective_replace(
 fn table_has_fks(
     connection: &crate::Connection,
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     table_name: &str,
 ) -> bool {
     connection.foreign_keys_enabled()
-        && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name))
-            || resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(table_name)))
+        && (resolver.with_schema(namespace.database_id, |s| {
+            s.has_child_fks(namespace.id, table_name)
+        }) || resolver.with_schema(namespace.database_id, |s| {
+            s.any_resolved_fks_referencing(namespace.id, table_name)
+        }))
+}
+
+/// Check whether a table has dependent incremental materialized views.
+/// Maintaining them evaluates the view's expressions after the base-table
+/// write, so an expression error strikes mid-statement and the statement
+/// needs a savepoint, like a trigger body does.
+fn table_has_materialized_views(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    table_name: &str,
+) -> bool {
+    resolver.with_schema(namespace.database_id, |s| {
+        !s.get_dependent_materialized_views(namespace.id, table_name)
+            .is_empty()
+    })
+}
+
+/// Check whether any of the given indexes uses an index method (vector, FTS).
+/// A method can reject a value after the statement already removed or wrote
+/// other entries for the row, so the statement needs a savepoint to keep the
+/// row and its index entries consistent.
+fn any_index_method<'a>(mut indexes: impl Iterator<Item = &'a Arc<crate::schema::Index>>) -> bool {
+    indexes.any(|index| index.index_method.is_some())
 }
 
 /// Determine whether any constraint's effective resolution can trigger an
@@ -124,12 +151,13 @@ pub(crate) fn constraint_may_abort(
 pub(crate) fn set_insert_stmt_journal_flags(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     table: &crate::schema::BTreeTable,
     has_statement_conflict: bool,
     statement_conflict: ResolveType,
     inserting_multiple_rows: bool,
     has_triggers: bool,
+    has_returning: bool,
     has_fks: bool,
     has_upsert: bool,
     has_upsert_do_update: bool,
@@ -137,17 +165,23 @@ pub(crate) fn set_insert_stmt_journal_flags(
     notnull_col_exists: bool,
     has_unique: bool,
 ) {
-    let index_modes: Vec<(Option<ResolveType>, bool)> = resolver.with_schema(database_id, |s| {
-        s.get_indices(&table.name)
-            .map(|idx| (idx.on_conflict, idx.unique))
-            .collect()
-    });
+    let (index_modes, has_index_method): (Vec<(Option<ResolveType>, bool)>, bool) = resolver
+        .with_schema(namespace.database_id, |s| {
+            (
+                s.get_indices(namespace.id, &table.name)
+                    .map(|idx| (idx.on_conflict, idx.unique))
+                    .collect(),
+                s.get_indices(namespace.id, &table.name)
+                    .any(|idx| idx.index_method.is_some()),
+            )
+        });
     let any_replace = any_effective_replace(
         has_statement_conflict,
         statement_conflict,
         table.rowid_alias_conflict_clause,
         index_modes.iter().map(|(oc, _)| *oc),
     );
+    let has_materialized_views = table_has_materialized_views(resolver, namespace, &table.name);
     let has_check = !table.check_constraints.is_empty();
     // Multi-row AUTOINCREMENT inserts taint `may_abort` even when no
     // constraint clause is declared on the table: `op_sequence_compute_next`
@@ -164,7 +198,14 @@ pub(crate) fn set_insert_stmt_journal_flags(
     // UNIQUE constraint (and any other constraints touched by SET), so it
     // can always fail mid-statement and must be undoable via a statement
     // journal — even when e.g. INSERT OR REPLACE alone would never abort.
+    // RETURNING evaluates its expressions after the row is written, so an
+    // expression error strikes mid-statement; the statement needs a savepoint
+    // to undo the row. SQLite gets the same effect because it implements
+    // RETURNING as an internal trigger.
     let may_abort = has_triggers
+        || has_returning
+        || has_materialized_views
+        || has_index_method
         || has_fks
         || autoinc_may_abort_multi_row
         || has_upsert_do_update
@@ -182,6 +223,9 @@ pub(crate) fn set_insert_stmt_journal_flags(
     // AUTOINCREMENT is multi-write because sqlite_sequence is updated before constraint checks.
     if !inserting_multiple_rows
         && !has_triggers
+        && !has_returning
+        && !has_materialized_views
+        && !has_index_method
         && !any_replace
         && !has_upsert
         && !has_autoincrement
@@ -203,7 +247,7 @@ pub(crate) fn set_update_stmt_journal_flags(
     let Some(btree_table) = target_table.btree() else {
         return Ok(()); // Virtual table — keep conservative defaults.
     };
-    let database_id = target_table.database_id;
+    let namespace = target_table.namespace;
 
     let updated_cols: ColumnMask = plan
         .set_clauses
@@ -217,12 +261,12 @@ pub(crate) fn set_update_stmt_journal_flags(
         .try_collect()?;
     let has_triggers = has_triggers_including_temp(
         resolver,
-        database_id,
+        namespace,
         TriggerEvent::Update,
         Some(&updated_col_names),
         &btree_table,
     );
-    let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
+    let has_fks = table_has_fks(connection, resolver, namespace, btree_table.name.as_str());
 
     let or_conflict = plan.or_conflict.unwrap_or(ResolveType::Abort);
     let has_statement_conflict = plan.or_conflict.is_some();
@@ -236,8 +280,19 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     // Ephemeral tables (used for key mutation / Halloween protection) always scan all
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
+    let has_returning = plan.returning.as_ref().is_some_and(|r| !r.is_empty());
+    let has_materialized_views =
+        table_has_materialized_views(resolver, namespace, btree_table.name.as_str());
+    let has_index_method = any_index_method(plan.indexes_to_update.iter());
     let is_single_row = target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !any_replace && !has_fks {
+    if is_single_row
+        && !has_triggers
+        && !has_returning
+        && !has_materialized_views
+        && !has_index_method
+        && !any_replace
+        && !has_fks
+    {
         program.set_multi_write(false);
     }
 
@@ -260,7 +315,11 @@ pub(crate) fn set_update_stmt_journal_flags(
         || !btree_table.unique_sets.is_empty()
         || plan.indexes_to_update.iter().any(|idx| idx.unique);
 
+    // RETURNING evaluates after the row write; see set_insert_stmt_journal_flags.
     let may_abort = has_triggers
+        || has_returning
+        || has_materialized_views
+        || has_index_method
         || has_fks
         || constraint_may_abort(
             has_statement_conflict,
@@ -283,7 +342,6 @@ pub(crate) fn set_delete_stmt_journal_flags(
     plan: &DeletePlan,
     resolver: &Resolver,
     connection: &Arc<Connection>,
-    database_id: usize,
 ) -> Result<()> {
     let Some(target_table) = plan.table_references.joined_tables().first() else {
         crate::bail_parse_error!("DELETE should have one target table");
@@ -292,18 +350,35 @@ pub(crate) fn set_delete_stmt_journal_flags(
         return Ok(()); // Virtual table — keep conservative defaults.
     };
     let has_triggers = plan.safety.reasons.contains(&DmlSafetyReason::Trigger);
-    let has_fks = table_has_fks(connection, resolver, database_id, btree_table.name.as_str());
+    let has_fks = table_has_fks(
+        connection,
+        resolver,
+        target_table.namespace,
+        btree_table.name.as_str(),
+    );
 
     // After rowset rewriting (for triggers/safety), the target table op is reset to a
     // Scan, so affects_max_1_row correctly returns false — no false optimization.
+    let has_returning = !plan.result_columns.is_empty();
+    let has_materialized_views =
+        table_has_materialized_views(resolver, target_table.namespace, btree_table.name.as_str());
+    let has_index_method = any_index_method(plan.indexes.iter());
     let is_single_row = target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !has_fks {
+    if is_single_row
+        && !has_triggers
+        && !has_returning
+        && !has_materialized_views
+        && !has_index_method
+        && !has_fks
+    {
         program.set_multi_write(false);
     }
 
     // DELETE has no ON CONFLICT clause, so NOT NULL/CHECK/UNIQUE don't apply —
-    // only triggers (RAISE(ABORT)) or FK violations can abort.
-    if !has_triggers && !has_fks {
+    // only triggers (RAISE(ABORT)), FK violations, a RETURNING expression, or
+    // materialized-view maintenance (both evaluated after the row is deleted)
+    // can abort.
+    if !has_triggers && !has_returning && !has_materialized_views && !has_index_method && !has_fks {
         program.set_may_abort(false);
     }
     Ok(())

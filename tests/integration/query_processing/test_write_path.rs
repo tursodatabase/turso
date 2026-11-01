@@ -594,6 +594,34 @@ fn test_rollback_on_foreign_key_constraint_violation(tmp_db: TempDatabase) -> an
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_delete_collects_rowids_first_only_when_foreign_keys_are_on(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )?;
+    conn.execute("CREATE TABLE plain_parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE plain_child(id INTEGER PRIMARY KEY, \
+         a INTEGER REFERENCES plain_parent(id) ON DELETE NO ACTION, \
+         b INTEGER REFERENCES plain_parent(id) ON DELETE RESTRICT)",
+    )?;
+    let delete_uses_rowset = |conn: &Arc<Connection>, table: &str| {
+        limbo_exec_rows(conn, &format!("EXPLAIN DELETE FROM {table} WHERE id > 5"))
+            .iter()
+            .any(|row| row[1] == RValue::Text("RowSetAdd".to_string()))
+    };
+
+    assert!(!delete_uses_rowset(&conn, "parent"));
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    assert!(delete_uses_rowset(&conn, "parent"));
+    assert!(!delete_uses_rowset(&conn, "plain_parent"));
+    Ok(())
+}
+
 #[turso_macros::test(init_sql = "CREATE TABLE t (x)")]
 fn test_multiple_statements(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
@@ -2293,5 +2321,36 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
     let ic = run_integrity_check(&conn);
     assert_eq!(ic, "ok", "integrity_check after commit: {ic}");
 
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER)")?;
+    conn.execute("CREATE INDEX tb ON t(b)")?;
+    conn.execute(
+        "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 2000) \
+         INSERT INTO t(id, b) SELECT x, x FROM s",
+    )?;
+    let mut stmt = conn.prepare("SELECT b FROM t ORDER BY b DESC")?;
+    let mut seen = Vec::new();
+    while seen.len() <= 4000 {
+        match stmt.step()? {
+            StepResult::Row => {
+                let b = stmt.row().unwrap().get::<i64>(0)?;
+                seen.push(b);
+                if b % 97 == 0 {
+                    conn.execute(format!("INSERT INTO t(b) VALUES ({})", 1_000_000 + b))?;
+                }
+            }
+            StepResult::IO => stmt._io().step()?,
+            StepResult::Done => break,
+            other => anyhow::bail!("unexpected step result {other:?}"),
+        }
+    }
+    assert_eq!(seen, (1..=2000).rev().collect::<Vec<i64>>());
     Ok(())
 }

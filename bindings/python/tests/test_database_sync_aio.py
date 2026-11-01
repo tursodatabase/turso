@@ -69,6 +69,23 @@ async def test_push():
 
 
 @pytest.mark.asyncio
+async def test_callable_remote_url():
+    with TursoServer() as server:
+        server.db_sql("CREATE TABLE t(x)")
+        server.db_sql("INSERT INTO t VALUES ('hello')")
+
+        url = server.db_url()
+        conn = await turso.aio.sync.connect(":memory:", lambda: url)
+        rows = await (await conn.execute("SELECT * FROM t")).fetchall()
+        assert rows == [("hello",)]
+
+        await conn.execute("INSERT INTO t VALUES ('push works')")
+        await conn.commit()
+        await conn.push()
+        assert server.db_sql("SELECT * FROM t") == [["hello"], ["push works"]]
+
+
+@pytest.mark.asyncio
 async def test_checkpoint():
     # turso.setup_logging(level=logging.DEBUG)
 

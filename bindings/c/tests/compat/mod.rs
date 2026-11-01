@@ -655,9 +655,11 @@ mod tests {
             let name2_str = std::ffi::CStr::from_ptr(name2).to_str().unwrap();
             assert_eq!(name2_str, "value");
 
-            // will lead to panic
-            //let invalid = sqlite3_column_name(stmt, 5);
-            //assert!(invalid.is_null());
+            for invalid_idx in [-1, 2, 5, i32::MIN, i32::MAX] {
+                assert!(sqlite3_column_name(stmt, invalid_idx).is_null());
+                assert!(sqlite3_column_table_name(stmt, invalid_idx).is_null());
+                assert!(sqlite3_column_decltype(stmt, invalid_idx).is_null());
+            }
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);
@@ -812,7 +814,7 @@ mod tests {
             let col2_len = sqlite3_column_bytes(stmt, 0);
             assert!(!col2_ptr.is_null());
 
-            let col2_slice = std::slice::from_raw_parts(col2_ptr as *const u8, col2_len as usize);
+            let col2_slice = std::slice::from_raw_parts(col2_ptr.cast::<u8>(), col2_len as usize);
             let col2_str = std::str::from_utf8(col2_slice).unwrap().to_owned();
 
             assert_eq!(col2_str, "abc");
@@ -910,6 +912,76 @@ mod tests {
             let col2_len = sqlite3_column_bytes(stmt, 0);
             let col2_slice = std::slice::from_raw_parts(col2_ptr as *const u8, col2_len as usize);
             assert_eq!(col2_slice, &data2[..2]);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[cfg(not(feature = "sqlite3"))]
+    #[test]
+    fn test_sqlite3_bind_blob_negative_len_is_misuse() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE test_bind_blob_nlen (data BLOB)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO test_bind_blob_nlen (data) VALUES (?)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            let data = b"abc\0def";
+            // A NULL value ignores n. A pointer with n < 0 is SQLITE_MISUSE.
+            assert_eq!(sqlite3_bind_blob(stmt, 1, ptr::null(), -1, None), SQLITE_OK);
+            assert_eq!(
+                sqlite3_bind_blob(stmt, 1, data.as_ptr() as *const _, -1, None),
+                SQLITE_MISUSE
+            );
+            assert_eq!(
+                sqlite3_bind_blob(stmt, 1, data.as_ptr() as *const _, 3, None),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT data FROM test_bind_blob_nlen".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let col = sqlite3_column_blob(stmt, 0);
+            let n = sqlite3_column_bytes(stmt, 0);
+            let got = std::slice::from_raw_parts(col as *const u8, n as usize);
+            assert_eq!(got, b"abc");
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);

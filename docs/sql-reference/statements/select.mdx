@@ -311,6 +311,8 @@ SELECT DISTINCT department, title FROM employees;
 DISTINCT applies to the entire result row, not to a single column. Two rows are considered duplicates only if every column value is identical.
 </Info>
 
+Text values are compared with the collation of their result column. A column with a custom collation registered by the application is not supported in `SELECT DISTINCT` or in an aggregate such as `count(DISTINCT x)`, and is an error.
+
 ## ORDER BY
 
 Sorts the result set. Without ORDER BY, the row order is unspecified.
@@ -479,6 +481,7 @@ ORDER BY department, salary;
 function_name() OVER (
   [PARTITION BY expression [, ...]]
   [ORDER BY expression [ASC | DESC] [, ...]]
+  [{ ROWS | RANGE | GROUPS } frame specification]
 )
 ```
 
@@ -486,11 +489,12 @@ function_name() OVER (
 |-----------|-------------|
 | `PARTITION BY` | Divides rows into groups (partitions). The function resets for each partition |
 | `ORDER BY` | Defines the order of rows within each partition |
+| Frame specification | `ROWS`, `RANGE`, or `GROUPS` with explicit bounds, overriding the default frame |
 
 Standard aggregate functions (`SUM`, `AVG`, `COUNT`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`) can all be used as window functions.
 
 <Info>
-Window functions in Turso use the default frame definition (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW). Custom frame specifications (ROWS, RANGE, GROUPS with explicit bounds) are not supported. The `row_number()` ranking function and the `FILTER (WHERE ...)` clause are supported; other ranking and navigation functions (`rank`, `dense_rank`, `lag`, `lead`, and so on) are not yet available.
+Turso implements the SQLite window function feature set: the default frame (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) plus custom `ROWS`, `RANGE`, and `GROUPS` frames with the `EXCLUDE` clause; the ranking functions `row_number()`, `rank()`, `dense_rank()`, `percent_rank()`, `cume_dist()`, and `ntile()`; the value functions `first_value()`, `last_value()`, and `nth_value()`; the navigational functions `lag()` and `lead()`; and the `FILTER (WHERE ...)` clause. See [Window Functions](/docs/sql-reference/functions/window) for details.
 </Info>
 
 ## Set Operations
@@ -505,6 +509,8 @@ Combine the results of two or more SELECT statements.
 | `EXCEPT` | Returns rows from the first result set that are not in the second |
 
 All set operations require the same number of columns in each SELECT, with compatible types.
+
+For text comparisons in `UNION`, `INTERSECT`, and `EXCEPT`, each result column uses the first defined collation among the corresponding SELECT expressions, from left to right. This also applies to chains of three or more SELECT statements.
 
 ```sql
 -- Customers who are also employees
@@ -590,6 +596,49 @@ WHERE EXISTS (
 ORDER BY p.price DESC
 LIMIT 20;
 ```
+
+## PostgreSQL Catalog Queries
+
+`pg_catalog.pg_class` lists public-schema sequences with `relkind = 'S'`,
+including sequences created for `SERIAL` columns. Their OIDs are distinct from
+table and index OIDs in the same catalog snapshot. Internal SQLite
+AUTOINCREMENT sequences are excluded. Sequence dumping is not yet fully supported.
+
+Through the PostgreSQL frontend, `pg_catalog.pg_statistic_ext` exposes the
+system column `tableoid` for queries such as those sent by `pg_dump`.
+The catalog currently returns no rows. Select `tableoid` explicitly; it is
+not included in `SELECT *`.
+
+`pg_catalog.pg_trigger` exposes `tgparentid` for parent-trigger lookup during
+`pg_dump` discovery. It also exposes the hidden system column `tableoid`, which
+must be selected explicitly and is not included in `SELECT *`. This catalog
+currently returns no rows.
+
+`pg_get_triggerdef(oid)` and `pg_get_triggerdef(oid, pretty)` return NULL for
+missing trigger OIDs and NULL arguments. PostgreSQL triggers are not currently
+supported, so no trigger definitions are available.
+
+`pg_catalog.pg_rewrite` exposes the hidden system column `tableoid` for rule
+discovery. The catalog currently returns no rows. Select `tableoid` explicitly;
+it is not included in `SELECT *`.
+
+`pg_catalog.pg_policy` exposes the hidden system column `tableoid` for policy
+discovery. The catalog currently returns no rows. Select `tableoid` explicitly;
+it is not included in `SELECT *`.
+
+`pg_catalog.pg_publication`, `pg_catalog.pg_publication_rel`, and
+`pg_catalog.pg_publication_namespace` expose the hidden system column `tableoid`
+for publication discovery. These catalogs currently return no rows. Select `tableoid` explicitly; it is not included in `SELECT *`.
+
+`pg_catalog.pg_seclabels` exposes the security-label columns `objoid`, `classoid`,
+`objsubid`, `objtype`, `objnamespace`, `objname`, `provider`, and `label`. It
+currently returns no rows because security labels are not supported.
+
+In the PostgreSQL frontend, `generate_series(...)` and
+`pg_catalog.generate_series(...)` are available even when `search_path` is empty.
+A table alias also names the output column: `FROM generate_series(1, 3) AS s`
+allows `SELECT s` or `SELECT s.s`. An explicit column alias such as `AS s(n)`
+uses `n` instead. Without an alias the column is named `generate_series`.
 
 ## See Also
 

@@ -9,24 +9,26 @@ sidebarTitle: Window
 Window functions perform calculations across a set of rows that are related to the current row. Unlike aggregate functions with GROUP BY, window functions do not collapse rows into a single output row. Every input row produces a corresponding output row, with the window function result appended.
 
 <Info>
-Turso supports aggregate functions used as window functions with the default frame definition, `row_number()`, `rank()`, `dense_rank()`, `first_value()`, `last_value()`, `nth_value()`, and the `FILTER (WHERE ...)` clause. Other dedicated window functions and custom frame specifications (ROWS, RANGE, or GROUPS with explicit bounds) are not yet supported.
+Turso supports the SQLite window function feature set: aggregate functions used as window functions, the ranking functions `row_number()`, `rank()`, `dense_rank()`, `percent_rank()`, `cume_dist()`, and `ntile()`, the value functions `first_value()`, `last_value()`, and `nth_value()`, the navigational functions `lag()` and `lead()`, custom `ROWS`, `RANGE`, and `GROUPS` frame specifications, the `EXCLUDE` clause, and the `FILTER (WHERE ...)` clause.
 </Info>
 
 ## Syntax
 
 ```sql
-aggregate_function(expression) OVER (
+function(expression [, ...]) OVER (
     [PARTITION BY expression [, ...]]
     [ORDER BY expression [ASC | DESC] [, ...]]
+    [<frame specification>]
 )
 ```
 
 | Clause | Description |
 |--------|-------------|
-| `aggregate_function` | Any supported aggregate function: `count`, `sum`, `avg`, `min`, `max`, `total`, `group_concat` |
+| `function` | A built-in aggregate function, a dedicated window function, or a `FILTER`-qualified aggregate |
 | `OVER (...)` | Defines the window over which the function operates |
 | `PARTITION BY` | Divides the result set into partitions. The function is applied independently within each partition. If omitted, the entire result set is one partition |
 | `ORDER BY` | Defines the order of rows within each partition. This determines which rows are included in the frame for each calculation |
+| Frame specification | `ROWS`, `RANGE`, or `GROUPS` with explicit bounds, overriding the default frame |
 
 ### Default Frame
 
@@ -40,9 +42,51 @@ This means the function considers all rows from the start of the partition up to
 
 When ORDER BY is omitted, the default frame covers the entire partition.
 
+### Custom Frames
+
+A frame specification overrides the default frame:
+
+```sql
+{ ROWS | RANGE | GROUPS } BETWEEN <start> AND <end>
+{ ROWS | RANGE | GROUPS } <bound>
+```
+
+where `<start>` and `<end>` (or the shorthand `<bound>`) are one of:
+
+| Bound | Description |
+|-------|-------------|
+| `UNBOUNDED PRECEDING` | The first row of the partition |
+| `<expression> PRECEDING` | A row or value offset before the current row |
+| `CURRENT ROW` | The current row (for `RANGE`/`GROUPS`, its peer group boundary) |
+| `<expression> FOLLOWING` | A row or value offset after the current row |
+| `UNBOUNDED FOLLOWING` | The last row of the partition |
+
+- `ROWS` counts individual physical rows.
+- `RANGE` compares the `ORDER BY` value: `<n> PRECEDING` includes every row whose ordering value is at least the current value minus `n`. When the `ORDER BY` value is a `numeric`, the bounds are computed with numeric arithmetic. An offset on a value of another custom type with an order, such as an array, is an error.
+- `GROUPS` counts peer groups (sets of rows that are equal on the `ORDER BY` expression).
+
+Example — a three-row moving window:
+
+```sql
+SELECT id, sum(v) OVER (
+    ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+) FROM t;
+```
+
+### EXCLUDE
+
+An `EXCLUDE` clause removes rows from the frame:
+
+```sql
+EXCLUDE NO OTHERS    -- keep the frame as-is (the default)
+EXCLUDE CURRENT ROW  -- remove the current row
+EXCLUDE GROUP        -- remove the current row and its peers
+EXCLUDE TIES         -- remove the peers, but keep the current row
+```
+
 ## Supported Aggregate Functions as Window Functions
 
-Any aggregate function can be used as a window function by adding an OVER clause.
+A built-in aggregate function can be used as a window function by adding an `OVER` clause.
 
 | Function | Description |
 |----------|-------------|
@@ -59,7 +103,7 @@ Any aggregate function can be used as a window function by adding an OVER clause
 
 ### row_number()
 
-Assigns a sequential integer (starting at 1) to each row within its partition, in the order defined by the window's `ORDER BY`. This is the one dedicated ranking function supported in Turso.
+Assigns a sequential integer (starting at 1) to each row within its partition, in the order defined by the window's `ORDER BY`.
 
 ```sql
 SELECT
@@ -77,6 +121,163 @@ FROM employees;
 | Engineering | Carol | 75000 | 3 |
 | Marketing | Dave | 70000 | 1 |
 | Marketing | Eve | 60000 | 2 |
+
+### rank()
+
+Assigns the same rank to rows that are equal on the `ORDER BY` expression (peers), and the next rank skips positions by the size of the peer group.
+
+```sql
+CREATE TABLE items(id INTEGER PRIMARY KEY, v INTEGER);
+INSERT INTO items VALUES (1,10),(2,10),(3,20),(4,5),(5,5),(6,5),(7,100);
+
+SELECT id, v, rank() OVER (ORDER BY v) FROM items ORDER BY id;
+```
+
+| id | v | rank() |
+|----|---|--------|
+| 1 | 10 | 4 |
+| 2 | 10 | 4 |
+| 3 | 20 | 6 |
+| 4 | 5 | 1 |
+| 5 | 5 | 1 |
+| 6 | 5 | 1 |
+| 7 | 100 | 7 |
+
+### dense_rank()
+
+Like `rank()`, peers share a rank, but the next rank is simply the previous one plus one — no gaps.
+
+```sql
+SELECT id, v, dense_rank() OVER (ORDER BY v) FROM items ORDER BY id;
+```
+
+| id | v | dense_rank() |
+|----|---|--------------|
+| 1 | 10 | 2 |
+| 2 | 10 | 2 |
+| 3 | 20 | 3 |
+| 4 | 5 | 1 |
+| 5 | 5 | 1 |
+| 6 | 5 | 1 |
+| 7 | 100 | 4 |
+
+### percent_rank()
+
+Returns a REAL computed as `(rows in peer groups before the current row) / (partition size - 1)`, so the first peer group is always 0.0 and the last reaches 1.0. A single-row partition returns 0.0.
+
+```sql
+CREATE TABLE t(x INTEGER);
+INSERT INTO t VALUES (1),(2),(3),(4),(5);
+
+SELECT x, percent_rank() OVER (ORDER BY x) FROM t;
+```
+
+| x | percent_rank() |
+|---|----------------|
+| 1 | 0.0 |
+| 2 | 0.25 |
+| 3 | 0.5 |
+| 4 | 0.75 |
+| 5 | 1.0 |
+
+### cume_dist()
+
+Returns a REAL computed as `(rows in peer groups up to and including the current row) / (partition size)`.
+
+```sql
+CREATE TABLE t5(x INTEGER);
+INSERT INTO t5 VALUES (1),(2),(3),(4),(5);
+
+SELECT x, cume_dist() OVER (ORDER BY x) FROM t5;
+```
+
+| x | cume_dist() |
+|---|-------------|
+| 1 | 0.2 |
+| 2 | 0.4 |
+| 3 | 0.6 |
+| 4 | 0.8 |
+| 5 | 1.0 |
+
+### ntile(N)
+
+Splits each partition into `N` buckets numbered 1 to N and assigns each row its bucket. When the partition size is not a clean multiple of `N`, the first buckets each get one extra row.
+
+```sql
+CREATE TABLE t10(x INTEGER);
+INSERT INTO t10 VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+
+SELECT x, ntile(3) OVER (ORDER BY x) FROM t10;
+```
+
+| x | ntile(3) |
+|---|----------|
+| 1 | 1 |
+| 2 | 1 |
+| 3 | 1 |
+| 4 | 1 |
+| 5 | 2 |
+| 6 | 2 |
+| 7 | 2 |
+| 8 | 3 |
+| 9 | 3 |
+| 10 | 3 |
+
+`N` must be a positive integer; `ntile(0)` or a negative argument fails with `argument of ntile must be a positive integer`.
+
+## Value Functions
+
+### first_value(expression)
+
+Returns the value of the first row in the frame.
+
+### last_value(expression)
+
+Returns the value of the last row in the frame. Under the default frame (which ends at the current row's peer group) rows in the same peer group share the same `last_value`. To see the true last row of the partition, use an explicit frame ending in `UNBOUNDED FOLLOWING`.
+
+### nth_value(expression, N)
+
+Returns the value of the N-th row (1-based) within the frame, or NULL when the frame has fewer than N rows.
+
+```sql
+CREATE TABLE nth_items(id INTEGER PRIMARY KEY, g TEXT, v INTEGER);
+INSERT INTO nth_items VALUES (1,'a',10),(2,'a',20),(3,'a',30),(4,'b',100),(5,'b',200);
+
+SELECT id, v, nth_value(v, 1) OVER (PARTITION BY g ORDER BY v) FROM nth_items ORDER BY id;
+```
+
+| id | v | nth_value(v, 1) |
+|----|---|-----------------|
+| 1 | 10 | 10 |
+| 2 | 20 | 10 |
+| 3 | 30 | 10 |
+| 4 | 100 | 100 |
+| 5 | 200 | 100 |
+
+## Navigational Functions
+
+### lag(expression [, offset [, default]])
+
+Returns the value of `expression` from a previous row within the partition, `offset` rows back (default 1). When the offset reaches before the first row, `default` is returned (NULL when omitted).
+
+### lead(expression [, offset [, default]])
+
+Same as `lag()` but looks forward in the partition.
+
+```sql
+CREATE TABLE v(x INTEGER);
+INSERT INTO v VALUES (1),(2),(3),(4),(5);
+
+SELECT x, lag(x) OVER (ORDER BY x), lead(x) OVER (ORDER BY x) FROM v;
+```
+
+| x | lag(x) | lead(x) |
+|---|--------|---------|
+| 1 | NULL | 2 |
+| 2 | 1 | 3 |
+| 3 | 2 | 4 |
+| 4 | 3 | 5 |
+| 5 | 4 | NULL |
 
 ## FILTER (WHERE ...)
 
@@ -272,21 +473,12 @@ FROM employees;
 
 ## Limitations
 
-The following window function features are not yet supported in Turso:
-
 | Feature | Status |
 |---------|--------|
-| `ntile(N)` | Not supported |
-| `lag(expr, offset, default)` | Not supported |
-| `lead(expr, offset, default)` | Not supported |
-| `cume_dist()` | Not supported |
-| `percent_rank()` | Not supported |
-| Custom frame: `ROWS BETWEEN ...` | Not supported |
-| Custom frame: `RANGE BETWEEN ... AND ...` | Not supported |
-| Custom frame: `GROUPS BETWEEN ...` | Not supported |
-| `EXCLUDE` clause | Not supported |
+| `DISTINCT` inside a window function call | Not supported; fails with `DISTINCT is not supported for window functions` |
+| Extension aggregates as window functions | Not supported; an extension aggregate used with `OVER` fails with `<name>() is an extension aggregate and cannot be used as a window function` |
 
-The supported functions listed above use the default frame definition.
+The built-in aggregates and dedicated window functions listed above support the default frame and explicit `ROWS`, `RANGE`, and `GROUPS` frames, including all `EXCLUDE` variants.
 
 ## See Also
 

@@ -44,6 +44,31 @@ fn test_wal_checkpoint_result(tmp_db: TempDatabase) -> Result<()> {
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
+fn test_passive_checkpoint_between_read_and_write_does_not_fail_the_write(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    let writer = tmp_db.connect_limbo();
+    let checkpointer = tmp_db.connect_limbo();
+    writer.execute("CREATE TABLE t (x)")?;
+    writer.execute("INSERT INTO t VALUES (1)")?;
+
+    writer.execute("BEGIN")?;
+    assert_eq!(execute_and_get_ints(&writer, "SELECT x FROM t")?, vec![1]);
+    let res = execute_and_get_ints(&checkpointer, "PRAGMA wal_checkpoint(PASSIVE)")?;
+    assert_eq!(res[0], 0, "checkpoint must not be busy");
+    assert_eq!(res[1], res[2], "checkpoint must backfill every frame");
+    writer.execute("INSERT INTO t VALUES (2)")?;
+    writer.execute("COMMIT")?;
+
+    assert_eq!(
+        execute_and_get_ints(&checkpointer, "SELECT x FROM t ORDER BY x")?,
+        vec![1, 2]
+    );
+    Ok(())
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
 fn test_truncate_checkpoint_not_busy_after_rollback(tmp_db: TempDatabase) -> Result<()> {
     maybe_setup_tracing();
     let conn = tmp_db.connect_limbo();
@@ -321,6 +346,52 @@ fn test_wal_read_lock_released_on_conn_drop() {
     assert!(
         truncate_succeeded,
         "truncate should have succeeded, got checkpoint result: {res:?}"
+    );
+}
+
+#[test]
+fn test_deferred_transaction_first_write_retries_stale_snapshot() {
+    maybe_setup_tracing();
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp_db = TempDatabase::new("test_deferred_first_write_stale_snapshot.db");
+    let db = tmp_db.limbo_database();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT)")
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = stop.clone();
+    let writer_db = db.clone();
+    let writer = std::thread::spawn(move || {
+        let conn = writer_db.connect(ConnectOpts::new()).unwrap();
+        while !writer_stop.load(Ordering::Relaxed) {
+            match conn.execute("INSERT INTO t(source) VALUES ('writer')") {
+                Ok(()) | Err(LimboError::Busy) => {}
+                Err(err) => panic!("writer failed: {err:?}"),
+            }
+        }
+    });
+
+    let conn = tmp_db.connect_limbo();
+    let mut result = Ok(());
+    for _ in 0..20_000 {
+        conn.execute("BEGIN DEFERRED").unwrap();
+        result = match conn.execute("INSERT INTO t(source) VALUES ('deferred')") {
+            Ok(()) | Err(LimboError::Busy) => Ok(()),
+            Err(err) => Err(err),
+        };
+        conn.execute("ROLLBACK").unwrap();
+        if result.is_err() {
+            break;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "first write after BEGIN DEFERRED must not fail on a stale snapshot, got {result:?}"
     );
 }
 

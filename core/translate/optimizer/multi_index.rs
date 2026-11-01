@@ -9,6 +9,7 @@
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Index, Schema};
 use crate::stats::AnalyzeStats;
+use crate::translate::emitter::Resolver;
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
     choose_best_btree_candidate, choose_best_in_seek_candidate, AccessMethod, AccessMethodParams,
@@ -160,6 +161,7 @@ fn get_table_local_constraints_for_branch(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: &Resolver,
 ) -> crate::Result<(Vec<WhereTerm>, TableConstraints)> {
     let synthetic_where_terms = exprs
         .iter()
@@ -177,6 +179,7 @@ fn get_table_local_constraints_for_branch(
         subqueries,
         schema,
         params,
+        resolver,
     )?
     .into_iter()
     .find(|constraints| constraints.table_id == table_reference.internal_id)
@@ -542,6 +545,7 @@ fn estimate_residual_expr_selectivity(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: &Resolver,
 ) -> f64 {
     let Ok(expr) = crate::translate::expr::unwrap_parens(expr) else {
         return params.sel_other;
@@ -557,6 +561,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             ) * estimate_residual_expr_selectivity(
                 rhs,
                 rhs_table,
@@ -565,6 +570,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             )
         }
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
@@ -576,6 +582,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             );
             let rhs_selectivity = estimate_residual_expr_selectivity(
                 rhs,
@@ -585,6 +592,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             );
             1.0 - (1.0 - lhs_selectivity) * (1.0 - rhs_selectivity)
         }
@@ -597,6 +605,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             )
         }
         _ => {
@@ -609,6 +618,7 @@ fn estimate_residual_expr_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             ) else {
                 return params.sel_other;
             };
@@ -637,6 +647,7 @@ fn estimate_multi_or_residual_selectivity(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: &Resolver,
 ) -> f64 {
     residual_exprs
         .iter()
@@ -649,6 +660,7 @@ fn estimate_multi_or_residual_selectivity(
                 subqueries,
                 schema,
                 params,
+                resolver,
             )
         })
         .product::<f64>()
@@ -671,6 +683,7 @@ fn evaluate_multi_index_branches(
     input_cardinality: f64,
     params: &CostModelParams,
     best_cost: Cost,
+    resolver: &Resolver,
 ) -> Result<Option<AccessMethod>> {
     let mut branch_costs = Vec::with_capacity(branches.len());
     let mut branch_rows = Vec::with_capacity(branches.len());
@@ -703,6 +716,7 @@ fn evaluate_multi_index_branches(
                 subqueries,
                 schema,
                 params,
+                resolver,
             )
         } else {
             1.0
@@ -822,6 +836,7 @@ fn analyze_and_terms_for_multi_index(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    resolver: &Resolver,
 ) -> Option<AndClauseDecomposition> {
     let table_id = table_reference.internal_id;
     let indexes = available_indexes.indexes_for_table(table_reference.internal_id);
@@ -855,6 +870,7 @@ fn analyze_and_terms_for_multi_index(
             rowid_alias_column,
             table_references,
             subqueries,
+            resolver,
         ) else {
             continue;
         };
@@ -946,6 +962,7 @@ fn analyze_and_terms_for_multi_index(
                 subqueries,
                 schema,
                 params,
+                resolver,
             )
             .expect("multi-index prepass accepted a term that full analysis rejected");
 
@@ -985,6 +1002,7 @@ pub fn consider_multi_index_union(
     best_cost: Cost,
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
+    resolver: &Resolver,
 ) -> Result<Option<AccessMethod>> {
     for (where_term_idx, term) in where_clause.iter().enumerate() {
         if term.consumed {
@@ -1035,6 +1053,7 @@ pub fn consider_multi_index_union(
                         subqueries,
                         schema,
                         params,
+                        resolver,
                     )
                     .ok()
                 else {
@@ -1101,6 +1120,7 @@ pub fn consider_multi_index_union(
             input_cardinality,
             params,
             best_cost,
+            resolver,
         )? {
             return Ok(Some(access_method));
         }
@@ -1128,6 +1148,7 @@ pub fn consider_multi_index_intersection(
     best_cost: Cost,
     lhs_mask: &TableMask,
     analyze_stats: &AnalyzeStats,
+    resolver: &Resolver,
 ) -> Result<Option<AccessMethod>> {
     let Some(decomposition) = analyze_and_terms_for_multi_index(
         rhs_table,
@@ -1137,6 +1158,7 @@ pub fn consider_multi_index_intersection(
         subqueries,
         schema,
         params,
+        resolver,
     ) else {
         return Ok(None);
     };
@@ -1221,6 +1243,7 @@ pub fn consider_multi_index_intersection(
         input_cardinality,
         params,
         best_cost,
+        resolver,
     )
 }
 
@@ -1232,6 +1255,8 @@ mod tests {
     };
     use crate::alloc::TursoIteratorExt;
     use crate::alloc::TursoSliceExt;
+    use crate::namespace::NamespaceRef;
+    use crate::translate::emitter::Resolver;
     use crate::{
         schema::{
             BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
@@ -1315,12 +1340,13 @@ mod tests {
             unmatched_right_rows_plan: None,
             table,
             identifier: name,
+            has_alias: false,
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
-            database_id: MAIN_DB_ID,
+            namespace: NamespaceRef::root_of(MAIN_DB_ID),
             plan_estimate: None,
             indexed: None,
         }
@@ -1420,6 +1446,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1522,6 +1549,7 @@ mod tests {
             Cost(f64::INFINITY),
             &lhs_mask,
             &AnalyzeStats::default(),
+            &Resolver::empty_for_tests(),
         )
         .unwrap();
 
@@ -1557,13 +1585,18 @@ mod tests {
                 name: "idx_item_a".to_string(),
                 table_name: "item".to_string(),
                 where_clause: None,
-                columns: crate::alloc::vec![IndexColumn::new("a", 1)],
+                columns: crate::alloc::vec![IndexColumn::new(
+                    "a",
+                    1,
+                    crate::translate::collate::CollationSeq::BINARY
+                )],
                 unique: false,
                 ephemeral: false,
                 root_page: 2,
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1604,6 +1637,7 @@ mod tests {
             Cost(f64::INFINITY),
             &TableMask::default(),
             &AnalyzeStats::default(),
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .expect("rowid and secondary-index terms should be eligible for intersection");
@@ -1673,6 +1707,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1778,6 +1813,7 @@ mod tests {
             Cost(f64::INFINITY),
             &lhs_mask,
             &AnalyzeStats::default(),
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .expect("compound OR branches should produce a multi-index union");
@@ -1855,6 +1891,7 @@ mod tests {
                 has_rowid: true,
                 index_method: None,
                 on_conflict: None,
+                constraint_name: None,
             })]),
         );
 
@@ -1916,6 +1953,7 @@ mod tests {
             Cost(f64::INFINITY),
             &lhs_mask,
             &AnalyzeStats::default(),
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .expect("plain OR branches should produce a multi-index union");
@@ -1933,6 +1971,7 @@ mod tests {
             Cost(f64::INFINITY),
             &lhs_mask,
             &AnalyzeStats::default(),
+            &Resolver::empty_for_tests(),
         )
         .unwrap()
         .expect("residual-filtered OR branches should still produce a multi-index union");

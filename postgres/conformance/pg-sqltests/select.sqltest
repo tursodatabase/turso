@@ -77,6 +77,141 @@ expect {
     1|2
 }
 
+test subquery-column-alias-list-renames-columns {
+    SELECT s.p + s.q FROM (SELECT 1 AS a, 2 AS b) AS s(p, q);
+}
+expect {
+    3
+}
+
+test values-subquery-column-alias-list {
+    SELECT v.b, v.a FROM (VALUES (1, 2), (3, 4)) AS v(a, b) ORDER BY v.a;
+}
+expect {
+    2|1
+    4|3
+}
+
+test star-subquery-column-alias-list {
+    SELECT s.y FROM (SELECT * FROM (VALUES (1, 2)) AS t(a, b)) AS s(x, y);
+}
+expect {
+    2
+}
+
+test subquery-column-alias-list-keeps-inner-order-by {
+    SELECT s.b FROM (SELECT a, b FROM (VALUES (1, 9), (2, 3)) AS t(a, b) ORDER BY b LIMIT 1) AS s(b, a);
+}
+expect {
+    2
+}
+
+test partial-column-alias-list-keeps-remaining-names {
+    SELECT s.x, s.b FROM (SELECT 1 AS a, 2 AS b) AS s(x);
+    SELECT v.x, v.column2 FROM (VALUES (3, 4)) AS v(x);
+}
+expect {
+    1|2
+    3|4
+}
+
+test column-alias-list-longer-than-subquery-errors {
+    SELECT * FROM (SELECT 1, 2) AS s(a, b, c);
+}
+@sqlstate 42P10
+expect error {
+}
+
+test generate-series-column-alias-list-renames-column {
+    SELECT sum(g.n) FROM generate_series(1, 3) AS g(n);
+}
+expect {
+    6
+}
+
+test generate-series-table-alias-names-column {
+    SELECT s, s.s FROM generate_series(1, 3) AS s ORDER BY s;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+test generate-series-quoted-table-alias-names-column {
+    SELECT "series value" FROM generate_series(1, 3) AS "series value"
+    ORDER BY "series value";
+}
+expect {
+    1
+    2
+    3
+}
+
+test generate-series-alias-used-as-array-subscript {
+    SET search_path TO '';
+    SELECT a.elements[s]
+    FROM (VALUES (ARRAY[10, 20, 30])) AS a(elements),
+         pg_catalog.generate_series(1, array_upper(a.elements, 1)) AS s
+    ORDER BY s;
+}
+expect {
+    10
+    20
+    30
+}
+
+test generate-series-column-named-after-function {
+    SELECT generate_series FROM generate_series(1, 3);
+    SELECT generate_series.generate_series FROM generate_series(4, 4);
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test generate-series-column-named-after-table-alias {
+    SELECT g FROM generate_series(1, 3) g;
+    SELECT g.g FROM generate_series(4, 4) AS g;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test generate-series-select-star-column-name {
+    SELECT * FROM generate_series(1, 2) g, generate_series(3, 3) ORDER BY g.g;
+}
+expect {
+    1|3
+    2|3
+}
+
+test generate-series-has-no-value-column {
+    SELECT value FROM generate_series(1, 3);
+}
+@sqlstate 42703
+expect error {
+}
+
+test generate-series-rejects-aggregate-argument {
+    SELECT * FROM generate_series(1, count(*));
+}
+@sqlstate 42803
+expect error {
+}
+
+test generate-series-rejects-window-function-argument {
+    SELECT * FROM generate_series(1, 3, rank() OVER ()) AS g(n);
+}
+@sqlstate 42P20
+expect error {
+}
+
 test select-null-renders-empty {
     SELECT NULL;
 }
@@ -109,6 +244,7 @@ test select-cast-to-enum-rejects-unknown-label {
     CREATE TYPE mood AS ENUM ('sad', 'happy');
     SELECT 'xyz'::mood;
 }
+@sqlstate 22P02
 expect error {
     invalid input value for enum mood
 }
@@ -125,6 +261,7 @@ test select-cast-to-domain-checks-constraint {
     CREATE DOMAIN short_text AS text CHECK (length(VALUE) < 3);
     SELECT 'abcd'::short_text;
 }
+@sqlstate 23514
 expect error {}
 
 test select-cast-text-to-date-and-time {
@@ -144,11 +281,13 @@ expect {
 test select-cast-invalid-text-to-date {
     SELECT 'hello'::date;
 }
+@sqlstate 22007
 expect error {}
 
 test select-cast-invalid-text-to-timestamp {
     SELECT 'hello'::timestamp;
 }
+@sqlstate 22007
 expect error {}
 
 test select-case-expression {
@@ -222,6 +361,30 @@ test any-subquery {
 expect {
     1
     5
+}
+
+test exists-subquery-with-empty-select-list {
+    SELECT a FROM (VALUES (1), (2)) AS t1(a)
+    WHERE EXISTS (SELECT FROM (VALUES (2)) AS t2(b) WHERE t2.b > t1.a);
+}
+expect {
+    1
+}
+
+test exists-subquery-with-empty-select-list-rejects-order-by-position {
+    SELECT a FROM (VALUES (1)) AS t1(a)
+    WHERE EXISTS (SELECT FROM (VALUES (2)) AS t2(b) ORDER BY 1);
+}
+@sqlstate 42P10
+expect error {
+}
+
+test exists-subquery-with-empty-select-list-rejects-group-by-position {
+    SELECT a FROM (VALUES (1)) AS t1(a)
+    WHERE EXISTS (SELECT FROM (VALUES (2)) AS t2(b) GROUP BY 1);
+}
+@sqlstate 42P10
+expect error {
 }
 
 test select-current-data-and-time {
@@ -304,24 +467,28 @@ expect {
 test qualified-column-errors-when-the-nearest-table-with-its-name-has-no-such-column {
     SELECT t2.a, (SELECT t2.a + b FROM (SELECT 100 AS b) AS t2) FROM t1 AS t2;
 }
+@sqlstate 42703
 expect error {}
 
 @setup outer_t1
 test qualified-column-in-exists-errors-when-the-nearest-table-has-no-such-column {
     SELECT x.a FROM t1 AS x WHERE EXISTS (SELECT 1 FROM (SELECT 5 AS b) AS x WHERE x.a = 1);
 }
+@sqlstate 42703
 expect error {}
 
 @setup outer_t1
 test qualified-column-errors-when-a-cte-with-the-same-name-has-no-such-column {
     WITH t2 AS (SELECT 100 AS b) SELECT t2.a, (SELECT t2.a + b FROM t2) FROM t1 AS t2;
 }
+@sqlstate 42703
 expect error {}
 
 @setup outer_t1
 test qualified-column-errors-when-a-middle-query-table-has-no-such-column {
     SELECT (SELECT (SELECT x.a FROM (SELECT 1 AS c) AS z) FROM (SELECT 5 AS b) AS x) FROM t1 AS x;
 }
+@sqlstate 42703
 expect error {}
 
 setup array_items {
@@ -449,6 +616,7 @@ expect {
 test array-subquery-single-column-required {
     SELECT ARRAY(SELECT v, group_id FROM array_items);
 }
+@sqlstate 42601
 expect error {}
 
 @setup array_items
@@ -657,6 +825,96 @@ expect {
     N
 }
 
+test intersect-binds-tighter-than-union {
+    SELECT 1 UNION SELECT 2 INTERSECT SELECT 3;
+    SELECT 5 UNION ALL SELECT 5 INTERSECT SELECT 5 ORDER BY 1;
+}
+expect {
+    1
+    5
+    5
+}
+
+test parenthesized-set-operation-on-the-right {
+    SELECT 1 AS n EXCEPT (SELECT 2 UNION SELECT 1) UNION SELECT 7;
+    (SELECT 1 UNION SELECT 2) INTERSECT (SELECT 2 UNION SELECT 3);
+    SELECT count(*) FROM (SELECT 1 EXCEPT (SELECT 1 UNION SELECT 2)) AS s;
+}
+expect {
+    7
+    2
+    0
+}
+
+setup set_operation_operands {
+    CREATE TABLE t (a int, b text);
+    INSERT INTO t VALUES (3, 'x'), (1, 'y'), (2, 'z');
+    CREATE TABLE u (a int, b text);
+    INSERT INTO u VALUES (5, 'p'), (4, 'q'), (1, 'y');
+}
+
+@setup set_operation_operands
+@skip-if postgres "PostgreSQL accepts it"
+test set-operation-leading-operand-selecting-star-rejected {
+    (SELECT * FROM t ORDER BY a LIMIT 1) UNION SELECT * FROM u;
+}
+expect error {
+}
+
+@setup set_operation_operands
+test set-operation-operands-keep-their-own-order-by-and-limit {
+    (SELECT a FROM t ORDER BY a DESC LIMIT 1) UNION ALL (SELECT a FROM u ORDER BY a LIMIT 1) ORDER BY a;
+    (SELECT a, b FROM t ORDER BY a DESC LIMIT 2) UNION SELECT a, b FROM u ORDER BY a;
+    SELECT 0 UNION ALL (SELECT a FROM u ORDER BY a OFFSET 1) ORDER BY 1;
+}
+expect {
+    1
+    3
+    1|y
+    2|z
+    3|x
+    4|q
+    5|p
+    0
+    4
+    5
+}
+
+@setup set_operation_operands
+test limited-set-operation-as-set-operation-operand {
+    ((SELECT a FROM t UNION SELECT a FROM u) ORDER BY a DESC LIMIT 2) UNION SELECT 1 ORDER BY a;
+    SELECT 9 UNION ALL (SELECT a FROM t EXCEPT SELECT a FROM u ORDER BY 1 LIMIT 1) ORDER BY 1;
+}
+expect {
+    1
+    4
+    5
+    2
+    9
+}
+
+@setup set_operation_operands
+test with-on-set-operation-operand {
+    (WITH c AS (SELECT a FROM t WHERE a > 1) SELECT a FROM c) UNION SELECT 7 ORDER BY a;
+}
+expect {
+    2
+    3
+    7
+}
+
+@setup set_operation_operands
+test nested-set-operation-in-correlated-subquery {
+    SELECT a FROM t WHERE a IN (SELECT 1 UNION SELECT 2 INTERSECT SELECT t.a) ORDER BY a;
+    SELECT a FROM t WHERE a IN ((SELECT u.a FROM u WHERE u.a = t.a LIMIT 1) UNION SELECT 3) ORDER BY a;
+}
+expect {
+    1
+    2
+    1
+    3
+}
+
 @setup null_order
 test window-order-by-puts-nulls-last {
     SELECT coalesce(x::text, 'N'), row_number() OVER (ORDER BY x) FROM v ORDER BY 2;
@@ -675,4 +933,596 @@ expect {
     1|1
     2|1
     N|1
+}
+
+setup like_strings {
+    CREATE TABLE t (id int, s text);
+    INSERT INTO t VALUES (1, 'abc'), (2, 'Abd'), (3, 'a_c'), (4, 'axc'), (5, 'a\c'), (6, 'a*c'), (7, 'a[c');
+}
+
+@setup like_strings
+test like-is-case-sensitive {
+    SELECT id FROM t WHERE s LIKE 'Ab%' ORDER BY id;
+    SELECT id FROM t WHERE s NOT LIKE 'a%' ORDER BY id;
+    SELECT id FROM t WHERE s LIKE 'Ab' || '%' ORDER BY id;
+}
+expect {
+    2
+    2
+    2
+}
+
+@setup like_strings
+test like-in-partial-index-and-index-expression {
+    CREATE INDEX t_like_partial ON t (s) WHERE s LIKE 'a\_%';
+    CREATE INDEX t_like_expr ON t ((s NOT LIKE 'A%'));
+    SELECT id FROM t WHERE s LIKE 'a\_%' ORDER BY id;
+    SELECT id FROM t WHERE s NOT LIKE 'A%' AND s LIKE '_b%' ORDER BY id;
+}
+expect {
+    3
+    1
+}
+
+@setup like_strings
+test like-backslash-escapes-a-wildcard {
+    SELECT id FROM t WHERE s LIKE 'a\_c' ORDER BY id;
+    SELECT id FROM t WHERE s LIKE 'a\*c' ORDER BY id;
+}
+expect {
+    3
+    6
+}
+
+@setup like_strings
+test like-escape-clause-replaces-backslash {
+    SELECT id FROM t WHERE s LIKE 'a#_c' ESCAPE '#' ORDER BY id;
+    SELECT id FROM t WHERE s LIKE 'a\c' ESCAPE '#' ORDER BY id;
+    SELECT id FROM t WHERE s LIKE 'a\c' ESCAPE '' ORDER BY id;
+}
+expect {
+    3
+    5
+    5
+}
+
+@setup like_strings
+test like-matches-glob-characters-literally {
+    SELECT id FROM t WHERE s LIKE 'a*c' ORDER BY id;
+    SELECT id FROM t WHERE s LIKE 'a[c' ORDER BY id;
+}
+expect {
+    6
+    7
+}
+
+@setup like_strings
+test ilike-ignores-case-and-backslash-escapes-a-wildcard {
+    SELECT id FROM t WHERE s ILIKE 'AB%' ORDER BY id;
+    SELECT id FROM t WHERE s ILIKE 'A\_C' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup like_strings
+test ilike-in-index-expression {
+    CREATE INDEX t_ilike_expr ON t ((s ILIKE 'A%'));
+    SELECT id FROM t WHERE s ILIKE 'A%' AND s NOT ILIKE '_X%' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    5
+    6
+    7
+}
+
+@setup like_strings
+@skip-if postgres "Turso can only index LIKE with a string-literal pattern, which it turns into GLOB"
+test like-with-computed-pattern-in-index-errors {
+    CREATE INDEX t_like_computed ON t (id) WHERE s LIKE 'a' || '%';
+}
+expect error {
+    CREATE INDEX supports LIKE and ILIKE only with a string-literal pattern
+}
+
+@setup like_strings
+@skip-if postgres "Turso can only index LIKE with a string-literal pattern, which it turns into GLOB"
+test like-with-escape-clause-in-index-errors {
+    CREATE INDEX t_like_escape ON t (id) WHERE s LIKE 'a#_c' ESCAPE '#';
+}
+expect error {
+    CREATE INDEX supports LIKE and ILIKE only with a string-literal pattern
+}
+
+test ilike-pattern-ending-with-escape-errors {
+    SELECT 'abc\' ILIKE 'ABC\';
+}
+@sqlstate 22025
+expect error {
+    LIKE pattern must not end with escape character
+}
+
+test like-pattern-ending-with-escape-errors {
+    SELECT 'abc\' LIKE 'abc\';
+}
+@sqlstate 22025
+expect error {
+    LIKE pattern must not end with escape character
+}
+
+test like-pattern-ending-with-escape-is-false-when-the-text-runs-out-first {
+    SELECT CASE WHEN 'x' LIKE 'abc\' THEN 1 ELSE 0 END;
+}
+expect {
+    0
+}
+
+test like-long-pattern-of-literal-glob-characters {
+    SELECT CASE WHEN repeat('*', 20000) LIKE repeat('\*', 20000) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN repeat('?', 20000) LIKE repeat('?', 20000) THEN 1 ELSE 0 END;
+    SELECT CASE WHEN repeat('*', 20000) LIKE repeat('?', 20000) THEN 1 ELSE 0 END;
+}
+expect {
+    1
+    1
+    0
+}
+
+test like-escape-longer-than-one-character-errors {
+    SELECT 'abc' LIKE 'abc' ESCAPE '##';
+}
+@sqlstate 22025
+expect error {
+    invalid escape string
+}
+
+@setup like_strings
+test case-insensitive-regex-match {
+    SELECT id FROM t WHERE s ~* '^ab' ORDER BY id;
+    SELECT id FROM t WHERE s !~* '^ab' AND s ~ '^a.c$' ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+}
+
+test similar-to-anchors-alternation-and-treats-dot-caret-dollar-literally {
+    SELECT CASE WHEN 'ax' SIMILAR TO 'a|b' THEN 1 ELSE 0 END, CASE WHEN 'b' SIMILAR TO 'a|b' THEN 1 ELSE 0 END, CASE WHEN 'abc' SIMILAR TO 'a.c' THEN 1 ELSE 0 END, CASE WHEN 'a.c' SIMILAR TO 'a.c' THEN 1 ELSE 0 END, CASE WHEN 'a^b' SIMILAR TO 'a^b' THEN 1 ELSE 0 END, CASE WHEN 'a$' SIMILAR TO 'a$' THEN 1 ELSE 0 END, CASE WHEN 'x' SIMILAR TO '[^a]' THEN 1 ELSE 0 END, CASE WHEN 'a%' SIMILAR TO 'a\%' THEN 1 ELSE 0 END, CASE WHEN 'aab' SIMILAR TO '(a|b)+' THEN 1 ELSE 0 END, CASE WHEN 'abc' NOT SIMILAR TO 'a_' THEN 1 ELSE 0 END, CASE WHEN 'a5' SIMILAR TO 'a\d' THEN 1 ELSE 0 END, CASE WHEN 'ad' SIMILAR TO 'a\d' THEN 1 ELSE 0 END, CASE WHEN ' ' SIMILAR TO '\s' THEN 1 ELSE 0 END;
+}
+expect {
+    0|1|0|1|1|1|1|1|1|1|1|0|1
+}
+
+test similar-to-escape-character {
+    SELECT CASE WHEN 'a%' SIMILAR TO 'a#%' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'ab' SIMILAR TO 'a#%' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a_' SIMILAR TO 'a!_' ESCAPE '!' THEN 1 ELSE 0 END, CASE WHEN 'ax' SIMILAR TO 'a!_' ESCAPE '!' THEN 1 ELSE 0 END, CASE WHEN 'a#' SIMILAR TO 'a##' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a5' SIMILAR TO 'a#d' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a%' NOT SIMILAR TO 'a#%' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a%' SIMILAR TO 'a\%' ESCAPE '\' THEN 1 ELSE 0 END;
+}
+expect {
+    1|0|1|0|1|1|0|1
+}
+
+test similar-to-escape-makes-backslash-a-literal {
+    SELECT CASE WHEN 'a\b' SIMILAR TO 'a\b' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a\b' SIMILAR TO 'a[\x]b' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a%' SIMILAR TO 'a%' ESCAPE '' THEN 1 ELSE 0 END, CASE WHEN 'a\bc' SIMILAR TO 'a\%' ESCAPE '' THEN 1 ELSE 0 END, CASE WHEN 'a%' SIMILAR TO 'a\%' ESCAPE '' THEN 1 ELSE 0 END;
+}
+expect {
+    1|1|1|1|0
+}
+
+test similar-to-escape-double-quote-separators {
+    SELECT CASE WHEN 'xay' SIMILAR TO '%#"a#"%' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'xay' SIMILAR TO '%\"a\"%' THEN 1 ELSE 0 END, CASE WHEN 'xby' SIMILAR TO '%#"a#"%' ESCAPE '#' THEN 1 ELSE 0 END;
+}
+expect {
+    1|1|0
+}
+
+test similar-to-escape-null-gives-null {
+    SELECT CASE WHEN ('a' SIMILAR TO 'a' ESCAPE NULL) IS NULL THEN 1 ELSE 0 END, CASE WHEN (NULL SIMILAR TO 'a' ESCAPE '#') IS NULL THEN 1 ELSE 0 END;
+}
+expect {
+    1|1
+}
+
+test similar-to-escape-longer-than-one-character-errors {
+    SELECT 'a' SIMILAR TO 'a' ESCAPE '##';
+}
+@sqlstate 22025
+expect error {
+    invalid escape string
+}
+
+test similar-to-more-than-two-escape-double-quotes-errors {
+    SELECT 'a' SIMILAR TO '#"a#"#"' ESCAPE '#';
+}
+@sqlstate 2200C
+expect error {
+    SQL regular expression may not contain more than two escape-double-quote separators
+}
+
+test similar-to-non-literal-pattern-and-escape {
+    CREATE TABLE similar_patterns (id int, s text, pattern text, esc text);
+    INSERT INTO similar_patterns VALUES (1, 'a%', 'a#%', '#'), (2, 'ab', 'a#%', '#'), (3, 'abc', 'a(b|x)c', '\'), (4, 'a.c', 'a.c', ''), (5, 'abc', 'a.c', ''), (6, 'a', 'a', NULL);
+    SELECT id FROM similar_patterns WHERE s SIMILAR TO pattern ESCAPE esc ORDER BY id;
+    SELECT id FROM similar_patterns WHERE s SIMILAR TO pattern ORDER BY id;
+    SELECT id FROM similar_patterns WHERE s NOT SIMILAR TO pattern || '%' ESCAPE esc ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+    3
+    4
+    6
+    2
+    5
+}
+
+test similar-to-non-literal-escape-longer-than-one-character-errors {
+    CREATE TABLE similar_escapes (esc text);
+    INSERT INTO similar_escapes VALUES ('##');
+    SELECT 'a' SIMILAR TO 'a' ESCAPE esc FROM similar_escapes;
+}
+@sqlstate 22025
+expect error {
+    invalid escape string
+}
+
+test similar-to-escape-function {
+    SELECT similar_to_escape('a#%#"b#"c', '#'), similar_to_escape('a%_');
+}
+expect {
+    ^(?:a\%){1,1}?(b){1,1}(?:c)$|^(?:a.*.)$
+}
+
+test similar-to-custom-escape-inside-brackets {
+    SELECT CASE WHEN ']x' SIMILAR TO '[#]]x' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN '5' SIMILAR TO '[#d]' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN '"' SIMILAR TO '[#"]' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN ']x' SIMILAR TO p ESCAPE '#' THEN 1 ELSE 0 END FROM (SELECT '[#]]x' AS p) s;
+}
+expect {
+    1|1|1|1
+}
+
+test similar-to-escape-function-makes-groups-non-capturing {
+    SELECT similar_to_escape('a(b|c)'), similar_to_escape('[(]#(', '#');
+}
+expect {
+    ^(?:a(?:b|c))$|^(?:[(]\()$
+}
+
+@setup like_strings
+test similar-to-escape-in-partial-index {
+    CREATE INDEX t_similar_escape ON t (id) WHERE s SIMILAR TO 'a#_c' ESCAPE '#';
+    SELECT id FROM t WHERE s SIMILAR TO 'a#_c' ESCAPE '#' ORDER BY id;
+}
+expect {
+    3
+}
+
+@setup like_strings
+@skip-if postgres "Turso can only index SIMILAR TO with a string-literal pattern, which it turns into a regex"
+test similar-to-with-computed-pattern-in-index-errors {
+    CREATE INDEX t_similar_computed ON t (id) WHERE s SIMILAR TO 'a' || '%';
+}
+expect error {
+    CREATE INDEX supports SIMILAR TO only with a string-literal pattern and ESCAPE
+}
+
+test with-clause-on-set-operation-and-values {
+    WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION SELECT 2 ORDER BY 1;
+    WITH c AS (SELECT 3 AS x) VALUES ((SELECT x FROM c));
+}
+expect {
+    1
+    2
+    3
+}
+
+# A WITH clause in front of UNION / INTERSECT / EXCEPT covers every part of
+# the compound select.
+
+setup cte_rows {
+    CREATE TABLE t (id int PRIMARY KEY, x int);
+    INSERT INTO t VALUES (1, 1), (2, 2);
+}
+
+@setup cte_rows
+test with-clause-before-union-all {
+    WITH c AS (SELECT x FROM t) SELECT x FROM c UNION ALL SELECT x FROM c ORDER BY x;
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+@setup cte_rows
+test with-clause-before-intersect {
+    WITH c AS (SELECT x FROM t WHERE x > 1) SELECT x FROM t INTERSECT SELECT x FROM c ORDER BY x;
+}
+expect {
+    2
+}
+
+@setup cte_rows
+test with-clause-before-except {
+    WITH c AS (SELECT x FROM t WHERE x > 1) SELECT x FROM t EXCEPT SELECT x FROM c ORDER BY x;
+}
+expect {
+    1
+}
+
+test with-clause-two-ctes-three-way-union {
+    WITH a AS (SELECT 1 AS n), b AS (SELECT 2 AS n)
+    SELECT n FROM a UNION ALL SELECT n FROM b UNION ALL SELECT n FROM a ORDER BY n;
+}
+expect {
+    1
+    1
+    2
+}
+
+@setup cte_rows
+test with-clause-before-union-in-from-subquery {
+    SELECT * FROM (WITH c AS (SELECT x FROM t) SELECT x FROM c UNION ALL SELECT x FROM c) AS s ORDER BY x;
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+@setup cte_rows
+test with-clause-before-union-with-limit {
+    WITH c AS (SELECT x FROM t) SELECT x FROM c UNION ALL SELECT x FROM c ORDER BY x LIMIT 3;
+}
+expect {
+    1
+    1
+    2
+}
+
+test with-recursive-before-union-all {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3)
+    SELECT n FROM r UNION ALL SELECT n FROM r ORDER BY n;
+}
+expect {
+    1
+    1
+    2
+    2
+    3
+    3
+}
+
+test insert-with-and-values-with-clause {
+    CREATE TABLE ins_with2 (a int);
+    WITH d AS (SELECT 6 AS y) INSERT INTO ins_with2 WITH c AS (SELECT 7 AS x) VALUES ((SELECT y FROM d)), ((SELECT x FROM c));
+    SELECT a FROM ins_with2 ORDER BY a;
+}
+expect {
+    6
+    7
+}
+
+test insert-values-with-clause-not-visible-in-returning {
+    CREATE TABLE ins_u (x int);
+    INSERT INTO ins_u VALUES (3);
+    CREATE TABLE ins_with3 (a int);
+    INSERT INTO ins_with3 WITH ins_u AS (SELECT 7 AS x) VALUES ((SELECT x FROM ins_u)) RETURNING (SELECT x FROM ins_u);
+}
+expect {
+    3
+}
+
+test insert-values-with-clause {
+    CREATE TABLE ins_with (a int);
+    INSERT INTO ins_with WITH c AS (SELECT 5 AS x) VALUES ((SELECT x FROM c));
+    SELECT a FROM ins_with;
+}
+expect {
+    5
+}
+
+test set-operation-nested-on-the-right-with-same-operator {
+    SELECT 1 UNION ALL (SELECT 2 UNION ALL SELECT 3) ORDER BY 1;
+    SELECT 1 UNION (SELECT 1 UNION SELECT 2) ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+    1
+    2
+}
+
+test cast-to-public-qualified-type {
+    CREATE TYPE qmood AS ENUM ('a', 'b');
+    SELECT 'b'::public.qmood, '5'::pg_catalog.int4 + 1;
+}
+expect {
+    b|6
+}
+
+test cast-to-type-in-unknown-schema-errors {
+    SELECT '5'::nosuchschema.int4;
+}
+@sqlstate 3F000
+expect error {
+}
+
+test function-in-schema-main-errors {
+    SELECT main.lower('A');
+}
+@sqlstate 3F000
+expect error {
+    schema "main" does not exist
+}
+
+test recursive-cte-reference-inside-same-operator-group {
+    WITH RECURSIVE r(n) AS (SELECT 1 UNION (SELECT 2 UNION SELECT n + 1 FROM r WHERE n < 3)) SELECT n FROM r ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+test limit-negative-is-an-error {
+    SELECT * FROM generate_series(1, 3) LIMIT -1;
+}
+@sqlstate 2201W
+expect error {
+    LIMIT must not be negative
+}
+
+test offset-negative-is-an-error {
+    SELECT * FROM generate_series(1, 3) OFFSET -1;
+}
+@sqlstate 2201X
+expect error {
+    OFFSET must not be negative
+}
+
+test limit-negative-from-subquery-is-an-error {
+    SELECT * FROM generate_series(1, 3) LIMIT (SELECT -1);
+}
+@sqlstate 2201W
+expect error {
+    LIMIT must not be negative
+}
+
+test offset-negative-from-subquery-is-an-error {
+    SELECT * FROM generate_series(1, 3) OFFSET (SELECT -1);
+}
+@sqlstate 2201X
+expect error {
+    OFFSET must not be negative
+}
+
+test limit-all-and-null-return-every-row {
+    SELECT * FROM generate_series(1, 3) LIMIT ALL;
+    SELECT * FROM generate_series(1, 3) LIMIT NULL;
+    SELECT * FROM generate_series(1, 3) LIMIT (SELECT NULL::int);
+}
+expect {
+    1
+    2
+    3
+    1
+    2
+    3
+    1
+    2
+    3
+}
+
+test offset-null-skips-no-rows {
+    SELECT * FROM generate_series(1, 3) OFFSET NULL;
+    SELECT * FROM generate_series(1, 3) LIMIT ALL OFFSET 1;
+}
+expect {
+    1
+    2
+    3
+    2
+    3
+}
+
+test limit-and-offset-fractions-round-half-away-from-zero {
+    SELECT * FROM generate_series(1, 3) LIMIT 1.5;
+    SELECT * FROM generate_series(1, 3) LIMIT 2.5;
+    SELECT * FROM generate_series(1, 3) OFFSET 1.5;
+    SELECT count(*) FROM (SELECT * FROM generate_series(1, 3) LIMIT -0.4) AS s;
+}
+expect {
+    1
+    2
+    1
+    2
+    3
+    3
+    0
+}
+
+test limit-expression-is-evaluated-once {
+    CREATE SEQUENCE limit_calls;
+    SELECT * FROM generate_series(1, 5) LIMIT nextval('limit_calls') + 0.5;
+    SELECT currval('limit_calls');
+    DROP SEQUENCE limit_calls;
+}
+expect {
+    1
+    2
+    1
+}
+
+test compound-select-limit-and-offset-expressions {
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 1 + 1;
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 ORDER BY 1 LIMIT 1 + 1;
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 2 OFFSET 0 + 1;
+}
+expect {
+    1
+    2
+    1
+    2
+    2
+    3
+}
+
+test compound-select-limit-all-null-and-fractions {
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT ALL;
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 OFFSET NULL;
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 1.5;
+}
+expect {
+    1
+    2
+    3
+    1
+    2
+    3
+    1
+    2
+}
+
+test compound-select-limit-negative-is-an-error {
+    SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT -1;
+}
+@sqlstate 2201W
+expect error {
+    LIMIT must not be negative
+}
+
+test compound-select-offset-negative-is-an-error {
+    SELECT 1 UNION SELECT 2 UNION SELECT 3 ORDER BY 1 OFFSET -1;
+}
+@sqlstate 2201X
+expect error {
+    OFFSET must not be negative
+}
+
+test limit-out-of-bigint-range-is-an-error {
+    SELECT * FROM generate_series(1, 3) LIMIT 9223372036854775808;
+}
+@sqlstate 22003
+expect error {
+    bigint out of range
+}
+
+test limit-text-that-is-not-a-number-is-an-error {
+    SELECT * FROM generate_series(1, 3) LIMIT 'abc';
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type bigint: "abc"
 }

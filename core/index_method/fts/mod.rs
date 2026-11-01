@@ -51,7 +51,10 @@ use tantivy::{
     index::SegmentId,
     indexer::{AddOperation, SegmentWriter},
     query::{EnableScoring, Query, Scorer},
-    schema::{Field, IndexRecordOption, Schema},
+    schema::{
+        Field, FieldType, IndexRecordOption, JsonObjectOptions, OwnedValue, Schema,
+        TextFieldIndexing, TextOptions,
+    },
     tokenizer::{
         NgramTokenizer, RawTokenizer, SimpleTokenizer, TextAnalyzer, TokenStream,
         WhitespaceTokenizer,
@@ -125,7 +128,7 @@ impl FtsStore {
 
 fn key_info() -> KeyInfo {
     KeyInfo {
-        collation: CollationSeq::Binary,
+        collation: CollationSeq::BINARY,
         sort_order: SortOrder::Asc,
         nulls_order: None,
     }
@@ -303,20 +306,8 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
     let valid_columns: HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
 
     // Parse format: "col1=1.5,col2=2.0"
-    for part in weights_str.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-
-        let (col_name, weight_str) = part.split_once('=').ok_or_else(|| {
-            LimboError::ParseError(format!(
-                "invalid weight format '{part}'. Expected 'column=weight' (e.g., 'title=2.0')",
-            ))
-        })?;
-
-        let col_name = col_name.trim();
-        let weight_str = weight_str.trim();
+    for entry in split_weights(weights_str) {
+        let (col_name, weight_str) = entry?;
 
         // Validate column exists in index
         if !valid_columns.contains(col_name) {
@@ -357,6 +348,85 @@ impl IndexMethod for FtsIndexMethod {
         let attachment = FtsIndexAttachment::new(cfg.clone())?;
         Ok(Arc::new(attachment))
     }
+
+    fn rename_column_in_with_clause(
+        &self,
+        with_clause: &mut [(ast::Name, Box<ast::Expr>)],
+        from: &str,
+        to: &str,
+    ) -> Result<()> {
+        let Some((_, value)) = with_clause
+            .iter_mut()
+            .find(|(key, _)| key.as_str().eq_ignore_ascii_case("weights"))
+        else {
+            return Ok(());
+        };
+        let ast::Expr::Literal(ast::Literal::String(weights)) = value.as_mut() else {
+            return Ok(());
+        };
+        if let Some(renamed_weights) = rename_column_in_weights(weights, from, to)? {
+            *weights = renamed_weights;
+        }
+        Ok(())
+    }
+}
+
+/// Renames column `from` to `to` in a weights value like 'title=2.0,body=1.0'
+/// Returns None if the weights do not name the column
+fn rename_column_in_weights(weights: &str, from: &str, to: &str) -> Result<Option<String>> {
+    let entries = split_weights(weights).collect::<Result<Vec<_>>>()?;
+    if !entries
+        .iter()
+        .any(|(column, _)| column.eq_ignore_ascii_case(from))
+    {
+        return Ok(None);
+    }
+    let renamed: Vec<(&str, &str)> = entries
+        .into_iter()
+        .map(|(column, weight)| {
+            if column.eq_ignore_ascii_case(from) {
+                (to, weight)
+            } else {
+                (column, weight)
+            }
+        })
+        .collect();
+    let renamed_weights = format!(
+        "'{}'",
+        crate::util::escape_sql_string_literal(
+            &renamed
+                .iter()
+                .map(|(column, weight)| format!("{column}={weight}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    );
+    if !split_weights(&renamed_weights)
+        .collect::<Result<Vec<_>>>()
+        .is_ok_and(|read_back| read_back == renamed)
+    {
+        return Err(LimboError::ParseError(format!(
+            "cannot rename column {from} to \"{to}\": the name cannot be written in FTS weights"
+        )));
+    }
+    Ok(Some(renamed_weights))
+}
+
+/// Splits a weights value like 'title=2.0, body=1.0' into (column, weight) pairs
+fn split_weights(weights: &str) -> impl Iterator<Item = Result<(&str, &str)>> + '_ {
+    weights
+        .trim_matches(|c| c == '\'' || c == '"')
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let (column, weight) = part.split_once('=').ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "invalid weight format '{part}'. Expected 'column=weight' (e.g., 'title=2.0')",
+                ))
+            })?;
+            Ok((column.trim(), weight.trim()))
+        })
 }
 
 /// The single cursor allowed to flush this FTS index for a given connection.
@@ -569,8 +639,8 @@ pub struct FtsIndexAttachment {
     /// Tantivy fields for the document identity
     identity_hi_field: Field,
     identity_lo_field: Field,
-    /// Schema fields for each indexed text column
-    text_fields: Vec<(IndexColumn, Field)>,
+    /// Schema fields for each indexed column
+    indexed_fields: Vec<(IndexColumn, Field)>,
     /// Parsed query patterns for FTS queries
     patterns: Vec<Select>,
     /// Weights for each field in FTS scoring, from the WITH clause.
@@ -584,6 +654,7 @@ pub struct FtsIndexAttachment {
 /// Supported tokenizer names for FTS indexes
 pub const SUPPORTED_TOKENIZERS: &[&str] = &[
     "default",    // Tantivy default: lowercase + punctuation split + 40 char limit
+    "en_stem",    // Like default, plus English stemming ("running" matches "runs")
     "raw",        // No tokenization - exact match only
     "simple",     // Basic whitespace/punctuation split
     "whitespace", // Split on whitespace only
@@ -591,7 +662,14 @@ pub const SUPPORTED_TOKENIZERS: &[&str] = &[
 ];
 
 /// Supported keys in the WITH clause of an FTS index
-pub const SUPPORTED_WITH_KEYS: &[&str] = &["tokenizer", "weights", "min_gram", "max_gram"];
+pub const SUPPORTED_WITH_KEYS: &[&str] = &[
+    "tokenizer",
+    "weights",
+    "min_gram",
+    "max_gram",
+    "json_fields",
+    "json_tokenizer",
+];
 
 /// Ngram window used when `min_gram`/`max_gram` are not given.
 pub const DEFAULT_NGRAM_WINDOW: (usize, usize) = (2, 3);
@@ -655,6 +733,32 @@ impl FtsIndexAttachment {
             )));
         }
 
+        let json_columns = parse_json_fields(
+            parameters.get(UncasedStr::new("json_fields")).copied(),
+            &cfg.columns,
+        )?;
+        let json_tokenizer = match parameters.get(UncasedStr::new("json_tokenizer")) {
+            None => tokenizer_name.as_str(),
+            Some(Value::Text(value)) => {
+                if json_columns.is_empty() {
+                    return Err(LimboError::ParseError(
+                        "FTS json_tokenizer requires json_fields".into(),
+                    ));
+                }
+                value.as_str().trim_matches(|c| c == '\'' || c == '"')
+            }
+            Some(_) => {
+                return Err(LimboError::ParseError(
+                    "FTS json_tokenizer must be text".into(),
+                ))
+            }
+        };
+        if !SUPPORTED_TOKENIZERS.contains(&json_tokenizer) {
+            return Err(LimboError::ParseError(format!(
+                "unsupported FTS json_tokenizer '{json_tokenizer}'"
+            )));
+        }
+
         // Parse the ngram window: WITH (tokenizer = 'ngram', min_gram = 1, max_gram = 3)
         let parse_gram = |key: &str| -> Result<Option<usize>> {
             let Some(value) = parameters.get(UncasedStr::new(key)) else {
@@ -671,10 +775,14 @@ impl FtsIndexAttachment {
         };
         let min_gram = parse_gram("min_gram")?;
         let max_gram = parse_gram("max_gram")?;
-        if (min_gram.is_some() || max_gram.is_some()) && tokenizer_name != "ngram" {
-            return Err(LimboError::ParseError(format!(
-                "FTS WITH parameters 'min_gram' and 'max_gram' require tokenizer = 'ngram', got tokenizer = '{tokenizer_name}'"
-            )));
+        if (min_gram.is_some() || max_gram.is_some())
+            && tokenizer_name != "ngram"
+            && json_tokenizer != "ngram"
+        {
+            return Err(LimboError::ParseError(
+                "FTS min_gram and max_gram require tokenizer = 'ngram' or json_tokenizer = 'ngram'"
+                    .into(),
+            ));
         }
         let ngram_window = (
             min_gram.unwrap_or(DEFAULT_NGRAM_WINDOW.0),
@@ -691,16 +799,25 @@ impl FtsIndexAttachment {
         let field_weights = if let Some(weights_value) = parameters.get(UncasedStr::new("weights"))
         {
             let weights_str = match weights_value {
-                Value::Text(t) => {
-                    let s = t.to_string();
-                    s.trim_matches(|c| c == '\'' || c == '"').to_string()
-                }
-                _ => String::new(),
+                Value::Text(t) => t.as_str(),
+                _ => "",
             };
-            parse_field_weights(&weights_str, &cfg.columns)?
+            parse_field_weights(weights_str, &cfg.columns)?
         } else {
             HashMap::default()
         };
+
+        // Tantivy panics on these names, so refuse them here
+        for col in &cfg.columns {
+            if !tantivy::schema::is_valid_field_name(&col.name)
+                || [ROWID_FIELD, IDENTITY_HI_FIELD, IDENTITY_LO_FIELD].contains(&col.name.as_str())
+            {
+                return Err(LimboError::ParseError(format!(
+                    "FTS cannot index a column named \"{}\": the name must not be empty, start with '-', or be one of {ROWID_FIELD}, {IDENTITY_HI_FIELD}, {IDENTITY_LO_FIELD}",
+                    col.name
+                )));
+            }
+        }
 
         // Build Tantivy schema (no Directory or Index creation yet)
         let mut schema_builder = Schema::builder();
@@ -716,15 +833,29 @@ impl FtsIndexAttachment {
         let identity_lo_field =
             schema_builder.add_u64_field(IDENTITY_LO_FIELD, tantivy::schema::FAST);
 
-        let mut text_fields = Vec::with_capacity(cfg.columns.len());
+        let mut indexed_fields = Vec::with_capacity(cfg.columns.len());
         for col in &cfg.columns {
-            let opts = tantivy::schema::TextOptions::default().set_indexing_options(
-                tantivy::schema::TextFieldIndexing::default()
-                    .set_tokenizer(&tokenizer_name)
-                    .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
-            );
-            let field = schema_builder.add_text_field(&col.name, opts);
-            text_fields.push((col.clone(), field));
+            let is_json = json_columns.contains(&col.name);
+            let tokenizer = if is_json {
+                json_tokenizer
+            } else {
+                &tokenizer_name
+            };
+            let indexing = TextFieldIndexing::default()
+                .set_tokenizer(tokenizer)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+            let field = if is_json {
+                let options = JsonObjectOptions::default()
+                    .set_indexing_options(indexing)
+                    .set_fast(None);
+                schema_builder.add_json_field(&col.name, options)
+            } else {
+                schema_builder.add_text_field(
+                    &col.name,
+                    TextOptions::default().set_indexing_options(indexing),
+                )
+            };
+            indexed_fields.push((col.clone(), field));
         }
 
         let schema = schema_builder.build();
@@ -734,45 +865,35 @@ impl FtsIndexAttachment {
         let cols = cfg
             .columns
             .iter()
-            .map(|c| c.name.as_str())
+            .map(|c| crate::util::quote_identifier(&c.name))
             .collect::<Vec<_>>()
             .join(", ");
+        let table = crate::util::quote_identifier(&cfg.table_name);
 
         // Pattern 0: score with ORDER BY DESC LIMIT
         let score_pattern = format!(
-            "SELECT fts_score({}, ?) as score FROM {} ORDER BY score DESC LIMIT ?",
-            cols, cfg.table_name
+            "SELECT fts_score({cols}, ?) as score FROM {table} ORDER BY score DESC LIMIT ?"
         );
         // Pattern 1: combined + ORDER BY DESC + LIMIT (most specific)
         let combined_ordered_limit = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score DESC LIMIT ?",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC LIMIT ?"
         );
         // Pattern 2: combined + ORDER BY DESC (no LIMIT)
         let combined_ordered = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score DESC",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) ORDER BY score DESC"
         );
         // Pattern 3: combined + LIMIT (no ORDER BY)
         let combined_limit = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) LIMIT ?",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1) LIMIT ?"
         );
         // Pattern 4: combined (no ORDER BY, no LIMIT)
         let combined = format!(
-            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1)",
-            cols, cfg.table_name, cols
+            "SELECT fts_score({cols}, ?1) as score FROM {table} WHERE fts_match({cols}, ?1)"
         );
         // Pattern 5: match + LIMIT
-        let match_limit = format!(
-            "SELECT * FROM {} WHERE fts_match({}, ?) LIMIT ?",
-            cfg.table_name, cols
-        );
+        let match_limit = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?");
         // Pattern 6: match (no LIMIT)
-        let match_pattern = format!(
-            "SELECT * FROM {} WHERE fts_match({}, ?)",
-            cfg.table_name, cols
-        );
+        let match_pattern = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)");
         let patterns = parse_patterns(&[
             &score_pattern,          // 0
             &combined_ordered_limit, // 1
@@ -788,13 +909,43 @@ impl FtsIndexAttachment {
             rowid_field,
             identity_hi_field,
             identity_lo_field,
-            text_fields,
+            indexed_fields,
             patterns,
             field_weights,
             ngram_window,
             shared: Arc::new(FtsShared::default()),
         })
     }
+}
+
+fn parse_json_fields(value: Option<&Value>, columns: &[IndexColumn]) -> Result<HashSet<String>> {
+    let mut names = HashSet::default();
+    let Some(value) = value else {
+        return Ok(names);
+    };
+    let Value::Text(value) = value else {
+        return Err(LimboError::ParseError(
+            "FTS json_fields must be a comma-separated list of indexed columns".into(),
+        ));
+    };
+    let value = value.as_str().trim_matches(|c| c == '\'' || c == '"');
+    for name in value.split(',').map(str::trim) {
+        if name.is_empty() {
+            return Err(LimboError::ParseError(
+                "empty column name in FTS json_fields".into(),
+            ));
+        }
+        let column = columns
+            .iter()
+            .find(|col| col.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| LimboError::ParseError(format!("unknown FTS JSON column '{name}'")))?;
+        if !names.insert(column.name.clone()) {
+            return Err(LimboError::ParseError(format!(
+                "duplicate FTS JSON column '{name}'"
+            )));
+        }
+    }
+    Ok(names)
 }
 
 impl IndexMethodAttachment for FtsIndexAttachment {
@@ -844,6 +995,37 @@ impl IndexMethodAttachment for FtsIndexAttachment {
         selected.push(args.last()?.clone());
         *args = selected;
         Some(result)
+    }
+
+    fn rename_column(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
+        if !self
+            .cfg
+            .columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(from))
+        {
+            return Ok(None);
+        }
+        let mut cfg = self.cfg.clone();
+        for column in &mut cfg.columns {
+            if column.name.eq_ignore_ascii_case(from) {
+                column.name = to.to_string();
+            }
+        }
+        if let Some((_, Value::Text(weights))) = cfg
+            .parameters
+            .iter_mut()
+            .find(|(key, _)| key.eq_ignore_ascii_case("weights"))
+        {
+            if let Some(renamed_weights) = rename_column_in_weights(weights.as_str(), from, to)? {
+                *weights = crate::types::Text::new(renamed_weights);
+            }
+        }
+        Ok(Some(Arc::new(FtsIndexAttachment::new(cfg)?)))
     }
 }
 
@@ -1023,7 +1205,7 @@ pub struct FtsCursor {
     identity_lo_field: Field,
     /// (min_gram, max_gram) window for the ngram tokenizer
     ngram_window: (usize, usize),
-    text_fields: Vec<(IndexColumn, Field)>,
+    indexed_fields: Vec<(IndexColumn, Field)>,
     /// The user-visible index name, for error messages.
     index_name: String,
     store: FtsStore,
@@ -1100,9 +1282,9 @@ impl FtsCursor {
     /// Creates a new FTS cursor with the given configuration.
     fn new(attachment: &FtsIndexAttachment) -> Self {
         let store = FtsStore::new(&attachment.cfg.index_name);
-        let text_fields = attachment.text_fields.clone();
-        let default_fields: Vec<Field> = text_fields.iter().map(|(_, f)| *f).collect();
-        let field_boosts: Vec<(Field, f32)> = text_fields
+        let indexed_fields = attachment.indexed_fields.clone();
+        let default_fields: Vec<Field> = indexed_fields.iter().map(|(_, f)| *f).collect();
+        let field_boosts: Vec<(Field, f32)> = indexed_fields
             .iter()
             .filter_map(|(col, field)| {
                 attachment
@@ -1118,7 +1300,7 @@ impl FtsCursor {
             identity_hi_field: attachment.identity_hi_field,
             identity_lo_field: attachment.identity_lo_field,
             ngram_window: attachment.ngram_window,
-            text_fields,
+            indexed_fields,
             index_name: attachment.cfg.index_name.clone(),
             store,
             default_fields,
@@ -2926,7 +3108,7 @@ impl IndexMethodCursor for FtsCursor {
         result
     }
 
-    /// Buffers a document for the next segment build. Values are text
+    /// Buffers a document for the next segment build. Values are indexed
     /// columns followed by rowid.
     fn insert(&mut self, values: &[Register]) -> IOResultOr<()> {
         self.claim_writer_slot()?;
@@ -2946,7 +3128,14 @@ impl IndexMethodCursor for FtsCursor {
         let mut doc = TantivyDocument::default();
         doc.add_i64(self.rowid_field, rowid);
 
-        for ((_col, field), reg) in self.text_fields.iter().zip(&values[..values.len() - 1]) {
+        for ((col, field), reg) in self.indexed_fields.iter().zip(&values[..values.len() - 1]) {
+            if matches!(
+                self.schema.get_field_entry(*field).field_type(),
+                FieldType::JsonObject(_)
+            ) {
+                add_json_value(&mut doc, *field, &col.name, reg)?;
+                continue;
+            }
             match reg {
                 Register::Value(Value::Text(t)) => {
                     doc.add_text(*field, t.as_str());
@@ -3738,6 +3927,33 @@ impl IndexMethodCursor for FtsCursor {
             merge_segments_skipped: Some(stats.merge_segments_skipped.load(Ordering::Relaxed)),
         }))
     }
+}
+
+fn add_json_value(
+    doc: &mut TantivyDocument,
+    field: Field,
+    column: &str,
+    value: &Register,
+) -> Result<()> {
+    let text = match value {
+        Register::Value(Value::Null) => return Ok(()),
+        Register::Value(Value::Text(text)) => text.as_str(),
+        _ => {
+            return Err(LimboError::InvalidArgument(format!(
+                "FTS JSON column '{column}' requires JSON text or NULL"
+            )))
+        }
+    };
+    let object: Option<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(text)
+        .map_err(|error| {
+            LimboError::InvalidArgument(format!(
+                "invalid JSON object in FTS column '{column}': {error}"
+            ))
+        })?;
+    if let Some(object) = object {
+        doc.add_field_value(field, &OwnedValue::from(object));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -11,21 +11,27 @@
 // contract (the outer `Statement::step()` must return
 // `StepResult::IO` rather than blocking).
 
+use crate::translate::collate::CollationSeq;
 use std::sync::Arc;
 
 use crate::bail_parse_error;
+use crate::namespace::{NamespaceId, NamespaceRef, MANGLED_NAME_PREFIX};
 use crate::schema::{
     BTreeTable, Sequence, AUTOINCREMENT_SEQ_PREFIX, SEQ_BACKING_TABLE_PREFIX,
     SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::functions::{names_mangled_sequence, qualify_sequence_argument};
+use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
+use crate::translate::trigger_exec::rewrite_select_expressions;
 use crate::util::{escape_sql_string_literal, normalize_ident};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, AddSequenceData, CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral,
 };
+use crate::Connection;
 use crate::Result;
 use turso_parser::ast;
 
@@ -34,13 +40,13 @@ pub fn sequence_backing_table_name(seq_name: &str) -> String {
 }
 
 pub fn sequence_backing_table_sql(seq_name: &str) -> String {
-    let table_name = sequence_backing_table_name(seq_name);
+    let escaped_table_name = sequence_backing_table_name(seq_name).replace('"', "\"\"");
     // INTEGER PRIMARY KEY makes `value` the rowid alias: nextval inserts are
     // keyed by the sequence value itself (no synthetic rowid) and the inline
     // compaction emitted by `emit_backing_table_compaction` collapses each
     // backing table down to a single watermark row via DELETE-all + INSERT.
     format!(
-        "CREATE TABLE \"{table_name}\"(\
+        "CREATE TABLE \"{escaped_table_name}\"(\
          value INTEGER PRIMARY KEY,\
          is_called INTEGER,\
          start INTEGER,\
@@ -179,18 +185,18 @@ pub fn emit_sequence_backing_table(
 pub fn emit_disk_read_nextval(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     seq_name: &str,
     seq: &Sequence,
     target_register: usize,
-    // Optional caller-supplied register holding the name that currval is
-    // keyed by (the user's spelling, e.g. `'main.my_seq'`). When `None`
-    // the helper allocates one holding `seq_name`.
-    seq_name_reg: Option<usize>,
 ) -> Result<()> {
-    let backing_table_name = sequence_backing_table_name(seq_name);
+    let database_id = namespace.database_id;
+    let mangled_seq_name = resolver.mangle_name(namespace, seq_name);
+    let backing_table_name = sequence_backing_table_name(&mangled_seq_name);
     let backing_table = resolver
-        .with_schema(database_id, |s| s.get_btree_table(&backing_table_name))
+        .with_schema(database_id, |s| {
+            s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
+        })
         .ok_or_else(|| {
             crate::LimboError::InternalError(format!(
                 "missing backing table for sequence \"{seq_name}\""
@@ -198,9 +204,6 @@ pub fn emit_disk_read_nextval(
         })?;
     let root_page = backing_table.root_page;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(backing_table));
-
-    let seq_name_reg =
-        seq_name_reg.unwrap_or_else(|| program.emit_string8_new_reg(seq_name.to_string()));
 
     // Inner-tx wrap state, shared by Begin/Commit. See
     // Insn::SequenceBeginInnerTx doc for the path-kind / saved-outer
@@ -262,6 +265,7 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceComputeNext {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         in_value_reg: col_base,
         in_is_called_reg: col_base + 1,
@@ -363,7 +367,7 @@ pub fn emit_disk_read_nextval(
         program,
         resolver,
         database_id,
-        seq_name,
+        &mangled_seq_name,
         target_register,
     )?;
 
@@ -374,6 +378,7 @@ pub fn emit_disk_read_nextval(
     // `op_sequence_register_allocation`.
     program.emit_insn(Insn::SequenceRegisterAllocation {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         value_reg: target_register,
         saved_outer_reg,
@@ -404,12 +409,15 @@ pub fn emit_disk_read_nextval(
 
     program.emit_insn(Insn::SequenceTrackAllocation {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
         value_reg: target_register,
     });
 
     program.emit_insn(Insn::SetSequenceCurrval {
-        seq_name_reg,
+        db: database_id,
+        namespace: namespace.id,
+        seq_name: seq_name.to_string(),
         value_reg: target_register,
     });
 
@@ -428,14 +436,18 @@ pub fn emit_disk_read_nextval(
 pub fn emit_disk_advance_past(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     seq_name: &str,
     seq: &Sequence,
     value_reg: usize,
 ) -> Result<()> {
-    let backing_table_name = sequence_backing_table_name(seq_name);
+    let database_id = namespace.database_id;
+    let mangled_seq_name = resolver.mangle_name(namespace, seq_name);
+    let backing_table_name = sequence_backing_table_name(&mangled_seq_name);
     let backing_table = resolver
-        .with_schema(database_id, |s| s.get_btree_table(&backing_table_name))
+        .with_schema(database_id, |s| {
+            s.get_btree_table(NamespaceId::ROOT, &backing_table_name)
+        })
         .ok_or_else(|| {
             crate::LimboError::InternalError(format!(
                 "missing backing table for sequence \"{seq_name}\""
@@ -506,14 +518,14 @@ pub fn emit_disk_advance_past(
             rhs: col_value_reg,
             target_pc: done_seek_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Gt {
             lhs: value_reg,
             rhs: col_value_reg,
             target_pc: do_advance_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
     } else {
         program.emit_insn(Insn::Gt {
@@ -521,14 +533,14 @@ pub fn emit_disk_advance_past(
             rhs: col_value_reg,
             target_pc: done_seek_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Lt {
             lhs: value_reg,
             rhs: col_value_reg,
             target_pc: do_advance_label,
             flags: CmpInsFlags::default(),
-            collation: program.curr_collation(),
+            collation: CollationSeq::for_internal_values(),
         });
     }
     program.emit_insn(Insn::If {
@@ -569,9 +581,10 @@ pub fn emit_disk_advance_past(
             .skip_all_change_counts(),
         table_name: seq_name.to_string(),
     });
-    let seq_name_reg = program.emit_string8_new_reg(seq_name.to_string());
     program.emit_insn(Insn::SetSequenceCurrval {
-        seq_name_reg,
+        db: database_id,
+        namespace: namespace.id,
+        seq_name: seq_name.to_string(),
         value_reg,
     });
     // Inline compaction is gated the same way as the nextval path —
@@ -606,7 +619,13 @@ pub fn emit_disk_advance_past(
     // row even though the engine's autoinc state is unchanged. Repro
     // covered by `mvcc-autoinc-explicit-low-rowid-preserves-sqlite-sequence`
     // in `sqlite/conformance/turso-sqltests/mvcc_sequence.sqltest`.
-    emit_autoincrement_sqlite_sequence_sync(program, resolver, database_id, seq_name, value_reg)?;
+    emit_autoincrement_sqlite_sequence_sync(
+        program,
+        resolver,
+        database_id,
+        &mangled_seq_name,
+        value_reg,
+    )?;
 
     program.preassign_label_to_next_insn(done_seek_label);
     program.emit_insn(Insn::Close { cursor_id });
@@ -664,7 +683,7 @@ pub(crate) fn emit_backing_table_compaction(
         rhs: keep_value_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Delete {
         cursor_id,
@@ -709,7 +728,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
     value_reg: usize,
 ) -> Result<bool> {
     let Some(sseq_table) = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME)
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
     }) else {
         return Ok(false);
     };
@@ -740,7 +759,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
         rhs: name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Delete {
         cursor_id: sseq_cursor,
@@ -861,13 +880,16 @@ pub fn translate_create_sequence(
     max_value: &Option<i64>,
     cycle: bool,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
-    let database_id = resolver.resolve_database_id_for_create(seq_name)?;
+    let namespace = resolver.resolve_namespace_for_create(seq_name)?;
+    let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
     let normalized_name = normalize_ident(seq_name.name.as_str());
+    let mangled_seq_name = resolver.mangle_name(namespace, &normalized_name);
 
     // `__turso_internal_autoincrement_<table>` is reserved for the
     // implicit sequences CREATE TABLE ... AUTOINCREMENT installs.
@@ -888,8 +910,24 @@ pub fn translate_create_sequence(
         );
     }
 
+    // A sequence of a namespace is stored under its mangled name, so a name
+    // like that would be read as a sequence of another namespace. The other
+    // reserved prefixes are for tables: a sequence's backing table has a
+    // prefix of its own, so they cannot collide.
+    if resolver.catalog.dialect.supports_namespaces()
+        && normalized_name.starts_with(MANGLED_NAME_PREFIX)
+        && !connection.is_nested_stmt()
+    {
+        bail_parse_error!(
+            "Object name reserved for internal use: {}",
+            seq_name.name.as_str()
+        );
+    }
+
     // Check if sequence already exists
-    let exists = resolver.with_schema(database_id, |s| s.get_sequence(&normalized_name).is_some());
+    let exists = resolver.with_schema(database_id, |s| {
+        s.get_sequence(namespace.id, &normalized_name).is_some()
+    });
     if exists {
         if if_not_exists {
             return Ok(());
@@ -908,7 +946,10 @@ pub fn translate_create_sequence(
     )?;
 
     // Open cursor to sqlite_schema (in the target database)
-    let table = resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let table = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -921,7 +962,7 @@ pub fn translate_create_sequence(
         resolver,
         database_id,
         sqlite_schema_cursor_id,
-        &normalized_name,
+        &mangled_seq_name,
         seq.start_value,
         seq.increment_by,
         seq.min_value,
@@ -933,6 +974,7 @@ pub fn translate_create_sequence(
     program.emit_insn(Insn::AddSequence {
         data: Box::new(AddSequenceData {
             db: database_id,
+            namespace: namespace.id,
             name: normalized_name,
             start: seq.start_value,
             increment: seq.increment_by,
@@ -966,21 +1008,28 @@ pub fn translate_create_sequence(
 pub(crate) fn emit_drop_sequence_cleanup(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    database_id: usize,
+    namespace: NamespaceRef,
     seq_name: &str,
 ) -> Result<bool> {
-    let backing_table_name = sequence_backing_table_name(seq_name);
+    let database_id = namespace.database_id;
+    let backing_table_name =
+        sequence_backing_table_name(&resolver.mangle_name(namespace, seq_name));
     let root_page = resolver.with_schema(database_id, |s| {
-        s.get_sequence(seq_name)?;
-        Some(s.get_btree_table(&backing_table_name)?.root_page)
+        s.get_sequence(namespace.id, seq_name)?;
+        Some(
+            s.get_btree_table(NamespaceId::ROOT, &backing_table_name)?
+                .root_page,
+        )
     });
     let Some(root_page) = root_page else {
         return Ok(false);
     };
 
     // Open sqlite_schema for writing (in the target database)
-    let schema_table =
-        resolver.with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
+    let schema_table = resolver.with_schema(database_id, |s| {
+        s.get_btree_table(NamespaceId::ROOT, SQLITE_TABLEID)
+            .unwrap()
+    });
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
@@ -1017,14 +1066,14 @@ pub(crate) fn emit_drop_sequence_cleanup(
         rhs: type_str_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Ne {
         lhs: col1_reg,
         rhs: seq_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id,
@@ -1052,6 +1101,7 @@ pub(crate) fn emit_drop_sequence_cleanup(
     // Remove from the in-memory schema (sequences + tables maps)
     program.emit_insn(Insn::DropSequence {
         db: database_id,
+        namespace: namespace.id,
         seq_name: seq_name.to_string(),
     });
     Ok(true)
@@ -1065,15 +1115,20 @@ pub fn translate_drop_sequence(
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let normalized_name = normalize_ident(seq_name.name.as_str());
-    let database_id = if seq_name.namespace.is_some() {
-        resolver.resolve_database_id(seq_name)?
+    let namespace = if seq_name.namespace.is_some() {
+        resolver.resolve_namespace(seq_name)?
     } else {
-        resolver.resolve_existing_sequence_database_id(&normalized_name)
+        match resolver.find_existing_sequence(&normalized_name) {
+            Some(namespace) => namespace,
+            None if if_exists => return Ok(()),
+            None => bail_parse_error!("sequence \"{}\" does not exist", normalized_name),
+        }
     };
+    let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
 
-    let dropped = emit_drop_sequence_cleanup(program, resolver, database_id, &normalized_name)?;
+    let dropped = emit_drop_sequence_cleanup(program, resolver, namespace, &normalized_name)?;
     if !dropped {
         if if_exists {
             return Ok(());
@@ -1090,4 +1145,51 @@ pub fn translate_drop_sequence(
     });
 
     Ok(())
+}
+
+/// Qualifies each sequence named without a schema in `expr` with the schema
+/// it resolves to now, so the expression keeps that sequence after the
+/// search path changes. Returns whether a name was qualified.
+pub(crate) fn bind_sequence_names(expr: &mut ast::Expr, resolver: &Resolver) -> Result<bool> {
+    let mut bound = false;
+    walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
+        bound |= bind_sequence_call(expr, resolver);
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(bound)
+}
+
+/// [`bind_sequence_names`] for every expression of a SELECT.
+pub(crate) fn bind_sequence_names_in_select(
+    select: &mut ast::Select,
+    resolver: &Resolver,
+) -> Result<()> {
+    rewrite_select_expressions(select, &mut |expr: &mut ast::Expr| {
+        bind_sequence_call(expr, resolver);
+        Ok(())
+    })
+}
+
+fn bind_sequence_call(expr: &mut ast::Expr, resolver: &Resolver) -> bool {
+    let ast::Expr::FunctionCall { name, args, .. } = expr else {
+        return false;
+    };
+    if !is_sequence_function(name.as_str()) {
+        return false;
+    }
+    // A sequence named by its mangled name is bound to its namespace already.
+    if names_mangled_sequence(args, resolver) {
+        return false;
+    }
+    let Some(qualified_args) = qualify_sequence_argument(args, resolver) else {
+        return false;
+    };
+    *args = qualified_args.into_vec();
+    true
+}
+
+pub(crate) fn is_sequence_function(name: &str) -> bool {
+    name.eq_ignore_ascii_case("nextval")
+        || name.eq_ignore_ascii_case("currval")
+        || name.eq_ignore_ascii_case("setval")
 }

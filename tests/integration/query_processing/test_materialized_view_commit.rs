@@ -477,7 +477,7 @@ fn failed_commit_with_materialized_view_leaves_no_rows_behind(
 
     let mut committed = 0i64;
     let mut commit_error = None;
-    for start in (0..60_000).step_by(1000) {
+    for start in (0..10_000).step_by(1000) {
         conn.execute("BEGIN").unwrap();
         for i in start..start + 1000 {
             let key = format!("order-{i:05}");

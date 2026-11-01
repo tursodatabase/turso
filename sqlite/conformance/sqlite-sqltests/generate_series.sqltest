@@ -52,3 +52,28 @@ test generate-series-explicit-negative-stop {
 expect {
     0
 }
+
+test generate-series-hidden-columns-have-no-hidden-type {
+    SELECT name, instr(upper(type), 'HIDDEN') FROM pragma_table_xinfo('generate_series') WHERE hidden = 1;
+}
+expect {
+    start|0
+    stop|0
+    step|0
+}
+
+test generate-series-rowid-is-the-value {
+    SELECT typeof(rowid), rowid, value FROM generate_series(0, 2);
+}
+expect {
+    integer|0|0
+    integer|1|1
+    integer|2|2
+}
+
+test generate-series-rowid-is-null-on-unmatched-left-join-row {
+    SELECT x, typeof(s.rowid) FROM (SELECT 1 AS x) LEFT JOIN generate_series(5, 7) AS s ON s.value = x;
+}
+expect {
+    1|null
+}

@@ -4,9 +4,8 @@
 //! these must produce an error or NULL rather than an out-of-bounds read,
 //! invalid UTF-8 decoded as `&str`, or a stack overflow.
 //!
-//! Not in the `.sqltest` corpus because SQLite is more permissive here -- it
-//! renders an invalid UTF-8 key with replacement characters instead of
-//! rejecting the document.
+//! Not in the `.sqltest` corpus because SQLite returns the raw bytes of a
+//! key that is not UTF-8, where Turso returns U+FFFD.
 
 use crate::assertions::NULL;
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
@@ -31,42 +30,35 @@ fn assert_rejected(db: &TempDatabase, conn: &Arc<turso_core::Connection>, sql: &
     }
 }
 
+/// Like SQLite, a key that is not UTF-8 is still JSONB. Turso reads each bad
+/// byte as U+FFFD.
 #[turso_macros::test]
-fn json_rejects_invalid_utf8_object_key(tmp_db: TempDatabase) {
+fn json_reads_invalid_utf8_object_key_as_replacement_characters(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
-    for blob in [TRUNCATED_UTF8_KEY, INVALID_UTF8_KEY] {
-        assert_rejected(&tmp_db, &conn, &format!("SELECT json({blob})"));
-        assert_rejected(
-            &tmp_db,
-            &conn,
-            &format!("SELECT json_extract({blob}, '$.a')"),
-        );
-        assert_rejected(
-            &tmp_db,
-            &conn,
-            &format!("SELECT json_set({blob}, '$.a', 1)"),
-        );
-        assert_rejected(
-            &tmp_db,
-            &conn,
-            &format!("SELECT json_insert({blob}, '$.a', 1)"),
-        );
-        assert_rejected(
-            &tmp_db,
-            &conn,
-            &format!("SELECT json_replace({blob}, '$.a', 1)"),
-        );
-        assert_rejected(
-            &tmp_db,
-            &conn,
-            &format!("SELECT json_remove({blob}, '$.a')"),
-        );
-        assert_rejected(&tmp_db, &conn, &format!("SELECT json_type({blob}, '$.a')"));
-        assert_rejected(
-            &tmp_db,
-            &conn,
-            &format!("SELECT json_array_length({blob}, '$.a')"),
-        );
+    for (blob, key) in [
+        (TRUNCATED_UTF8_KEY, "aaaaaa\u{FFFD}"),
+        (INVALID_UTF8_KEY, &"\u{FFFD}".repeat(7)),
+    ] {
+        let doc = format!(r#"{{"{key}":null}}"#);
+        let doc_with_a = format!(r#"{{"{key}":null,"a":1}}"#);
+        for (sql, expected) in [
+            (format!("SELECT json({blob})"), &doc),
+            (format!("SELECT json_set({blob}, '$.a', 1)"), &doc_with_a),
+            (format!("SELECT json_insert({blob}, '$.a', 1)"), &doc_with_a),
+            (format!("SELECT json_replace({blob}, '$.a', 1)"), &doc),
+            (format!("SELECT json_remove({blob}, '$.a')"), &doc),
+        ] {
+            let result = limbo_exec_rows(&conn, &sql);
+            assert_that!(result).is_equal_to(vec![row![expected.as_str()]]);
+        }
+        for sql in [
+            format!("SELECT json_extract({blob}, '$.a')"),
+            format!("SELECT json_type({blob}, '$.a')"),
+            format!("SELECT json_array_length({blob}, '$.a')"),
+        ] {
+            let result = limbo_exec_rows(&conn, &sql);
+            assert_that!(result).is_equal_to(vec![row![NULL]]);
+        }
     }
 }
 
@@ -150,7 +142,7 @@ fn json_accepts_well_formed_blob(tmp_db: TempDatabase) {
     );
     assert_that!(result).is_equal_to(vec![row![r#"{"b":2}"#]]);
 
-    // Non-ASCII keys and values survive the UTF-8 checks on text payloads.
+    // Non-ASCII keys and values survive a round trip through a blob.
     let result = limbo_exec_rows(
         &conn,
         r#"SELECT json_extract(jsonb('{"ключ":"значение"}'), '$."ключ"')"#,

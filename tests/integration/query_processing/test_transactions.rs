@@ -180,7 +180,7 @@ fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     // should fail
     assert!(conn
         .execute("begin")
-        .inspect_err(|e| assert!(matches!(e, LimboError::TxError(_))))
+        .inspect_err(|e| assert!(matches!(e, LimboError::TransactionAlreadyActive)))
         .is_err());
     conn.execute("insert into t values (1)")?;
     conn.execute("commit")?;
@@ -188,6 +188,74 @@ fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     if let StepResult::Row = stmt.step()? {
         let row = stmt.row().unwrap();
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
+    }
+
+    Ok(())
+}
+
+fn query_scalar_i64(conn: &Arc<Connection>, sql: &str) -> Result<i64> {
+    let mut stmt = conn.query(sql)?.unwrap();
+    match stmt.step()? {
+        StepResult::Row => {
+            let row = stmt.row().unwrap();
+            match row.get::<&Value>(0).unwrap() {
+                Value::Numeric(turso_core::Numeric::Integer(v)) => Ok(*v),
+                v => panic!("expected integer, got {v:?}"),
+            }
+        }
+        _ => panic!("expected row from {sql}"),
+    }
+}
+
+fn query_scalar_text(conn: &Arc<Connection>, sql: &str) -> Result<String> {
+    let mut stmt = conn.query(sql)?.unwrap();
+    match stmt.step()? {
+        StepResult::Row => {
+            let row = stmt.row().unwrap();
+            match row.get::<&Value>(0).unwrap() {
+                Value::Text(v) => Ok(v.as_str().to_string()),
+                v => panic!("expected text, got {v:?}"),
+            }
+        }
+        _ => panic!("expected row from {sql}"),
+    }
+}
+
+#[turso_macros::test]
+fn test_database_full_rolls_back_explicit_transaction(tmp_db: TempDatabase) -> Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA page_size = 1024")?;
+    conn.execute("PRAGMA auto_vacuum = 0")?;
+    conn.execute("CREATE TABLE filler (fill)")?;
+    conn.execute("PRAGMA max_page_count = 50")?;
+
+    let initial_page_count = query_scalar_i64(&conn, "PRAGMA page_count")?;
+
+    for _ in 0..3 {
+        conn.execute("BEGIN")?;
+
+        loop {
+            match conn.execute("INSERT INTO filler (fill) VALUES (randomblob(5000))") {
+                Ok(_) => {}
+                Err(LimboError::DatabaseFull) => break,
+                Err(e) => return Err(e),
+            }
+        }
+
+        let integrity = query_scalar_text(&conn, "PRAGMA integrity_check")?;
+        assert_eq!(
+            integrity, "ok",
+            "integrity_check failed after DatabaseFull rollback"
+        );
+
+        let page_count = query_scalar_i64(&conn, "PRAGMA page_count")?;
+        assert_eq!(
+            page_count, initial_page_count,
+            "page count must revert to pre-BEGIN value after DatabaseFull rollback"
+        );
+
+        let _ = conn.execute("COMMIT");
     }
 
     Ok(())
@@ -349,6 +417,91 @@ fn test_delete_all_while_same_connection_scans_table(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_scan_continues_after_delete_of_leaf_last_row_and_split(tmp_db: TempDatabase) {
+    let id = |id: i64| Value::from_i64(id);
+    assert_eq!(
+        scan_join_deleting_then_splitting(&tmp_db, 60),
+        vec![
+            (id(10), 1),
+            (id(10), 2),
+            (id(20), 1),
+            (id(20), 2),
+            (id(30), 1),
+            (id(30), 2),
+            (id(40), 1),
+            (id(40), 2),
+            (id(50), 1),
+            (id(50), 2),
+            (id(60), 1),
+            (Value::Null, 2),
+            (id(58), 1),
+            (id(58), 2),
+            (id(59), 1),
+            (id(59), 2),
+            (id(70), 1),
+            (id(70), 2),
+        ]
+    );
+}
+
+#[turso_macros::test]
+fn test_scan_continues_after_delete_of_leaf_middle_row_and_split(tmp_db: TempDatabase) {
+    let outer_ids: Vec<Value> = scan_join_deleting_then_splitting(&tmp_db, 30)
+        .into_iter()
+        .filter(|(_, x)| *x == 1)
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(
+        outer_ids,
+        [10, 20, 30, 40, 50, 58, 59, 60, 70].map(Value::from_i64)
+    );
+}
+
+fn scan_join_deleting_then_splitting(tmp_db: &TempDatabase, deleted_id: i64) -> Vec<(Value, i64)> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, v BLOB)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2(x INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t2 VALUES (1), (2)").unwrap();
+    for id in [10, 20, 30, 40, 50, 60, 70] {
+        conn.execute(format!("INSERT INTO t1 VALUES ({id}, zeroblob(600))"))
+            .unwrap();
+    }
+
+    conn.execute("BEGIN").unwrap();
+    let mut scan = conn.prepare("SELECT t1.id, t2.x FROM t1, t2").unwrap();
+    let mut rows = Vec::new();
+    let mut deleted = false;
+    let mut inserted = false;
+    loop {
+        match scan.step().unwrap() {
+            StepResult::Row => {
+                let row = scan.row().unwrap();
+                let id = row.get_value(0).clone();
+                let x = row.get::<i64>(1).unwrap();
+                rows.push((id.clone(), x));
+                if !deleted && id == Value::from_i64(deleted_id) && x == 1 {
+                    conn.execute(format!("DELETE FROM t1 WHERE id = {deleted_id}"))
+                        .unwrap();
+                    deleted = true;
+                } else if deleted && !inserted {
+                    conn.execute("INSERT INTO t1 VALUES (58, zeroblob(600)), (59, zeroblob(600))")
+                        .unwrap();
+                    inserted = true;
+                }
+            }
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Done => break,
+            other => panic!("scan failed after DELETE and INSERT: {other:?}"),
+        }
+    }
+    drop(scan);
+    conn.execute("COMMIT").unwrap();
+    rows
+}
+
+#[turso_macros::test]
 /// A constraint error does not rollback the transaction, it rolls back the statement.
 fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
@@ -384,6 +537,34 @@ fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDat
             vec![Value::from_i64(4)]
         ]
     );
+}
+
+#[turso_macros::test]
+/// A failed read statement must not roll back the open transaction. SQLite
+/// keeps the transaction and its savepoints after a runtime error, so
+/// ROLLBACK TO can recover and COMMIT can persist the surviving writes.
+fn test_read_error_keeps_transaction_and_savepoints(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (a INTEGER)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("SAVEPOINT s").unwrap();
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    let result = conn.execute("SELECT abs(-9223372036854775808)");
+    assert!(matches!(result, Err(LimboError::IntegerOverflow)));
+    assert!(
+        !conn.get_auto_commit(),
+        "a failed read statement must leave the transaction open"
+    );
+
+    conn.execute("ROLLBACK TO s").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let stmt = conn.query("SELECT a FROM t").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::from_i64(1)]]);
 }
 
 #[turso_macros::test]
@@ -1821,6 +2002,38 @@ fn test_savepoint_rollback_across_wal_restart() {
     let stmt = conn2.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
     let row = helper_read_single_row(stmt);
     assert_eq!(row[0], Value::from_i64(310));
+}
+
+#[turso_macros::test]
+fn test_insert_after_database_full_in_transaction(tmp_db: TempDatabase) {
+    insert_after_database_full(&tmp_db, "BEGIN", "COMMIT");
+}
+
+#[turso_macros::test]
+fn test_insert_after_database_full_in_savepoint(tmp_db: TempDatabase) {
+    insert_after_database_full(&tmp_db, "SAVEPOINT s1", "RELEASE s1");
+}
+
+fn insert_after_database_full(tmp_db: &TempDatabase, begin: &str, end: &str) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t1(a)").unwrap();
+    conn.execute("PRAGMA max_page_count = 3").unwrap();
+    conn.execute(begin).unwrap();
+    let result =
+        conn.execute("INSERT INTO t1(rowid, a) VALUES (2, zeroblob(3000)), (1, zeroblob(3000))");
+    assert!(
+        matches!(result, Err(LimboError::DatabaseFull)),
+        "expected database full, got: {result:?}"
+    );
+    conn.execute("PRAGMA max_page_count = 10").unwrap();
+    conn.execute("INSERT INTO t1(rowid, a) VALUES (3, zeroblob(3000)), (4, zeroblob(3000))")
+        .unwrap();
+    conn.execute(end).unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t1");
+    assert_eq!(rows, vec![(2,)]);
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
 }
 
 #[turso_macros::test]

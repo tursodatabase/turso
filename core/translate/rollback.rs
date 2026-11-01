@@ -40,6 +40,8 @@ pub fn translate_rollback(
         program.emit_insn(Insn::AutoCommit {
             auto_commit: true,
             rollback: true,
+            concurrent: false,
+            read_only: false,
         });
         program.rollback();
     }

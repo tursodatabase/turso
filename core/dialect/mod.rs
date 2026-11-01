@@ -33,6 +33,10 @@ pub trait Dialect: Send + Sync + 'static {
     /// reject an open whose dialect differs from the already-open instance.
     fn name(&self) -> &'static str;
 
+    fn format_error(&self, error: crate::LimboError) -> crate::LimboError {
+        error.into_sqlite_error()
+    }
+
     /// Parse the first statement in `sql` into the engine AST.
     ///
     /// Returns the parsed command, if any, and the number of input bytes
@@ -128,10 +132,8 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
-    /// Create the namespaces of a new connection. SQLite has one namespace
-    /// per database: `main`, `temp` and each attached database.
-    fn new_namespaces(&self) -> crate::sync::Arc<dyn crate::NamespaceCatalog> {
-        crate::sync::Arc::new(sqlite::attach::AttachedNamespaces::default())
+    fn random_value(&self, bits: i64) -> crate::Value {
+        crate::Value::from_i64(bits) // SQLite default
     }
 
     /// Resolve a function name in user SQL to the engine's function IR.
@@ -178,6 +180,78 @@ pub trait Dialect: Send + Sync + 'static {
     /// `c`. PostgreSQL stops there and reports that the column does not
     /// exist.
     fn qualified_column_uses_nearest_table_only(&self) -> bool {
+        false
+    }
+
+    /// Whether a sequence named without a schema in a column default or a
+    /// view body is bound to the schema it is found in when the table or
+    /// view is created.
+    ///
+    /// PostgreSQL stores the bound name, so the default or view keeps its
+    /// sequence after the search path changes. SQLite looks the name up
+    /// each time the default or view runs.
+    fn binds_names_at_create(&self) -> bool {
+        false
+    }
+
+    /// Whether a database of this dialect supports namespaces: the objects of
+    /// a namespace are kept in the schema rows of the main database
+    /// under names that encode the namespace's id, which the loader decodes
+    /// and which no user object may be named.
+    ///
+    /// PostgreSQL stores its schemas this way. SQLite has no namespaces, so
+    /// a name that looks like a mangled name is an ordinary name.
+    fn supports_namespaces(&self) -> bool {
+        false
+    }
+
+    /// The namespaces of a database that has never created or dropped one.
+    /// They have ids from 1 in this order and no rows until the first
+    /// CREATE SCHEMA or DROP SCHEMA creates the namespaces table, which then
+    /// stores them with the change.
+    ///
+    /// PostgreSQL has the schema public. SQLite has no namespaces.
+    fn default_namespaces(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Whether `INSERT ... ON CONFLICT DO UPDATE` fails when the conflicting
+    /// row was already inserted or updated by the same statement.
+    ///
+    /// PostgreSQL raises an error so that the result does not depend on the
+    /// order of the proposed rows. SQLite updates the row again.
+    fn upsert_rejects_row_written_by_same_statement(&self) -> bool {
+        false
+    }
+
+    /// Whether integer division by zero raises an error.
+    ///
+    /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
+    fn errors_on_zero_divisor(&self) -> bool {
+        false
+    }
+
+    /// Whether `mod` of two integers returns an integer.
+    ///
+    /// PostgreSQL returns an integer. SQLite always returns a REAL.
+    fn mod_of_integers_is_integer(&self) -> bool {
+        false
+    }
+
+    /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
+    /// a table that has rows.
+    ///
+    /// PostgreSQL rewrites the table and computes the default for each
+    /// existing row. SQLite raises an error unless the table is empty.
+    fn add_column_computes_default_for_existing_rows(&self) -> bool {
+        false
+    }
+
+    /// Whether `CREATE INDEX` accepts qualified column names such as `t.a`
+    /// in its indexed terms.
+    ///
+    /// PostgreSQL accepts them. SQLite raises an error.
+    fn allows_qualified_columns_in_index_terms(&self) -> bool {
         false
     }
 }
@@ -349,97 +423,6 @@ mod tests {
         }
     }
 
-    /// Namespaces where CREATE needs a namespace, so a connection that uses
-    /// them cannot create an object without one.
-    #[derive(Default)]
-    struct CreateNeedsNamespace(sqlite::attach::AttachedNamespaces);
-
-    impl crate::NamespaceCatalog for CreateNeedsNamespace {
-        fn database_id(&self, name: &str) -> Option<usize> {
-            self.0.database_id(name)
-        }
-
-        fn name(&self, database_id: usize) -> Option<String> {
-            self.0.name(database_id)
-        }
-
-        fn others(&self) -> Vec<(usize, String)> {
-            self.0.others()
-        }
-
-        fn add(&self, name: &str, database_id: usize) {
-            self.0.add(name, database_id)
-        }
-
-        fn remove(&self, name: &str) -> Option<usize> {
-            self.0.remove(name)
-        }
-
-        fn find_in_search_order(&self, contains: &mut dyn FnMut(usize) -> bool) -> Option<usize> {
-            self.0.find_in_search_order(contains)
-        }
-
-        fn database_for_create(&self) -> crate::Result<usize> {
-            Err(crate::LimboError::ParseError(
-                "no namespace for create".to_string(),
-            ))
-        }
-    }
-
-    /// A dialect whose connections use [`CreateNeedsNamespace`].
-    struct CreateNeedsNamespaceDialect;
-
-    impl Dialect for CreateNeedsNamespaceDialect {
-        fn name(&self) -> &'static str {
-            "create-needs-namespace"
-        }
-
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
-            sqlite::parse(sql)
-        }
-
-        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
-            BTreeTable::from_sql(sql, root_page)
-        }
-
-        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
-            sqlite::parse_table_sql_ast(sql)
-        }
-
-        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-            sqlite::table_sql_for_replay(sql)
-        }
-
-        fn format_table_sql(
-            &self,
-            input: &str,
-            tbl_name: &turso_parser::ast::QualifiedName,
-            body: &turso_parser::ast::CreateTableBody,
-        ) -> crate::Result<String> {
-            SqliteDialect.format_table_sql(input, tbl_name, body)
-        }
-
-        fn register_catalog(
-            &self,
-            schema: &mut crate::schema::Schema,
-            enable_custom_types: bool,
-        ) -> crate::Result<()> {
-            sqlite::register_builtin_catalog(schema, enable_custom_types)
-        }
-
-        fn resolve_function(
-            &self,
-            name: &str,
-            arg_count: usize,
-        ) -> crate::Result<Option<crate::function::Func>> {
-            sqlite::resolve_builtin_function(name, arg_count)
-        }
-
-        fn new_namespaces(&self) -> Arc<dyn crate::NamespaceCatalog> {
-            Arc::new(CreateNeedsNamespace::default())
-        }
-    }
-
     /// A one-row catalog table installed by [`TestDialect`],
     /// standing in for a frontend catalog surface like `pg_class`.
     #[derive(Debug)]
@@ -582,48 +565,12 @@ mod tests {
     }
 
     #[test]
-    fn connections_use_the_namespaces_of_the_dialect() {
+    fn consume_stmt_reports_parse_error() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(
-            &io,
-            "dialect-namespaces.db",
-            Arc::new(CreateNeedsNamespaceDialect),
-        )
-        .unwrap();
+        let db = open_db(&io, "consume-stmt-parse-error.db", Arc::new(SqliteDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
 
-        let Err(crate::LimboError::ParseError(message)) = conn.execute("CREATE TABLE t (x)") else {
-            panic!("CREATE without a namespace must use the dialect's namespaces");
-        };
-        assert_eq!(message, "no namespace for create");
-        conn.execute("CREATE TABLE main.t (x)").unwrap();
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn query_runner_reports_invalid_utf8_once() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "query-runner-invalid-utf8.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        let mut runner = conn.query_runner(b"SELECT 1;\xff");
-
-        let Some(Err(crate::LimboError::ParseError(message))) = runner.next() else {
-            panic!("invalid UTF-8 must produce a parse error");
-        };
-        assert!(message.contains("invalid UTF-8"));
-        assert!(runner.next().is_none());
-        conn.close().unwrap();
-    }
-
-    #[test]
-    fn query_runner_reports_parse_error_once() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "query-runner-parse-error.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
-        let mut runner = conn.query_runner(b"SELECT * FROM");
-
-        assert!(runner.next().is_some_and(|result| result.is_err()));
-        assert!(runner.next().is_none());
+        assert!(conn.consume_stmt("SELECT * FROM").is_err());
         conn.close().unwrap();
     }
 
