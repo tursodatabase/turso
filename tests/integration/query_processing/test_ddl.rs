@@ -89,6 +89,132 @@ fn test_drop_sqlite_created_mixed_case_index() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_sqlite_created_indexes_with_double_quoted_strings() -> anyhow::Result<()> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("test.db");
+    rusqlite::Connection::open(&db_path)?.execute_batch(
+        r#"CREATE TABLE t(c);
+        CREATE INDEX i1 ON t(datetime(c, "+1 month"));
+        CREATE INDEX i2 ON t(c) WHERE c < "-61";"#,
+    )?;
+
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES ('2020-01-31'), (1)")?;
+    let rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT datetime(c, '+1 month') FROM t INDEXED BY i1 WHERE datetime(c, '+1 month') > '2000'",
+    );
+    assert_eq!(rows, vec![("2020-03-02 00:00:00".to_string(),)]);
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT c FROM t INDEXED BY i2 WHERE c < '-61'");
+    assert_eq!(rows, vec![(1,)]);
+    conn.close()?;
+    drop(db);
+
+    rusqlite_integrity_check(&db_path)?;
+    Ok(())
+}
+
+#[test]
+fn test_alter_table_keeps_index_strings_after_adding_column_of_that_name() -> anyhow::Result<()> {
+    let indexes = [
+        (
+            r#"CREATE INDEX i ON t(c || "q")"#,
+            "SELECT count(*) FROM t INDEXED BY i WHERE c || 'q' = '1q'",
+        ),
+        (
+            r#"CREATE INDEX i ON t(c) WHERE c || "q" IS NOT NULL"#,
+            "SELECT count(*) FROM t INDEXED BY i WHERE c || 'q' IS NOT NULL",
+        ),
+    ];
+    for alter_sql in [
+        "ALTER TABLE t RENAME COLUMN x TO z",
+        "ALTER TABLE t DROP COLUMN x",
+    ] {
+        for (index_sql, query) in indexes {
+            let tmp_dir = tempfile::TempDir::new()?;
+            let db_path = tmp_dir.path().join("test.db");
+            {
+                let db = TempDatabase::new_with_existent(&db_path);
+                let conn = db.connect_limbo();
+                conn.execute("CREATE TABLE t(c, x)")?;
+                conn.execute(index_sql)?;
+                conn.execute("INSERT INTO t VALUES (1, 2)")?;
+                conn.execute(alter_sql)?;
+                conn.execute("ALTER TABLE t ADD COLUMN q")?;
+                conn.close()?;
+            }
+            {
+                let db = TempDatabase::new_with_existent(&db_path);
+                let conn = db.connect_limbo();
+                let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+                assert_eq!(
+                    integrity,
+                    vec![("ok".to_string(),)],
+                    "{alter_sql}; {index_sql}"
+                );
+                let rows: Vec<(i64,)> = conn.exec_rows(query);
+                assert_eq!(rows, vec![(1,)], "{alter_sql}; {index_sql}");
+                conn.close()?;
+            }
+            rusqlite_integrity_check(&db_path)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_add_column_named_like_index_string_after_reopen() -> anyhow::Result<()> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("test.db");
+    {
+        let db = TempDatabase::new_with_existent(&db_path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(c)")?;
+        conn.execute(r#"CREATE INDEX i ON t(c || "q")"#)?;
+        conn.execute("ALTER TABLE t ADD COLUMN q")?;
+        conn.execute("INSERT INTO t VALUES (2, 3)")?;
+        conn.close()?;
+    }
+    {
+        let db = TempDatabase::new_with_existent(&db_path);
+        let conn = db.connect_limbo();
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT c FROM t INDEXED BY i WHERE c || q = '23'");
+        assert_eq!(rows, vec![(2,)]);
+        conn.close()?;
+    }
+    rusqlite_integrity_check(&db_path)?;
+    Ok(())
+}
+
+#[test]
+fn test_add_column_reloads_sqlite_created_mixed_case_index() -> anyhow::Result<()> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("test.db");
+    rusqlite::Connection::open(&db_path)?.execute_batch(
+        r#"CREATE TABLE t(c);
+        CREATE INDEX Single ON t(c || 'q');
+        CREATE INDEX "Double" ON t(c || "q");"#,
+    )?;
+    {
+        let db = TempDatabase::new_with_existent(&db_path);
+        let conn = db.connect_limbo();
+        conn.execute("ALTER TABLE t ADD COLUMN q")?;
+        conn.execute("INSERT INTO t VALUES (2, 3)")?;
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT c FROM t INDEXED BY Single WHERE c || 'q' = '2q'");
+        assert_eq!(rows, vec![(2,)]);
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT c FROM t INDEXED BY Double WHERE c || q = '23'");
+        assert_eq!(rows, vec![(2,)]);
+        conn.close()?;
+    }
+    rusqlite_integrity_check(&db_path)?;
+    Ok(())
+}
+
 #[turso_macros::test]
 fn test_alter_column_rewrites_indexed_affinity_change(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
