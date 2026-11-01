@@ -9,6 +9,8 @@
 //! - Empty field = empty string (not NULL)
 //! - Lines starting with `\.` = end of data
 
+mod pgwire_text;
+
 use crate::session::relation_lookup_namespaces;
 use turso_core::{ColumnTypeKind, LimboError, Numeric, Result, Row, Value};
 use turso_pg_parser::{copy::CopyToStdout, quote_identifier};
@@ -53,6 +55,7 @@ impl CopyTextEncoder {
     /// Append one COPY text record, including its trailing newline.
     pub fn encode_row(&self, row: &Row, output: &mut Vec<u8>) {
         assert_eq!(row.len(), self.columns.len());
+        let mut bytea = Vec::new();
         for (index, (value, ty)) in row.get_values().zip(&self.columns).enumerate() {
             if index > 0 {
                 output.push(b'\t');
@@ -61,16 +64,13 @@ impl CopyTextEncoder {
                 Value::Null => output.extend_from_slice(b"\\N"),
                 Value::Numeric(Numeric::Integer(value)) => {
                     if matches!(ty, CopyTextType::Boolean) {
-                        output.push(if *value != 0 { b't' } else { b'f' });
+                        pgwire_text::encode_bool(*value != 0, output);
                     } else {
-                        output.extend_from_slice(value.to_string().as_bytes());
+                        pgwire_text::encode_integer(*value, output);
                     }
                 }
                 Value::Numeric(Numeric::Float(value)) => {
-                    let mut buffer = ryu::Buffer::new();
-                    output.extend_from_slice(
-                        copy_float_text(f64::from(*value), &mut buffer).as_bytes(),
-                    );
+                    output.extend_from_slice(pgwire_text::format_f64(f64::from(*value)).as_bytes());
                 }
                 Value::Text(text) => {
                     let text = text.value.as_ref();
@@ -84,41 +84,17 @@ impl CopyTextEncoder {
                     }
                 }
                 Value::Blob(bytes) => {
-                    let array = matches!(ty, CopyTextType::ByteaArray);
-                    if array {
-                        escape_copy_text(b"\"\\", output);
-                    }
-                    escape_copy_text(b"\\x", output);
-                    const HEX: &[u8; 16] = b"0123456789abcdef";
-                    for byte in bytes {
-                        output.push(HEX[(byte >> 4) as usize]);
-                        output.push(HEX[(byte & 15) as usize]);
-                    }
-                    if array {
-                        output.push(b'"');
-                    }
+                    bytea.clear();
+                    pgwire_text::encode_bytea(
+                        bytes,
+                        matches!(ty, CopyTextType::ByteaArray),
+                        &mut bytea,
+                    );
+                    escape_copy_text(&bytea, output);
                 }
             }
         }
         output.push(b'\n');
-    }
-}
-
-// Adapted from pgwire 0.36.3's ExtraFloatDigits::format_f64 (default options).
-// Copyright (c) 2018 Ning Sun. See licenses/pgwire-mit-license.md.
-fn copy_float_text(value: f64, buffer: &mut ryu::Buffer) -> &str {
-    if value.is_nan() {
-        "NaN"
-    } else if value.is_infinite() {
-        if value.is_sign_positive() {
-            "inf"
-        } else {
-            "-inf"
-        }
-    } else if value == 0.0 {
-        "0"
-    } else {
-        buffer.format(value)
     }
 }
 

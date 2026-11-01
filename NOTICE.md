@@ -100,10 +100,17 @@ The PostgreSQL dump fuzzer uses comfy-table, distributed by its authors:
 * License: licenses/testing/comfy-table-mit-license.md (MIT License)
 * Homepage: https://github.com/nukesor/comfy-table
 
-The PostgreSQL frontend includes text-formatting code adapted from pgwire 0.36.3:
+The PostgreSQL frontend vendors the default bool, integer, float, and bytea
+text-formatting routines from pgwire 0.36.3 in
+postgres/frontend/copy/pgwire_text.rs, with local buffer and API adaptations:
 
 * License: licenses/pgwire-mit-license.md (MIT License)
 * Homepage: https://github.com/sunng87/pgwire
+
+The PostgreSQL frontend depends on hex, distributed by its authors:
+
+* License: licenses/hex-mit-license.md (MIT License)
+* Homepage: https://github.com/KokaKiwi/rust-hex
 
 The PostgreSQL frontend depends on Ryū, distributed by its authors:
 

@@ -14,6 +14,7 @@ path = "lib.rs"
 bitflags = { workspace = true }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 chumsky = { workspace = true }
+hex = { workspace = true }
 parking_lot = { workspace = true }
 rustc-hash = "2.0"
 ryu = "1.0.19"
