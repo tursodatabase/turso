@@ -1,0 +1,31 @@
+# Regression test for https://github.com/tursodatabase/turso/issues/11101
+# SQLite rejects a table-level FOREIGN KEY that names a child column the table
+# does not have. Accepting it defers the failure to every later INSERT, where it
+# surfaces as a misleading "foreign key mismatch".
+
+@database :memory:
+
+test create-table-table-fk-unknown-child-column-is-rejected {
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(a, FOREIGN KEY(zz) REFERENCES p(id));
+}
+expect error {
+    unknown column "zz" in foreign key definition
+}
+
+test create-table-table-fk-unknown-child-column-keeps-declared-spelling {
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(a, FOREIGN KEY(Zz) REFERENCES p(id));
+}
+expect error {
+    unknown column "Zz" in foreign key definition
+}
+
+test create-table-table-fk-known-child-column-is-accepted {
+    CREATE TABLE p(id PRIMARY KEY);
+    CREATE TABLE c(a INTEGER, FOREIGN KEY(a) REFERENCES p(id));
+    SELECT count(*) FROM sqlite_schema WHERE name = 'c';
+}
+expect {
+    1
+}
