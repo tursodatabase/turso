@@ -5282,6 +5282,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // blocking). A failure here cannot be downgraded: it would
                     // leave the next AUTOINCREMENT INSERT able to re-emit a rowid
                     // already on disk, so it propagates as a bootstrap failure.
+                    // Rows whose name is not text name no table and are logged
+                    // and skipped inside the sync, as WAL mode does.
                     return_if_io!(bootstrap_conn
                         .sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(sync_st));
                     *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
