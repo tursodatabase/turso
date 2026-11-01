@@ -2061,13 +2061,17 @@ fn wipe_table_leaf_cells(page: &mut [u8], page_no: u32) -> bool {
 }
 
 fn metadata_root_page(conn: &Arc<Connection>) -> u32 {
-    let rows = get_rows(
-        conn,
-        "SELECT rootpage FROM sqlite_schema
-         WHERE type = 'table' AND name = '__turso_internal_mvcc_meta'",
-    );
-    assert_eq!(rows.len(), 1, "expected exactly one metadata table row");
-    rows[0][0].as_int().unwrap() as u32
+    // Read the root page from the in-memory schema. The metadata table is hidden from
+    // ordinary sqlite_schema scans now, but it is still registered in the schema; this
+    // also avoids opening a read statement that would block the Truncate checkpoint below.
+    let schema = conn.schema.read();
+    let table = schema
+        .get_table(NamespaceId::ROOT, "__turso_internal_mvcc_meta")
+        .expect("expected exactly one metadata table row");
+    table
+        .btree()
+        .expect("metadata table must be a btree table")
+        .root_page as u32
 }
 
 fn tamper_db_metadata_row_value(db_path: &str, metadata_root_page: u32, new_value: i64) {

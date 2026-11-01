@@ -30,7 +30,9 @@ use turso_core::{
     Numeric, Register, Result, Value, MAIN_DB_ID,
 };
 
-use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, ExecRows, TempDatabase};
+use crate::common::{
+    limbo_exec_rows, limbo_exec_rows_fallible, limbo_exec_rows_internal, ExecRows, TempDatabase,
+};
 
 fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> turso_core::types::IOResultOr<T>) -> Result<T> {
     loop {
@@ -685,7 +687,9 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
 
     let schema_rows = || {
-        limbo_exec_rows(
+        // Internal origin: FTS backing tables use the __turso_internal_ prefix, which
+        // ordinary schema scans now hide; this white-box test needs to see them.
+        limbo_exec_rows_internal(
             &conn,
             "SELECT name FROM sqlite_master WHERE type='table' OR type='index'",
         )

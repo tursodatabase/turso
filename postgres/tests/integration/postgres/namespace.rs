@@ -302,7 +302,9 @@ fn open_through_the_engine(path: &Path, mvcc: bool) -> Arc<Connection> {
             .db_opts(turso_core::DatabaseOpts::new().with_mvcc(mvcc)),
     )
     .unwrap();
-    db.connect(turso_core::ConnectOpts::new()).unwrap()
+    let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+    conn.set_show_internal_schema(true);
+    conn
 }
 
 fn has_namespaces_table(conn: &Arc<Connection>) -> bool {

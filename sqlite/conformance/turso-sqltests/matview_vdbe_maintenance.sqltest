@@ -27,6 +27,7 @@ expect {
 # made old filter/project views appear compatible after identity or lowering
 # changes because they had no operator-state tables to carry the version.
 test matview-vdbe-stateless-version-marker {
+    PRAGMA show_internal_schema = ON;
     CREATE TABLE versioned_base(id INTEGER PRIMARY KEY, enabled INTEGER);
     CREATE MATERIALIZED VIEW versioned_stateless AS
       SELECT id FROM versioned_base WHERE enabled <> 0;
@@ -2603,6 +2604,7 @@ expect {
 # Each aggregate owns its value multiset, so its index can use the argument's
 # collation independently of every other aggregate in the same node.
 test matview-vdbe-collated-multisets-independent {
+    PRAGMA show_internal_schema = ON;
     CREATE TABLE t56(a TEXT, b TEXT COLLATE NOCASE);
     INSERT INTO t56 VALUES ('Z', 'A'), ('a', 'a'), ('B', 'B'), ('z', 'c');
     CREATE MATERIALIZED VIEW v56 AS
@@ -2888,6 +2890,7 @@ expect {
 # UNION ALL keeps duplicates: rows are identified by (branch, source rowid),
 # so per-branch updates and deletes hit the right copy.
 test matview-vdbe-union-all-maintenance {
+    PRAGMA show_internal_schema = ON;
     CREATE TABLE uc(x INTEGER);
     CREATE MATERIALIZED VIEW vu2 AS SELECT x FROM uc WHERE x < 5 UNION ALL SELECT x FROM uc WHERE x >= 0;
     SELECT 'state', COUNT(*) FROM sqlite_schema
@@ -3549,6 +3552,7 @@ expect {
 # derived input's base table and accidentally admitting rows rejected by its
 # filter.
 test matview-vdbe-filtered-derived-input-arrangement {
+    PRAGMA show_internal_schema = ON;
     CREATE TABLE arranged_left(id INTEGER PRIMARY KEY, k INTEGER, enabled INTEGER);
     CREATE TABLE arranged_right(k INTEGER PRIMARY KEY, label TEXT);
     INSERT INTO arranged_left VALUES (1, 10, 1), (2, 20, 0), (3, 30, 1);
@@ -3926,6 +3930,7 @@ expect {
 # aggregate owns its native state while the pure UNION ALL root owns the
 # arrangement that normalizes its composite branch identity.
 test matview-vdbe-node-owned-hidden-state {
+    PRAGMA show_internal_schema = ON;
     CREATE TABLE node_a(k INTEGER);
     CREATE TABLE node_b(k INTEGER);
     CREATE MATERIALIZED VIEW node_catalog AS
@@ -3951,6 +3956,7 @@ expect {
 # Generated hidden-table DDL must quote names derived from a quoted view
 # identifier. The raw catalog name remains stable and DROP owns its cleanup.
 test matview-vdbe-quoted-stateful-view-name {
+    PRAGMA show_internal_schema = ON;
     CREATE TABLE quoted_state_base(g INTEGER, x INTEGER);
     INSERT INTO quoted_state_base VALUES (1, 10), (1, 20);
     CREATE MATERIALIZED VIEW "stateful-view" AS
@@ -3972,6 +3978,7 @@ expect {
 # Hidden-state ownership parses the complete node suffix. A view whose name
 # itself contains "__n<digits>" must not be mistaken for another view's node.
 test matview-vdbe-hidden-state-owner-prefix-collision {
+    PRAGMA show_internal_schema = ON;
     CREATE TABLE owner_base(x INTEGER);
     INSERT INTO owner_base VALUES (1);
     CREATE MATERIALIZED VIEW owner AS

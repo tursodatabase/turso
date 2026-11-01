@@ -2466,6 +2466,7 @@ expect {
 
 # Test that dropping a materialized view cleans up its node-owned state table.
 test matview-drop-cleans-up-dbsp-table {
+    PRAGMA show_internal_schema = ON;
     CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
     CREATE MATERIALIZED VIEW v AS
