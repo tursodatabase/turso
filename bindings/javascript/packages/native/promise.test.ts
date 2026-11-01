@@ -22,6 +22,37 @@ test('drizzle-orm', async () => {
     }
 })
 
+test('statement calls reject missing parameters instead of reusing old values', async () => {
+    const db = await connect(':memory:');
+    try {
+        await db.exec("CREATE TABLE items(key TEXT, value TEXT); INSERT INTO items VALUES('first','fv')");
+        for (const method of ['get', 'all', 'run', 'iterate']) {
+            for (const [placeholder, args, missing] of [
+                ['?', ['first'], []],
+                [':key', [{ key: 'first' }], [{ zz: 'x' }]],
+            ] as const) {
+                const stmt = await db.prepare(`SELECT value FROM items WHERE key = ${placeholder}`);
+                try {
+                    const execute = async (params: readonly unknown[]) => {
+                        if (method === 'iterate') {
+                            for await (const row of stmt.iterate(...params)) {}
+                        } else {
+                            await stmt[method](...params);
+                        }
+                    };
+                    await execute(args);
+                    await expect(execute(missing)).rejects.toThrow('Too few parameter values');
+                    await execute(args);
+                } finally {
+                    stmt.close();
+                }
+            }
+        }
+    } finally {
+        await db.close();
+    }
+});
+
 test('in-memory-db-async', async () => {
     const db = await connect(":memory:");
     await db.exec("CREATE TABLE t(x)");
