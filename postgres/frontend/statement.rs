@@ -312,7 +312,7 @@ impl Statement {
                 None => self.inner.step(),
             },
         }
-        .map_err(Into::into);
+        .map_err(|error| statement_error(&self.inner, error));
         self.finish_step(result, was_in_tx, waker)
     }
 
@@ -408,7 +408,9 @@ impl Statement {
             }
         }
         self.commit_became_rollback = false;
-        self.inner.reset().map_err(Into::into)
+        self.inner
+            .reset()
+            .map_err(|error| statement_error(&self.inner, error))
     }
 
     /// Finish PostgreSQL deferred cleanup before resetting or dropping this
@@ -578,6 +580,10 @@ impl Statement {
             Err(_) => tracing::error!("PostgreSQL statement reset panicked"),
         }
     }
+}
+
+fn statement_error(stmt: &turso_core::Statement, error: LimboError) -> crate::Error {
+    crate::Error::from_statement(&stmt.get_program().connection, error)
 }
 
 enum BooleanResultType {

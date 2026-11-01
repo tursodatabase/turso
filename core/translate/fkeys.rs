@@ -1,7 +1,7 @@
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
-use crate::namespace::NamespaceRef;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::{emit_stored_column, emit_table_column_for_dml};
 use crate::translate::plan::ColumnMask;
@@ -1430,7 +1430,12 @@ pub fn emit_fk_child_update_counters(
                         }
                     })
                     .collect();
-                Box::new(fk_constraint_info(&child_tbl.name, &fk_ref.fk, regs))
+                Box::new(fk_constraint_info(
+                    namespace.id,
+                    &child_tbl.name,
+                    &fk_ref.fk,
+                    regs,
+                ))
             });
             emit_fk_violation(program, &fk_ref.fk, constraint_info)?;
         } else {
@@ -1493,7 +1498,12 @@ pub fn emit_fk_child_update_counters(
                                 }
                             })
                             .collect();
-                        Box::new(fk_constraint_info(&child_tbl.name, &fk_ref.fk, regs))
+                        Box::new(fk_constraint_info(
+                            namespace.id,
+                            &child_tbl.name,
+                            &fk_ref.fk,
+                            regs,
+                        ))
                     });
                     emit_fk_violation(p, &fk_ref.fk, constraint_info)?;
                     Ok(())
@@ -1510,13 +1520,21 @@ pub fn emit_fk_child_update_counters(
 }
 
 pub(crate) fn fk_constraint_info(
+    child_namespace: NamespaceId,
     child_table: &str,
     fk: &ForeignKey,
     regs: Vec<usize>,
 ) -> ConstraintInfo {
     let columns = fk.child_columns.to_vec();
     let name = fk.constraint_name.clone();
-    ConstraintInfo::fk(child_table, name, columns, regs, fk.parent_table.clone())
+    ConstraintInfo::fk(
+        child_namespace,
+        child_table,
+        name,
+        columns,
+        regs,
+        fk.parent_table.clone(),
+    )
 }
 
 /// Single FK existence check for NO ACTION/RESTRICT on DELETE.

@@ -2254,6 +2254,7 @@ fn emit_check_constraint_bytecode(
     halt_on_error: Option<ResolveType>,
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
+    namespace: NamespaceId,
     table_name: &str,
     column_mappings: &[(&str, usize)],
 ) -> Result<()> {
@@ -2327,6 +2328,7 @@ fn emit_check_constraint_bytecode(
                     column_mappings.iter().map(|(n, _)| n.to_string()).collect();
                 program.emit_insn(Insn::Halt {
                     constraint_info: Some(Box::new(ConstraintInfo::check(
+                        namespace,
                         table_name,
                         check_constraint.name.clone(),
                         col_regs,
@@ -2363,6 +2365,7 @@ pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
+    namespace: NamespaceId,
     table_name: &str,
     rowid_reg: usize,
     column_mappings: impl Iterator<Item = (&'a str, usize)>,
@@ -2444,6 +2447,7 @@ pub(crate) fn emit_check_constraints<'a>(
         halt_on_error,
         skip_row_label,
         referenced_tables,
+        namespace,
         table_name,
         &column_mappings,
     );
