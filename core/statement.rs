@@ -2288,3 +2288,181 @@ mod tests {
         );
     }
 }
+
+/// Shuttle tests for two threads that use statements of one connection.
+///
+/// sdk-kit lets only one `step()` at a time run on a connection, but it calls
+/// `reset()` and drops statements with no such check. The Rust crate calls
+/// `reset()` at the start of each `Statement::query` and `Statement::execute`.
+/// These tests do the same: each `step()` call takes `StepLock`. `reset()` and
+/// the drop of a statement take it only in the `take_turns` tests.
+#[cfg(all(shuttle, test))]
+mod shuttle_tests {
+    use super::*;
+    use crate::sync::atomic::{AtomicBool, Ordering};
+    use crate::sync::Arc;
+    use crate::thread;
+    use crate::{ConnectOpts, Database, MemoryIO, SqliteDialect, IO};
+
+    /// Thread W updates a row again and again. Thread R resets a SELECT that it
+    /// left unfinished, then steps it to its first row. The reset of an unfinished
+    /// statement calls `abort()`, which can change the transaction state of the
+    /// connection while thread W is in `step()`. Then an assert on the WAL locks
+    /// or on the dirty pages fails.
+    #[test]
+    fn shuttle_reset_while_other_statement_steps() {
+        shuttle::check_random(
+            || reset_and_step_on_two_threads(1, Cleanup::WithoutStepLock),
+            1000,
+        );
+    }
+
+    /// The same, but each UPDATE changes 50 rows, so thread W is in the b-tree for
+    /// a longer time. A rollback from thread R can then also invalidate the cursor
+    /// of thread W or unload a page that thread W uses.
+    #[test]
+    fn shuttle_reset_while_other_statement_updates_many_rows() {
+        shuttle::check_pct(
+            || reset_and_step_on_two_threads(50, Cleanup::WithoutStepLock),
+            200,
+            3,
+        );
+    }
+
+    /// The same work as `shuttle_reset_while_other_statement_steps`, but no
+    /// `reset()` and no drop runs during a `step()`.
+    #[test]
+    fn shuttle_reset_and_step_take_turns() {
+        shuttle::check_random(
+            || reset_and_step_on_two_threads(1, Cleanup::WithStepLock),
+            1000,
+        );
+    }
+
+    /// The same work as `shuttle_reset_while_other_statement_updates_many_rows`,
+    /// but no `reset()` and no drop runs during a `step()`.
+    #[test]
+    fn shuttle_reset_and_step_take_turns_many_rows() {
+        shuttle::check_pct(
+            || reset_and_step_on_two_threads(50, Cleanup::WithStepLock),
+            200,
+            3,
+        );
+    }
+
+    /// How `reset()` and the drop of a statement run.
+    #[derive(Clone, Copy)]
+    enum Cleanup {
+        /// They do not take `StepLock`, as in sdk-kit.
+        WithoutStepLock,
+        /// They take `StepLock`, so they wait until no `step()` runs.
+        WithStepLock,
+    }
+
+    fn reset_and_step_on_two_threads(rows: i64, cleanup: Cleanup) {
+        let conn = open_connection_with_rows(rows);
+        let mut writer = conn.prepare("UPDATE t SET v = v + ?1").unwrap();
+        let mut reader = conn.prepare("SELECT v FROM t").unwrap();
+        let step_lock = Arc::new(StepLock::default());
+
+        let writer_thread = {
+            let step_lock = step_lock.clone();
+            thread::spawn(move || {
+                for i in 0..3 {
+                    with_cleanup_lock(&step_lock, cleanup, || {
+                        let _ = writer.reset();
+                    });
+                    writer
+                        .bind_at(NonZero::new(1).unwrap(), Value::from_i64(i))
+                        .unwrap();
+                    while let Ok(StepResult::Row) = step_with_lock(&mut writer, &step_lock) {}
+                }
+                with_cleanup_lock(&step_lock, cleanup, || drop(writer));
+            })
+        };
+        let reader_thread = thread::spawn(move || {
+            for _ in 0..3 {
+                // After the first loop, the SELECT is unfinished: it returned a row
+                // and did not get to Done.
+                with_cleanup_lock(&step_lock, cleanup, || {
+                    let _ = reader.reset();
+                });
+                let _ = step_with_lock(&mut reader, &step_lock);
+            }
+            with_cleanup_lock(&step_lock, cleanup, || drop(reader));
+        });
+        writer_thread.join().unwrap();
+        reader_thread.join().unwrap();
+    }
+
+    fn open_connection_with_rows(rows: i64) -> Arc<Connection> {
+        // A file name, not ":memory:", gives a database with a WAL. A new name for
+        // each shuttle iteration gives a new `Database`. The counter is a std
+        // atomic because a static must not keep a shuttle object between iterations.
+        static NEXT_DB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(
+            io,
+            &format!("shuttle-reset-{n}.db"),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+        conn.execute(format!(
+            "INSERT INTO t SELECT value, 0 FROM generate_series(1, {rows})"
+        ))
+        .unwrap();
+        conn
+    }
+
+    fn with_cleanup_lock(step_lock: &StepLock, cleanup: Cleanup, f: impl FnOnce()) {
+        match cleanup {
+            Cleanup::WithoutStepLock => f(),
+            Cleanup::WithStepLock => {
+                step_lock.lock();
+                f();
+                step_lock.unlock();
+            }
+        }
+    }
+
+    /// Steps `stmt` until it gives a row or ends. Each `step()` call holds
+    /// `step_lock`. The I/O between two calls does not, as in sdk-kit.
+    fn step_with_lock(stmt: &mut Statement, step_lock: &StepLock) -> Result<StepResult> {
+        loop {
+            step_lock.lock();
+            let result = stmt.step();
+            step_lock.unlock();
+            match result? {
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    stmt._io().step()?
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    /// Lets one thread at a time call `step()` on the connection, as
+    /// `ConcurrentGuard` in sdk-kit does.
+    #[derive(Default)]
+    struct StepLock(AtomicBool);
+
+    impl StepLock {
+        fn lock(&self) {
+            while self
+                .0
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                thread::yield_now();
+            }
+        }
+
+        fn unlock(&self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+}
