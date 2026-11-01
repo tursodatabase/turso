@@ -6,7 +6,7 @@
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
+    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_SYNTAX_ERROR,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
@@ -3564,13 +3564,10 @@ impl PostgreSQLTranslator {
         }
 
         // Map PostgreSQL operators to Turso operators
+        if let Some(comparison) = Self::comparison_operator(op_name) {
+            return Ok(ast::Expr::Binary(left, comparison, right));
+        }
         let binary_op = match op_name {
-            "=" => ast::Operator::Equals,
-            "!=" | "<>" => ast::Operator::NotEquals,
-            "<" => ast::Operator::Less,
-            "<=" => ast::Operator::LessEquals,
-            ">" => ast::Operator::Greater,
-            ">=" => ast::Operator::GreaterEquals,
             "+" => ast::Operator::Add,
             "-" => ast::Operator::Subtract,
             "*" => ast::Operator::Multiply,
@@ -4299,30 +4296,73 @@ impl PostgreSQLTranslator {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
             SubLinkType::ArraySublink => Ok(Self::translate_array_subquery(*select)),
-            SubLinkType::AnySublink => {
-                let op = extract_key_columns(&sub_link.oper_name)?;
-                let is_equality =
-                    op.is_empty() || unqualified_name(&op, is_pg_catalog).is_some_and(|o| o == "=");
-                if !is_equality {
-                    return Err(not_supported(format!(
-                        "{} ANY/SOME (subquery)",
-                        op.last().map(String::as_str).unwrap_or_default()
-                    )));
-                }
-                // ANY/IN subquery: testexpr IN (SELECT ...)
-                let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
-                    ParseError::ParseError("ANY SubLink missing testexpr".to_string())
-                })?;
-                let lhs = self.translate_operand(test_node)?;
-                Ok(ast::Expr::InSelect {
-                    lhs: Box::new(lhs),
-                    not: false,
-                    rhs: select,
-                })
-            }
+            SubLinkType::AnySublink => self.translate_any_all_sublink(sub_link, select, false),
+            SubLinkType::AllSublink => self.translate_any_all_sublink(sub_link, select, true),
             other => Err(ParseError::ParseError(format!(
                 "Unsupported SubLink type: {other:?}",
             ))),
+        }
+    }
+
+    /// Translate `<lhs> <op> ANY/SOME (<subquery>)` and `<lhs> <op> ALL
+    /// (<subquery>)`. `= ANY` is `IN` and `<> ALL` is `NOT IN`; both already
+    /// carry PostgreSQL's three-valued result, so they lower straight to
+    /// InSelect. Every other comparison operator lowers to the scalar subquery
+    /// built by `any_all_subquery`, which keeps the same NULL behavior.
+    fn translate_any_all_sublink(
+        &self,
+        sub_link: &pg_query::protobuf::SubLink,
+        select: Box<ast::Select>,
+        is_all: bool,
+    ) -> Result<ast::Expr, ParseError> {
+        let kw = if is_all { "ALL" } else { "ANY/SOME" };
+        let op = extract_key_columns(&sub_link.oper_name)?;
+        let op_name: &str = if op.is_empty() {
+            "="
+        } else {
+            unqualified_name(&op, is_pg_catalog)
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    not_supported(format!("a schema-qualified operator in {kw} (subquery)"))
+                })?
+        };
+
+        let test_node = sub_link
+            .testexpr
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError(format!("{kw} SubLink missing testexpr")))?;
+        let lhs = self.translate_operand(test_node)?;
+
+        match (op_name, is_all) {
+            ("=", false) => Ok(ast::Expr::InSelect {
+                lhs: Box::new(lhs),
+                not: false,
+                rhs: select,
+            }),
+            ("<>", true) => Ok(ast::Expr::InSelect {
+                lhs: Box::new(lhs),
+                not: true,
+                rhs: select,
+            }),
+            _ => {
+                let operator = Self::comparison_operator(op_name)
+                    .ok_or_else(|| not_supported(format!("{op_name} {kw} (subquery)")))?;
+                // The lowering evaluates the left-hand side inside a new
+                // subquery, where an aggregate or window function would
+                // belong to that subquery instead of the outer query.
+                if contains_aggregate_or_window(&lhs) {
+                    return Err(not_supported(format!(
+                        "an aggregate or window function on the left of {op_name} {kw} (subquery)"
+                    )));
+                }
+                if result_column_count(&select).is_some_and(|count| count > 1) {
+                    return Err(ParseError::Sqlstate {
+                        sqlstate: SQLSTATE_SYNTAX_ERROR,
+                        message: "subquery has too many columns".to_string(),
+                    });
+                }
+                Ok(Self::any_all_subquery(lhs, select, operator, is_all))
+            }
         }
     }
 
@@ -4424,6 +4464,158 @@ impl PostgreSQLTranslator {
                         )),
                         joins: vec![],
                     }),
+                    where_clause: None,
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }))
+    }
+
+    /// Maps a PostgreSQL comparison operator name to the Turso AST operator.
+    /// Returns None for anything that is not a simple comparison.
+    fn comparison_operator(name: &str) -> Option<ast::Operator> {
+        Some(match name {
+            "=" => ast::Operator::Equals,
+            "!=" | "<>" => ast::Operator::NotEquals,
+            "<" => ast::Operator::Less,
+            "<=" => ast::Operator::LessEquals,
+            ">" => ast::Operator::Greater,
+            ">=" => ast::Operator::GreaterEquals,
+            _ => return None,
+        })
+    }
+
+    /// Build the scalar subquery for `lhs <op> ANY (select)` / `lhs <op> ALL
+    /// (select)` when `op` is a comparison other than the `=`/`<>` membership
+    /// forms. The rows are materialized once, then a CASE returns 1, 0 or NULL
+    /// so the result keeps PostgreSQL's three-valued logic: ANY is NULL when no
+    /// row compares true but some comparison is NULL, and ALL is NULL when no
+    /// row compares false but some comparison is NULL. An empty subquery makes
+    /// ANY false and ALL true.
+    //
+    //   (
+    //       WITH _turso_anyall_rows(_turso_anyall_value) AS MATERIALIZED (select)
+    //       SELECT CASE
+    //           -- ANY:
+    //           WHEN EXISTS (SELECT 1 FROM rows WHERE lhs op value) THEN 1
+    //           WHEN EXISTS (SELECT 1 FROM rows WHERE (lhs op value) IS NULL) THEN NULL
+    //           ELSE 0
+    //           -- ALL:
+    //           WHEN EXISTS (SELECT 1 FROM rows WHERE NOT (lhs op value)) THEN 0
+    //           WHEN EXISTS (SELECT 1 FROM rows WHERE (lhs op value) IS NULL) THEN NULL
+    //           ELSE 1
+    //       END
+    //   )
+    fn any_all_subquery(
+        lhs: ast::Expr,
+        select: Box<ast::Select>,
+        operator: ast::Operator,
+        is_all: bool,
+    ) -> ast::Expr {
+        // The generated names must not hide a table or column that the
+        // subquery or the left-hand side refers to.
+        let used_names = format!("{select} {lhs}").to_ascii_lowercase();
+        let unused_name = |base: &str| {
+            let mut name = base.to_owned();
+            while used_names.contains(&name) {
+                name.push('_');
+            }
+            exact_name(name)
+        };
+        let table = unused_name("_turso_anyall_rows");
+        let column = unused_name("_turso_anyall_value");
+
+        let numeric = |n: &str| Box::new(ast::Expr::Literal(ast::Literal::Numeric(n.to_owned())));
+        let null_lit = || Box::new(ast::Expr::Literal(ast::Literal::Null));
+        let comparison = || {
+            ast::Expr::Binary(
+                Box::new(lhs.clone()),
+                operator,
+                Box::new(ast::Expr::Id(column.clone())),
+            )
+        };
+        let exists_where = |cond: ast::Expr| {
+            ast::Expr::Exists(Box::new(ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Expr(numeric("1"), None)],
+                        from: Some(ast::FromClause {
+                            select: Box::new(ast::SelectTable::Table(
+                                ast::QualifiedName::single(table.clone()),
+                                None,
+                                None,
+                            )),
+                            joins: vec![],
+                        }),
+                        where_clause: Some(Box::new(cond)),
+                        group_by: None,
+                        window_clause: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            }))
+        };
+
+        let compares_null = ast::Expr::Binary(
+            Box::new(comparison()),
+            ast::Operator::Is,
+            Box::new(ast::Expr::Literal(ast::Literal::Null)),
+        );
+        let (when_then_pairs, else_result) = if is_all {
+            let has_false = exists_where(ast::Expr::Unary(
+                ast::UnaryOperator::Not,
+                Box::new(comparison()),
+            ));
+            (
+                vec![
+                    (Box::new(has_false), numeric("0")),
+                    (Box::new(exists_where(compares_null)), null_lit()),
+                ],
+                numeric("1"),
+            )
+        } else {
+            (
+                vec![
+                    (Box::new(exists_where(comparison())), numeric("1")),
+                    (Box::new(exists_where(compares_null)), null_lit()),
+                ],
+                numeric("0"),
+            )
+        };
+
+        let case = ast::Expr::Case {
+            base: None,
+            when_then_pairs,
+            else_expr: Some(else_result),
+        };
+
+        ast::Expr::Subquery(Box::new(ast::Select {
+            with: Some(ast::With {
+                recursive: false,
+                ctes: vec![ast::CommonTableExpr {
+                    tbl_name: table,
+                    columns: vec![ast::IndexedColumn {
+                        col_name: column,
+                        collation_name: None,
+                        order: None,
+                    }],
+                    materialized: ast::Materialized::Yes,
+                    select: *select,
+                }],
+            }),
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(Box::new(case), None)],
+                    from: None,
                     where_clause: None,
                     group_by: None,
                     window_clause: vec![],
@@ -7371,6 +7563,146 @@ fn not_supported(what: impl std::fmt::Display) -> ParseError {
     ParseError::Sqlstate {
         sqlstate: SQLSTATE_FEATURE_NOT_SUPPORTED,
         message: format!("{what} is not supported"),
+    }
+}
+
+/// Whether `expr` calls an aggregate or window function of the query it is in.
+/// Calls inside a nested subquery belong to that subquery and do not count.
+/// An aggregate from an extension loaded at runtime is not recognized.
+fn contains_aggregate_or_window(expr: &ast::Expr) -> bool {
+    use ast::Expr;
+    let any = |exprs: &[Box<Expr>]| exprs.iter().any(|e| contains_aggregate_or_window(e));
+    match expr {
+        Expr::FunctionCall {
+            name,
+            distinctness,
+            args,
+            order_by,
+            within_group,
+            filter_over,
+        } => {
+            distinctness.is_some()
+                || !order_by.is_empty()
+                || !within_group.is_empty()
+                || filter_over.filter_clause.is_some()
+                || filter_over.over_clause.is_some()
+                || is_aggregate_function(name.as_str(), args.len())
+                || any(args)
+        }
+        Expr::FunctionCallStar { name, filter_over } => {
+            filter_over.filter_clause.is_some()
+                || filter_over.over_clause.is_some()
+                || is_aggregate_function(name.as_str(), 0)
+        }
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            contains_aggregate_or_window(lhs)
+                || contains_aggregate_or_window(start)
+                || contains_aggregate_or_window(end)
+        }
+        Expr::Binary(left, _, right)
+        | Expr::Subscript {
+            base: left,
+            index: right,
+        } => contains_aggregate_or_window(left) || contains_aggregate_or_window(right),
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_deref().is_some_and(contains_aggregate_or_window)
+                || when_then_pairs.iter().any(|(when, then)| {
+                    contains_aggregate_or_window(when) || contains_aggregate_or_window(then)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(contains_aggregate_or_window)
+        }
+        Expr::Cast { expr, .. }
+        | Expr::Collate(expr, _)
+        | Expr::FieldAccess { base: expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::NotNull(expr)
+        | Expr::Unary(_, expr)
+        | Expr::InSelect { lhs: expr, .. } => contains_aggregate_or_window(expr),
+        Expr::InList { lhs, rhs, .. } => contains_aggregate_or_window(lhs) || any(rhs),
+        Expr::InTable { lhs, args, .. } => contains_aggregate_or_window(lhs) || any(args),
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            contains_aggregate_or_window(lhs)
+                || contains_aggregate_or_window(rhs)
+                || escape.as_deref().is_some_and(contains_aggregate_or_window)
+        }
+        Expr::MergedColumn(exprs)
+        | Expr::Parenthesized(exprs)
+        | Expr::Array { elements: exprs } => any(exprs),
+        Expr::Raise(_, expr) => expr.as_deref().is_some_and(contains_aggregate_or_window),
+        Expr::SubqueryResult { lhs, .. } => {
+            lhs.as_deref().is_some_and(contains_aggregate_or_window)
+        }
+        Expr::Exists(_)
+        | Expr::Subquery(_)
+        | Expr::Register(_)
+        | Expr::DoublyQualified(..)
+        | Expr::Id(_)
+        | Expr::Column { .. }
+        | Expr::RowId { .. }
+        | Expr::Literal(_)
+        | Expr::Name(_)
+        | Expr::Qualified(..)
+        | Expr::Variable(_)
+        | Expr::Default => false,
+    }
+}
+
+/// Whether `name` called with `arg_count` arguments is an aggregate that turso
+/// always provides: the built-in ones and those of `core/percentile.rs`.
+/// `min` and `max` with two or more arguments are scalar functions.
+fn is_aggregate_function(name: &str, arg_count: usize) -> bool {
+    const AGGREGATES: &[&str] = &[
+        "array_agg",
+        "avg",
+        "bool_and",
+        "bool_or",
+        "count",
+        "every",
+        "group_concat",
+        "json_agg",
+        "json_group_array",
+        "json_group_object",
+        "json_object_agg",
+        "jsonb_agg",
+        "jsonb_group_array",
+        "jsonb_group_object",
+        "jsonb_object_agg",
+        "median",
+        "mode",
+        "percentile",
+        "percentile_cont",
+        "percentile_disc",
+        "stddev",
+        "string_agg",
+        "sum",
+        "total",
+    ];
+    let name = name.to_ascii_lowercase();
+    match name.as_str() {
+        "min" | "max" => arg_count <= 1,
+        name => AGGREGATES.contains(&name),
+    }
+}
+
+/// The number of columns `select` returns, when it can be read from the
+/// statement without the schema (no `*`).
+fn result_column_count(select: &ast::Select) -> Option<usize> {
+    match &select.body.select {
+        ast::OneSelect::Select { columns, .. } => columns
+            .iter()
+            .all(|column| matches!(column, ast::ResultColumn::Expr(..)))
+            .then_some(columns.len()),
+        ast::OneSelect::Values(rows) => rows.first().map(Vec::len),
     }
 }
 
@@ -11470,12 +11802,41 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_any_sublink_operators() {
-        assert_not_supported("SELECT 1 > ANY (SELECT a FROM t)", "> ANY/SOME");
-        assert_not_supported("SELECT 1 <> SOME (SELECT a FROM t)", "<> ANY/SOME");
-        assert_translates("SELECT 1 = ANY (SELECT a FROM t)");
+    fn any_all_sublink_comparison_operators_translate() {
+        for op in ["=", "<>", "<", "<=", ">", ">="] {
+            assert_translates(&format!("SELECT 1 {op} ANY (SELECT a FROM t)"));
+            assert_translates(&format!("SELECT 1 {op} ALL (SELECT a FROM t)"));
+        }
+        assert_translates("SELECT 1 <> SOME (SELECT a FROM t)");
         assert_translates("SELECT 1 IN (SELECT a FROM t)");
         assert_translates("SELECT 1 NOT IN (SELECT a FROM t)");
+    }
+
+    #[test]
+    fn any_all_sublink_rejects_aggregate_or_window_on_the_left() {
+        for sql in [
+            "SELECT a FROM t GROUP BY a HAVING count(*) > ALL (SELECT a FROM t)",
+            "SELECT max(a) < ANY (SELECT a FROM t) FROM t",
+            "SELECT sum(a) + 1 >= ALL (SELECT a FROM t) FROM t",
+            "SELECT row_number() OVER () < ANY (SELECT a FROM t) FROM t",
+            "SELECT stddev(a) > ANY (SELECT 1) FROM t",
+            "SELECT median(a) <= ALL (SELECT a FROM t) FROM t",
+        ] {
+            assert_not_supported(sql, "an aggregate or window function on the left");
+        }
+        assert_translates("SELECT (SELECT max(a) FROM t) > ALL (SELECT a FROM t)");
+        assert_translates("SELECT max(a, 1) > ANY (SELECT a FROM t) FROM t");
+        assert_translates("SELECT a FROM t GROUP BY a HAVING count(*) = ANY (SELECT a FROM t)");
+    }
+
+    #[test]
+    fn any_all_sublink_rejects_subquery_with_two_columns() {
+        let parsed = crate::parse("SELECT 1 > ANY (SELECT a, a FROM t)").unwrap();
+        let err = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parsed)
+            .expect_err("two columns")
+            .to_string();
+        assert!(err.contains("subquery has too many columns"), "got: {err}");
     }
 
     #[test]
