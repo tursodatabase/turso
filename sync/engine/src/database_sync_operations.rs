@@ -3055,7 +3055,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
         }),
     };
 
-    let mut add_column_step_indices = std::collections::HashSet::new();
+    let mut ignored_step_indices = std::collections::HashSet::new();
     let mut sql_over_http_requests = vec![
         BatchStep {
             stmt: Stmt {
@@ -3131,6 +3131,17 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                         replay_info.query = rewritten;
                     }
                 }
+                // a rename runs only when the remote still has the old name, so
+                // a rename that the remote already has is skipped
+                let rename_probe = if replay_info.is_ddl_replay {
+                    rename_old_name_probe(&replay_info.query)
+                } else {
+                    None
+                };
+                let rename_probe_step_index = rename_probe.map(|probe| {
+                    sql_over_http_requests.push(step(probe, Vec::new()));
+                    sql_over_http_requests.len() - 1
+                });
                 match &change.change {
                     DatabaseTapeRowChangeType::Delete { before, key } => {
                         let values = generator.replay_delete_values(
@@ -3206,7 +3217,21 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
                     }
                 }
                 if is_alter_add_column {
-                    add_column_step_indices.insert(sql_over_http_requests.len() - 1);
+                    ignored_step_indices.insert(sql_over_http_requests.len() - 1);
+                }
+                if let Some(probe_index) = rename_probe_step_index {
+                    ignored_step_indices.insert(probe_index);
+                    let rename_step = sql_over_http_requests.last_mut().unwrap();
+                    rename_step.condition = Some(BatchCond::And(server_proto::BatchCondList {
+                        conds: vec![
+                            BatchCond::Not {
+                                cond: Box::new(BatchCond::IsAutocommit {}),
+                            },
+                            BatchCond::Ok {
+                                step: u32::try_from(probe_index).unwrap(),
+                            },
+                        ],
+                    }));
                 }
             }
         }
@@ -3246,7 +3271,7 @@ async fn send_push_batch<IO: SyncEngineIo, Ctx>(
         .into(),
     };
 
-    let _ = sql_execute_http(ctx, replay_hrana_request, &add_column_step_indices).await?;
+    let _ = sql_execute_http(ctx, replay_hrana_request, &ignored_step_indices).await?;
     Ok((rows_changed, last_change_id.unwrap_or(0)))
 }
 
@@ -3774,6 +3799,28 @@ fn is_alter_table_add_column(sql: &str) -> bool {
             }
         ))
     )
+}
+
+/// For `ALTER TABLE ... RENAME TO` and `RENAME COLUMN` / `ALTER COLUMN` with a
+/// new name, returns a query that fails when the old table or column name does
+/// not exist. Returns None for other statements.
+fn rename_old_name_probe(sql: &str) -> Option<String> {
+    use turso_parser::ast::{AlterTable, AlterTableBody, Cmd, Stmt};
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    let Some(Ok(Cmd::Stmt(Stmt::AlterTable(AlterTable { name, body })))) = parser.next() else {
+        return None;
+    };
+    // backticks, unlike double quotes, never turn a missing column into a string literal
+    let backtick_quote =
+        |name: &turso_parser::ast::Name| format!("`{}`", name.as_str().replace('`', "``"));
+    let table = name.to_string();
+    match body {
+        AlterTableBody::RenameTo(_) => Some(format!("SELECT 1 FROM {table} LIMIT 0")),
+        AlterTableBody::RenameColumn { old, .. } | AlterTableBody::AlterColumn { old, .. } => Some(
+            format!("SELECT {} FROM {table} LIMIT 0", backtick_quote(&old)),
+        ),
+        _ => None,
+    }
 }
 
 /// Rewrite a CREATE statement with `IF NOT EXISTS` so it can be replayed on a
