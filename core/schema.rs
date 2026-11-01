@@ -7337,8 +7337,7 @@ pub struct Column {
     /// `info` because a custom collation does not fit in its bits.
     collation: Option<TextCollation>,
     /// The order of the column's type, when it has one (numeric, arrays).
-    /// Keys on the column use it instead of `collation`. Set from the schema's
-    /// types by `BTreeTable::resolve_custom_types`, never stored in the SQL.
+    /// Keys on the column use it instead of `collation`.
     type_ordering: Option<TypeOrdering>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
