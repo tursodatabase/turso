@@ -24,7 +24,7 @@ use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
-use crate::translate::sequence::bind_sequence_names;
+use crate::translate::sequence::{bind_sequence_names, emit_find_sqlite_sequence_row_name};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
     column_declared_type, dequote, escape_sql_string_literal, is_builtin_strict_type,
@@ -2675,12 +2675,15 @@ pub fn translate_drop_table(
     // database using main's root page, corrupting whatever lived there.
     // The matching `OpenWrite` below passes `db: database_id`, so the root
     // page must come from the same schema.
-    if let Some(seq_table) = resolver.with_schema(database_id, |s| {
+    let autoincrement_table = table.btree().filter(|btree| btree.has_autoincrement);
+    let seq_table = resolver.with_schema(database_id, |s| {
         s.get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
-    }) {
+    });
+    if let (Some(dropped_table), Some(seq_table)) = (autoincrement_table, seq_table) {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
-        let dropped_table_name_reg = program.emit_string8_new_reg(mangled_name.clone());
+        let dropped_table_name_reg = program
+            .emit_string8_new_reg(resolver.mangle_name(namespace, &dropped_table.declared_name));
         program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
@@ -2689,6 +2692,8 @@ pub fn translate_drop_table(
             db: database_id,
         });
 
+        let table_row_name_reg =
+            emit_find_sqlite_sequence_row_name(program, seq_cursor_id, dropped_table_name_reg);
         let end_loop_label = program.allocate_label();
         let loop_start_label = program.allocate_label();
 
@@ -2704,10 +2709,10 @@ pub fn translate_drop_table(
         let continue_loop_label = program.allocate_label();
         program.emit_insn(Insn::Ne {
             lhs: seq_table_name_reg,
-            rhs: dropped_table_name_reg,
+            rhs: table_row_name_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default().jump_if_null(),
-            collation: CollationSeq::NOCASE,
+            collation: CollationSeq::for_internal_values(),
         });
 
         program.emit_insn(Insn::Delete {

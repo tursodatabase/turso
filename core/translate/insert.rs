@@ -5,6 +5,7 @@ use crate::translate::emitter::RegisterColumn;
 use crate::translate::emitter::{
     emit_index_column_value_old_image, emit_partial_index_where_old_image, gencol,
 };
+use crate::translate::sequence::emit_find_sqlite_sequence_row_name;
 use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -1788,7 +1789,7 @@ fn open_autoincrement_state(
     });
 
     let table_name_reg =
-        program.emit_string8_new_reg(resolver.mangle_name(ctx.namespace, &ctx.table.name));
+        program.emit_string8_new_reg(resolver.mangle_name(ctx.namespace, &ctx.table.declared_name));
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
 
@@ -1834,6 +1835,8 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         dest_end: None,
     });
 
+    let table_row_name_reg =
+        emit_find_sqlite_sequence_row_name(program, seq_cursor_id, table_name_reg);
     let loop_start_label = program.allocate_label();
     let loop_end_label = program.allocate_label();
     let found_label = program.allocate_label();
@@ -1847,16 +1850,11 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
     let name_col_reg = program.alloc_register();
     program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
     program.emit_insn(Insn::Ne {
-        lhs: table_name_reg,
-        rhs: name_col_reg,
+        lhs: name_col_reg,
+        rhs: table_row_name_reg,
         target_pc: found_label,
         flags: CmpInsFlags::default().jump_if_null(),
-        collation: super::collate::CollationSeq::NOCASE,
-    });
-    program.emit_insn(Insn::Copy {
-        src_reg: name_col_reg,
-        dst_reg: table_name_reg,
-        extra_amount: 0,
+        collation: CollationSeq::for_internal_values(),
     });
 
     program.emit_column_or_rowid(seq_cursor_id, 1, r_seq);

@@ -73,6 +73,173 @@ fn test_alter_table_drop_column_preserves_autoincrement_reopen() {
     }
 }
 
+/// ADD COLUMN and DROP COLUMN rewrite the stored CREATE TABLE. After reopen,
+/// sqlite_sequence must still use the table name as written in CREATE TABLE.
+#[test]
+fn test_alter_table_add_drop_column_keeps_mixed_case_sequence_name_reopen() {
+    alter_table_add_drop_column_keeps_mixed_case_sequence_name_reopen(false);
+}
+
+#[test]
+fn test_mvcc_alter_table_add_drop_column_keeps_mixed_case_sequence_name_reopen() {
+    alter_table_add_drop_column_keeps_mixed_case_sequence_name_reopen(true);
+}
+
+fn alter_table_add_drop_column_keeps_mixed_case_sequence_name_reopen(enable_mvcc: bool) {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join("alter_mixed_case_autoincrement_reopen.db");
+    let open = || {
+        TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(enable_mvcc)
+            .build()
+    };
+
+    {
+        let db = open();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE \"MiXeD\"(id INTEGER PRIMARY KEY AUTOINCREMENT, v)")
+            .unwrap();
+        conn.execute("INSERT INTO mixed(v) VALUES (1)").unwrap();
+        conn.execute("ALTER TABLE mixed ADD COLUMN z").unwrap();
+        conn.execute("ALTER TABLE mixed DROP COLUMN z").unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let db = open();
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO mixed(v) VALUES (2)").unwrap();
+        let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+        assert_eq!(seq, vec![("MiXeD".into(), 2)]);
+
+        conn.execute("DELETE FROM sqlite_sequence").unwrap();
+        conn.execute("INSERT INTO mixed(v) VALUES (3)").unwrap();
+        let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+        assert_eq!(seq, vec![("MiXeD".into(), 3)]);
+        conn.close().unwrap();
+    }
+}
+
+/// Databases written by Turso v0.9.0-pre.1 and earlier keep working. Those
+/// versions stored the lowercased table name in `sqlite_sequence`, and ADD
+/// COLUMN rewrote the stored CREATE TABLE with the lowercased name. The test
+/// builds that state with the current code, then checks that INSERT, RENAME
+/// TO and DROP TABLE use the old rows and that ids keep counting from them
+/// after a reopen.
+#[test]
+fn test_autoincrement_tables_from_older_turso_keep_working() {
+    autoincrement_tables_from_older_turso_keep_working(false);
+}
+
+/// Same as above, but the lowercased `sqlite_sequence` rows are written in
+/// MVCC mode and are only in the logical log when the database is reopened.
+#[test]
+fn test_mvcc_autoincrement_tables_from_older_turso_keep_working() {
+    autoincrement_tables_from_older_turso_keep_working(true);
+}
+
+fn autoincrement_tables_from_older_turso_keep_working(enable_mvcc: bool) {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("autoincrement_from_older_turso.db");
+    let open = |enable_mvcc| {
+        TempDatabase::builder()
+            .with_db_path(&path)
+            .with_mvcc(enable_mvcc)
+            .build()
+    };
+
+    {
+        let db = open(false);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE \"MiXeD Name\"(id INTEGER PRIMARY KEY AUTOINCREMENT, v)")
+            .unwrap();
+        // ADD COLUMN in older versions rewrote the CREATE TABLE text with the
+        // lowercased name. Creating the table with that text gives the same
+        // sqlite_schema row.
+        conn.execute("CREATE TABLE \"add col\" (id INTEGER PRIMARY KEY AUTOINCREMENT, v, w)")
+            .unwrap();
+        conn.execute("INSERT INTO \"MiXeD Name\"(v) VALUES ('x'), ('y')")
+            .unwrap();
+        conn.execute("INSERT INTO \"AdD Col\"(v) VALUES ('a'), ('b'), ('c')")
+            .unwrap();
+        // Without the sqlite_sequence rows, the next ids would reuse these.
+        conn.execute("DELETE FROM \"MiXeD Name\" WHERE id = 2")
+            .unwrap();
+        conn.execute("DELETE FROM \"AdD Col\" WHERE id = 3")
+            .unwrap();
+        conn.close().unwrap();
+    }
+
+    {
+        let db = open(enable_mvcc);
+        let conn = db.connect_limbo();
+        conn.execute("UPDATE sqlite_sequence SET name = lower(name)")
+            .unwrap();
+        conn.close().unwrap();
+    }
+    if enable_mvcc {
+        let log_path = format!("{}-log", path.display());
+        let log_len = std::fs::metadata(log_path).unwrap().len();
+        assert!(
+            log_len > 0,
+            "the old sqlite_sequence rows must be in the logical log"
+        );
+    }
+
+    {
+        let db = open(enable_mvcc);
+        let conn = db.connect_limbo();
+        let schema: Vec<(String,)> =
+            conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'add col'");
+        assert_eq!(
+            schema,
+            vec![("CREATE TABLE \"add col\" (id INTEGER PRIMARY KEY AUTOINCREMENT, v, w)".into(),)]
+        );
+        let seq: Vec<(String, i64)> =
+            conn.exec_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name");
+        assert_eq!(seq, vec![("add col".into(), 3), ("mixed name".into(), 2)]);
+
+        conn.execute("INSERT INTO \"MiXeD Name\"(v) VALUES ('z')")
+            .unwrap();
+        conn.execute("INSERT INTO \"AdD Col\"(v) VALUES ('d')")
+            .unwrap();
+        let seq: Vec<(String, i64)> =
+            conn.exec_rows("SELECT name, seq FROM sqlite_sequence ORDER BY name");
+        assert_eq!(seq, vec![("MiXeD Name".into(), 3), ("add col".into(), 4)]);
+
+        conn.execute("ALTER TABLE \"AdD Col\" RENAME TO \"ReNaMed\"")
+            .unwrap();
+        conn.execute("DROP TABLE \"MiXeD Name\"").unwrap();
+        let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+        assert_eq!(seq, vec![("ReNaMed".into(), 4)]);
+        conn.close().unwrap();
+    }
+
+    {
+        let db = open(enable_mvcc);
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO renamed(v) VALUES ('e')").unwrap();
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM renamed ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                (1, "a".into()),
+                (2, "b".into()),
+                (4, "d".into()),
+                (5, "e".into()),
+            ]
+        );
+        let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
+        assert_eq!(seq, vec![("ReNaMed".into(), 5)]);
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".into(),)]);
+        conn.close().unwrap();
+    }
+}
+
 /// After ALTER TABLE ADD COLUMN on a table with UNIQUE(stream_id, version), reopen
 /// must succeed (no orphan autoindex) and the unique constraint must still be enforced.
 #[test]

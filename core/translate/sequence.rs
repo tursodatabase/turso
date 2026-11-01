@@ -702,7 +702,7 @@ pub(crate) fn emit_backing_table_compaction(
 }
 
 /// Emit bytecode that mirrors a sequence watermark into the
-/// `sqlite_sequence` row keyed by `autoinc_table_name`. Used by
+/// `sqlite_sequence` row of the table stored as `autoinc_table_name`. Used by
 /// nextval / advance_past / setval for `_autoincrement_*` sequences,
 /// so that SQLite-compatibility readers of `sqlite_sequence` always
 /// see the current high-water mark without waiting for a checkpoint.
@@ -743,7 +743,8 @@ pub(crate) fn emit_sqlite_sequence_sync(
 
     let name_reg = program.emit_string8_new_reg(autoinc_table_name.to_string());
 
-    // Delete every existing row matching `name = autoinc_table_name`.
+    // Delete every existing row of the table.
+    let table_row_name_reg = emit_find_sqlite_sequence_row_name(program, sseq_cursor, name_reg);
     let insert_label = program.allocate_label();
     let loop_top_label = program.allocate_label();
     let skip_delete_label = program.allocate_label();
@@ -756,7 +757,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
     program.emit_column_or_rowid(sseq_cursor, 0, col_name_reg);
     program.emit_insn(Insn::Ne {
         lhs: col_name_reg,
-        rhs: name_reg,
+        rhs: table_row_name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default().jump_if_null(),
         collation: CollationSeq::for_internal_values(),
@@ -818,6 +819,70 @@ pub(crate) fn emit_sqlite_sequence_sync(
     Ok(true)
 }
 
+/// Emit a scan of `sqlite_sequence` that finds the name of the row of the
+/// table stored as the name in `table_name_reg`, and return the register
+/// holding it, or NULL when the table has no row. Like SQLite, the table's row
+/// is the one named exactly as the table was written in CREATE TABLE. Older
+/// versions of Turso stored and matched names ignoring case, so their files can
+/// hold a row whose name differs from the table's only in case; when no row has
+/// the exact name, the first such row is the table's row.
+pub(crate) fn emit_find_sqlite_sequence_row_name(
+    program: &mut ProgramBuilder,
+    seq_cursor_id: usize,
+    table_name_reg: usize,
+) -> usize {
+    let row_name_reg = program.alloc_register();
+    program.emit_insn(Insn::Null {
+        dest: row_name_reg,
+        dest_end: None,
+    });
+    let candidate_reg = program.alloc_register();
+    let done_label = program.allocate_label();
+    program.cursor_loop(seq_cursor_id, |program, _rowid| {
+        let exact_match_label = program.allocate_label();
+        let next_row_label = program.allocate_label();
+        program.emit_column_or_rowid(seq_cursor_id, 0, candidate_reg);
+        program.emit_insn(Insn::Eq {
+            lhs: candidate_reg,
+            rhs: table_name_reg,
+            target_pc: exact_match_label,
+            flags: CmpInsFlags::default(),
+            collation: CollationSeq::for_internal_values(),
+        });
+        program.emit_insn(Insn::NotNull {
+            reg: row_name_reg,
+            target_pc: next_row_label,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: candidate_reg,
+            rhs: table_name_reg,
+            target_pc: next_row_label,
+            flags: CmpInsFlags::default(),
+            collation: CollationSeq::NOCASE,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: candidate_reg,
+            dst_reg: row_name_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: next_row_label,
+        });
+        program.preassign_label_to_next_insn(exact_match_label);
+        program.emit_insn(Insn::Copy {
+            src_reg: candidate_reg,
+            dst_reg: row_name_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: done_label,
+        });
+        program.preassign_label_to_next_insn(next_row_label);
+    });
+    program.preassign_label_to_next_insn(done_label);
+    row_name_reg
+}
+
 /// If `seq` is an AUTOINCREMENT-backing sequence (its name begins with
 /// `__turso_internal_autoincrement_`), emit `sqlite_sequence` sync
 /// bytecode for the underlying table. No-op for user-defined
@@ -831,10 +896,27 @@ pub(crate) fn emit_autoincrement_sqlite_sequence_sync(
     seq_name: &str,
     value_reg: usize,
 ) -> Result<()> {
-    let Some(table_name) = seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX) else {
+    let Some(mangled_table_name) = seq_name.strip_prefix(AUTOINCREMENT_SEQ_PREFIX) else {
         return Ok(());
     };
-    emit_sqlite_sequence_sync(program, resolver, database_id, table_name, value_reg)?;
+    let table_name_as_written = resolver
+        .with_schema(database_id, |s| {
+            let (namespace, table_name) = s.demangle_name(mangled_table_name);
+            s.get_btree_table(namespace, table_name)
+                .map(|table| crate::namespace::mangle_name(namespace, &table.declared_name))
+        })
+        .ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "missing AUTOINCREMENT table \"{mangled_table_name}\" for sequence \"{seq_name}\""
+            ))
+        })?;
+    emit_sqlite_sequence_sync(
+        program,
+        resolver,
+        database_id,
+        &table_name_as_written,
+        value_reg,
+    )?;
     Ok(())
 }
 
