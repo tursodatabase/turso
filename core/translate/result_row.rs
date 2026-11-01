@@ -171,7 +171,17 @@ pub fn emit_columns_to_destination(
             affinity_str,
             is_delete,
         } => {
-            if *is_delete {
+            if *is_delete && dedupe_index.has_rowid {
+                let label_not_found = program.allocate_label();
+                emit_delete_one_matching_entry(
+                    program,
+                    *index_cursor_id,
+                    start_reg,
+                    num_columns,
+                    label_not_found,
+                );
+                program.preassign_label_to_next_insn(label_not_found);
+            } else if *is_delete {
                 program.emit_insn(Insn::IdxDelete {
                     start_reg,
                     num_regs: num_columns,
@@ -459,6 +469,43 @@ pub fn emit_columns_to_destination(
         QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }
     Ok(())
+}
+
+/// Removes one entry whose columns equal the `num_columns` registers at `start_reg` from
+/// an ephemeral index that keeps duplicates, or jumps to `label_not_found` if there is
+/// none. The entry's last column is its unique sequence number, which IdxDelete needs in
+/// order to pick exactly one of the duplicates.
+pub fn emit_delete_one_matching_entry(
+    program: &mut ProgramBuilder,
+    cursor_id: usize,
+    start_reg: usize,
+    num_columns: usize,
+    label_not_found: BranchOffset,
+) {
+    let key_start = program.alloc_registers(num_columns + 1);
+    program.emit_insn(Insn::Copy {
+        src_reg: start_reg,
+        dst_reg: key_start,
+        extra_amount: num_columns - 1,
+    });
+    program.emit_insn(Insn::NotFound {
+        cursor_id,
+        target_pc: label_not_found,
+        record_reg: key_start,
+        num_regs: num_columns,
+    });
+    program.emit_insn(Insn::Column {
+        cursor_id,
+        column: num_columns,
+        dest: key_start + num_columns,
+        default: None,
+    });
+    program.emit_insn(Insn::IdxDelete {
+        start_reg: key_start,
+        num_regs: num_columns + 1,
+        cursor_id,
+        raise_error_if_no_matching_entry: true,
+    });
 }
 
 /// Emits the bytecode for:

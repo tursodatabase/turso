@@ -1398,7 +1398,10 @@ fn prepare_recursive_cte_plan(
     let union_all = match recursive_compound_operator {
         ast::CompoundOperator::UnionAll => true,
         ast::CompoundOperator::Union => false,
-        ast::CompoundOperator::Except | ast::CompoundOperator::Intersect => {
+        ast::CompoundOperator::Except
+        | ast::CompoundOperator::Intersect
+        | ast::CompoundOperator::ExceptAll
+        | ast::CompoundOperator::IntersectAll => {
             crate::bail_parse_error!(
                 "recursive CTEs must use UNION ALL or UNION between the initial and recursive queries"
             );
