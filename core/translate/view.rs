@@ -7,7 +7,7 @@ use crate::translate::collate::CollationSeq;
 use crate::translate::sequence::bind_sequence_names_in_select;
 use crate::translate::{
     emitter::Resolver,
-    schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
+    schema::{check_functions_exist_in_select, emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
 use crate::util::{
     escape_sql_string_literal, extract_view_columns, normalize_ident,
@@ -421,6 +421,9 @@ pub fn translate_create_view(
     }
 
     crate::util::validate_select_for_views(select_stmt, resolver, database_id)?;
+    if resolver.catalog.dialect.checks_functions_exist_at_create() {
+        check_functions_exist_in_select(select_stmt, &resolver.catalog)?;
+    }
 
     let mut select_stmt = select_stmt.clone();
     if resolver.catalog.dialect.binds_names_at_create() {

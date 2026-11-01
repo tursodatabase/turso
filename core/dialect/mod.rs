@@ -201,6 +201,15 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a column default or a view body that calls a function that
+    /// does not exist fails when the table or view is created.
+    ///
+    /// PostgreSQL looks the function up at create time. SQLite accepts the
+    /// default or view and fails each time it runs.
+    fn checks_functions_exist_at_create(&self) -> bool {
+        false
+    }
+
     /// The namespaces of a database that has never created or dropped one.
     /// They have ids from 1 in this order and no rows until the first
     /// CREATE SCHEMA or DROP SCHEMA creates the namespaces table, which then

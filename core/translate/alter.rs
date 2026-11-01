@@ -11,7 +11,7 @@ use turso_parser::{
 use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
-    schema::{validate_check_expr, validate_default_expr, SQLITE_TABLEID},
+    schema::{check_functions_exist, validate_check_expr, validate_default_expr, SQLITE_TABLEID},
     update::translate_update_for_schema_change,
 };
 use crate::{
@@ -1263,6 +1263,12 @@ pub fn translate_alter_table(
             }
             if btree.is_strict {
                 column.resolve_custom_type(resolver.schema());
+            }
+
+            if let Some(default) = &column.default {
+                if resolver.catalog.dialect.checks_functions_exist_at_create() {
+                    check_functions_exist(default, &resolver.catalog)?;
+                }
             }
 
             // If a column has no explicit DEFAULT but its custom type defines

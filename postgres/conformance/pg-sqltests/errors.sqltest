@@ -24,6 +24,61 @@ test error-missing-column-named-like-an-error-message {
 @sqlstate 42703
 expect error {}
 
+test error-column-default-calls-missing-function {
+    CREATE TABLE t (id uuid DEFAULT nosuchfn(), name text);
+}
+@sqlstate 42883
+expect error {}
+
+test error-added-column-default-calls-missing-function {
+    CREATE TABLE t (name text);
+    ALTER TABLE t ADD COLUMN id uuid DEFAULT nosuchfn();
+}
+@sqlstate 42883
+expect error {}
+
+test error-domain-default-calls-missing-function {
+    CREATE DOMAIN d AS int DEFAULT nosuchfn();
+}
+@sqlstate 42883
+expect error {}
+
+test error-domain-check-calls-missing-function {
+    CREATE DOMAIN d AS int CHECK (nosuchfn(VALUE) > 0);
+}
+@sqlstate 42883
+expect error {}
+
+test domain-default-and-check-call-existing-functions {
+    CREATE DOMAIN d AS int DEFAULT abs(-3) CHECK (abs(VALUE) < 10);
+    CREATE TABLE t (a int, b d);
+    INSERT INTO t (a) VALUES (1);
+    SELECT b FROM t;
+}
+expect {
+    3
+}
+
+test error-view-calls-missing-function {
+    CREATE VIEW v AS SELECT nosuchfn();
+}
+@sqlstate 42883
+expect error {}
+
+test error-view-calls-missing-function-in-subquery {
+    CREATE VIEW v AS SELECT (SELECT nosuchfn()) AS x;
+}
+@sqlstate 42883
+expect error {}
+
+test view-calls-function-from-extension {
+    CREATE VIEW v AS SELECT gen_random_uuid() AS u;
+    SELECT count(*) FROM v WHERE u IS NOT NULL;
+}
+expect {
+    1
+}
+
 test error-syntax {
     SELEC 1;
 }
