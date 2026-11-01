@@ -261,6 +261,32 @@ impl RowValueSubqueries {
         self.parent.as_ref()?.get(subquery_id)
     }
 
+    /// Makes the columns of `subquery_id` bring no text collation to a row
+    /// value comparison, for a subquery compared by a WHERE term.
+    pub(crate) fn drop_column_collations(&self, subquery_id: TableInternalId) {
+        let Some(subquery) = self.get(subquery_id) else {
+            return;
+        };
+        let columns = subquery
+            .columns
+            .iter()
+            .map(|column| RowValueSubqueryColumn {
+                text_collation: crate::translate::collate::FieldCollation {
+                    collation: None,
+                    explicit: false,
+                },
+                ..column.clone()
+            })
+            .collect();
+        self.insert(
+            subquery_id,
+            RowValueSubquery {
+                result_reg_start: subquery.result_reg_start,
+                columns,
+            },
+        );
+    }
+
     fn fork(self: &Rc<Self>) -> Rc<Self> {
         Rc::new(Self {
             parent: Some(self.clone()),
@@ -285,6 +311,10 @@ pub(crate) struct RowValueSubqueryColumn {
     /// The column's type, which decides custom-type operators: in
     /// `d - (SELECT e FROM u)` with `e` a date, the result is a number of days.
     pub(crate) expr_type: ExprType,
+    /// The column's text collation and whether a COLLATE operator gave it, so
+    /// `(SELECT a, 1 FROM t) = ('A', 1)` compares `a` with its own collation,
+    /// as SQLite does for the columns of a row value.
+    pub(crate) text_collation: crate::translate::collate::FieldCollation,
 }
 
 impl RowValueSubquery {

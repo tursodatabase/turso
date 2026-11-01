@@ -62,6 +62,17 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
     pub(crate) fn schema(&self) -> &'a Schema {
         self.resolver.schema()
     }
+
+    /// The collation of the column of a row subquery whose value is in
+    /// `result_reg`, for comparing the components of a row value.
+    pub(crate) fn subquery_field_collation(
+        &self,
+        query: TableInternalId,
+        result_reg: usize,
+    ) -> Option<crate::translate::collate::FieldCollation> {
+        let subquery = self.resolver.row_value_subqueries.get(query)?;
+        Some(subquery.column(result_reg)?.text_collation)
+    }
 }
 
 impl ExprProperties for ExprContext<'_, '_> {
