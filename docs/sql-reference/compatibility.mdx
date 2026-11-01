@@ -55,3 +55,41 @@ Cancellation after commit does not undo the changes.
 
 - [Experimental Features](/docs/sql-reference/experimental-features) for how to enable experimental features
 - [COMPAT.md](https://github.com/tursodatabase/turso/blob/main/COMPAT.md) for the full compatibility matrix
+
+## PostgreSQL configuration parameters
+
+`SET`, `SET LOCAL`, `set_config`, `SHOW`, and `current_setting` use the same
+built-in parameter validation. `RESET`, `SET ... TO DEFAULT`, and a NULL value
+passed to `set_config` restore the parameter's default. `RESET ALL` and
+`DISCARD ALL` also reset `application_name`, `search_path`, and custom parameters.
+Session changes inside a transaction roll back with the transaction; local
+changes last until its end. An implicit-transaction `set_config(..., true)`
+returns the validated value without changing the next statement's settings.
+
+`application_name` stores text per connection (default: empty). `search_path`
+and dotted custom parameter names retain their existing transaction behavior.
+`current_setting(name, true)` returns NULL for unknown parameters.
+
+Other supported parameters describe fixed engine modes. Their effective value
+is returned consistently, including after reset:
+
+| Parameter | Effective value | Accepted alternatives |
+| --- | --- | --- |
+| `DateStyle` | `ISO, MDY` | `ISO`, `MDY`, either order of `ISO, MDY`; case insensitive |
+| `IntervalStyle` | `postgres` | Case insensitive |
+| `client_encoding` | `UTF8` | `UTF-8`, `UNICODE`; case insensitive |
+| `standard_conforming_strings` | `on` | PostgreSQL true spellings |
+| `extra_float_digits` | `1` | `2`, `3` (the same shortest-precise output mode) |
+| `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`, `transaction_timeout` | `0` | None; timeouts are disabled |
+| `row_security`, `quote_all_identifiers`, `check_function_bodies`, `synchronize_seqscans` | `off` | PostgreSQL false spellings |
+| `default_tablespace` | Empty string | None |
+| `default_table_access_method` | `heap` | None |
+| `xmloption` | `content` | Case insensitive |
+| `client_min_messages` | `warning` | Case insensitive |
+
+Unsupported values raise an error. In particular, accepting ISO date output
+does not enable other date formats or date input orders; non-ISO date input
+remains unsupported. These settings do not add timeout enforcement, row-level
+security, function-body validation, synchronized scans, or additional diagnostic
+message levels. Previously accepted no-op requests for unsupported modes now
+raise an error rather than reporting that those modes took effect.

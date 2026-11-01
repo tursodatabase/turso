@@ -135,9 +135,7 @@ fn test_postgres_rejects_unsupported_transaction_commands(db: TempDatabase) {
 fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
     let conn = db.connect_postgres();
     for sql in [
-        "SET statement_timeout = 1000",
         "SET foreign_keys = off",
-        "SET LOCAL lock_timeout = '1s'",
         "SHOW server_version",
         "SHOW journal_mode",
     ] {
@@ -171,6 +169,8 @@ fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
         conn.execute(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
     for sql in [
+        "SET statement_timeout = 1000",
+        "SET LOCAL lock_timeout = '1s'",
         "SET DATESTYLE = SQL",
         "SET extra_float_digits = 0",
         "SET row_security = on",
@@ -178,7 +178,7 @@ fn test_postgres_rejects_unsupported_set_and_show(db: TempDatabase) {
         "SET standard_conforming_strings = off",
         "SET client_min_messages = bogus",
     ] {
-        assert!(conn.prepare(sql).is_err(), "{sql} was accepted");
+        assert!(conn.execute(sql).is_err(), "{sql} was accepted");
     }
 }
 

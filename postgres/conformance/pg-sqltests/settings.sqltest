@@ -231,3 +231,124 @@ test discard-all-inside-a-transaction-errors {
 expect error {
     DISCARD ALL cannot run inside a transaction block
 }
+
+test builtin-datestyle-apis-agree {
+    SET DATESTYLE = ISO;
+    SHOW DateStyle;
+    SELECT pg_catalog.set_config('datestyle', 'iso', true);
+    SELECT current_setting('DATESTYLE');
+    SET datestyle = ISO, MDY;
+    SHOW datestyle;
+    RESET datestyle;
+    SELECT set_config('datestyle', NULL, false);
+    SET datestyle FROM CURRENT;
+    SHOW datestyle;
+}
+expect {
+    ISO, MDY
+    ISO, MDY
+    ISO, MDY
+    ISO, MDY
+    ISO, MDY
+    ISO, MDY
+}
+
+test builtin-application-name-transaction-scope {
+    SELECT CASE WHEN set_config('app.default_name', current_setting('application_name'), false) IS NOT NULL THEN 'yes' ELSE 'no' END;
+    SET application_name = 'session';
+    SELECT set_config('application_name', 'probe', true);
+    SHOW application_name;
+    BEGIN;
+    SET LOCAL application_name = 'local';
+    SHOW application_name;
+    COMMIT;
+    SHOW application_name;
+    BEGIN;
+    SET application_name = 'rolled back';
+    ROLLBACK;
+    SHOW application_name;
+    SELECT CASE WHEN set_config('application_name', NULL, false) = current_setting('app.default_name') THEN 'yes' ELSE 'no' END;
+    SELECT CASE WHEN current_setting('application_name') = current_setting('app.default_name') THEN 'yes' ELSE 'no' END;
+}
+expect {
+    yes
+    probe
+    session
+    local
+    session
+    session
+    yes
+    yes
+}
+
+test builtin-pgdump-setup-functions {
+    SELECT set_config('client_encoding', 'unicode', true);
+    SELECT set_config('standard_conforming_strings', 'true', true);
+    SELECT set_config('statement_timeout', '0', true);
+    SELECT set_config('lock_timeout', '0', true);
+    SELECT set_config('idle_in_transaction_session_timeout', '0', true);
+    SELECT set_config('row_security', 'false', true);
+    SELECT set_config('IntervalStyle', 'postgres', true);
+    SELECT set_config('extra_float_digits', '1', true);
+    SELECT set_config('check_function_bodies', 'false', true);
+    SELECT set_config('client_min_messages', 'warning', true);
+    SELECT set_config('default_table_access_method', 'heap', true);
+    SELECT set_config('xmloption', 'content', true);
+}
+expect {
+    UTF8
+    on
+    0
+    0
+    0
+    off
+    postgres
+    1
+    off
+    warning
+    heap
+    content
+}
+
+test builtin-invalid-datestyle-function {
+    SELECT set_config('datestyle', 'bogus', true);
+}
+@sqlstate 22023
+expect error {
+    invalid value for parameter "DateStyle"
+}
+
+test builtin-invalid-datestyle-set {
+    SET datestyle = bogus;
+}
+@sqlstate 22023
+expect error {
+    invalid value for parameter "DateStyle"
+}
+
+test builtin-application-name-local-reset-and-from-current {
+    SELECT CASE WHEN set_config('app.default_name', current_setting('application_name'), false) IS NOT NULL THEN 'yes' ELSE 'no' END;
+    SET application_name = 'session';
+    BEGIN;
+    SET LOCAL application_name TO DEFAULT;
+    SELECT CASE WHEN current_setting('application_name') = current_setting('app.default_name') THEN 'yes' ELSE 'no' END;
+    COMMIT;
+    SHOW application_name;
+    BEGIN;
+    SET LOCAL application_name = 'local';
+    SET application_name FROM CURRENT;
+    COMMIT;
+    SHOW application_name;
+    SELECT current_setting('datestyle', true);
+    SELECT CASE WHEN current_setting('datestyle', NULL) IS NULL THEN 'yes' ELSE 'no' END;
+    SELECT CASE WHEN current_setting(NULL) IS NULL THEN 'yes' ELSE 'no' END;
+}
+expect {
+    yes
+    yes
+    session
+    local
+    ISO, MDY
+    yes
+    yes
+}
