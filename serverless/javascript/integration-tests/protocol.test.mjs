@@ -220,6 +220,42 @@ test.serial('Session.batch encodes named arguments for statement objects', async
   t.deepEqual(requests[0].requests.at(-1), { type: 'get_autocommit' });
 });
 
+test.serial('Session.batch keeps the affected row count of a write that returns rows', async t => {
+  const session = new Session({ url: 'http://fake-host' });
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    baton: null,
+    base_url: null,
+    results: [
+      {
+        type: 'ok',
+        response: {
+          type: 'batch',
+          result: {
+            step_results: [{
+              cols: [{ name: 'id', decltype: 'INTEGER' }],
+              rows: [[{ type: 'integer', value: '2' }]],
+              affected_row_count: 1,
+              last_insert_rowid: '2',
+            }],
+            step_errors: [null],
+          },
+        },
+      },
+      { type: 'ok', response: { type: 'get_autocommit', is_autocommit: true } },
+    ],
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+  t.teardown(() => { globalThis.fetch = originalFetch; });
+
+  const results = await session.batch([
+    { sql: 'INSERT INTO example VALUES (?) RETURNING id', args: [2] },
+  ]);
+  t.is(results[0].rows.length, 1);
+  t.is(results[0].rowsAffected, 1);
+});
+
 test.serial('Session.batch rejects every transaction-control keyword before an atomic request', async t => {
   const session = new Session({ url: 'http://fake-host' });
   const originalFetch = globalThis.fetch;
