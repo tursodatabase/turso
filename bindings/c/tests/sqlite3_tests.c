@@ -30,6 +30,7 @@ void test_sqlite3_exec_null_values();
 void test_sqlite3_prepare_no_statements();
 void test_sqlite3_close_with_unfinalized_stmt();
 void test_sqlite3_open_v2_flags();
+void test_sqlite3_db_readonly();
 
 int allocated = 0;
 
@@ -59,6 +60,7 @@ int main(void)
     test_sqlite3_prepare_no_statements();
     test_sqlite3_close_with_unfinalized_stmt();
     test_sqlite3_open_v2_flags();
+    test_sqlite3_db_readonly();
     return 0;
 }
 
@@ -1296,4 +1298,27 @@ void test_sqlite3_open_v2_flags()
     sqlite3_close(db);
 
     printf("test_sqlite3_open_v2_flags test passed\n");
+}
+
+void test_sqlite3_db_readonly()
+{
+    sqlite3 *db;
+    int rc;
+
+    rc = sqlite3_open(":memory:", &db);
+    assert(rc == SQLITE_OK);
+
+    assert(sqlite3_db_readonly(db, "missing_schema") == -1);
+    assert(sqlite3_db_readonly(db, "main") == 0);
+    assert(sqlite3_db_readonly(db, "MAIN") == 0);
+    assert(sqlite3_db_readonly(db, NULL) == 0);
+
+    /* temp is not a database until a temp object creates it. */
+    assert(sqlite3_db_readonly(db, "temp") == -1);
+    rc = sqlite3_exec(db, "CREATE TEMP TABLE tt(x);", NULL, NULL, NULL);
+    assert(rc == SQLITE_OK);
+    assert(sqlite3_db_readonly(db, "temp") == 0);
+
+    sqlite3_close(db);
+    printf("test_sqlite3_db_readonly test passed\n");
 }
