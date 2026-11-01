@@ -7,8 +7,9 @@ use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
-use crate::functions::{find_parameter, ConfigParameter, Parameter};
-use crate::settings::{ConnectionSettings, PgSessionState, SettingScope};
+use crate::settings::{
+    find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SettingScope,
+};
 use crate::statement::{PgTxState, PostRunFn, TxRole};
 use turso_core::schema::Table;
 use turso_core::{
@@ -1695,8 +1696,25 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 ))
             }
         },
-        (None, PgSetTo::Values(values)) if set_value_already_in_effect(name, values) => {
-            return noop_statement(&pg_conn.conn);
+        (Some(Parameter::BuiltIn(parameter)), PgSetTo::Values(values)) => {
+            if values.len() != 1 && !parameter.accepts_list() {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_PARAMETER_VALUE,
+                    format!("SET {name} takes only one argument"),
+                ));
+            }
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    PgSetValue::Identifier(s)
+                    | PgSetValue::StringLiteral(s)
+                    | PgSetValue::Number(s) => Ok(s.as_str()),
+                    PgSetValue::Bool(true) => Ok("on"),
+                    PgSetValue::Bool(false) => Ok("off"),
+                    _ => Err(LimboError::ParseError("incorrect format".to_string())),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            quote(&values.join(", "))
         }
         (None, to) => {
             let command = match to {
@@ -1717,62 +1735,12 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     ))
 }
 
-fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
-    let Some(values) = values
-        .iter()
-        .map(|value| match value {
-            PgSetValue::Identifier(s) | PgSetValue::StringLiteral(s) | PgSetValue::Number(s) => {
-                Some(s.to_ascii_lowercase())
-            }
-            PgSetValue::Bool(b) => Some(if *b { "on" } else { "off" }.to_string()),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    let value = values.join(", ");
-    let is_on = matches!(value.as_str(), "on" | "true" | "1");
-    let is_off = matches!(value.as_str(), "off" | "false" | "0");
-    match name.to_ascii_lowercase().as_str() {
-        "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
-            value == "0"
-        }
-        "datestyle" => matches!(value.as_str(), "iso" | "iso, mdy" | "iso, ymd" | "iso, dmy"),
-        "intervalstyle" => value == "postgres",
-        "client_encoding" => matches!(value.as_str(), "utf8" | "utf-8" | "unicode"),
-        "extra_float_digits" => matches!(value.as_str(), "1" | "2" | "3"),
-        "standard_conforming_strings" => is_on,
-        "row_security" | "quote_all_identifiers" => is_off,
-        "check_function_bodies" | "synchronize_seqscans" => is_on || is_off,
-        "default_tablespace" => value.is_empty(),
-        "default_table_access_method" => value == "heap",
-        "transaction_timeout" => value == "0",
-        "xmloption" => value == "content",
-        "application_name" => true,
-        "client_min_messages" => matches!(
-            value.as_str(),
-            "debug5"
-                | "debug4"
-                | "debug3"
-                | "debug2"
-                | "debug1"
-                | "debug"
-                | "log"
-                | "notice"
-                | "warning"
-                | "error"
-        ),
-        _ => false,
-    }
-}
-
 fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> Result<Statement> {
     let name = &show_stmt.name;
     // PostgreSQL names the column after the parameter, not after the name
     // SHOW was given.
     let column = match find_parameter(name) {
-        Some(Parameter::BuiltIn(ConfigParameter::SearchPath)) => SEARCH_PATH_SETTING.to_owned(),
+        Some(Parameter::BuiltIn(parameter)) => parameter.name().to_owned(),
         Some(Parameter::Custom(_)) => session_state(&pg_conn.conn)?
             .name_as_defined(name)
             .unwrap_or_else(|| name.clone()),
@@ -1865,7 +1833,7 @@ pub(crate) fn custom_parameter(conn: &Connection, name: &str) -> Option<String> 
         .then(|| state.setting(&name).unwrap_or_default())
 }
 
-fn session_state(conn: &Connection) -> Result<&PgSessionState> {
+pub(crate) fn session_state(conn: &Connection) -> Result<&PgSessionState> {
     conn.context::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })
