@@ -98,6 +98,8 @@ All comparison operators return `1` (true), `0` (false), or `NULL` (if either op
 | `OR` | Logical OR | `x = 1 OR x = 2` |
 | `NOT` | Logical NOT | `NOT x = 5` |
 
+As in SQLite 3.51 and later, `x AND 0` is `0` and `x OR 1` is `1` without evaluating `x` when the constant operand is an integer literal or `TRUE`/`FALSE`, so `SELECT 1 OR json_extract('bare', '$.a')` returns `1` instead of a "malformed JSON" error.
+
 ### Bitwise Operators
 
 | Operator | Description | Example | Result |
