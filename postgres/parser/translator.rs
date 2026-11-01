@@ -5,9 +5,10 @@
 
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
-    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
+    SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_OBJECT_DEFINITION,
+    SQLSTATE_INVALID_SCHEMA_DEFINITION, SQLSTATE_INVALID_SCHEMA_NAME,
+    SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_SYNTAX_ERROR, SQLSTATE_UNDEFINED_FUNCTION,
+    SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
 use pg_query::protobuf::JoinType as PgJoinType;
@@ -338,6 +339,8 @@ impl PostgreSQLTranslator {
             }
         }
 
+        reject_generated_column_references(&create.table_elts)?;
+
         // Check for table-level PK (to suppress column-level PK emission)
         let mut has_table_pk = false;
         for elt in &create.table_elts {
@@ -540,6 +543,7 @@ impl PostgreSQLTranslator {
         let mut default_expr: Option<ast::Expr> = None;
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
+        let mut generated: Option<ast::ColumnConstraint> = None;
 
         for constraint_node in &col_def.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
@@ -568,6 +572,20 @@ impl PostgreSQLTranslator {
                         ParseError::ParseError("DEFAULT missing expression".into())
                     })?;
                     default_expr = Some(self.translate_expr(raw_expr)?);
+                }
+                ConstrType::ConstrGenerated => {
+                    if generated.is_some() {
+                        return Err(ParseError::Sqlstate {
+                            sqlstate: SQLSTATE_SYNTAX_ERROR,
+                            message: format!(
+                                "multiple generation clauses specified for column \"{name}\" of table \"{}\"",
+                                bare_table_name(tbl_name.name.as_str())
+                            ),
+                        });
+                    }
+                    generated = Some(
+                        self.translate_generated_column(constraint, col_def, &pg_type, &mapping)?,
+                    );
                 }
                 ConstrType::ConstrCheck => {
                     if let Some(ref raw_expr) = constraint.raw_expr {
@@ -710,12 +728,55 @@ impl PostgreSQLTranslator {
             });
         }
 
+        if let Some(constraint) = generated {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint,
+            });
+        }
+
         constraints.extend(check_constraints);
 
         Ok(ast::ColumnDefinition {
             col_name: exact_name(name),
             col_type,
             constraints,
+        })
+    }
+
+    /// Translate `GENERATED ALWAYS AS (expr) STORED` to a virtual generated
+    /// column, the only kind core has. A PostgreSQL generation expression must
+    /// be immutable, so reading the column gives the value storing it would have.
+    /// The expression is cast to the column's type, as PostgreSQL does on store.
+    fn translate_generated_column(
+        &self,
+        constraint: &pg_query::protobuf::Constraint,
+        col_def: &pg_query::protobuf::ColumnDef,
+        pg_type: &str,
+        mapping: &PgTypeMapping,
+    ) -> Result<ast::ColumnConstraint, ParseError> {
+        if !generated_column_type_is_supported(mapping) {
+            return Err(not_supported(format!(
+                "a generated column of type {pg_type}"
+            )));
+        }
+        let raw_expr = constraint
+            .raw_expr
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("generated column missing expression".into()))?;
+        let cast_to_column_type = pg_query::protobuf::Node {
+            node: Some(pg_query::protobuf::node::Node::TypeCast(Box::new(
+                pg_query::protobuf::TypeCast {
+                    arg: Some(raw_expr.clone()),
+                    type_name: col_def.type_name.clone(),
+                    location: -1,
+                },
+            ))),
+        };
+        Ok(ast::ColumnConstraint::Generated {
+            generated_always: true,
+            expr: Box::new(self.translate_expr(&cast_to_column_type)?),
+            typ: Some(ast::GeneratedColumnType::Virtual),
         })
     }
 
@@ -1037,7 +1098,7 @@ impl PostgreSQLTranslator {
             _ => None,
         };
         let col_type = Some(ast::Type {
-            name: mapping.type_name,
+            name: mapping.type_name.clone(),
             size,
             array_dimensions: mapping.array_dimensions,
         });
@@ -1063,6 +1124,9 @@ impl PostgreSQLTranslator {
                     Some(ast::ColumnConstraint::Default(Box::new(
                         self.translate_expr(raw_expr)?,
                     )))
+                }
+                ConstrType::ConstrGenerated => {
+                    Some(self.translate_generated_column(constraint, col_def, &pg_type, &mapping)?)
                 }
                 ConstrType::ConstrNull
                 | ConstrType::ConstrAttrNotDeferrable
@@ -7431,6 +7495,75 @@ fn reject_constraint_attributes(
     Ok(())
 }
 
+/// Core does not pass a virtual generated value through the column type's
+/// ENCODE, so a type that checks or converts what is written cannot be used:
+/// a smallint or varchar(n) column would return a value out of its range, and
+/// a uuid or numeric(p, s) column would fail on every INSERT.
+fn generated_column_type_is_supported(mapping: &PgTypeMapping) -> bool {
+    mapping.type_params.is_empty()
+        && matches!(
+            mapping.type_name.as_str(),
+            "INTEGER"
+                | "REAL"
+                | "TEXT"
+                | "BLOB"
+                | "bigint"
+                | "boolean"
+                | "bytea"
+                | "date"
+                | "inet"
+                | "json"
+                | "time"
+                | "timestamp"
+        )
+}
+
+/// A PostgreSQL generation expression cannot read a generated column of the
+/// table. Core allows it, so CREATE TABLE has to refuse it here.
+fn reject_generated_column_references(
+    table_elts: &[pg_query::protobuf::Node],
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::ConstrType;
+
+    let mut generated_names = Vec::new();
+    let mut generation_exprs = Vec::new();
+    for elt in table_elts {
+        let Some(Node::ColumnDef(col_def)) = &elt.node else {
+            continue;
+        };
+        for constraint_node in &col_def.constraints {
+            let Some(Node::Constraint(constraint)) = &constraint_node.node else {
+                continue;
+            };
+            if constraint.contype == ConstrType::ConstrGenerated as i32 {
+                generated_names.push(col_def.colname.as_str());
+                generation_exprs.extend(constraint.raw_expr.as_ref());
+            }
+        }
+    }
+    for node in generation_exprs
+        .iter()
+        .filter_map(|expr| expr.node.as_ref())
+    {
+        for (node, _, _, _) in node.nodes() {
+            if let NodeRef::ColumnRef(column) = node {
+                if let Some(name) = last_string(&column.fields) {
+                    if generated_names.contains(&name.as_str()) {
+                        return Err(ParseError::Sqlstate {
+                            sqlstate: SQLSTATE_INVALID_OBJECT_DEFINITION,
+                            message: format!(
+                                "cannot use generated column \"{name}\" in column generation expression"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn constr_type_name(contype: pg_query::protobuf::ConstrType) -> String {
     use pg_query::protobuf::ConstrType;
     match contype {
@@ -10678,9 +10811,10 @@ mod tests {
             "CREATE TABLE t (id int GENERATED BY DEFAULT AS IDENTITY)",
             "AS IDENTITY",
         );
+        assert_translates("CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED)");
         assert_not_supported(
-            "CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a * 2) STORED)",
-            "GENERATED ALWAYS AS",
+            "CREATE TABLE t (a int, b smallint GENERATED ALWAYS AS (a * 2) STORED)",
+            "generated column of type",
         );
         assert_translates("CREATE TABLE t (a int NULL)");
     }
@@ -10695,6 +10829,11 @@ mod tests {
         assert_not_supported(
             "ALTER TABLE t ADD COLUMN a int GENERATED ALWAYS AS IDENTITY",
             "AS IDENTITY",
+        );
+        assert_translates("ALTER TABLE t ADD COLUMN a int GENERATED ALWAYS AS (b * 2) STORED");
+        assert_not_supported(
+            "ALTER TABLE t ADD COLUMN a uuid GENERATED ALWAYS AS (b) STORED",
+            "generated column of type",
         );
         assert_not_supported("ALTER TABLE t ADD COLUMN v int UNIQUE", "UNIQUE");
         assert_not_supported("ALTER TABLE t ADD COLUMN v text PRIMARY KEY", "PRIMARY KEY");
