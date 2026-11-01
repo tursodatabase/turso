@@ -138,7 +138,13 @@ pub(super) fn translate_in_list(
                 });
             }
         } else {
-            // Row-valued comparison path: compare each component
+            // Row-valued comparison path: compare each component. SQLite reads a
+            // list of row values as a VALUES, so every row compares with the
+            // affinity and collation of the left operand's component first,
+            // else of the component in the last row; the other rows bring none.
+            let last_item = rhs
+                .last()
+                .expect("the loop runs over rhs, so it has a last item");
             if !last_condition || false_null_jump_targets_differ {
                 // If all components match, jump to label_ok; otherwise skip to next RHS item
                 let skip_label = program.allocate_label();
@@ -146,7 +152,7 @@ pub(super) fn translate_in_list(
                 // Check for unequal values and skip if one is found.
                 for j in 0..lhs_arity {
                     let (aff, collation) =
-                        row_component_affinity_collation(lhs, expr, j, &metadata)?;
+                        row_component_affinity_collation(lhs, last_item, j, &metadata)?;
                     let flags = CmpInsFlags::default().with_affinity(aff);
                     program.emit_insn(Insn::Ne {
                         lhs: lhs_reg + j,
@@ -198,7 +204,7 @@ pub(super) fn translate_in_list(
                 // Last condition, simple case: jump to false if any component doesn't match
                 for j in 0..lhs_arity {
                     let (aff, collation) =
-                        row_component_affinity_collation(lhs, expr, j, &metadata)?;
+                        row_component_affinity_collation(lhs, last_item, j, &metadata)?;
                     let flags = CmpInsFlags::default().with_affinity(aff).jump_if_null();
                     program.emit_insn(Insn::Ne {
                         lhs: lhs_reg + j,

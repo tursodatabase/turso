@@ -26,6 +26,13 @@ pub(crate) trait ExprProperties<
     fn register_affinity(&self, register: usize) -> Option<Affinity>;
     fn register_collation(&self, register: usize) -> Option<TextCollation>;
     fn subquery_affinity(&self, query: SubqueryId, result_reg: usize) -> Option<Affinity>;
+    /// The collation of the column of a row subquery whose value is in
+    /// `result_reg`, for comparing the components of a row value.
+    fn subquery_field_collation(
+        &self,
+        query: SubqueryId,
+        result_reg: usize,
+    ) -> Option<crate::translate::collate::FieldCollation>;
 }
 
 #[derive(Clone, Copy)]
@@ -118,6 +125,15 @@ impl ExprProperties for ExprContext<'_, '_> {
         let subquery = self.resolver.row_value_subqueries.get(query)?;
         Some(subquery.column(result_reg)?.affinity)
     }
+
+    fn subquery_field_collation(
+        &self,
+        query: TableInternalId,
+        result_reg: usize,
+    ) -> Option<crate::translate::collate::FieldCollation> {
+        let subquery = self.resolver.row_value_subqueries.get(query)?;
+        Some(subquery.column(result_reg)?.text_collation)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -197,5 +213,13 @@ impl ExprProperties for TableMetadata<'_> {
 
     fn subquery_affinity(&self, query: TableInternalId, _result_reg: usize) -> Option<Affinity> {
         self.tables?.scalar_subquery_affinity(query)
+    }
+
+    fn subquery_field_collation(
+        &self,
+        _query: TableInternalId,
+        _result_reg: usize,
+    ) -> Option<crate::translate::collate::FieldCollation> {
+        None
     }
 }

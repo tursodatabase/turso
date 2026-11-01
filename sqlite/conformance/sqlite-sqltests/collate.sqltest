@@ -2361,3 +2361,19 @@ expect {
     u|b
     ui|A
 }
+
+# The columns of a row value subquery compare with their own collation, as the
+# columns of `(SELECT a, b FROM t)` do in SQLite, with a COLLATE operator on
+# either side still winning. A scalar subquery brings no collation.
+test collate-row-value-subquery-compares-with-its-column-collation {
+    CREATE TABLE c(a TEXT COLLATE NOCASE);
+    INSERT INTO c VALUES('A');
+    SELECT (SELECT a, 1 FROM c) = ('a', 1), ('a', 1) = (SELECT a, 1 FROM c), (SELECT a, 1 FROM c) = (SELECT 'a', 1);
+    SELECT (SELECT a, 1 FROM c) = ('a' COLLATE BINARY, 1), (SELECT a COLLATE BINARY, 1 FROM c) = ('a', 1), (a, 1) = (SELECT 'a' COLLATE BINARY, 1) FROM c;
+    SELECT (SELECT a FROM c) = 'a', ((SELECT a FROM c), 1) = ('a', 1), ('a', 1) = ((SELECT a FROM c), 1);
+}
+expect {
+    1|1|1
+    0|0|0
+    0|0|0
+}

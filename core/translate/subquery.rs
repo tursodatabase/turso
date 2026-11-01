@@ -866,17 +866,19 @@ fn get_subquery_parser<'a>(
                 let reg_start = program.alloc_registers(reg_count);
 
                 let env = TypeEnv::new(Some(&plan.table_references), resolver);
-                let columns: Vec<_> = plan
-                    .result_columns
-                    .iter()
-                    .map(|result_col| RowValueSubqueryColumn {
-                        affinity: get_expr_affinity(
-                            &result_col.expr,
-                            &ExprContext::new(Some(&plan.table_references), resolver),
-                        ),
+                let context = ExprContext::new(Some(&plan.table_references), resolver);
+                let mut columns = Vec::with_capacity(plan.result_columns.len());
+                for result_col in &plan.result_columns {
+                    columns.push(RowValueSubqueryColumn {
+                        affinity: get_expr_affinity(&result_col.expr, &context),
                         expr_type: type_of(&result_col.expr, &env),
-                    })
-                    .collect();
+                        text_collation: crate::translate::collate::field_collation(
+                            &result_col.expr,
+                            &context,
+                            context.catalog(),
+                        )?,
+                    });
+                }
                 if let [column] = columns.as_slice() {
                     referenced_tables.add_scalar_subquery_affinity(subquery_id, column.affinity);
                 }
