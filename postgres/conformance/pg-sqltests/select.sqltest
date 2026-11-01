@@ -5,6 +5,26 @@
 
 @database :memory:
 
+test order-by-using-builtin-operators {
+    CREATE TABLE order_using_values (x int);
+    INSERT INTO order_using_values VALUES (1), (NULL), (2);
+    SELECT coalesce(x::text, 'N') FROM order_using_values ORDER BY x USING >;
+    SELECT coalesce(x::text, 'N') FROM order_using_values ORDER BY x USING OPERATOR(pg_catalog.<);
+    SELECT coalesce(x::text, 'N') FROM order_using_values ORDER BY x USING > NULLS LAST;
+    DROP TABLE order_using_values;
+}
+expect {
+    N
+    2
+    1
+    1
+    2
+    N
+    2
+    1
+    N
+}
+
 test cast-text-to-integer-array {
     SELECT '{10,20,30}'::integer[];
     SELECT array_length('{10,20,30}'::integer[], 1);
@@ -1545,4 +1565,20 @@ test limit-text-that-is-not-a-number-is-an-error {
 @sqlstate 22P02
 expect error {
     invalid input syntax for type bigint: "abc"
+}
+
+test where-on-indexed-time-and-date-columns-converts-the-literal {
+    CREATE TABLE seek_m(x time PRIMARY KEY);
+    INSERT INTO seek_m VALUES ('12:00');
+    CREATE TABLE seek_d(d date PRIMARY KEY);
+    INSERT INTO seek_d VALUES ('2026-10-08');
+    SELECT count(*) FROM seek_m WHERE x = '12:00';
+    SELECT count(*) FROM seek_d WHERE d = '2026-10-08T00:00';
+    DELETE FROM seek_m WHERE x = '12:00';
+    SELECT count(*) FROM seek_m;
+}
+expect {
+    1
+    1
+    0
 }

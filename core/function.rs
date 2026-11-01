@@ -121,6 +121,7 @@ pub enum ExtFunc {
     NativeScalar {
         arity: crate::native_ext::FunctionArity,
         deterministic: bool,
+        return_type: Option<crate::native_ext::ReturnType>,
         function: Arc<dyn crate::native_ext::ScalarFactory>,
     },
     NativeAggregate {
@@ -175,6 +176,13 @@ impl ExtFunc {
             Self::Scalar { argc, .. }
             | Self::Aggregate { argc, .. }
             | Self::NativeAggregate { argc, .. } => vec![*argc],
+        }
+    }
+
+    pub fn return_type(&self) -> Option<crate::native_ext::ReturnType> {
+        match self {
+            Self::NativeScalar { return_type, .. } => *return_type,
+            Self::Scalar { .. } | Self::Aggregate { .. } | Self::NativeAggregate { .. } => None,
         }
     }
 
@@ -326,6 +334,41 @@ impl Deterministic for JsonFunc {
 }
 
 #[cfg(feature = "json")]
+impl JsonFunc {
+    pub fn return_type(&self) -> Option<ReturnType> {
+        match self {
+            Self::Json
+            | Self::JsonArray
+            | Self::JsonObject
+            | Self::JsonPatch
+            | Self::JsonRemove
+            | Self::JsonReplace
+            | Self::JsonInsert
+            | Self::JsonSet
+            | Self::JsonPretty
+            | Self::JsonQuote
+            | Self::JsonType => Some(ReturnType::Text),
+            Self::Jsonb
+            | Self::JsonbArray
+            | Self::JsonbObject
+            | Self::JsonbPatch
+            | Self::JsonbRemove
+            | Self::JsonbReplace
+            | Self::JsonbInsert
+            | Self::JsonbSet => Some(ReturnType::Blob),
+            Self::JsonArrayLength | Self::JsonErrorPosition | Self::JsonValid => {
+                Some(ReturnType::Integer)
+            }
+            // The extracted value, which may have any type.
+            Self::JsonArrowExtract
+            | Self::JsonArrowShiftExtract
+            | Self::JsonExtract
+            | Self::JsonbExtract => None,
+        }
+    }
+}
+
+#[cfg(feature = "json")]
 impl Display for JsonFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -403,6 +446,26 @@ pub enum VectorFunc {
 impl Deterministic for VectorFunc {
     fn is_deterministic(&self) -> bool {
         true
+    }
+}
+
+impl VectorFunc {
+    pub fn return_type(&self) -> Option<ReturnType> {
+        Some(match self {
+            Self::Vector
+            | Self::Vector32
+            | Self::Vector32Sparse
+            | Self::Vector64
+            | Self::Vector8
+            | Self::Vector1Bit
+            | Self::VectorConcat
+            | Self::VectorSlice => ReturnType::Blob,
+            Self::VectorExtract => ReturnType::Text,
+            Self::VectorDistanceCos
+            | Self::VectorDistanceL2
+            | Self::VectorDistanceJaccard
+            | Self::VectorDistanceDot => ReturnType::Real,
+        })
     }
 }
 
@@ -1129,25 +1192,134 @@ impl Deterministic for ScalarFunc {
 }
 
 impl ScalarFunc {
-    /// Returns true if this function returns a record-format array blob
-    /// that needs ArrayDecode for display.
-    ///
-    /// FIXME: ideally every function would declare its return type via a
-    /// `return_type()` method, and this whitelist would be replaced by a
-    /// generic check. Postponed for now — the set of array-returning
-    /// functions is small and controlled by us.
-    pub fn returns_array_blob(&self) -> bool {
-        matches!(
-            self,
+    /// The type of every non-NULL value the function returns. `None` when the
+    /// type depends on the arguments, as for `coalesce` or `substr` (which
+    /// returns a blob for a blob), or when the function may return any value.
+    pub fn return_type(&self) -> Option<ReturnType> {
+        use ReturnType::{Array, Blob, Integer, Real, Text};
+        match self {
+            Self::Changes
+            | Self::TotalChanges
+            | Self::LastInsertRowid
+            | Self::Glob
+            | Self::Like
+            | Self::Instr
+            | Self::Random
+            | Self::Length
+            | Self::OctetLength
+            | Self::Sign
+            | Self::Subtype
+            | Self::Unicode
+            | Self::GetByte
+            | Self::ConnTxnId
+            | Self::IsAutocommit
+            | Self::SequenceWatermark
+            | Self::Gcd
+            | Self::Lcm
+            | Self::BooleanToInt
+            | Self::DateDiff
+            | Self::ArrayLength
+            | Self::ArrayContains
+            | Self::ArrayPosition
+            | Self::ArrayOverlap
+            | Self::ArrayContainsAll
+            | Self::NextVal
+            | Self::CurrVal
+            | Self::SetVal => Some(Integer),
+            #[cfg(feature = "test_helper")]
+            Self::TestNondetCounter => Some(Integer),
+            Self::JulianDay => Some(Real),
+            // A real for a real argument; see MathFunc::return_type.
+            Self::Round => None,
+            Self::Char
+            | Self::Concat
+            | Self::ConcatWs
+            | Self::Upper
+            | Self::Lower
+            | Self::Trim
+            | Self::LTrim
+            | Self::RTrim
+            | Self::Replace
+            | Self::Soundex
+            | Self::Date
+            | Self::Time
+            | Self::DateTime
+            | Self::StrfTime
+            | Self::TimeDiff
+            | Self::Typeof
+            | Self::Unistr
+            | Self::UnistrQuote
+            | Self::Quote
+            | Self::SqliteVersion
+            | Self::TursoVersion
+            | Self::SqliteSourceId
+            | Self::Hex
+            | Self::Printf
+            | Self::TableColumnsJsonArray
+            | Self::BinRecordJsonObject
+            | Self::StringReverse
+            | Self::Repeat
+            | Self::Lpad
+            | Self::Rpad
+            | Self::IntToBoolean
+            | Self::ValidateIpAddr
+            | Self::NumericDecode
+            | Self::NumericAdd
+            | Self::NumericSub
+            | Self::NumericMul
+            | Self::NumericDiv
+            | Self::NumericMod
+            | Self::NumericNeg
+            | Self::DatePlus
+            | Self::DateMinus
+            | Self::ArrayToString => Some(Text),
+            Self::RandomBlob
+            | Self::ZeroBlob
+            | Self::Unhex
+            | Self::SetByte
+            | Self::NumericEncode
+            | Self::NumericFit => Some(Blob),
             Self::Array
-                | Self::ArraySetElement
-                | Self::ArrayAppend
-                | Self::ArrayPrepend
-                | Self::ArrayCat
-                | Self::ArrayRemove
-                | Self::ArraySlice
-                | Self::StringToArray
-        )
+            | Self::ArraySetElement
+            | Self::ArrayAppend
+            | Self::ArrayPrepend
+            | Self::ArrayCat
+            | Self::ArrayRemove
+            | Self::ArraySlice
+            | Self::StringToArray => Some(Array),
+            // The type of an argument, or of the CAST target.
+            Self::Cast
+            | Self::Coalesce
+            | Self::IfNull
+            | Self::Iif
+            | Self::Abs
+            | Self::Min
+            | Self::Max
+            | Self::Nullif
+            | Self::Likely
+            | Self::Unlikely
+            | Self::Likelihood
+            | Self::Substr
+            | Self::Substring
+            | Self::ArrayElement
+            | Self::StructExtractFunc
+            | Self::UnionExtractFunc => None,
+            // An integer, or a real with the 'subsec' modifier.
+            Self::UnixEpoch => None,
+            Self::TestUintEncode
+            | Self::TestUintDecode
+            | Self::Attach
+            | Self::Detach
+            | Self::StatInit
+            | Self::StatPush
+            | Self::StatGet
+            | Self::StructPack
+            | Self::UnionValueFunc
+            | Self::UnionTagFunc => None,
+            #[cfg(feature = "fs")]
+            #[cfg(not(target_family = "wasm"))]
+            Self::LoadExtension => None,
+        }
     }
 
     pub fn is_date_time_function(&self) -> bool {
@@ -1497,6 +1669,31 @@ impl Deterministic for MathFunc {
 }
 
 impl MathFunc {
+    pub fn return_type(&self) -> Option<ReturnType> {
+        match self {
+            // SQLite returns a real (ceil, floor and trunc an integer for an
+            // integer), but PostgreSQL computes these exactly for an exact
+            // argument: round(0.25, 1) and mod(10, 4) are not floating-point
+            // numbers there. So the result is only known to be a real for a
+            // real argument.
+            Self::Ceil
+            | Self::Ceiling
+            | Self::Floor
+            | Self::Trunc
+            | Self::Exp
+            | Self::Ln
+            | Self::Log
+            | Self::Log10
+            | Self::Mod
+            | Self::Pow
+            | Self::Power
+            | Self::Sqrt => None,
+            _ => Some(ReturnType::Real),
+        }
+    }
+}
+
+impl MathFunc {
     pub fn arity(&self) -> MathFuncArity {
         match self {
             Self::Pi => MathFuncArity::Nullary,
@@ -1663,7 +1860,42 @@ impl Deterministic for Func {
     }
 }
 
+/// The type of every non-NULL value a function returns, declared with the
+/// function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnType {
+    Integer,
+    Real,
+    Text,
+    Blob,
+    /// A type created with CREATE TYPE, such as `date` or `uuid`. The function
+    /// returns the value the way reading a column of that type gives it, after
+    /// the type's DECODE: a uuid is returned as text, not as its stored blob.
+    Custom(&'static str),
+    /// An array. Its elements have the type of the elements of the function's
+    /// array argument.
+    Array,
+}
+
 impl Func {
+    /// The type of every non-NULL value the function returns, when the function
+    /// declares one. Aggregate and window functions don't declare a type yet,
+    /// and neither do functions of C extensions, whose interface has no place
+    /// for one.
+    pub fn return_type(&self) -> Option<ReturnType> {
+        match self {
+            Self::Scalar(func) => func.return_type(),
+            Self::Math(func) => func.return_type(),
+            #[cfg(feature = "json")]
+            Self::Json(func) => func.return_type(),
+            Self::Vector(func) => func.return_type(),
+            Self::External(func) => func.func.return_type(),
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            Self::Fts(_) => None,
+            Self::Agg(_) | Self::Window(_) | Self::AlterTable(_) | Self::Dialect(_) => None,
+        }
+    }
+
     /// Whether the function compares its arguments, and so needs the
     /// collation of its first argument that has one. SQLite marks these
     /// functions `SQLITE_FUNC_NEEDCOLL`.

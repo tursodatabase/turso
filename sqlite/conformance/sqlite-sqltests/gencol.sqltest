@@ -6243,3 +6243,89 @@ expect {
     0
     ok
 }
+
+test gencol_delete_returning_column_after_virtual {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT AS (ZEROBLOB(5)) VIRTUAL, c INTEGER);
+    INSERT INTO t1(a, c) VALUES (1, 100), (2, 200), (3, 300);
+    DELETE FROM t1 RETURNING c;
+}
+expect {
+    100
+    200
+    300
+}
+
+test gencol_delete_returning_column_before_and_after_virtual {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT AS (ZEROBLOB(3)) VIRTUAL, c INTEGER, d TEXT AS (a || c) VIRTUAL, e TEXT);
+    INSERT INTO t1(a, c, e) VALUES (1, 10, 'x'), (2, 20, 'y');
+    DELETE FROM t1 WHERE a = 1 RETURNING a, c, e;
+}
+expect {
+    1|10|x
+}
+
+test gencol_strict_alter_add_virtual_rejects_lossy_rows {
+    CREATE TABLE t(a TEXT) STRICT;
+    INSERT INTO t(a) VALUES('hello');
+    ALTER TABLE t ADD COLUMN b INTEGER GENERATED ALWAYS AS (a) VIRTUAL;
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+test gencol_strict_alter_add_virtual_accepts_coercible_rows {
+    CREATE TABLE t(a TEXT) STRICT;
+    INSERT INTO t(a) VALUES('42');
+    ALTER TABLE t ADD COLUMN b INTEGER GENERATED ALWAYS AS (a) VIRTUAL;
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    42|integer
+}
+
+test gencol_strict_alter_add_virtual_accepts_null_rows {
+    CREATE TABLE t(a TEXT) STRICT;
+    INSERT INTO t(a) VALUES(NULL);
+    ALTER TABLE t ADD COLUMN b INTEGER GENERATED ALWAYS AS (a) VIRTUAL;
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+test gencol_strict_alter_add_virtual_rejects_lossy_real {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t(a) VALUES(1.5);
+    ALTER TABLE t ADD COLUMN b INTEGER GENERATED ALWAYS AS (a) VIRTUAL;
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+test gencol_non_strict_alter_add_virtual_skips_type_validation {
+    CREATE TABLE t(a TEXT);
+    INSERT INTO t(a) VALUES('hello');
+    ALTER TABLE t ADD COLUMN b INTEGER GENERATED ALWAYS AS (a) VIRTUAL;
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    hello|text
+}
+
+test gencol_strict_alter_add_virtual_type_error_beats_check_error {
+    CREATE TABLE t(a ANY) STRICT;
+    INSERT INTO t VALUES('x');
+    ALTER TABLE t ADD COLUMN b INT AS (a) VIRTUAL CHECK(b<>'x');
+}
+expect error {
+    type mismatch on DEFAULT
+}
+
+test gencol_strict_alter_add_virtual_check_error_when_type_passes {
+    CREATE TABLE t(a ANY) STRICT;
+    INSERT INTO t VALUES(5);
+    ALTER TABLE t ADD COLUMN b INT AS (a) VIRTUAL CHECK(b<>5);
+}
+expect error {
+    CHECK constraint failed
+}

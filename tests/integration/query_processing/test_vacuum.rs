@@ -10,7 +10,9 @@ use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
 use turso_core::SqliteDialect;
-use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, LimboError, StepResult, Value};
+use turso_core::{
+    ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, StepResult, Value,
+};
 use turso_parser::{ast::Cmd, parser::Parser};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5752,11 +5754,15 @@ fn test_plain_vacuum_encrypted() -> anyhow::Result<()> {
     conn.execute(format!("PRAGMA hexkey = '{HEXKEY}'"))?;
     conn.execute("PRAGMA cipher = 'aegis256'")?;
 
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
-    for i in 0..150 {
-        conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", "z".repeat(80)))?;
-    }
-    conn.execute("DELETE FROM t WHERE id >= 30")?;
+    let fill = |conn: &Arc<Connection>| -> anyhow::Result<()> {
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+        for i in 0..150 {
+            conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", "z".repeat(80)))?;
+        }
+        conn.execute("DELETE FROM t WHERE id >= 30")?;
+        Ok(())
+    };
+    fill(&conn)?;
 
     conn.execute("VACUUM")?;
     assert_eq!(run_integrity_check(&conn), "ok");
@@ -5770,6 +5776,27 @@ fn test_plain_vacuum_encrypted() -> anyhow::Result<()> {
     let last: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t WHERE id = 29");
     assert_eq!(last.len(), 1);
     assert_eq!(last[0], (29, "z".repeat(80)));
+
+    // dbhash of the vacuumed database matches a plain database with the same rows. Close
+    // the database first: it was encrypted with PRAGMAs, so its open `Database` has no
+    // cipher set and cannot take a key from a new connection.
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+    let vacuumed_hash = turso_dbhash::hash_database(
+        path.to_str().unwrap(),
+        &turso_dbhash::DbHashOptions {
+            encryption: Some(EncryptionOpts {
+                cipher: "aegis256".to_string(),
+                hexkey: HEXKEY.to_string(),
+            }),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(vacuumed_hash.rows_hashed, 30);
+    let plain_db = TempDatabase::new_empty();
+    fill(&plain_db.connect_limbo())?;
+    assert_eq!(vacuumed_hash.hash, compute_dbhash(&plain_db).hash);
 
     Ok(())
 }

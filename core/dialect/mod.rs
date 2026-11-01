@@ -132,10 +132,6 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
-    fn random_value(&self, bits: i64) -> crate::Value {
-        crate::Value::from_i64(bits) // SQLite default
-    }
-
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
@@ -235,6 +231,15 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// PostgreSQL returns an integer. SQLite always returns a REAL.
     fn mod_of_integers_is_integer(&self) -> bool {
+        false
+    }
+
+    /// Whether a quoted string compared with a value of a custom type is
+    /// first converted to that type, the way it would be when stored.
+    ///
+    /// PostgreSQL converts it, so `time_col = '12:00'` matches a stored
+    /// `12:00:00`. SQLite compares the string as it is.
+    fn converts_strings_compared_with_custom_types(&self) -> bool {
         false
     }
 

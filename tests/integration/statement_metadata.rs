@@ -452,8 +452,9 @@ mod tests {
         assert_eq!(array_agg.array_dimensions, 1);
     }
 
-    /// An expression of a custom type that isn't a column reports the primitive
-    /// the type is stored as, not one guessed from the type's name.
+    /// An expression of a custom type that isn't a column reports itself like a
+    /// column of that type: the type's name, with the primitive it is stored as
+    /// in `base_type` (not one guessed from the type's name).
     #[test]
     fn type_info_for_custom_type_expressions() {
         let db = fresh_db_with_custom_types("type_info_custom_expressions.db");
@@ -469,12 +470,33 @@ mod tests {
 
         let stmt = conn
             .prepare(
-                "SELECT CAST(id AS cents), CAST(id AS rev), coalesce(code, code) FROM accounts",
+                "SELECT CAST(id AS cents), CAST(id AS rev), coalesce(code, code), \
+                 coalesce(amount, CAST(0 AS cents)), CAST(id AS cents[]) FROM accounts",
             )
             .unwrap();
-        assert_eq!(expect_info(&stmt, 0).declared_name, "INTEGER");
-        assert_eq!(expect_info(&stmt, 1).declared_name, "TEXT");
-        assert_eq!(expect_info(&stmt, 2).declared_name, "TEXT");
+        let column_of_cents = conn.prepare("SELECT amount FROM accounts").unwrap();
+        let expected_cents = expect_info(&column_of_cents, 0);
+
+        let cast_to_cents = expect_info(&stmt, 0);
+        assert_eq!(cast_to_cents, expected_cents);
+        assert_eq!(cast_to_cents.declared_name, "cents");
+        assert_eq!(cast_to_cents.base_type.as_deref(), Some("INTEGER"));
+        assert_eq!(cast_to_cents.kind, ColumnTypeKind::Custom);
+
+        let cast_to_rev = expect_info(&stmt, 1);
+        assert_eq!(cast_to_rev.declared_name, "rev");
+        assert_eq!(cast_to_rev.base_type.as_deref(), Some("TEXT"));
+        assert_eq!(cast_to_rev.kind, ColumnTypeKind::Custom);
+
+        let coalesced = expect_info(&stmt, 2);
+        assert_eq!(coalesced.declared_name, "rev");
+        assert_eq!(coalesced.base_type.as_deref(), Some("TEXT"));
+
+        assert_eq!(expect_info(&stmt, 3), expected_cents);
+
+        let cents_array = expect_info(&stmt, 4);
+        assert_eq!(cents_array.declared_name, "cents");
+        assert_eq!(cents_array.array_dimensions, 1);
     }
 
     /// A custom type with no function for an operator goes to SQLite's operator as
@@ -506,7 +528,7 @@ mod tests {
     }
 
     /// Date arithmetic declares its result: `date + n` is a date, which is stored
-    /// as text, and `date - date` is a number of days.
+    /// as text (it reports as a date), and `date - date` is a number of days.
     #[test]
     fn type_info_for_date_arithmetic() {
         let db = fresh_db_with_custom_types("type_info_date_arithmetic.db");
@@ -515,7 +537,9 @@ mod tests {
             .unwrap();
 
         let stmt = conn.prepare("SELECT d + 1, d - d FROM t").unwrap();
-        assert_eq!(expect_info(&stmt, 0).declared_name, "TEXT");
+        let date_plus_days = expect_info(&stmt, 0);
+        assert_eq!(date_plus_days.declared_name, "date");
+        assert_eq!(date_plus_days.base_type.as_deref(), Some("TEXT"));
         assert_eq!(expect_info(&stmt, 1).declared_name, "INTEGER");
     }
 

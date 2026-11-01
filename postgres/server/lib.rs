@@ -1317,6 +1317,40 @@ mod tests {
     }
 
     #[test]
+    fn test_functions_that_return_a_custom_type_are_described_as_that_type() {
+        let (_io, db) = turso_pg::open_database(
+            ":memory:",
+            None,
+            turso_pg::OpenFlags::default(),
+            turso_pg::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = PgConnection::connect(&db).unwrap();
+        conn.execute("SELECT set_config('request.jwt.claim.sub', '11111111-2222-3333-4444-555555555555', false)")
+            .unwrap();
+        for (sql, expected_type) in [
+            ("SELECT booleq(true, true)", Type::BOOL),
+            ("SELECT now()", Type::TIMESTAMPTZ),
+            ("SELECT auth.uid()", Type::UUID),
+            ("SELECT CAST(1 AS timestamptz)", Type::TIMESTAMPTZ),
+            ("SELECT random()", Type::FLOAT8),
+            ("SELECT random() * 10", Type::FLOAT8),
+        ] {
+            let mut stmt = conn.prepare(sql).unwrap();
+            let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+            assert_eq!(*fields[0].datatype(), expected_type, "{sql}");
+            let _ = stmt.run_collect_rows().unwrap();
+        }
+
+        let mut stmt = conn.prepare("SELECT booleq(true, true)").unwrap();
+        let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
+        let rows = stmt.run_collect_rows().unwrap();
+        let mut encoder = DataRowEncoder::new(fields.clone());
+        encode_value(&mut encoder, &rows[0][0], fields[0].datatype()).unwrap();
+        assert_eq!(&encoder.finish().unwrap().data[..], b"\0\0\0\x01t");
+    }
+
+    #[test]
     fn test_access_share_lock_has_no_result_fields() {
         let (_io, db) = turso_pg::open_database(
             ":memory:",

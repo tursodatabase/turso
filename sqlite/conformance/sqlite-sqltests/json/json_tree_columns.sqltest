@@ -263,3 +263,128 @@ test json-tree-id-with-two-byte-container-header {
 expect {
     1891|501
 }
+
+test json-each-decoded-object-keys {
+    SELECT hex(key) FROM json_each('{"a\\nb":1,"e\\\\f":2,"c\\td":3,"\\u00e9":4,"\\ud83d\\ude00":5,"\\b\\f\\r\\/":6,"\\\\n":7,"c\\"d":8}') WHERE type = 'integer';
+}
+expect {
+    610A62
+    655C66
+    630964
+    C3A9
+    F09F9880
+    080C0D2F
+    5C6E
+    632264
+}
+
+test json-each-decoded-object-keys-jsonb {
+    SELECT hex(key) FROM json_each(jsonb('{"a\\nb":1,"e\\\\f":2,"c\\td":3,"\\u00e9":4,"\\ud83d\\ude00":5,"\\b\\f\\r\\/":6,"\\\\n":7,"c\\"d":8}')) WHERE type = 'integer';
+}
+expect {
+    610A62
+    655C66
+    630964
+    C3A9
+    F09F9880
+    080C0D2F
+    5C6E
+    632264
+}
+
+test json-each-decoded-json5-escape-keys {
+    SELECT hex(key) FROM json_each('{"\\v":1,"\\x41":2,"a\\vb":3}') WHERE type = 'integer';
+    SELECT hex(key) FROM json_each(jsonb('{"\\v":1}'));
+}
+expect {
+    0B
+    41
+    610B62
+    0B
+}
+
+test json-tree-root-key-from-path-keeps-the-path-spelling {
+    SELECT hex(key), key FROM json_tree('{"c\\"d":{"x":1}}', '$."c\\"d"') ORDER BY id LIMIT 1;
+}
+expect {
+    635C2264|c\\"d
+}
+
+test json-tree-decoded-object-keys-keep-escaped-paths {
+    SELECT hex(key), fullkey, path FROM json_tree('{"p\\nq":{"a\\nb":1,"e\\\\f":2}}') WHERE key IS NOT NULL;
+    WITH d(j) AS (VALUES('{"p\\nq":{"a\\nb":1,"e\\\\f":2,"c\\"d":3}}'))
+    SELECT hex(key), json_extract(j, fullkey) = value FROM d, json_tree(j) WHERE type = 'integer';
+}
+expect {
+    700A71|$."p\\nq"|$
+    610A62|$."p\\nq"."a\\nb"|$."p\\nq"
+    655C66|$."p\\nq"."e\\\\f"|$."p\\nq"
+    610A62|1
+    655C66|1
+    632264|1
+}
+
+test json-each-fullkey-keeps-the-stored-json5-spelling {
+    SELECT fullkey FROM json_each('{"a\\vb":1}');
+    SELECT fullkey FROM json_each('{"\\x41":1}');
+    SELECT fullkey FROM json_each('{"a\\x41b":1}');
+    SELECT fullkey FROM json_each('{"\\0":1}');
+    SELECT fullkey FROM json_each('{"it\\''s":1}');
+    SELECT hex(fullkey) FROM json_each('{"a' || char(92) || char(10) || 'b":1}');
+}
+expect {
+    $."a\\vb"
+    $."\\x41"
+    $."a\\x41b"
+    $."\\0"
+    $."it\\'s"
+    242E22615C0A6222
+}
+
+test json-tree-path-and-fullkey-keep-the-stored-json5-spelling {
+    SELECT path, fullkey FROM json_tree('{"a\\vb":{"c\\v":[1,{"d\\x41":2}]}}') WHERE key IS NOT NULL;
+}
+expect {
+    $|$."a\\vb"
+    $."a\\vb"|$."a\\vb"."c\\v"
+    $."a\\vb"."c\\v"|$."a\\vb"."c\\v"[0]
+    $."a\\vb"."c\\v"|$."a\\vb"."c\\v"[1]
+    $."a\\vb"."c\\v"[1]|$."a\\vb"."c\\v"[1]."d\\x41"
+}
+
+test json-each-fullkey-with-json5-escape-finds-the-member-again {
+    WITH d(j) AS (VALUES('{"a\\vb":1,"\\x41":2,"it\\''s":3,"\\0":4}'))
+    SELECT hex(key), json_extract(j, fullkey) FROM d, json_each(j);
+}
+expect {
+    610B62|1
+    41|2
+    69742773|3
+    00|4
+}
+
+test json-each-fullkey-of-jsonb-object-label-with-control-character {
+    SELECT hex(fullkey) FROM json_each(jsonb_object('a' || char(9) || 'b', 1));
+    SELECT hex(fullkey) FROM json_each((SELECT jsonb_group_object('a' || char(10) || 'b', 1)));
+    SELECT hex(path) FROM json_tree(jsonb_object('k' || char(9), jsonb_object('x', 1))) WHERE key = 'x';
+}
+expect {
+    242E22615C746222
+    242E22615C6E6222
+    242E226B5C7422
+}
+
+test json-extract-with-fullkey-of-json5-name-with-raw-quote {
+    WITH d(j) AS (VALUES('{''a"b\\x41'':1,"c":2}'))
+    SELECT count(*) FROM (SELECT json_extract(j, fullkey) FROM d, json_tree(j) WHERE type = 'integer');
+}
+expect {
+    2
+}
+
+test json-each-fullkey-keeps-a-backslash-before-a-crlf-line-break-in-the-name {
+    SELECT hex(fullkey) FROM json_each('{"a\\' || char(13) || char(10) || 'b\\v":1}');
+}
+expect {
+    242E22615C0D0A625C7622
+}

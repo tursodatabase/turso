@@ -520,6 +520,26 @@ expect error {
     CHECK constraint failed
 }
 
+# likely() returns its argument, so it has the argument's type.
+@requires strict "uses STRICT tables"
+test likely-of-text-vs-real-error {
+    CREATE TABLE t(x REAL, s TEXT, CHECK(x = likely(s))) STRICT;
+}
+expect error {
+    cannot compare REAL with TEXT
+}
+
+# floor() of a text value has no fixed type, so the comparison is accepted.
+@requires strict "uses STRICT tables"
+test floor-of-text-vs-text-valid {
+    CREATE TABLE t(x TEXT, CHECK(x = floor(x))) STRICT;
+    INSERT INTO t VALUES('3');
+    SELECT x FROM t;
+}
+expect {
+    3
+}
+
 # ============================================================================
 # Non-STRICT tables — no type checking applied
 # ============================================================================

@@ -4770,7 +4770,12 @@ impl PostgreSQLTranslator {
                         Ok(pg_query::protobuf::SortByDir::SortbyAsc) => Some(ast::SortOrder::Asc),
                         Ok(pg_query::protobuf::SortByDir::SortbyDesc) => Some(ast::SortOrder::Desc),
                         Ok(pg_query::protobuf::SortByDir::SortbyUsing) => {
-                            return Err(not_supported("ORDER BY ... USING operator"))
+                            let names = extract_key_columns(&sort_by.use_op)?;
+                            match unqualified_name(&names, is_pg_catalog).map(String::as_str) {
+                                Some("<") => Some(ast::SortOrder::Asc),
+                                Some(">") => Some(ast::SortOrder::Desc),
+                                _ => return Err(not_supported("ORDER BY ... USING operator")),
+                            }
                         }
                         _ => None, // Default or undefined
                     };
@@ -7862,6 +7867,17 @@ mod tests {
         ] {
             assert_eq!(translate(sql).unwrap_err().to_string(), error, "{sql}");
         }
+    }
+
+    #[test]
+    fn create_index_keeps_table_schema() {
+        let parsed = crate::parse("CREATE INDEX i ON s.t (a)").unwrap();
+        let stmt = PostgreSQLTranslator::new().translate(&parsed).unwrap();
+        let ast::Stmt::CreateIndex { idx_name, .. } = stmt else {
+            panic!("expected CREATE INDEX, got {stmt:?}");
+        };
+        assert_eq!(idx_name.namespace.as_ref().map(|n| n.as_str()), Some("s"));
+        assert_eq!(idx_name.name.as_str(), "i");
     }
 
     #[test]
@@ -11437,12 +11453,11 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_order_by_using() {
-        assert_not_supported("SELECT a FROM t ORDER BY a USING >", "USING operator");
-        assert_not_supported(
-            "SELECT string_agg(a, ',' ORDER BY a USING <) FROM t",
-            "USING operator",
-        );
+    fn order_by_using_builtin_operators() {
+        assert_translates("SELECT a FROM t ORDER BY a USING >");
+        assert_translates("SELECT string_agg(a, ',' ORDER BY a USING <) FROM t");
+        assert_translates("SELECT a FROM t ORDER BY a USING OPERATOR(pg_catalog.>)");
+        assert_not_supported("SELECT a FROM t ORDER BY a USING <=", "USING operator");
     }
 
     #[test]
