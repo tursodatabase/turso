@@ -5,7 +5,7 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
+    CursorTransaction, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
     SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
@@ -83,6 +83,14 @@ enum RewindState {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum LastMove {
+    Other,
+    Next,
+    Prev,
+    ExactSeek,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum NextState {
     AdvanceUnitialized,
     CheckNeedsAdvance,
@@ -107,6 +115,9 @@ enum SeekBtreeState {
 
 #[derive(Debug, Clone, Copy)]
 enum SeekState {
+    PointBtree,
+    PointCheckBtreeFound,
+    PointCheckBtreeMissing,
     /// Seeking in btree (MVCC seek already done)
     SeekBtree(SeekBtreeState),
     /// Pick winner and finalize
@@ -115,6 +126,7 @@ enum SeekState {
 
 #[derive(Debug, Clone, Copy)]
 enum CountState {
+    Btree { generation: u64 },
     Rewind,
     NextBtree { count: usize },
     CheckBtreeKey { count: usize },
@@ -165,7 +177,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> ProvidesYieldContext
             connection.yield_injector(),
             connection.failure_injector(),
             self.yield_instance_id,
-            cursor_yield_key(self.tx_id, self.table_id),
+            cursor_yield_key(self.snapshot.tx_id, self.table_id),
         )
     }
 }
@@ -539,6 +551,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
 }
 
 pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator = TursoAllocator> {
+    table_walk: Option<Box<TableChainWalk<A>>>,
     pub db: Arc<MvStore<Clock, A>>,
     /// Weak so a cursor retained past its statement (an index-method cursor
     /// parked on its connection) cannot keep the connection alive.
@@ -553,13 +566,18 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     index_iterator: Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
-    tx_id: u64,
+    transaction: Box<CursorTransaction<Clock, A>>,
     snapshot: MvccReadSnapshot,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
+    payload_row: Option<Row>,
+    payload_generation: u64,
+    table_scan: TableScan,
+    last_move: LastMove,
     /// Eq-only table seek copies the occupying payload under the version lock.
     /// Passive GC can empty the live chain before Column.
     eq_seek_row: Option<Row>,
+    eq_seek_generation: u64,
     /// Set once the B-tree is readable at this cursor's snapshot. It stays
     /// readable for the cursor's lifetime.
     btree_readable: bool,
@@ -622,13 +640,15 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         } else {
             db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot.begin_ts)
         };
+        let transaction = db.cursor_transaction(tx_id)?;
+        let table_scan = TableScan::new(transaction.write_generation());
         Ok(Self {
             db,
             #[cfg(any(test, injected_yields))]
             yield_instance_id: connection.next_yield_instance_id(),
             #[cfg(any(test, injected_yields))]
             connection: Arc::downgrade(connection),
-            tx_id,
+            transaction,
             snapshot,
             table_iterator: None,
             index_iterator: None,
@@ -636,7 +656,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             current_pos: CursorPosition::BeforeFirst,
             table_id,
             reusable_immutable_record: None,
+            payload_generation: 0,
+            table_walk: None,
+            table_scan,
+            payload_row: None,
+            last_move: LastMove::Other,
             eq_seek_row: None,
+            eq_seek_generation: 0,
             btree_readable: false,
             btree_cursor,
             null_flag: false,
@@ -650,15 +676,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         })
     }
 
-    /// Forward-direction shadow check: `IndexShadowScan` fast-path for index
-    /// cursors, the authoritative per-row lookup for table cursors.
     fn btree_row_is_valid_forward(&mut self, key: &RowKey) -> Result<bool> {
-        let RowKey::Record(rec) = key else {
-            return self.query_btree_version_is_valid(key);
+        let rec = match key {
+            RowKey::Int(rowid) => {
+                return self.table_row_is_valid(*rowid, IterationDirection::Forwards)
+            }
+            RowKey::Record(rec) => rec,
         };
-        let valid =
-            self.index_shadow_scan
-                .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec)?;
+        let valid = self.index_shadow_scan.btree_row_is_valid(
+            &self.db,
+            self.table_id,
+            self.snapshot.tx_id,
+            rec,
+        )?;
         // Debug-only cross-check: any scan divergence (e.g. a missed reset)
         // fails the test suite instead of shipping.
         #[cfg(debug_assertions)]
@@ -667,7 +697,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             self.db.query_btree_version_is_valid(
                 self.table_id,
                 &RowKey::Record(rec.clone()),
-                self.tx_id
+                self.snapshot.tx_id
             )?,
             "index shadow scan diverged from query_btree_version_is_valid"
         );
@@ -676,7 +706,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Returns the current row as an immutable record.
     pub fn current_row(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
-        if self.db.tx_should_abort(self.tx_id) {
+        if self.transaction.should_abort() {
             return Err(LimboError::CommitDependencyAborted.into());
         }
         if self.get_null_flag() {
@@ -708,10 +738,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         MvccCursorType::Index(_) => Some(self.table_id),
                         MvccCursorType::Table => None,
                     };
-                    match self
-                        .db
-                        .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
-                    {
+                    match self.db.read_from_table_or_index(
+                        self.snapshot.tx_id,
+                        row_id,
+                        maybe_index_id,
+                    )? {
                         Some(row) => {
                             record.invalidate();
                             record.start_serialization(row.payload())?;
@@ -724,7 +755,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 if !found {
                     let Some(row) = self.eq_seek_row.as_ref().filter(|row| row.id == *row_id)
                     else {
-                        if self.db.tx_should_abort(self.tx_id) {
+                        if self.transaction.should_abort() {
                             return Err(LimboError::CommitDependencyAborted.into());
                         }
                         return Ok(IOResult::Done(None));
@@ -763,7 +794,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             MvccCursorType::Table => None,
         };
         self.db
-            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)
+            .read_from_table_or_index(self.snapshot.tx_id, row_id, maybe_index_id)
     }
 
     pub fn close(self) -> Result<()> {
@@ -858,8 +889,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> Result<bool> {
-        self.db
-            .query_btree_version_is_valid(self.table_id, key, self.tx_id)
+        self.db.cursor_btree_row_is_valid(
+            &self.transaction,
+            self.table_id,
+            key,
+            self.snapshot.tx_id,
+        )
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
@@ -1024,21 +1059,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
-                    if let Some(key) = key {
-                        if self.btree_row_is_valid_forward(&key)? {
-                            self.dual_peek.btree_peek = CursorPeek::Row {
-                                key,
-                                versions: None,
-                            };
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
-                        // Row is shadowed by MVCC, continue to next
-                        // FIXME: do we want to iterate over all shadowed rows? If every row is shadowed by MVCC, we will iterate the whole btree in a single `next` call
-                        self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-                    } else {
-                        self.dual_peek.btree_peek = CursorPeek::Exhausted;
-                        self.btree_advance_state = None;
+                    if self.peek_btree_key::<true>(key)? {
                         return Ok(IOResult::Done(()));
                     }
                 }
@@ -1079,7 +1100,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k)? => {
+                        Some(k) if self.btree_row_is_valid_backward(&k)? => {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -1112,24 +1133,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
-                    match key {
-                        Some(k) if self.query_btree_version_is_valid(&k)? => {
-                            self.dual_peek.btree_peek = CursorPeek::Row {
-                                key: k,
-                                versions: None,
-                            };
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
-                        Some(_) => {
-                            // shadowed by MVCC, continue to prev
-                            self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-                        }
-                        None => {
-                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
+                    if self.peek_btree_key::<false>(key)? {
+                        return Ok(IOResult::Done(()));
                     }
                 }
             }
@@ -1197,12 +1202,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             };
             let row_id = row_id.clone();
             let table_id = row_id.table_id;
-            let falls_through = {
+            let btree_has_newest_version = {
                 let chain = versions.read();
                 self.db
                     .btree_covers_chain_for_snapshot(self.snapshot, table_id, &chain)
             };
-            if !falls_through {
+            if !btree_has_newest_version {
                 return pos;
             }
             if self.dual_peek.btree_peek.get_row_key() == Some(&row_id.row_id) {
@@ -1221,6 +1226,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.dual_peek = DualCursorPeek::default();
         self.mvcc_peek_epoch = self.mvcc_rows_epoch();
         self.eq_seek_row = None;
+        self.last_move = LastMove::Other;
         // The forward scan is monotonic; a reposition invalidates it.
         self.index_shadow_scan.reset();
     }
@@ -1325,10 +1331,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     table_id: self.table_id,
                     row_id: RowKey::Int(i64::MIN),
                 };
-                let range =
-                    create_seek_range(Bound::Included(start_rowid), IterationDirection::Forwards);
-                let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+                self.table_iterator = Some(self.db.table_rows_iterator(
+                    Bound::Included(start_rowid),
+                    IterationDirection::Forwards,
+                ));
             }
             MvccCursorType::Index(_) => {
                 let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
@@ -1362,6 +1368,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.set_null_flag(false);
         let state = self.state.clone();
         if state.is_none() {
+            self.reset_table_scan();
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
@@ -1391,7 +1398,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccCursorType::Table => match self.db.get_last_table_rowid(
                 self.table_id,
                 &mut self.table_iterator,
-                self.tx_id,
+                self.snapshot.tx_id,
             ) {
                 Some(k) => {
                     tracing::trace!("last: mvcc_key: {:?}", k);
@@ -1406,7 +1413,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             },
             MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
                 self.table_id,
-                self.tx_id,
+                self.snapshot.tx_id,
                 &mut self.index_iterator,
             )? {
                 Some(k) => {
@@ -1429,9 +1436,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     /// Move the cursor to the next row. Returns true if the cursor moved to the next row, false if the cursor is at the end of the table.
-    ///
-    /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn next(&mut self) -> IOResultOr<()> {
+        if matches!(self.last_move, LastMove::Prev | LastMove::ExactSeek) {
+            return self.seek_past_current_row(IterationDirection::Forwards);
+        }
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
             if matches!(self.current_pos, CursorPosition::BeforeFirst) {
@@ -1454,6 +1462,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 inject_io_yield!(self, CursorYieldPoint::NextStart);
             }
         }
+        if self.table_scan.generation != self.transaction.write_generation() {
+            return self.refresh_scan_after_write(IterationDirection::Forwards);
+        }
         // If it was uninitialized, we need to advance the btree first
         if matches!(
             self.state.as_ref().expect("next state is not initialized"),
@@ -1468,6 +1479,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             self.state.as_ref().expect("next state is not initialized"),
             MvccLazyCursorState::Next(NextState::CheckNeedsAdvance)
         ) {
+            if self.can_step_table_row::<true>() {
+                return self.step_table_row::<true>();
+            }
+            if self.can_step_version_row::<true>() {
+                return self.step_version_row::<true>();
+            }
             // Determine which cursor(s) need to be advanced based on current position
             let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
                 CursorPosition::BeforeFirst => {
@@ -1518,17 +1535,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             return_if_io!(self.advance_btree_forward());
         }
 
-        self.refresh_current_position(IterationDirection::Forwards);
-        self.invalidate_record();
-        self.state = None;
-
-        Ok(IOResult::Done(()))
+        self.finish_table_step::<true>()
     }
 
     /// Move the cursor to the previous row. Returns true if the cursor moved, false if at the beginning.
-    ///
-    /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
+        if matches!(self.last_move, LastMove::Next | LastMove::ExactSeek) {
+            return self.seek_past_current_row(IterationDirection::Backwards);
+        }
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
             if matches!(self.current_pos, CursorPosition::End) {
@@ -1547,6 +1561,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             }
         }
 
+        if self.table_scan.generation != self.transaction.write_generation() {
+            return self.refresh_scan_after_write(IterationDirection::Backwards);
+        }
         if matches!(
             self.state.as_ref().expect("prev state is not initialized"),
             MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized)
@@ -1560,6 +1577,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             self.state.as_ref().expect("prev state is not initialized"),
             MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance)
         ) {
+            if self.can_step_table_row::<false>() {
+                return self.step_table_row::<false>();
+            }
+            if self.can_step_version_row::<false>() {
+                return self.step_version_row::<false>();
+            }
             // Determine which cursor(s) need to be advanced based on current position
             let (need_advance_mvcc, need_advance_btree) = match &self.current_pos {
                 CursorPosition::End => {
@@ -1608,11 +1631,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         ) {
             return_if_io!(self.advance_btree_backward());
         }
-        self.refresh_current_position(IterationDirection::Backwards);
-        self.invalidate_record();
-        self.state = None;
-
-        Ok(IOResult::Done(()))
+        self.finish_table_step::<false>()
     }
 
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
@@ -1653,6 +1672,43 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     fn record(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
         self.current_row()
+    }
+
+    fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
+        if self.get_null_flag() {
+            return Ok(IOResult::Done(None));
+        }
+        if self.transaction.should_abort() {
+            return Err(LimboError::CommitDependencyAborted.into());
+        }
+        match &self.current_pos {
+            CursorPosition::Loaded { in_btree: true, .. } => self.btree_cursor.record_payload(),
+            CursorPosition::Loaded { row_id, .. } => {
+                let generation = self.transaction.write_generation();
+                let is_row_here = |row: &Option<Row>| {
+                    !self.transaction.is_removed()
+                        && row.as_ref().is_some_and(|row| row.id == *row_id)
+                };
+                if self.payload_generation == generation && is_row_here(&self.payload_row) {
+                    return Ok(IOResult::Done(self.payload_row.as_ref().map(Row::payload)));
+                }
+                if self.eq_seek_generation == generation && is_row_here(&self.eq_seek_row) {
+                    return Ok(IOResult::Done(self.eq_seek_row.as_ref().map(Row::payload)));
+                }
+                self.payload_row = self.read_mvcc_current_row()?.or_else(|| {
+                    self.eq_seek_row
+                        .as_ref()
+                        .filter(|row| row.id == *row_id)
+                        .cloned()
+                });
+                self.payload_generation = generation;
+                if self.payload_row.is_none() && self.transaction.should_abort() {
+                    return Err(LimboError::CommitDependencyAborted.into());
+                }
+                Ok(IOResult::Done(self.payload_row.as_ref().map(Row::payload)))
+            }
+            CursorPosition::BeforeFirst | CursorPosition::End => Ok(IOResult::Done(None)),
+        }
     }
 
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
@@ -1716,10 +1772,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         self.query_btree_version_is_valid(&row_id.row_id)?
                     } else {
                         self.db
-                            .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)?
+                            .read_from_table_or_index(self.snapshot.tx_id, row_id, maybe_index_id)?
                             .is_some()
                     };
                     if visible {
+                        self.invalidate_record();
                         // We need to clear the null flag for the table cursor before seeking,
                         // because it might have been set to false by an unmatched left-join row
                         // during the previous iteration on the outer loop.
@@ -1734,6 +1791,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let state = self.state.clone();
             match state {
                 None => {
+                    self.reset_table_scan();
                     // Initial state: Reset and do MVCC seek
                     let _ = self.table_iterator.take();
                     let _ = self.index_iterator.take();
@@ -1770,6 +1828,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 self.dual_peek.mvcc_peek = match mvcc_rowid {
                                     Some((rid, versions, payload)) => {
                                         self.eq_seek_row = payload;
+                                        self.eq_seek_generation =
+                                            self.transaction.write_generation();
                                         CursorPeek::Row {
                                             key: rid.row_id,
                                             versions: Some(versions),
@@ -1822,12 +1882,80 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         }
                     }
 
-                    // Move to btree seek state
+                    let seek_state = if matches!(seek_key, SeekKey::TableRowId(_))
+                        && op.eq_only()
+                        && self.eq_seek_row.is_some()
+                    {
+                        SeekState::PointBtree
+                    } else {
+                        SeekState::SeekBtree(SeekBtreeState::SeekBtree)
+                    };
+                    self.state
+                        .replace(MvccLazyCursorState::Seek(seek_state, direction));
+                    inject_io_yield!(self, CursorYieldPoint::SeekStart);
+                }
+                Some(MvccLazyCursorState::Seek(SeekState::PointBtree, direction)) => {
+                    let found = self.is_btree_allocated()
+                        && matches!(
+                            return_if_io!(self.btree_cursor.seek(seek_key.clone(), op)),
+                            SeekResult::Found
+                        );
                     self.state.replace(MvccLazyCursorState::Seek(
-                        SeekState::SeekBtree(SeekBtreeState::SeekBtree),
+                        if found {
+                            SeekState::PointCheckBtreeFound
+                        } else {
+                            SeekState::PointCheckBtreeMissing
+                        },
                         direction,
                     ));
-                    inject_io_yield!(self, CursorYieldPoint::SeekStart);
+                    inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
+                }
+                Some(MvccLazyCursorState::Seek(
+                    point_state @ (SeekState::PointCheckBtreeFound
+                    | SeekState::PointCheckBtreeMissing),
+                    direction,
+                )) => {
+                    let found = matches!(point_state, SeekState::PointCheckBtreeFound);
+                    let SeekKey::TableRowId(rowid) = seek_key else {
+                        unreachable!("point seek requires a table rowid");
+                    };
+                    let row_id = RowID {
+                        table_id: self.table_id,
+                        row_id: RowKey::Int(rowid),
+                    };
+                    let physical_valid = found
+                        && self.get_btree_current_key()?.as_ref() == Some(&row_id.row_id)
+                        && self.query_btree_version_is_valid(&row_id.row_id)?;
+                    let versions = self
+                        .dual_peek
+                        .mvcc_peek
+                        .get_versions()
+                        .expect("point seek requires a version chain");
+                    let btree_has_newest_version = {
+                        let chain = versions.read();
+                        self.db.btree_covers_chain_for_snapshot(
+                            self.snapshot,
+                            self.table_id,
+                            &chain,
+                        )
+                    };
+                    if btree_has_newest_version && !physical_valid {
+                        self.eq_seek_row = None;
+                        self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
+                        self.state.replace(MvccLazyCursorState::Seek(
+                            SeekState::SeekBtree(SeekBtreeState::SeekBtree),
+                            direction,
+                        ));
+                        continue;
+                    }
+                    self.current_pos = CursorPosition::Loaded {
+                        row_id,
+                        in_btree: btree_has_newest_version,
+                        versions: (!btree_has_newest_version).then_some(versions),
+                    };
+                    self.last_move = LastMove::ExactSeek;
+                    self.state = None;
+                    return Ok(IOResult::Done(SeekResult::Found));
                 }
                 Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(_), direction)) => {
                     return_if_io!(self.seek_btree_and_set_peek(seek_key.clone(), op));
@@ -1880,6 +2008,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 }
                             };
                             if found {
+                                self.last_move = if self.table_iterator.is_none()
+                                    && matches!(seek_key, SeekKey::TableRowId(_))
+                                {
+                                    LastMove::ExactSeek
+                                } else {
+                                    LastMove::Other
+                                };
                                 return Ok(IOResult::Done(SeekResult::Found));
                             } else {
                                 return Ok(IOResult::Done(SeekResult::NotFound));
@@ -1961,6 +2096,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             _ => false,
         };
 
+        let keeps_scan = self.write_at_current_row_keeps_scan(&row.id);
+        self.save_position_before_write();
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
             in_btree: was_btree_resident,
@@ -1973,12 +2110,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         // FIXME: set btree to somewhere close to this rowid?
         if self
             .db
-            .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
+            .read_from_table_or_index(self.snapshot.tx_id, &row.id, maybe_index_id)?
             .is_some()
         {
             let updated = self
                 .db
-                .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .update_to_table_or_index(self.snapshot.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
@@ -1990,16 +2127,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             // The row exists in B-tree but not in MvStore - mark it as B-tree resident
             // so that checkpoint knows to write deletes to the B-tree file.
             self.db
-                .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_btree_resident_to_table_or_index(self.snapshot.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
         } else {
             self.db
-                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .insert_to_table_or_index(self.snapshot.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
+        }
+        if keeps_scan {
+            self.keep_scan_after_write();
         }
         self.invalidate_record();
         Ok(IOResult::Done(()))
@@ -2019,6 +2159,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 { "row_id": &rowid }
             );
         }
+        let keeps_scan = self.write_at_current_row_keeps_scan(&rowid);
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
@@ -2039,11 +2180,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             None
         };
         self.db.delete_from_table_or_index(
-            self.tx_id,
+            self.snapshot.tx_id,
             rowid,
             maybe_index_id,
             btree_record.as_ref(),
         )?;
+        if keeps_scan {
+            self.keep_scan_after_write();
+        }
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }
@@ -2058,6 +2202,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
         if self.state.is_none() {
+            self.reset_table_scan();
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
@@ -2069,9 +2214,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             };
             let inclusive = true;
 
-            // Check MVCC first. This is a point existence probe, so it is
-            // eq-only: bound the skiplist walk to the single rowid instead of
-            // scanning forward over invisible concurrent rows.
             let rowid = self.db.seek_rowid(
                 RowID {
                     table_id: self.table_id,
@@ -2114,6 +2256,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     in_btree: false,
                     versions: Some(versions),
                 };
+                self.last_move = LastMove::ExactSeek;
                 self.state = None;
                 return Ok(IOResult::Done(true));
             }
@@ -2176,6 +2319,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     in_btree: true,
                     versions: None,
                 };
+                self.last_move = LastMove::ExactSeek;
                 self.state = None;
                 Ok(IOResult::Done(true))
             } else {
@@ -2206,8 +2350,50 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             let state = self.count_state;
             match state {
                 None => {
-                    self.count_state.replace(CountState::Rewind);
+                    self.set_null_flag(false);
+                    let generation = self.transaction.write_generation();
+                    let start = RowID::new(self.table_id, RowKey::Int(i64::MIN));
+                    let end = RowID::new(self.table_id, RowKey::Int(i64::MAX));
+                    self.count_state = Some(
+                        if matches!(self.mv_cursor_type, MvccCursorType::Table)
+                            && self.is_btree_allocated()
+                            && self.db.rows.range(start..=end).next().is_none()
+                        {
+                            self.btree_cursor.invalidate_btree_cache();
+                            CountState::Btree { generation }
+                        } else {
+                            CountState::Rewind
+                        },
+                    );
+                    if matches!(self.count_state, Some(CountState::Rewind)) {
+                        inject_io_yield!(self, CursorYieldPoint::CountProgress);
+                    }
+                }
+                Some(CountState::Btree { generation }) => {
+                    if self.transaction.write_generation() != generation {
+                        self.btree_cursor.invalidate_btree_cache();
+                        self.count_state = Some(CountState::Rewind);
+                        continue;
+                    }
+                    let count = return_if_io!(self.btree_cursor.count());
+                    if self.transaction.write_generation() != generation {
+                        self.btree_cursor.invalidate_btree_cache();
+                        self.count_state = Some(CountState::Rewind);
+                        continue;
+                    }
                     inject_io_yield!(self, CursorYieldPoint::CountProgress);
+                    self.current_pos = CursorPosition::End;
+                    self.dual_peek = DualCursorPeek {
+                        mvcc_peek: CursorPeek::Exhausted,
+                        btree_peek: CursorPeek::Exhausted,
+                    };
+                    self.table_iterator = None;
+                    self.eq_seek_row = None;
+                    self.last_move = LastMove::Other;
+                    self.state = None;
+                    self.count_state = None;
+                    self.invalidate_record();
+                    return Ok(IOResult::Done(count));
                 }
                 Some(CountState::Rewind) => {
                     return_if_io!(self.rewind());
@@ -2262,6 +2448,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.set_null_flag(false);
         let state = self.state.clone();
         if state.is_none() {
+            self.reset_table_scan();
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
@@ -2359,9 +2546,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn invalidate_record(&mut self) {
-        if let Some(record) = self.reusable_immutable_record.as_mut() {
-            record.invalidate();
-        }
+        self.clear_row_caches();
     }
 
     fn has_rowid(&self) -> bool {
@@ -2390,9 +2575,632 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for MvccLazyCursor<Clock
         f.debug_struct("MvccLazyCursor")
             .field("current_pos", &self.current_pos)
             .field("table_id", &self.table_id)
-            .field("tx_id", &self.tx_id)
+            .field("tx_id", &self.snapshot.tx_id)
             .field("reusable_immutable_record", &self.reusable_immutable_record)
             .field("btree_cursor", &())
             .finish()
+    }
+}
+
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock, A> {
+    fn can_step_table_row<const FORWARD: bool>(&self) -> bool {
+        let CursorPosition::Loaded {
+            row_id,
+            in_btree: true,
+            ..
+        } = &self.current_pos
+        else {
+            return false;
+        };
+        let RowKey::Int(rowid) = row_id.row_id else {
+            return false;
+        };
+        matches!(self.mv_cursor_type, MvccCursorType::Table)
+            && self.btree_readable
+            && !self.transaction.is_removed()
+            && !self.dual_peek.btree_exhausted()
+            && self.dual_peek.mvcc_peek.get_row_key() != Some(&row_id.row_id)
+            && self
+                .table_walk
+                .as_deref()
+                .is_some_and(|walk| walk.continues(rowid, Self::direction::<FORWARD>()))
+    }
+
+    fn step_table_row<const FORWARD: bool>(&mut self) -> IOResultOr<()> {
+        if FORWARD {
+            self.state
+                .replace(MvccLazyCursorState::Next(NextState::Advance));
+            inject_io_yield!(self, CursorYieldPoint::NextBtreeAdvance);
+        } else {
+            self.state
+                .replace(MvccLazyCursorState::Prev(PrevState::Advance));
+            inject_io_yield!(self, CursorYieldPoint::PrevBtreeAdvance);
+        }
+        self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
+        if FORWARD {
+            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
+        } else {
+            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
+        }
+        if FORWARD {
+            return_if_io!(self.btree_cursor.next());
+        } else {
+            return_if_io!(self.btree_cursor.prev());
+        }
+        if !self.btree_cursor.has_record() {
+            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+            self.btree_advance_state = None;
+            return self.finish_table_step::<FORWARD>();
+        }
+        self.btree_advance_state = Some(AdvanceBtreeState::NextCheckBtreeKey);
+        if FORWARD {
+            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
+        } else {
+            inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
+        }
+        let rowid = loop {
+            match self.btree_cursor.rowid()? {
+                IOResult::Done(rowid) => break rowid,
+                IOResult::IO(c) => c.wait(self.btree_cursor.get_pager().io.as_ref())?,
+            }
+        };
+        let Some(rowid) = rowid else {
+            return self.finish_step_with_merge::<FORWARD>(None);
+        };
+        let at_chain = self
+            .table_walk
+            .as_deref_mut()
+            .expect("a table step needs the table chain walk")
+            .advance_to(self.table_id, rowid, Self::direction::<FORWARD>());
+        let version_row_first = match self.dual_peek.mvcc_peek.get_row_key() {
+            Some(RowKey::Int(key)) if FORWARD => *key <= rowid,
+            Some(RowKey::Int(key)) => *key >= rowid,
+            _ => false,
+        };
+        if at_chain || version_row_first {
+            return self.finish_step_with_merge::<FORWARD>(Some(RowKey::Int(rowid)));
+        }
+        #[cfg(debug_assertions)]
+        self.debug_assert_table_row_validity(rowid, true);
+        self.set_btree_peek(RowKey::Int(rowid));
+        self.current_pos = CursorPosition::Loaded {
+            row_id: RowID::new(self.table_id, RowKey::Int(rowid)),
+            in_btree: true,
+            versions: None,
+        };
+        self.clear_row_caches();
+        self.state = None;
+        Ok(IOResult::Done(()))
+    }
+
+    fn can_step_version_row<const FORWARD: bool>(&self) -> bool {
+        let CursorPosition::Loaded {
+            row_id,
+            in_btree: false,
+            ..
+        } = &self.current_pos
+        else {
+            return false;
+        };
+        matches!(self.mv_cursor_type, MvccCursorType::Table)
+            && !self.transaction.is_removed()
+            && !self.dual_peek.mvcc_exhausted()
+            && self.dual_peek.btree_peek.get_row_key() != Some(&row_id.row_id)
+    }
+
+    fn step_version_row<const FORWARD: bool>(&mut self) -> IOResultOr<()> {
+        self.advance_mvcc_iterator();
+        let CursorPeek::Row {
+            key: RowKey::Int(rowid),
+            versions: Some(versions),
+        } = &self.dual_peek.mvcc_peek
+        else {
+            return self.finish_table_step::<FORWARD>();
+        };
+        let btree_first = match self.dual_peek.btree_peek.get_row_key() {
+            Some(RowKey::Int(btree_rowid)) if FORWARD => btree_rowid <= rowid,
+            Some(RowKey::Int(btree_rowid)) => btree_rowid >= rowid,
+            _ => false,
+        };
+        if btree_first {
+            return self.finish_table_step::<FORWARD>();
+        }
+        let btree_has_newest_version = {
+            let chain = versions.read();
+            self.db
+                .btree_covers_chain_for_snapshot(self.snapshot, self.table_id, &chain)
+        };
+        if btree_has_newest_version {
+            return self.finish_table_step::<FORWARD>();
+        }
+        self.current_pos = CursorPosition::Loaded {
+            row_id: RowID::new(self.table_id, RowKey::Int(*rowid)),
+            in_btree: false,
+            versions: Some(versions.clone()),
+        };
+        self.clear_row_caches();
+        self.state = None;
+        Ok(IOResult::Done(()))
+    }
+
+    fn finish_step_with_merge<const FORWARD: bool>(
+        &mut self,
+        key: Option<RowKey>,
+    ) -> IOResultOr<()> {
+        if !self.peek_btree_key::<FORWARD>(key)? {
+            if FORWARD {
+                return_if_io!(self.advance_btree_forward());
+            } else {
+                return_if_io!(self.advance_btree_backward());
+            }
+        }
+        self.finish_table_step::<FORWARD>()
+    }
+
+    fn finish_table_step<const FORWARD: bool>(&mut self) -> IOResultOr<()> {
+        self.refresh_current_position(Self::direction::<FORWARD>());
+        self.invalidate_record();
+        self.state = None;
+        Ok(IOResult::Done(()))
+    }
+
+    fn direction<const FORWARD: bool>() -> IterationDirection {
+        if FORWARD {
+            IterationDirection::Forwards
+        } else {
+            IterationDirection::Backwards
+        }
+    }
+
+    fn peek_btree_key<const FORWARD: bool>(&mut self, key: Option<RowKey>) -> Result<bool> {
+        if let Some(key) = key {
+            let valid = if FORWARD {
+                self.btree_row_is_valid_forward(&key)?
+            } else {
+                self.btree_row_is_valid_backward(&key)?
+            };
+            if valid {
+                self.set_btree_peek(key);
+                return Ok(true);
+            }
+            // Row is shadowed by MVCC, continue scanning
+            // FIXME: do we want to iterate over all shadowed rows? If every row is shadowed by MVCC, we will iterate the whole btree in a single `next`/`prev` call
+            self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
+            Ok(false)
+        } else {
+            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+            self.btree_advance_state = None;
+            Ok(true)
+        }
+    }
+
+    fn btree_row_is_valid_backward(&mut self, key: &RowKey) -> Result<bool> {
+        match key {
+            RowKey::Int(rowid) => self.table_row_is_valid(*rowid, IterationDirection::Backwards),
+            RowKey::Record(_) => self.query_btree_version_is_valid(key),
+        }
+    }
+
+    fn table_row_is_valid(&mut self, rowid: i64, direction: IterationDirection) -> Result<bool> {
+        if self.transaction.is_removed() {
+            let valid = self.db.cursor_btree_row_is_valid(
+                &self.transaction,
+                self.table_id,
+                &RowKey::Int(rowid),
+                self.snapshot.tx_id,
+            )?;
+            #[cfg(debug_assertions)]
+            self.debug_assert_table_row_validity(rowid, valid);
+            return Ok(valid);
+        }
+        let db = self.db.as_ref();
+        let slot = &mut self.table_walk;
+        match slot.as_deref_mut() {
+            Some(walk) if walk.continues(rowid, direction) => {}
+            Some(walk) => *walk = TableChainWalk::start(db, self.table_id, rowid, direction),
+            None => {
+                *slot = Some(Box::new(TableChainWalk::start(
+                    db,
+                    self.table_id,
+                    rowid,
+                    direction,
+                )))
+            }
+        }
+        let at_chain = self
+            .table_walk
+            .as_deref_mut()
+            .expect("table chain walk starts above")
+            .advance_to(self.table_id, rowid, direction);
+        let valid = if at_chain {
+            let versions = self
+                .table_walk
+                .as_deref()
+                .expect("table chain walk starts above")
+                .head_versions()
+                .read();
+            versions.is_empty()
+                || self.db.cursor_chain_leaves_btree_row_valid(
+                    &self.transaction,
+                    self.table_id,
+                    &versions,
+                    self.snapshot.tx_id,
+                )?
+        } else {
+            true
+        };
+        #[cfg(debug_assertions)]
+        self.debug_assert_table_row_validity(rowid, valid);
+        Ok(valid)
+    }
+
+    fn set_btree_peek(&mut self, key: RowKey) {
+        self.dual_peek.btree_peek = CursorPeek::Row {
+            key,
+            versions: None,
+        };
+        self.btree_advance_state = None;
+    }
+
+    fn clear_row_caches(&mut self) {
+        if let Some(record) = self.reusable_immutable_record.as_mut() {
+            record.invalidate();
+        }
+        self.payload_row = None;
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_table_row_validity(&self, rowid: i64, valid: bool) {
+        let expected = self.db.cursor_btree_row_is_valid(
+            &self.transaction,
+            self.table_id,
+            &RowKey::Int(rowid),
+            self.snapshot.tx_id,
+        );
+        debug_assert!(
+            matches!(expected, Ok(expected) if expected == valid),
+            "table chain walk diverged from the point lookup at rowid {rowid}: \
+             walk {valid}, point lookup {expected:?}"
+        );
+    }
+
+    fn seek_past_current_row(&mut self, direction: IterationDirection) -> IOResultOr<()> {
+        if self.table_scan.generation != self.transaction.write_generation() {
+            return self.refresh_scan_after_write(direction);
+        }
+        self.table_walk = None;
+        let forwards = matches!(direction, IterationDirection::Forwards);
+        let result = match &self.current_pos {
+            CursorPosition::Loaded {
+                row_id:
+                    RowID {
+                        row_id: RowKey::Int(rowid),
+                        ..
+                    },
+                ..
+            } => {
+                let op = if forwards { SeekOp::GT } else { SeekOp::LT };
+                self.seek(SeekKey::TableRowId(*rowid), op)
+                    .map(|result| result.map(|_| ()))
+            }
+            CursorPosition::BeforeFirst if forwards => self.rewind(),
+            CursorPosition::End if !forwards => self.last(),
+            CursorPosition::BeforeFirst | CursorPosition::End => Ok(IOResult::Done(())),
+            CursorPosition::Loaded { .. } => {
+                unreachable!("range continuation requires a table row position")
+            }
+        };
+        self.last_move = match &result {
+            Ok(IOResult::IO(_)) => LastMove::ExactSeek,
+            Ok(IOResult::Done(_)) if forwards => LastMove::Next,
+            Ok(IOResult::Done(_)) => LastMove::Prev,
+            Err(_) => LastMove::Other,
+        };
+        result
+    }
+
+    #[cold]
+    fn refresh_scan_after_write(&mut self, direction: IterationDirection) -> IOResultOr<()> {
+        let current_generation = self.transaction.write_generation();
+        if !matches!(self.mv_cursor_type, MvccCursorType::Table) || self.transaction.is_removed() {
+            self.table_scan.generation = current_generation;
+            return self.move_once(direction);
+        }
+        let table_generation = self.transaction.table_write_generation(self.table_id);
+        if self.table_scan.resume.is_none() && table_generation <= self.table_scan.generation {
+            self.table_scan.generation = current_generation;
+            return self.move_once(direction);
+        }
+        self.table_walk = None;
+        let scan_generation = self.table_scan.generation;
+        let movement_pending = self.btree_advance_state.is_some()
+            || matches!(
+                self.state,
+                Some(
+                    MvccLazyCursorState::Seek(..)
+                        | MvccLazyCursorState::Rewind(..)
+                        | MvccLazyCursorState::Exists(..)
+                        | MvccLazyCursorState::Next(NextState::AdvanceUnitialized)
+                        | MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized)
+                )
+            );
+        if self.table_scan.resume.is_none() && !movement_pending {
+            self.state = None;
+        }
+        let mut resume = match self.table_scan.resume {
+            Some(resume) => resume,
+            None => PendingScanRefresh {
+                position: self
+                    .table_scan
+                    .position_before_write
+                    .unwrap_or_else(|| self.current_scan_position()),
+                phase: if movement_pending {
+                    PendingScanPhase::FinishPendingMove
+                } else {
+                    PendingScanPhase::SeekPastPosition
+                },
+                table_generation,
+            },
+        };
+        loop {
+            let generation = self.transaction.write_generation();
+            self.table_scan.generation = generation;
+            let result = match resume.phase {
+                PendingScanPhase::FinishPendingMove => {
+                    self.current_pos = match resume.position {
+                        ScanPosition::BeforeFirst => CursorPosition::BeforeFirst,
+                        ScanPosition::At { rowid, in_btree } => CursorPosition::Loaded {
+                            row_id: RowID::new(self.table_id, RowKey::Int(rowid)),
+                            in_btree,
+                            versions: None,
+                        },
+                        ScanPosition::End => CursorPosition::End,
+                    };
+                    self.move_once(direction)
+                }
+                PendingScanPhase::SeekPastPosition => match (resume.position, direction) {
+                    (ScanPosition::At { rowid, .. }, IterationDirection::Forwards) => self
+                        .seek(SeekKey::TableRowId(rowid), SeekOp::GT)
+                        .map(|r| r.map(|_| ())),
+                    (ScanPosition::At { rowid, .. }, IterationDirection::Backwards) => self
+                        .seek(SeekKey::TableRowId(rowid), SeekOp::LT)
+                        .map(|r| r.map(|_| ())),
+                    (ScanPosition::BeforeFirst, IterationDirection::Forwards) => self.rewind(),
+                    (ScanPosition::End, IterationDirection::Backwards) => self.last(),
+                    (ScanPosition::BeforeFirst, IterationDirection::Backwards) => {
+                        self.current_pos = CursorPosition::BeforeFirst;
+                        Ok(IOResult::Done(()))
+                    }
+                    (ScanPosition::End, IterationDirection::Forwards) => {
+                        self.current_pos = CursorPosition::End;
+                        Ok(IOResult::Done(()))
+                    }
+                },
+            };
+            self.table_scan.generation = scan_generation;
+            match result? {
+                IOResult::IO(io) => {
+                    self.table_scan.resume = Some(resume);
+                    return Ok(IOResult::IO(io));
+                }
+                IOResult::Done(()) => match resume.phase {
+                    PendingScanPhase::FinishPendingMove => {
+                        resume.phase = PendingScanPhase::SeekPastPosition;
+                        resume.table_generation =
+                            self.transaction.table_write_generation(self.table_id);
+                    }
+                    PendingScanPhase::SeekPastPosition => {
+                        let current = self.transaction.table_write_generation(self.table_id);
+                        if current != resume.table_generation {
+                            resume.table_generation = current;
+                            continue;
+                        }
+                        self.table_scan = TableScan::new(self.transaction.write_generation());
+                        self.last_move = match direction {
+                            IterationDirection::Forwards => LastMove::Next,
+                            IterationDirection::Backwards => LastMove::Prev,
+                        };
+                        return Ok(IOResult::Done(()));
+                    }
+                },
+            }
+        }
+    }
+
+    fn move_once(&mut self, direction: IterationDirection) -> IOResultOr<()> {
+        match direction {
+            IterationDirection::Forwards => self.next(),
+            IterationDirection::Backwards => self.prev(),
+        }
+    }
+
+    fn write_at_current_row_keeps_scan(&self, row_id: &RowID) -> bool {
+        matches!(self.mv_cursor_type, MvccCursorType::Table)
+            && matches!(&self.current_pos, CursorPosition::Loaded { row_id: current, .. } if current == row_id)
+            && !self.dual_peek.both_uninitialized()
+            && self.table_scan.resume.is_none()
+            && self.table_scan.position_before_write.is_none()
+            && self.transaction.table_write_generation(self.table_id) <= self.table_scan.generation
+    }
+
+    fn keep_scan_after_write(&mut self) {
+        self.table_scan.position_before_write = None;
+        self.table_scan.generation = self.transaction.write_generation();
+    }
+
+    fn save_position_before_write(&mut self) {
+        if matches!(self.mv_cursor_type, MvccCursorType::Table)
+            && !self.dual_peek.both_uninitialized()
+            && self.table_scan.position_before_write.is_none()
+            && self.table_scan.resume.is_none()
+        {
+            self.table_scan.position_before_write = Some(self.current_scan_position());
+        }
+    }
+
+    fn reset_table_scan(&mut self) {
+        if !matches!(self.mv_cursor_type, MvccCursorType::Table) {
+            return;
+        }
+        self.table_scan = TableScan::new(self.transaction.write_generation());
+        self.table_walk = None;
+    }
+
+    fn current_scan_position(&self) -> ScanPosition {
+        match &self.current_pos {
+            CursorPosition::BeforeFirst => ScanPosition::BeforeFirst,
+            CursorPosition::End => ScanPosition::End,
+            CursorPosition::Loaded {
+                row_id, in_btree, ..
+            } => ScanPosition::At {
+                rowid: row_id.row_id.to_int_or_panic(),
+                in_btree: *in_btree,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+struct TableScan {
+    generation: u64,
+    position_before_write: Option<ScanPosition>,
+    resume: Option<PendingScanRefresh>,
+}
+
+impl TableScan {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScanPosition {
+    BeforeFirst,
+    At { rowid: i64, in_btree: bool },
+    End,
+}
+
+#[derive(Clone, Copy)]
+struct PendingScanRefresh {
+    position: ScanPosition,
+    phase: PendingScanPhase,
+    table_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+enum PendingScanPhase {
+    FinishPendingMove,
+    SeekPastPosition,
+}
+
+enum TableChainWalk<A: ConcurrentAllocator = TursoAllocator> {
+    Peeked {
+        direction: IterationDirection,
+        checked: i64,
+        rowid: i64,
+        versions: RowVersions<A>,
+        iter: MvccIterator<'static, RowID, A>,
+    },
+    Exhausted {
+        direction: IterationDirection,
+        checked: i64,
+    },
+}
+
+impl<A: ConcurrentAllocator> TableChainWalk<A> {
+    fn advance_to(
+        &mut self,
+        table_id: MVTableId,
+        rowid: i64,
+        direction: IterationDirection,
+    ) -> bool {
+        loop {
+            match self {
+                Self::Exhausted { checked, .. } => {
+                    *checked = rowid;
+                    return false;
+                }
+                Self::Peeked {
+                    checked,
+                    rowid: head,
+                    ..
+                } => {
+                    *checked = rowid;
+                    let behind = match direction {
+                        IterationDirection::Forwards => *head < rowid,
+                        IterationDirection::Backwards => *head > rowid,
+                    };
+                    if !behind {
+                        return *head == rowid;
+                    }
+                }
+            }
+            let finished = Self::Exhausted {
+                direction,
+                checked: rowid,
+            };
+            let Self::Peeked { iter, .. } = std::mem::replace(self, finished) else {
+                unreachable!("only a peeked walk falls behind")
+            };
+            *self = Self::step(iter, table_id, direction, rowid);
+        }
+    }
+
+    fn continues(&self, rowid: i64, direction: IterationDirection) -> bool {
+        let (Self::Peeked {
+            direction: walk_direction,
+            checked,
+            ..
+        }
+        | Self::Exhausted {
+            direction: walk_direction,
+            checked,
+        }) = self;
+        *walk_direction == direction
+            && match direction {
+                IterationDirection::Forwards => rowid >= *checked,
+                IterationDirection::Backwards => rowid <= *checked,
+            }
+    }
+
+    fn start<Clock: LogicalClock>(
+        db: &MvStore<Clock, A>,
+        table_id: MVTableId,
+        rowid: i64,
+        direction: IterationDirection,
+    ) -> Self {
+        let iter = db.table_rows_iterator(
+            Bound::Included(RowID::new(table_id, RowKey::Int(rowid))),
+            direction,
+        );
+        Self::step(iter, table_id, direction, rowid)
+    }
+
+    fn step(
+        mut iter: MvccIterator<'static, RowID, A>,
+        table_id: MVTableId,
+        direction: IterationDirection,
+        checked: i64,
+    ) -> Self {
+        match iter.next() {
+            Some(entry) if entry.key().table_id == table_id => Self::Peeked {
+                direction,
+                checked,
+                rowid: entry.key().row_id.to_int_or_panic(),
+                versions: entry.value().clone(),
+                iter,
+            },
+            _ => Self::Exhausted { direction, checked },
+        }
+    }
+
+    fn head_versions(&self) -> &RowVersions<A> {
+        let Self::Peeked { versions, .. } = self else {
+            unreachable!("only a walk at a chain key has versions")
+        };
+        versions
     }
 }
