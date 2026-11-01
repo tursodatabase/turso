@@ -184,11 +184,12 @@ const INVALID_REQUEST: i32 = -32600;
 /// Malformed JSON is a Parse error (`-32700`). Well-formed JSON that does not
 /// describe a request is an Invalid Request (`-32600`) that echoes the id when
 /// the client supplied one, so it can pair the error with its call.
-fn parse_request_line(line: &str) -> Result<JsonRpcRequest, JsonRpcResponse> {
-    let value: Value =
-        serde_json::from_str(line).map_err(|_| jsonrpc_error(None, PARSE_ERROR, "Parse error"))?;
+fn parse_request_line(line: &str) -> Result<JsonRpcRequest, Box<JsonRpcResponse>> {
+    let value: Value = serde_json::from_str(line)
+        .map_err(|_| Box::new(jsonrpc_error(None, PARSE_ERROR, "Parse error")))?;
     let id = value.get("id").cloned();
-    serde_json::from_value(value).map_err(|_| jsonrpc_error(id, INVALID_REQUEST, "Invalid Request"))
+    serde_json::from_value(value)
+        .map_err(|_| Box::new(jsonrpc_error(id, INVALID_REQUEST, "Invalid Request")))
 }
 
 pub struct TursoMcpServer {
@@ -220,7 +221,7 @@ impl TursoMcpServer {
                 // Don't send a response for notifications (when id is None)
                 (response.id.is_some() || response.error.is_some()).then_some(response)
             }
-            Err(response) => Some(response),
+            Err(response) => Some(*response),
         }
     }
 
