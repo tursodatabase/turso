@@ -278,6 +278,9 @@ pub struct ProgramBuilder {
     /// that are deemed to be compile-time constant and can be hoisted out of loops
     /// so that they get evaluated only once at the start of the program.
     pub constant_spans: Vec<(usize, usize)>,
+    /// Number of open regions where constant expressions are evaluated in place,
+    /// without hoisting and without their own `Once`.
+    constants_in_place_depth: usize,
     /// Cursors that are referenced by the program. Indexed by [CursorKey].
     /// Certain types of cursors do not need a [CursorKey] (e.g. temp tables, sorter),
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
@@ -823,6 +826,7 @@ impl ProgramBuilder {
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
+            constants_in_place_depth: 0,
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
@@ -1144,18 +1148,25 @@ impl ProgramBuilder {
             .is_some_and(|(_, end)| *end == usize::MAX)
     }
 
-    /// Get the index of the next constant span.
-    /// Used in `crate::translate::expr::translate_expr_no_constant_opt()` to invalidate
-    /// all constant spans after the given index.
-    pub const fn constant_spans_next_idx(&self) -> usize {
+    /// Start a region where constant expressions are evaluated in place, without hoisting
+    /// and without their own `Once`. Returns the index of the next constant span, to be
+    /// passed to [ProgramBuilder::constants_in_place_end].
+    pub fn constants_in_place_start(&mut self) -> usize {
+        self.constants_in_place_depth += 1;
         self.constant_spans.len()
     }
 
-    /// Invalidate all constant spans after the given index. This is used when we want to
-    /// be sure that constant optimization is never used for translating a given expression.
-    /// See `crate::translate::expr::translate_expr_no_constant_opt()` for more details.
-    pub fn constant_spans_invalidate_after(&mut self, idx: usize) {
-        self.constant_spans.truncate(idx);
+    /// End a region started by [ProgramBuilder::constants_in_place_start], dropping the
+    /// constant spans opened inside it so their instructions are not hoisted.
+    pub fn constants_in_place_end(&mut self, span_idx: usize) {
+        self.constants_in_place_depth -= 1;
+        self.constant_spans.truncate(span_idx);
+    }
+
+    /// Whether constant expressions must be evaluated in place, see
+    /// [ProgramBuilder::constants_in_place_start].
+    pub const fn constants_in_place(&self) -> bool {
+        self.constants_in_place_depth > 0
     }
 
     pub fn alloc_register(&mut self) -> usize {
