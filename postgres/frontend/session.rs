@@ -15,6 +15,7 @@ use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
 use turso_parser::ast::{self};
+use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::foreign_key_tables;
 use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
@@ -377,7 +378,7 @@ fn prepare_statement_inner(
     // query, for every kind of statement this function returns.
     let marks_query_start = execution_takes_snapshot(&parse_result);
 
-    if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
+    if let Some(stmt) = try_prepare_special(pg_conn, sql, &parse_result)? {
         return Ok(stmt
             .with_tx_tracking(
                 Arc::clone(&pg_conn.conn),
@@ -1584,8 +1585,18 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
 
 fn try_prepare_special(
     pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
     parse_result: &turso_pg_parser::ParseResult,
 ) -> Result<Option<crate::Statement>> {
+    if CommandTag::of(parse_result) == CommandTag::Copy {
+        if let Some(copy) = turso_pg_parser::copy::parse_copy_to_stdout(sql)
+            .map_err(|e| translation_error(&pg_conn.conn, e))?
+        {
+            return crate::copy::prepare_copy_to_stdout(&pg_conn.conn, &copy)
+                .map(crate::Statement::new)
+                .map(Some);
+        }
+    }
     let Some(stmt) = session_stmt(parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     else {
         return Ok(None);
@@ -2737,10 +2748,7 @@ mod tests {
         let conn = test_connection();
         conn.execute("CREATE TABLE t (a int)").unwrap();
         conn.execute("BEGIN READ ONLY").unwrap();
-        let spec = turso_pg_parser::copy::parse_copy_to_stdout("COPY t TO STDOUT")
-            .unwrap()
-            .unwrap();
-        let mut stmt = conn.prepare_copy_to_stdout(&spec).unwrap();
+        let mut stmt = conn.prepare("COPY t TO STDOUT").unwrap();
         stmt.run_ignore_rows().unwrap();
         drop(stmt);
         let err = conn.execute("SET TRANSACTION READ WRITE").unwrap_err();

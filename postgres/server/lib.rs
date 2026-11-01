@@ -343,7 +343,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = &self.conn;
         let query = &portal.statement.statement;
 
-        let mut stmt = conn.prepare(query).map_err(pg_error)?;
+        let mut stmt = prepare_extended(conn, query)?;
 
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
@@ -367,7 +367,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = &self.conn;
-        let stmt = conn.prepare(&target.statement).map_err(pg_error)?;
+        let stmt = prepare_extended(conn, &target.statement)?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -388,9 +388,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = &self.conn;
-        let stmt = conn
-            .prepare(&portal.statement.statement)
-            .map_err(pg_error)?;
+        let stmt = prepare_extended(conn, &portal.statement.statement)?;
 
         let fields = describe_fields(
             &stmt,
@@ -399,6 +397,23 @@ impl ExtendedQueryHandler for TursoPgHandler {
         )?;
         Ok(DescribePortalResponse::new(fields))
     }
+}
+
+fn prepare_extended(conn: &PgConnection, sql: &str) -> PgWireResult<turso_pg::Statement> {
+    let stmt = conn.prepare(sql).map_err(pg_error)?;
+    if parse_copy_to_stdout(sql)
+        .map_err(|error| pg_error(turso_core::LimboError::ParseError(error.to_string()).into()))?
+        .is_some()
+    {
+        conn.abort_transaction_block_on_error();
+        return Err(pg_error(
+            turso_core::LimboError::ParseError(
+                "COPY TO STDOUT is not supported through the extended query protocol".to_owned(),
+            )
+            .into(),
+        ));
+    }
+    Ok(stmt)
 }
 
 /// The fields of the rows that `sql` returns, or none if it returns no rows.

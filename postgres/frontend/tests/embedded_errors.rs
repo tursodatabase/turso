@@ -969,10 +969,7 @@ fn copy_text_encoding_returns_one_record_per_row() {
         .execute("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
     conn.inner().get_pager().clear_page_cache(false);
-    let spec = turso_pg_parser::copy::parse_copy_to_stdout("COPY t TO STDOUT")
-        .unwrap()
-        .unwrap();
-    let mut stmt = conn.prepare_copy_to_stdout(&spec).unwrap();
+    let mut stmt = conn.prepare("COPY t TO STDOUT").unwrap();
     let encoder = turso_pg::CopyTextEncoder::new(&stmt);
     let expected = [
         "t\t-17\t1.25\t\\\\N\\t\\n\\r\\b\\f\\vé\t{2,7}\t2026-10-31 12:34:56+00\t2026-10-31 12:34:56\t\\\\x00ff\n",
@@ -1004,6 +1001,48 @@ fn copy_text_encoding_returns_one_record_per_row() {
     }
     assert_eq!(rows, expected.len());
     assert!(yields > 0);
+}
+
+#[test]
+fn embedded_copy_returns_values_in_column_order() {
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE SCHEMA exports").unwrap();
+    conn.execute("CREATE TABLE exports.items (id INT, name TEXT, enabled BOOLEAN)")
+        .unwrap();
+    conn.execute("SET search_path TO exports").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO items VALUES (7, E'a\tb', true), (19, NULL, false)")
+        .unwrap();
+
+    for sql in [
+        "COPY items (name, enabled, id) TO STDOUT",
+        "COPY exports.items (name, enabled, id) TO STDOUT WITH (FORMAT text)",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![
+                vec![
+                    Value::from_text("a\tb"),
+                    Value::from_i64(1),
+                    Value::from_i64(7)
+                ],
+                vec![Value::Null, Value::from_i64(0), Value::from_i64(19)],
+            ],
+            "{sql}"
+        );
+        assert_eq!(conn.transaction_state(), TransactionState::Active);
+    }
+
+    assert!(conn
+        .prepare("COPY items TO STDOUT WITH (FORMAT csv)")
+        .is_err());
+    assert_eq!(conn.transaction_state(), TransactionState::Aborted);
+    let error = conn.prepare("COPY items TO STDOUT").err().unwrap();
+    assert_eq!(error.sqlstate, "25P02");
+    conn.execute("ROLLBACK").unwrap();
+    let mut stmt = conn.prepare("COPY items TO STDOUT").unwrap();
+    assert!(stmt.run_collect_rows().unwrap().is_empty());
 }
 
 #[test]
