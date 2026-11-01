@@ -1,7 +1,7 @@
 use crate::catalog::PG_DATABASE_OWNER_OID;
 use crate::error::sqlstate_error;
 use crate::settings::{find_parameter, Parameter, SettingScope};
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
 use turso_core::types::IOResultOr;
@@ -9,7 +9,7 @@ use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_DATETIME_FIELD_OVERFLOW, SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
@@ -75,6 +75,7 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         "to_char"(FunctionArity::Exact(2), true) => {
             exec_to_char(args[0].get_value(), &text_arg(args, 1))
         },
+        "to_timestamp"(FunctionArity::Exact(1), true) => exec_to_timestamp(args[0].get_value())?,
         "age"(FunctionArity::OneOf(&[1, 2]), false) => exec_age(args)?,
         "pg_input_is_valid"(FunctionArity::Exact(2), true) => {
             exec_pg_input_is_valid(args[0].get_value(), &text_arg(args, 1))
@@ -865,6 +866,46 @@ fn exec_to_char(value: &Value, format: &str) -> Option<String> {
         _ => return None,
     };
     Some(pg_to_char_numeric(num, format))
+}
+
+/// `to_timestamp(double precision)`: the timestamptz that is this many seconds
+/// after 1970-01-01 00:00:00 UTC, in the text form of a stored timestamptz.
+fn exec_to_timestamp(value: &Value) -> Result<Option<Timestamptz>> {
+    let seconds = match value {
+        Value::Null => return Ok(None),
+        Value::Numeric(Numeric::Integer(i)) => *i as f64,
+        Value::Numeric(Numeric::Float(f)) => f64::from(*f),
+        // Numeric columns reach functions as text.
+        Value::Text(text) => text.as_str().trim().parse::<f64>().map_err(|_| {
+            sqlstate_error(
+                SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                format!(
+                    "invalid input syntax for type double precision: \"{}\"",
+                    text.as_str()
+                ),
+            )
+        })?,
+        Value::Blob(_) => return Err(undefined_function("to_timestamp", &["bytea"])),
+    };
+    if seconds.is_nan() {
+        return Err(sqlstate_error(
+            SQLSTATE_DATETIME_FIELD_OVERFLOW,
+            "timestamp cannot be NaN".to_string(),
+        ));
+    }
+    let timestamp =
+        DateTime::from_timestamp_micros((seconds * 1_000_000.0).round_ties_even() as i64)
+            .filter(|timestamp| (1..=9999).contains(&timestamp.year()))
+            .ok_or_else(|| {
+                sqlstate_error(
+                    SQLSTATE_DATETIME_FIELD_OVERFLOW,
+                    format!("timestamp out of range: \"{seconds}\""),
+                )
+            })?;
+    let text = timestamp.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    Ok(Some(Timestamptz(
+        text.trim_end_matches('0').trim_end_matches('.').to_string(),
+    )))
 }
 
 /// age(end, start) the way PostgreSQL's timestamp_age computes it: subtract the
