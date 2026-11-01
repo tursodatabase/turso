@@ -279,6 +279,10 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST
     } else if is_duplicate_object_error(msg) {
         SQLSTATE_DUPLICATE_TABLE
+    } else if msg.starts_with("cannot INSERT into generated column")
+        || msg.starts_with("cannot UPDATE generated column")
+    {
+        SQLSTATE_GENERATED_ALWAYS
     } else if msg.contains("no such table")
         || msg.contains("table not found")
         || msg.starts_with("no such object")
@@ -442,6 +446,14 @@ mod tests {
         for (msg, code) in [
             ("no such table: t", SQLSTATE_UNDEFINED_TABLE),
             ("no such column: c", SQLSTATE_UNDEFINED_COLUMN),
+            (
+                "cannot INSERT into generated column \"b\"",
+                SQLSTATE_GENERATED_ALWAYS,
+            ),
+            (
+                "cannot UPDATE generated column \"b\"",
+                SQLSTATE_GENERATED_ALWAYS,
+            ),
             ("no such function: f", SQLSTATE_UNDEFINED_FUNCTION),
             ("table t already exists", SQLSTATE_DUPLICATE_TABLE),
             (
