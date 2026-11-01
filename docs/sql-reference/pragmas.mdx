@@ -290,8 +290,11 @@ unless the database was opened with the `--experimental-autovacuum` flag. Writin
 The `incremental` mode can be set but is not supported yet: the next write fails with
 `Incremental auto-vacuum is not supported`.
 
-Like SQLite, the mode is fixed once page 1 of the database file exists: setting the
-pragma after the database has been initialized is silently ignored. Opening a database
+Setting `full` or `incremental` on an empty database writes page 1 in its own write
+transaction, so the mode is saved even if nothing else is written. Like SQLite, once
+page 1 of the database file exists a database cannot gain or lose auto-vacuum: such a
+change is silently ignored. A database that has auto-vacuum can still switch between
+`full` and `incremental`. Opening a database
 that already has auto-vacuum enabled without the flag logs a warning and opens the
 connection read-only.
 

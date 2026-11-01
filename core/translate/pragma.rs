@@ -603,18 +603,28 @@ fn update_pragma(
 
             let pager = connection.get_pager_from_database_index(&database_id)?;
 
-            // Like SQLite, the auto-vacuum mode is fixed once page 1 exists,
-            // so the pragma is silently ignored after that.
-            if pager.db_initialized() {
-                return Ok(TransactionMode::None);
-            }
-
             let Some(auto_vacuum_mode) = requested_mode else {
                 return Err(LimboError::InvalidArgument(
                     "invalid auto vacuum mode".to_string(),
                 ));
             };
-            pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
+
+            // Like SQLite, once page 1 exists a database cannot gain or lose
+            // auto-vacuum, so such a change is silently ignored. It can still
+            // switch between full and incremental.
+            if pager.db_initialized() {
+                if auto_vacuum_mode == AutoVacuumMode::None
+                    || pager.get_auto_vacuum_mode() == AutoVacuumMode::None
+                {
+                    return Ok(TransactionMode::None);
+                }
+                pager.set_auto_vacuum_mode(auto_vacuum_mode);
+            } else {
+                pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
+                if auto_vacuum_mode == AutoVacuumMode::None {
+                    return Ok(TransactionMode::None);
+                }
+            }
             let largest_root_page_number_reg = program.alloc_register();
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,
@@ -641,7 +651,7 @@ fn update_pragma(
                 value: i32::from(u8::from(auto_vacuum_mode)) - 1,
                 p5: 0,
             });
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Write)
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
