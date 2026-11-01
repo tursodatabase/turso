@@ -19,8 +19,8 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_function_that_changes_within_statement,
-        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
-        BindingBehavior, WalkControl,
+        expr_contains_nondeterministic_scalar_function, expr_vector_size,
+        integer_literal_truth_value, unwrap_parens, BindingBehavior, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -3339,7 +3339,14 @@ pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     // left as-is by unwrap_parens.
     let predicate = unwrap_parens(predicate).unwrap_or(predicate);
     match predicate {
-        Expr::Binary(left, ast::Operator::And, right) => {
+        // A conjunction with the integer literal 0 stays one term, so binding
+        // folds it to 0 instead of planning the other operand. SQLite's parser
+        // folds exactly that shape; `g = 2 AND false` still splits, and the
+        // `g = 2` term can move from HAVING to WHERE.
+        Expr::Binary(left, ast::Operator::And, right)
+            if integer_literal_truth_value(left) != Some(false)
+                && integer_literal_truth_value(right) != Some(false) =>
+        {
             break_predicate_at_and_boundaries(left, out_predicates);
             break_predicate_at_and_boundaries(right, out_predicates);
         }

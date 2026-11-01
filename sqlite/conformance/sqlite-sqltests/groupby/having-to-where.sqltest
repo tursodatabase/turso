@@ -98,6 +98,16 @@ test having-moves-group-by-term-next-to-false {
 expect {
 }
 
+# `g = 2 AND 0` is folded to 0 by SQLite's parser before any term can move to
+# WHERE, so every group is aggregated; `false` is only resolved later.
+@setup overflow
+test having-integer-zero-folds-before-the-move {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g = 2 AND 0;
+}
+expect error {
+    integer overflow
+}
+
 @setup overflow
 test having-subquery-still-aggregates {
     SELECT g, sum(a) FROM t GROUP BY g HAVING g = (SELECT 2);

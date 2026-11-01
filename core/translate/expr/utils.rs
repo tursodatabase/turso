@@ -90,6 +90,39 @@ pub fn truth_test_rhs(expr: &ast::Expr) -> Option<bool> {
     }
 }
 
+/// The truth value of TRUE, FALSE or an integer literal that fits in 32 bits,
+/// through parentheses: the operands SQLite folds `x AND 0` and `x OR 1` on
+/// (sqlite3ExprAlwaysFalse, sqlite3ExprAlwaysTrue). A float, a string, NULL,
+/// a COLLATE or a unary sign in front make it None.
+pub fn literal_truth_value(expr: &ast::Expr) -> Option<bool> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::True) => Some(true),
+        ast::Expr::Literal(ast::Literal::False) => Some(false),
+        ast::Expr::Parenthesized(items) if items.len() == 1 => literal_truth_value(&items[0]),
+        _ => integer_literal_truth_value(expr),
+    }
+}
+
+/// [literal_truth_value] for an integer literal only. SQLite's parser folds
+/// `x AND 0` as soon as it reads it, before TRUE and FALSE are resolved, so a
+/// place that follows the parser must not accept the keywords.
+pub fn integer_literal_truth_value(expr: &ast::Expr) -> Option<bool> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(text)) => {
+            match crate::util::parse_numeric_literal(text) {
+                Ok(crate::Value::Numeric(crate::Numeric::Integer(value))) => {
+                    i32::try_from(value).ok().map(|value| value != 0)
+                }
+                _ => None,
+            }
+        }
+        ast::Expr::Parenthesized(items) if items.len() == 1 => {
+            integer_literal_truth_value(&items[0])
+        }
+        _ => None,
+    }
+}
+
 /// Recursively unwrap parentheses from an owned Expr.
 /// Returns how many pairs of parentheses were removed.
 pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
