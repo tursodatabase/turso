@@ -865,7 +865,7 @@ fn validate(
                     bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
                 }
             }
-            table.resolve_custom_types(resolver.schema());
+            table.resolve_custom_types(resolver.schema())?;
             table.check_collates_are_allowed()?;
         }
     }

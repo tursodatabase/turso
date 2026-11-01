@@ -1966,7 +1966,7 @@ pub fn translate_alter_table(
             let altered_table = if let Some(replacement_column) = &replacement_column {
                 let mut table = btree.clone();
                 table.columns_mut()[column_index] = replacement_column.clone();
-                table.resolve_custom_types(resolver.schema());
+                table.resolve_custom_types(resolver.schema())?;
                 let column = &table.columns()[column_index];
                 key_collation(column.text_collation(), column.type_ordering())?;
                 table.prepare_generated_columns()?;

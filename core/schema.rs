@@ -153,6 +153,9 @@ pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 /// Hidden per-view value-multiset table backing MIN/MAX and DISTINCT
 /// aggregates.
 pub const DBSP_MULTISET_TABLE_PREFIX: &str = "__turso_internal_dbsp_multiset_v";
+/// Start of the declared type of a materialized view's hidden key column that
+/// compares in a type's order. The rest is the [TypeOrdering::name].
+pub const HIDDEN_KEY_ORDER_TYPE_PREFIX: &str = "__turso_key_order_";
 /// Hidden z-set integral for an operator output consumed as a join
 /// arrangement.
 pub const DBSP_ARRANGEMENT_TABLE_PREFIX: &str = "__turso_internal_dbsp_arrangement_v";
@@ -2050,7 +2053,7 @@ impl Schema {
         {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
-            modified.resolve_custom_types(self);
+            modified.resolve_custom_types(self)?;
             modified.propagate_domain_constraints(self)?;
             tables.push((
                 namespace,
@@ -3848,7 +3851,7 @@ impl Schema {
                         }
                     }
 
-                    table.resolve_custom_types(self);
+                    table.resolve_custom_types(self)?;
                     table.propagate_domain_constraints(self)?;
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = name.to_string();
@@ -5295,13 +5298,23 @@ impl BTreeTable {
     ///   the custom type name (e.g. "doubled" contains "DOUB" which would
     ///   incorrectly map to REAL instead of INTEGER).
     /// - Keys on the column use the order of its type, when it has one.
-    pub fn resolve_custom_types(&mut self, schema: &Schema) {
+    /// - Key columns of a materialized view's hidden table use the type order
+    ///   they declare.
+    pub fn resolve_custom_types(&mut self, schema: &Schema) -> Result<()> {
+        if self.name.starts_with(DBSP_TABLE_PREFIX)
+            || self.name.starts_with(DBSP_MULTISET_TABLE_PREFIX)
+        {
+            for col in &mut self.columns {
+                col.resolve_hidden_key_order()?;
+            }
+        }
         if !self.is_strict {
-            return;
+            return Ok(());
         }
         for col in &mut self.columns {
             col.resolve_custom_type(schema);
         }
+        Ok(())
     }
 
     /// Propagate domain NOT NULL and CHECK constraints to table columns.
@@ -7324,8 +7337,7 @@ pub struct Column {
     /// `info` because a custom collation does not fit in its bits.
     collation: Option<TextCollation>,
     /// The order of the column's type, when it has one (numeric, arrays).
-    /// Keys on the column use it instead of `collation`. Set from the schema's
-    /// types by `BTreeTable::resolve_custom_types`, never stored in the SQL.
+    /// Keys on the column use it instead of `collation`.
     type_ordering: Option<TypeOrdering>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
@@ -7732,6 +7744,25 @@ impl Column {
             self.override_affinity(Affinity::affinity(&resolved.primitive));
             self.type_ordering = resolved.ordering();
         }
+    }
+    /// Give a key column of a materialized view's hidden table the type order
+    /// it declares with [HIDDEN_KEY_ORDER_TYPE_PREFIX]. Like the table's other
+    /// columns, it stores values as they are.
+    fn resolve_hidden_key_order(&mut self) -> Result<()> {
+        let Some(order_name) = self.ty_str.strip_prefix(HIDDEN_KEY_ORDER_TYPE_PREFIX) else {
+            return Ok(());
+        };
+        let ordering = TypeOrdering::ALL
+            .into_iter()
+            .find(|ordering| ordering.name() == order_name)
+            .ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "malformed database schema - hidden key column declares an unknown type order: {order_name}"
+                ))
+            })?;
+        self.type_ordering = Some(ordering);
+        self.override_affinity(Affinity::Blob);
+        Ok(())
     }
     /// Set the key order of a derived table's column, which takes it from the
     /// type of the expression the column comes from.
