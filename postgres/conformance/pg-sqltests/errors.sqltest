@@ -60,3 +60,56 @@ test error-drop-domain-used-by-table-in-other-schema {
 }
 @sqlstate 2BP01
 expect error {}
+
+test error-star-argument-to-plain-function {
+    SELECT version(*) IS NOT NULL;
+}
+@sqlstate 42809
+expect error {version\(\*\) specified, but version is not an aggregate function}
+
+test error-star-argument-to-plain-function-now {
+    SELECT now(*) IS NOT NULL;
+}
+@sqlstate 42809
+expect error {now\(\*\) specified, but now is not an aggregate function}
+
+test error-star-argument-to-plain-function-in-column-check {
+    CREATE TABLE star_check_column (a int CHECK (random(*) IS NOT NULL));
+}
+@sqlstate 42809
+expect error {random\(\*\) specified, but random is not an aggregate function}
+
+test error-star-argument-to-plain-function-in-table-check {
+    CREATE TABLE star_check_table (a int, CHECK (random(*) IS NOT NULL));
+}
+@sqlstate 42809
+expect error {random\(\*\) specified, but random is not an aggregate function}
+
+# PostgreSQL has no jsonb_object() without arguments, so it reports a missing
+# function. turso-pg has one and reports that it is not an aggregate.
+test error-star-argument-to-jsonb-object-in-select-list {
+    CREATE TABLE star_jsonb_select (a int);
+    INSERT INTO star_jsonb_select VALUES (1);
+    SELECT jsonb_object(*) FROM star_jsonb_select;
+}
+@sqlstate 42883
+expect error {function jsonb_object\(\) does not exist}
+@sqlstate 42809
+expect @tursopg error {jsonb_object\(\*\) specified, but jsonb_object is not an aggregate function}
+
+test error-star-argument-to-jsonb-object-in-where {
+    CREATE TABLE star_jsonb_where (a int);
+    INSERT INTO star_jsonb_where VALUES (1);
+    SELECT a FROM star_jsonb_where WHERE jsonb_object(*) IS NOT NULL;
+}
+@sqlstate 42883
+expect error {function jsonb_object\(\) does not exist}
+@sqlstate 42809
+expect @tursopg error {jsonb_object\(\*\) specified, but jsonb_object is not an aggregate function}
+
+test star-argument-to-aggregate {
+    SELECT count(*);
+}
+expect {
+    1
+}
