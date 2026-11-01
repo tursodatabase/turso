@@ -666,6 +666,29 @@ test table-add-column-not-null-default-that-is-null-errors {
 }
 expect error {}
 
+test insert-float-into-int-column-rounds {
+    CREATE TABLE ti (id int, a int);
+    INSERT INTO ti VALUES (1, 0.5::float8), (2, 1.5::float8), (3, 2.5::float8), (4, 2.6::float8), (5, -0.5::float8);
+    SELECT a FROM ti ORDER BY id;
+}
+expect {
+    0
+    2
+    2
+    3
+    0
+}
+
+test update-float-into-int-column-rounds {
+    CREATE TABLE tu (a int);
+    INSERT INTO tu VALUES (10);
+    UPDATE tu SET a = 3.5::float8;
+    SELECT a FROM tu;
+}
+expect {
+    4
+}
+
 test add-column-fills-existing-rows-with-a-function-default {
     CREATE TABLE add_column_fill (id int);
     INSERT INTO add_column_fill VALUES (1), (2);
