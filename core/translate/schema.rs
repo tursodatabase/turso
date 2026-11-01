@@ -8,8 +8,9 @@ use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, GeneratedType, Schema, SchemaObjectType, Table, Trigger, Type,
-    TypeDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, Schema, SchemaObjectType, Table,
+    Trigger, Type, TypeDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -19,9 +20,10 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
+use crate::translate::expr::expr_type::{common_of_types, type_of, ExprType, TypeEnv};
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
+use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination, SelectPlan};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::sequence::bind_sequence_names;
@@ -886,7 +888,7 @@ fn derive_ctas_schema(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
+) -> Result<(CtasInfo, Vec<ColumnDefinition>, ast::TableOptions)> {
     let plan = prepare_select_plan(
         select,
         resolver,
@@ -934,32 +936,39 @@ fn derive_ctas_schema(
         *count += 1;
     }
 
+    let keeps_column_types = resolver
+        .catalog
+        .dialect
+        .create_table_as_keeps_column_types();
     let mut sql_parts = Vec::with_capacity(result_columns.len());
     let mut col_defs = Vec::with_capacity(result_columns.len());
 
     for (column_index, (col, name)) in result_columns.iter().zip(names).enumerate() {
-        // Names come from the leftmost arm, but compound affinity can weaken its type.
-        let ty = compound_arms
-            .as_ref()
-            .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
-            .unwrap_or_else(|| col.declared_type(table_refs));
-
-        let quoted = quote_identifier(&name);
-        if ty.is_empty() {
-            sql_parts.push(quoted);
+        let col_type = if keeps_column_types {
+            let arms = match (&plan, &compound_arms) {
+                (_, Some(arms)) => arms.clone(),
+                (Plan::Select(select), None) => vec![select.as_ref()],
+                _ => unreachable!("CTAS plan is a SELECT or a compound SELECT"),
+            };
+            Some(ctas_column_type(&arms, column_index, resolver))
         } else {
-            sql_parts.push(format!("{quoted} {ty}"));
-        }
-
-        let col_type = if ty.is_empty() {
-            None
-        } else {
-            Some(ast::Type {
+            // Names come from the leftmost arm, but compound affinity can weaken its type.
+            let ty = compound_arms
+                .as_ref()
+                .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
+                .unwrap_or_else(|| col.declared_type(table_refs));
+            (!ty.is_empty()).then(|| ast::Type {
                 name: ty.to_string(),
                 size: None,
                 array_dimensions: 0,
             })
         };
+
+        let quoted = quote_identifier(&name);
+        match &col_type {
+            Some(col_type) => sql_parts.push(format!("{quoted} {col_type}")),
+            None => sql_parts.push(quoted),
+        }
         col_defs.push(ColumnDefinition {
             col_name: ast::Name::exact(name),
             col_type,
@@ -967,11 +976,132 @@ fn derive_ctas_schema(
         });
     }
 
+    let options = if keeps_column_types {
+        ast::TableOptions {
+            without_rowid_text: None,
+            strict_text: Some("STRICT".to_string()),
+        }
+    } else {
+        ast::TableOptions::empty()
+    };
+    let strict_suffix = if keeps_column_types { " STRICT" } else { "" };
     let info = CtasInfo {
         plan,
-        schema_sql: format!("CREATE TABLE {table_name_in_sql}({})", sql_parts.join(",")),
+        schema_sql: format!(
+            "CREATE TABLE {table_name_in_sql}({}){strict_suffix}",
+            sql_parts.join(",")
+        ),
     };
-    Ok((info, col_defs))
+    Ok((info, col_defs, options))
+}
+
+/// The type of result column `column_index` of a CTAS SELECT. When every SELECT
+/// of a compound SELECT gives the column the same type, that is the type;
+/// otherwise it is the common type of the values.
+fn ctas_column_type(arms: &[&SelectPlan], column_index: usize, resolver: &Resolver) -> ast::Type {
+    let mut types = arms
+        .iter()
+        .map(|arm| result_column_strict_type(arm, column_index, resolver));
+    let first = types.next().expect("a SELECT has at least one arm");
+    if types.all(|ty| ty == first) {
+        return first;
+    }
+    let common = common_of_types(
+        arms.iter().map(|arm| {
+            let env = TypeEnv::new(Some(&arm.table_references), resolver);
+            type_of(&arm.result_columns[column_index].expr, &env)
+        }),
+        resolver.schema(),
+    );
+    strict_column_type(common)
+}
+
+/// A column of a STRICT table keeps the type it was declared with, including
+/// its parameters and array dimensions. The name of a type made with CREATE
+/// TYPE or CREATE DOMAIN is quoted when it has to be, such as `"select"` or
+/// `"Mood X"`. A custom type the schema does not know (an enum is not loaded
+/// again when the database is reopened) leaves the column unchecked, as on a
+/// table created without types.
+fn result_column_strict_type(
+    select: &SelectPlan,
+    column_index: usize,
+    resolver: &Resolver,
+) -> ast::Type {
+    let expr = &select.result_columns[column_index].expr;
+    if let ast::Expr::Column { table, column, .. } = expr {
+        let declared = select
+            .table_references
+            .find_table_by_internal_id(*table)
+            .filter(|(_, table)| table.is_strict())
+            .and_then(|(_, table)| table.get_column_at(*column));
+        if let Some(declared) = declared {
+            let type_def = resolver.schema().get_type_def_unchecked(&declared.ty_str);
+            if !is_builtin_strict_type(&declared.ty_str) && type_def.is_none() {
+                return unchecked_column_type();
+            }
+            let name = match type_def {
+                Some(type_def) if !type_def.is_builtin => quote_identifier(&declared.ty_str),
+                _ => declared.ty_str.clone(),
+            };
+            return ast::Type {
+                name,
+                size: type_size(declared.ty_params.clone()),
+                array_dimensions: declared.array_dimensions(),
+            };
+        }
+    }
+    let env = TypeEnv::new(Some(&select.table_references), resolver);
+    strict_column_type(type_of(expr, &env))
+}
+
+/// The STRICT column type for values of type `ty`, the type of an expression
+/// that is not a column of a STRICT table. A custom type without arguments
+/// keeps its name, and text without a type becomes TEXT.
+///
+/// Any other type becomes ANY, so writes are not checked:
+/// - A builtin type here is only how the values are stored, not their
+///   PostgreSQL type. A comparison or a boolean read through a view is an
+///   INTEGER, for example, and an INTEGER column would reject 't'.
+/// - The arguments of a custom type come from a column the expression reads,
+///   not from the expression: `a || 'toolong'` on a varchar(3)[] column, or
+///   `n * 1000` on numeric(5,2), would not fit them.
+fn strict_column_type(ty: ExprType) -> ast::Type {
+    let array_dimensions = ty.array_dimensions();
+    let scalar = match ty {
+        ExprType::Array { element, .. } => *element,
+        scalar => scalar,
+    };
+    let (name, array_dimensions) = match scalar {
+        ExprType::Custom { type_def, params }
+            if type_def.is_domain || (params.is_empty() && type_def.user_params().count() == 0) =>
+        {
+            (quote_identifier(&type_def.name), array_dimensions)
+        }
+        ExprType::Untyped | ExprType::Null if array_dimensions == 0 => ("TEXT".to_string(), 0),
+        _ => return unchecked_column_type(),
+    };
+    ast::Type {
+        name,
+        size: None,
+        array_dimensions,
+    }
+}
+
+/// The type of a CTAS column whose writes are not checked.
+fn unchecked_column_type() -> ast::Type {
+    ast::Type {
+        name: "ANY".to_string(),
+        size: None,
+        array_dimensions: 0,
+    }
+}
+
+#[allow(clippy::vec_box)]
+fn type_size(params: Vec<Box<ast::Expr>>) -> Option<ast::TypeSize> {
+    match <[_; 2]>::try_from(params) {
+        Ok([precision, scale]) => Some(ast::TypeSize::TypeSize(precision, scale)),
+        Err(mut params) => params.pop().map(ast::TypeSize::MaxSize),
+    }
 }
 
 /// Emit bytecode to populate a newly-created CTAS table from the SELECT.
@@ -1046,7 +1176,8 @@ fn emit_ctas_insert(
         .iter()
         .map(|column| column.affinity().aff_mask())
         .collect();
-    let new_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctas_btree));
+    let new_table_cursor_id =
+        program.alloc_cursor_id(CursorType::BTreeTable(Arc::clone(&ctas_btree)));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: new_table_cursor_id,
         root_page: RegisterOrLiteral::Register(table_root_reg),
@@ -1070,6 +1201,10 @@ fn emit_ctas_insert(
             "CTAS internal error: result column start register not set".into(),
         )
     })?;
+    if ctas_btree.is_strict {
+        emit_ctas_type_checks(program, resolver, &ctas_btree, result_start_reg)?;
+    }
+
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(result_start_reg),
@@ -1106,6 +1241,39 @@ fn emit_ctas_insert(
     Ok(())
 }
 
+/// Checks and encodes a row for a STRICT CTAS table the way INSERT does: the
+/// values must fit the column types, and custom type values are stored encoded.
+fn emit_ctas_type_checks(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &Arc<BTreeTable>,
+    start_reg: usize,
+) -> Result<()> {
+    let columns = table.columns();
+    program.emit_insn(Insn::TypeCheck {
+        start_reg,
+        count: columns.len(),
+        check_generated: false,
+        table_reference: BTreeTable::input_type_check_table_ref(table, resolver.schema(), None)?,
+    });
+    crate::translate::expr::emit_custom_type_encode_columns(
+        program,
+        resolver,
+        columns,
+        start_reg,
+        None,
+        &table.name,
+        &ColumnLayout::from_columns(columns)?,
+    )?;
+    program.emit_insn(Insn::TypeCheck {
+        start_reg,
+        count: columns.len(),
+        check_generated: false,
+        table_reference: BTreeTable::type_check_table_ref(table, resolver.schema()),
+    });
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn translate_create_table(
     tbl_name: ast::QualifiedName,
@@ -1121,7 +1289,7 @@ pub fn translate_create_table(
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
     let (mut body, ctas_info) = match body {
         ast::CreateTableBody::AsSelect(select) => {
-            let (info, col_defs) = derive_ctas_schema(
+            let (info, col_defs, options) = derive_ctas_schema(
                 select,
                 &resolver
                     .name_in_sql(
@@ -1136,7 +1304,7 @@ pub fn translate_create_table(
             let body = ast::CreateTableBody::ColumnsAndConstraints {
                 columns: col_defs,
                 constraints: vec![],
-                options: ast::TableOptions::empty(),
+                options,
             };
             (body, Some(info))
         }

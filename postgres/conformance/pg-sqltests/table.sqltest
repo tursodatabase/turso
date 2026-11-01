@@ -163,6 +163,137 @@ expect {
     bob
 }
 
+setup typed_src {
+    CREATE TABLE src (b boolean, n numeric(5,2), v varchar(3), a int[]);
+    INSERT INTO src VALUES (true, 1.5, 'abc', '{1,2}');
+}
+
+@setup typed_src
+test table-create-table-as-copies-typed-values {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (n, v, a) VALUES (2.5, 'ab', '{3}');
+    SELECT n, v, a FROM dst ORDER BY v;
+}
+expect {
+    2.50|ab|{3}
+    1.50|abc|{1,2}
+}
+
+@setup typed_src
+test table-create-table-as-rejects-invalid-boolean {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (b) VALUES ('garbage');
+}
+expect error {}
+
+@setup typed_src
+test table-create-table-as-rejects-invalid-numeric {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (n) VALUES ('x');
+}
+expect error {}
+
+@setup typed_src
+test table-create-table-as-rejects-too-long-varchar {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (v) VALUES ('abcd');
+}
+expect error {}
+
+@setup typed_src
+test table-create-table-as-rejects-invalid-array-element {
+    CREATE TABLE dst AS SELECT * FROM src;
+    INSERT INTO dst (a) VALUES ('{x}');
+}
+expect error {}
+
+@setup typed_src
+test table-create-table-as-compound-keeps-column-type {
+    CREATE TABLE dst AS SELECT b FROM src UNION SELECT b FROM src;
+    INSERT INTO dst VALUES ('garbage');
+}
+expect error {}
+
+test table-create-table-as-keeps-keyword-named-type {
+    CREATE TYPE "select" AS ENUM ('a');
+    CREATE TABLE src_kw (b "select");
+    CREATE TABLE dst AS SELECT * FROM src_kw;
+    INSERT INTO dst VALUES ('a');
+    SELECT b FROM dst;
+}
+expect {
+    a
+}
+
+test table-create-table-as-keeps-mixed-case-type-checks {
+    CREATE TYPE "Mood X" AS ENUM ('a');
+    CREATE TABLE src_mc (b "Mood X");
+    CREATE TABLE dst AS SELECT * FROM src_mc;
+    INSERT INTO dst VALUES ('zz');
+}
+expect error {}
+
+test table-create-table-as-keeps-keyword-named-type-of-expression {
+    CREATE TYPE "order" AS ENUM ('a');
+    CREATE TABLE src_ex (b "order");
+    INSERT INTO src_ex VALUES (NULL);
+    CREATE TABLE dst AS SELECT coalesce(b, 'a'::"order") AS b FROM src_ex;
+    INSERT INTO dst VALUES ('a');
+    SELECT b FROM dst;
+}
+expect {
+    a
+    a
+}
+
+@setup typed_src
+test table-select-into-rejects-invalid-boolean {
+    SELECT * INTO dst FROM src;
+    INSERT INTO dst (b) VALUES ('garbage');
+}
+expect error {}
+
+@setup typed_src
+test table-create-table-as-boolean-expression-accepts-boolean-text {
+    CREATE TABLE dst AS SELECT NOT b AS x, 1 > 0 AS y FROM src;
+    INSERT INTO dst VALUES ('t', 'f');
+    SELECT count(*) FROM dst;
+}
+expect {
+    2
+}
+
+@setup typed_src
+test table-create-table-as-boolean-from-view-accepts-boolean-text {
+    CREATE VIEW v AS SELECT b FROM src;
+    CREATE TABLE dst AS SELECT * FROM v;
+    INSERT INTO dst VALUES ('true');
+    SELECT count(*) FROM dst;
+}
+expect {
+    2
+}
+
+test table-create-table-as-union-of-numeric-with-different-scales {
+    CREATE TABLE s (n numeric(5,2), m numeric(4,1));
+    INSERT INTO s VALUES (1.5, 2.5);
+    CREATE TABLE dst AS SELECT n FROM s UNION ALL SELECT m FROM s;
+    SELECT count(*) FROM dst;
+}
+expect {
+    2
+}
+
+test table-create-table-as-array-concatenation-drops-the-length-limit {
+    CREATE TABLE s (a varchar(3)[]);
+    INSERT INTO s VALUES ('{abc}');
+    CREATE TABLE dst AS SELECT a || 'toolong'::varchar AS x FROM s;
+    SELECT * FROM dst;
+}
+expect {
+    {abc,toolong}
+}
+
 test table-select-into-nested-rejected {
     SELECT * FROM (SELECT 1 INTO dst) sub;
 }

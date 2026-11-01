@@ -227,6 +227,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn create_table_as_keeps_column_types(&self) -> bool {
+        true
+    }
+
     fn allows_qualified_columns_in_index_terms(&self) -> bool {
         true
     }

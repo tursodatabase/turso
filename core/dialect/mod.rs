@@ -252,6 +252,17 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether `CREATE TABLE ... AS SELECT` creates a STRICT table whose
+    /// columns have the types of the SELECT's result columns, custom types
+    /// included.
+    ///
+    /// PostgreSQL keeps the types, so later writes to the new table are
+    /// checked against them. SQLite gives each column only the affinity of
+    /// its result column.
+    fn create_table_as_keeps_column_types(&self) -> bool {
+        false
+    }
+
     /// Whether `CREATE INDEX` accepts qualified column names such as `t.a`
     /// in its indexed terms.
     ///
