@@ -257,11 +257,13 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                         (0..env.connections.len()).find(|idx| env.conn_in_transaction(*idx))
                     {
                         return Some(
-                            InteractionBuilder::from_interaction(peek_interaction)
-                                .interaction(InteractionType::Query(Query::Commit(Commit)))
-                                .connection_index(conn_index)
-                                .build()
-                                .unwrap(),
+                            InteractionBuilder::with_interaction(InteractionType::Query(
+                                Query::Commit(Commit),
+                            ))
+                            .connection_index(conn_index)
+                            .id(self.plan.next_property_id())
+                            .build()
+                            .unwrap(),
                         );
                     }
                 }
