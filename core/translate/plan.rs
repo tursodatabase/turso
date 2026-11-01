@@ -1995,6 +1995,12 @@ impl TableReferences {
             .push((subquery_id, affinity));
     }
 
+    /// Take the recorded affinities of `other`, for when its WHERE terms move into this query.
+    pub(crate) fn take_scalar_subquery_affinities_from(&mut self, other: &mut TableReferences) {
+        self.scalar_subquery_affinities
+            .append(&mut other.scalar_subquery_affinities);
+    }
+
     pub(crate) fn scalar_subquery_affinity(
         &self,
         subquery_id: TableInternalId,

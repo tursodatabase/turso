@@ -83,6 +83,53 @@ expect {
     changed
 }
 
+# The optimizer moves these subqueries into the outer query as a semi-join or an
+# anti-join, and the comparison must keep the scalar subquery's affinity.
+setup correlated_text_index_integer_subquery {
+    CREATE TABLE t(x TEXT, v INT);
+    CREATE INDEX i ON t(x);
+    INSERT INTO t VALUES ('20', 1);
+    CREATE TABLE u(k INTEGER);
+    INSERT INTO u VALUES (20);
+    CREATE TABLE b(y INT);
+    INSERT INTO b VALUES (1);
+}
+
+@setup correlated_text_index_integer_subquery
+test correlated-exists-through-indexed-text-column-compared-with-integer-subquery {
+    SELECT count(*) FROM b
+    WHERE EXISTS (SELECT 1 FROM t WHERE x = (SELECT k FROM u) AND v = b.y);
+}
+expect {
+    1
+}
+
+@setup correlated_text_index_integer_subquery
+test correlated-not-exists-through-indexed-text-column-compared-with-integer-subquery {
+    SELECT count(*) FROM b
+    WHERE NOT EXISTS (SELECT 1 FROM t WHERE x = (SELECT k FROM u) AND v = b.y);
+}
+expect {
+    0
+}
+
+@setup correlated_text_index_integer_subquery
+test correlated-in-through-indexed-text-column-compared-with-integer-subquery {
+    SELECT count(*) FROM b
+    WHERE y IN (SELECT v FROM t WHERE x = (SELECT k FROM u) AND v = b.y);
+}
+expect {
+    1
+}
+
+@setup correlated_text_index_integer_subquery
+test aggregate-subquery-through-indexed-text-column-compared-with-integer-subquery {
+    SELECT y, (SELECT count(*) FROM t WHERE x = (SELECT k FROM u) AND v = b.y) FROM b;
+}
+expect {
+    1|1
+}
+
 # A column of a derived table, CTE or view that holds a scalar subquery has the
 # affinity of the column that subquery selects.
 setup scalar_subquery_column_values {
