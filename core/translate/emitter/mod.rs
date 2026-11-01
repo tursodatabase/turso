@@ -271,6 +271,10 @@ pub(crate) struct RowValueSubqueryColumn {
     /// The column's type, which decides custom-type operators: in
     /// `d - (SELECT e FROM u)` with `e` a date, the result is a number of days.
     pub(crate) expr_type: ExprType,
+    /// The column's text collation and whether a COLLATE operator gave it, so
+    /// `(SELECT a, 1 FROM t) = ('A', 1)` compares `a` with its own collation,
+    /// as SQLite does for the columns of a row value.
+    pub(crate) text_collation: crate::translate::collate::FieldCollation,
 }
 
 impl RowValueSubquery {

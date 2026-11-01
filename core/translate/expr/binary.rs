@@ -406,16 +406,55 @@ pub(super) fn row_component_affinity_collation(
 ) -> Result<(Affinity, CollationSeq)> {
     let lhs_for_cmp = row_value_component_expr(lhs_expr, idx)?;
     let rhs_for_cmp = row_value_component_expr(rhs_expr, idx)?;
+    let lhs_field = row_value_field_collation(lhs_expr, &lhs_for_cmp, idx, metadata)?;
+    let rhs_field = row_value_field_collation(rhs_expr, &rhs_for_cmp, idx, metadata)?;
     Ok((
         comparison_affinity(&*lhs_for_cmp, &*rhs_for_cmp, metadata),
-        comparison_collation(&lhs_for_cmp, &rhs_for_cmp, metadata)?,
+        crate::translate::collate::row_value_component_collation(
+            &lhs_for_cmp,
+            lhs_field,
+            &rhs_for_cmp,
+            rhs_field,
+            metadata,
+        )?,
     ))
 }
 
+/// The text collation component `idx` of row value `expr` brings. A column of
+/// a row subquery brings the collation of the subquery's result column, as
+/// SQLite compares the columns of `(SELECT a, b FROM t)` with the collation
+/// of `a` and `b`. Any other component, a scalar subquery included, brings the
+/// collation its expression has.
+fn row_value_field_collation(
+    expr: &Expr,
+    component: &Expr,
+    idx: usize,
+    metadata: &ExprContext<'_, '_>,
+) -> Result<crate::translate::collate::FieldCollation> {
+    if let Expr::SubqueryResult {
+        subquery_id,
+        query_type:
+            ast::SubqueryType::RowValue {
+                result_reg_start,
+                num_regs,
+            },
+        ..
+    } = unwrap_parens(expr)?
+    {
+        if *num_regs > 1 {
+            if let Some(field) =
+                metadata.subquery_field_collation(*subquery_id, result_reg_start + idx)
+            {
+                return Ok(field);
+            }
+        }
+    }
+    crate::translate::collate::field_collation(component, metadata, metadata.catalog())
+}
+
 /// Component `idx` of a row value: an element of `(a, b)`, or one column of a
-/// row subquery's result, so each component compares with its own type. A
-/// subquery column does not bring its text collation. Any other expression
-/// stands for itself.
+/// row subquery's result, so each component compares with its own type. Any
+/// other expression stands for itself.
 fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
     match unwrap_parens(expr)? {
         Expr::Parenthesized(exprs) if exprs.len() > 1 => {

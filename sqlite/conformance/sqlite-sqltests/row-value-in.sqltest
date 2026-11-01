@@ -288,3 +288,28 @@ test row-value-null-in-both-lhs-rhs-in {
 expect {
     1
 }
+
+# SQLite reads a list of row values as a VALUES, so each column compares with
+# the collation and the affinity of the left operand's component first, else
+# of the component in the last row; the other rows bring neither.
+test row-value-in-list-compares-with-the-last-row-collation {
+    CREATE TABLE c(a TEXT COLLATE NOCASE);
+    INSERT INTO c VALUES('A');
+    SELECT ('a', 1) IN (('A', 1), ('x' COLLATE NOCASE, 2)), ('a', 1) IN (('x' COLLATE NOCASE, 2), ('A', 1)), ('a', 1) IN (('A', 1), ('x', 2));
+    SELECT ('a' COLLATE NOCASE, 1) IN (('A', 1), ('x', 2)), ('a', 1) IN (('A' COLLATE NOCASE, 1)), ('a', 1) IN (('q', 3), ('A', 1), ('x' COLLATE NOCASE, 2));
+    SELECT (a, 1) IN (('a' COLLATE BINARY, 1), ('z', 2)), ('a', 1) IN ((a, 1), ('z', 2)), ('a', 1) IN (('z', 2), (a, 1)) FROM c;
+}
+expect {
+    1|0|0
+    1|1|1
+    1|0|1
+}
+
+test row-value-in-list-compares-with-the-last-row-affinity {
+    SELECT (1, 2) IN ((CAST('1' AS TEXT), 2), (CAST('x' AS BLOB), 3)), (1, 2) IN ((CAST('x' AS BLOB), 3), (CAST('1' AS TEXT), 2)), (1, 2) IN ((CAST('1' AS TEXT), 2));
+    SELECT (1, 2) IN ((CAST('1' AS TEXT), 2), ('x', 3)), (1, 2) IN (('x', 3), (CAST('1' AS TEXT), 2)), (1, 2) IN (('1', 2), ('x', 3));
+}
+expect {
+    0|1|1
+    0|1|0
+}

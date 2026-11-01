@@ -509,19 +509,61 @@ pub fn comparison_collation_across_queries(
         return Ok(CollationSeq::Type(ordering));
     }
     let catalog = lhs_context.catalog();
-    let collation = if has_collate_operator(lhs) {
-        expr_collation_if_any(lhs, lhs_context, catalog)?
-    } else if has_collate_operator(rhs) {
-        expr_collation_if_any(rhs, rhs_context, catalog)?
+    Ok(CollationSeq::Text(text_collation_by_precedence(
+        field_collation(lhs, lhs_context, catalog)?,
+        field_collation(rhs, rhs_context, catalog)?,
+    )))
+}
+
+/// The text collation an expression brings to a comparison, and whether a
+/// COLLATE operator gave it, which decides its precedence.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FieldCollation {
+    pub(crate) collation: Option<TextCollation>,
+    pub(crate) explicit: bool,
+}
+
+pub(crate) fn field_collation(
+    expr: &Expr,
+    metadata: &impl ExprProperties,
+    catalog: &CatalogContext<'_>,
+) -> Result<FieldCollation> {
+    Ok(FieldCollation {
+        collation: expr_collation_if_any(expr, metadata, catalog)?,
+        explicit: has_collate_operator(expr),
+    })
+}
+
+/// SQLite's rule for a comparison: a COLLATE operator on the left wins, then
+/// one on the right, then the collation the left operand has on its own,
+/// then the right's, then BINARY.
+fn text_collation_by_precedence(lhs: FieldCollation, rhs: FieldCollation) -> TextCollation {
+    let collation = if lhs.explicit {
+        lhs.collation
+    } else if rhs.explicit {
+        rhs.collation
     } else {
-        match expr_collation_if_any(lhs, lhs_context, catalog)? {
-            Some(collation) => Some(collation),
-            None => expr_collation_if_any(rhs, rhs_context, catalog)?,
-        }
+        lhs.collation.or(rhs.collation)
     };
-    Ok(CollationSeq::Text(
-        collation.unwrap_or(TextCollation::Binary),
-    ))
+    collation.unwrap_or(TextCollation::Binary)
+}
+
+/// [comparison_collation] for one component of a row value comparison, where
+/// a component that is a column of a row subquery brings the collation
+/// `lhs_field` / `rhs_field` say instead of the one its expression has here.
+pub(crate) fn row_value_component_collation(
+    lhs: &Expr,
+    lhs_field: FieldCollation,
+    rhs: &Expr,
+    rhs_field: FieldCollation,
+    context: &ExprContext<'_, '_>,
+) -> Result<CollationSeq> {
+    if let Some(ordering) = common_type_ordering([(lhs, context), (rhs, context)])? {
+        return Ok(CollationSeq::Type(ordering));
+    }
+    Ok(CollationSeq::Text(text_collation_by_precedence(
+        lhs_field, rhs_field,
+    )))
 }
 
 /// [comparison_collation_across_queries] for `x IN (SELECT ...)`, where the
