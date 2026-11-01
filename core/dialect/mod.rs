@@ -268,6 +268,16 @@ pub trait Dialect: Send + Sync + 'static {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         false
     }
+
+    /// Whether constraint errors report the values that broke the constraint.
+    ///
+    /// PostgreSQL shows them in the error DETAIL, so custom type and array
+    /// values are decoded before the error is raised. SQLite's messages name
+    /// only the columns, so no decode runs, and a DECODE that fails cannot
+    /// replace the constraint error.
+    fn constraint_errors_show_values(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

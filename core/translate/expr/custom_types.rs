@@ -352,3 +352,60 @@ pub(crate) fn emit_trigger_decode_registers(
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
 }
+
+/// Decode the custom type and array values a constraint error reports, so the
+/// error shows the values the user wrote instead of their stored encoding.
+///
+/// Emit this right before the instruction that raises the error, so only rows
+/// that fail the constraint run the decode.
+pub(crate) fn emit_constraint_values_decode(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &BTreeTable,
+    info: &mut ConstraintInfo,
+) -> Result<()> {
+    if !resolver.catalog.dialect.constraint_errors_show_values() {
+        return Ok(());
+    }
+    let names = if info.row_col_names.is_empty() {
+        &info.column_names
+    } else {
+        &info.row_col_names
+    };
+    for (i, name) in names.iter().enumerate() {
+        let Some((_, column)) = table.get_column(name) else {
+            continue;
+        };
+        let decode_changes_value = resolver
+            .schema()
+            .resolve_type(&column.ty_str, table.is_strict)
+            .ok()
+            .flatten()
+            .is_some_and(|resolved| !resolved.reads_stored_values_unchanged());
+        if !column.is_array() && !decode_changes_value {
+            continue;
+        }
+        let decoded_reg = program.alloc_register();
+        emit_user_facing_column_value(
+            program,
+            info.violation_regs[i],
+            decoded_reg,
+            column,
+            table.is_strict,
+            resolver,
+        )?;
+        // emit_user_facing_column_value leaves arrays encoded, because SELECT
+        // decodes them when it outputs the row.
+        if column.is_array() {
+            let skip_label = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: decoded_reg,
+                target_pc: skip_label,
+            });
+            emit_array_decode(program, decoded_reg, column, resolver)?;
+            program.preassign_label_to_next_insn(skip_label);
+        }
+        info.violation_regs[i] = decoded_reg;
+    }
+    Ok(())
+}
