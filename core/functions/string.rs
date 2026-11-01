@@ -29,9 +29,7 @@ pub fn exec_repeat(input: &Value, count: &Value) -> Result<Value> {
     if n <= 0 {
         return Ok(Value::build_text(String::new()));
     }
-    // Refuse before allocating. `s.repeat(n)` asks for `s.len() * n` bytes up
-    // front, so a large `n` aborted the process in the allocator instead of
-    // raising an error the statement could report.
+    // Check before allocating: the allocator aborts the process on failure.
     let total = (s.len() as i64).checked_mul(n);
     if total.is_none_or(|bytes| bytes > Value::MAX_BLOB_LENGTH) {
         return Err(LimboError::TooBig);
@@ -75,10 +73,7 @@ fn pad(input: &Value, length: &Value, fill: Option<&Value>, on_left: bool) -> Re
     if target_len <= 0 {
         return Ok(Value::build_text(String::new()));
     }
-    // Refuse before allocating, for the same reason as `repeat` above: the
-    // padding below is built with `.take(target_len - char_count).collect()`,
-    // which reserves room for the whole result, so a large `target_len`
-    // aborted the process in the allocator rather than raising an error.
+    // Check before allocating: the allocator aborts the process on failure.
     if target_len > Value::MAX_BLOB_LENGTH {
         return Err(LimboError::TooBig);
     }
@@ -135,30 +130,48 @@ mod tests {
 
     #[test]
     fn repeat_null() {
-        assert!(matches!(exec_repeat(&Value::Null, &i(3)).unwrap(), Value::Null));
-        assert!(matches!(exec_repeat(&t("x"), &Value::Null).unwrap(), Value::Null));
+        assert!(matches!(
+            exec_repeat(&Value::Null, &i(3)).unwrap(),
+            Value::Null
+        ));
+        assert!(matches!(
+            exec_repeat(&t("x"), &Value::Null).unwrap(),
+            Value::Null
+        ));
     }
 
     #[test]
     fn lpad_basic() {
         assert_eq!(exec_lpad(&t("abc"), &i(6), None).unwrap(), t("   abc"));
-        assert_eq!(exec_lpad(&t("abc"), &i(6), Some(&t("xy"))).unwrap(), t("xyxabc"));
+        assert_eq!(
+            exec_lpad(&t("abc"), &i(6), Some(&t("xy"))).unwrap(),
+            t("xyxabc")
+        );
         // Already long enough — truncate from the right.
         assert_eq!(exec_lpad(&t("abcdef"), &i(3), None).unwrap(), t("abc"));
         // Equal length — pass through.
-        assert_eq!(exec_lpad(&t("abc"), &i(3), Some(&t("x"))).unwrap(), t("abc"));
+        assert_eq!(
+            exec_lpad(&t("abc"), &i(3), Some(&t("x"))).unwrap(),
+            t("abc")
+        );
     }
 
     #[test]
     fn rpad_basic() {
         assert_eq!(exec_rpad(&t("abc"), &i(6), None).unwrap(), t("abc   "));
-        assert_eq!(exec_rpad(&t("abc"), &i(6), Some(&t("xy"))).unwrap(), t("abcxyx"));
+        assert_eq!(
+            exec_rpad(&t("abc"), &i(6), Some(&t("xy"))).unwrap(),
+            t("abcxyx")
+        );
         assert_eq!(exec_rpad(&t("abcdef"), &i(3), None).unwrap(), t("abc"));
     }
 
     #[test]
     fn pad_null() {
-        assert!(matches!(exec_lpad(&Value::Null, &i(3), None).unwrap(), Value::Null));
+        assert!(matches!(
+            exec_lpad(&Value::Null, &i(3), None).unwrap(),
+            Value::Null
+        ));
         assert!(matches!(
             exec_lpad(&t("x"), &Value::Null, None).unwrap(),
             Value::Null
@@ -172,8 +185,14 @@ mod tests {
     #[test]
     fn pad_empty_fill_returns_input() {
         // PG: if fill is empty the result is the input unchanged.
-        assert_eq!(exec_lpad(&t("abc"), &i(10), Some(&t(""))).unwrap(), t("abc"));
-        assert_eq!(exec_rpad(&t("abc"), &i(10), Some(&t(""))).unwrap(), t("abc"));
+        assert_eq!(
+            exec_lpad(&t("abc"), &i(10), Some(&t(""))).unwrap(),
+            t("abc")
+        );
+        assert_eq!(
+            exec_rpad(&t("abc"), &i(10), Some(&t(""))).unwrap(),
+            t("abc")
+        );
     }
 
     #[test]
@@ -193,17 +212,19 @@ mod tests {
     /// the fix these tests do not fail — they abort the test runner.
     #[test]
     fn pad_rejects_a_length_over_the_limit() {
-        for n in [
-            i64::MAX,
-            Value::MAX_BLOB_LENGTH + 1,
-            4_294_967_296,
-        ] {
+        for n in [i64::MAX, Value::MAX_BLOB_LENGTH + 1, 4_294_967_296] {
             assert!(
-                matches!(exec_lpad(&t("a"), &i(n), Some(&t("b"))), Err(LimboError::TooBig)),
+                matches!(
+                    exec_lpad(&t("a"), &i(n), Some(&t("b"))),
+                    Err(LimboError::TooBig)
+                ),
                 "lpad should refuse length {n}"
             );
             assert!(
-                matches!(exec_rpad(&t("a"), &i(n), Some(&t("b"))), Err(LimboError::TooBig)),
+                matches!(
+                    exec_rpad(&t("a"), &i(n), Some(&t("b"))),
+                    Err(LimboError::TooBig)
+                ),
                 "rpad should refuse length {n}"
             );
         }
@@ -222,15 +243,24 @@ mod tests {
     }
 
     #[test]
-    fn pad_and_repeat_still_accept_lengths_at_the_limit() {
-        // The boundary itself must keep working, so the guard cannot be a
-        // blanket refusal of large-but-legal arguments.
-        assert_eq!(exec_lpad(&t("a"), &i(5), Some(&t("b"))).unwrap(), t("bbbba"));
-        assert_eq!(exec_rpad(&t("a"), &i(5), Some(&t("b"))).unwrap(), t("abbbb"));
+    fn pad_and_repeat_still_accept_lengths_the_limit_allows() {
+        // The guard must not be a blanket refusal of large-but-legal arguments.
+        assert_eq!(
+            exec_lpad(&t("a"), &i(5), Some(&t("b"))).unwrap(),
+            t("bbbba")
+        );
+        assert_eq!(
+            exec_rpad(&t("a"), &i(5), Some(&t("b"))).unwrap(),
+            t("abbbb")
+        );
         assert_eq!(exec_repeat(&t("ab"), &i(3)).unwrap(), t("ababab"));
-        assert!(matches!(
-            exec_lpad(&t("a"), &i(Value::MAX_BLOB_LENGTH), Some(&t("b"))),
-            Ok(_)
-        ));
+        // The check is `>`, so MAX_BLOB_LENGTH itself must be admitted. An
+        // empty fill returns the input before any padding is built, so this
+        // pins that off-by-one without the ~1 GB allocation and ~26 s that
+        // asserting it through the padding path would cost a parallel CI job.
+        assert_eq!(
+            exec_lpad(&t("a"), &i(Value::MAX_BLOB_LENGTH), Some(&t(""))).unwrap(),
+            t("a")
+        );
     }
 }
