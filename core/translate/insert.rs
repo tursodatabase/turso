@@ -182,6 +182,10 @@ pub struct InsertEmitCtx<'a> {
     /// when a DO UPDATE must fail on such a row (see
     /// [crate::Dialect::upsert_rejects_row_written_by_same_statement]).
     pub written_rowids_cursor_id: Option<usize>,
+    /// Flag register set to 1 when a REPLACE conflict deletes an existing row,
+    /// triggering a post-preflight ABORT uniqueness recheck in case FK actions
+    /// or triggers inserted a conflicting row.
+    pub replace_deleted_reg: Option<usize>,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -238,6 +242,7 @@ impl<'a> InsertEmitCtx<'a> {
             namespace,
             returning_buffer: None,
             written_rowids_cursor_id: None,
+            replace_deleted_reg: None,
         })
     }
 }
@@ -898,6 +903,25 @@ pub fn translate_insert(
         });
     let on_replace = (matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty())
         || has_ddl_replace;
+    let may_fire_on_replace_delete = on_replace
+        && (has_triggers_including_temp(
+            resolver,
+            ctx.database_id,
+            TriggerEvent::Delete,
+            None,
+            ctx.table.as_ref(),
+        ) || (connection.foreign_keys_enabled()
+            && resolver.with_schema(ctx.database_id, |s| {
+                s.any_resolved_fks_referencing(ctx.table.name.as_str())
+            })));
+    if may_fire_on_replace_delete {
+        let reg = program.alloc_register();
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: reg,
+        });
+        ctx.replace_deleted_reg = Some(reg);
+    }
     let mut preflight_ctx = PreflightCtx {
         upsert_actions: &upsert_actions,
         on_replace,
@@ -936,6 +960,10 @@ pub fn translate_insert(
         &mut preflight_ctx,
     )?;
 
+    if let Some(replace_deleted_reg) = ctx.replace_deleted_reg {
+        emit_replace_constraint_recheck(program, &ctx, resolver, &insertion, replace_deleted_reg)?;
+    }
+
     // Create and insert the record
     emit_make_record(
         program,
@@ -963,22 +991,17 @@ pub fn translate_insert(
         )?;
     }
 
-    // Emit deferred index inserts for cases where preflight only checked constraints
-    // but didn't insert. This covers UPSERT and non-REPLACE conflict types (ABORT/FAIL/
-    // IGNORE/ROLLBACK). REPLACE inserts eagerly in the preflight phase because it needs
-    // to delete-then-insert per index.
-    //
-    // When statement-level REPLACE is active, ALL indexes use REPLACE and are eagerly
-    // inserted in preflight, so the commit phase can be skipped entirely. But when only
-    // some constraints have REPLACE (mixed mode via DDL), non-REPLACE indexes still need
-    // their entries committed here.
-    // Pure statement-level REPLACE (no upsert). When upsert actions exist,
-    // ON CONFLICT DO UPDATE takes precedence over REPLACE for matching
-    // constraints, so we can't skip the commit phase.
-    let statement_replace = matches!(ctx.on_conflict, ResolveType::Replace);
-    let skip_replace_indexes = has_ddl_replace && !statement_replace;
-    if has_upsert || !statement_replace {
-        emit_commit_phase(program, resolver, &insertion, &ctx, skip_replace_indexes)?;
+    // When REPLACE deletion can fire DELETE triggers or FK actions, all index inserts
+    // are deferred until after post-delete rechecks and immediate child-FK checks pass.
+    // Otherwise keep the single-pass eager preflight REPLACE path.
+    if ctx.replace_deleted_reg.is_some() {
+        emit_commit_phase(program, resolver, &insertion, &ctx, false)?;
+    } else {
+        let statement_replace = matches!(ctx.on_conflict, ResolveType::Replace);
+        let skip_replace_indexes = has_ddl_replace && !statement_replace;
+        if has_upsert || !statement_replace {
+            emit_commit_phase(program, resolver, &insertion, &ctx, skip_replace_indexes)?;
+        }
     }
 
     resolver.register_columns.clear();
@@ -1459,9 +1482,6 @@ fn emit_commit_phase(
             .collect()
     });
     for index in &indices {
-        // In mixed mode (some constraints REPLACE, some not), REPLACE indexes
-        // were already eagerly inserted in the preflight phase. Skip them here
-        // to avoid double-insertion.
         if skip_replace_indexes && index.on_conflict == Some(ResolveType::Replace) {
             continue;
         }
@@ -1489,6 +1509,9 @@ fn emit_commit_phase(
                 idx_col,
                 idx_start_reg + i,
             )?;
+        }
+        if ctx.replace_deleted_reg.is_some() {
+            emit_index_column_affinity(program, ctx.table, index, idx_start_reg);
         }
         program.emit_insn(Insn::Copy {
             src_reg: insertion.key_register(),
@@ -3215,26 +3238,22 @@ fn emit_index_uniqueness_check(
             upsert_catch_all,
             preflight,
         )?;
-    } else {
-        // Non-unique index: insert eagerly only for REPLACE (which doesn't use commit phase).
-        // For UPSERT and ABORT/FAIL/IGNORE/ROLLBACK, defer to commit phase.
-        if preflight.on_replace {
-            let record_reg = program.alloc_register();
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u32(idx_start_reg),
-                count: to_u32(num_cols + 1),
-                dest_reg: to_u32(record_reg),
-                index_name: Some(index.name.clone()),
-                affinity_str: None,
-            });
-            program.emit_insn(Insn::IdxInsert {
-                cursor_id: idx_cursor_id,
-                record_reg,
-                unpacked_start: Some(idx_start_reg),
-                unpacked_count: Some((num_cols + 1) as u32),
-                flags: IdxInsertFlags::new().nchange(true),
-            });
-        }
+    } else if preflight.on_replace && ctx.replace_deleted_reg.is_none() {
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(idx_start_reg),
+            count: to_u32(num_cols + 1),
+            dest_reg: to_u32(record_reg),
+            index_name: Some(index.name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: idx_cursor_id,
+            record_reg,
+            unpacked_start: Some(idx_start_reg),
+            unpacked_count: Some((num_cols + 1) as u32),
+            flags: IdxInsertFlags::new().nchange(true),
+        });
     }
 
     // Close the partial-index skip (preflight)
@@ -3242,6 +3261,33 @@ fn emit_index_uniqueness_check(
         program.preassign_label_to_next_insn(lbl);
     }
     Ok(())
+}
+
+fn emit_index_column_affinity(
+    program: &mut ProgramBuilder,
+    table: &BTreeTable,
+    index: &Index,
+    idx_start_reg: usize,
+) {
+    let Some(count) = NonZeroUsize::new(index.columns.len()) else {
+        return;
+    };
+    let affinities = index
+        .columns
+        .iter()
+        .map(|ic| {
+            if ic.expr.is_some() {
+                Affinity::Blob.aff_mask()
+            } else {
+                table.columns()[ic.pos_in_table].affinity().aff_mask()
+            }
+        })
+        .collect::<String>();
+    program.emit_insn(Insn::Affinity {
+        start_reg: idx_start_reg,
+        count,
+        affinities,
+    });
 }
 
 /// Emit bytecode for unique index conflict detection and handling.
@@ -3258,22 +3304,7 @@ fn emit_unique_index_check(
     upsert_catch_all: Option<usize>,
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
-    let aff = index
-        .columns
-        .iter()
-        .map(|ic| {
-            if ic.expr.is_some() {
-                Affinity::Blob.aff_mask()
-            } else {
-                ctx.table.columns()[ic.pos_in_table].affinity().aff_mask()
-            }
-        })
-        .collect::<String>();
-    program.emit_insn(Insn::Affinity {
-        start_reg: idx_start_reg,
-        count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
-        affinities: aff,
-    });
+    emit_index_column_affinity(program, ctx.table, index, idx_start_reg);
 
     if !preflight.upsert_actions.is_empty() {
         let next_check = program.allocate_label();
@@ -3365,10 +3396,7 @@ fn emit_unique_index_check(
             });
         }
         program.preassign_label_to_next_insn(ok);
-
-        if preflight.on_replace {
-            // REPLACE: insert index entry eagerly (right after delete).
-            // IdxDelete repositions the cursor, so we must NOT use USE_SEEK.
+        if preflight.on_replace && ctx.replace_deleted_reg.is_none() {
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u32(idx_start_reg),
@@ -3385,10 +3413,109 @@ fn emit_unique_index_check(
                 flags: IdxInsertFlags::new().nchange(true),
             });
         }
-        // For non-REPLACE cases (ABORT/FAIL/IGNORE/ROLLBACK), index inserts are
-        // deferred to the commit phase after all constraint checks pass.
-        // This prevents stale index entries when a later constraint check fails.
     }
+    Ok(())
+}
+
+/// Re-check PRIMARY KEY / rowid and UNIQUE index constraints with ABORT semantics
+/// when a REPLACE conflict deleted an existing row. FK cascade actions and child
+/// triggers fired during the deletion may have inserted a new conflicting row into
+/// the target table, which SQLite rejects with SQLITE_CONSTRAINT (OE_Abort).
+fn emit_replace_constraint_recheck(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    resolver: &Resolver,
+    insertion: &Insertion,
+    replace_deleted_reg: usize,
+) -> Result<()> {
+    let skip_recheck = program.allocate_label();
+    program.emit_insn(Insn::IfNot {
+        reg: replace_deleted_reg,
+        target_pc: skip_recheck,
+        jump_if_null: true,
+    });
+
+    if ctx.table.has_rowid {
+        let rowid_ok = program.allocate_label();
+        program.emit_insn(Insn::NotExists {
+            cursor: ctx.cursor_id,
+            rowid_reg: insertion.key_register(),
+            target_pc: rowid_ok,
+        });
+        let rowid_column_name = insertion.key.column_name();
+        let raw_desc = format!("{}.{}", ctx.table.name, rowid_column_name);
+        program.emit_insn(Insn::Halt {
+            constraint_info: Some(Box::new(ConstraintInfo::primary_key(
+                ctx.table.name.as_str(),
+                ctx.table.primary_key_constraint_name.clone(),
+                vec![rowid_column_name.to_string()],
+                vec![insertion.key_register()],
+            ))),
+            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+            description: raw_desc,
+            on_error: Some(ResolveType::Abort),
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(rowid_ok);
+    }
+
+    let indices: Vec<_> = resolver.with_schema(ctx.database_id, |s| {
+        s.get_indices(ctx.table.name.as_str()).cloned().collect()
+    });
+    for index in &indices {
+        if !index.unique {
+            continue;
+        }
+        let idx_cursor_id = ctx
+            .idx_cursors
+            .iter()
+            .find(|(name, _, _)| name == &index.name)
+            .map(|(_, _, c_id)| *c_id)
+            .expect("no cursor found for index");
+
+        let maybe_skip = emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
+
+        let num_cols = index.columns.len();
+        let idx_start_reg = program.alloc_registers(num_cols);
+        for (i, idx_col) in index.columns.iter().enumerate() {
+            emit_index_column_value_for_insert(
+                program,
+                resolver,
+                insertion,
+                ctx.table,
+                idx_col,
+                idx_start_reg + i,
+            )?;
+        }
+        emit_index_column_affinity(program, ctx.table, index, idx_start_reg);
+
+        let ok = program.allocate_label();
+        program.emit_insn(Insn::NoConflict {
+            cursor_id: idx_cursor_id,
+            target_pc: ok,
+            record_reg: idx_start_reg,
+            num_regs: num_cols,
+        });
+        let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+        program.emit_insn(Insn::Halt {
+            constraint_info: Some(Box::new(ConstraintInfo::unique_index(
+                ctx.table.name.as_str(),
+                index,
+                (0..num_cols).map(|i| idx_start_reg + i).collect(),
+            ))),
+            err_code: SQLITE_CONSTRAINT_UNIQUE,
+            description: raw_desc,
+            on_error: Some(ResolveType::Abort),
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(ok);
+
+        if let Some(lbl) = maybe_skip {
+            program.preassign_label_to_next_insn(lbl);
+        }
+    }
+
+    program.preassign_label_to_next_insn(skip_recheck);
     Ok(())
 }
 
@@ -3985,6 +4112,13 @@ fn emit_replace_delete_conflicting_row(
         connection,
         ctx.namespace.database_id,
     )?;
+
+    if let Some(reg) = ctx.replace_deleted_reg {
+        program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: reg,
+        });
+    }
 
     Ok(())
 }
