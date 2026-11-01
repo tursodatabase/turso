@@ -647,3 +647,74 @@ expect {
     2.5|real
     '3.5'|text
 }
+
+@cross-check-integrity
+test ctas_parenthesized_column_name {
+    CREATE TABLE source(value INTEGER);
+    INSERT INTO source VALUES (42);
+    CREATE TABLE copied AS SELECT (value) FROM source;
+    SELECT name FROM pragma_table_info('copied');
+    SELECT value FROM copied;
+}
+expect {
+    value
+    42
+}
+
+@cross-check-integrity
+test ctas_nested_parenthesized_column_name {
+    CREATE TABLE source(value TEXT);
+    INSERT INTO source VALUES ('nested');
+    CREATE TABLE copied AS SELECT ((value)) FROM source;
+    SELECT name FROM pragma_table_info('copied');
+    SELECT value FROM copied;
+}
+expect {
+    value
+    nested
+}
+
+@cross-check-integrity
+test ctas_qualified_parenthesized_column_name {
+    CREATE TABLE source(value INTEGER);
+    INSERT INTO source VALUES (7);
+    CREATE TABLE copied AS SELECT (source.value) FROM source;
+    SELECT name FROM pragma_table_info('copied');
+}
+expect {
+    value
+}
+
+@cross-check-integrity
+test ctas_multiple_parenthesized_column_names {
+    CREATE TABLE source(a INTEGER, b TEXT);
+    INSERT INTO source VALUES (1, 'x');
+    CREATE TABLE copied AS SELECT (a), (b) FROM source;
+    SELECT name FROM pragma_table_info('copied') ORDER BY cid;
+}
+expect {
+    a
+    b
+}
+
+@cross-check-integrity
+test ctas_parenthesized_column_alias_takes_precedence {
+    CREATE TABLE source(value INTEGER);
+    INSERT INTO source VALUES (9);
+    CREATE TABLE copied AS SELECT (value) AS renamed FROM source;
+    SELECT name FROM pragma_table_info('copied');
+}
+expect {
+    renamed
+}
+
+@cross-check-integrity
+test ctas_parenthesized_expression_keeps_expression_name {
+    CREATE TABLE source(a INTEGER, b INTEGER);
+    INSERT INTO source VALUES (3, 4);
+    CREATE TABLE copied AS SELECT (a + b) FROM source;
+    SELECT name FROM pragma_table_info('copied');
+}
+expect {
+    (a + b)
+}

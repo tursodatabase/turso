@@ -125,7 +125,40 @@ impl ResultSetColumn {
         if let Some(alias) = &self.alias {
             return Some(alias);
         }
-        match &self.expr {
+        self.resolved_column_name(&self.expr, tables)
+            .or(self.implicit_column_name.as_deref())
+    }
+
+    /// Returns the name SQLite assigns to a CTAS result column.
+    ///
+    /// SQLite removes parentheses around a direct column reference when it
+    /// derives the destination table's column name (for example, `(value)`
+    /// becomes `value`). Keep the original expression intact for query
+    /// results; apply this normalization only while deriving a CTAS schema.
+    pub fn name_or_expr_for_ctas(&self, tables: &TableReferences) -> String {
+        if let Some(alias) = &self.alias {
+            return alias.clone();
+        }
+
+        let mut expr = &self.expr;
+        while let ast::Expr::Parenthesized(inner) = expr {
+            if inner.len() != 1 {
+                break;
+            }
+            expr = &inner[0];
+        }
+
+        self.resolved_column_name(expr, tables)
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.name_or_expr(tables))
+    }
+
+    fn resolved_column_name<'a>(
+        &'a self,
+        expr: &'a ast::Expr,
+        tables: &'a TableReferences,
+    ) -> Option<&'a str> {
+        match expr {
             ast::Expr::Column { table, column, .. } => {
                 if let Some(joined_table_ref) = tables.find_joined_table_by_internal_id(*table) {
                     if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
