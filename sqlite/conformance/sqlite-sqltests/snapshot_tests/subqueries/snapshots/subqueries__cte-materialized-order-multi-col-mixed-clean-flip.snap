@@ -15,6 +15,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN t
-|--USE SORTER FOR ORDER BY
+|--MATERIALIZE ordered
+|  |--SCAN t
+|  `--USE SORTER FOR ORDER BY
 `--SCAN ordered
