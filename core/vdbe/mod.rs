@@ -1230,6 +1230,7 @@ pub struct ProgramState {
     pub(crate) tx_read_only_at_start: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
+    shared_auto_txn_savepoint: bool,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
     /// The connection's MvStore handle, revalidated with one pointer compare
@@ -1332,6 +1333,7 @@ impl ProgramState {
             tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
+            shared_auto_txn_savepoint: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
@@ -1506,6 +1508,7 @@ impl ProgramState {
         self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;
         self.has_stmt_transaction = false;
+        self.shared_auto_txn_savepoint = false;
         self.distinct_key_values.clear();
         self.attached_savepoint_pagers.clear();
         *self.n_change.get_mut() = 0;
@@ -1549,8 +1552,7 @@ impl ProgramState {
         connection: &Connection,
         self_counted: bool,
     ) -> bool {
-        let is_already_committing = !matches!(self.commit_state, CommitState::Ready);
-        if is_already_committing {
+        if self.is_committing() {
             return true;
         }
         let active_writers = connection.n_active_writes.load(Ordering::SeqCst);
@@ -1607,6 +1609,10 @@ impl ProgramState {
         }
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
             || (connection.get_auto_commit() && attached_txn_open())
+    }
+
+    pub(crate) fn is_committing(&self) -> bool {
+        !matches!(self.commit_state, CommitState::Ready)
     }
 
     /// The MvStore this statement runs against: the same answer as
@@ -1766,8 +1772,10 @@ impl ProgramState {
     /// when each DB's Transaction opcode is executed.
     ///
     /// Pager/MVCC savepoints are only opened for write statements inside an
-    /// explicit transaction. In autocommit mode, a statement abort is a
-    /// transaction abort, so savepoints are unnecessary.
+    /// explicit transaction, or for MVCC writes that join an autocommit
+    /// transaction a sibling statement holds open. Otherwise, in autocommit
+    /// mode a statement abort is a transaction abort, so savepoints are
+    /// unnecessary.
     pub fn begin_statement(
         &mut self,
         connection: &Connection,
@@ -1775,11 +1783,15 @@ impl ProgramState {
         write: bool,
     ) -> IOResultOr<()> {
         let in_explicit_txn = !connection.auto_commit.load(Ordering::SeqCst);
-        if write && in_explicit_txn {
+        let joins_shared_mvcc_auto_txn = !in_explicit_txn
+            && connection.mv_store().is_some()
+            && connection.n_active_root_statements.load(Ordering::SeqCst) > 1;
+        if write && (in_explicit_txn || joins_shared_mvcc_auto_txn) {
             // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
             if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
                     mv_store.begin_savepoint(tx_id);
+                    self.shared_auto_txn_savepoint = joins_shared_mvcc_auto_txn;
                 }
             } else {
                 // Non-MVCC mode: use pager savepoints
@@ -3720,7 +3732,12 @@ impl Program {
 
             let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
             let is_mvcc = state.mv_store(&self.connection).is_some();
-            let changed_shared_mvcc_auto_txn = !can_autocommit_now
+            let statement_savepoint_covers_shared_txn = state.shared_auto_txn_savepoint
+                && !can_autocommit_now
+                && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
+                && state.sequence_inner_tx_pending.is_none();
+            let changed_shared_mvcc_auto_txn = !statement_savepoint_covers_shared_txn
+                && !can_autocommit_now
                 && state.auto_txn_cleanup == TxnCleanup::RollbackTxn
                 && state.n_change.load(Ordering::SeqCst) > 0;
             if changed_shared_mvcc_auto_txn {
@@ -3734,7 +3751,8 @@ impl Program {
                 // is rolling back the whole MVCC transaction.
             }
             let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
-            if err.is_some() && !pager.is_checkpointing() {
+            if (err.is_some() || statement_savepoint_covers_shared_txn) && !pager.is_checkpointing()
+            {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
                 // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
@@ -3778,6 +3796,9 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
+                Some(LimboError::WriteWriteConflict) if statement_savepoint_covers_shared_txn => {
+                    self.connection.set_changes(0);
+                }
                 Some(LimboError::WriteWriteConflict | LimboError::SchemaConflict) => {
                     // These MVCC errors mean the current transaction cannot
                     // commit. Roll it back even if this statement opened a
