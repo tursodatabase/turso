@@ -93,34 +93,22 @@ impl InProcessServer {
         let request = PullUpdatesReqProtoBody::decode(body)
             .map_err(|error| Error::DatabaseSyncEngineError(error.to_string()))?;
         if request.client_revision.is_empty() {
-            self.page_bootstrap()
+            let database = self.bootstrap_base.checkpoint_and_read_database_file()?;
+            let log_end = self.bootstrap_base.read_logical_log()?.len();
+            Ok(page_stream(
+                &database,
+                log_end,
+                PullUpdatesApplyMode::Incremental,
+            ))
+        } else if let Some((database, log_end)) = self.remote.take_replace_base_snapshot() {
+            Ok(page_stream(
+                &database,
+                log_end,
+                PullUpdatesApplyMode::ReplaceBase,
+            ))
         } else {
             self.logical_log_since(log_offset_of(&request.client_revision)?)
         }
-    }
-
-    fn page_bootstrap(&self) -> Result<Vec<u8>> {
-        let database = self.bootstrap_base.checkpoint_and_read_database_file()?;
-        let log_end = self.bootstrap_base.read_logical_log()?.len();
-        let header = PullUpdatesRespProtoBody {
-            server_revision: revision_at(log_end),
-            db_size: (database.len() / PAGE_SIZE) as u64,
-            raw_encoding: Some(PageSetRawEncodingProto {}),
-            zstd_encoding: None,
-            stream_kind: PullUpdatesStreamKind::Pages as i32,
-            apply_mode: PullUpdatesApplyMode::Incremental as i32,
-            mvcc_log: None,
-            protocol: PullUpdatesProtocol::MvccLogical as i32,
-        };
-        let mut response = header.encode_length_delimited_to_vec();
-        for (page_id, page) in database.chunks_exact(PAGE_SIZE).enumerate() {
-            let page = PageData {
-                page_id: page_id as u64,
-                encoded_page: Bytes::copy_from_slice(page),
-            };
-            response.extend(page.encode_length_delimited_to_vec());
-        }
-        Ok(response)
     }
 
     fn logical_log_since(&self, offset: usize) -> Result<Vec<u8>> {
@@ -161,6 +149,28 @@ impl InProcessServer {
         response.extend_from_slice(new_frames);
         Ok(response)
     }
+}
+
+fn page_stream(database: &[u8], log_end: usize, apply_mode: PullUpdatesApplyMode) -> Vec<u8> {
+    let header = PullUpdatesRespProtoBody {
+        server_revision: revision_at(log_end),
+        db_size: (database.len() / PAGE_SIZE) as u64,
+        raw_encoding: Some(PageSetRawEncodingProto {}),
+        zstd_encoding: None,
+        stream_kind: PullUpdatesStreamKind::Pages as i32,
+        apply_mode: apply_mode as i32,
+        mvcc_log: None,
+        protocol: PullUpdatesProtocol::MvccLogical as i32,
+    };
+    let mut response = header.encode_length_delimited_to_vec();
+    for (page_id, page) in database.chunks_exact(PAGE_SIZE).enumerate() {
+        let page = PageData {
+            page_id: page_id as u64,
+            encoded_page: Bytes::copy_from_slice(page),
+        };
+        response.extend(page.encode_length_delimited_to_vec());
+    }
+    response
 }
 
 fn log_offset_of(revision: &str) -> Result<usize> {

@@ -18,7 +18,7 @@ use crate::{
     client_proto::{
         LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
     },
-    database_replay_generator::DatabaseReplayGenerator,
+    database_replay_generator::{sql_string_literal, DatabaseReplayGenerator},
     database_sync_engine::{DataStats, DatabaseSyncEngineOpts},
     database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     database_tape::{
@@ -295,6 +295,29 @@ fn logical_op_to_tape_operations(
                     }
                     DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Alter { sql: op.sql })
                 }
+                LogicalSchemaAction::RenameTable => {
+                    if op.table_name.is_empty() {
+                        return Err(Error::DatabaseSyncEngineError(
+                            "logical table rename must include table_name".to_string(),
+                        ));
+                    }
+                    DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::RenameTable {
+                        old_name: op.table_name,
+                        new_name: op.schema_name,
+                    })
+                }
+                LogicalSchemaAction::RenameTableToTemporaryName => {
+                    DatabaseTapeOperation::SchemaReplay(
+                        DatabaseSchemaReplay::RenameTableToTemporaryName {
+                            name: op.schema_name,
+                        },
+                    )
+                }
+                LogicalSchemaAction::RenameTemporaryTable => DatabaseTapeOperation::SchemaReplay(
+                    DatabaseSchemaReplay::RenameTemporaryTable {
+                        new_name: op.schema_name,
+                    },
+                ),
             };
             Ok(vec![operation])
         }
@@ -485,7 +508,10 @@ impl LogicalReplayTableMap {
             return;
         }
         match schema_action {
-            LogicalSchemaAction::Unspecified => {}
+            LogicalSchemaAction::Unspecified
+            | LogicalSchemaAction::RenameTable
+            | LogicalSchemaAction::RenameTableToTemporaryName
+            | LogicalSchemaAction::RenameTemporaryTable => {}
             LogicalSchemaAction::Create
             | LogicalSchemaAction::Refresh
             | LogicalSchemaAction::Alter => {
@@ -568,6 +594,69 @@ fn logical_txn_to_tape_operations_with_table_map(
 #[derive(Debug, Default)]
 pub struct LogicalReplayApplyStats {
     pub touched_rows: std::collections::BTreeSet<(String, i64)>,
+    pub renamed_tables: RenamedTables,
+}
+
+#[derive(Debug, Default)]
+pub struct RenamedTables {
+    old_and_current_names: Vec<(String, Option<String>)>,
+}
+
+impl RenamedTables {
+    pub fn is_empty(&self) -> bool {
+        self.old_and_current_names.is_empty()
+    }
+
+    pub fn current_name<'a>(&'a self, old_name: &'a str) -> &'a str {
+        match self
+            .old_and_current_names
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(old_name))
+        {
+            Some((_, current_name)) => current_name
+                .as_deref()
+                .expect("a table renamed to a temporary name must be renamed back"),
+            None => old_name,
+        }
+    }
+
+    fn observe(&mut self, operation: &DatabaseTapeOperation) {
+        let DatabaseTapeOperation::SchemaReplay(replay) = operation else {
+            return;
+        };
+        match replay {
+            DatabaseSchemaReplay::RenameTable { old_name, new_name } => {
+                self.rename(Some(old_name), Some(new_name))
+            }
+            DatabaseSchemaReplay::RenameTableToTemporaryName { name } => {
+                self.rename(Some(name), None)
+            }
+            DatabaseSchemaReplay::RenameTemporaryTable { new_name } => {
+                self.rename(None, Some(new_name))
+            }
+            _ => {}
+        }
+    }
+
+    fn rename(&mut self, from: Option<&str>, to: Option<&str>) {
+        let to = to.map(str::to_string);
+        let renamed_before =
+            self.old_and_current_names
+                .iter_mut()
+                .find(|(_, current_name)| match (current_name.as_deref(), from) {
+                    (Some(current_name), Some(from)) => current_name.eq_ignore_ascii_case(from),
+                    (None, None) => true,
+                    _ => false,
+                });
+        match renamed_before {
+            Some((_, current_name)) => *current_name = to,
+            None => {
+                let from = from
+                    .expect("a table renamed from a temporary name must be renamed to it first");
+                self.old_and_current_names.push((from.to_string(), to));
+            }
+        }
+    }
 }
 
 fn logical_operations_touched_rows(
@@ -681,6 +770,7 @@ async fn replay_logical_transactions_from_file<Ctx>(
                 for row in logical_operations_touched_rows(std::slice::from_ref(&operation)) {
                     stats.touched_rows.insert(row);
                 }
+                stats.renamed_tables.observe(&operation);
                 replay.replay(coro, operation).await?;
             }
         }
@@ -1253,6 +1343,7 @@ fn append_schema_ops(
     ops: &mut Vec<LogicalOp>,
 ) -> Result<()> {
     let mut drops = Vec::new();
+    let mut table_renames = Vec::new();
     let mut table_refreshes_and_creates = Vec::new();
     let mut non_table_creates = Vec::new();
     for delta in deltas.into_values() {
@@ -1276,8 +1367,13 @@ fn append_schema_ops(
                     new.name, old.row_type, new.row_type
                 )));
             }
-            (Some(_), Some(new)) if is_table(&new) => table_refreshes_and_creates
-                .push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?),
+            (Some(old), Some(new)) if is_table(&new) => {
+                if old.name != new.name {
+                    table_renames.push((Some(old.name), created_table_name(&new.sql)?));
+                }
+                table_refreshes_and_creates
+                    .push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?);
+            }
             (Some(old), Some(new)) => {
                 drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
                 non_table_creates.push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
@@ -1285,10 +1381,76 @@ fn append_schema_ops(
         }
     }
     ops.extend(drops);
+    append_table_rename_ops(table_renames, ops);
     ops.extend(table_refreshes_and_creates);
     // these may depend on new or altered tables, so we emit them after all tables have been updated
     ops.extend(non_table_creates);
     Ok(())
+}
+
+fn created_table_name(create_table: &str) -> Result<String> {
+    let mut parser = turso_parser::parser::Parser::new(create_table.as_bytes());
+    match parser.next() {
+        Some(Ok(turso_parser::ast::Cmd::Stmt(
+            turso_parser::ast::Stmt::CreateTable { tbl_name, .. }
+            | turso_parser::ast::Stmt::CreateVirtualTable(turso_parser::ast::CreateVirtualTable {
+                tbl_name,
+                ..
+            }),
+        ))) => Ok(tbl_name.name.as_str().to_string()),
+        _ => Err(Error::DatabaseSyncEngineError(format!(
+            "sqlite_schema table row has unexpected sql: {create_table}"
+        ))),
+    }
+}
+
+fn append_table_rename_ops(mut renames: Vec<(Option<String>, String)>, ops: &mut Vec<LogicalOp>) {
+    while !renames.is_empty() {
+        let next_with_free_name = renames.iter().position(|(_, new_name)| {
+            !renames.iter().any(|(old_name, _)| {
+                old_name
+                    .as_deref()
+                    .is_some_and(|old_name| old_name.eq_ignore_ascii_case(new_name))
+            })
+        });
+        match next_with_free_name {
+            Some(i) => {
+                let (old_name, new_name) = renames.remove(i);
+                ops.push(match old_name {
+                    Some(old_name) => {
+                        table_rename_op(LogicalSchemaAction::RenameTable, &old_name, &new_name)
+                    }
+                    None => {
+                        table_rename_op(LogicalSchemaAction::RenameTemporaryTable, "", &new_name)
+                    }
+                });
+            }
+            None => {
+                let old_name = renames[0].0.take().unwrap();
+                ops.push(table_rename_op(
+                    LogicalSchemaAction::RenameTableToTemporaryName,
+                    "",
+                    &old_name,
+                ));
+            }
+        }
+    }
+}
+
+fn table_rename_op(action: LogicalSchemaAction, old_name: &str, name: &str) -> LogicalOp {
+    LogicalOp {
+        op_type: LogicalOpType::Schema as i32,
+        table_name: old_name.to_string(),
+        rowid: 0,
+        record: Bytes::new(),
+        sql: String::new(),
+        user_version: None,
+        application_id: None,
+        schema_action: Some(action as i32),
+        schema_kind: Some(LogicalSchemaKind::Table as i32),
+        schema_name: name.to_string(),
+        stable_table_id: 0,
+    }
 }
 
 fn is_table(row: &DecodedSchemaRow) -> bool {
@@ -2532,6 +2694,32 @@ pub async fn has_table<Ctx>(
         _ => panic!("expected single row"),
     };
     Ok(count > 0)
+}
+
+pub async fn rename_tables_in_local_changes<Ctx>(
+    coro: &Coro<Ctx>,
+    conn: &Arc<turso_core::Connection>,
+    renamed_tables: &RenamedTables,
+) -> Result<()> {
+    let mut when_clauses = String::new();
+    let mut old_names = Vec::new();
+    for (old_name, current_name) in &renamed_tables.old_and_current_names {
+        let current_name = current_name
+            .as_deref()
+            .expect("a table renamed to a temporary name must be renamed back");
+        let old_name = sql_string_literal(&old_name.to_lowercase());
+        when_clauses.push_str(&format!(
+            " WHEN {old_name} THEN {}",
+            sql_string_literal(current_name)
+        ));
+        old_names.push(old_name);
+    }
+    let mut stmt = conn.prepare(format!(
+        "UPDATE turso_cdc SET table_name = CASE lower(table_name){when_clauses} END WHERE lower(table_name) IN ({})",
+        old_names.join(", ")
+    ))?;
+    run_stmt_ignore_rows(coro, &mut stmt).await?;
+    Ok(())
 }
 
 /// Counts local changes above `change_id` which the next push will send to the remote.

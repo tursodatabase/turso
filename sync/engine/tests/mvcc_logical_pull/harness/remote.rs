@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use turso_core::{
@@ -13,6 +13,7 @@ use super::snapshot::Snapshot;
 pub struct Remote {
     conn: Arc<Connection>,
     db_path: PathBuf,
+    replace_base_snapshot: Mutex<Option<(Vec<u8>, usize)>>,
     _db: Arc<Database>,
     _dir: TempDir,
 }
@@ -35,6 +36,7 @@ impl Remote {
         Ok(Arc::new(Self {
             conn,
             db_path,
+            replace_base_snapshot: Mutex::new(None),
             _db: db,
             _dir: dir,
         }))
@@ -53,6 +55,13 @@ impl Remote {
         Ok(())
     }
 
+    pub fn answer_next_pull_with_replace_base_snapshot(&self) -> Result<()> {
+        let database = self.checkpoint_and_read_database_file()?;
+        let log_end = self.read_logical_log()?.len();
+        *self.replace_base_snapshot.lock().unwrap() = Some((database, log_end));
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot> {
         Snapshot::capture(&self.conn)
     }
@@ -60,6 +69,10 @@ impl Remote {
     pub(super) fn checkpoint_and_read_database_file(&self) -> Result<Vec<u8>> {
         self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(std::fs::read(&self.db_path)?)
+    }
+
+    pub(super) fn take_replace_base_snapshot(&self) -> Option<(Vec<u8>, usize)> {
+        self.replace_base_snapshot.lock().unwrap().take()
     }
 
     pub(super) fn read_logical_log(&self) -> Result<Vec<u8>> {
