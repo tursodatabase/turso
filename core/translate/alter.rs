@@ -598,7 +598,10 @@ fn emit_column_constraints_validation(
             }
         })
         .collect();
-    if !check_constraints.is_empty() {
+    if !check_constraints.is_empty()
+        || table.is_strict
+        || (column.is_virtual_generated() && has_notnull)
+    {
         check_constraints.extend_from_slice(prior_checks);
     }
     if table.is_strict {

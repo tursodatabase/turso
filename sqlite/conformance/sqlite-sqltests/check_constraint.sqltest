@@ -11,6 +11,28 @@ expect error {
     CHECK constraint failed
 }
 
+test add-column-strict-rechecks-old-check {
+    PRAGMA ignore_check_constraints = 1;
+    CREATE TABLE t(a INT CHECK(a > 0)) STRICT;
+    INSERT INTO t VALUES(-1);
+    PRAGMA ignore_check_constraints = 0;
+    ALTER TABLE t ADD COLUMN d INT;
+}
+expect error {
+    CHECK constraint failed
+}
+
+test add-column-generated-not-null-rechecks-old-check {
+    PRAGMA ignore_check_constraints = 1;
+    CREATE TABLE t(a INT CHECK(a > 0));
+    INSERT INTO t VALUES(-1);
+    PRAGMA ignore_check_constraints = 0;
+    ALTER TABLE t ADD COLUMN d AS (1) NOT NULL;
+}
+expect error {
+    CHECK constraint failed
+}
+
 test add-column-rechecks-old-table-check {
     PRAGMA ignore_check_constraints = 1;
     CREATE TABLE t(a, b, CHECK(a + b > 0));
