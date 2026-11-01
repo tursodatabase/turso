@@ -506,6 +506,14 @@ pub fn translate_insert(
     if !result_columns.is_empty() {
         program.result_columns.clone_from(&result_columns);
     }
+    if columns.is_empty()
+        && resolver
+            .catalog
+            .dialect
+            .positional_insert_counts_generated_columns()
+    {
+        reject_positional_value_for_generated_column(&table, ctx.num_values)?;
+    }
     let insertion = build_insertion(program, &table, &columns, ctx.num_values)?;
 
     translate_rows_and_open_tables(
@@ -2676,6 +2684,20 @@ pub struct ColMapping<'a> {
     pub value_index: Option<usize>,
     /// Register where the value will be stored for insertion into the table.
     pub register: usize,
+}
+
+/// An INSERT without a column list gives its values to the table's columns in
+/// order, so a value that falls on a generated column is an attempt to write it.
+fn reject_positional_value_for_generated_column(table: &Table, num_values: usize) -> Result<()> {
+    for column in table
+        .columns()
+        .iter()
+        .filter(|c| !c.hidden())
+        .take(num_values)
+    {
+        column.ensure_not_generated("INSERT into", column.name.as_deref().unwrap_or_default())?;
+    }
+    Ok(())
 }
 
 /// Resolves how each column in a table should be populated during an INSERT.

@@ -268,6 +268,15 @@ pub trait Dialect: Send + Sync + 'static {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         false
     }
+
+    /// Whether an INSERT without a column list counts generated columns when
+    /// it gives its values to the table's columns in order.
+    ///
+    /// PostgreSQL does, and rejects a value that falls on a generated column.
+    /// SQLite skips generated columns, so the value goes to the next column.
+    fn positional_insert_counts_generated_columns(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

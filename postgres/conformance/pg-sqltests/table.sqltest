@@ -724,6 +724,18 @@ test generated-column-rejects-named-insert {
 }
 expect error {}
 
+test generated-column-rejects-positional-value {
+    CREATE TABLE gen_positional (a int, b int GENERATED ALWAYS AS (a * 2) STORED, c int);
+    INSERT INTO gen_positional VALUES (1, 2);
+}
+expect error {}
+
+test generated-column-rejects-positional-select {
+    CREATE TABLE gen_positional_select (a int, b int GENERATED ALWAYS AS (a * 2) STORED, c int);
+    INSERT INTO gen_positional_select SELECT 1, 2;
+}
+expect error {}
+
 test generated-column-rejects-update {
     CREATE TABLE gen_no_update (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
     UPDATE gen_no_update SET b = 1;
