@@ -3,17 +3,29 @@ use crate::{
 };
 use std::fmt::Debug;
 use std::future::Future;
+use std::sync::atomic::Ordering;
 
 /// Results of a prepared statement query.
+///
+/// Dropping `Rows` before reading the last row resets the statement, which ends
+/// its transaction when no other statement or explicit transaction needs it.
 pub struct Rows {
     inner: Statement,
+    run: u64,
+    has_finished: bool,
     _operation_guard: Option<ConnectionOperationGuard>,
 }
 
 impl Rows {
-    pub(crate) fn new(inner: Statement, operation_guard: Option<ConnectionOperationGuard>) -> Self {
+    pub(crate) fn new(
+        inner: Statement,
+        run: u64,
+        operation_guard: Option<ConnectionOperationGuard>,
+    ) -> Self {
         Self {
             inner,
+            run,
+            has_finished: false,
             _operation_guard: operation_guard,
         }
     }
@@ -70,9 +82,28 @@ impl Rows {
 
         let result = next.await;
         if !matches!(result, Ok(Some(_))) {
+            self.has_finished = true;
             self._operation_guard.take();
         }
         result
+    }
+}
+
+impl Drop for Rows {
+    fn drop(&mut self) {
+        if self.has_finished {
+            return;
+        }
+        let Ok(mut stmt) = self.inner.inner.lock() else {
+            return;
+        };
+        // A newer run owns the statement's bindings and position, so it must not be reset.
+        if self.inner.runs_started.load(Ordering::Relaxed) != self.run {
+            return;
+        }
+        if let Err(err) = stmt.reset() {
+            tracing::error!("Statement reset failed after dropping unfinished rows: {err}");
+        }
     }
 }
 
