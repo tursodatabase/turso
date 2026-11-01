@@ -1559,6 +1559,52 @@ fn test_mvcc_checkpointed_upsert_changing_ipk(db: TempDatabase) -> anyhow::Resul
     Ok(())
 }
 
+#[turso_macros::test]
+fn test_mvcc_scan_returns_own_insert_ahead_after_checkpoint(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    fn next_row(stmt: &mut turso_core::Statement) -> anyhow::Result<Option<(i64, String)>> {
+        loop {
+            match stmt.step()? {
+                StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    return Ok(Some((row.get::<i64>(0)?, row.get::<String>(1)?)));
+                }
+                StepResult::Done => return Ok(None),
+                StepResult::IO => {
+                    stmt._io().step()?;
+                }
+                StepResult::Yield => {}
+                other => anyhow::bail!("unexpected step result: {other:?}"),
+            }
+        }
+    }
+
+    let conn = db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute("BEGIN CONCURRENT")?;
+    let mut scan = conn.prepare("SELECT id, v FROM t ORDER BY id")?;
+    let mut rows = vec![next_row(&mut scan)?];
+    conn.execute("INSERT INTO t VALUES (3, 'own')")?;
+    while let Some(row) = next_row(&mut scan)? {
+        rows.push(Some(row));
+    }
+    drop(scan);
+    conn.execute("COMMIT")?;
+    assert_eq!(
+        rows,
+        vec![
+            Some((1, "first".to_string())),
+            Some((2, "second".to_string())),
+            Some((3, "own".to_string())),
+        ]
+    );
+    Ok(())
+}
+
 /// Regression test for https://github.com/tursodatabase/turso/issues/7578
 ///
 /// An active MVCC index scan must not return a row deleted after the scan

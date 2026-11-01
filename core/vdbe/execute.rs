@@ -2166,8 +2166,8 @@ fn op_column_fetch_other(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
-                let record_result = return_if_io!(state, cursor.record());
-                let Some(record) = record_result else {
+                let payload_result = return_if_io!(state, cursor.record_payload());
+                let Some(payload) = payload_result else {
                     // Cursor is not positioned on a valid row (e.g., empty table).
                     // Return NULL, not the column's default value.
                     // DEFAULT handling below is for when record exists
@@ -2176,7 +2176,7 @@ fn op_column_fetch_other(
                     return Ok(InsnFunctionStepResult::Step);
                 };
 
-                let mut payload_iterator = record.iter()?;
+                let mut payload_iterator = ValueIterator::new(payload)?;
 
                 // Parse the header for serial types incrementally until we have the target column
                 // Use nth_into_register to write directly to the register without
@@ -2414,15 +2414,15 @@ fn op_column_range_fetch_other(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
-                let record_result = return_if_io!(state, cursor.record());
-                let Some(record) = record_result else {
+                let payload_result = return_if_io!(state, cursor.record_payload());
+                let Some(payload) = payload_result else {
                     for reg in &mut state.registers[dest..dest + count] {
                         reg.set_null();
                     }
                     return Ok(InsnFunctionStepResult::Step);
                 };
 
-                record.iter()?.decode_into_registers_after(
+                ValueIterator::new(payload)?.decode_into_registers_after(
                     start_column,
                     &mut state.registers[dest..dest + count],
                 )?
