@@ -770,8 +770,6 @@ fn rewrite_aggregate_as_join_then_group(
         lateral: false,
     });
     plan.table_references.add_joined_table(inner_table);
-    plan.table_references
-        .take_scalar_subquery_affinities_from(&mut inner_plan.table_references);
 
     for mut term in inner_plan.where_clause {
         term.origin = match term.origin {
