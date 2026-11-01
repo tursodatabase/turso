@@ -756,10 +756,11 @@ mod tests {
             ));
         }
 
+        // SQLite's parser drops both operands of `x AND 0` before it resolves
+        // names, so SQLite accepts this statement; Turso resolves the names
+        // first, so only Turso rejects it.
         let stmt = GeneratedStatement {
-            sql: "WITH cte(x) AS (SELECT 1, 2) \
-                  UPDATE t SET a = 2 WHERE 0 AND EXISTS (SELECT * FROM cte)"
-                .to_string(),
+            sql: "UPDATE t SET a = 2 WHERE 0 AND nosuchcol".to_string(),
             is_ddl: false,
             mutates_data: true,
             has_unordered_limit: false,
