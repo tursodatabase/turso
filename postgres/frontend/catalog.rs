@@ -7,7 +7,9 @@ use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
-    schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
+    schema::{
+        BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX,
+    },
     Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
     Value,
 };
@@ -749,7 +751,8 @@ impl SnapshotRows for PgAttributeTable {
                 };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = i64::from(col.notnull());
-                let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
+                let has_def = i64::from(col.default.is_some() || col.is_generated());
+                let generated = if col.is_generated() { "s" } else { "" };
 
                 rows.push(vec![
                     Value::from_i64(table_oid),   // attrelid
@@ -765,19 +768,19 @@ impl SnapshotRows for PgAttributeTable {
                     Value::build_text(storage),   // attstorage
                     Value::Text("i".into()),      // attalign (int)
                     Value::Text("".into()),
-                    Value::from_i64(notnull), // attnotnull
-                    Value::from_i64(has_def), // atthasdef
-                    Value::from_i64(0),       // atthasmissing
-                    Value::Text("".into()),   // attidentity
-                    Value::Text("".into()),   // attgenerated
-                    Value::from_i64(0),       // attisdropped
-                    Value::from_i64(1),       // attislocal
-                    Value::from_i64(0),       // attinhcount
-                    Value::from_i64(0),       // attcollation
-                    Value::Null,              // attacl
-                    Value::Null,              // attoptions
-                    Value::Null,              // attfdwoptions
-                    Value::Null,              // attmissingval
+                    Value::from_i64(notnull),     // attnotnull
+                    Value::from_i64(has_def),     // atthasdef
+                    Value::from_i64(0),           // atthasmissing
+                    Value::Text("".into()),       // attidentity
+                    Value::build_text(generated), // attgenerated
+                    Value::from_i64(0),           // attisdropped
+                    Value::from_i64(1),           // attislocal
+                    Value::from_i64(0),           // attinhcount
+                    Value::from_i64(0),           // attcollation
+                    Value::Null,                  // attacl
+                    Value::Null,                  // attoptions
+                    Value::Null,                  // attfdwoptions
+                    Value::Null,                  // attmissingval
                 ]);
             }
         }
@@ -2133,12 +2136,18 @@ impl SnapshotRows for PgAttrdefTable {
                 .unwrap_or(0);
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
-                if let Some(default_expr) = &col.default {
+                let default_sql = match col.generated_type() {
+                    GeneratedType::Virtual { original_sql, .. } => Some(original_sql.clone()),
+                    GeneratedType::NotGenerated => {
+                        col.default.as_ref().map(|expr| expr.to_string())
+                    }
+                };
+                if let Some(default_sql) = default_sql {
                     rows.push(vec![
-                        Value::from_i64(attrdef_oid),                // oid
-                        Value::from_i64(table_oid),                  // adrelid
-                        Value::from_i64(col_idx as i64 + 1),         // adnum (1-based)
-                        Value::build_text(default_expr.to_string()), // adbin
+                        Value::from_i64(attrdef_oid),        // oid
+                        Value::from_i64(table_oid),          // adrelid
+                        Value::from_i64(col_idx as i64 + 1), // adnum (1-based)
+                        Value::build_text(default_sql),      // adbin
                     ]);
                     attrdef_oid += 1;
                 }
