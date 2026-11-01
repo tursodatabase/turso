@@ -9,8 +9,8 @@ use super::*;
 use crate::function::Deterministic;
 use crate::schema::{OperatorArg, OperatorSignature, BINARY_OPERATORS, PREFIX_OPERATORS};
 use crate::translate::expr::expr_type::{
-    same_type_def, sqlite_operand_type, type_of, without_wrappers, BuiltinType, ColumnCustomType,
-    ExprType, TypeEnv,
+    custom_operator_type, same_type_def, sqlite_operand_type, type_of, type_ordering,
+    without_wrappers, BuiltinType, ColumnCustomType, ExprType, TypeEnv,
 };
 
 /// The function that runs the operator expression `expr`, such as `a + b` or
@@ -86,6 +86,76 @@ pub(super) fn find_operator_call(
         }
     };
     call_for(signature, ty, env)
+}
+
+/// The type of `abs(arg)` when `arg` is a custom type that has its own order
+/// and its own `-x`, such as numeric: the type `-x` has. `None` means SQLite's
+/// abs runs on the stored value (see [emit_abs_with_type_operators]). It also
+/// does in a CHECK constraint, where a column is read in its stored form and
+/// the type's operators, which expect the decoded value, cannot run on it.
+pub(super) fn abs_of_custom_type(
+    arg: &ast::Expr,
+    arg_type: &ExprType,
+    env: &TypeEnv,
+) -> Option<ExprType> {
+    if env.reads_stored_form()
+        || !matches!(arg_type, ExprType::Custom { .. })
+        || type_ordering(arg_type, env.schema()).is_none()
+    {
+        return None;
+    }
+    let negated = ast::Expr::Unary(ast::UnaryOperator::Negative, Box::new(arg.clone()));
+    match custom_operator_type(&negated, core::slice::from_ref(arg_type), env) {
+        Some(ExprType::Unknown) | None => None,
+        Some(negated_type) => Some(negated_type),
+    }
+}
+
+/// Emits `abs(arg)` for a type that [abs_of_custom_type] accepts, as
+/// `CASE WHEN x < 0 THEN -x ELSE x END` with the type's own order and `-`.
+/// `arg` is evaluated once, into a register that the CASE reads three times.
+/// Returns `None` when SQLite's abs runs instead.
+pub(super) fn emit_abs_with_type_operators(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    arg: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<Option<usize>> {
+    let env = TypeEnv::new(referenced_tables, resolver);
+    let arg_type = type_of(arg, &env);
+    if abs_of_custom_type(arg, &arg_type, &env).is_none() {
+        return Ok(None);
+    }
+    let ExprType::Custom { type_def, .. } = &arg_type else {
+        unreachable!("abs_of_custom_type accepts only custom types");
+    };
+    let arg_reg = program.alloc_register();
+    translate_expr(program, referenced_tables, arg, arg_reg, resolver)?;
+    let value = || {
+        Box::new(ast::Expr::Register {
+            register: arg_reg,
+            custom_type: Some(Box::new(ast::Type {
+                name: type_def.name.clone(),
+                size: None,
+                array_dimensions: 0,
+            })),
+        })
+    };
+    let abs = ast::Expr::Case {
+        base: None,
+        when_then_pairs: vec![(
+            Box::new(ast::Expr::Binary(
+                value(),
+                ast::Operator::Less,
+                Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))),
+            )),
+            Box::new(ast::Expr::Unary(ast::UnaryOperator::Negative, value())),
+        )],
+        else_expr: Some(value()),
+    };
+    translate_expr(program, referenced_tables, &abs, target_register, resolver)?;
+    Ok(Some(target_register))
 }
 
 /// The symbol and operands of `expr` when it is an operator that custom types

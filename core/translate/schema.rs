@@ -439,6 +439,16 @@ fn resolve_func_return_type(
         ResultType::RealForTextOtherwiseTheFirstArgumentsType => Ok(match first_argument()? {
             Some(ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null)) => ty,
             Some(CheckExprType::Text | CheckExprType::Blob) => CheckExprType::Real,
+            // A CHECK constraint sees a custom type's stored value, such as
+            // numeric's blob, so abs of it would not be the value's abs.
+            // Unary minus is refused for the same reason.
+            Some(CheckExprType::CustomType(type_name)) => {
+                bail_parse_error!(
+                    "cannot use {}() on a {} value in a CHECK constraint",
+                    name,
+                    type_name
+                )
+            }
             _ => CheckExprType::Any,
         }),
         ResultType::RealForARealArgument => Ok(CheckExprType::Real),

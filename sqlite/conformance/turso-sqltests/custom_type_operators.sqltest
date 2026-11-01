@@ -726,6 +726,59 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test op-date-plus-abs-of-numeric-error {
+    -- abs of a numeric is a numeric, so it is not a number of days.
+    CREATE TABLE t(d date, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', 3);
+    SELECT d + abs(n) FROM t;
+}
+expect error {
+    operator does not exist: date \+ numeric
+}
+
+@requires strict "uses STRICT tables"
+test op-abs-of-numeric-is-numeric {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (-1.5);
+    INSERT INTO t VALUES (NULL);
+    SELECT abs(n), typeof(abs(n)), abs(n) * 3, typeof(abs(n) * 3) FROM t ORDER BY rowid;
+}
+expect {
+    1.50|text|4.50|text
+    |null||null
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-with-abs-of-numeric-is-exact {
+    CREATE TABLE t(n numeric(10,2), m numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (3, -0.20);
+    SELECT n + abs(m), n - abs(m), n * abs(m) FROM t;
+}
+expect {
+    3.20|2.80|0.6000
+}
+
+@requires strict "uses STRICT tables"
+test op-abs-of-numeric-in-check-comparison-error {
+    -- A CHECK sees the stored numeric, so abs of it is not the number's abs.
+    CREATE TABLE c(n numeric(10,2) CHECK(abs(n) <> n)) STRICT;
+}
+expect error {
+    cannot use abs\(\) on a numeric value in a CHECK constraint
+}
+
+@requires strict "uses STRICT tables"
+test op-abs-of-numeric-in-check-without-comparison {
+    -- Outside a comparison CHECK does not type abs, so it still runs on the stored value.
+    CREATE TABLE c(n numeric(10,2) CHECK(abs(n) IS NOT NULL)) STRICT;
+    INSERT INTO c VALUES (-20);
+    SELECT n FROM c;
+}
+expect {
+    -20.00
+}
+
+@requires strict "uses STRICT tables"
 test op-date-minus-derived-table-cte-and-view-columns {
     CREATE TABLE t(d date) STRICT;
     CREATE TABLE u(e date) STRICT;
