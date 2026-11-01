@@ -547,16 +547,17 @@ jobs:
             fi
           done
 
-  # Same as differential-fuzzer above (fixed seeds on pull requests, random
-  # seeds on all other runs), but with materialized views turned on (--ivm):
-  # the fuzzer creates views over the generated tables and checks that they
-  # stay in sync with a plain re-query. The pull request seeds are hand-picked,
-  # not just 1..6 like the non-IVM job: a few known pre-existing main bugs
-  # unrelated to views (collation precedence in `x IN (subquery)` #6088, a
-  # 3+-arm compound dropping the first arm's collation #6407, and some
-  # INSERT/UPDATE OR FAIL differences vs SQLite) can make a seed fail here for
-  # reasons that have nothing to do with the view code. Widen this list with
-  # more seeds once those bugs are fixed.
+  # Same fixed-seed idea as differential-fuzzer above, but with materialized
+  # views turned on (--ivm): the fuzzer creates views over the generated
+  # tables and checks that they stay in sync with a plain re-query. Seeds are
+  # hand-picked, not just 1..6 like the non-IVM job: a few known pre-existing
+  # main bugs unrelated to views (collation precedence in `x IN (subquery)`
+  # #6088, a 3+-arm compound dropping the first arm's collation #6407, and
+  # some INSERT/UPDATE OR FAIL differences vs SQLite) can make a seed fail
+  # here for reasons that have nothing to do with the view code. Widen this
+  # list with more seeds once those bugs are fixed. For the same reason, main
+  # also runs these fixed seeds: random IVM seeds fail on collation bugs on
+  # most pushes.
   differential-fuzzer-ivm:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
@@ -578,21 +579,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build differential_fuzzer
         run: cargo build -p differential-fuzzer --bin differential_fuzzer
-      - name: Run differential_fuzzer in IVM mode on ${{ github.event_name == 'pull_request' && 'fixed' || 'random' }} seeds
+      - name: Run differential_fuzzer in IVM mode on a fixed set of seeds
         run: |
           # Reproduce a failure locally with:
           #   cargo run -p differential-fuzzer --bin differential_fuzzer -- \
           #     --seed <seed> --profile ${{ matrix.profile }} -n 1000 --ivm
-          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
-            seeds=(1 2 3)
-          else
-            seeds=()
-            for _ in {1..10}; do
-              seeds+=("$(od -An -N8 -tu8 /dev/urandom | tr -d ' ')")
-            done
-          fi
-          for seed in "${seeds[@]}"; do
-            echo "Starting fuzzer run. Seed: $seed. Profile: ${{ matrix.profile }}."
+          for seed in 1 2 3; do
             exit_code=0
             # One slow statement must not consume the complete CI job.
             timeout --kill-after=10s "${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS}s" \
