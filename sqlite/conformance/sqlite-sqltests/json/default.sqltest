@@ -3790,6 +3790,55 @@ expect {
     {"a":[1,2,3,4]}
 }
 
+test jsonb_set_array_append_at_root {
+    SELECT json(jsonb_set('[1]', '$[#]', 2));
+}
+expect {
+    [1,2]
+}
+
+test jsonb_insert_array_append_at_root {
+    SELECT json(jsonb_insert('[1]', '$[#]', 2));
+}
+expect {
+    [1,2]
+}
+
+test jsonb_set_array_append_after_object_key {
+    SELECT json(jsonb_set('{"a":[1]}', '$.a[#]', 2));
+}
+expect {
+    {"a":[1,2]}
+}
+
+test jsonb_insert_array_append_after_object_key {
+    SELECT json(jsonb_insert('{"a":[1]}', '$.a[#]', 2));
+}
+expect {
+    {"a":[1,2]}
+}
+
+test jsonb_set_chained_array_append {
+    SELECT json(jsonb_set('[]', '$[0]', 1, '$[#]', 2));
+}
+expect {
+    [1,2]
+}
+
+test jsonb_insert_chained_mixed_numeric_array_append {
+    SELECT json(jsonb_insert('[1,1.0]', '$[#]', 2147483648, '$[#]', 1.5));
+}
+expect {
+    [1,1.0,2147483648,1.5]
+}
+
+test jsonb_insert_nested_array_append_across_header_size {
+    SELECT json(jsonb_insert('{"a":[0,1,2,3]}', '$.a[#]', 'abcdefghijklmnop'));
+}
+expect {
+    {"a":[0,1,2,3,"abcdefghijklmnop"]}
+}
+
 # A BLOB argument is read as JSONB, so every element type, payload size and
 # text byte in it is caller-controlled. Validation used to be skipped whenever
 # the payload exceeded 7 bytes, which let arbitrary bytes reach
