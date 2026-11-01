@@ -8,11 +8,12 @@ use turso_core::{
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
-    Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
-    Value,
+    security::roles::{BuiltinRoleNames, Role, RoleId},
+    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
+    Result, Statement, Value, WalkControl,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::{RefAct, SortOrder};
+use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -39,6 +40,13 @@ impl Dialect for PostgresDialect {
 
     fn format_error(&self, error: LimboError) -> LimboError {
         error
+    }
+
+    fn builtin_role_names(&self) -> BuiltinRoleNames {
+        BuiltinRoleNames {
+            superuser: "postgres",
+            public: "public",
+        }
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -200,6 +208,10 @@ impl Dialect for PostgresDialect {
     }
 
     fn supports_namespaces(&self) -> bool {
+        true
+    }
+
+    fn supports_roles(&self) -> bool {
         true
     }
 
@@ -786,9 +798,39 @@ impl SnapshotRows for PgAttributeTable {
     }
 }
 
-/// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns the "turso" superuser and the built-in database owner role.
-/// TODO: replace with real role data when authentication is implemented.
+const SUPERUSER_OID: i64 = 10;
+const USER_ROLE_OID_START: i64 = 16384;
+
+/// Returns the PostgreSQL OID of a role. The built-in superuser has the OID
+/// of the PostgreSQL bootstrap superuser, and `public` has OID 0, as in
+/// PostgreSQL's access control lists.
+pub(crate) fn role_oid(id: RoleId) -> i64 {
+    match id {
+        RoleId::SUPERUSER => SUPERUSER_OID,
+        RoleId::PUBLIC => 0,
+        _ => USER_ROLE_OID_START + id.get(),
+    }
+}
+
+/// Returns the roles that PostgreSQL lists in `pg_roles`. PostgreSQL has no
+/// row for `public`.
+pub(crate) fn listed_roles(conn: &Connection) -> Vec<Role> {
+    conn.role_catalog()
+        .iter()
+        .filter(|role| role.id != RoleId::PUBLIC)
+        .cloned()
+        .collect()
+}
+
+fn superuser_name(conn: &Connection) -> String {
+    conn.role_catalog()
+        .get(RoleId::SUPERUSER)
+        .expect("the role catalog always has the superuser")
+        .name
+        .clone()
+}
+
+/// Virtual table implementation for pg_catalog.pg_roles.
 #[derive(Debug)]
 struct PgRolesTable;
 
@@ -812,40 +854,50 @@ impl SnapshotRows for PgRolesTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![
-            vec![
-                Value::from_i64(10),        // oid
-                Value::build_text("turso"), // rolname
-                Value::from_i64(1),         // rolsuper
-                Value::from_i64(1),         // rolinherit
-                Value::from_i64(1),         // rolcreaterole
-                Value::from_i64(1),         // rolcreatedb
-                Value::from_i64(1),         // rolcanlogin
-                Value::from_i64(1),         // rolreplication
-                Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-                Value::Null,                // rolpassword (never exposed)
-                Value::Null,                // rolvaliduntil
-                Value::from_i64(1),         // rolbypassrls
-                Value::Null,                // rolconfig
-            ],
-            vec![
-                Value::from_i64(PG_DATABASE_OWNER_OID),
-                Value::build_text("pg_database_owner"),
-                Value::from_i64(0),
-                Value::from_i64(1),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(-1),
-                Value::Null,
-                Value::Null,
-                Value::from_i64(0),
-                Value::Null,
-            ],
-        ]
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let mut rows: Vec<_> = listed_roles(conn).iter().map(role_row).collect();
+        // The owner of the public schema, which PostgreSQL makes for every
+        // database.
+        rows.push(vec![
+            Value::from_i64(PG_DATABASE_OWNER_OID),
+            Value::build_text("pg_database_owner"),
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(-1),
+            Value::Null,
+            Value::Null,
+            Value::from_i64(0),
+            Value::Null,
+        ]);
+        rows
     }
+}
+
+/// `CREATE ROLE` creates roles that cannot log in, so only the built-in
+/// superuser can.
+fn role_row(role: &Role) -> Vec<Value> {
+    let superuser = Value::from_i64(role.superuser as i64);
+    let can_login = role.id == RoleId::SUPERUSER;
+    let bypasses_rls = role.superuser || role.ignores_row_policies;
+    vec![
+        Value::from_i64(role_oid(role.id)),   // oid
+        Value::build_text(role.name.clone()), // rolname
+        superuser.clone(),                    // rolsuper
+        Value::from_i64(1),                   // rolinherit
+        superuser.clone(),                    // rolcreaterole
+        superuser.clone(),                    // rolcreatedb
+        Value::from_i64(can_login as i64),    // rolcanlogin
+        superuser,                            // rolreplication
+        Value::from_i64(-1),                  // rolconnlimit (-1 = no limit)
+        Value::Null,                          // rolpassword (never exposed)
+        Value::Null,                          // rolvaliduntil
+        Value::from_i64(bypasses_rls as i64), // rolbypassrls
+        Value::Null,                          // rolconfig
+    ]
 }
 
 /// Virtual table implementation for pg_catalog.pg_proc
@@ -1106,6 +1158,10 @@ impl VirtualTableModule for EmptyPgCatalogTable {
 impl VirtualTable for EmptyPgCatalogTable {
     type Cursor = EmptyPgCatalogCursor;
 
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(EmptyPgCatalogCursor)
     }
@@ -1180,12 +1236,13 @@ impl SnapshotRows for PgTablesTable {
         let mut rows = Vec::new();
         let tables = user_tables_sorted(&schema);
 
+        let owner = superuser_name(conn);
         for (namespace, _, table) in tables {
             let btree = table.btree().expect("user tables are B-trees");
             rows.push(vec![
                 Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
                 Value::Text(btree.declared_name.clone().into()),                   // tablename
-                Value::Text("turso".into()),                                       // tableowner
+                Value::Text(owner.clone().into()),                                 // tableowner
                 Value::Null,                                                       // tablespace
                 Value::from_i64(0),                                                // hasindexes
                 Value::from_i64(0),                                                // hasrules
@@ -2085,7 +2142,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(chk.expr.to_string()), // conbin
+                    Value::build_text(render_expr(&chk.expr)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2135,10 +2192,10 @@ impl SnapshotRows for PgAttrdefTable {
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
                     rows.push(vec![
-                        Value::from_i64(attrdef_oid),                // oid
-                        Value::from_i64(table_oid),                  // adrelid
-                        Value::from_i64(col_idx as i64 + 1),         // adnum (1-based)
-                        Value::build_text(default_expr.to_string()), // adbin
+                        Value::from_i64(attrdef_oid),                 // oid
+                        Value::from_i64(table_oid),                   // adrelid
+                        Value::from_i64(col_idx as i64 + 1),          // adnum (1-based)
+                        Value::build_text(render_expr(default_expr)), // adbin
                     ]);
                     attrdef_oid += 1;
                 }
@@ -2246,24 +2303,29 @@ impl SnapshotRows for PgSequencesTable {
                 let seq_name = seq.name.clone();
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
-                let last_val = conn
-                    .get_sequence_currval(
-                        turso_core::MAIN_DB_ID,
-                        &mangle_name(namespace, &seq_name),
+                let last_value = if conn.current_role_is_superuser() {
+                    Value::from_i64(
+                        conn.get_sequence_currval(
+                            turso_core::MAIN_DB_ID,
+                            &mangle_name(namespace, &seq_name),
+                        )
+                        .unwrap_or(seq.start_value),
                     )
-                    .unwrap_or(seq.start_value);
+                } else {
+                    Value::Null
+                };
                 rows.push(vec![
                     Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
-                    Value::build_text(seq_name),           // sequencename
-                    Value::build_text("turso"),            // sequenceowner
-                    Value::build_text("bigint"),           // data_type
-                    Value::from_i64(seq.start_value),      // start_value
-                    Value::from_i64(seq.min_value),        // min_value
-                    Value::from_i64(seq.max_value),        // max_value
-                    Value::from_i64(seq.increment_by),     // increment_by
+                    Value::build_text(seq_name), // sequencename
+                    Value::build_text(superuser_name(conn)), // sequenceowner
+                    Value::build_text("bigint"), // data_type
+                    Value::from_i64(seq.start_value), // start_value
+                    Value::from_i64(seq.min_value), // min_value
+                    Value::from_i64(seq.max_value), // max_value
+                    Value::from_i64(seq.increment_by), // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
-                    Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val), // last_value
+                    Value::from_i64(1),          // cache_size (PG default; Turso doesn't cache)
+                    last_value,                  // last_value
                 ]);
             }
         }
@@ -3142,6 +3204,10 @@ impl<T: SnapshotRows> VirtualTableModule for SnapshotCatalog<T> {
 impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
     type Cursor = SnapshotCursor;
 
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(SnapshotCursor {
             conn,
@@ -3349,6 +3415,10 @@ impl VirtualTableCursor for PgInputErrorInfoCursor {
 
 impl VirtualTable for PgInputErrorInfoTable {
     type Cursor = PgInputErrorInfoCursor;
+
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
 
     fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(PgInputErrorInfoCursor::new())
@@ -3608,6 +3678,10 @@ impl VirtualTableCursor for PgGetTableDefCursor {
 impl VirtualTable for PgGetTableDefTable {
     type Cursor = PgGetTableDefCursor;
 
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(PgGetTableDefCursor::new(conn))
     }
@@ -3783,7 +3857,7 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // CHECK constraints
         for chk in &btree.check_constraints {
             if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", chk.expr));
+                return Some(format!("CHECK ({})", render_expr(&chk.expr)));
             }
             constraint_oid += 1;
         }
@@ -3807,6 +3881,32 @@ fn constraint_column_list<'a>(
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn render_expr(expr: &ast::Expr) -> String {
+    let mut expr = expr.clone();
+    walk_expr_mut(&mut expr, &mut |expr| {
+        if let ast::Expr::FunctionCall { name, args, .. } = expr {
+            if args.is_empty() {
+                if let Some(keyword) = role_keyword(name.as_str()) {
+                    *expr = ast::Expr::Id(ast::Name::from_string(keyword));
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("rewriting role functions does not fail");
+    expr.to_string()
+}
+
+fn role_keyword(function_name: &str) -> Option<&'static str> {
+    if function_name.eq_ignore_ascii_case("current_user") {
+        Some("CURRENT_USER")
+    } else if function_name.eq_ignore_ascii_case("session_user") {
+        Some("SESSION_USER")
+    } else {
+        None
+    }
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
@@ -4009,7 +4109,9 @@ mod tests {
     /// Connects like the frontend does: with the `public` schema in place
     /// and on the search path.
     fn connect_with_public(db: &Arc<Database>) -> Arc<Connection> {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.set_search_path(Some(vec!["public".to_string()]));
         conn
     }
@@ -4626,7 +4728,9 @@ mod tests {
             Arc::new(turso_core::SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Try to query pg_class - should fail
         let result = conn.prepare("SELECT * FROM pg_class");

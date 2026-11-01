@@ -63,7 +63,7 @@ fn main() -> Result<()> {
         &args.database.to_string_lossy(),
         OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::ReadOnly),
     )?;
-    let connection = database.connect(ConnectOpts::new())?;
+    let connection = database.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
     for query in queries {
         if args.plans {

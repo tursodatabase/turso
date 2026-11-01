@@ -4,6 +4,7 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
+use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -13,6 +14,7 @@ use crate::sync::{
     },
     Arc, Mutex, RwLock,
 };
+use crate::types::{IOResult, IOResultOr};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -188,6 +190,44 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
+/// Settings for preparing a statement that only core sets.
+#[derive(Debug, Default)]
+pub(crate) struct PrepareOptions {
+    /// Whether the statement reads the engine's own metadata to load the
+    /// schema, which no role's privileges limit.
+    pub(crate) reads_engine_metadata: bool,
+}
+
+impl PrepareOptions {
+    pub(crate) fn engine_metadata_read() -> Self {
+        Self {
+            reads_engine_metadata: true,
+        }
+    }
+}
+
+/// Re-entrant state for [`Connection::maybe_reparse_schema_nonblock`].
+///
+/// Every state but `Start` holds a read transaction, which
+/// [`Connection::end_maybe_reparse_schema`] ends when an I/O error stops the
+/// reload before it finishes.
+#[derive(Default)]
+pub(crate) enum MaybeReparseSchemaState {
+    #[default]
+    Start,
+    /// A read transaction is open (outside MVCC) to read the schema cookie.
+    ReadCookie {
+        pager: Arc<Pager>,
+        had_main_mv_tx: bool,
+    },
+    /// The schema changed on disk and is being read again.
+    Reparse {
+        pager: Arc<Pager>,
+        had_main_mv_tx: bool,
+        reparse: ReparseSchemaState,
+    },
+}
+
 /// Re-entrant state for [`Connection::reparse_schema_nonblock`] and the
 /// VACUUM-only [`Connection::reparse_schema_with_cookie_keeping_sequences`].
 /// `Start` is the fresh state (cookie not yet read / schema build not yet
@@ -266,6 +306,11 @@ enum ReparsePhase {
     /// Loading the CREATE TYPE statements `type_sqls`, then building the
     /// materialized views and indexes collected by the `sqlite_schema` scan.
     BuildIndexes { type_sqls: Vec<String> },
+    /// Loading roles from the roles table into the role catalog.
+    LoadRoles {
+        stmt: Box<Statement>,
+        rows: Vec<Vec<Value>>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -591,6 +636,10 @@ pub struct Connection {
     /// Per-connection last-returned value for each sequence (for currval()),
     /// by the database and normalized name of the sequence.
     pub(crate) sequence_currvals: RwLock<HashMap<(usize, String), i64>>,
+    /// The role the session logged in as. `SET ROLE` checks against it.
+    pub(crate) session_role: RoleId,
+    /// The role whose privileges statements are checked against.
+    pub(crate) current_role: RwLock<RoleId>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -1025,6 +1074,7 @@ impl Connection {
         cmd: Cmd,
         input: &str,
         origin: StatementOrigin,
+        prepare_options: &PrepareOptions,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
 
@@ -1042,6 +1092,7 @@ impl Connection {
             mode,
             input,
             origin,
+            prepare_options,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -1073,6 +1124,7 @@ impl Connection {
                     mode,
                     input,
                     origin,
+                    prepare_options,
                 )
                 .map(|program| (program, pager, mode))
             }
@@ -1103,6 +1155,16 @@ impl Connection {
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
         origin: StatementOrigin,
+    ) -> Result<Statement> {
+        self.prepare_with_origin_and_options(sql, origin, &PrepareOptions::default())
+    }
+
+    #[turso_macros::trace_stack]
+    pub(crate) fn prepare_with_origin_and_options(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        origin: StatementOrigin,
+        prepare_options: &PrepareOptions,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1136,7 +1198,7 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1145,7 +1207,8 @@ impl Connection {
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
-            ))
+            )
+            .with_reads_engine_metadata(prepare_options.reads_engine_metadata))
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1193,7 +1256,8 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
+            let (program, pager, mode) =
+                self.compile_cmd(cmd, input, origin, &PrepareOptions::default())?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -1232,93 +1296,142 @@ impl Connection {
     /// This function must be called outside of any transaction because internally it will start transaction session by itself.
     /// In multi-process mode, this is the only way to discover schema changes made by other processes.
     pub fn maybe_reparse_schema(self: &Arc<Connection>) -> Result<()> {
-        let pager = self.pager.load().clone();
-        let mv_store = self.mv_store();
-
-        // maybe_reparse_schema must be called outside any explicit transaction
-        // because it starts its own read transaction to load a fresh view of
-        // sqlite_schema from disk.
-        if self.get_tx_state() != TransactionState::None {
-            return Ok(());
+        let io = self.pager.load().io.clone();
+        let mut state = MaybeReparseSchemaState::default();
+        let result = io.block(|| self.maybe_reparse_schema_nonblock(&mut state));
+        if result.is_err() {
+            self.end_maybe_reparse_schema(&mut state);
         }
-        let had_main_mv_tx = self.get_mv_tx().is_some();
+        result
+    }
 
-        if self.db.shared_wal_coordination()?.is_some() {
-            // Cross-process schema changes can leave page 1 and sqlite_schema
-            // pages cached from an earlier WAL snapshot. Drop the cache before
-            // probing the cookie so reparsing observes the current committed view.
-            pager.clear_page_cache(false);
-            pager.set_schema_cookie(None);
-        }
+    /// Non-blocking [`Self::maybe_reparse_schema`]. Call again with the same
+    /// `state` after every `IOResult::IO` until it returns `IOResult::Done`.
+    pub(crate) fn maybe_reparse_schema_nonblock(
+        self: &Arc<Connection>,
+        state: &mut MaybeReparseSchemaState,
+    ) -> IOResultOr<()> {
+        loop {
+            match state {
+                MaybeReparseSchemaState::Start => {
+                    // maybe_reparse_schema must be called outside any explicit transaction
+                    // because it starts its own read transaction to load a fresh view of
+                    // sqlite_schema from disk.
+                    if self.get_tx_state() != TransactionState::None {
+                        return Ok(IOResult::Done(()));
+                    }
+                    let pager = self.pager.load().clone();
+                    let had_main_mv_tx = self.get_mv_tx().is_some();
 
-        let on_disk_schema_version = if mv_store.as_ref().is_some() {
-            self.read_current_schema_cookie().or_else(|err| match err {
-                LimboError::Page1NotAlloc => Ok(0),
-                other => Err(other),
-            })?
-        } else {
-            // first, quickly read schema_version from the root page in order to check if schema changed
-            pager.begin_read_tx()?;
-            let on_disk_schema_version = pager
-                .io
-                .block(|| pager.with_header(|header| header.schema_cookie));
-
-            let on_disk_schema_version = match on_disk_schema_version {
-                Ok(db_schema_version) => db_schema_version.get(),
-                Err(LimboError::Page1NotAlloc) => {
-                    // this means this is a fresh db, so return a schema version of 0
-                    0
+                    if self.db.shared_wal_coordination()?.is_some() {
+                        // Cross-process schema changes can leave page 1 and sqlite_schema
+                        // pages cached from an earlier WAL snapshot. Drop the cache before
+                        // probing the cookie so reparsing observes the current committed view.
+                        pager.clear_page_cache(false);
+                        pager.set_schema_cookie(None);
+                    }
+                    if self.mv_store().is_none() {
+                        pager.begin_read_tx()?;
+                    }
+                    *state = MaybeReparseSchemaState::ReadCookie {
+                        pager,
+                        had_main_mv_tx,
+                    };
                 }
-                Err(err) => {
+                MaybeReparseSchemaState::ReadCookie { .. } => {
+                    let cookie = self.read_current_schema_cookie_nonblock();
+                    if let Ok(IOResult::IO(io)) = cookie {
+                        return Ok(IOResult::IO(io));
+                    }
+                    let MaybeReparseSchemaState::ReadCookie {
+                        pager,
+                        had_main_mv_tx,
+                    } = std::mem::take(state)
+                    else {
+                        unreachable!("state is ReadCookie");
+                    };
+                    if self.mv_store().is_none() {
+                        pager.end_read_tx();
+                    }
+                    let on_disk_schema_version = match cookie {
+                        Ok(IOResult::Done(cookie)) => cookie,
+                        Ok(IOResult::IO(_)) => unreachable!("IO is returned above"),
+                        // this means this is a fresh db, so return a schema version of 0
+                        Err(err) if matches!(*err, LimboError::Page1NotAlloc) => 0,
+                        Err(err) => return Err(err),
+                    };
+
+                    let db_schema_version = self.db.schema.lock().schema_version;
+                    tracing::debug!(
+                        "path: {}, db_schema_version={} vs on_disk_schema_version={}",
+                        self.db.path,
+                        db_schema_version,
+                        on_disk_schema_version
+                    );
+                    // if schema_versions matches - exit early
+                    if db_schema_version == on_disk_schema_version {
+                        return Ok(IOResult::Done(()));
+                    }
+
+                    // start read transaction manually, because we will read schema cookie once again and
+                    // we must be sure that it will consistent with schema content
+                    //
+                    // from now on we must be very careful with errors propagation
+                    // in order to not accidentally keep read transaction opened
+                    pager.begin_read_tx()?;
+                    self.set_tx_state(TransactionState::Read);
+                    *state = MaybeReparseSchemaState::Reparse {
+                        pager,
+                        had_main_mv_tx,
+                        reparse: ReparseSchemaState::default(),
+                    };
+                }
+                MaybeReparseSchemaState::Reparse { reparse, .. } => {
+                    let reparse_result = match self.reparse_schema_nonblock(reparse) {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(())) => Ok(()),
+                        Err(err) => Err(err),
+                    };
+                    self.end_maybe_reparse_schema(state);
+                    reparse_result?;
+
+                    let schema = self.schema.read().clone();
+                    self.db.update_schema_if_newer(schema);
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
+    /// Ends the read transaction that `state` holds and returns it to `Start`.
+    fn end_maybe_reparse_schema(self: &Arc<Connection>, state: &mut MaybeReparseSchemaState) {
+        match std::mem::take(state) {
+            MaybeReparseSchemaState::Start => {}
+            MaybeReparseSchemaState::ReadCookie { pager, .. } => {
+                if self.mv_store().is_none() {
                     pager.end_read_tx();
-                    return Err(err);
                 }
-            };
-            pager.end_read_tx();
-            on_disk_schema_version
-        };
-
-        let db_schema_version = self.db.schema.lock().schema_version;
-        tracing::debug!(
-            "path: {}, db_schema_version={} vs on_disk_schema_version={}",
-            self.db.path,
-            db_schema_version,
-            on_disk_schema_version
-        );
-        // if schema_versions matches - exit early
-        if db_schema_version == on_disk_schema_version {
-            return Ok(());
+            }
+            MaybeReparseSchemaState::Reparse {
+                pager,
+                had_main_mv_tx,
+                ..
+            } => {
+                let previous = self.transaction_state.swap(TransactionState::None);
+                turso_assert!(
+                    matches!(previous, TransactionState::None | TransactionState::Read),
+                    "unexpected end transaction state"
+                );
+                // close opened transaction if it was kept open
+                // (in most cases, it will be automatically closed if stmt was executed properly)
+                if previous == TransactionState::Read {
+                    pager.end_read_tx();
+                }
+                if !had_main_mv_tx {
+                    self.clear_internal_main_mvcc_tx(&pager);
+                }
+            }
         }
-
-        // start read transaction manually, because we will read schema cookie once again and
-        // we must be sure that it will consistent with schema content
-        //
-        // from now on we must be very careful with errors propagation
-        // in order to not accidentally keep read transaction opened
-        pager.begin_read_tx()?;
-        self.set_tx_state(TransactionState::Read);
-
-        let reparse_result = self.reparse_schema();
-
-        let previous = self.transaction_state.swap(TransactionState::None);
-        turso_assert!(
-            matches!(previous, TransactionState::None | TransactionState::Read),
-            "unexpected end transaction state"
-        );
-        // close opened transaction if it was kept open
-        // (in most cases, it will be automatically closed if stmt was executed properly)
-        if previous == TransactionState::Read {
-            pager.end_read_tx();
-        }
-        if !had_main_mv_tx {
-            self.clear_internal_main_mvcc_tx(&pager);
-        }
-
-        reparse_result?;
-
-        let schema = self.schema.read().clone();
-        self.db.update_schema_if_newer(schema);
-        Ok(())
     }
 
     /// Parse schema from scratch even if the schema cookie did not change.
@@ -1694,6 +1807,18 @@ impl Connection {
                         &self.syms.read(),
                         type_sqls,
                     )?;
+                    inner.phase = self.load_roles_phase(&inner.fresh)?;
+                }
+                ReparsePhase::LoadRoles { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        turso_assert!(
+                            !matches!(self.get_tx_state(), TransactionState::None),
+                            "roles must be read in a transaction"
+                        );
+                        rows.push(row.get_values().cloned().collect());
+                        Ok(())
+                    }));
+                    inner.fresh.roles = Arc::new(inner.fresh.roles.with_stored_roles(rows)?);
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1720,6 +1845,34 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Returns the phase that loads the roles table into `fresh`, or the
+    /// stats refresh phase if the dialect has no roles or the database has no
+    /// roles table. The fresh
+    /// schema is installed first, because the current schema may not contain
+    /// the roles table yet.
+    fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        if !self.db.dialect().supports_roles()
+            || !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
+        {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare_with_origin_and_options(
+            SELECT_ROLES_SQL,
+            StatementOrigin::Root,
+            &PrepareOptions::engine_metadata_read(),
+        )?;
+        Ok(ReparsePhase::LoadRoles {
+            stmt: Box::new(stmt),
+            rows: Vec::new(),
+        })
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -1770,7 +1923,12 @@ impl Connection {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+            let (program, pager, mode) = self.compile_cmd(
+                cmd,
+                input,
+                StatementOrigin::Root,
+                &PrepareOptions::default(),
+            )?;
             Statement::new(program, pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
@@ -1792,7 +1950,12 @@ impl Connection {
         let Some(cmd) = cmd else {
             return Ok(None);
         };
-        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+        let (program, pager, mode) = self.compile_cmd(
+            cmd,
+            input,
+            StatementOrigin::Root,
+            &PrepareOptions::default(),
+        )?;
         Ok(Some(Statement::new(program, pager, mode, 0)))
     }
 
@@ -1810,7 +1973,12 @@ impl Connection {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+            let (program, pager, mode) = self.compile_cmd(
+                cmd,
+                input,
+                StatementOrigin::Root,
+                &PrepareOptions::default(),
+            )?;
             {
                 crate::stack::trace_stack!("run");
                 Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
@@ -1835,7 +2003,12 @@ impl Connection {
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+        let (program, pager, mode) = self.compile_cmd(
+            cmd,
+            input,
+            StatementOrigin::Root,
+            &PrepareOptions::default(),
+        )?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
@@ -1863,7 +2036,7 @@ impl Connection {
                 None,
                 dialect,
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(crate::SessionRole::Superuser))?;
             return Ok((io, conn));
         }
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
@@ -1893,7 +2066,7 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(crate::SessionRole::Superuser))?;
         if let Some(cipher) = opts.cipher {
             let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
         }
@@ -3489,6 +3662,38 @@ impl Connection {
             .search_order(self.search_path.read().as_deref())
     }
 
+    /// Returns the roles of the main database as seen by this connection.
+    /// Outside a transaction, this includes roles that other connections
+    /// committed.
+    pub fn role_catalog(&self) -> Arc<RoleCatalog> {
+        self.maybe_update_schema();
+        self.with_schema(MAIN_DB_ID, |schema| schema.roles.clone())
+    }
+
+    pub fn session_role(&self) -> RoleId {
+        self.session_role
+    }
+
+    pub fn current_role(&self) -> RoleId {
+        *self.current_role.read()
+    }
+
+    pub fn current_role_is_superuser(&self) -> bool {
+        self.role_catalog().is_superuser(self.current_role())
+    }
+
+    /// Makes the session role the current role again, as RESET ROLE does.
+    pub fn reset_current_role(&self) {
+        self.set_current_role(self.session_role);
+    }
+
+    /// Statements prepared under the previous role are prepared again, because
+    /// privileges are checked when a statement is prepared.
+    pub(crate) fn set_current_role(&self, role: RoleId) {
+        *self.current_role.write() = role;
+        self.bump_prepare_context_generation();
+    }
+
     /// Access schema for a database using a closure pattern to avoid cloning
     pub fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
@@ -3950,12 +4155,18 @@ impl Connection {
         if stmt.is_none() {
             let escaped = backing_table_name.replace('"', "\"\"");
             let sql = format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1");
-            let prepared = self.prepare_internal(sql).map_err(|err| {
-                LimboError::Corrupt(format!(
-                    "internal sequence backing table \"{backing_table_name}\" for sequence \
+            let prepared = self
+                .prepare_with_origin_and_options(
+                    sql,
+                    StatementOrigin::InternalHelper,
+                    &PrepareOptions::engine_metadata_read(),
+                )
+                .map_err(|err| {
+                    LimboError::Corrupt(format!(
+                        "internal sequence backing table \"{backing_table_name}\" for sequence \
                      \"{seq_name}\": cannot prepare descriptor SELECT: {err}"
-                ))
-            })?;
+                    ))
+                })?;
             *stmt = Some(Box::new(prepared));
             // Fresh statement → clear any descriptor captured for a prior backing
             // table, so an empty backing table is detected as missing-row
@@ -4031,13 +4242,19 @@ impl Connection {
             let sql = format!(
                 "SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1"
             );
-            let prepared = self.prepare_internal(sql).map_err(|err| {
-                LimboError::Corrupt(format!(
-                    "internal sequence backing table \"{backing_table_name}\" for sequence \
+            let prepared = self
+                .prepare_with_origin_and_options(
+                    sql,
+                    StatementOrigin::InternalHelper,
+                    &PrepareOptions::engine_metadata_read(),
+                )
+                .map_err(|err| {
+                    LimboError::Corrupt(format!(
+                        "internal sequence backing table \"{backing_table_name}\" for sequence \
                      \"{}\": cannot prepare watermark SELECT: {err}",
-                    seq.name
-                ))
-            })?;
+                        seq.name
+                    ))
+                })?;
             *stmt = Some(Box::new(prepared));
             *row = None;
         }
@@ -5203,7 +5420,8 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        db.connect(ConnectOpts::new()).unwrap()
+        db.connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap()
     }
 
     fn open_connection(path: &std::path::Path) -> Arc<Connection> {
@@ -5276,8 +5494,12 @@ mod tests {
             Database::open_file(io, ":memory:sync-synced", Arc::new(SqliteDialect)).unwrap();
         assert!(!Arc::ptr_eq(&draft_db, &synced_db));
 
-        let draft = draft_db.connect(ConnectOpts::new()).unwrap();
-        let synced = synced_db.connect(ConnectOpts::new()).unwrap();
+        let draft = draft_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
+        let synced = synced_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         for conn in [&draft, &synced] {
             assert_eq!(conn.get_database_canonical_path(), "");
@@ -5304,13 +5526,17 @@ mod tests {
 
         let first_db =
             Database::open_file(io.clone(), ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
-        let first = first_db.connect(ConnectOpts::new()).unwrap();
+        let first = first_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         first
             .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(99)")
             .unwrap();
 
         let second_db = Database::open_file(io, ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
-        let second = second_db.connect(ConnectOpts::new()).unwrap();
+        let second = second_db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
     }
 
@@ -5407,7 +5633,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute(format!("ATTACH '{}' AS aux", aux_path.to_str().unwrap()))
             .unwrap();

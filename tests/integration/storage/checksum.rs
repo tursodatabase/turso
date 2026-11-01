@@ -100,7 +100,9 @@ fn test_checksum_detects_corruption() {
     {
         let existing_db = TempDatabase::new_with_existent(&db_path);
         // Connecting should fail with a checksum error because the header page is corrupted
-        let result = existing_db.db.connect(ConnectOpts::new());
+        let result = existing_db
+            .db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser));
 
         match result {
             Ok(_) => panic!("should return error when connecting to corrupted DB"),

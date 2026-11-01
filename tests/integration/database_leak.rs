@@ -22,7 +22,9 @@ fn open_run_drop_mvcc(
     )
     .unwrap();
 
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn.pragma_update("journal_mode", "'mvcc'").unwrap();
 
     conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)")

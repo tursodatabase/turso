@@ -1075,7 +1075,9 @@ mod tests {
     fn json_workload_variants_execute() {
         let io = Arc::new(MemoryIO::new());
         let database = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let connection = database.connect(ConnectOpts::new()).unwrap();
+        let connection = database
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         let document =
             r#"{"id":1,"meta":{"active":true},"items":[1,2,{"value":3}],"nullable":null}"#;
         let patch = r#"{"patched":true}"#;

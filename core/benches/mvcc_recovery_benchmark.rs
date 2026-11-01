@@ -58,7 +58,9 @@ fn build_mvcc_db_with_log(populate: impl FnOnce(&Arc<turso_core::Connection>)) -
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
         .unwrap();

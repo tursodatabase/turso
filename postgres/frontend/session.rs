@@ -12,6 +12,7 @@ use crate::settings::{
 };
 use crate::statement::{PgTxState, PostRunFn, TxRole};
 use turso_core::schema::Table;
+use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
@@ -119,14 +120,19 @@ fn refuse_a_file_with_tables_in_no_schema(
     if db.mvcc_enabled() {
         return Ok(());
     }
-    let conn = db.connect(turso_core::ConnectOpts::new())?;
+    let conn = db.connect(turso_core::ConnectOpts::new(
+        turso_core::SessionRole::Superuser,
+    ))?;
     refuse_tables_in_no_schema(&conn)?;
     Ok(())
 }
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
-        Self::connect_with(db, turso_core::ConnectOpts::new())
+        Self::connect_with(
+            db,
+            turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
+        )
     }
 
     /// Opens a session on `db`, connecting with `opts`, such as the
@@ -1043,15 +1049,33 @@ impl DeferredOperation {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
+                        require_superuser(conn, || {
+                            PermissionDenied::privilege(
+                                Action::Create,
+                                Object::Database(catalog::db_name_from_path(conn.db_file_path())),
+                            )
+                        })?;
                         create_schema_commands(conn, stmt)?
                     }
                     FrontendStmt::DropSchema(stmt) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
+                        require_superuser(conn, || {
+                            PermissionDenied::owner(
+                                Action::Drop,
+                                Object::Schema(stmt.name.to_lowercase()),
+                            )
+                        })?;
                         drop_schema_commands(conn, stmt)?
                     }
                     FrontendStmt::CopyFrom(stmt) => {
+                        require_superuser(conn, || {
+                            PermissionDenied::privilege(
+                                Action::Read,
+                                Object::File(stmt.filename.clone()),
+                            )
+                        })?;
                         *active = Some(crate::Statement::new(prepare_copy_columns(
                             conn,
                             &stmt.table_name,
@@ -1661,6 +1685,16 @@ fn prepare_set_transaction(
     Ok(crate::Statement::new_with_post_run(inner, post_run))
 }
 
+/// Statements that the frontend runs itself, outside the privilege checks of
+/// core, are allowed only for a superuser.
+fn require_superuser(conn: &Connection, denial: impl FnOnce() -> PermissionDenied) -> Result<()> {
+    if conn.role_catalog().is_superuser(conn.current_role()) {
+        Ok(())
+    } else {
+        Err(LimboError::PermissionDenied(Box::new(denial())))
+    }
+}
+
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
     conn.prepare("SELECT 0 WHERE 0")
 }
@@ -1764,9 +1798,10 @@ fn reset_all_settings(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Resets the session as DISCARD ALL does. tursopg has no temporary
-/// tables, SQL-level prepared statements or cached plans to drop. A server
-/// client's protocol-level prepared statements are not dropped.
+/// Resets the session as DISCARD ALL does, including the current role.
+/// tursopg has no temporary tables, SQL-level prepared statements or cached
+/// plans to drop. A server client's protocol-level prepared statements are
+/// not dropped.
 fn discard_all(conn: &Connection) -> Result<()> {
     if !conn.get_auto_commit() {
         return Err(sqlstate_error(
@@ -1776,6 +1811,7 @@ fn discard_all(conn: &Connection) -> Result<()> {
     }
     reset_all_settings(conn)?;
     conn.clear_sequence_currvals();
+    conn.reset_current_role();
     Ok(())
 }
 
@@ -2321,10 +2357,12 @@ mod tests {
             OpenOptions::new(Arc::new(PostgresDialect)),
         )
         .unwrap();
-        db.connect(turso_core::ConnectOpts::new())
-            .unwrap()
-            .execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
-            .unwrap();
+        db.connect(turso_core::ConnectOpts::new(
+            turso_core::SessionRole::Superuser,
+        ))
+        .unwrap()
+        .execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+        .unwrap();
         let error = match PgConnection::connect(&db) {
             Ok(_) => panic!("expected the database to be refused"),
             Err(error) => error.to_string(),

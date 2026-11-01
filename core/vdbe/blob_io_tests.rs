@@ -16,7 +16,8 @@ use crate::{
 fn fresh_db() -> Arc<Connection> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-    db.connect(ConnectOpts::new()).unwrap()
+    db.connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap()
 }
 
 fn fresh_db_with_opts(opts: DatabaseOpts) -> Arc<Connection> {
@@ -30,7 +31,8 @@ fn fresh_db_with_opts(opts: DatabaseOpts) -> Arc<Connection> {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    db.connect(ConnectOpts::new()).unwrap()
+    db.connect(ConnectOpts::new(crate::SessionRole::Superuser))
+        .unwrap()
 }
 
 fn exec(conn: &Arc<Connection>, sql: &str) {

@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use crate::connection::PrepareOptions;
 use tracing::{instrument, Level};
 use turso_parser::ast::{fmt::ToTokens, Cmd};
 
@@ -209,6 +210,7 @@ pub struct Statement {
     /// The command the statement was prepared from, when its SQL text cannot
     /// be parsed again, so that preparing it again translates the command.
     reprepare_cmd: Option<Cmd>,
+    reads_engine_metadata: bool,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -291,7 +293,13 @@ impl Statement {
             nested_guard_active,
             analyze_refresh: None,
             reprepare_cmd: None,
+            reads_engine_metadata: false,
         }
+    }
+
+    pub(crate) fn with_reads_engine_metadata(mut self, reads_engine_metadata: bool) -> Self {
+        self.reads_engine_metadata = reads_engine_metadata;
+        self
     }
 
     /// Mark this statement as the parked backing statement of an incremental
@@ -999,6 +1007,9 @@ impl Statement {
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
             let schema = conn.schema.read().clone();
+            let prepare_options = PrepareOptions {
+                reads_engine_metadata: self.reads_engine_metadata,
+            };
             translate::translate(
                 &schema,
                 stmt,
@@ -1008,6 +1019,7 @@ impl Statement {
                 mode,
                 &self.program.sql,
                 self.origin,
+                &prepare_options,
             )?
         };
 
@@ -1999,7 +2011,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        db.connect(ConnectOpts::new())
+        db.connect(ConnectOpts::new(crate::SessionRole::Superuser))
     }
 
     /// A hash join inside a correlated subquery is built once and probed once per

@@ -280,7 +280,7 @@ impl Limbo {
                 None,
                 Arc::new(SqliteDialect),
             )?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
             (io, conn)
         };
         unsafe {
@@ -500,7 +500,7 @@ impl Limbo {
             )
         };
         self.io = io;
-        self.conn = db.connect(ConnectOpts::new())?;
+        self.conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         self.opts.db_file = path.to_string();
         Ok(())
     }
@@ -2056,7 +2056,7 @@ impl Limbo {
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
         let db = Database::open_file(io.clone(), output_file, Arc::new(SqliteDialect))?;
-        let target = db.connect(ConnectOpts::new())?;
+        let target = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
         let mut applier = ApplyWriter::new(&target);
         Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;
@@ -2476,7 +2476,7 @@ mod tests {
     fn test_dump_and_reload_infinite_real() -> anyhow::Result<()> {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x REAL);")?;
         conn.execute("INSERT INTO t VALUES(1, 1e400), (2, -1e400), (3, 1.5), (4, NULL);")?;
 
@@ -2499,7 +2499,7 @@ mod tests {
 
         let io2: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
         let db2 = Database::open_file(io2, ":memory:", Arc::new(SqliteDialect))?;
-        let conn2 = db2.connect(ConnectOpts::new())?;
+        let conn2 = db2.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         for stmt in dump_sql.split(';') {
             let stmt = stmt.trim();
             if stmt.is_empty() {

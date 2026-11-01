@@ -90,7 +90,7 @@ impl TestServer {
             "127.0.0.1:0".to_string(),
             db_file,
             db,
-            ConnectOpts::new(),
+            ConnectOpts::new(turso_core::SessionRole::Superuser),
             Arc::new(AtomicUsize::new(0)),
         );
         let runtime = tokio::runtime::Runtime::new().unwrap();

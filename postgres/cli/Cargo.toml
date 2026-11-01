@@ -57,6 +57,9 @@ default = ["io_uring", "mimalloc"]
 io_uring = ["turso_core/io_uring"]
 mimalloc = ["dep:mimalloc"]
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [build-dependencies]
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 include_dir = "0.7"

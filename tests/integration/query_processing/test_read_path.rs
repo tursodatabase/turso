@@ -1304,7 +1304,7 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
 
     {
         let db = open(io.clone())?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         conn.execute("CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER, e TEXT)")?;
         for i in 0..ROWS {
             conn.execute(
@@ -1321,7 +1321,7 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     // A fresh Database over the same backing file starts with a cold page
     // cache, so every record (and its overflow chain) must be read back.
     let db = open(io.clone())?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     let mut stmt = conn.prepare("SELECT a, b, c, d, e FROM t")?;
     let mut io_yields = 0usize;
     let mut rows: Vec<(i64, usize, String, i64, String)> = Vec::new();
@@ -1395,7 +1395,7 @@ fn test_columns_before_overflow_value_do_not_read_overflow_pages() -> anyhow::Re
 
     {
         let db = open(io.clone())?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         conn.execute(
             "CREATE TABLE revisions(doc_id TEXT, rev INTEGER, saved_at INTEGER, body TEXT, tail TEXT)",
         )?;
@@ -1415,7 +1415,7 @@ fn test_columns_before_overflow_value_do_not_read_overflow_pages() -> anyhow::Re
     // cache, so every page the query needs is read again.
     let scan = |sql: &str| -> anyhow::Result<(Vec<Vec<Value>>, usize)> {
         let db = open(io.clone())?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         let mut stmt = conn.prepare(sql)?;
         let mut rows = Vec::new();
         let mut page_reads = 0;

@@ -111,7 +111,7 @@ fn run_with_stack(stack_size: usize, statements: Vec<String>) -> turso_core::Res
         .spawn(move || -> turso_core::Result<()> {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
-            let conn = db.connect(ConnectOpts::new())?;
+            let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
             for sql in &statements {
                 conn.execute(sql)?;
             }
