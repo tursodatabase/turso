@@ -141,6 +141,30 @@ expect {
     amount|''|f|t|||f|t|0
 }
 
+test pg-attribute-reports-generated-column {
+    CREATE TABLE generated_columns (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED);
+    SELECT a.attname, a.atthasdef, a.attgenerated
+    FROM pg_catalog.pg_attribute a
+    JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = 'generated_columns' AND a.attnum > 0
+    ORDER BY a.attnum;
+}
+expect {
+    a|f|
+    b|t|s
+}
+
+test pg-attrdef-has-a-row-for-generated-column {
+    CREATE TABLE generated_attrdef (a integer, b integer GENERATED ALWAYS AS (a * 2) STORED);
+    SELECT d.adnum
+    FROM pg_catalog.pg_attrdef d
+    JOIN pg_catalog.pg_class c ON c.oid = d.adrelid
+    WHERE c.relname = 'generated_attrdef';
+}
+expect {
+    2
+}
+
 test pg-index-nulls-are-distinct {
     CREATE TABLE nullable_index_columns (a integer, b text);
     CREATE INDEX nullable_plain_idx ON nullable_index_columns (a);
