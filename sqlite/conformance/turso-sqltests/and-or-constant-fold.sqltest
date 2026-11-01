@@ -1,0 +1,51 @@
+@database :memory:
+
+# SQLite 3.51 and later never run the other operand of `x AND 0` or `x OR 1`
+# when one operand is an integer literal or TRUE/FALSE, whatever the other
+# operand is (3.51: a subquery is not evaluated when it cannot change the
+# result; 3.54: `expr OR TRUE` and `expr OR FALSE`). SQLite 3.50.4, which
+# sqlite-sqltests run against, still runs a function call operand and the
+# operand of OR, so these cases live here. boolean.sqltest has the shapes both
+# versions agree on.
+
+test and-or-with-a-constant-operand-never-runs-a-function-call {
+    SELECT 1 OR json_extract('bare', '$.a'), 0 AND json_extract('bare', '$.a'), json_extract('bare', '$.a') OR 1, json_extract('bare', '$.a') AND 0;
+    SELECT 2 OR json_extract('bare', '$.a'), 2147483647 OR json_extract('bare', '$.a'), TRUE OR json_extract('bare', '$.a'), FALSE AND json_extract('bare', '$.a');
+    SELECT 0x0 AND json_extract('bare', '$.a'), ((0)) AND json_extract('bare', '$.a'), 00 AND json_extract('bare', '$.a');
+    SELECT NOT (json_extract('bare', '$.a') AND 0), (json_extract('bare', '$.a') AND 0) OR 1.5, 0 AND (1 OR json_extract('bare', '$.a')), json_extract('bare', '$.a') AND 1 AND 0;
+    SELECT coalesce(NULL, 0 AND json_extract('bare', '$.a')), iif(json_extract('bare', '$.a') OR 1, 'y', 'n'), CASE 0 AND json_extract('bare', '$.a') WHEN 0 THEN 'z' END;
+    SELECT typeof(1 OR json_extract('bare', '$.a')), typeof(0 AND 'x'), 0 AND 'x', 1 OR 'x';
+}
+expect {
+    1|0|1|0
+    1|1|1|0
+    0|0|0
+    1|1|0|0
+    0|y|z
+    integer|integer|0|1
+}
+
+test or-with-a-constant-true-operand-never-runs-a-subquery {
+    SELECT 1 OR (SELECT abs(-9223372036854775807 - 1)), (SELECT abs(-9223372036854775807 - 1)) OR 1, TRUE OR (SELECT abs(-9223372036854775807 - 1)), FALSE AND (SELECT abs(-9223372036854775807 - 1));
+}
+expect {
+    1|1|1|0
+}
+
+test and-or-with-a-constant-operand-folds-in-dml-and-ordering {
+    CREATE TABLE fold(a);
+    INSERT INTO fold VALUES (5);
+    SELECT 1 FROM fold ORDER BY json_extract('bare', '$.a') AND 0;
+    SELECT 1 FROM fold LIMIT json_extract('bare', '$.a') OR 1;
+    UPDATE fold SET a = json_extract('bare', '$.a') AND 0 RETURNING a;
+    INSERT INTO fold VALUES (json_extract('bare', '$.a') AND 0) RETURNING a;
+    CREATE VIEW fold_view AS SELECT 0 AND json_extract('bare', '$.a') AS c;
+    SELECT c FROM fold_view;
+}
+expect {
+    1
+    1
+    0
+    0
+    0
+}
