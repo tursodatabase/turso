@@ -2297,7 +2297,7 @@ fn build_where_term_info(
             let equal_tables = if term.consumed {
                 None
             } else {
-                tables_in_hashable_equal_test(&term.expr, table_references, resolver)?
+                tables_in_hashable_equal_test(&term.expr, table_references, subqueries, resolver)?
             };
             Ok(WhereTermInfo {
                 table_mask: table_mask_from_expr(&term.expr, table_references, subqueries)?,
