@@ -11665,7 +11665,7 @@ pub fn op_function(
                 ),
             },
         },
-        crate::function::Func::Dialect(name) => {
+        crate::function::Func::Dialect { name, .. } => {
             let args: Vec<Value> = state.registers[*start_reg..*start_reg + arg_count]
                 .iter()
                 .map(|r| r.get_value().clone())

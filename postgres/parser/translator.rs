@@ -4,7 +4,7 @@
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
 use crate::sqlstate::{
-    SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
+    SQLSTATE_DUPLICATE_COLUMN, SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
     SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
@@ -352,10 +352,24 @@ impl PostgreSQLTranslator {
             }
         }
 
+        let mut column_names = std::collections::HashSet::new();
         for elt in &create.table_elts {
             let Some(ref inner) = elt.node else { continue };
             match inner {
                 Node::ColumnDef(col_def) => {
+                    // IF NOT EXISTS skips an existing table without looking at
+                    // the column list, so this check waits for the core to
+                    // decide the table does not exist; the core then rejects a
+                    // duplicate column itself.
+                    if !create.if_not_exists && !column_names.insert(col_def.colname.clone()) {
+                        return Err(ParseError::Sqlstate {
+                            sqlstate: SQLSTATE_DUPLICATE_COLUMN,
+                            message: format!(
+                                "column \"{}\" specified more than once",
+                                col_def.colname
+                            ),
+                        });
+                    }
                     let col = self.translate_create_table_column(
                         col_def,
                         has_table_pk,
@@ -1664,6 +1678,8 @@ impl PostgreSQLTranslator {
     ) -> Result<(Vec<Vec<Box<ast::Expr>>>, Vec<bool>), ParseError> {
         use pg_query::protobuf::node::Node;
 
+        check_values_row_lengths(values_lists)?;
+
         // First pass: compute the default mask across ALL rows.
         // A column is "all defaults" only if every row has DEFAULT for that position.
         let mut default_mask: Vec<bool> = Vec::new();
@@ -1859,6 +1875,7 @@ impl PostgreSQLTranslator {
 
         // VALUES clause: standalone VALUES (1,'a'), (2,'b') ...
         if !select.values_lists.is_empty() && select.target_list.is_empty() {
+            check_values_row_lengths(&select.values_lists)?;
             let mut rows = Vec::new();
             for row_node in &select.values_lists {
                 let Some(pg_query::protobuf::node::Node::List(list)) = &row_node.node else {
@@ -2998,6 +3015,24 @@ impl PostgreSQLTranslator {
                     return Err(not_supported("a type modifier in a cast"));
                 }
                 let type_name = pg_type_name_to_ast_type(pg_type_name)?;
+                let pg_type = object_name(&pg_type_name.names, is_default_schema, "type")?;
+                // Index expressions cannot call frontend functions, so index
+                // casts keep SQLite's lenient input handling.
+                let expr = match cast_input_check_type(&pg_type) {
+                    Some(label)
+                        if !self.translating_index.get()
+                            && pg_type_name.array_bounds.is_empty() =>
+                    {
+                        Box::new(function_call(
+                            "pg_cast_input",
+                            vec![
+                                *expr,
+                                ast::Expr::Literal(ast::Literal::String(format!("'{label}'"))),
+                            ],
+                        ))
+                    }
+                    _ => expr,
+                };
                 Ok(ast::Expr::Cast {
                     expr,
                     type_name: Some(type_name),
@@ -3493,9 +3528,7 @@ impl PostgreSQLTranslator {
                     ast::UnaryOperator::BitwiseNot,
                     Box::new(operand),
                 )),
-                _ => Err(ParseError::ParseError(format!(
-                    "Unsupported unary operator: {op_name}"
-                ))),
+                _ => Err(unsupported_prefix_operator(op_name)),
             };
         }
 
@@ -3605,11 +3638,7 @@ impl PostgreSQLTranslator {
                     },
                 });
             }
-            _ => {
-                return Err(ParseError::ParseError(format!(
-                    "Unsupported operator: {op_name}"
-                )));
-            }
+            _ => return Err(unsupported_operator(op_name)),
         };
 
         Ok(ast::Expr::Binary(left, binary_op, right))
@@ -4260,7 +4289,7 @@ impl PostgreSQLTranslator {
 
         let exprs: Vec<Box<ast::Expr>> = group_clause
             .iter()
-            .map(|node| Ok(Box::new(self.translate_expr(node)?)))
+            .map(|node| Ok(Box::new(self.translate_sort_term(node)?)))
             .collect::<Result<Vec<_>, ParseError>>()?;
 
         let having = if let Some(having_node) = having_clause {
@@ -4750,6 +4779,28 @@ impl PostgreSQLTranslator {
         })))
     }
 
+    /// An ORDER BY or GROUP BY term. Collations are dropped everywhere
+    /// else, but a COLLATE around a constant keeps a no-op BINARY wrapper:
+    /// PostgreSQL reads the wrapped constant as an expression, while a bare
+    /// constant is a position or an error.
+    fn translate_sort_term(
+        &self,
+        node: &pg_query::protobuf::Node,
+    ) -> Result<ast::Expr, ParseError> {
+        use pg_query::protobuf::node::Node;
+        if let Some(Node::CollateClause(collate)) = &node.node {
+            if let Some(arg) = &collate.arg {
+                if matches!(&arg.node, Some(Node::AConst(_))) {
+                    return Ok(ast::Expr::Collate(
+                        Box::new(self.translate_expr(arg)?),
+                        ast::Name::exact("BINARY".to_string()),
+                    ));
+                }
+            }
+        }
+        self.translate_expr(node)
+    }
+
     fn translate_order_by(
         &self,
         sort_clause: &[pg_query::protobuf::Node],
@@ -4759,7 +4810,7 @@ impl PostgreSQLTranslator {
             match &node.node {
                 Some(pg_query::protobuf::node::Node::SortBy(sort_by)) => {
                     let expr = if let Some(ref sort_node) = sort_by.node {
-                        Box::new(self.translate_expr(sort_node)?)
+                        Box::new(self.translate_sort_term(sort_node)?)
                     } else {
                         return Err(ParseError::ParseError(
                             "Missing sort expression".to_string(),
@@ -5123,6 +5174,56 @@ impl PostgreSQLTranslator {
             constraints,
         })
     }
+}
+
+fn unsupported_operator(op_name: &str) -> ParseError {
+    // The infix operator names of PostgreSQL's pg_operator.
+    const POSTGRES_OPERATOR_NAMES: &[&str] = &[
+        "!~", "!~*", "!~~", "!~~*", "##", "#", "#-", "#>", "#>>", "%", "&&", "&", "&<", "&<|",
+        "&>", "*", "*<", "*<=", "*<>", "*=", "*>", "*>=", "+", "-", "->", "->>", "-|-", "/", "<",
+        "<->", "<<", "<<=", "<<|", "<=", "<>", "<@", "<^", "=", ">", ">=", ">>", ">>=", ">^", "?#",
+        "?&", "?", "?-", "?-|", "?|", "?||", "@>", "@?", "@@", "@@@", "^", "^@", "|&>", "|", "|>>",
+        "||", "~", "~*", "~<=~", "~<~", "~=", "~>=~", "~>~", "~~", "~~*",
+    ];
+    operator_error(op_name, POSTGRES_OPERATOR_NAMES)
+}
+
+fn unsupported_prefix_operator(op_name: &str) -> ParseError {
+    // The prefix operator names of PostgreSQL's pg_operator.
+    const POSTGRES_PREFIX_OPERATOR_NAMES: &[&str] = &[
+        "#", "+", "-", "?-", "?|", "@", "@-@", "@@", "|/", "||/", "~",
+    ];
+    operator_error(op_name, POSTGRES_PREFIX_OPERATOR_NAMES)
+}
+
+fn operator_error(op_name: &str, postgres_operator_names: &[&str]) -> ParseError {
+    if postgres_operator_names.contains(&op_name) {
+        not_supported(format!("operator {op_name}"))
+    } else {
+        ParseError::Sqlstate {
+            sqlstate: crate::sqlstate::SQLSTATE_UNDEFINED_FUNCTION,
+            message: format!("operator does not exist: {op_name}"),
+        }
+    }
+}
+
+fn check_values_row_lengths(values_lists: &[pg_query::protobuf::Node]) -> Result<(), ParseError> {
+    use pg_query::protobuf::node::Node;
+    let row_length = |row: &pg_query::protobuf::Node| match &row.node {
+        Some(Node::List(list)) => list.items.len(),
+        _ => 0,
+    };
+    let Some(first) = values_lists.first() else {
+        return Ok(());
+    };
+    let expected = row_length(first);
+    if values_lists.iter().any(|row| row_length(row) != expected) {
+        return Err(ParseError::Sqlstate {
+            sqlstate: crate::sqlstate::SQLSTATE_SYNTAX_ERROR,
+            message: "VALUES lists must all be the same length".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[allow(clippy::vec_box)]
@@ -6069,9 +6170,7 @@ fn pg_type_name_to_ast_type(
         "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
             "REAL"
         }
-        // For CAST expressions, map all text-like PG types to TEXT and
-        // boolean to INTEGER for SQLite VDBE compatibility
-        "BOOLEAN" | "BOOL" => "INTEGER",
+        "BOOLEAN" | "BOOL" => "boolean",
         "DATE" => "date",
         "TIME" | "TIMETZ" => "time",
         "TIMESTAMP" => "timestamp",
@@ -6089,6 +6188,22 @@ fn pg_type_name_to_ast_type(
         size: None,
         array_dimensions: type_name.array_bounds.len() as u32,
     })
+}
+
+/// The PostgreSQL name of a cast target whose input the frontend's
+/// pg_cast_input function validates before the lenient SQLite CAST runs.
+fn cast_input_check_type(pg_type: &str) -> Option<&'static str> {
+    match pg_type.to_uppercase().as_str() {
+        "INT2" | "SMALLINT" => Some("smallint"),
+        "INT4" | "INT" | "INTEGER" => Some("integer"),
+        "INT8" | "BIGINT" => Some("bigint"),
+        "FLOAT4" | "REAL" => Some("real"),
+        "FLOAT8" | "DOUBLE PRECISION" => Some("double precision"),
+        "NUMERIC" | "DECIMAL" => Some("numeric"),
+        "JSON" => Some("json"),
+        "JSONB" => Some("jsonb"),
+        _ => None,
+    }
 }
 
 fn extract_type_name_from_typename(

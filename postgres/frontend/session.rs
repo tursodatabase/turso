@@ -414,6 +414,9 @@ fn prepare_statement_inner(
         .translate_with_prereqs(&parse_result)
         .map_err(|e| translation_error(&pg_conn.conn, e))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    if let ast::Stmt::DropIndex { idx_name, .. } = translated.cmd.stmt() {
+        reject_drop_of_non_index(&pg_conn.conn, idx_name)?;
+    }
     if let ast::Stmt::DropView { view_name, .. } = translated.cmd.stmt() {
         reject_drop_of_other_view_kind(&pg_conn.conn, view_name, is_drop_matview(&parse_result))?;
     }
@@ -518,25 +521,33 @@ fn tx_state_post_run(
                 Ok(())
             })
         }
-        TxRole::Other => match stmt {
-            ast::Stmt::Savepoint { name } => {
-                let name = name.as_str().to_string();
-                Arc::new(move |result: crate::Result<()>| {
-                    result?;
-                    tx.savepoint_created(&conn, &name);
-                    Ok(())
-                })
-            }
-            ast::Stmt::Release { name } => {
-                let name = name.as_str().to_string();
-                Arc::new(move |result: crate::Result<()>| {
-                    result?;
-                    tx.savepoint_released(&conn, &name);
-                    Ok(())
-                })
-            }
-            _ => Arc::new(|result| result),
-        },
+        TxRole::Savepoint => {
+            let name = match stmt {
+                ast::Stmt::Savepoint { name } => Some(name.as_str().to_string()),
+                _ => None,
+            };
+            Arc::new(move |result: crate::Result<()>| {
+                result?;
+                if let Some(name) = &name {
+                    tx.savepoint_created(&conn, name);
+                }
+                Ok(())
+            })
+        }
+        TxRole::Release => {
+            let name = match stmt {
+                ast::Stmt::Release { name } => Some(name.as_str().to_string()),
+                _ => None,
+            };
+            Arc::new(move |result: crate::Result<()>| {
+                result?;
+                if let Some(name) = &name {
+                    tx.savepoint_released(&conn, name);
+                }
+                Ok(())
+            })
+        }
+        TxRole::Other => Arc::new(|result| result),
     }
 }
 
@@ -559,6 +570,8 @@ fn tx_role(stmt: &ast::Stmt) -> TxRole {
             ..
         } => TxRole::RollbackToSavepoint,
         ast::Stmt::Rollback { .. } => TxRole::Rollback,
+        ast::Stmt::Savepoint { .. } => TxRole::Savepoint,
+        ast::Stmt::Release { .. } => TxRole::Release,
         _ => TxRole::Other,
     }
 }
@@ -1439,6 +1452,35 @@ fn relation_name_is_taken(
     Ok(taken)
 }
 
+/// DROP INDEX of a table or view is a wrong object type rather than a
+/// missing index.
+fn reject_drop_of_non_index(
+    conn: &Arc<Connection>,
+    idx_name: &ast::QualifiedName,
+) -> Result<()> {
+    use turso_core::schema::SchemaObjectType;
+    let schema = conn.current_schema();
+    let name = idx_name.name.as_str();
+    let found = match &idx_name.namespace {
+        Some(namespace) => conn.qualifier(namespace.as_str()).and_then(|q| {
+            schema.get_object_type(q.target.id, name)
+        }),
+        None => conn.search_order().into_iter().find_map(|q| {
+            schema.get_object_type(q.target.id, name)
+        }),
+    };
+    let Some(kind) = found else {
+        return Ok(());
+    };
+    if kind != SchemaObjectType::Index {
+        return Err(sqlstate_error(
+            SQLSTATE_WRONG_OBJECT_TYPE,
+            format!("\"{name}\" is not an index"),
+        ));
+    }
+    Ok(())
+}
+
 /// PostgreSQL refuses DROP VIEW and DROP MATERIALIZED VIEW on a relation of
 /// another kind, but core's DROP VIEW drops both kinds of view. The relation
 /// is the first table or view named `view_name` in the databases that core
@@ -1662,7 +1704,7 @@ fn prepare_set_transaction(
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
-    conn.prepare("SELECT 0 WHERE 0")
+    conn.prepare("SELECT 0 LIMIT 0")
 }
 
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {

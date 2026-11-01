@@ -803,6 +803,13 @@ fn translate_cast_expr(
             // SQLite's CAST: CAST(x AS NUMERIC) is a common SQLite idiom.
             let user_param_count = resolved.leaf().user_params().count();
             if user_param_count == 0 || ty_params.len() == user_param_count {
+                if resolved
+                    .chain
+                    .iter()
+                    .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
+                {
+                    emit_integer_to_boolean_cast(program, target_register);
+                }
                 emit_store_value(
                     program,
                     &resolved.chain[..1],
@@ -933,7 +940,7 @@ fn translate_function_call_expr(
         Func::Window(_) => {
             crate::bail_parse_error!("misuse of window function {}()", name.as_str())
         }
-        Func::External(_) | Func::Dialect(_) => {
+        Func::External(_) | Func::Dialect { .. } => {
             let regs = program.alloc_registers(args_count);
             for (i, arg_expr) in args.iter().enumerate() {
                 translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;

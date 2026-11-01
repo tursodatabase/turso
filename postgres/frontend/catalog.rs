@@ -184,7 +184,32 @@ impl Dialect for PostgresDialect {
         if name.eq_ignore_ascii_case("random") {
             return Ok(None);
         }
+        // These need PostgreSQL's range errors and strict input, so the
+        // dialect runs them instead of the engine builtins, carrying the
+        // result type the builtins would have inferred.
+        let dialect_return_type = match (name, arg_count) {
+            ("exp", 1) | ("sqrt", 1) | ("ln", 1) | ("log", 1 | 2) | ("power" | "pow", 2) => {
+                Some(turso_core::native_ext::ReturnType::Real)
+            }
+            ("chr", 1) => Some(turso_core::native_ext::ReturnType::Text),
+            _ => None,
+        };
+        if dialect_return_type.is_some() {
+            return Ok(Some(Func::Dialect {
+                name: name.to_string(),
+                return_type: dialect_return_type,
+            }));
+        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
+    }
+
+    fn exec_scalar_function(
+        &self,
+        _conn: &Connection,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value> {
+        crate::functions::exec_math_with_range_errors(name, args)
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -213,6 +238,18 @@ impl Dialect for PostgresDialect {
 
     fn errors_on_zero_divisor(&self) -> bool {
         true
+    }
+
+    fn allows_bare_columns_in_aggregate_queries(&self) -> bool {
+        false
+    }
+
+    fn allows_numeric_constants_in_where(&self) -> bool {
+        false
+    }
+
+    fn allows_non_integer_sort_constants(&self) -> bool {
+        false
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {
@@ -4168,7 +4205,7 @@ mod tests {
             );
             conn.execute("CREATE TABLE namespace_counts (n INT)")
                 .unwrap();
-            conn.execute("CREATE TRIGGER catalog_check AFTER INSERT ON second_connection BEGIN INSERT INTO namespace_counts SELECT COUNT(*) FROM main.pg_namespace LEFT JOIN main.pg_policy ON 1; END").unwrap();
+            conn.execute("CREATE TRIGGER catalog_check AFTER INSERT ON second_connection BEGIN INSERT INTO namespace_counts SELECT COUNT(*) FROM main.pg_namespace LEFT JOIN main.pg_policy ON true; END").unwrap();
             conn.execute("INSERT INTO second_connection VALUES (7)")
                 .unwrap();
             let mut counts = conn.prepare("SELECT n FROM namespace_counts").unwrap();

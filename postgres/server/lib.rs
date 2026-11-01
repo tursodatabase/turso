@@ -905,7 +905,9 @@ mod tests {
     fn error_response_fields_end_at_nul() {
         let (mut client, _conn) = copy_test_client();
         let events = client
-            .simple_query("SELECT set_config('nodot' || chr(0) || 'Dinjected detail', 'x', false)")
+            .simple_query(
+                "SELECT set_config('nodot' || \"char\"(0) || 'Dinjected detail', 'x', false)",
+            )
             .unwrap();
         let fields = events
             .iter()
@@ -1296,6 +1298,9 @@ mod tests {
             ("SELECT CAST(1 AS timestamptz)", Type::TIMESTAMPTZ),
             ("SELECT random()", Type::FLOAT8),
             ("SELECT random() * 10", Type::FLOAT8),
+            ("SELECT sqrt(4.0)", Type::FLOAT8),
+            ("SELECT exp(1.0)", Type::FLOAT8),
+            ("SELECT power(2.0, 3.0)", Type::FLOAT8),
         ] {
             let mut stmt = conn.prepare(sql).unwrap();
             let fields = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
