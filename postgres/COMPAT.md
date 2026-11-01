@@ -249,11 +249,11 @@ INTEGER. Unknown type names pass through as custom types.
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
-| Stored generated columns | ❌ Not supported | GENERATED ... AS rejected |
+| Stored generated columns | ⚠️ Partial | Computed on read, not stored, which gives the same values because the expression must be immutable. Column types with their own write checks or encoding are rejected (smallint, varchar(n), numeric(p,s), uuid, jsonb, timestamptz, cidr, macaddr, domains, enums); so are a generated PRIMARY KEY, `t.a` in the expression, DROP EXPRESSION, `UPDATE SET b = DEFAULT` and `INSERT INTO t VALUES (1, DEFAULT)` without a column list. ALTER TABLE ADD COLUMN cannot refuse an expression that reads another generated column, and the expression's type is not checked at CREATE TABLE: it is cast to the column's type when computed |
 | Temporal constraints | ❌ Not supported | |
 | Temporary tables (CREATE TEMP TABLE) | ❌ Not supported | Rejected (UNLOGGED is accepted and creates an ordinary table) |
 | Typed tables | ❌ Not supported | |
-| Virtual generated columns | ❌ Not supported | GENERATED ... AS rejected |
+| Virtual generated columns | ❌ Not supported | GENERATED ... VIRTUAL is PostgreSQL 18 syntax, and the parser is older |
 
 ## Performance
 

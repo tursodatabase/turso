@@ -229,6 +229,8 @@ The `GENERATED ALWAYS` and `VIRTUAL` keywords are optional, so `total REAL AS (p
 
 Turso supports only virtual generated columns. A `STORED` generated column gives an error.
 
+The PostgreSQL frontend accepts `GENERATED ALWAYS AS (expression) STORED` and computes the value on read, so it is not stored in the row either. The catalogs report the column as stored, and `pg_dump` writes it the same way. Types that check or convert what is written, such as `smallint`, `varchar(n)`, `numeric(p, s)`, `uuid`, `jsonb` and `timestamptz`, cannot be used for a generated column.
+
 ## Table Constraints
 
 Table constraints apply to one or more columns and are specified after all column definitions.
