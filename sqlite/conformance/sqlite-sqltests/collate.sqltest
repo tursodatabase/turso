@@ -2361,3 +2361,35 @@ expect {
     u|b
     ui|A
 }
+
+# x IN (c) with one constant item is x = +c in SQLite, so an explicit COLLATE
+# on either side applies, the left first. A unary +, parentheses, a function
+# of constants or a CAST keep the item constant.
+test collate-in-one-constant-item-compares-like-equals {
+    CREATE TABLE r(value TEXT COLLATE NOCASE);
+    INSERT INTO r VALUES('a');
+    SELECT 'A' IN ('a' COLLATE NOCASE), 'A' IN (('a' COLLATE NOCASE)), 'A' IN (+('a' COLLATE NOCASE));
+    SELECT 'A' IN (lower('A') COLLATE NOCASE), 'A' IN (CAST('a' AS TEXT) COLLATE NOCASE), 'A' IN ('a' COLLATE NOCASE || '');
+    SELECT 'A' NOT IN ('a' COLLATE NOCASE), value IN ('A' COLLATE BINARY), (value COLLATE BINARY) IN ('A' COLLATE NOCASE) FROM r;
+}
+expect {
+    1|1|1
+    1|1|1
+    0|0|0
+}
+
+# Any other list compares with the collation of the left operand alone: a
+# column or a subquery as the one item, or two or more items, do not bring
+# their collation, explicit or not.
+test collate-in-list-uses-the-left-operand-collation {
+    CREATE TABLE r(value TEXT COLLATE NOCASE);
+    INSERT INTO r VALUES('a');
+    SELECT 'A' IN (value), 'A' IN (value COLLATE NOCASE), 'A' IN ('a' COLLATE NOCASE, 'x') FROM r;
+    SELECT 'A' IN (value COLLATE NOCASE, 'x'), value IN ('A', 'x'), ('A' COLLATE NOCASE) IN (value COLLATE BINARY) FROM r;
+    SELECT ('A' COLLATE BINARY) IN (value COLLATE NOCASE), 'A' IN ((SELECT 'a') COLLATE NOCASE), 'A' IN (SELECT value FROM r) FROM r;
+}
+expect {
+    0|0|0
+    0|1|1
+    0|0|1
+}

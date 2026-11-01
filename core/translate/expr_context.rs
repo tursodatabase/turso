@@ -62,6 +62,10 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
     pub(crate) fn schema(&self) -> &Schema {
         self.resolver.schema()
     }
+
+    pub(crate) fn resolver(&self) -> &Resolver<'schema> {
+        self.resolver
+    }
 }
 
 impl ExprProperties for ExprContext<'_, '_> {
