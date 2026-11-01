@@ -866,7 +866,7 @@ fn get_subquery_parser<'a>(
                 let reg_start = program.alloc_registers(reg_count);
 
                 let env = TypeEnv::new(Some(&plan.table_references), resolver);
-                let columns = plan
+                let columns: Vec<_> = plan
                     .result_columns
                     .iter()
                     .map(|result_col| RowValueSubqueryColumn {
@@ -877,6 +877,9 @@ fn get_subquery_parser<'a>(
                         expr_type: type_of(&result_col.expr, &env),
                     })
                     .collect();
+                if let [column] = columns.as_slice() {
+                    referenced_tables.add_scalar_subquery_affinity(subquery_id, column.affinity);
+                }
                 resolver.row_value_subqueries.insert(
                     subquery_id,
                     RowValueSubquery {
