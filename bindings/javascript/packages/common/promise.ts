@@ -1412,12 +1412,14 @@ class Statement {
    * @returns this - Statement with binded parameters
    */
   bind(...bindParameters) {
-    try {
-      bindParams(this.stmt, bindParameters);
-      return this;
-    } catch (err) {
-      throw convertError(err);
-    }
+    this.stmt.apply(stmt => {
+      try {
+        bindParams(stmt, bindParameters);
+      } catch (err) {
+        throw convertError(err);
+      }
+    });
+    return this;
   }
 
   close() {
