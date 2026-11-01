@@ -937,6 +937,76 @@ fn copy_to_stdout_is_rejected_while_aborted() {
 }
 
 #[test]
+fn copy_text_encoding_returns_one_record_per_row() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use turso_core::IO;
+
+    let io = Arc::new(CountedYieldIO::default());
+    let db = turso_pg::open_database_with_io(
+        io.clone(),
+        "copy-encoding.db",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+    )
+    .unwrap();
+    let conn = Connection::connect(&db).unwrap();
+    conn.execute("CREATE TABLE t (b BOOLEAN, n BIGINT, f FLOAT8, s TEXT, a INT[], z TIMESTAMPTZ, ts TIMESTAMP, data BYTEA)").unwrap();
+    conn.execute(r#"INSERT INTO t VALUES
+        (true, -17, 1.25, E'\\N\t\n\r\b\f\013é', ARRAY[2,7], '2026-10-31 12:34:56', '2026-10-31 12:34:56', NULL),
+        (false, 0, 1e100, '', ARRAY[]::INT[], NULL, NULL, NULL),
+        (NULL, NULL, -1e-100, NULL, NULL, NULL, NULL, NULL)"#).unwrap();
+    let mut update = conn
+        .prepare("UPDATE t SET data = $1 WHERE n = -17")
+        .unwrap();
+    update
+        .bind_at(
+            std::num::NonZero::new(1).unwrap(),
+            Value::from_blob(vec![0, 255]),
+        )
+        .unwrap();
+    update.run_ignore_rows().unwrap();
+    conn.inner()
+        .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    conn.inner().get_pager().clear_page_cache(false);
+    let spec = turso_pg_parser::copy::parse_copy_to_stdout("COPY t TO STDOUT")
+        .unwrap()
+        .unwrap();
+    let mut stmt = conn.prepare_copy_to_stdout(&spec).unwrap();
+    let encoder = turso_pg::CopyTextEncoder::new(&stmt);
+    let expected = [
+        "t\t-17\t1.25\t\\\\N\\t\\n\\r\\b\\f\\vé\t{2,7}\t2026-10-31 12:34:56+00\t2026-10-31 12:34:56\t\\\\x00ff\n",
+        "f\t0\t1e100\t\t{}\t\\N\t\\N\t\\N\n",
+        "\\N\t\\N\t-1e-100\t\\N\t\\N\t\\N\t\\N\t\\N\n",
+    ];
+    let mut rows = 0;
+    let mut yields = 0;
+    let mut output = Vec::new();
+    loop {
+        let before = io.steps.load(Relaxed);
+        let result = stmt.step().unwrap();
+        assert_eq!(io.steps.load(Relaxed), before, "COPY pumped I/O");
+        match result {
+            StepResult::Row => {
+                output.clear();
+                encoder.encode_row(stmt.row().unwrap(), &mut output);
+                assert_eq!(output, expected[rows].as_bytes());
+                assert_eq!(io.steps.load(Relaxed), before, "encoding pumped I/O");
+                rows += 1;
+            }
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                yields += 1;
+                io.step().unwrap();
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected COPY result: {other:?}"),
+        }
+    }
+    assert_eq!(rows, expected.len());
+    assert!(yields > 0);
+}
+
+#[test]
 fn and_chain_is_rejected_in_every_transaction_state() {
     // PostgreSQL's COMMIT/ROLLBACK AND CHAIN ends the transaction and starts
     // a new one with the same characteristics — on an aborted block too

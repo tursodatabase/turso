@@ -99,3 +99,13 @@ The PostgreSQL dump fuzzer uses comfy-table, distributed by its authors:
 
 * License: licenses/testing/comfy-table-mit-license.md (MIT License)
 * Homepage: https://github.com/nukesor/comfy-table
+
+The PostgreSQL frontend includes text-formatting code adapted from pgwire 0.36.3:
+
+* License: licenses/pgwire-mit-license.md (MIT License)
+* Homepage: https://github.com/sunng87/pgwire
+
+The PostgreSQL frontend depends on Ryū, distributed by its authors:
+
+* License: licenses/ryu-boost-license.md (Boost Software License 1.0)
+* Homepage: https://github.com/dtolnay/ryu
