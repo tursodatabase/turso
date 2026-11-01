@@ -4687,6 +4687,14 @@ impl Pager {
                             "dirty page still has overflow cells at commit time",
                             { "page_id": page.get().id() }
                         );
+                        // A page 1 frame that a cacheflush wrote earlier in this
+                        // transaction keeps the old counter, but the commit frame
+                        // written here supersedes it.
+                        if page.get().id() == DatabaseHeader::PAGE_ID {
+                            let change_counter =
+                                HeaderRef(page.clone()).borrow().change_counter.get();
+                            Self::write_change_counter(&page, change_counter);
+                        }
                         commit_info.page_source_cursor += 1;
                         commit_info.collected_pages.push(page);
 
@@ -4816,6 +4824,17 @@ impl Pager {
                 CommitState::AutoCheckpoint => panic!("checkpoint must be handled externally"),
             }
         }
+    }
+
+    /// Like SQLite's pager_write_changecounter: a transaction that writes page 1
+    /// sets the file change counter to the value it had when the transaction
+    /// started plus one, and records the new value as version-valid-for, which
+    /// tells readers that the in-header database size is current.
+    pub(crate) fn write_change_counter(page_1: &PageRef, change_counter_at_start: u32) {
+        let header_ref = HeaderRefMut(page_1.clone());
+        let header = header_ref.borrow_mut();
+        header.change_counter = change_counter_at_start.wrapping_add(1).into();
+        header.version_valid_for = header.change_counter;
     }
 
     /// Prepare collected pages as WAL frames without submitting I/O.
