@@ -3146,3 +3146,33 @@ expect {
     1|1|10
     2|2|0
 }
+
+# SQLite's RETURNING sees only the updated table. PostgreSQL's also sees the
+# FROM tables, and that must not leak into the SQLite dialect.
+@cross-check-integrity
+test update-from-returning-star-has-only-target-columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, w INTEGER);
+    INSERT INTO t VALUES(1,0);
+    INSERT INTO s VALUES(1,5);
+    UPDATE t SET v = s.w FROM s WHERE t.id = s.id RETURNING *;
+}
+expect {
+    1|5
+}
+
+test update-from-returning-rejects-from-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, w INTEGER);
+    UPDATE t SET v = s.w FROM s WHERE t.id = s.id RETURNING s.w;
+}
+expect error {
+}
+
+test update-from-returning-rejects-table-star {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE s(id INTEGER PRIMARY KEY, w INTEGER);
+    UPDATE t SET v = s.w FROM s WHERE t.id = s.id RETURNING t.*;
+}
+expect error {
+}

@@ -1780,9 +1780,6 @@ impl PostgreSQLTranslator {
             None
         };
 
-        if !update.from_clause.is_empty() && update.returning_list.iter().any(is_bare_star) {
-            return Err(not_supported("RETURNING * on UPDATE ... FROM"));
-        }
         let returning = self.translate_returning(
             &update.returning_list,
             relation,
@@ -4615,7 +4612,11 @@ impl PostgreSQLTranslator {
         let mut columns = Vec::with_capacity(returning_list.len());
         for node in returning_list {
             if is_star_qualified_by(node, target_qualifiers) {
-                columns.push(ast::ResultColumn::Star);
+                columns.push(if only_target_in_scope {
+                    ast::ResultColumn::Star
+                } else {
+                    ast::ResultColumn::TableStar(ast::Name::exact(target_qualifiers[0].to_string()))
+                });
                 continue;
             }
             if only_target_in_scope {
@@ -5580,20 +5581,6 @@ fn reject_duplicate_columns<'a>(
         }
     }
     Ok(())
-}
-
-fn is_bare_star(node: &pg_query::protobuf::Node) -> bool {
-    use pg_query::protobuf::node::Node;
-    let Some(Node::ResTarget(res_target)) = &node.node else {
-        return false;
-    };
-    match res_target.val.as_ref().and_then(|v| v.node.as_ref()) {
-        Some(Node::AStar(_)) => true,
-        Some(Node::ColumnRef(col_ref)) => {
-            matches!(col_ref.fields.as_slice(), [f] if matches!(f.node, Some(Node::AStar(_))))
-        }
-        _ => false,
-    }
 }
 
 /// Whether `node` is a `qualifier.*` RETURNING target whose qualifier, read
@@ -11053,12 +11040,9 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_update_from_returning_star() {
-        assert_not_supported(
-            "UPDATE t SET a = u.a FROM u WHERE t.id = u.id RETURNING *",
-            "RETURNING * on UPDATE ... FROM",
-        );
-        assert_translates("UPDATE t SET a = u.a FROM u WHERE t.id = u.id RETURNING t.*, a");
+    fn update_from_returning_star_translates() {
+        assert_translates("UPDATE t SET a = u.a FROM u WHERE t.id = u.id RETURNING *");
+        assert_translates("UPDATE t SET a = u.a FROM u WHERE t.id = u.id RETURNING t.*, u.*, a");
         assert_translates("UPDATE t SET a = 1 RETURNING *");
     }
 

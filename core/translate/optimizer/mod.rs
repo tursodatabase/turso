@@ -42,7 +42,7 @@ use crate::{
         plan::{
             DmlSafetyReason, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
             NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
-            SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause, WriteSetPlan,
+            SubqueryEvalPhase, SubqueryOrigin, SubqueryState, WriteSetPlan,
         },
         trigger_exec::has_triggers_including_temp,
     },
@@ -1360,14 +1360,14 @@ fn optimize_update_plan(
     )? {
         plan.contains_constant_false_condition = true;
         if is_update_from {
-            let update_from_set_result_columns = update_from_set_result_columns(&plan.set_clauses);
-            build_update_write_set_plan(program, plan, update_from_set_result_columns)?;
+            let update_from_result_columns = update_from_result_columns(plan);
+            build_update_write_set_plan(program, plan, update_from_result_columns)?;
         }
         return Ok(());
     }
     if is_update_from {
-        let update_from_set_result_columns = update_from_set_result_columns(&plan.set_clauses);
-        build_update_write_set_plan(program, plan, update_from_set_result_columns)?;
+        let update_from_result_columns = update_from_result_columns(plan);
+        build_update_write_set_plan(program, plan, update_from_result_columns)?;
         optimize_select_plan(
             &mut plan
                 .write_set_plan
@@ -1586,8 +1586,8 @@ fn update_from_scratch_col_name(idx: usize) -> String {
     format!("__update_from_{idx}")
 }
 
-fn update_from_scratch_columns(set_clause_count: usize) -> Result<crate::alloc::Vec<Column>> {
-    Ok((0..set_clause_count)
+fn update_from_scratch_columns(column_count: usize) -> Result<crate::alloc::Vec<Column>> {
+    Ok((0..column_count)
         .map(|idx| {
             // Keep scratch-table columns at BLOB affinity so materializing SET payloads
             // does not coerce values before the real target-column affinity is applied.
@@ -1608,17 +1608,18 @@ fn update_from_scratch_columns(set_clause_count: usize) -> Result<crate::alloc::
 /// mutating write loop runs.
 ///
 /// Plain UPDATE materializes only target rowids. `UPDATE ... FROM` materializes
-/// both the chosen SET payloads and the target rowid, using the FROM-side graph
-/// plus the target table as the read-side SELECT source.
+/// the chosen SET payloads, the FROM values that RETURNING reads and the target
+/// rowid, using the FROM-side graph plus the target table as the read-side SELECT
+/// source.
 fn build_update_write_set_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
-    update_from_set_result_columns: Vec<ResultSetColumn>,
+    update_from_result_columns: Vec<ResultSetColumn>,
 ) -> Result<()> {
     let scratch_table_id = program.table_reference_counter.next();
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
     let columns = if is_update_from {
-        update_from_scratch_columns(plan.set_clauses.len())?
+        update_from_scratch_columns(update_from_result_columns.len())?
     } else {
         std::iter::once((*ROWID_COLUMN).clone()).try_collect()?
     };
@@ -1658,7 +1659,7 @@ fn build_update_write_set_plan(
     };
     let rowid_internal_id = plan.target_table.internal_id;
 
-    let mut result_columns = update_from_set_result_columns;
+    let mut result_columns = update_from_result_columns;
     result_columns.push(ResultSetColumn {
         expr: Expr::RowId {
             database: None,
@@ -1761,12 +1762,14 @@ fn default_join_order(table_references: &TableReferences) -> Vec<JoinOrderMember
         .collect()
 }
 
-fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<ResultSetColumn> {
-    set_clauses
+fn update_from_result_columns(plan: &UpdatePlan) -> Vec<ResultSetColumn> {
+    plan.set_clauses
         .iter()
+        .map(|set_clause| set_clause.expr.as_ref())
+        .chain(&plan.returning_from_values)
         .enumerate()
-        .map(|(idx, set_clause)| ResultSetColumn {
-            expr: set_clause.expr.as_ref().clone(),
+        .map(|(idx, expr)| ResultSetColumn {
+            expr: expr.clone(),
             alias: Some(update_from_scratch_col_name(idx)),
             implicit_column_name: None,
             contains_aggregates: false,
