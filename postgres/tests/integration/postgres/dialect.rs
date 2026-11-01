@@ -4559,3 +4559,24 @@ fn stored_create_table_text_names_the_table_without_its_database(db: TempDatabas
         ]
     );
 }
+
+// DROP of several objects runs each single-object drop in one savepoint, so a
+// missing table in the list rolls the whole statement back, like PostgreSQL.
+#[turso_macros::test(mvcc)]
+fn test_postgres_multi_drop_is_atomic(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE keep_me (x INTEGER)").unwrap();
+    conn.execute("INSERT INTO keep_me VALUES (1)").unwrap();
+    assert!(
+        conn.execute("DROP TABLE keep_me, missing_table").is_err(),
+        "dropping a missing table should fail the statement"
+    );
+    assert_eq!(
+        conn.prepare("SELECT x FROM keep_me")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(1)]],
+        "keep_me must survive the rolled-back drop"
+    );
+}

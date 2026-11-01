@@ -676,3 +676,50 @@ expect {
     1|public
     2|public
 }
+
+# DROP and TRUNCATE can name several objects, which PostgreSQL applies
+# atomically. The frontend translates each object into its own statement and
+# runs them in one savepoint.
+
+test drop-several-tables {
+    CREATE TABLE ta (x int);
+    CREATE TABLE tb (y int);
+    DROP TABLE ta, tb;
+    -- recreating would fail with "already exists" if either survived the drop
+    CREATE TABLE ta (x int);
+    CREATE TABLE tb (y int);
+    SELECT count(*) FROM ta;
+}
+expect {
+    0
+}
+
+test drop-if-exists-several-tables-skips-missing {
+    CREATE TABLE ta (x int);
+    DROP TABLE IF EXISTS ta, tb_missing;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test drop-several-tables-with-one-missing-errors {
+    CREATE TABLE ta (x int);
+    DROP TABLE ta, tb_missing;
+}
+@sqlstate 42P01
+expect error {}
+
+test truncate-several-tables {
+    CREATE TABLE ta (x int);
+    CREATE TABLE tb (y int);
+    INSERT INTO ta VALUES (1), (2);
+    INSERT INTO tb VALUES (3);
+    TRUNCATE ta, tb;
+    SELECT count(*) FROM ta;
+    SELECT count(*) FROM tb;
+}
+expect {
+    0
+    0
+}

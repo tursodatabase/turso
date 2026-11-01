@@ -56,7 +56,7 @@ Basics not enumerated by the official feature matrix.
 | CREATE SEQUENCE / nextval / currval / setval | ✅ Supported | START, INCREMENT, MIN/MAXVALUE, CYCLE; AS smallint/integer/bigint bounds the range; CACHE accepted (no-op); OWNED BY a column, TEMP and other options rejected; pg_sequences view; pg_sequence exposes the parameters of the sequences of every schema (bigint, cache 1); pg_class lists the sequences of every schema with relkind S (sequence dumps remain incomplete); a sequence named without a schema is looked up through `search_path`, and a column default or view binds it to the schema it is in when the table or view is created; a serial column's sequence is created in the table's schema |
 | CREATE DOMAIN | ✅ Supported | Base type + DEFAULT, NOT NULL, CHECK constraints enforced; array base types, type modifiers and non-binary COLLATE rejected |
 | CREATE TYPE ... AS ENUM | ✅ Supported | Values validated on write; other CREATE TYPE forms unsupported |
-| TRUNCATE | 🟡 Partial | Lowered to DELETE of one table; several tables, CASCADE and RESTART IDENTITY rejected |
+| TRUNCATE | 🟡 Partial | Lowered to DELETE; several tables run as one DELETE each in a single savepoint (atomic); CASCADE and RESTART IDENTITY rejected |
 | BEGIN / COMMIT / ROLLBACK | ✅ Supported | Every transaction is snapshot isolation, i.e. REPEATABLE READ; `ISOLATION LEVEL REPEATABLE READ` is accepted, every other level, DEFERRABLE and AND CHAIN are rejected. READ ONLY and READ WRITE are enforced, on BEGIN and on SET TRANSACTION; switching a READ ONLY transaction to READ WRITE after its first query is rejected with SQLSTATE 25001 like PostgreSQL. A statement error aborts the transaction but keeps its savepoints, so ROLLBACK TO recovers it; a failed COMMIT rolls the transaction back and returns the connection to idle |
 | LOCK TABLE | 🟡 Partial | ACCESS SHARE without NOWAIT is accepted as a no-op inside a transaction for pg_dump compatibility; table names are not checked, no locks are acquired, and no read snapshot is started; other modes are rejected |
 | Casts (`expr::type`, CAST) | ✅ Supported | Also `int4(x)`-style cast functions |
@@ -247,6 +247,7 @@ INTEGER. Unknown type names pass through as custom types.
 | CREATE ACCESS METHOD | ❌ Not supported | |
 | CREATE TABLE ... (LIKE) with foreign tables, views and composite types | ❌ Not supported | LIKE rejected |
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |
+| DROP of several objects | 🟡 Partial | `DROP TABLE a, b` (and INDEX, VIEW, TYPE, DOMAIN, SEQUENCE) runs one single-object DROP each in a single savepoint, so it is atomic like PostgreSQL; DROP SCHEMA of several objects and CASCADE are still rejected |
 | ON COMMIT clause for CREATE TEMPORARY TABLE | ❌ Not supported | Rejected, like TEMP itself |
 | REINDEX CONCURRENTLY | ❌ Not supported | REINDEX not supported at all |
 | Stored generated columns | ❌ Not supported | GENERATED ... AS rejected |
