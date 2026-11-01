@@ -781,6 +781,30 @@ fn emit_replace_delete<'a>(
         }
     }
 
+    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+        let before_record_reg = if program.capture_data_changes_info().has_before() {
+            Some(emit_cdc_full_record(
+                program,
+                target_table.table.columns(),
+                target_table_cursor_id,
+                conflicting_rowid_reg,
+            ))
+        } else {
+            None
+        };
+        emit_cdc_insns(
+            program,
+            &t_ctx.resolver,
+            OperationMode::DELETE,
+            cdc_cursor_id,
+            conflicting_rowid_reg,
+            before_record_reg,
+            None,
+            None,
+            table_name,
+        )?;
+    }
+
     program.emit_insn(Insn::Delete {
         cursor_id: target_table_cursor_id,
         table_name: table_name.to_string(),
