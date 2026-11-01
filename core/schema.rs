@@ -3121,6 +3121,8 @@ impl Schema {
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
+        self.recover_quoted_integer_rowid_aliases(&automatic_indices);
+
         for unparsed_sql_from_index in from_sql_indexes {
             let (namespace, table_name) = self.demangle_name(&unparsed_sql_from_index.table_name);
             let table = self.get_btree_table(namespace, table_name).ok_or_else(|| {
@@ -3265,6 +3267,82 @@ impl Schema {
             }
         }
         Ok(())
+    }
+
+    fn recover_quoted_integer_rowid_aliases(
+        &mut self,
+        automatic_indices: &HashMap<String, Vec<(String, i64)>>,
+    ) {
+        for (namespace_id, namespace) in &mut self.namespaces {
+            for schema_table in namespace.tables.values_mut() {
+                let Table::BTree(btree) = Arc::make_mut(schema_table) else {
+                    continue;
+                };
+                let btree = Arc::make_mut(btree);
+                let Some(primary_key_index) = btree
+                    .unique_sets
+                    .iter()
+                    .position(|set| set.is_primary_key && set.columns.len() == 1)
+                else {
+                    continue;
+                };
+                if btree
+                    .unique_sets
+                    .iter()
+                    .filter(|set| set.is_primary_key)
+                    .count()
+                    != 1
+                    || btree.primary_key_columns.len() != 1
+                    || !btree.has_rowid
+                {
+                    continue;
+                }
+
+                let autoindex_count = automatic_indices
+                    .iter()
+                    .find(|(table_name, _)| {
+                        table_name.eq_ignore_ascii_case(&mangle_name(*namespace_id, &btree.name))
+                    })
+                    .map_or(0, |(_, indices)| indices.len());
+                if btree.unique_sets.len() != autoindex_count + 1 {
+                    continue;
+                }
+
+                let (column_name, order) = btree.primary_key_columns[0].clone();
+                if btree.primary_key_is_inline && order == SortOrder::Desc {
+                    continue;
+                }
+                let Some(column) = btree
+                    .columns()
+                    .iter()
+                    .find(|column| column.name.as_deref() == Some(column_name.as_str()))
+                else {
+                    continue;
+                };
+                if !column.primary_key()
+                    || column.is_rowid_alias()
+                    || !column.ty_str.eq_ignore_ascii_case("INTEGER")
+                    || !column.ty_params.is_empty()
+                    || !column.written_ty_str.as_deref().is_some_and(|name| {
+                        ["\"INTEGER\"", "'INTEGER'", "`INTEGER`"]
+                            .iter()
+                            .any(|quoted| name.eq_ignore_ascii_case(quoted))
+                    })
+                {
+                    continue;
+                }
+
+                let primary_key_set = btree.unique_sets.remove(primary_key_index);
+                btree.rowid_alias_conflict_clause = primary_key_set.conflict_clause;
+                if let Some(column) = btree
+                    .columns_mut()
+                    .iter_mut()
+                    .find(|column| column.name.as_deref() == Some(column_name.as_str()))
+                {
+                    column.set_rowid_alias(true);
+                }
+            }
+        }
     }
 
     fn order_persisted_materialized_views(
@@ -5370,7 +5448,13 @@ impl BTreeTable {
         let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                Self::from_create_table_ast(&tbl_name, &body, root_page, supports_namespaces)
+                create_table_with_stored_types(
+                    tbl_name.name.as_str(),
+                    &body,
+                    root_page,
+                    supports_namespaces,
+                    true,
+                )
             }
             Some(Cmd::Stmt(Stmt::CreateVirtualTable(vtab))) => Err(LimboError::Corrupt(format!(
                 "sqlite_schema root_page must be 0 for virtual table {}, got {root_page}",
@@ -6458,6 +6542,12 @@ fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<TextCollati
     }
 }
 
+fn is_quoted_integer_type(name: &str) -> bool {
+    ["\"INTEGER\"", "'INTEGER'", "`INTEGER`"]
+        .iter()
+        .any(|quoted| name.eq_ignore_ascii_case(quoted))
+}
+
 /// `supports_namespaces` says whether the database supports namespaces, so that
 /// a foreign key may name the mangled name of a table of one.
 pub fn create_table(
@@ -6465,6 +6555,16 @@ pub fn create_table(
     body: &CreateTableBody,
     root_page: i64,
     supports_namespaces: bool,
+) -> Result<BTreeTable> {
+    create_table_with_stored_types(tbl_name, body, root_page, supports_namespaces, false)
+}
+
+fn create_table_with_stored_types(
+    tbl_name: &str,
+    body: &CreateTableBody,
+    root_page: i64,
+    supports_namespaces: bool,
+    stored_types: bool,
 ) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
@@ -6707,7 +6807,8 @@ pub fn create_table(
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
                     Some(written_type) => {
-                        typename_exactly_integer = is_rowid_alias_type(&written_type.name);
+                        typename_exactly_integer = is_rowid_alias_type(&written_type.name)
+                            || (!stored_types && is_quoted_integer_type(&written_type.name));
                         type_from_name(&ty_str).0
                     }
                     None => Type::Null,
@@ -7549,7 +7650,8 @@ impl Column {
         let (ty, typename_exactly_integer) = match value.col_type {
             Some(ref written_type) => (
                 type_from_name(&ty_str).0,
-                is_rowid_alias_type(&written_type.name),
+                is_rowid_alias_type(&written_type.name)
+                    || is_quoted_integer_type(&written_type.name),
             ),
             None => (Type::Null, false),
         };
