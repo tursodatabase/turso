@@ -1084,7 +1084,7 @@ fn resolve_sorted_columns_with_catalog(
                 expr,
             }
         } else {
-            if !validate_index_expression(unwrapped_expr, table) {
+            if !validate_index_expression(unwrapped_expr, table, syms) {
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
             let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;
@@ -1240,7 +1240,7 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+fn validate_index_expression(expr: &Expr, table: &BTreeTable, syms: &SymbolTable) -> bool {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
@@ -1260,8 +1260,12 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
-        Func::resolve_function(&n, args.len())
-            .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
+        let func = match Func::resolve_function(&n, args.len()) {
+            Ok(None) => syms.resolve_function(&n, args.len()).map(Func::External),
+            Ok(func) => func,
+            Err(_) => None,
+        };
+        func.is_some_and(|f| is_deterministic_schema_function_call(&f, args))
     };
 
     let mut ok = true;
