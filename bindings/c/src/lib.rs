@@ -975,13 +975,21 @@ pub unsafe extern "C" fn sqlite3_busy_handler(
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_readonly(
     db: *mut sqlite3,
-    _db_name: *const ffi::c_char,
+    db_name: *const ffi::c_char,
 ) -> ffi::c_int {
-    if db.is_null() {
+    if db.is_null() || db_name.is_null() {
         return -1;
     }
+    let name = match CStr::from_ptr(db_name).to_str() {
+        Ok(name) => name,
+        Err(_) => return -1,
+    };
     let inner = (*db).inner.lock().unwrap();
-    inner._db.is_readonly() as ffi::c_int
+    inner
+        .conn
+        .database_is_readonly(name)
+        .map(|is_readonly| is_readonly as ffi::c_int)
+        .unwrap_or(-1)
 }
 
 #[no_mangle]
@@ -3930,6 +3938,19 @@ mod tests {
     }
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn sqlite3_db_readonly_returns_minus_one_for_unknown_schema() {
+        unsafe {
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            assert_eq!(sqlite3_db_readonly(db, c"missing_schema".as_ptr()), -1);
+            assert_eq!(sqlite3_db_readonly(db, c"MAIN".as_ptr()), 0);
+
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
 
     /// sqlite3_errmsg must return the bare message SQLite produces — no
     /// "Runtime error:" prefix and no "(19)" suffix; those are sqlite3
