@@ -820,7 +820,6 @@ fn emit_update_column_values<'a>(
     skip_row_label: BranchOffset,
     skip_notnull_checks: bool,
 ) -> crate::Result<bool> {
-    let or_conflict = program.resolve_type;
     let mut table_column_was_read = false;
     if let Some(expr) = set_clauses
         .iter()
@@ -951,13 +950,6 @@ fn emit_update_column_values<'a>(
                             program.target_union_type = prev_union;
                             translate_result?;
                             if table_column.notnull() && !skip_notnull_checks {
-                                let notnull_conflict = if program.flags.has_statement_conflict() {
-                                    or_conflict
-                                } else {
-                                    table_column
-                                        .notnull_conflict_clause
-                                        .unwrap_or(ResolveType::Abort)
-                                };
                                 emit_notnull_constraint_check(
                                     program,
                                     table_references,
@@ -965,7 +957,7 @@ fn emit_update_column_values<'a>(
                                     table_column,
                                     column_ctx.target_table.namespace.id,
                                     column_ctx.table_name(),
-                                    notnull_conflict,
+                                    notnull_conflict_resolution(program, table_column),
                                     skip_row_label,
                                     &t_ctx.resolver,
                                 )?;
@@ -1061,25 +1053,39 @@ fn emit_update_column_values<'a>(
     Ok(table_column_was_read)
 }
 
-/// Emit NOT NULL constraint checks for SET clause columns after BEFORE triggers have fired.
-/// This is deferred from the first `emit_update_column_values` call so that triggers
-/// run before constraint checks, matching SQLite's behavior.
+/// The UPDATE's OR clause wins over the column's own ON CONFLICT clause.
+fn notnull_conflict_resolution(program: &ProgramBuilder, table_column: &Column) -> ResolveType {
+    if program.flags.has_statement_conflict() {
+        program.resolve_type
+    } else {
+        table_column
+            .notnull_conflict_clause
+            .unwrap_or(ResolveType::Abort)
+    }
+}
+
+/// Emit NOT NULL constraint checks for the columns the UPDATE changes, for the cases
+/// where they must run later than the first `emit_update_column_values` call:
+/// after BEFORE triggers have fired, or after the STRICT type check.
+///
+/// The checks run in two passes, as in INSERT: first the columns the SET clauses
+/// change, because OR REPLACE puts a column's DEFAULT in place of a NULL there,
+/// then the generated columns, once they are computed again from those values.
+/// `include_column` picks the columns of the pass.
 fn emit_deferred_notnull_checks<'a>(
     program: &mut ProgramBuilder,
     table_references: &mut TableReferences,
     target_table: &Arc<JoinedTable>,
-    updated_column_indices: &ColumnMask,
     column_ctx: &UpdateColumnCtx<'_>,
     skip_row_label: BranchOffset,
     t_ctx: &mut TranslateCtx<'a>,
+    include_column: impl Fn(&Column) -> bool,
 ) -> crate::Result<()> {
-    let or_conflict = program.resolve_type;
     for (idx, table_column) in target_table.table.columns().iter().enumerate() {
         if !table_column.notnull() || table_column.is_rowid_alias() {
             continue;
         }
-        // Only check columns that are in SET clauses
-        if !updated_column_indices.get(idx) {
+        if !column_ctx.affected_columns.get(idx) || !include_column(table_column) {
             continue;
         }
         let target_reg = column_ctx.layout.to_register(column_ctx.start, idx);
@@ -1090,11 +1096,34 @@ fn emit_deferred_notnull_checks<'a>(
             table_column,
             column_ctx.target_table.namespace.id,
             column_ctx.table_name(),
-            or_conflict,
+            notnull_conflict_resolution(program, table_column),
             skip_row_label,
             &t_ctx.resolver,
         )?;
     }
+    Ok(())
+}
+
+/// Check the new values of the SET columns against their declared types, before
+/// custom type encoding.
+fn emit_input_type_check(
+    program: &mut ProgramBuilder,
+    btree: &Arc<BTreeTable>,
+    start: usize,
+    layout: &ColumnLayout,
+    updated_column_indices: &ColumnMask,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    program.emit_insn(Insn::TypeCheck {
+        start_reg: start,
+        count: layout.num_non_virtual_cols(),
+        check_generated: false,
+        table_reference: BTreeTable::input_type_check_table_ref(
+            btree,
+            resolver.schema(),
+            Some(updated_column_indices),
+        )?,
+    });
     Ok(())
 }
 
@@ -1378,6 +1407,13 @@ fn emit_update_insns<'a>(
     };
     let has_before_triggers = !relevant_before_update_triggers.is_empty();
 
+    // SQLite type-checks a STRICT table's new values while computing generated
+    // columns, so on such a table a wrong type wins over a NOT NULL violation.
+    let notnull_checks_follow_type_check = !has_before_triggers
+        && target_table.table.btree().is_some_and(|btree| {
+            btree.is_strict && btree.columns().iter().any(|c| c.is_generated())
+        });
+
     let table_column_was_read = emit_update_column_values(
         program,
         table_references,
@@ -1386,7 +1422,7 @@ fn emit_update_insns<'a>(
         t_ctx,
         skip_set_clauses,
         skip_row_label,
-        has_before_triggers,
+        has_before_triggers || notnull_checks_follow_type_check,
     )?;
 
     // For non-STRICT tables, apply column affinity to the NEW values early.
@@ -1455,6 +1491,18 @@ fn emit_update_insns<'a>(
             if has_before_triggers {
                 let old_registers =
                     old_registers.expect("old_registers allocated when has_before_triggers");
+                // SQLite rejects a wrong type before firing the triggers, so they
+                // never see it.
+                if btree_table.is_strict {
+                    emit_input_type_check(
+                        program,
+                        &btree_table,
+                        start,
+                        &layout,
+                        &updated_column_indices,
+                        &t_ctx.resolver,
+                    )?;
+                }
                 // NEW row values are already in 'start' registers.
                 // If the rowid is being updated (INTEGER PRIMARY KEY in SET clause),
                 // use the new rowid register; otherwise use the current rowid (beg).
@@ -1574,15 +1622,16 @@ fn emit_update_insns<'a>(
 
         // Now emit NOT NULL checks for SET clause columns that were deferred
         // from the first emit_update_column_values call. In SQLite, NOT NULL
-        // constraint checks happen after BEFORE triggers fire.
+        // constraint checks happen after BEFORE triggers fire. The generated
+        // columns are checked below, after they are computed again.
         emit_deferred_notnull_checks(
             program,
             table_references,
             &target_table,
-            &updated_column_indices,
             &column_ctx,
             skip_row_label,
             t_ctx,
+            |column| !column.is_virtual_generated(),
         )?;
     }
 
@@ -1630,16 +1679,27 @@ fn emit_update_insns<'a>(
     if let Table::BTree(ref btree) = target_table.table {
         if btree.is_strict {
             // pre-encode typecheck for updated columns
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: start,
-                count: layout.num_non_virtual_cols(),
-                check_generated: false,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    btree,
-                    t_ctx.resolver.schema(),
-                    Some(&updated_column_indices),
-                )?,
-            });
+            emit_input_type_check(
+                program,
+                btree,
+                start,
+                &layout,
+                &updated_column_indices,
+                &t_ctx.resolver,
+            )?;
+        }
+        if notnull_checks_follow_type_check {
+            // Before the generated columns are computed again below, so that
+            // they read the DEFAULT that OR REPLACE put in place of a NULL.
+            emit_deferred_notnull_checks(
+                program,
+                table_references,
+                &target_table,
+                &column_ctx,
+                skip_row_label,
+                t_ctx,
+                |column| !column.is_virtual_generated(),
+            )?;
         }
         let has_check_constraints = !btree.check_constraints.is_empty();
         let cols = btree.columns();
@@ -1689,6 +1749,20 @@ fn emit_update_insns<'a>(
                 btree,
             )?;
         }
+    }
+
+    if has_before_triggers || notnull_checks_follow_type_check {
+        // The generated columns were computed again above, from the values the
+        // deferred checks may have replaced with a DEFAULT.
+        emit_deferred_notnull_checks(
+            program,
+            table_references,
+            &target_table,
+            &column_ctx,
+            skip_row_label,
+            t_ctx,
+            Column::is_virtual_generated,
+        )?;
     }
 
     // Non-REPLACE PK constraint check. Must run BEFORE the index preflight so that

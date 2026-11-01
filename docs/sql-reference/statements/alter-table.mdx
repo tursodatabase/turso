@@ -130,6 +130,7 @@ A new column added with ADD COLUMN must satisfy these requirements:
 | No duplicate column name | The column name must not already exist in the table |
 | No `STORED` generated column | Only virtual [generated columns](/docs/sql-reference/statements/create-table#generated-always-as) can be added |
 | STRICT tables require an explicit type | The column type must be a valid STRICT type |
+| Virtual generated columns on STRICT tables must type-check against existing rows | If any existing row computes a value that cannot be losslessly stored under the declared type, the statement fails with `type mismatch on DEFAULT` |
 
 ### Supported Column Constraints
 

@@ -758,7 +758,7 @@ pub(crate) fn emit_sqlite_sequence_sync(
         lhs: col_name_reg,
         rhs: name_reg,
         target_pc: skip_delete_label,
-        flags: CmpInsFlags::default(),
+        flags: CmpInsFlags::default().jump_if_null(),
         collation: CollationSeq::for_internal_values(),
     });
     program.emit_insn(Insn::Delete {

@@ -3443,7 +3443,7 @@ impl Connection {
     /// Prepares CREATE SCHEMA or DROP SCHEMA. No dialect parses their text, so
     /// preparing the statement again, after another connection changes the
     /// schema, translates the statement itself.
-    fn prepare_namespace_stmt(
+    pub fn prepare_namespace_stmt(
         self: &Arc<Self>,
         statement: turso_parser::ast::Stmt,
     ) -> Result<Statement> {
@@ -3490,7 +3490,7 @@ impl Connection {
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning
-    pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
+    pub fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
             crate::MAIN_DB_ID => {
                 let schema = self.schema.read();

@@ -849,7 +849,9 @@ fn emit_delete_row_common(
         let columns_start_reg = columns_start_reg
             .expect("columns_start_reg must be provided when there are triggers or RETURNING");
         let delete_table = unsafe { &*table_reference };
-        let delete_layout = ColumnLayout::from_columns(delete_table.columns())?;
+        let delete_layout = ColumnLayout::Identity {
+            column_count: delete_table.columns().len(),
+        };
         let cache_state = seed_returning_row_image_in_cache(
             program,
             table_references,

@@ -1728,6 +1728,14 @@ impl TursoStatement {
             .to_owned()
             .map_err(LimboError::from)?)
     }
+    /// returns true if the statement does not write to the database, like sqlite3_stmt_readonly
+    pub fn is_readonly(&self) -> bool {
+        let handle = self.handle.lock().unwrap();
+        match handle.as_ref() {
+            Some(stmt) => stmt.get_program().is_readonly(),
+            None => true,
+        }
+    }
     /// returns column count
     pub fn column_count(&self) -> usize {
         let handle = self.handle.lock().unwrap();

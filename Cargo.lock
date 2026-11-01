@@ -7282,6 +7282,7 @@ dependencies = [
  "serde_json",
  "strum",
  "tempfile",
+ "tracing",
  "turso_core",
  "turso_ext",
  "turso_parser",
