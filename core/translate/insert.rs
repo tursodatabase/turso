@@ -2218,15 +2218,13 @@ fn bind_insert(
             upsert = upsert_opt.take();
         }
     }
-    if let ResolveType::Ignore = on_conflict {
-        program.set_resolve_type(ResolveType::Ignore);
-        upsert.replace(Box::new(ast::Upsert {
+    program.set_resolve_type(on_conflict);
+    if on_conflict == ResolveType::Ignore && upsert.is_none() {
+        upsert = Some(Box::new(ast::Upsert {
             do_clause: UpsertDo::Nothing,
             index: None,
             next: None,
         }));
-    } else {
-        program.set_resolve_type(on_conflict);
     }
     while let Some(mut upsert_opt) = upsert.take() {
         if let UpsertDo::Set {
@@ -3303,21 +3301,25 @@ fn emit_unique_index_check(
                     });
                 }
             }
+        } else if matches!(preflight.effective_on_conflict, ResolveType::Ignore) {
+            program.emit_insn(Insn::Goto {
+                target_pc: ctx.loop_labels.row_done,
+            });
+        } else {
+            // No matching UPSERT handler so we emit constraint error
+            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+            program.emit_insn(Insn::Halt {
+                constraint_info: Some(Box::new(ConstraintInfo::unique_index(
+                    ctx.table.name.as_str(),
+                    index,
+                    (0..num_cols).map(|i| idx_start_reg + i).collect(),
+                ))),
+                err_code: SQLITE_CONSTRAINT_UNIQUE,
+                description: raw_desc,
+                on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
+                description_reg: None,
+            });
         }
-        // No matching UPSERT handler so we emit constraint error
-        // (if conflict clause matched - VM will jump to later instructions and skip halt)
-        let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
-        program.emit_insn(Insn::Halt {
-            constraint_info: Some(Box::new(ConstraintInfo::unique_index(
-                ctx.table.name.as_str(),
-                index,
-                (0..num_cols).map(|i| idx_start_reg + i).collect(),
-            ))),
-            err_code: SQLITE_CONSTRAINT_UNIQUE,
-            description: raw_desc,
-            on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
-            description_reg: None,
-        });
 
         // continue preflight with next constraint
         program.preassign_label_to_next_insn(next_check);
