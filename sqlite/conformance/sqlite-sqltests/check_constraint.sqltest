@@ -1,5 +1,94 @@
 @database :memory:
 
+test add-column-rechecks-old-column-check {
+    PRAGMA ignore_check_constraints = 1;
+    CREATE TABLE t(a CHECK(a > 0));
+    INSERT INTO t VALUES(-1);
+    PRAGMA ignore_check_constraints = 0;
+    ALTER TABLE t ADD COLUMN d CHECK(1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test add-column-strict-rechecks-old-check {
+    PRAGMA ignore_check_constraints = 1;
+    CREATE TABLE t(a INT CHECK(a > 0)) STRICT;
+    INSERT INTO t VALUES(-1);
+    PRAGMA ignore_check_constraints = 0;
+    ALTER TABLE t ADD COLUMN d INT;
+}
+expect error {
+    CHECK constraint failed
+}
+
+test add-column-generated-not-null-rechecks-old-check {
+    PRAGMA ignore_check_constraints = 1;
+    CREATE TABLE t(a INT CHECK(a > 0));
+    INSERT INTO t VALUES(-1);
+    PRAGMA ignore_check_constraints = 0;
+    ALTER TABLE t ADD COLUMN d AS (1) NOT NULL;
+}
+expect error {
+    CHECK constraint failed
+}
+
+test add-column-rechecks-old-table-check {
+    PRAGMA ignore_check_constraints = 1;
+    CREATE TABLE t(a, b, CHECK(a + b > 0));
+    INSERT INTO t VALUES(-2, 1);
+    PRAGMA ignore_check_constraints = 0;
+    ALTER TABLE t ADD COLUMN d CHECK(1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@backend rust
+test add-column-rechecks-old-virtual-check {
+    PRAGMA ignore_check_constraints = 1;
+    CREATE TABLE t(a, b GENERATED ALWAYS AS(a * 2) VIRTUAL CHECK(b > 0));
+    INSERT INTO t(a) VALUES(-1);
+    PRAGMA ignore_check_constraints = 0;
+    ALTER TABLE t ADD COLUMN d CHECK(1);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test add-column-rechecks-old-valid-check {
+    CREATE TABLE t(a CHECK(a > 0));
+    INSERT INTO t VALUES(1);
+    ALTER TABLE t ADD COLUMN d CHECK(1);
+    SELECT a FROM t;
+}
+expect {
+    1
+}
+
+test add-column-rechecks-old-without-new-check {
+    PRAGMA ignore_check_constraints = 1;
+    CREATE TABLE t(a CHECK(a > 0));
+    INSERT INTO t VALUES(-1);
+    PRAGMA ignore_check_constraints = 0;
+    ALTER TABLE t ADD COLUMN d;
+    SELECT a FROM t;
+}
+expect {
+    -1
+}
+
+test add-column-rechecks-old-ignored-check {
+    PRAGMA ignore_check_constraints = 1;
+    CREATE TABLE t(a CHECK(a > 0));
+    INSERT INTO t VALUES(-1);
+    ALTER TABLE t ADD COLUMN d CHECK(1);
+    SELECT a FROM t;
+}
+expect {
+    -1
+}
+
 # Basic column-level CHECK constraints
 @cross-check-integrity
 test check_constraint_column_level_basic {

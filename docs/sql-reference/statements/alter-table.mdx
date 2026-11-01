@@ -130,7 +130,7 @@ A new column added with ADD COLUMN must satisfy these requirements:
 | `NOT NULL` requires a non-NULL default | Existing rows must have a valid value for the new column |
 | Default must be a constant expression | Only literal values, signed literals, and parenthesized constant expressions are allowed. Functions like `random()` are not permitted |
 | `CURRENT_TIME`, `CURRENT_DATE`, `CURRENT_TIMESTAMP` defaults require an empty table | These non-deterministic values cannot be retroactively applied to existing rows |
-| CHECK constraints require an empty table | The constraint cannot be validated against existing rows |
+| CHECK constraints must hold for existing rows | With CHECK enforcement enabled, both new and existing table CHECK constraints are validated before the column is added |
 | No duplicate column name | The column name must not already exist in the table |
 | No `STORED` generated column | Only virtual [generated columns](/docs/sql-reference/statements/create-table#generated-always-as) can be added |
 | STRICT tables require an explicit type | The column type must be a valid STRICT type |

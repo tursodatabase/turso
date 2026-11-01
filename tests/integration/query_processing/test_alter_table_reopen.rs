@@ -12,6 +12,50 @@ use crate::common::{ExecRows, TempDatabase};
 use asserting::prelude::*;
 use tempfile::TempDir;
 
+#[test]
+fn test_add_column_old_check_failure_preserves_schema_and_transaction() {
+    let temp_dir = TempDir::new().expect("create isolated database directory");
+    let path = temp_dir.path().join("add_column_old_check.db");
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("PRAGMA ignore_check_constraints=1")
+            .expect("allow the invalid fixture row");
+        conn.execute("CREATE TABLE t(a CHECK(a > 0))")
+            .expect("create checked table");
+        conn.execute("INSERT INTO t VALUES(-1)")
+            .expect("insert ignored violation");
+        conn.execute("PRAGMA ignore_check_constraints=0")
+            .expect("restore checks");
+        conn.execute("BEGIN").expect("begin outer transaction");
+        conn.execute("INSERT INTO t VALUES(1)")
+            .expect("insert valid outer-transaction row");
+        let error = conn
+            .execute("ALTER TABLE t ADD COLUMN d CHECK(1)")
+            .expect_err("ADD COLUMN must reject the existing CHECK violation");
+        assert!(error.to_string().contains("CHECK constraint failed"));
+        let names: Vec<(String,)> =
+            conn.exec_rows("SELECT name FROM pragma_table_info('t') ORDER BY cid");
+        assert_that!(&names).is_equal_to(&vec![("a".to_string(),)]);
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t ORDER BY a");
+        assert_that!(&rows).is_equal_to(&vec![(-1,), (1,)]);
+        conn.execute("COMMIT")
+            .expect("preserve the outer transaction");
+        conn.close().expect("close before reopening");
+    }
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        let names: Vec<(String,)> =
+            conn.exec_rows("SELECT name FROM pragma_table_info('t') ORDER BY cid");
+        assert_that!(&names).is_equal_to(&vec![("a".to_string(),)]);
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t ORDER BY a");
+        assert_that!(&rows).is_equal_to(&vec![(-1,), (1,)]);
+        assert!(conn.execute("INSERT INTO t VALUES(-2)").is_err());
+        conn.close().expect("close reopened database");
+    }
+}
+
 /// After ALTER TABLE DROP COLUMN on an AUTOINCREMENT table, reopen must parse
 /// the persisted schema as AUTOINCREMENT and avoid reusing deleted rowids.
 #[test]
