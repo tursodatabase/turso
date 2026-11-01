@@ -676,3 +676,247 @@ expect {
     1|public
     2|public
 }
+
+test generated-column-follows-its-expression {
+    CREATE TABLE gen_basic (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO gen_basic (a) VALUES (1), (NULL);
+    UPDATE gen_basic SET a = 5 WHERE a = 1;
+    SELECT * FROM gen_basic ORDER BY a;
+}
+expect {
+    5|10
+    |
+}
+
+test generated-column-in-returning-and-where {
+    CREATE TABLE gen_returning (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO gen_returning (a) VALUES (1) RETURNING b;
+    UPDATE gen_returning SET a = 2 RETURNING a, b;
+    DELETE FROM gen_returning WHERE b = 4 RETURNING a;
+}
+expect {
+    2
+    2|4
+    2
+}
+
+test generated-column-before-the-column-it-reads {
+    CREATE TABLE gen_forward (b int GENERATED ALWAYS AS (a + 1) STORED, a int);
+    INSERT INTO gen_forward (a) VALUES (1);
+    SELECT * FROM gen_forward;
+}
+expect {
+    2|1
+}
+
+test generated-column-with-default-in-values {
+    CREATE TABLE gen_default (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO gen_default (a, b) VALUES (1, DEFAULT);
+    SELECT * FROM gen_default;
+}
+expect {
+    1|2
+}
+
+test generated-column-rejects-named-insert {
+    CREATE TABLE gen_no_insert (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO gen_no_insert (a, b) VALUES (1, 2);
+}
+expect error {}
+
+test generated-column-rejects-update {
+    CREATE TABLE gen_no_update (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    UPDATE gen_no_update SET b = 1;
+}
+expect error {}
+
+test generated-column-rejects-upsert-update {
+    CREATE TABLE gen_no_upsert (a int PRIMARY KEY, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO gen_no_upsert (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET b = 5;
+}
+expect error {}
+
+test generated-column-rejects-reading-a-generated-column {
+    CREATE TABLE gen_on_gen (a int, b int GENERATED ALWAYS AS (a) STORED, c int GENERATED ALWAYS AS (b) STORED);
+}
+expect error {}
+
+test generated-column-rejects-reading-itself {
+    CREATE TABLE gen_on_itself (b int GENERATED ALWAYS AS (b) STORED);
+}
+expect error {}
+
+test generated-column-rejects-two-generation-clauses {
+    CREATE TABLE gen_twice (a int, b int GENERATED ALWAYS AS (a) STORED GENERATED ALWAYS AS (a) STORED);
+}
+expect error {}
+
+test generated-column-rejects-default {
+    CREATE TABLE gen_with_default (a int, b int DEFAULT 1 GENERATED ALWAYS AS (a) STORED);
+}
+expect error {}
+
+test generated-column-rejects-volatile-expression {
+    CREATE TABLE gen_volatile (a float8, b float8 GENERATED ALWAYS AS (random()) STORED);
+}
+expect error {}
+
+test generated-column-rejects-subquery {
+    CREATE TABLE gen_subquery (a int, b int GENERATED ALWAYS AS ((SELECT 1)) STORED);
+}
+expect error {}
+
+test generated-column-casts-to-the-column-type {
+    CREATE TABLE gen_cast (d date, ts timestamp, a float8,
+        as_timestamp timestamp GENERATED ALWAYS AS (d) STORED,
+        as_date date GENERATED ALWAYS AS (ts) STORED,
+        as_int int GENERATED ALWAYS AS (a) STORED);
+    INSERT INTO gen_cast (d, ts, a) VALUES ('2026-01-02', '2026-03-04 10:00:00', 2.5);
+    SELECT as_timestamp, as_date, as_int FROM gen_cast;
+}
+expect {
+    2026-01-02 00:00:00|2026-03-04|2
+}
+
+test generated-column-of-common-types {
+    CREATE TABLE gen_types (a int, t text, j jsonb,
+        big bigint GENERATED ALWAYS AS (a * 2) STORED,
+        flag boolean GENERATED ALWAYS AS (a > 1) STORED,
+        upper_t text GENERATED ALWAYS AS (upper(t)) STORED,
+        field text GENERATED ALWAYS AS (j ->> 'k') STORED,
+        arr int[] GENERATED ALWAYS AS (ARRAY[a, a]) STORED);
+    INSERT INTO gen_types (a, t, j) VALUES (3, 'x', '{"k":"v"}');
+    SELECT big, flag, upper_t, field, arr FROM gen_types;
+}
+expect {
+    6|t|X|v|{3,3}
+}
+
+test generated-column-with-check-not-null-and-unique {
+    CREATE TABLE gen_constraints (a int,
+        b int NOT NULL GENERATED ALWAYS AS (a) STORED CHECK (b > 0) UNIQUE);
+    INSERT INTO gen_constraints (a) VALUES (1);
+    INSERT INTO gen_constraints (a) VALUES (1) ON CONFLICT (b) DO NOTHING;
+    SELECT * FROM gen_constraints;
+}
+expect {
+    1|1
+}
+
+test generated-column-unique-violation {
+    CREATE TABLE gen_unique (a int, b int GENERATED ALWAYS AS (a * 2) STORED UNIQUE);
+    INSERT INTO gen_unique (a) VALUES (1);
+    INSERT INTO gen_unique (a) VALUES (1);
+}
+expect error {}
+
+test generated-column-not-null-violation {
+    CREATE TABLE gen_not_null (a int, b int NOT NULL GENERATED ALWAYS AS (a) STORED);
+    INSERT INTO gen_not_null (a) VALUES (NULL);
+}
+expect error {}
+
+test generated-column-check-violation {
+    CREATE TABLE gen_check (a int, b int GENERATED ALWAYS AS (a) STORED CHECK (b > 0));
+    INSERT INTO gen_check (a) VALUES (0);
+}
+expect error {}
+
+test generated-column-index-follows-updates {
+    CREATE TABLE gen_index (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    CREATE INDEX gen_index_b ON gen_index (b);
+    INSERT INTO gen_index (a) VALUES (1), (2);
+    UPDATE gen_index SET a = 5 WHERE a = 2;
+    SELECT a FROM gen_index WHERE b = 10;
+}
+expect {
+    5
+}
+
+test generated-column-added-to-a-table-with-rows {
+    CREATE TABLE gen_added (a int);
+    INSERT INTO gen_added VALUES (1);
+    ALTER TABLE gen_added ADD COLUMN b int GENERATED ALWAYS AS (a * 2) STORED;
+    INSERT INTO gen_added (a) VALUES (2);
+    SELECT * FROM gen_added ORDER BY a;
+}
+expect {
+    1|2
+    2|4
+}
+
+test generated-column-follows-renames {
+    CREATE TABLE gen_rename (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    ALTER TABLE gen_rename RENAME COLUMN a TO z;
+    ALTER TABLE gen_rename RENAME COLUMN b TO y;
+    INSERT INTO gen_rename (z) VALUES (2);
+    SELECT z, y FROM gen_rename;
+}
+expect {
+    2|4
+}
+
+test generated-column-blocks-dropping-the-column-it-reads {
+    CREATE TABLE gen_drop (a int, c int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    ALTER TABLE gen_drop DROP COLUMN a;
+}
+expect error {}
+
+test generated-column-can-be-dropped {
+    CREATE TABLE gen_drop_self (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    ALTER TABLE gen_drop_self DROP COLUMN b;
+    SELECT * FROM gen_drop_self;
+}
+expect {
+}
+
+test generated-column-in-a-schema {
+    CREATE SCHEMA gen_schema;
+    CREATE TABLE gen_schema.t (a int, b int GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO gen_schema.t (a) VALUES (2);
+    SELECT * FROM gen_schema.t;
+}
+expect {
+    2|4
+}
+
+@skip-if postgres "tursopg rejects types whose values core would not check or encode"
+test generated-column-rejects-smallint {
+    CREATE TABLE gen_smallint (a int, b smallint GENERATED ALWAYS AS (a * 2) STORED);
+}
+expect error {
+    generated column of type int2
+}
+
+@skip-if postgres "tursopg rejects types whose values core would not check or encode"
+test generated-column-rejects-limited-varchar {
+    CREATE TABLE gen_varchar (a text, b varchar(2) GENERATED ALWAYS AS (a) STORED);
+}
+expect error {
+    generated column of type varchar
+}
+
+@skip-if postgres "tursopg rejects types whose values core would not check or encode"
+test generated-column-rejects-limited-numeric {
+    CREATE TABLE gen_numeric (a int, b numeric(10, 2) GENERATED ALWAYS AS (a / 3.0) STORED);
+}
+expect error {
+    generated column of type numeric
+}
+
+@skip-if postgres "tursopg rejects types whose values core would not check or encode"
+test generated-column-rejects-uuid {
+    CREATE TABLE gen_uuid (a text, b uuid GENERATED ALWAYS AS (a::uuid) STORED);
+}
+expect error {
+    generated column of type uuid
+}
+
+@skip-if postgres "tursopg rejects types whose values core would not check or encode"
+test generated-column-rejects-domain {
+    CREATE DOMAIN gen_positive AS int CHECK (VALUE > 0);
+    CREATE TABLE gen_domain (a int, b gen_positive GENERATED ALWAYS AS (a) STORED);
+}
+expect error {
+    generated column of type gen_positive
+}
