@@ -319,7 +319,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Improved set of JSON functions and operators | ❌ Not supported | |
-| JSONB data type | 🟡 Partial | jsonb columns supported (Turso custom type); `->` and `->>` operators work; `#>`, `#>>`, `?`, `?&`, `?\|`, `@@` fail to translate |
+| JSONB data type | 🟡 Partial | jsonb columns supported (Turso custom type); `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?\|` and `?&` work; `@@` fails to translate; the operators also accept json and text, where PostgreSQL rejects them; `'1'::jsonb -> 0` is NULL, not the scalar |
 | JSONB-modifying operators and functions | ❌ Not supported | |
 | JSONB subscripting | ❌ Not supported | |
 | JSON data type | 🟡 Partial | Same as jsonb (see above) |

@@ -1628,3 +1628,278 @@ test random-divisor-is-not-an-integer {
 expect {
     ok
 }
+
+# JSON operators
+
+setup json_operators_table {
+    CREATE TABLE json_docs (id int, j jsonb, ja json, tags text[], key text);
+    INSERT INTO json_docs VALUES
+        (1, '{"n":1,"f":1.50,"b":true,"nul":null,"s":"str","o":{"x":[10,20]}}', '{"n":1,"s":"str"}', ARRAY['n','s'], 'n'),
+        (2, '{"a":2,"n":2}', '{"n":2}', ARRAY['z'], 'a'),
+        (3, '[10,"a",[1]]', '[10]', '{}', 'n'),
+        (4, NULL, NULL, NULL, NULL);
+}
+
+@setup json_operators_table
+test json-long-arrow-returns-text-so-it-compares-to-text {
+    SELECT id FROM json_docs WHERE j ->> 'n' = '2';
+}
+expect {
+    2
+}
+
+@setup json_operators_table
+test json-long-arrow-converts-each-json-kind-to-text {
+    SELECT j ->> 'n', j ->> 'f', j ->> 'b', j ->> 's', coalesce(j ->> 'nul', '<null>'), coalesce(j ->> 'zz', '<null>') FROM json_docs WHERE id = 1;
+}
+expect {
+    1|1.50|true|str|<null>|<null>
+}
+
+@setup json_operators_table
+test json-long-arrow-on-a-json-column {
+    SELECT ja ->> 'n', ja ->> 's', ja #>> '{s}' FROM json_docs WHERE id = 1;
+}
+expect {
+    1|str|str
+}
+
+@setup json_operators_table
+test json-arrow-keeps-json-text {
+    SELECT j -> 'n', j -> 'f', j -> 'b', j -> 's', j -> 'nul' FROM json_docs WHERE id = 1;
+}
+expect {
+    1|1.50|true|"str"|null
+}
+
+test json-arrow-text-key-is-never-a-path {
+    SELECT '{"a":1,"$.a":2,"b.c":3}'::jsonb ->> '$.a', '{"a":1,"$.a":2,"b.c":3}'::jsonb -> 'b.c', coalesce('{"a":1}'::jsonb -> '$.a', 'null'::jsonb);
+}
+expect {
+    2|3|null
+}
+
+test json-arrow-key-with-a-quote {
+    SELECT '{"k\"q":5}'::jsonb ->> 'k"q';
+}
+expect {
+    5
+}
+
+test json-arrow-integer-is-an-array-index-only {
+    SELECT '[10,20]'::jsonb ->> 1, '[10,20]'::jsonb ->> -1, coalesce('{"1":5}'::jsonb ->> 1, '<null>'), coalesce('[10,20]'::jsonb ->> '1', '<null>');
+}
+expect {
+    20|20|<null>|<null>
+}
+
+@setup json_operators_table
+test json-arrow-key-from-a-column {
+    SELECT id, j ->> key FROM json_docs WHERE id IN (1, 2) ORDER BY id;
+}
+expect {
+    1|1
+    2|2
+}
+
+test json-long-arrow-string-escapes {
+    SELECT '{"a":"x\"y"}'::jsonb ->> 'a', '{"a":"null"}'::jsonb ->> 'a', '["1"]'::jsonb ->> 0;
+}
+expect {
+    x"y|null|1
+}
+
+@setup json_operators_table
+test json-contains-column-and-literal {
+    SELECT id FROM json_docs WHERE j @> '{"n":1}';
+}
+expect {
+    1
+}
+
+@setup json_operators_table
+test json-contained-by-column-and-literal {
+    SELECT id FROM json_docs WHERE j <@ '{"a":2,"n":2,"z":3}';
+}
+expect {
+    2
+}
+
+test json-contains-nested-values {
+    SELECT '{"a":{"b":[1,2,{"c":3}]}}'::jsonb @> '{"a":{"b":[{"c":3},1]}}'::jsonb, '{"a":{"b":[1]}}'::jsonb @> '{"a":{"b":[2]}}'::jsonb, '{"a":1}'::jsonb @> '{"a":1.0}'::jsonb;
+}
+expect {
+    t|f|t
+}
+
+test json-contains-scalar-only-at-the-top-level-of-an-array {
+    SELECT '[1,2]'::jsonb @> '1'::jsonb, '1'::jsonb @> '[1]'::jsonb, '{"a":[1]}'::jsonb @> '{"a":1}'::jsonb, '[[1,2]]'::jsonb @> '[1]'::jsonb;
+}
+expect {
+    t|f|f|f
+}
+
+test json-contains-empty-documents {
+    SELECT '{}'::jsonb @> '{}'::jsonb, '{"a":1}'::jsonb @> '{}'::jsonb, '{}'::jsonb @> '{"a":1}'::jsonb, '[]'::jsonb @> '{}'::jsonb;
+}
+expect {
+    t|t|f|f
+}
+
+test json-contains-rejects-invalid-json {
+    SELECT '{"a":1}'::jsonb @> 'nope';
+}
+expect error {
+    invalid input syntax for type json
+}
+
+@setup json_operators_table
+test array-contains-still-works-with-a-text-literal {
+    SELECT id, tags @> '{n}', tags <@ '{n,s,x}', tags @> '{}', tags @> ARRAY['n','s'] FROM json_docs WHERE id IN (1, 2) ORDER BY id;
+}
+expect {
+    1|t|t|t|t
+    2|f|f|t|f
+}
+
+test array-contains-returns-boolean {
+    SELECT ARRAY[1,2] @> ARRAY[2], ARRAY[1] <@ ARRAY[2], '{1,2}'::int[] @> '{1}';
+}
+expect {
+    t|f|t
+}
+
+@setup json_operators_table
+test json-exists-key {
+    SELECT id FROM json_docs WHERE j ? 'a' ORDER BY id;
+}
+expect {
+    2
+    3
+}
+
+test json-exists-only-matches-strings-in-arrays {
+    SELECT '["a",1]'::jsonb ? 'a', '["a",1]'::jsonb ? '1', '"a"'::jsonb ? 'a', '{"x":"a"}'::jsonb ? 'a';
+}
+expect {
+    t|f|t|f
+}
+
+@setup json_operators_table
+test json-exists-any {
+    SELECT id FROM json_docs WHERE j ?| ARRAY['s','a'] ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup json_operators_table
+test json-exists-all {
+    SELECT id FROM json_docs WHERE j ?& ARRAY['n','a'] ORDER BY id;
+}
+expect {
+    2
+}
+
+@setup json_operators_table
+test json-exists-keys-from-a-column {
+    SELECT id FROM json_docs WHERE j ?& tags ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test json-exists-keys-skip-null-and-empty {
+    SELECT '{"a":1}'::jsonb ?| '{}', '{"a":1}'::jsonb ?& '{}', '{"a":1}'::jsonb ?| '{NULL}', '{"a":1}'::jsonb ?& '{a,NULL}';
+}
+expect {
+    f|t|f|t
+}
+
+@setup json_operators_table
+test json-path-text-issue-example {
+    SELECT j #>> '{n}' FROM json_docs WHERE id IN (1, 2) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup json_operators_table
+test json-path-walks-objects-and-arrays {
+    SELECT j #> '{o,x}' -> 1, j #> '{o,x,0}', j #>> '{o,x,-1}', j #>> '{s}', j #> ARRAY['s'] FROM json_docs WHERE id = 1;
+}
+expect {
+    20|10|20|str|"str"
+}
+
+test json-path-element-is-a-key-or-an-index-by-container {
+    SELECT '{"a":{"0":5}}'::jsonb #>> '{a,0}', '{"a":[5]}'::jsonb #>> '{a,0}', '{"a":{"b.c":6}}'::jsonb #>> '{a,b.c}', '[[1,2]]'::jsonb #>> '{0,-1}';
+}
+expect {
+    5|5|6|2
+}
+
+test json-path-that-leads-nowhere-is-null {
+    SELECT coalesce('{"a":1}'::jsonb #>> '{a,b}', '<null>'), coalesce('[1]'::jsonb #>> '{x}', '<null>'), coalesce('[1]'::jsonb #>> '{5}', '<null>'), coalesce('{"a":1}'::jsonb #>> '{a,NULL}', '<null>');
+}
+expect {
+    <null>|<null>|<null>|<null>
+}
+
+test json-empty-path-returns-the-document {
+    SELECT '[1]'::jsonb #>> '{}', '"s"'::jsonb #>> '{}', '5'::jsonb #> '{}';
+}
+expect {
+    [1]|s|5
+}
+
+@setup json_operators_table
+test json-operators-are-null-on-null {
+    SELECT coalesce(j ->> 'a', '<null>'), coalesce(j #>> '{a}', '<null>'), coalesce(j @> '{}', true), coalesce(j ? 'a', true), coalesce(j ?| '{a}', true) FROM json_docs WHERE id = 4;
+}
+expect {
+    <null>|<null>|t|t|t
+}
+
+test json-check-constraint-reads-the-stored-value {
+    CREATE TABLE json_checked (j jsonb CHECK (j ? 'a' AND j @> '{"a":1}' AND j #>> '{a}' = '1'), tags int[] CHECK (tags @> ARRAY[1]));
+    INSERT INTO json_checked VALUES ('{"a":1}', ARRAY[1]);
+    SELECT count(*) FROM json_checked;
+}
+expect {
+    1
+}
+
+test json-check-constraint-rejects-a-row {
+    CREATE TABLE json_checked (j jsonb CHECK (j ? 'a'));
+    INSERT INTO json_checked VALUES ('{"b":1}');
+}
+expect error {
+    violates check constraint
+}
+
+@setup json_operators_table
+test json-expression-index-and-partial-index {
+    CREATE INDEX json_docs_n ON json_docs ((j ->> 'n'));
+    CREATE INDEX json_docs_path ON json_docs ((j #>> '{s}'));
+    CREATE INDEX json_docs_has_a ON json_docs (id) WHERE j ? 'a';
+    INSERT INTO json_docs VALUES (5, '{"n":7,"s":"new","a":1}', NULL, NULL, NULL);
+    UPDATE json_docs SET j = '{"n":8}' WHERE id = 2;
+    SELECT id FROM json_docs WHERE (j ->> 'n') = '7';
+    SELECT id FROM json_docs WHERE (j #>> '{s}') = 'new';
+    SELECT id FROM json_docs WHERE (j ->> 'n') = '8';
+    SELECT count(*) FROM json_docs WHERE (j ->> 'n') = '2';
+    SELECT id FROM json_docs WHERE j ? 'a' ORDER BY id;
+}
+expect {
+    5
+    5
+    2
+    0
+    3
+    5
+}

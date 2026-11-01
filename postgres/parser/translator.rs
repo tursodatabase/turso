@@ -3577,19 +3577,33 @@ impl PostgreSQLTranslator {
             "/" => ast::Operator::Divide,
             "%" => ast::Operator::Modulus,
             "||" => ast::Operator::Concat,
-            "->" => ast::Operator::ArrowRight,
-            "->>" => ast::Operator::ArrowRightShift,
+            "->" | "->>" | "#>" | "#>>" => {
+                let path = if matches!(op_name, "->" | "->>") {
+                    function_call("pg_json_key", vec![*right])
+                } else {
+                    function_call("pg_json_path", vec![(*left).clone(), *right])
+                };
+                let value = ast::Expr::Binary(left, ast::Operator::ArrowRight, Box::new(path));
+                return Ok(if matches!(op_name, "->>" | "#>>") {
+                    function_call("pg_json_text", vec![value])
+                } else {
+                    value
+                });
+            }
+            "?" => return Ok(function_call("jsonb_exists", vec![*left, *right])),
+            "?|" => return Ok(function_call("jsonb_exists_any", vec![*left, *right])),
+            "?&" => return Ok(function_call("jsonb_exists_all", vec![*left, *right])),
             "&" => ast::Operator::BitwiseAnd,
             "|" => ast::Operator::BitwiseOr,
             "<<" => ast::Operator::LeftShift,
             ">>" => ast::Operator::RightShift,
             "AND" => ast::Operator::And,
             "OR" => ast::Operator::Or,
-            // Array operators → translate to native array function calls
+            // Array and jsonb operators → translate to native function calls
             "@>" | "<@" | "&&" => {
                 let (func_name, args) = match op_name {
-                    "@>" => ("array_contains_all", vec![left, right]),
-                    "<@" => ("array_contains_all", vec![right, left]), // swap: b contains all of a
+                    "@>" => ("pg_contains", vec![left, right]),
+                    "<@" => ("pg_contains", vec![right, left]), // swap: b contains all of a
                     "&&" => ("array_overlap", vec![left, right]),
                     _ => unreachable!(),
                 };
@@ -9738,7 +9752,7 @@ mod tests {
             if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
                 let wc = where_clause.as_ref().expect("Expected WHERE clause");
                 if let ast::Expr::FunctionCall { name, args, .. } = &**wc {
-                    assert_eq!(name.as_str(), "array_contains_all");
+                    assert_eq!(name.as_str(), "pg_contains");
                     assert_eq!(args.len(), 2);
                 } else {
                     panic!("Expected FunctionCall for @>, got: {wc:?}");
@@ -9761,7 +9775,7 @@ mod tests {
             if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
                 let wc = where_clause.as_ref().expect("Expected WHERE clause");
                 if let ast::Expr::FunctionCall { name, .. } = &**wc {
-                    assert_eq!(name.as_str(), "array_contains_all");
+                    assert_eq!(name.as_str(), "pg_contains");
                 } else {
                     panic!("Expected FunctionCall for <@, got: {wc:?}");
                 }
