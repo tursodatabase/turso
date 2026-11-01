@@ -7,8 +7,8 @@ sidebarTitle: COPY
 # COPY
 
 The PostgreSQL frontend supports exporting plain tables with `COPY TO STDOUT`
-through the simple query protocol. This statement is not available through the
-SQLite frontend.
+through the simple query protocol and the embedded `prepare()` API.
+This statement is not available through the SQLite frontend.
 
 ```sql
 COPY [schema.]table_name [(column_name, ...)] TO STDOUT [WITH (FORMAT text)];
@@ -23,14 +23,19 @@ rejected.
 COPY public.users (id, name, email) TO STDOUT;
 ```
 
-The output uses PostgreSQL COPY text format: tabs separate fields, newlines
+The server output uses PostgreSQL COPY text format: tabs separate fields, newlines
 separate rows, and `\N` represents NULL. Backslashes, tabs, newlines, carriage
 returns, backspaces, form feeds, and vertical tabs are escaped. Empty strings
 remain empty fields. The server sends rows individually and reports `COPY n`
 when the export succeeds.
 
+With the embedded API, `conn.prepare("COPY users TO STDOUT")` returns a normal
+statement. Call `step()` and `row()` to read ordinary column values, without
+COPY escaping or wire-protocol messages. The caller handles I/O yields as with
+other statements. To produce COPY text, pass each row to `CopyTextEncoder`.
+The embedded `execute()` API executes the statement but discards the rows.
+
 COPY reads changes visible to the current transaction and does not commit that
 transaction. Views, query sources such as `COPY (SELECT ...)`, file or program
 destinations, CSV, binary format, and custom output options are not supported.
-COPY TO STDOUT is not supported through the extended query protocol or the
-embedded `execute()` API.
+COPY TO STDOUT is not supported through the extended query protocol.

@@ -134,10 +134,8 @@ pub fn emit_program_for_update(
     };
 
     let target_table = Arc::new(plan.target_table.clone());
-    let target_tables = TableReferences::new(
-        vec![plan.target_table.clone()],
-        plan.from_tables.outer_query_refs().to_vec(),
-    );
+    let target_tables =
+        TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables);
     let write_set_plan = plan.write_set_plan.take();
     let temp_cursor_id = match write_set_plan.as_ref() {
         Some(plan) => {

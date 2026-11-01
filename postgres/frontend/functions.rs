@@ -1,6 +1,6 @@
 use crate::catalog::PG_DATABASE_OWNER_OID;
 use crate::error::sqlstate_error;
-use crate::settings::SettingScope;
+use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
@@ -485,17 +485,6 @@ fn text_arg(args: &[Register], i: usize) -> String {
     }
 }
 
-#[derive(strum::EnumString)]
-#[strum(ascii_case_insensitive, serialize_all = "snake_case")]
-pub(crate) enum ConfigParameter {
-    SearchPath,
-}
-
-pub(crate) enum Parameter<'a> {
-    BuiltIn(ConfigParameter),
-    Custom(&'a str),
-}
-
 fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<String> {
     let name = match args[0].get_value() {
         Value::Text(name) => name.as_str(),
@@ -533,9 +522,7 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<String> {
         },
     };
     match parameter {
-        Parameter::BuiltIn(ConfigParameter::SearchPath) => {
-            crate::session::set_search_path(conn, value, scope)
-        }
+        Parameter::BuiltIn(parameter) => parameter.set(conn, value, scope),
         Parameter::Custom(name) => crate::session::set_custom_parameter(conn, name, value, scope),
     }
 }
@@ -575,10 +562,7 @@ fn exec_current_setting(conn: &Connection, args: &[Register]) -> Result<Option<S
         },
     };
     let setting = match find_parameter(name) {
-        Some(Parameter::BuiltIn(ConfigParameter::SearchPath)) => Some(
-            crate::session::search_path_setting(conn)
-                .unwrap_or_else(|| crate::session::DEFAULT_SEARCH_PATH.to_owned()),
-        ),
+        Some(Parameter::BuiltIn(parameter)) => Some(parameter.get(conn)),
         Some(Parameter::Custom(name)) => crate::session::custom_parameter(conn, name),
         None => None,
     };
@@ -594,14 +578,6 @@ fn unrecognized_parameter(name: &str) -> LimboError {
         SQLSTATE_UNDEFINED_OBJECT,
         format!("unrecognized configuration parameter \"{name}\""),
     )
-}
-
-pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
-    match name.parse::<ConfigParameter>() {
-        Ok(parameter) => Some(Parameter::BuiltIn(parameter)),
-        Err(_) if name.contains('.') => Some(Parameter::Custom(name)),
-        Err(_) => None,
-    }
 }
 
 /// Turns 64 random bits into a number in [0, 1). A double holds 53 bits of
@@ -1388,7 +1364,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
 /// and the case of the letters do not matter, and the start of true, false,
 /// yes or no is enough. For on and off, the first two letters are necessary.
 /// None when the text is not a boolean literal.
-fn parse_pg_bool(text: &str) -> Option<bool> {
+pub(crate) fn parse_pg_bool(text: &str) -> Option<bool> {
     let word = text
         .trim_matches(|c: char| c.is_ascii_whitespace() || c == '\u{b}')
         .to_ascii_lowercase();
@@ -1606,25 +1582,4 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
     }
 
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ConfigParameter;
-
-    #[test]
-    fn config_parameter_parses_sql_names() {
-        for name in ["search_path", "SEARCH_PATH", "SeArCh_PaTh"] {
-            assert!(
-                matches!(
-                    name.parse::<ConfigParameter>(),
-                    Ok(ConfigParameter::SearchPath)
-                ),
-                "{name}"
-            );
-        }
-        for name in ["", "statement_timeout", "SearchPath", "search_path "] {
-            assert!(name.parse::<ConfigParameter>().is_err(), "{name}");
-        }
-    }
 }

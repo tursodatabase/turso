@@ -115,7 +115,7 @@ impl Trigger {
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::translate::collate::{CollationSeq, TextCollation};
+use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
 use crate::translate::expr::expr_type::ExprType;
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
@@ -5273,6 +5273,21 @@ impl BTreeTable {
             }
         }
         Ok(Arc::new(modified))
+    }
+
+    /// Fails when a column or a key of a UNIQUE or PRIMARY KEY constraint has a
+    /// COLLATE and the column's type has its own order. Call this after
+    /// [Self::resolve_custom_types].
+    pub(crate) fn check_collates_are_allowed(&self) -> Result<()> {
+        for column in &self.columns {
+            key_collation(column.text_collation(), column.type_ordering())?;
+        }
+        for key in self.unique_sets.iter().flat_map(|set| &set.columns) {
+            if let Some((_, column)) = self.get_column(&key.name) {
+                key_collation(key.collation, column.type_ordering())?;
+            }
+        }
+        Ok(())
     }
 
     /// Fill in what custom type columns get from their type:

@@ -10,6 +10,7 @@ mod statement;
 mod unnest;
 
 pub use catalog::PostgresDialect;
+pub use copy::CopyTextEncoder;
 pub use error::{Error, ErrorReport, Result};
 pub use session::PgConnection as Connection;
 pub use session::{

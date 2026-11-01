@@ -165,10 +165,9 @@ impl Constraint {
         };
         let mut affinity = Affinity::Blob;
         if op.as_ast_operator().is_some_and(|op| op.is_comparison()) {
-            // The resolver matters here: a scalar subquery's affinity is only
-            // known through it. Without it, `text_col < (SELECT int_col ...)`
-            // would take the TEXT side's affinity and the seek would compare
-            // the integer as text.
+            // `text_col < (SELECT int_col ...)` must use the subquery column's
+            // affinity. With the TEXT side's affinity alone, the seek would
+            // compare the integer as text.
             affinity = match resolver {
                 Some(resolver) => {
                     comparison_affinity(lhs, rhs, &ExprContext::new(referenced_tables, resolver))

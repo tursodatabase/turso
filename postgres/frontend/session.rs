@@ -7,8 +7,9 @@ use std::task::Waker;
 
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
-use crate::functions::{find_parameter, ConfigParameter, Parameter};
-use crate::settings::{ConnectionSettings, PgSessionState, SettingScope};
+use crate::settings::{
+    find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SettingScope,
+};
 use crate::statement::{PgTxState, PostRunFn, TxRole};
 use turso_core::schema::Table;
 use turso_core::{
@@ -23,10 +24,10 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
-    execution_takes_snapshot, is_drop_matview, is_tx_exit_stmt, session_stmt,
+    execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
-    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo, PgSetValue,
-    PgShowStmt, PostgreSQLTranslator, SessionStmt,
+    FrontendStmt, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo,
+    PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 use turso_pg_parser::ParseError;
 
@@ -377,7 +378,7 @@ fn prepare_statement_inner(
     // query, for every kind of statement this function returns.
     let marks_query_start = execution_takes_snapshot(&parse_result);
 
-    if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
+    if let Some(stmt) = try_prepare_special(pg_conn, sql, &parse_result)? {
         return Ok(stmt
             .with_tx_tracking(
                 Arc::clone(&pg_conn.conn),
@@ -582,7 +583,7 @@ enum DeferredOperation {
         cmd: Box<ast::Cmd>,
         sql: String,
     },
-    Session(SessionStmt),
+    Frontend(FrontendStmt),
 }
 
 enum DeferredCommand {
@@ -1028,29 +1029,29 @@ impl DeferredOperation {
                     target_exists: false,
                 })))
             }
-            Self::Session(stmt) => {
+            Self::Frontend(stmt) => {
                 let statements = match stmt {
-                    SessionStmt::ResetAll => {
+                    FrontendStmt::ResetAll => {
                         reset_all_settings(conn)?;
                         return Ok(None);
                     }
-                    SessionStmt::DiscardAll => {
+                    FrontendStmt::DiscardAll => {
                         discard_all(conn)?;
                         return Ok(None);
                     }
-                    SessionStmt::CreateSchema(stmt) => {
+                    FrontendStmt::CreateSchema(stmt) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
                         create_schema_commands(conn, stmt)?
                     }
-                    SessionStmt::DropSchema(stmt) => {
+                    FrontendStmt::DropSchema(stmt) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
                         drop_schema_commands(conn, stmt)?
                     }
-                    SessionStmt::CopyFrom(stmt) => {
+                    FrontendStmt::CopyFrom(stmt) => {
                         *active = Some(crate::Statement::new(prepare_copy_columns(
                             conn,
                             &stmt.table_name,
@@ -1064,13 +1065,16 @@ impl DeferredOperation {
                             index: 0,
                         })));
                     }
-                    SessionStmt::RefreshMatview | SessionStmt::CommentOn => {
+                    FrontendStmt::RefreshMatview | FrontendStmt::CommentOn => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
                         return Ok(None);
                     }
-                    SessionStmt::Set(_) | SessionStmt::SetTransaction | SessionStmt::Show(_) => {
+                    FrontendStmt::Set(_)
+                    | FrontendStmt::SetTransaction
+                    | FrontendStmt::Show(_)
+                    | FrontendStmt::CopyTo(_) => {
                         unreachable!()
                     }
                 };
@@ -1584,25 +1588,32 @@ fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
 
 fn try_prepare_special(
     pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
     parse_result: &turso_pg_parser::ParseResult,
 ) -> Result<Option<crate::Statement>> {
-    let Some(stmt) = session_stmt(parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
+    let Some(stmt) =
+        frontend_stmt(sql, parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
     else {
         return Ok(None);
     };
     let stmt = match stmt {
-        SessionStmt::Set(set_stmt) => crate::Statement::new(handle_pg_set(pg_conn, &set_stmt)?),
-        SessionStmt::SetTransaction => prepare_set_transaction(pg_conn, parse_result)?,
-        SessionStmt::Show(show_stmt) => crate::Statement::new(handle_pg_show(pg_conn, &show_stmt)?),
-        stmt @ (SessionStmt::ResetAll
-        | SessionStmt::DiscardAll
-        | SessionStmt::CreateSchema(_)
-        | SessionStmt::DropSchema(_)
-        | SessionStmt::CopyFrom(_)
-        | SessionStmt::RefreshMatview
-        | SessionStmt::CommentOn) => crate::Statement::with_deferred(
+        FrontendStmt::Set(set_stmt) => crate::Statement::new(handle_pg_set(pg_conn, &set_stmt)?),
+        FrontendStmt::SetTransaction => prepare_set_transaction(pg_conn, parse_result)?,
+        FrontendStmt::Show(show_stmt) => {
+            crate::Statement::new(handle_pg_show(pg_conn, &show_stmt)?)
+        }
+        FrontendStmt::CopyTo(copy) => {
+            crate::Statement::new(crate::copy::prepare_copy_to_stdout(&pg_conn.conn, &copy)?)
+        }
+        stmt @ (FrontendStmt::ResetAll
+        | FrontendStmt::DiscardAll
+        | FrontendStmt::CreateSchema(_)
+        | FrontendStmt::DropSchema(_)
+        | FrontendStmt::CopyFrom(_)
+        | FrontendStmt::RefreshMatview
+        | FrontendStmt::CommentOn) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
-            DeferredExecution::new(pg_conn, DeferredOperation::Session(stmt)),
+            DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
     };
     Ok(Some(stmt))
@@ -1685,8 +1696,25 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 ))
             }
         },
-        (None, PgSetTo::Values(values)) if set_value_already_in_effect(name, values) => {
-            return noop_statement(&pg_conn.conn);
+        (Some(Parameter::BuiltIn(parameter)), PgSetTo::Values(values)) => {
+            if values.len() != 1 && !parameter.accepts_list() {
+                return Err(sqlstate_error(
+                    SQLSTATE_INVALID_PARAMETER_VALUE,
+                    format!("SET {name} takes only one argument"),
+                ));
+            }
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    PgSetValue::Identifier(s)
+                    | PgSetValue::StringLiteral(s)
+                    | PgSetValue::Number(s) => Ok(s.as_str()),
+                    PgSetValue::Bool(true) => Ok("on"),
+                    PgSetValue::Bool(false) => Ok("off"),
+                    _ => Err(LimboError::ParseError("incorrect format".to_string())),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            quote(&values.join(", "))
         }
         (None, to) => {
             let command = match to {
@@ -1707,62 +1735,12 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     ))
 }
 
-fn set_value_already_in_effect(name: &str, values: &[PgSetValue]) -> bool {
-    let Some(values) = values
-        .iter()
-        .map(|value| match value {
-            PgSetValue::Identifier(s) | PgSetValue::StringLiteral(s) | PgSetValue::Number(s) => {
-                Some(s.to_ascii_lowercase())
-            }
-            PgSetValue::Bool(b) => Some(if *b { "on" } else { "off" }.to_string()),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    let value = values.join(", ");
-    let is_on = matches!(value.as_str(), "on" | "true" | "1");
-    let is_off = matches!(value.as_str(), "off" | "false" | "0");
-    match name.to_ascii_lowercase().as_str() {
-        "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
-            value == "0"
-        }
-        "datestyle" => matches!(value.as_str(), "iso" | "iso, mdy" | "iso, ymd" | "iso, dmy"),
-        "intervalstyle" => value == "postgres",
-        "client_encoding" => matches!(value.as_str(), "utf8" | "utf-8" | "unicode"),
-        "extra_float_digits" => matches!(value.as_str(), "1" | "2" | "3"),
-        "standard_conforming_strings" => is_on,
-        "row_security" | "quote_all_identifiers" => is_off,
-        "check_function_bodies" | "synchronize_seqscans" => is_on || is_off,
-        "default_tablespace" => value.is_empty(),
-        "default_table_access_method" => value == "heap",
-        "transaction_timeout" => value == "0",
-        "xmloption" => value == "content",
-        "application_name" => true,
-        "client_min_messages" => matches!(
-            value.as_str(),
-            "debug5"
-                | "debug4"
-                | "debug3"
-                | "debug2"
-                | "debug1"
-                | "debug"
-                | "log"
-                | "notice"
-                | "warning"
-                | "error"
-        ),
-        _ => false,
-    }
-}
-
 fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show_stmt: &PgShowStmt) -> Result<Statement> {
     let name = &show_stmt.name;
     // PostgreSQL names the column after the parameter, not after the name
     // SHOW was given.
     let column = match find_parameter(name) {
-        Some(Parameter::BuiltIn(ConfigParameter::SearchPath)) => SEARCH_PATH_SETTING.to_owned(),
+        Some(Parameter::BuiltIn(parameter)) => parameter.name().to_owned(),
         Some(Parameter::Custom(_)) => session_state(&pg_conn.conn)?
             .name_as_defined(name)
             .unwrap_or_else(|| name.clone()),
@@ -1855,7 +1833,7 @@ pub(crate) fn custom_parameter(conn: &Connection, name: &str) -> Option<String> 
         .then(|| state.setting(&name).unwrap_or_default())
 }
 
-fn session_state(conn: &Connection) -> Result<&PgSessionState> {
+pub(crate) fn session_state(conn: &Connection) -> Result<&PgSessionState> {
     conn.context::<PgSessionState>().ok_or_else(|| {
         LimboError::InvalidArgument("PostgreSQL session state is not initialized".to_string())
     })
@@ -2737,10 +2715,7 @@ mod tests {
         let conn = test_connection();
         conn.execute("CREATE TABLE t (a int)").unwrap();
         conn.execute("BEGIN READ ONLY").unwrap();
-        let spec = turso_pg_parser::copy::parse_copy_to_stdout("COPY t TO STDOUT")
-            .unwrap()
-            .unwrap();
-        let mut stmt = conn.prepare_copy_to_stdout(&spec).unwrap();
+        let mut stmt = conn.prepare("COPY t TO STDOUT").unwrap();
         stmt.run_ignore_rows().unwrap();
         drop(stmt);
         let err = conn.execute("SET TRANSACTION READ WRITE").unwrap_err();
