@@ -158,6 +158,7 @@ pub enum EncryptionCipher {
     Aegis128l,
     Aegis128x2,
     Aegis128x4,
+    Aegis256x4,
 }
 
 impl EncryptionCipher {
@@ -167,6 +168,7 @@ impl EncryptionCipher {
             EncryptionCipher::Aes256Gcm => "aes256gcm",
             EncryptionCipher::Aegis256 => "aegis256",
             EncryptionCipher::Aegis256x2 => "aegis256x2",
+            EncryptionCipher::Aegis256x4 => "aegis256x4",
             EncryptionCipher::Aegis128l => "aegis128l",
             EncryptionCipher::Aegis128x2 => "aegis128x2",
             EncryptionCipher::Aegis128x4 => "aegis128x4",
