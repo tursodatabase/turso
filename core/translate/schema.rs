@@ -842,6 +842,13 @@ fn validate(
                         "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
                     );
                 }
+                // SQLite stores such a column once per PRIMARY KEY entry; Turso
+                // stores it once, so the file would not be readable by SQLite.
+                if table.primary_key_repeats_column_with_other_collation() {
+                    bail_parse_error!(
+                        "a WITHOUT ROWID PRIMARY KEY that lists a column more than once with different collations is not supported"
+                    );
+                }
             } else if table.has_autoincrement {
                 // SQLite allows AUTOINCREMENT only on a key declared exactly as
                 // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size

@@ -5459,9 +5459,7 @@ impl BTreeTable {
             && self
                 .get_column(&self.primary_key_columns[0].0)
                 .is_some_and(|(_, col)| col.primary_key())
-            && self
-                .primary_key_constraint_collation(&self.primary_key_columns[0].0)
-                .is_none();
+            && self.primary_key_explicit_collation(0).is_none();
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {
             if i > 0 {
@@ -5560,7 +5558,7 @@ impl BTreeTable {
                     sql.push_str(", ");
                 }
                 sql.push_str(&quote_ident(&col.0));
-                push_collation(sql, self.primary_key_constraint_collation(&col.0));
+                push_collation(sql, self.primary_key_explicit_collation(i));
                 if col.1 == SortOrder::Desc {
                     sql.push_str(" DESC");
                 }
@@ -5727,29 +5725,25 @@ impl BTreeTable {
             })
     }
 
-    /// Collation of the WITHOUT ROWID table key field that stores the `i`-th
-    /// PRIMARY KEY entry, whose column is `column`. The table stores a column
-    /// once even when PRIMARY KEY(...) lists it more than once. When those
-    /// entries have different collations the field compares with BINARY,
-    /// because two texts are equal under every built-in collation only when
-    /// they are equal under BINARY.
-    pub fn without_rowid_key_collation(&self, i: usize, column: &Column) -> CollationSeq {
-        let (name, _) = &self.primary_key_columns[i];
-        let collation = self.primary_key_collation(i, column);
-        let repeated_with_other_collation =
-            self.primary_key_columns
+    /// True when PRIMARY KEY(...) lists a column more than once with
+    /// different collations, e.g. PRIMARY KEY(a COLLATE NOCASE, a).
+    pub fn primary_key_repeats_column_with_other_collation(&self) -> bool {
+        let collations = self
+            .primary_key_columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (name, _))| {
+                let (_, column) = self.get_column(name)?;
+                Some((name, self.primary_key_collation(i, column)))
+            })
+            .collect::<Vec<_>>();
+        collations.iter().enumerate().any(|(i, (name, collation))| {
+            collations[i + 1..]
                 .iter()
-                .enumerate()
-                .any(|(j, (other_name, _))| {
-                    j != i
-                        && other_name.eq_ignore_ascii_case(name)
-                        && self.primary_key_collation(j, column) != collation
-                });
-        if repeated_with_other_collation {
-            CollationSeq::Text(TextCollation::Binary)
-        } else {
-            collation
-        }
+                .any(|(other_name, other_collation)| {
+                    other_name.eq_ignore_ascii_case(name) && other_collation != collation
+                })
+        })
     }
 
     /// Collation of the `i`-th PRIMARY KEY entry, whose column is `column`:
@@ -5765,19 +5759,6 @@ impl BTreeTable {
             .iter()
             .find(|unique_set| unique_set.is_primary_key)
             .and_then(|unique_set| unique_set.columns.get(i))
-            .and_then(|column| column.collation)
-    }
-
-    fn primary_key_constraint_collation(&self, column_name: &str) -> Option<TextCollation> {
-        self.unique_sets
-            .iter()
-            .find(|unique_set| unique_set.is_primary_key)
-            .and_then(|unique_set| {
-                unique_set
-                    .columns
-                    .iter()
-                    .find(|column| column.name == column_name)
-            })
             .and_then(|column| column.collation)
     }
 
@@ -9664,6 +9645,14 @@ mod tests {
         assert_eq!(index.columns[1].name, "b");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_primary_key_collation_stays_on_its_own_entry_in_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE t (a, b, PRIMARY KEY (a COLLATE NOCASE, b, a))"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+        assert_eq!(table.to_sql(), sql);
         Ok(())
     }
 
