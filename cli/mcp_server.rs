@@ -1,3 +1,4 @@
+use crate::app::quote_ident;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -640,7 +641,7 @@ impl TursoMcpServer {
         };
 
         // Use table_xinfo to include generated columns (table_info hides them)
-        let query = format!("PRAGMA table_xinfo({table_name})");
+        let query = format!("PRAGMA table_xinfo({})", quote_ident(table_name));
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.query(&query) {
@@ -1113,5 +1114,28 @@ mod tests {
         let response = call_tool(&server, "no_such_tool", json!({}));
         assert!(response.result.is_none());
         assert_eq!(response.error.expect("JSON-RPC error").code, -32601);
+    }
+
+    #[test]
+    fn describe_table_accepts_names_that_need_quoting() {
+        let server = memory_server();
+        let conn = server.conn.lock().unwrap().clone();
+        conn.execute(r#"CREATE TABLE "order items" (id INTEGER, label TEXT)"#)
+            .unwrap();
+        conn.execute(r#"CREATE TABLE "a""b" (x INTEGER)"#).unwrap();
+        conn.execute("CREATE TABLE plain (y TEXT)").unwrap();
+
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "order items" }))),
+            Ok("Table 'order items' columns:\nid INTEGER NULL\nlabel TEXT NULL".to_string())
+        );
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "a\"b" }))),
+            Ok("Table 'a\"b' columns:\nx INTEGER NULL".to_string())
+        );
+        assert_eq!(
+            server.describe_table(&Some(json!({ "table_name": "plain" }))),
+            Ok("Table 'plain' columns:\ny TEXT NULL".to_string())
+        );
     }
 }
