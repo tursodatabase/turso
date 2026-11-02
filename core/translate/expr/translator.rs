@@ -819,10 +819,8 @@ fn translate_cast_expr(
 /// column of the type stores it, or None when the CAST is SQLite's CAST. A
 /// domain stores through every type under it, then checks its constraints on
 /// the stored value. A CAST with type arguments applies their limits too:
-/// CAST('3.504' AS numeric(10,2)) is 3.50. A type that takes arguments, named
-/// without all of them, is SQLite's CAST: CAST(x AS NUMERIC) is a common
-/// SQLite idiom. Array types are not covered here.
-pub(crate) fn custom_type_cast_chain(
+/// CAST('3.504' AS numeric(10,2)) is 3.50. Array types are not covered here.
+fn custom_type_cast_chain(
     type_name: &ast::Type,
     schema: &crate::schema::Schema,
 ) -> Result<Option<crate::alloc::Vec<Arc<TypeDef>>>> {
@@ -837,17 +835,24 @@ pub(crate) fn custom_type_cast_chain(
     if resolved.is_domain() {
         return Ok(Some(resolved.chain));
     }
+    if is_sqlite_cast_to(resolved.leaf(), type_name) {
+        return Ok(None);
+    }
+    resolved.chain.truncate(1);
+    Ok(Some(resolved.chain))
+}
+
+/// Whether a CAST to `type_def`, written as `type_name`, is SQLite's CAST
+/// instead: the type takes arguments and `type_name` doesn't give all of them.
+/// CAST(x AS NUMERIC) is a common SQLite idiom.
+pub(crate) fn is_sqlite_cast_to(type_def: &TypeDef, type_name: &ast::Type) -> bool {
     let type_arg_count = match &type_name.size {
         Some(ast::TypeSize::MaxSize(_)) => 1,
         Some(ast::TypeSize::TypeSize(..)) => 2,
         None => 0,
     };
-    let user_param_count = resolved.leaf().user_params().count();
-    if user_param_count != 0 && type_arg_count != user_param_count {
-        return Ok(None);
-    }
-    resolved.chain.truncate(1);
-    Ok(Some(resolved.chain))
+    let user_param_count = type_def.user_params().count();
+    !type_def.is_domain && user_param_count != 0 && type_arg_count != user_param_count
 }
 
 /// True when a cast to `type_def` turns every nonzero integer into true.

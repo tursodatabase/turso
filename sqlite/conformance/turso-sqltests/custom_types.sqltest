@@ -978,23 +978,29 @@ expect {
     cherry
 }
 
-# A CAST to test_reverse is a value of the type, so ORDER BY on it sorts by the
-# stored value like ORDER BY on a column of the type, and still reads decoded.
+# A CAST gives the decoded value, so ORDER BY on it sorts by the decoded value,
+# the same as an index on the CAST holds it. ORDER BY on the column itself
+# sorts by the stored value.
 @requires strict "uses STRICT tables"
-test order-by-cast-to-custom-type-sorts-like-column {
+test order-by-cast-to-custom-type-sorts-decoded-with-and-without-index {
     CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
     CREATE TABLE t1(val test_reverse, plain text) STRICT;
     INSERT INTO t1 VALUES ('apple', 'apple');
     INSERT INTO t1 VALUES ('banana', 'banana');
     INSERT INTO t1 VALUES ('cherry', 'cherry');
+    SELECT group_concat(val) FROM (SELECT val FROM t1 ORDER BY val);
     SELECT group_concat(plain) FROM (SELECT plain FROM t1 ORDER BY CAST(plain AS test_reverse));
     SELECT group_concat(c) FROM (SELECT CAST(plain AS test_reverse) AS c FROM t1 ORDER BY CAST(plain AS test_reverse));
     SELECT group_concat(c) FROM (SELECT CAST(val AS test_reverse) AS c FROM t1 ORDER BY CAST(val AS test_reverse));
+    CREATE INDEX t1_cast ON t1(CAST(plain AS test_reverse));
+    SELECT group_concat(plain) FROM (SELECT plain FROM t1 ORDER BY CAST(plain AS test_reverse));
 }
 expect {
     banana,apple,cherry
-    banana,apple,cherry
-    banana,apple,cherry
+    apple,banana,cherry
+    apple,banana,cherry
+    apple,banana,cherry
+    apple,banana,cherry
 }
 
 @requires strict "uses STRICT tables"

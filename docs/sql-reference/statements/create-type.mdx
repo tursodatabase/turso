@@ -140,7 +140,7 @@ SELECT w FROM t ORDER BY w;
 -- cherry   (stored as 'yrrehc')
 ```
 
-`ORDER BY CAST(x AS reversed_text)` sorts the same way, since the CAST is a value of the type.
+`ORDER BY CAST(x AS reversed_text)` sorts by the decoded value instead (apple, banana, cherry), because a CAST gives the decoded value. An index on the CAST holds the decoded value too.
 
 The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and so does a COLLATE on a column of such a type in a STRICT table, in `CREATE TABLE` (also in a `UNIQUE` or `PRIMARY KEY` constraint), `ALTER TABLE ADD COLUMN`, `ALTER TABLE ALTER COLUMN` or `CREATE INDEX`. Comparing two types with different orders fails with `cannot compare type x with type y`.
 
@@ -228,7 +228,7 @@ SELECT -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1;
 
 A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the value as the column holds it.
 
-In a CHECK constraint, a table's or a domain's, which sees the values it checks as they are stored, a CAST gives the stored value instead, without DECODE (see below). As an ORDER BY key, a CAST sorts by the stored value, like a column of the type (see [Sorting and comparing](#sorting-and-comparing)).
+In a CHECK constraint, a table's or a domain's, which sees the values it checks as they are stored, a CAST gives the stored value instead, without DECODE (see below).
 
 Earlier versions gave the stored value from a CAST to a type with a DECODE everywhere. An index made by an earlier version whose key or WHERE clause uses such a CAST holds those stored values, and `PRAGMA integrity_check` reports its rows as missing: run `REINDEX` on it. Triggers and views that use such a CAST now get the decoded value.
 

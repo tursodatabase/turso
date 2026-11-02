@@ -18,7 +18,7 @@ use crate::{
 
 use super::{
     emitter::{Resolver, TranslateCtx},
-    expr::{custom_type_cast_chain, emit_decode, translate_expr},
+    expr::translate_expr,
     plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
@@ -47,27 +47,6 @@ fn result_column_custom_type_info<'a>(
         Some((col, type_def))
     } else {
         None
-    }
-}
-
-/// The custom types whose DECODE turns the stored form of the ORDER BY key
-/// `expr` into its value: those of a column of a custom type, or of a CAST to
-/// one. The sorter sorts such a key in stored form, so `ORDER BY CAST(v AS t)`
-/// sorts like `ORDER BY` a column of `t`.
-fn sort_key_custom_types(
-    expr: &ast::Expr,
-    referenced_tables: &TableReferences,
-    schema: &Schema,
-) -> Result<Option<Vec<Arc<crate::schema::TypeDef>>>> {
-    match expr {
-        ast::Expr::Cast {
-            type_name: Some(type_name),
-            ..
-        } => custom_type_cast_chain(type_name, schema),
-        _ => Ok(
-            result_column_custom_type_info(expr, referenced_tables, schema)
-                .map(|(_, type_def)| crate::alloc::vec![type_def]),
-        ),
     }
 }
 
@@ -340,12 +319,26 @@ impl EmitOrderBy {
             // (on-disk) value (decode was suppressed during sorter insert). Apply
             // DECODE now so the result set contains human-readable values.
             if remapping.deduplicated {
-                if let Some(chain) = sort_key_custom_types(
+                if let Some((_, type_def)) = result_column_custom_type_info(
                     &rc.expr,
                     &plan.table_references,
                     t_ctx.resolver.schema(),
-                )? {
-                    emit_decode(program, &chain, reg, &t_ctx.resolver)?;
+                ) {
+                    if let Some(decode_expr) = type_def.decode() {
+                        let skip_label = program.allocate_label();
+                        program.emit_insn(Insn::IsNull {
+                            reg,
+                            target_pc: skip_label,
+                        });
+                        super::expr::emit_type_expr(
+                            program,
+                            decode_expr,
+                            reg,
+                            reg,
+                            &t_ctx.resolver,
+                        )?;
+                        program.preassign_label_to_next_insn(skip_label);
+                    }
                 }
             }
         }
@@ -437,8 +430,8 @@ impl EmitOrderBy {
                 // sorter compares stored values, with SQLite's comparison or the
                 // built-in type's own order (numeric).
                 let is_custom =
-                    sort_key_custom_types(expr, &plan.table_references, resolver.schema())?
-                        .is_some_and(|chain| chain.iter().any(|td| td.decode().is_some()));
+                    result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
+                        .is_some_and(|(_, td)| td.decode().is_some());
                 if is_custom {
                     program.flags.set_suppress_custom_type_decode(true);
                 }
