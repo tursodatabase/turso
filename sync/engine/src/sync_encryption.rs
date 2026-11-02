@@ -43,7 +43,8 @@ impl SyncEncryption {
     }
 
     pub(crate) fn connect_options(&self) -> ConnectOpts {
-        ConnectOpts::new().with_encryption_key(self.local_key.clone())
+        ConnectOpts::new(turso_core::SessionRole::Superuser)
+            .with_encryption_key(self.local_key.clone())
     }
 
     pub(crate) fn local_options(&self) -> Option<EncryptionOpts> {
