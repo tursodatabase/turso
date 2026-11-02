@@ -30,9 +30,13 @@ base64 = "0.22.1"
 prost = "0.14.1"
 roaring = "0.11.2"
 crc32c = "0.6.8"
+getrandom.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2.172" }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
 ctor = "0.4.2"
