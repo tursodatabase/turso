@@ -1,4 +1,6 @@
-use turso_core::{ConstraintKind, ConstraintViolation, DialectError, LimboError, Value};
+use turso_core::{
+    Connection, ConstraintKind, ConstraintViolation, DialectError, LimboError, Value,
+};
 use turso_pg_parser::sqlstate::*;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -19,6 +21,21 @@ impl Error {
 
     pub(crate) fn into_core_error(self) -> LimboError {
         self.0.source
+    }
+
+    /// The error that a statement of `conn` raised. A constraint violation
+    /// also reports the schema of its table, which only the connection's
+    /// schema can name.
+    pub(crate) fn from_statement(conn: &Connection, source: LimboError) -> Self {
+        let mut error = Self::from(source);
+        if let LimboError::ConstraintViolation(violation) = &error.0.source {
+            if let Some(table) = &violation.table_name {
+                let schema = conn.current_schema();
+                let (namespace, _) = schema.demangle_name(table);
+                error.0.report.schema_name = schema.namespace_name(namespace).map(str::to_string);
+            }
+        }
+        error
     }
 }
 
@@ -76,6 +93,7 @@ pub struct ErrorReport {
     pub sqlstate: &'static str,
     pub message: String,
     pub detail: Option<String>,
+    pub schema_name: Option<String>,
     pub table_name: Option<String>,
     pub constraint_name: Option<String>,
     pub column_name: Option<String>,
@@ -87,6 +105,7 @@ impl From<&LimboError> for ErrorReport {
             sqlstate: sqlstate(error),
             message: error.to_string(),
             detail: None,
+            schema_name: None,
             table_name: None,
             constraint_name: None,
             column_name: None,

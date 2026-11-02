@@ -1,4 +1,4 @@
-use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::RegisterColumn;
@@ -839,6 +839,7 @@ pub fn translate_insert(
         program,
         &ctx.table.check_constraints,
         resolver,
+        ctx.namespace.id,
         &ctx.table.name,
         insertion.key_register(),
         insertion.col_mappings.iter().filter_map(|m| {
@@ -2014,7 +2015,7 @@ fn emit_notnulls(
                     kind: crate::ConstraintKind::NotNull,
                     constraint_name: None,
                     index_name: None,
-                    table_name: ctx.table.name.as_str().to_string(),
+                    table_name: mangle_name(ctx.namespace.id, &ctx.table.name),
                     column_names: vec![col_name],
                     violation_regs: all_regs,
                     row_col_names: all_names,
@@ -3065,6 +3066,7 @@ fn emit_pk_uniqueness_check(
                 .join(", ");
             program.emit_insn(Insn::Halt {
                 constraint_info: Some(Box::new(ConstraintInfo::primary_key(
+                    ctx.namespace.id,
                     ctx.table.name.as_str(),
                     ctx.table.primary_key_constraint_name.clone(),
                     ctx.table
@@ -3139,6 +3141,7 @@ fn emit_pk_uniqueness_check(
         let raw_desc = format!("{}.{}", ctx.table.name, rowid_column_name);
         program.emit_insn(Insn::Halt {
             constraint_info: Some(Box::new(ConstraintInfo::primary_key(
+                ctx.namespace.id,
                 ctx.table.name.as_str(),
                 ctx.table.primary_key_constraint_name.clone(),
                 vec![rowid_column_name.to_string()],
@@ -3309,6 +3312,7 @@ fn emit_unique_index_check(
         let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
         program.emit_insn(Insn::Halt {
             constraint_info: Some(Box::new(ConstraintInfo::unique_index(
+                ctx.namespace.id,
                 ctx.table.name.as_str(),
                 index,
                 (0..num_cols).map(|i| idx_start_reg + i).collect(),
@@ -3354,6 +3358,7 @@ fn emit_unique_index_check(
             let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
             program.emit_insn(Insn::Halt {
                 constraint_info: Some(Box::new(ConstraintInfo::unique_index(
+                    ctx.namespace.id,
                     ctx.table.name.as_str(),
                     index,
                     (0..num_cols).map(|i| idx_start_reg + i).collect(),
@@ -4095,6 +4100,7 @@ pub fn emit_fk_child_insert_checks(
                 emit_fk_restrict_halt(
                     program,
                     Some(Box::new(fk_constraint_info(
+                        namespace.id,
                         child_tbl.name.as_str(),
                         &fk_ref.fk,
                         fk_col_regs,
@@ -4215,6 +4221,7 @@ pub fn emit_fk_child_insert_checks(
                         emit_fk_restrict_halt(
                             p,
                             Some(Box::new(fk_constraint_info(
+                                namespace.id,
                                 child_tbl.name.as_str(),
                                 &fk_ref.fk,
                                 fk_col_regs,

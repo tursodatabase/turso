@@ -103,7 +103,8 @@ diffs, suspect the runner's psql emulation before suspecting the server.
 
 The `turso_pg` connection and statement APIs return `turso_pg::Error`.
 Its `Display` implementation uses the PostgreSQL message, and its
-`sqlstate`, `detail`, `table_name`, `column_name`, and `constraint_name`
+`sqlstate`, `detail`, `schema_name`, `table_name`, `column_name`, and
+`constraint_name`
 fields are available without a separate conversion. `core_error()` and
 `std::error::Error::source()` expose the original engine error.
 
