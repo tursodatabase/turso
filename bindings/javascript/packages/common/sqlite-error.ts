@@ -1,3 +1,5 @@
+import { NativeDatabase, NativeExecutor, NativeStatement, StepResult } from "./types.js";
+
 export class SqliteError extends Error {
   name: string;
   code: string;
@@ -22,4 +24,45 @@ export class SqliteError extends Error {
 
     (Error as any).captureStackTrace(this, SqliteError);
   }
+}
+
+/** Steps a native statement or executor and throws its errors as `SqliteError`. */
+export function stepSync(stmt: NativeStatement | NativeExecutor): StepResult {
+  try {
+    return stmt.stepSync();
+  } catch (err) {
+    throw convertError(err);
+  }
+}
+
+/** Runs the native I/O loop once and throws its errors as `SqliteError`. */
+export function ioLoopSync(db: NativeDatabase) {
+  try {
+    db.ioLoopSync();
+  } catch (err) {
+    throw convertError(err);
+  }
+}
+
+const convertibleErrorTypes = { TypeError };
+const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
+
+export function convertError(err) {
+  if ((err.code ?? "").startsWith(CONVERTIBLE_ERROR_PREFIX)) {
+    return createErrorByName(
+      err.code.substring(CONVERTIBLE_ERROR_PREFIX.length),
+      err.message,
+    );
+  }
+
+  return new SqliteError(err.message, err.code, err.rawCode);
+}
+
+function createErrorByName(name, message) {
+  const ErrorConstructor = convertibleErrorTypes[name];
+  if (!ErrorConstructor) {
+    throw new Error(`unknown error type ${name} from Turso`);
+  }
+
+  return new ErrorConstructor(message);
 }

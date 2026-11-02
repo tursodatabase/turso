@@ -8,7 +8,7 @@ use crate::translate::emitter::{
 };
 use crate::turso_debug_assert;
 use crate::{
-    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
     schema::{
         self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
         SQLITE_SEQUENCE_TABLE_NAME,
@@ -3320,14 +3320,15 @@ fn emit_unique_index_check(
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
         let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
         let mut constraint_info = ConstraintInfo::unique_index(
-            ctx.table.name.as_str(),
+            ctx.table,
             index,
             (0..num_cols).map(|i| idx_start_reg + i).collect(),
         );
         emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
+        let err_code = constraint_info.kind.sqlite_extended_result_code();
         program.emit_insn(Insn::Halt {
             constraint_info: Some(Box::new(constraint_info)),
-            err_code: SQLITE_CONSTRAINT_UNIQUE,
+            err_code,
             description: raw_desc,
             on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
             description_reg: None,
@@ -3367,14 +3368,15 @@ fn emit_unique_index_check(
             // ABORT/FAIL/ROLLBACK: halt on conflict.
             let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
             let mut constraint_info = ConstraintInfo::unique_index(
-                ctx.table.name.as_str(),
+                ctx.table,
                 index,
                 (0..num_cols).map(|i| idx_start_reg + i).collect(),
             );
             emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
+            let err_code = constraint_info.kind.sqlite_extended_result_code();
             program.emit_insn(Insn::Halt {
                 constraint_info: Some(Box::new(constraint_info)),
-                err_code: SQLITE_CONSTRAINT_UNIQUE,
+                err_code,
                 description: raw_desc,
                 on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
                 description_reg: None,
@@ -3564,30 +3566,18 @@ fn translate_virtual_table_insert(
 }
 
 /// Build the UNIQUE constraint error description to match sqlite
-/// single column: `t.c1`
-/// multi-column:  `t.(k, c1)`
+/// columns:     `t.c1` or `t.k, t.c1`
+/// expressions: `index 'i'`
 pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
-    if index.columns.len() == 1 {
-        let mut s = String::with_capacity(table_name.len() + 1 + index.columns[0].name.len());
-        s.push_str(table_name);
-        s.push('.');
-        s.push_str(&index.columns[0].name);
-        s
-    } else {
-        let mut s = String::with_capacity(table_name.len() + 3 + 4 * index.columns.len());
-        s.push_str(table_name);
-        s.push_str(".(");
-        s.push_str(
-            &index
-                .columns
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        s.push(')');
-        s
+    if index.columns.iter().any(|c| c.expression().is_some()) {
+        return format!("index '{}'", index.name);
     }
+    index
+        .columns
+        .iter()
+        .map(|c| format!("{table_name}.{}", c.name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn emit_index_column_value_for_insert(

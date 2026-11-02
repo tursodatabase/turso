@@ -1,6 +1,6 @@
-import { unlinkSync } from "node:fs";
+import { unlinkSync, writeFileSync } from "node:fs";
 import { expect, test } from 'vitest'
-import { Database } from './compat.js'
+import { Database, SqliteError } from './compat.js'
 import { Database as NativeDatabase } from '#index'
 
 test('classifySql treats reindex as write', () => {
@@ -18,6 +18,44 @@ test('classifySql treats reindex as write', () => {
     } finally {
         db.close();
     }
+})
+
+test('errors carry the SQLite message and result code name', () => {
+    const db = new Database(':memory:');
+    db.exec('PRAGMA foreign_keys = ON');
+    db.exec('CREATE TABLE t(a UNIQUE, b NOT NULL DEFAULT 1, c CHECK(c < 5))');
+    db.exec('CREATE TABLE p(id INTEGER PRIMARY KEY)');
+    db.exec('CREATE TABLE ch(pid REFERENCES p(id))');
+    db.exec('INSERT INTO t(a) VALUES (1)');
+    db.exec('INSERT INTO p VALUES (1)');
+    db.exec('CREATE TABLE k(id TEXT PRIMARY KEY)');
+    db.exec('CREATE TABLE pair(a, b, PRIMARY KEY(a, b))');
+    db.exec("INSERT INTO k VALUES ('x')");
+    db.exec('INSERT INTO pair VALUES (1, 1), (1, 2)');
+    const notADatabase = `test-${(Math.random() * 10000) | 0}.db`;
+    writeFileSync(notADatabase, Buffer.alloc(8192, 7));
+    const cases: [() => unknown, string, string][] = [
+        [() => db.prepare('INSERT INTO t(a) VALUES (1)').run(), 'SQLITE_CONSTRAINT_UNIQUE', 'UNIQUE constraint failed: t.a'],
+        [() => db.exec('INSERT INTO t(a) VALUES (1)'), 'SQLITE_CONSTRAINT_UNIQUE', 'UNIQUE constraint failed: t.a'],
+        [() => db.prepare('INSERT INTO t(a, b) VALUES (2, NULL)').get(), 'SQLITE_CONSTRAINT_NOTNULL', 'NOT NULL constraint failed: t.b'],
+        [() => db.prepare('INSERT INTO t(a, c) VALUES (3, 9) RETURNING a').all(), 'SQLITE_CONSTRAINT_CHECK', 'CHECK constraint failed: c < 5'],
+        [() => db.prepare('INSERT INTO p VALUES (1)').run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: p.id'],
+        [() => db.prepare("INSERT INTO k VALUES ('x')").run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: k.id'],
+        [() => db.prepare('INSERT INTO pair VALUES (1, 1)').run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: pair.a, pair.b'],
+        [() => db.prepare('UPDATE pair SET b = 1 WHERE b = 2').run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: pair.a, pair.b'],
+        [() => db.prepare('INSERT INTO ch VALUES (9)').run(), 'SQLITE_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed'],
+        [() => db.prepare('SYNTAX ERROR'), 'SQLITE_ERROR', 'near "SYNTAX": syntax error'],
+        [() => db.prepare('SELECT * FROM missing'), 'SQLITE_ERROR', 'no such table: missing'],
+        [() => db.prepare("SELECT json_extract('{', '$')").get(), 'SQLITE_ERROR', 'malformed JSON'],
+        [() => new Database(notADatabase), 'SQLITE_NOTADB', 'file is not a database'],
+    ];
+    for (const [run, code, message] of cases) {
+        let error: any;
+        try { run(); } catch (e) { error = e; }
+        expect(error).toBeInstanceOf(SqliteError);
+        expect({ code: error.code, message: error.message }).toEqual({ code, message });
+    }
+    unlinkSync(notADatabase);
 })
 
 test('insert returning test', () => {
@@ -88,7 +126,10 @@ test('readonly-db', () => {
 
 test('file-must-exist', () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
-    expect(() => new Database(path, { fileMustExist: true })).toThrowError(/failed to open database/);
+    let error: any;
+    try { new Database(path, { fileMustExist: true }); } catch (e) { error = e; }
+    expect(error).toBeInstanceOf(SqliteError);
+    expect(error).toMatchObject({ code: 'SQLITE_ERROR', message: expect.stringContaining('I/O error (open)') });
 })
 
 test('on-disk db', () => {

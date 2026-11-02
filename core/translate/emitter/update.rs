@@ -10,7 +10,7 @@ use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
     ast, emit_explain,
-    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Index,
         EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
@@ -38,6 +38,7 @@ use crate::{
             fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
             ParentKeyNewProbeMode,
         },
+        insert::format_unique_violation_desc,
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             EvalAt, IterationDirection, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
@@ -2158,35 +2159,23 @@ fn emit_update_insns<'a>(
                 }
                 _ => {
                     // ABORT/FAIL/ROLLBACK behavior
-                    let column_names = index.columns.iter().enumerate().fold(
-                        String::with_capacity(50),
-                        |mut accum, (idx, col)| {
-                            if idx > 0 {
-                                accum.push_str(", ");
-                            }
-                            accum.push_str(table_name);
-                            accum.push('.');
-                            accum.push_str(&col.name);
-                            accum
-                        },
-                    );
+                    let btree_table = target_table.table.require_btree()?;
                     let mut constraint_info = ConstraintInfo::unique_index(
-                        table_name,
+                        &btree_table,
                         index,
                         (idx_start_reg..idx_start_reg + num_cols).collect(),
                     );
-                    if let Some(btree_table) = target_table.table.btree() {
-                        emit_constraint_values_decode(
-                            program,
-                            &t_ctx.resolver,
-                            &btree_table,
-                            &mut constraint_info,
-                        )?;
-                    }
+                    emit_constraint_values_decode(
+                        program,
+                        &t_ctx.resolver,
+                        &btree_table,
+                        &mut constraint_info,
+                    )?;
+                    let err_code = constraint_info.kind.sqlite_extended_result_code();
                     program.emit_insn(Insn::Halt {
                         constraint_info: Some(Box::new(constraint_info)),
-                        err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description: column_names,
+                        err_code,
+                        description: format_unique_violation_desc(table_name, index),
                         on_error: program.constraint_halt_on_error(idx_conflict),
                         description_reg: None,
                     });

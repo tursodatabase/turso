@@ -12,6 +12,19 @@ pub enum ConstraintKind {
     Other,
 }
 
+impl ConstraintKind {
+    pub fn sqlite_extended_result_code(self) -> usize {
+        match self {
+            Self::PrimaryKey => SQLITE_CONSTRAINT_PRIMARYKEY,
+            Self::Unique => SQLITE_CONSTRAINT_UNIQUE,
+            Self::ForeignKey => SQLITE_CONSTRAINT_FOREIGNKEY,
+            Self::NotNull => SQLITE_CONSTRAINT_NOTNULL,
+            Self::Check => SQLITE_CONSTRAINT_CHECK,
+            Self::Other => SQLITE_CONSTRAINT,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConstraintViolation {
     pub kind: ConstraintKind,
@@ -53,7 +66,7 @@ pub struct DialectError {
 pub enum LimboError {
     #[error("Corrupt database: {0}")]
     Corrupt(String),
-    #[error("File is not a database")]
+    #[error("file is not a database")]
     NotADB,
     #[error("Internal error: {0}")]
     InternalError(String),
@@ -71,7 +84,7 @@ pub enum LimboError {
     DatabaseFull,
     #[error("nextval: reached {} value of sequence \"{name}\"", sequence_bound(.ascending))]
     SequenceExhausted { name: String, ascending: bool },
-    #[error("Parse error: {0}")]
+    #[error("{0}")]
     ParseError(String),
     /// Boxed: the parser error is ~96 bytes inline and would dominate
     /// `LimboError`'s size, which rides in every hot-path `Result`.
@@ -246,6 +259,18 @@ impl LimboError {
             Self::BlobHandleExpired => 4,
             _ => 1,
         }
+    }
+
+    /// The extended SQLite result code for this error, e.g. what
+    /// sqlite3_extended_errcode reports. Only constraint violations of a
+    /// known kind have a code more specific than the primary one.
+    pub fn sqlite_extended_result_code(&self) -> i32 {
+        let code = match self {
+            Self::ConstraintViolation(violation) => violation.kind.sqlite_extended_result_code(),
+            Self::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT_FOREIGNKEY,
+            _ => return self.sqlite_result_code(),
+        };
+        code as i32
     }
 }
 
@@ -438,7 +463,6 @@ pub const SQLITE_ERROR: usize = 1;
 pub const SQLITE_CONSTRAINT: usize = 19;
 pub const SQLITE_CONSTRAINT_CHECK: usize = SQLITE_CONSTRAINT | (1 << 8);
 pub const SQLITE_CONSTRAINT_PRIMARYKEY: usize = SQLITE_CONSTRAINT | (6 << 8);
-#[allow(dead_code)]
 pub const SQLITE_CONSTRAINT_FOREIGNKEY: usize = SQLITE_CONSTRAINT | (3 << 8);
 pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
 pub const SQLITE_CONSTRAINT_TRIGGER: usize = SQLITE_CONSTRAINT | (7 << 8);

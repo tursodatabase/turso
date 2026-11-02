@@ -1,6 +1,6 @@
-import { unlinkSync } from "node:fs";
+import { unlinkSync, writeFileSync } from "node:fs";
 import { expect, test } from 'vitest'
-import { Database, connect, Transaction } from './promise.js'
+import { Database, connect, SqliteError, Transaction } from './promise.js'
 import { sql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 
@@ -161,7 +161,9 @@ test('readonly-db', async () => {
 
 test('file-must-exist', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
-    await expect(async () => await connect(path, { fileMustExist: true })).rejects.toThrowError(/failed to open database/);
+    const error = await connect(path, { fileMustExist: true }).then(() => undefined, (e) => e);
+    expect(error).toBeInstanceOf(SqliteError);
+    expect(error).toMatchObject({ code: 'SQLITE_ERROR', message: expect.stringContaining('I/O error (open)') });
 })
 
 test('implicit connect', async () => {
@@ -170,6 +172,44 @@ test('implicit connect', async () => {
     await expect(async () => await defer.all()).rejects.toThrowError(/no such table: t/);
     await expect(async () => await db.prepare("SELECT * FROM t")).rejects.toThrowError(/no such table: t/);
     expect(await (await db.prepare("SELECT 1 as x")).all()).toEqual([{ x: 1 }]);
+})
+
+test('errors carry the SQLite message and result code name', async () => {
+    const notADatabase = `test-${(Math.random() * 10000) | 0}.db`;
+    writeFileSync(notADatabase, Buffer.alloc(8192, 7));
+    const db = await connect(':memory:');
+    await db.exec('PRAGMA foreign_keys = ON');
+    await db.exec('CREATE TABLE t(a UNIQUE, b NOT NULL DEFAULT 1, c CHECK(c < 5))');
+    await db.exec('CREATE TABLE p(id INTEGER PRIMARY KEY)');
+    await db.exec('CREATE TABLE ch(pid REFERENCES p(id))');
+    await db.exec('INSERT INTO t(a) VALUES (1)');
+    await db.exec('INSERT INTO p VALUES (1)');
+    await db.exec('CREATE TABLE k(id TEXT PRIMARY KEY)');
+    await db.exec('CREATE TABLE pair(a, b, PRIMARY KEY(a, b))');
+    await db.exec("INSERT INTO k VALUES ('x')");
+    await db.exec('INSERT INTO pair VALUES (1, 1), (1, 2)');
+    const cases: [() => Promise<unknown>, string, string][] = [
+        [async () => (await db.prepare('INSERT INTO t(a) VALUES (1)')).run(), 'SQLITE_CONSTRAINT_UNIQUE', 'UNIQUE constraint failed: t.a'],
+        [() => db.exec('INSERT INTO t(a) VALUES (1)'), 'SQLITE_CONSTRAINT_UNIQUE', 'UNIQUE constraint failed: t.a'],
+        [async () => (await db.prepare('INSERT INTO t(a, b) VALUES (2, NULL)')).get(), 'SQLITE_CONSTRAINT_NOTNULL', 'NOT NULL constraint failed: t.b'],
+        [async () => (await db.prepare('INSERT INTO t(a, c) VALUES (3, 9) RETURNING a')).all(), 'SQLITE_CONSTRAINT_CHECK', 'CHECK constraint failed: c < 5'],
+        [() => db.batch(['INSERT INTO t(a) VALUES (1)']), 'SQLITE_CONSTRAINT_UNIQUE', 'UNIQUE constraint failed: t.a'],
+        [async () => (await db.prepare('INSERT INTO p VALUES (1)')).run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: p.id'],
+        [async () => (await db.prepare("INSERT INTO k VALUES ('x')")).run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: k.id'],
+        [async () => (await db.prepare('INSERT INTO pair VALUES (1, 1)')).run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: pair.a, pair.b'],
+        [async () => (await db.prepare('UPDATE pair SET b = 1 WHERE b = 2')).run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: pair.a, pair.b'],
+        [async () => (await db.prepare('INSERT INTO ch VALUES (9)')).run(), 'SQLITE_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed'],
+        [async () => db.prepare('SYNTAX ERROR'), 'SQLITE_ERROR', 'near "SYNTAX": syntax error'],
+        [async () => db.prepare('SELECT * FROM missing'), 'SQLITE_ERROR', 'no such table: missing'],
+        [async () => (await db.prepare("SELECT json_extract('{', '$')")).get(), 'SQLITE_ERROR', 'malformed JSON'],
+        [() => connect(notADatabase), 'SQLITE_NOTADB', 'file is not a database'],
+    ];
+    for (const [run, code, message] of cases) {
+        const error: any = await run().then(() => undefined, (e) => e);
+        expect(error).toBeInstanceOf(SqliteError);
+        expect({ code: error.code, message: error.message }).toEqual({ code, message });
+    }
+    unlinkSync(notADatabase);
 })
 
 test('zero-limit-bug', async () => {

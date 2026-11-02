@@ -1,29 +1,6 @@
 import { bindParams } from "./bind.js";
-import { SqliteError } from "./sqlite-error.js";
+import { convertError, ioLoopSync, stepSync } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP } from "./types.js";
-
-const convertibleErrorTypes = { TypeError };
-const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
-
-function convertError(err) {
-  if ((err.code ?? "").startsWith(CONVERTIBLE_ERROR_PREFIX)) {
-    return createErrorByName(
-      err.code.substring(CONVERTIBLE_ERROR_PREFIX.length),
-      err.message,
-    );
-  }
-
-  return new SqliteError(err.message, err.code, err.rawCode);
-}
-
-function createErrorByName(name, message) {
-  const ErrorConstructor = convertibleErrorTypes[name];
-  if (!ErrorConstructor) {
-    throw new Error(`unknown error type ${name} from Turso`);
-  }
-
-  return new ErrorConstructor(message);
-}
 
 function isQueryOptions(value) {
   return value != null
@@ -138,7 +115,11 @@ class Database {
    */
   constructor(db: NativeDatabase) {
     this.db = db;
-    this.db.connectSync();
+    try {
+      this.db.connectSync();
+    } catch (err) {
+      throw convertError(err);
+    }
 
     Object.defineProperties(this, {
       name: { get: () => this.db.path },
@@ -267,9 +248,9 @@ class Database {
     const exec = this.db.executor(sql, queryOptions);
     try {
       while (true) {
-        const [stepResult] = exec.stepSync();
+        const [stepResult] = stepSync(exec);
         if (stepResult === STEP_IO || stepResult === STEP_SLEEP) {
-          this.db.ioLoopSync();
+          ioLoopSync(this.db);
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -461,9 +442,9 @@ class Statement {
     this.stmt.setQueryTimeout(queryOptions);
     bindParams(this.stmt, toBindArgs(params));
     for (; ;) {
-      const [stepResult] = this.stmt.stepSync();
+      const [stepResult] = stepSync(this.stmt);
       if (stepResult === STEP_IO || stepResult === STEP_SLEEP) {
-        this.db.ioLoopSync();
+        ioLoopSync(this.db);
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -493,9 +474,9 @@ class Statement {
     bindParams(this.stmt, toBindArgs(params));
     let row = undefined;
     for (; ;) {
-      const [stepResult] = this.stmt.stepSync();
+      const [stepResult] = stepSync(this.stmt);
       if (stepResult === STEP_IO || stepResult === STEP_SLEEP) {
-        this.db.ioLoopSync();
+        ioLoopSync(this.db);
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -520,9 +501,9 @@ class Statement {
     bindParams(this.stmt, toBindArgs(params));
 
     while (true) {
-      const [stepResult] = this.stmt.stepSync();
+      const [stepResult] = stepSync(this.stmt);
       if (stepResult === STEP_IO || stepResult === STEP_SLEEP) {
-        this.db.ioLoopSync();
+        ioLoopSync(this.db);
         continue;
       }
       if (stepResult === STEP_DONE) {
@@ -546,9 +527,9 @@ class Statement {
     bindParams(this.stmt, toBindArgs(params));
     const rows: any[] = [];
     for (; ;) {
-      const [stepResult] = this.stmt.stepSync();
+      const [stepResult] = stepSync(this.stmt);
       if (stepResult === STEP_IO || stepResult === STEP_SLEEP) {
-        this.db.ioLoopSync();
+        ioLoopSync(this.db);
         continue;
       }
       if (stepResult === STEP_DONE) {

@@ -930,6 +930,48 @@ expect error {
     UNIQUE constraint failed: t\.rowid
 }
 
+@cross-check-integrity
+test insert-composite-unique-conflict-names-each-column {
+    CREATE TABLE t (a, b, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 1);
+}
+expect error {
+    ^UNIQUE constraint failed: t\.a, t\.b$
+}
+
+@cross-check-integrity
+test insert-expression-index-conflict-names-the-index {
+    CREATE TABLE t (a);
+    CREATE UNIQUE INDEX t_lower ON t (lower(a));
+    INSERT INTO t VALUES ('X');
+    INSERT INTO t VALUES ('x');
+}
+expect error {
+    ^UNIQUE constraint failed: index 't_lower'$
+}
+
+@cross-check-integrity
+test update-expression-index-conflict-names-the-index {
+    CREATE TABLE t (a, b);
+    CREATE UNIQUE INDEX t_lower ON t (lower(a));
+    INSERT INTO t VALUES ('X', 1), ('y', 2);
+    UPDATE t SET a = 'x' WHERE b = 2;
+}
+expect error {
+    ^UNIQUE constraint failed: index 't_lower'$
+}
+
+@cross-check-integrity
+test create-unique-expression-index-on-duplicates-names-the-index {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1), (1);
+    CREATE UNIQUE INDEX t_plus ON t (a + 0);
+}
+expect error {
+    ^UNIQUE constraint failed: index 't_plus'$
+}
+
 # RETURNING clause tests
 @cross-check-integrity
 test returning-basic-column {
