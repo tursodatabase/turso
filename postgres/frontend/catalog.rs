@@ -454,6 +454,10 @@ impl SnapshotRows for PgClassTable {
             let relnatts = btree.columns().len() as i64;
             let relhasindex = i64::from(indexes.iter().any(|index| index.table_oid == table_oid));
             let relchecks = btree.check_constraints.len() as i64;
+            let owner = owner_of(
+                &schema,
+                &ObjectKey::new(ObjectKind::Table, *namespace, table.get_name()),
+            );
 
             rows.push(vec![
                 Value::from_i64(table_oid),                          // oid
@@ -461,7 +465,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(namespace_oid(&schema, *namespace)), // relnamespace
                 Value::from_i64(0),                                  // reltype
                 Value::from_i64(0),                                  // reloftype
-                Value::from_i64(10),                                 // relowner
+                Value::from_i64(role_oid(owner)),                    // relowner
                 Value::from_i64(2),                                  // relam (heap)
                 Value::from_i64(0),                                  // relfilenode
                 Value::from_i64(0),                                  // reltablespace
@@ -829,6 +833,27 @@ pub(crate) fn postgres_roles(roles: &RoleCatalog) -> impl Iterator<Item = Role> 
         superuser: true,
     };
     std::iter::once(superuser).chain(roles.iter().cloned())
+}
+
+/// The role that owns the object `key`: the owner in its access control
+/// list, or the superuser for an object without one.
+fn owner_of(schema: &Schema, key: &ObjectKey) -> RoleId {
+    schema
+        .acls
+        .get(key)
+        .map_or(RoleId::SUPERUSER, |access| access.owner)
+}
+
+/// The name of the role that owns the object `key`. A role that is gone
+/// from the catalog is shown by its OID, as `pg_get_userbyid()` would.
+fn owner_name(conn: &Connection, schema: &Schema, key: &ObjectKey) -> String {
+    let owner = owner_of(schema, key);
+    postgres_roles(&conn.role_catalog())
+        .find(|role| role.id == owner)
+        .map_or_else(
+            || format!("unknown (OID={})", role_oid(owner)),
+            |role| role.name,
+        )
 }
 
 /// The catalog tables of `register_catalog_modules`. The other modules there
@@ -1294,10 +1319,15 @@ impl SnapshotRows for PgTablesTable {
 
         for (namespace, _, table) in tables {
             let btree = table.btree().expect("user tables are B-trees");
+            let owner = owner_name(
+                conn,
+                &schema,
+                &ObjectKey::new(ObjectKind::Table, namespace, table.get_name()),
+            );
             rows.push(vec![
                 Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
                 Value::Text(btree.declared_name.clone().into()),                   // tablename
-                Value::build_text(BOOTSTRAP_SUPERUSER_NAME),                       // tableowner
+                Value::Text(owner.into()),                                         // tableowner
                 Value::Null,                                                       // tablespace
                 Value::from_i64(0),                                                // hasindexes
                 Value::from_i64(0),                                                // hasrules
@@ -2376,16 +2406,20 @@ impl SnapshotRows for PgSequencesTable {
                 };
                 rows.push(vec![
                     Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
-                    Value::build_text(seq_name), // sequencename
-                    Value::build_text(BOOTSTRAP_SUPERUSER_NAME), // sequenceowner
-                    Value::build_text("bigint"), // data_type
-                    Value::from_i64(seq.start_value), // start_value
-                    Value::from_i64(seq.min_value), // min_value
-                    Value::from_i64(seq.max_value), // max_value
-                    Value::from_i64(seq.increment_by), // increment_by
+                    Value::build_text(seq_name.clone()), // sequencename
+                    Value::build_text(owner_name(
+                        conn,
+                        &schema,
+                        &ObjectKey::new(ObjectKind::Sequence, namespace, seq_name.as_str()),
+                    )), // sequenceowner
+                    Value::build_text("bigint"),         // data_type
+                    Value::from_i64(seq.start_value),    // start_value
+                    Value::from_i64(seq.min_value),      // min_value
+                    Value::from_i64(seq.max_value),      // max_value
+                    Value::from_i64(seq.increment_by),   // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
-                    Value::from_i64(1),          // cache_size (PG default; Turso doesn't cache)
-                    last_value,                  // last_value
+                    Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
+                    last_value,         // last_value
                 ]);
             }
         }

@@ -926,6 +926,18 @@ pub fn translate_grant(
         changes.push((key, access, rowid));
     }
 
+    emit_acl_rows(resolver, program, changes)
+}
+
+/// Writes one row of the access control table per change: the owner and
+/// list of an object, replacing the object's row `rowid` if it has one.
+/// Bumps the schema cookie so that other connections reload the lists, and
+/// updates the in-memory catalog when the statement runs.
+fn emit_acl_rows(
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    changes: Vec<(ObjectKey, ObjectAccess, Option<i64>)>,
+) -> Result<()> {
     let (acl_table, acl_root_page) = emit_acl_table(resolver, program)?;
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(acl_table));
     program.emit_insn(Insn::OpenWrite {
@@ -1019,6 +1031,141 @@ pub fn translate_grant(
         });
     }
     Ok(())
+}
+
+/// Returns the owner's list for the object that `stmt` creates, when the
+/// current role is not the superuser: the role owns what it creates. An
+/// object created by the superuser has no row, because the superuser is the
+/// owner of every object without one. A temporary object is the
+/// connection's and has no owner, and `IF NOT EXISTS` on an object that
+/// exists creates nothing.
+pub fn ownership_of_created_object(
+    stmt: &ast::Stmt,
+    resolver: &Resolver,
+) -> Result<Option<(ObjectKey, ObjectAccess)>> {
+    let Some(role) = resolver.checked_role else {
+        return Ok(None);
+    };
+    let created = match stmt {
+        ast::Stmt::CreateTable {
+            temporary: true, ..
+        }
+        | ast::Stmt::CreateView {
+            temporary: true, ..
+        } => return Ok(None),
+        ast::Stmt::CreateTable { tbl_name, .. } => created_object(
+            resolver,
+            ObjectKind::Table,
+            tbl_name,
+            |schema, namespace, name| schema.get_table(namespace, name).is_some(),
+        )?,
+        ast::Stmt::CreateVirtualTable(create) => created_object(
+            resolver,
+            ObjectKind::Table,
+            &create.tbl_name,
+            |schema, namespace, name| schema.get_table(namespace, name).is_some(),
+        )?,
+        ast::Stmt::CreateView { view_name, .. }
+        | ast::Stmt::CreateMaterializedView { view_name, .. } => created_object(
+            resolver,
+            ObjectKind::View,
+            view_name,
+            |schema, namespace, name| {
+                schema.get_view(namespace, name).is_some()
+                    || schema.get_materialized_view(namespace, name).is_some()
+            },
+        )?,
+        ast::Stmt::CreateSequence { seq_name, .. } => created_object(
+            resolver,
+            ObjectKind::Sequence,
+            seq_name,
+            |schema, namespace, name| schema.get_sequence(namespace, name).is_some(),
+        )?,
+        ast::Stmt::CreateType { type_name, .. } => {
+            if resolver
+                .schema()
+                .get_type_def_unchecked(type_name)
+                .is_some()
+            {
+                None
+            } else {
+                Some((
+                    MAIN_DB_ID,
+                    ObjectKey::root(ObjectKind::Type, type_name.as_str()),
+                ))
+            }
+        }
+        ast::Stmt::CreateDomain { domain_name, .. } => {
+            if resolver
+                .schema()
+                .get_type_def_unchecked(domain_name)
+                .is_some()
+            {
+                None
+            } else {
+                Some((
+                    MAIN_DB_ID,
+                    ObjectKey::root(ObjectKind::Type, domain_name.as_str()),
+                ))
+            }
+        }
+        ast::Stmt::CreateSchema { name, .. } => {
+            let schema_name = crate::util::normalize_ident(name.as_str());
+            if resolver.namespace_named(&schema_name).is_some() {
+                None
+            } else {
+                Some((
+                    MAIN_DB_ID,
+                    ObjectKey::root(ObjectKind::Schema, schema_name.as_str()),
+                ))
+            }
+        }
+        _ => None,
+    };
+    let Some((database_id, key)) = created else {
+        return Ok(None);
+    };
+    if database_id != MAIN_DB_ID {
+        // An attached database has no access control table of its own yet.
+        return Ok(None);
+    }
+    let access = ObjectAccess::default_for(key.kind, role);
+    Ok(Some((key, access)))
+}
+
+/// The database and key of the object `name` that a CREATE makes, or `None`
+/// when `exists` says the object is already there.
+fn created_object(
+    resolver: &Resolver,
+    kind: ObjectKind,
+    name: &ast::QualifiedName,
+    exists: impl Fn(&Schema, NamespaceId, &str) -> bool,
+) -> Result<Option<(usize, ObjectKey)>> {
+    let namespace = resolver.resolve_namespace_for_create(name)?;
+    let object_name = crate::util::normalize_ident(name.name.as_str());
+    let already_exists = resolver.with_schema(namespace.database_id, |schema| {
+        exists(schema, namespace.id, &object_name)
+    });
+    if already_exists {
+        return Ok(None);
+    }
+    Ok(Some((
+        namespace.database_id,
+        ObjectKey::new(kind, namespace.id, object_name),
+    )))
+}
+
+/// Records the current role as the owner of the object a CREATE statement
+/// made, after the statement's own bytecode.
+pub fn emit_ownership(
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    ownership: Option<(ObjectKey, ObjectAccess)>,
+) -> Result<()> {
+    match ownership {
+        Some((key, access)) => emit_acl_rows(resolver, program, vec![(key, access, None)]),
+        None => Ok(()),
+    }
 }
 
 /// The privileges a GRANT or REVOKE names, checked against what the kind of
@@ -1538,6 +1685,64 @@ mod tests {
             denial(joined),
             PermissionDenied::privilege(Action::Read, Object::Table("t".to_string()))
         );
+    }
+
+    #[test]
+    fn a_role_owns_what_it_creates() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        create_role(&conn, "bob").unwrap();
+        grant(
+            &conn,
+            true,
+            &["CREATE"],
+            ast::GrantObject::Schema(ast::Name::exact("main".into())),
+            &["alice", "bob"],
+            false,
+        )
+        .unwrap();
+
+        set_role(&conn, "alice").unwrap();
+        conn.execute("CREATE TABLE mine (x)").unwrap();
+        conn.execute("INSERT INTO mine VALUES (1)").unwrap();
+        conn.execute("CREATE VIEW my_view AS SELECT x FROM mine")
+            .unwrap();
+        conn.execute("CREATE SEQUENCE my_sequence").unwrap();
+        conn.execute("CREATE INDEX my_index ON mine (x)").unwrap();
+        assert_eq!(
+            query_rows(&conn, "SELECT x FROM my_view"),
+            vec![vec![Value::from_i64(1)]]
+        );
+        assert_eq!(
+            query_rows(&conn, "SELECT nextval('my_sequence')"),
+            vec![vec![Value::from_i64(1)]]
+        );
+        // IF NOT EXISTS on a table that exists does not change its owner.
+        conn.execute("CREATE TABLE IF NOT EXISTS t (x)").unwrap();
+        let error = conn.execute("SELECT x FROM t").unwrap_err();
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Read, Object::Table("t".to_string()))
+        );
+        // The owner may grant its table to others.
+        grant(&conn, true, &["SELECT"], table("mine"), &["bob"], false).unwrap();
+
+        reset_role(&conn).unwrap();
+        set_role(&conn, "bob").unwrap();
+        conn.execute("SELECT x FROM mine").unwrap();
+        let error = conn.execute("DROP TABLE mine").unwrap_err();
+        assert_eq!(
+            denial(error),
+            PermissionDenied::owner(Action::Drop, Object::Table("mine".to_string()))
+        );
+
+        reset_role(&conn).unwrap();
+        conn.reparse_schema().unwrap();
+        set_role(&conn, "alice").unwrap();
+        conn.execute("DROP INDEX my_index").unwrap();
+        conn.execute("DROP VIEW my_view").unwrap();
+        conn.execute("DROP TABLE mine").unwrap();
     }
 
     #[test]

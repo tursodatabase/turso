@@ -771,3 +771,27 @@ test grant-to-a-missing-role-fails {
 expect error {
     role "gr_nobody" does not exist
 }
+
+test a-role-owns-the-table-it-creates {
+    CREATE ROLE own_creator;
+    GRANT CREATE ON SCHEMA public TO own_creator;
+    SET ROLE own_creator;
+    CREATE TABLE own_table (x int);
+    INSERT INTO own_table VALUES (1);
+    SELECT x FROM own_table;
+    SELECT tableowner FROM pg_tables WHERE tablename = 'own_table';
+    DROP TABLE own_table;
+}
+expect {
+    1
+    own_creator
+}
+
+test a-role-without-create-on-the-schema-cannot-create-a-table {
+    CREATE ROLE own_no_create;
+    SET ROLE own_no_create;
+    CREATE TABLE own_denied (x int);
+}
+expect error {
+    permission denied for schema public
+}

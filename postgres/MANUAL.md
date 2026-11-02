@@ -89,8 +89,9 @@ keeps the role, and `DISCARD ALL` resets it.
 A role that is not a superuser holds only the privileges granted to it or to
 `PUBLIC` with `GRANT`. By default it can run statements that use no database
 objects, such as `SELECT 1`, read the `pg_catalog` tables, execute functions,
-change settings with `SET` and show them with `SHOW`, and switch roles. Every
-object is owned by the superuser, so a role cannot drop or alter objects.
+change settings with `SET` and show them with `SHOW`, and switch roles. A role
+owns the objects it creates and may read, change, alter, drop and grant them;
+creating an object needs `CREATE` on its schema.
 
 
 **Examples:**

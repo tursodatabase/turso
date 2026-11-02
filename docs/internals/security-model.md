@@ -11,12 +11,11 @@ what the role is allowed to do. Turso has no authentication; instead, it assumes
 the host program handles it.
 
 > [!NOTE]
-> Roles, privileges, `GRANT` and `REVOKE` are implemented: every object has
-> an owner and an access control list, the checks consult them, and the
-> owner changes them. `CREATE` does not record the creating role as owner
-> yet, so every object is owned by the superuser. Row-level security is in
-> scope and not implemented. Authentication is out of scope for Core: it
-> belongs to the host program or the frontend.
+> Roles, ownership, privileges, `GRANT` and `REVOKE` are implemented: a role
+> owns what it creates, every object has an access control list, the checks
+> consult them, and the owner changes them. Row-level security is in scope
+> and not implemented. Authentication is out of scope for Core: it belongs
+> to the host program or the frontend.
 
 ## Glossary
 
@@ -82,7 +81,7 @@ Turso does not defend against:
 |--------------------|---------------------------------------------------------|
 | Roles              | In scope, implemented                                   |
 | Privileges         | In scope, implemented                                   |
-| Ownership          | In scope, stored; `CREATE` does not record it yet       |
+| Ownership          | In scope, implemented                                   |
 | Row-level security | In scope, not implemented                               |
 | Authentication     | Out of scope for Core                                   |
 
@@ -213,11 +212,13 @@ and `TRIGGER`; a sequence `USAGE`, `SELECT` and `UPDATE`; a function
 
 Every object has an owner and an access control list: the privileges each
 role holds on the object, with the grant option, and the role that granted
-them. The list is stored in the `__turso_internal_acl` table, one row per
-object, and loaded with the schema like the roles. An object without a row
-has the default list of its kind: its owner holds every privilege and may
-grant them, and `public` holds what every role may do with such an object by
-default, which is `EXECUTE` on a function, `USAGE` on a type, `TEMPORARY` on
+them. A role owns what it creates: `CREATE` writes the owner's list for the
+new table, view, sequence, type or schema when the creating role is not the
+superuser. The list is stored in the `__turso_internal_acl` table, one row
+per object, and loaded with the schema like the roles. An object without a
+row is owned by the superuser and has the default list of its kind: its owner
+holds every privilege and may grant them, and `public` holds what every role
+may do with such an object by default, which is `EXECUTE` on a function, `USAGE` on a type, `TEMPORARY` on
 the database, and nothing on stored data, schemas or settings. Objects that
 no statement created, such as the schema table, have no owner's list, so the
 dialect registers theirs when it registers the objects: Core makes its
@@ -438,10 +439,8 @@ connection.
 
 In the order the pieces depend on each other:
 
-- **Ownership.** Record the role that created each table, view, index,
-  trigger, sequence and type. The denials that today say "not the owner" then
-  pass for the owner, and `DROP`, `ALTER` and `CREATE INDEX` become usable by
-  roles other than the superuser.
+- **`ALTER ... OWNER TO`.** Ownership is recorded at `CREATE` and cannot be
+  transferred yet.
 - **Column privileges, default privileges and `GRANT ... ON ALL TABLES IN
   SCHEMA`.** `GRANT` and `REVOKE` take one or more named objects today.
 - **Schema privileges.** Record the owner of a schema, and the `USAGE` and
