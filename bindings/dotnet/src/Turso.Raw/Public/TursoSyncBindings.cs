@@ -39,6 +39,7 @@ public sealed class TursoSyncDatabaseConfiguration
     public string? PartialBootstrapStrategyQuery { get; init; }
     public nuint PartialBootstrapSegmentSize { get; init; }
     public bool PartialBootstrapPrefetch { get; init; }
+    public string? LocalEncryptionKey { get; init; }
     public string? RemoteEncryptionKey { get; init; }
     public string? RemoteEncryptionCipher { get; init; }
     public nuint PushOperationsThreshold { get; init; }
@@ -85,7 +86,13 @@ public static class TursoSyncBindings
         using var query = NativeUtf8String.From(configuration.PartialBootstrapStrategyQuery);
         using var remoteEncryptionKey = NativeUtf8String.From(configuration.RemoteEncryptionKey);
         using var remoteEncryptionCipher = NativeUtf8String.From(configuration.RemoteEncryptionCipher);
-        using var experimentalFeatures = NativeUtf8String.From(configuration.ExperimentalFeatures);
+        using var localEncryptionKey = NativeUtf8String.From(configuration.LocalEncryptionKey);
+        if (configuration.LocalEncryptionKey is not null)
+            ArgumentException.ThrowIfNullOrWhiteSpace(configuration.RemoteEncryptionCipher);
+        var features = configuration.ExperimentalFeatures;
+        if (configuration.LocalEncryptionKey is not null)
+            features = string.IsNullOrEmpty(features) ? "encryption" : features + ",encryption";
+        using var experimentalFeatures = NativeUtf8String.From(features);
 
         var databaseConfig = new TursoDatabaseConfig
         {
@@ -93,8 +100,8 @@ public static class TursoSyncBindings
             Path = path.Pointer,
             ExperimentalFeatures = experimentalFeatures.Pointer,
             Vfs = IntPtr.Zero,
-            EncryptionCipher = IntPtr.Zero,
-            EncryptionHexKey = IntPtr.Zero,
+            EncryptionCipher = configuration.LocalEncryptionKey is null ? IntPtr.Zero : remoteEncryptionCipher.Pointer,
+            EncryptionHexKey = localEncryptionKey.Pointer,
             PageCodec = IntPtr.Zero,
             OpenFlags = 0,
         };
