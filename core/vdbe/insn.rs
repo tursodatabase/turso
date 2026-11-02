@@ -2668,24 +2668,30 @@ impl Insn {
     /// The collations this instruction compares values with.
     #[cfg(test)]
     pub(crate) fn collations(&self) -> Vec<CollationSeq> {
+        let mut collations = Vec::new();
+        self.for_each_collation(|collation| collations.push(collation));
+        collations
+    }
+
+    /// Calls `f` with each collation this instruction compares values with.
+    pub(crate) fn for_each_collation(&self, mut f: impl FnMut(CollationSeq)) {
         match self {
             Insn::Eq { collation, .. }
             | Insn::Ne { collation, .. }
             | Insn::Lt { collation, .. }
             | Insn::Le { collation, .. }
             | Insn::Gt { collation, .. }
-            | Insn::Ge { collation, .. } => vec![*collation],
-            Insn::Compare { key_info, .. } => key_info.iter().map(|key| key.collation).collect(),
+            | Insn::Ge { collation, .. } => f(*collation),
+            Insn::Compare { key_info, .. } => key_info.iter().for_each(|key| f(key.collation)),
             Insn::SorterOpen { data } => data
                 .order_collations_nulls
                 .iter()
-                .map(|(_, collation, _)| *collation)
-                .collect(),
-            Insn::AggStep { data } => vec![data.collation],
-            Insn::HashBuild { data } => data.collations.clone(),
-            Insn::HashDistinct { data } => data.collations.clone(),
-            Insn::Function { func, .. } => vec![func.collation],
-            _ => Vec::new(),
+                .for_each(|(_, collation, _)| f(*collation)),
+            Insn::AggStep { data } => f(data.collation),
+            Insn::HashBuild { data } => data.collations.iter().copied().for_each(f),
+            Insn::HashDistinct { data } => data.collations.iter().copied().for_each(f),
+            Insn::Function { func, .. } => f(func.collation),
+            _ => {}
         }
     }
 

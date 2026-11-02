@@ -89,6 +89,20 @@ test collate_unique_constraint-2 {
 expect error {
 }
 
+test collate_unknown_in_unique_constraint {
+    CREATE TABLE t(a, UNIQUE(a COLLATE unknown_collation));
+}
+expect error {
+    no such collation sequence: unknown_collation
+}
+
+test collate_unknown_in_primary_key_constraint {
+    CREATE TABLE t(a, PRIMARY KEY(a COLLATE unknown_collation));
+}
+expect error {
+    no such collation sequence: unknown_collation
+}
+
 @cross-check-integrity
 test collate_aggregation_default_binary {
     create table fruits(name collate binary);

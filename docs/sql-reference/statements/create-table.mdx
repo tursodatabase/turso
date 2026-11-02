@@ -203,7 +203,9 @@ Specifies the collation sequence used for text comparisons and sorting on the co
 | `NOCASE` | Case-insensitive comparison for ASCII characters |
 | `RTRIM` | Like `BINARY`, but ignores trailing spaces |
 
-Turso also resolves locale-aware collations and custom collations registered on the connection. An unknown collation name now raises a `no such collation sequence` error rather than being silently ignored.
+Turso also accepts locale-aware collations such as `COLLATE "fr-FR"`. A custom collation registered on the connection cannot be used in `CREATE TABLE` or `CREATE INDEX`, and an unknown collation name raises a `no such collation sequence` error. Some names that are no collation, such as `foo`, are accepted as locale collations instead.
+
+A database created elsewhere, for example by SQLite with a custom collation, still opens when its schema names a collation that Turso does not know. Statements that compare or sort with that collation fail with `no such collation sequence` unless the application registered it on the connection. Indexes and WITHOUT ROWID tables that use it cannot be read or written.
 
 ```sql
 CREATE TABLE contacts (

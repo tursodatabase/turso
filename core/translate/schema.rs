@@ -711,12 +711,7 @@ fn validate(
                         validate_generated_function_calls(expr, resolver)?;
                     }
                     ast::ColumnConstraint::Collate { collation_name } => {
-                        let collation = resolver.resolve_collation(collation_name.as_str())?;
-                        if collation.is_custom() {
-                            bail_parse_error!(
-                                "custom collations are not supported in schema definitions"
-                            );
-                        }
+                        validate_collation(collation_name.as_str(), resolver)?;
                     }
                     _ => {}
                 }
@@ -732,8 +727,19 @@ fn validate(
             }
         }
         for constraint in constraints {
-            if let ast::TableConstraint::Check { ref expr, .. } = constraint.constraint {
-                validate_check_expr(expr, table_name, &column_names, resolver)?;
+            match &constraint.constraint {
+                ast::TableConstraint::Check { expr, .. } => {
+                    validate_check_expr(expr, table_name, &column_names, resolver)?;
+                }
+                ast::TableConstraint::PrimaryKey { columns, .. }
+                | ast::TableConstraint::Unique { columns, .. } => {
+                    for column in columns {
+                        if let ast::Expr::Collate(_, collation_name) = column.expr.as_ref() {
+                            validate_collation(collation_name.as_str(), resolver)?;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -874,6 +880,14 @@ pub(crate) fn check_column_type(
                 provided
             );
         }
+    }
+    Ok(())
+}
+
+fn validate_collation(name: &str, resolver: &CatalogContext) -> Result<()> {
+    let collation = resolver.resolve_collation(name)?;
+    if collation.is_custom() {
+        bail_parse_error!("custom collations are not supported in schema definitions");
     }
     Ok(())
 }
