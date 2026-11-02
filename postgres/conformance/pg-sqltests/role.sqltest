@@ -653,3 +653,121 @@ expect {
     readable
     readable
 }
+
+test grant-select-lets-a-role-read-a-table {
+    CREATE TABLE gr_select (x int);
+    INSERT INTO gr_select VALUES (1);
+    CREATE ROLE gr_reader;
+    GRANT SELECT ON gr_select TO gr_reader;
+    SET ROLE gr_reader;
+    SELECT x FROM gr_select;
+}
+expect {
+    1
+}
+
+test grant-select-does-not-grant-insert {
+    CREATE TABLE gr_select_only (x int);
+    CREATE ROLE gr_select_only_reader;
+    GRANT SELECT ON gr_select_only TO gr_select_only_reader;
+    SET ROLE gr_select_only_reader;
+    INSERT INTO gr_select_only VALUES (1);
+}
+expect error {
+    permission denied for table gr_select_only
+}
+
+test revoke-select-takes-the-privilege-back {
+    CREATE TABLE gr_revoked (x int);
+    CREATE ROLE gr_revoked_reader;
+    GRANT SELECT ON gr_revoked TO gr_revoked_reader;
+    REVOKE SELECT ON gr_revoked FROM gr_revoked_reader;
+    SET ROLE gr_revoked_reader;
+    SELECT x FROM gr_revoked;
+}
+expect error {
+    permission denied for table gr_revoked
+}
+
+test grant-all-on-table-lets-a-role-change-it {
+    CREATE TABLE gr_all (x int);
+    CREATE ROLE gr_all_user;
+    GRANT ALL ON TABLE gr_all TO gr_all_user;
+    SET ROLE gr_all_user;
+    INSERT INTO gr_all VALUES (1), (2);
+    UPDATE gr_all SET x = x + 1;
+    DELETE FROM gr_all WHERE x = 3;
+    SELECT x FROM gr_all;
+}
+expect {
+    2
+}
+
+test grant-to-public-applies-to-every-role {
+    CREATE TABLE gr_public (x int);
+    INSERT INTO gr_public VALUES (7);
+    CREATE ROLE gr_public_reader;
+    GRANT SELECT ON gr_public TO PUBLIC;
+    SET ROLE gr_public_reader;
+    SELECT x FROM gr_public;
+}
+expect {
+    7
+}
+
+test grant-usage-on-sequence-lets-a-role-advance-it {
+    CREATE SEQUENCE gr_sequence;
+    CREATE ROLE gr_sequence_user;
+    GRANT USAGE ON SEQUENCE gr_sequence TO gr_sequence_user;
+    SET ROLE gr_sequence_user;
+    SELECT nextval('gr_sequence');
+}
+expect {
+    1
+}
+
+test grant-with-grant-option-lets-the-grantee-grant {
+    CREATE TABLE gr_option (x int);
+    INSERT INTO gr_option VALUES (4);
+    CREATE ROLE gr_option_holder;
+    CREATE ROLE gr_option_receiver;
+    GRANT SELECT ON gr_option TO gr_option_holder WITH GRANT OPTION;
+    SET ROLE gr_option_holder;
+    GRANT SELECT ON gr_option TO gr_option_receiver;
+    RESET ROLE;
+    SET ROLE gr_option_receiver;
+    SELECT x FROM gr_option;
+}
+expect {
+    4
+}
+
+test grant-select-on-a-view-lets-a-role-read-it {
+    CREATE TABLE gr_view_table (x int);
+    INSERT INTO gr_view_table VALUES (5);
+    CREATE VIEW gr_view AS SELECT x FROM gr_view_table;
+    CREATE ROLE gr_view_reader;
+    GRANT SELECT ON gr_view TO gr_view_reader;
+    SET ROLE gr_view_reader;
+    SELECT x FROM gr_view;
+}
+expect {
+    5
+}
+
+test grant-of-a-privilege-the-object-cannot-have-fails {
+    CREATE TABLE gr_wrong (x int);
+    CREATE ROLE gr_wrong_user;
+    GRANT EXECUTE ON TABLE gr_wrong TO gr_wrong_user;
+}
+expect error {
+    invalid privilege type EXECUTE for relation
+}
+
+test grant-to-a-missing-role-fails {
+    CREATE TABLE gr_missing_role (x int);
+    GRANT SELECT ON gr_missing_role TO gr_nobody;
+}
+expect error {
+    role "gr_nobody" does not exist
+}

@@ -11,12 +11,12 @@ what the role is allowed to do. Turso has no authentication; instead, it assumes
 the host program handles it.
 
 > [!NOTE]
-> Roles and privileges are implemented: every object has an owner and an
-> access control list, and the checks consult them. `GRANT` and `REVOKE` do
-> not exist yet, so a role that is not a superuser holds only what every role
-> holds by default. Row-level security is in scope and not implemented.
-> Authentication is out of scope for Core: it belongs to the host program or
-> the frontend.
+> Roles, privileges, `GRANT` and `REVOKE` are implemented: every object has
+> an owner and an access control list, the checks consult them, and the
+> owner changes them. `CREATE` does not record the creating role as owner
+> yet, so every object is owned by the superuser. Row-level security is in
+> scope and not implemented. Authentication is out of scope for Core: it
+> belongs to the host program or the frontend.
 
 ## Glossary
 
@@ -81,7 +81,7 @@ Turso does not defend against:
 | Area               | Status                                                  |
 |--------------------|---------------------------------------------------------|
 | Roles              | In scope, implemented                                   |
-| Privileges         | In scope, lists and checks implemented, `GRANT` is not  |
+| Privileges         | In scope, implemented                                   |
 | Ownership          | In scope, stored; `CREATE` does not record it yet       |
 | Row-level security | In scope, not implemented                               |
 | Authentication     | Out of scope for Core                                   |
@@ -230,11 +230,19 @@ needs an entry, and neither does a table-valued function of an extension.
 
 A check asks whether the current role holds one of the privileges the
 statement needs on the object, or owns it. A superuser passes every check. A
-role holds a privilege if it was granted to the role or to `public`. Until
-`GRANT` exists, an object that no row and no dialect names is owned by the
-superuser and grants nothing to `public`, so a role that is not a superuser
-can read the catalogs and execute functions, run statements that touch no
-object, such as `SELECT 1`, and switch roles, and nothing else.
+role holds a privilege if it was granted to the role or to `public`.
+
+`GRANT` adds privileges to an object's list and `REVOKE` removes them, for
+named roles or for `public`, with `WITH GRANT OPTION` and `GRANT OPTION FOR`
+as in PostgreSQL. The grantor is the current role, which must own the object
+or hold the grant option for every privilege named; a superuser grants as the
+owner. A privilege the kind of object cannot have, such as `EXECUTE` on a
+table, is an error. The statement is DDL: it writes the object's row in the
+access control table, replacing it if there is one, in the caller's
+transaction, bumps the schema cookie so other connections reload the lists,
+and changes the in-memory catalog when it completes. A built-in object can
+be granted or revoked on too, so `REVOKE SELECT ON pg_class FROM public`
+hides that catalog table from every role but the superuser.
 
 ### Statements
 
@@ -268,7 +276,9 @@ Roles:
 |---------------|---------------------------------------------------------------------------------------------|
 | `SET ROLE`    | Allowed, then checked when it runs: the session role must be a superuser or the role itself |
 | `RESET ROLE`  | Allowed                                                                                     |
-| `CREATE ROLE` | Needs the privilege to create roles                                                         |
+| `CREATE ROLE` | Superuser only                                                                              |
+| `GRANT`       | Allowed, then checked when it is translated: the grantor must own the object or hold the grant option |
+| `REVOKE`      | Allowed, then checked like `GRANT`                                                          |
 
 Creating objects:
 
@@ -432,10 +442,8 @@ In the order the pieces depend on each other:
   trigger, sequence and type. The denials that today say "not the owner" then
   pass for the owner, and `DROP`, `ALTER` and `CREATE INDEX` become usable by
   roles other than the superuser.
-- **`GRANT` and `REVOKE`.** Write the access control lists: a grantor who
-  owns the object or holds the grant option adds or removes privileges for a
-  role or for `public`, and the rows of the access control table change in
-  the grantor's transaction like any DDL.
+- **Column privileges, default privileges and `GRANT ... ON ALL TABLES IN
+  SCHEMA`.** `GRANT` and `REVOKE` take one or more named objects today.
 - **Schema privileges.** Record the owner of a schema, and the `USAGE` and
   `CREATE` privileges on it. `CREATE SCHEMA` and `DROP SCHEMA` then stop being
   superuser-only, and resolving a name in a schema needs `USAGE` on it, as in

@@ -62,6 +62,8 @@ pub enum Action {
     Alter,
     Drop,
     Use,
+    /// Granting or revoking privileges on the object
+    Grant,
     SetRole,
     Analyze,
     Vacuum,
@@ -83,6 +85,7 @@ impl fmt::Display for Action {
             Action::Alter => "alter",
             Action::Drop => "drop",
             Action::Use => "use",
+            Action::Grant => "grant",
             Action::SetRole => "set role",
             Action::Analyze => "analyze",
             Action::Vacuum => "vacuum",

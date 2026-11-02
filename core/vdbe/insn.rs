@@ -1916,6 +1916,15 @@ pub enum Insn {
         name: String,
         superuser: bool,
     },
+    /// Replace an object's owner and access control list in the in-memory
+    /// ACL catalog after its row was written
+    SetAcl {
+        db: usize,
+        /// Register holding the rowid of the object's row in the ACL table
+        id_reg: usize,
+        key: crate::security::acl_catalog::ObjectKey,
+        access: crate::security::privilege::ObjectAccess,
+    },
 
     /// Close a cursor.
     Close {
@@ -2571,6 +2580,7 @@ impl InsnVariants {
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::AddRole => execute::op_add_role,
+            InsnVariants::SetAcl => execute::op_set_acl,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2718,6 +2728,7 @@ impl Insn {
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
             | Self::AddRole { .. }
+            | Self::SetAcl { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

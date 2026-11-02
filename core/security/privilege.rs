@@ -68,6 +68,13 @@ impl Privilege {
         }
     }
 
+    /// The privilege called `name` in SQL, in any case.
+    pub fn from_name(name: &str) -> Option<Privilege> {
+        Privilege::ALL
+            .into_iter()
+            .find(|privilege| privilege.name().eq_ignore_ascii_case(name))
+    }
+
     pub fn from_code(code: char) -> Option<Privilege> {
         Privilege::ALL
             .into_iter()

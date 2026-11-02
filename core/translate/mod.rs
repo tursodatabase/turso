@@ -230,6 +230,7 @@ fn translate_statement(
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::CreateRole { .. }
+            | ast::Stmt::Grant(_)
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -424,6 +425,7 @@ fn translate_statement(
         ast::Stmt::CreateRole { role_name } => {
             roles::translate_create_role(&role_name, resolver, program)?
         }
+        ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -630,6 +632,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",
         ast::Stmt::CreateRole { .. } => "create_role",
+        ast::Stmt::Grant(grant) if grant.is_grant => "grant",
+        ast::Stmt::Grant(_) => "revoke",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
         ast::Stmt::DropIndex { .. } => "drop_index",
@@ -673,26 +677,42 @@ mod tests {
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 0, 0));
         program.push_cte_being_defined("caller".into());
 
-        let result = program.with_view_expansion(0, "v", |program| {
-            assert!(!program.is_cte_being_defined("caller"));
-            program.push_cte_being_defined("outer_view".into());
+        let result = program.with_view_expansion(
+            crate::namespace::NamespaceRef::root_of(0),
+            "v",
+            |program| {
+                assert!(!program.is_cte_being_defined("caller"));
+                program.push_cte_being_defined("outer_view".into());
 
-            // The same view name in another schema is not a circular reference.
-            program.with_view_expansion(1, "v", |program| {
-                assert!(!program.is_cte_being_defined("outer_view"));
-                Ok(())
-            })?;
-            assert!(program.is_cte_being_defined("outer_view"));
+                // The same view name in another schema is not a circular reference.
+                program.with_view_expansion(
+                    crate::namespace::NamespaceRef::root_of(1),
+                    "v",
+                    |program| {
+                        assert!(!program.is_cte_being_defined("outer_view"));
+                        Ok(())
+                    },
+                )?;
+                assert!(program.is_cte_being_defined("outer_view"));
 
-            // An indirect circular reference must unwind both expansion scopes.
-            program.with_view_expansion(0, "nested", |program| {
-                program.with_view_expansion(0, "v", |_| -> crate::Result<()> {
-                    panic!("a circular view must not be expanded")
-                })?;
+                // An indirect circular reference must unwind both expansion scopes.
+                program.with_view_expansion(
+                    crate::namespace::NamespaceRef::root_of(0),
+                    "nested",
+                    |program| {
+                        program.with_view_expansion(
+                            crate::namespace::NamespaceRef::root_of(0),
+                            "v",
+                            |_| -> crate::Result<()> {
+                                panic!("a circular view must not be expanded")
+                            },
+                        )?;
+                        Ok(())
+                    },
+                )?;
                 Ok(())
-            })?;
-            Ok(())
-        });
+            },
+        );
         assert!(
             matches!(result, Err(crate::LimboError::ParseError(ref message))
             if message == "view v is circularly defined")
@@ -702,8 +722,12 @@ mod tests {
 
         // Both names can be expanded again after the failed expansion.
         program
-            .with_view_expansion(0, "v", |program| {
-                program.with_view_expansion(0, "nested", |_| Ok(()))
+            .with_view_expansion(crate::namespace::NamespaceRef::root_of(0), "v", |program| {
+                program.with_view_expansion(
+                    crate::namespace::NamespaceRef::root_of(0),
+                    "nested",
+                    |_| Ok(()),
+                )
             })
             .unwrap();
         assert!(program.is_cte_being_defined("caller"));

@@ -693,6 +693,7 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some("ROLE"))?;
                 s.append(TK_ID, Some(role_name))
             }
+            Self::Grant(grant) => grant.to_tokens(s, context),
             Self::CreateType {
                 if_not_exists,
                 type_name,
@@ -1659,6 +1660,78 @@ impl ToTokens for Name {
 }
 
 impl_display_for_to_tokens!(QualifiedName);
+impl_display_for_to_tokens!(GrantStmt);
+
+impl ToTokens for GrantStmt {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_ID, Some(if self.is_grant { "GRANT" } else { "REVOKE" }))?;
+        if !self.is_grant && self.grant_option {
+            s.append(TK_ID, Some("GRANT"))?;
+            s.append(TK_ID, Some("OPTION"))?;
+            s.append(TK_FOR, None)?;
+        }
+        if self.privileges.is_empty() {
+            s.append(TK_ALL, None)?;
+        }
+        for (i, privilege) in self.privileges.iter().enumerate() {
+            if i > 0 {
+                s.append(TK_COMMA, None)?;
+            }
+            s.append(TK_ID, Some(privilege))?;
+        }
+        s.append(TK_ON, None)?;
+        let kind = match self.objects.first() {
+            Some(GrantObject::Table(_)) | None => "TABLE",
+            Some(GrantObject::Sequence(_)) => "SEQUENCE",
+            Some(GrantObject::Function(_)) => "FUNCTION",
+            Some(GrantObject::Schema(_)) => "SCHEMA",
+            Some(GrantObject::Database) => "DATABASE",
+            Some(GrantObject::Type(_)) => "TYPE",
+            Some(GrantObject::Setting(_)) => "PARAMETER",
+        };
+        s.append(TK_ID, Some(kind))?;
+        for (i, object) in self.objects.iter().enumerate() {
+            if i > 0 {
+                s.append(TK_COMMA, None)?;
+            }
+            match object {
+                GrantObject::Table(name) | GrantObject::Sequence(name) => {
+                    name.to_tokens(s, context)?
+                }
+                GrantObject::Function(name)
+                | GrantObject::Schema(name)
+                | GrantObject::Type(name)
+                | GrantObject::Setting(name) => name.to_tokens(s, context)?,
+                GrantObject::Database => s.append(TK_ID, Some("main"))?,
+            }
+        }
+        if self.is_grant {
+            s.append(TK_TO, None)?;
+        } else {
+            s.append(TK_FROM, None)?;
+        }
+        for (i, grantee) in self.grantees.iter().enumerate() {
+            if i > 0 {
+                s.append(TK_COMMA, None)?;
+            }
+            match grantee {
+                Grantee::Role(name) => s.append(TK_ID, Some(name))?,
+                Grantee::Public => s.append(TK_ID, Some("PUBLIC"))?,
+            }
+        }
+        if self.is_grant && self.grant_option {
+            s.append(TK_WITH, None)?;
+            s.append(TK_ID, Some("GRANT"))?;
+            s.append(TK_ID, Some("OPTION"))?;
+        }
+        Ok(())
+    }
+}
+
 impl ToTokens for QualifiedName {
     fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,

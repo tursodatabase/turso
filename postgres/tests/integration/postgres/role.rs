@@ -562,3 +562,69 @@ fn open_pragma_cursor_does_not_skip_privilege_checks() {
 
     assert_eq!(error.to_string(), "permission denied for table t");
 }
+
+#[test]
+fn granted_privileges_are_kept_after_reopening_the_database() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("GRANT SELECT ON t TO alice").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    let conn = db.connect_postgres();
+    conn.execute("SET ROLE alice").unwrap();
+    let mut stmt = conn.query("SELECT x FROM t").unwrap().unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap().len(), 1);
+    let error = conn.execute("INSERT INTO t VALUES (2)").unwrap_err();
+    assert_eq!(error.to_string(), "permission denied for table t");
+}
+
+#[test]
+fn a_grant_is_visible_to_another_connection() {
+    let db = TempDatabase::builder().build();
+    let admin = db.connect_postgres();
+    let other = db.connect_postgres();
+    admin.execute("CREATE TABLE t (x int)").unwrap();
+    admin.execute("CREATE ROLE alice").unwrap();
+    other.execute("SET ROLE alice").unwrap();
+    assert!(other.execute("SELECT x FROM t").is_err());
+
+    admin.execute("GRANT SELECT ON t TO alice").unwrap();
+
+    other.execute("SELECT x FROM t").unwrap();
+}
+
+#[test]
+fn a_role_without_the_grant_option_cannot_grant() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE ROLE bob").unwrap();
+    conn.execute("GRANT SELECT ON t TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("GRANT SELECT ON t TO bob").unwrap_err();
+
+    assert_eq!(error.to_string(), "permission denied for table t");
+}
+
+#[test]
+fn revoke_select_on_a_catalog_table_from_public_hides_it() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("REVOKE SELECT ON pg_class FROM PUBLIC")
+        .unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("SELECT relname FROM pg_class").unwrap_err();
+
+    assert_eq!(error.to_string(), "permission denied for table pg_class");
+    conn.execute("SELECT nspname FROM pg_namespace").unwrap();
+}

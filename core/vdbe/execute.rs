@@ -15206,6 +15206,35 @@ pub fn op_add_role(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_set_acl(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        SetAcl {
+            db,
+            id_reg,
+            key,
+            access,
+        },
+        insn
+    );
+    let Value::Numeric(Numeric::Integer(rowid)) = state.registers[*id_reg].get_value() else {
+        return Err(LimboError::InternalError(format!(
+            "SetAcl: rowid register r[{id_reg}] does not hold an integer"
+        ))
+        .into());
+    };
+    let rowid = *rowid;
+    program.connection.with_database_schema_mut(*db, |schema| {
+        Arc::make_mut(&mut schema.acls).set_stored(key.clone(), rowid, access.clone())
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Compute the next value of a sequence from a watermark row that has
 /// already been loaded into registers by the surrounding bytecode. Pure
 /// arithmetic — no I/O. The translator emits a cursor seek + Column reads

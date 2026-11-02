@@ -188,6 +188,12 @@ impl PostgreSQLTranslator {
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt)?,
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
             NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
+            NodeRef::GrantStmt(grant) => self.translate_grant(grant)?,
+            NodeRef::GrantRoleStmt(_) => {
+                return Err(ParseError::ParseError(
+                    "GRANT of a role is not supported".to_string(),
+                ))
+            }
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -2219,6 +2225,128 @@ impl PostgreSQLTranslator {
                 from_item.node
             ))),
         }
+    }
+
+    /// `GRANT` and `REVOKE` of privileges on objects. Column privileges,
+    /// `ALL ... IN SCHEMA`, default privileges and `GRANTED BY` are not
+    /// supported.
+    fn translate_grant(
+        &self,
+        stmt: &pg_query::protobuf::GrantStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::{GrantTargetType, ObjectType, RoleSpecType};
+
+        let verb = if stmt.is_grant { "GRANT" } else { "REVOKE" };
+        if GrantTargetType::try_from(stmt.targtype) != Ok(GrantTargetType::AclTargetObject) {
+            return Err(ParseError::ParseError(format!(
+                "{verb} ON ALL ... IN SCHEMA is not supported"
+            )));
+        }
+        if stmt.grantor.is_some() {
+            return Err(ParseError::ParseError(format!(
+                "{verb} ... GRANTED BY is not supported"
+            )));
+        }
+        let object_type = ObjectType::try_from(stmt.objtype).map_err(|_| {
+            ParseError::ParseError(format!("unknown object type in {verb}: {}", stmt.objtype))
+        })?;
+        let mut objects = Vec::with_capacity(stmt.objects.len());
+        for object in &stmt.objects {
+            let object = match (object_type, &object.node) {
+                (ObjectType::ObjectTable, Some(Node::RangeVar(range_var))) => {
+                    ast::GrantObject::Table(self.qualified_name_from_range_var(range_var)?)
+                }
+                (ObjectType::ObjectSequence, Some(Node::RangeVar(range_var))) => {
+                    ast::GrantObject::Sequence(self.qualified_name_from_range_var(range_var)?)
+                }
+                (
+                    ObjectType::ObjectFunction
+                    | ObjectType::ObjectRoutine
+                    | ObjectType::ObjectProcedure,
+                    Some(Node::ObjectWithArgs(function)),
+                ) => {
+                    let name = function
+                        .objname
+                        .iter()
+                        .filter_map(|node| match &node.node {
+                            Some(Node::String(name)) => Some(name.sval.as_str()),
+                            _ => None,
+                        })
+                        .filter(|name| !is_pg_catalog(name))
+                        .next_back()
+                        .ok_or_else(|| {
+                            ParseError::ParseError(format!("{verb} ON FUNCTION needs a name"))
+                        })?;
+                    ast::GrantObject::Function(exact_name(name))
+                }
+                (ObjectType::ObjectSchema, Some(Node::String(name))) => {
+                    ast::GrantObject::Schema(exact_name(&name.sval))
+                }
+                (ObjectType::ObjectDatabase, Some(Node::String(_))) => ast::GrantObject::Database,
+                (ObjectType::ObjectType, Some(Node::TypeName(type_name))) => {
+                    let name = type_name
+                        .names
+                        .iter()
+                        .filter_map(|node| match &node.node {
+                            Some(Node::String(name)) => Some(name.sval.as_str()),
+                            _ => None,
+                        })
+                        .next_back()
+                        .ok_or_else(|| {
+                            ParseError::ParseError(format!("{verb} ON TYPE needs a name"))
+                        })?;
+                    ast::GrantObject::Type(exact_name(name))
+                }
+                (ObjectType::ObjectParameterAcl, Some(Node::String(name))) => {
+                    ast::GrantObject::Setting(exact_name(&name.sval))
+                }
+                _ => {
+                    return Err(ParseError::ParseError(format!(
+                        "{verb} on this kind of object is not supported"
+                    )))
+                }
+            };
+            objects.push(object);
+        }
+        let mut privileges = Vec::with_capacity(stmt.privileges.len());
+        for privilege in &stmt.privileges {
+            let Some(Node::AccessPriv(access)) = &privilege.node else {
+                return Err(ParseError::ParseError(format!(
+                    "unsupported privilege in {verb}"
+                )));
+            };
+            if !access.cols.is_empty() {
+                return Err(ParseError::ParseError(format!(
+                    "{verb} of column privileges is not supported"
+                )));
+            }
+            privileges.push(access.priv_name.to_lowercase());
+        }
+        let mut grantees = Vec::with_capacity(stmt.grantees.len());
+        for grantee in &stmt.grantees {
+            let Some(Node::RoleSpec(role)) = &grantee.node else {
+                return Err(ParseError::ParseError(format!(
+                    "unsupported role in {verb}"
+                )));
+            };
+            grantees.push(match RoleSpecType::try_from(role.roletype) {
+                Ok(RoleSpecType::RolespecCstring) => ast::Grantee::Role(role.rolename.clone()),
+                Ok(RoleSpecType::RolespecPublic) => ast::Grantee::Public,
+                _ => {
+                    return Err(ParseError::ParseError(format!(
+                        "{verb} ... CURRENT_USER, CURRENT_ROLE and SESSION_USER are not supported"
+                    )))
+                }
+            });
+        }
+        Ok(ast::Stmt::Grant(ast::GrantStmt {
+            is_grant: stmt.is_grant,
+            privileges,
+            objects,
+            grantees,
+            grant_option: stmt.grant_option,
+        }))
     }
 
     fn translate_range_var(

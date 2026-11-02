@@ -26,7 +26,7 @@ pub const CREATE_ACL_TABLE_SQL: &str = "CREATE TABLE __turso_internal_acl (\
     acl TEXT NOT NULL)";
 
 pub const SELECT_ACL_SQL: &str =
-    "SELECT kind, namespace, name, owner, acl FROM __turso_internal_acl";
+    "SELECT id, kind, namespace, name, owner, acl FROM __turso_internal_acl";
 
 /// Names one object that privileges apply to. Functions, settings, schemas
 /// and the database itself are in the root namespace.
@@ -82,12 +82,19 @@ impl ObjectKind {
     }
 }
 
+/// A list read from the access control table, with the rowid of its row.
+#[derive(Debug, Clone)]
+struct StoredAccess {
+    rowid: i64,
+    access: ObjectAccess,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AclCatalog {
     /// The lists the dialect registered for built-in objects.
     builtin: HashMap<ObjectKey, ObjectAccess>,
     /// The lists read from the access control table.
-    stored: HashMap<ObjectKey, ObjectAccess>,
+    stored: HashMap<ObjectKey, StoredAccess>,
 }
 
 impl AclCatalog {
@@ -104,24 +111,33 @@ impl AclCatalog {
     /// Returns the list of `key`, or `None` if the object has neither a
     /// stored nor a registered list and so has the default list of its kind.
     pub fn get(&self, key: &ObjectKey) -> Option<&ObjectAccess> {
-        self.stored.get(key).or_else(|| self.builtin.get(key))
+        self.stored
+            .get(key)
+            .map(|stored| &stored.access)
+            .or_else(|| self.builtin.get(key))
     }
 
-    pub fn stored(&self, key: &ObjectKey) -> Option<&ObjectAccess> {
-        self.stored.get(key)
+    /// The rowid of the object's row in the access control table, if it has
+    /// one.
+    pub fn stored_rowid(&self, key: &ObjectKey) -> Option<i64> {
+        self.stored.get(key).map(|stored| stored.rowid)
     }
 
-    pub fn set_stored(&mut self, key: ObjectKey, access: ObjectAccess) {
-        self.stored.insert(key, access);
+    /// Records the list that was just written to the row `rowid`.
+    pub fn set_stored(&mut self, key: ObjectKey, rowid: i64, access: ObjectAccess) {
+        self.stored.insert(key, StoredAccess { rowid, access });
     }
 
     /// Replaces the lists read from the access control table with the lists
-    /// in `rows`. Each row is `(kind, namespace, name, owner, acl)`.
+    /// in `rows`. Each row is `(id, kind, namespace, name, owner, acl)`.
     pub fn load_stored(&mut self, rows: &[Vec<Value>]) -> Result<()> {
         let mut stored = HashMap::new();
         for row in rows {
-            let (key, access) = access_from_row(row)?;
-            if stored.insert(key.clone(), access).is_some() {
+            let (rowid, key, access) = access_from_row(row)?;
+            if stored
+                .insert(key.clone(), StoredAccess { rowid, access })
+                .is_some()
+            {
                 return Err(LimboError::Corrupt(format!(
                     "{ACL_TABLE_NAME} has two rows for {key:?}"
                 )));
@@ -132,18 +148,19 @@ impl AclCatalog {
     }
 }
 
-fn access_from_row(row: &[Value]) -> Result<(ObjectKey, ObjectAccess)> {
+fn access_from_row(row: &[Value]) -> Result<(i64, ObjectKey, ObjectAccess)> {
     let corrupt = || LimboError::Corrupt(format!("{ACL_TABLE_NAME} has an invalid row: {row:?}"));
-    let [kind, namespace, name, owner, acl] = row else {
+    let [rowid, kind, namespace, name, owner, acl] = row else {
         return Err(corrupt());
     };
     let (
+        Value::Numeric(Numeric::Integer(rowid)),
         Value::Text(kind),
         Value::Numeric(Numeric::Integer(namespace)),
         Value::Text(name),
         Value::Numeric(Numeric::Integer(owner)),
         Value::Text(acl),
-    ) = (kind, namespace, name, owner, acl)
+    ) = (rowid, kind, namespace, name, owner, acl)
     else {
         return Err(corrupt());
     };
@@ -154,6 +171,7 @@ fn access_from_row(row: &[Value]) -> Result<(ObjectKey, ObjectAccess)> {
         .ok_or_else(corrupt)?;
     let acl = Acl::from_stored(acl.as_str())?;
     Ok((
+        *rowid,
         ObjectKey::new(kind, NamespaceId::new(namespace), name.as_str()),
         ObjectAccess { owner, acl },
     ))
@@ -166,6 +184,7 @@ mod tests {
 
     fn row(kind: &str, namespace: i64, name: &str, owner: i64, acl: &str) -> Vec<Value> {
         vec![
+            Value::from_i64(1),
             Value::build_text(kind.to_string()),
             Value::from_i64(namespace),
             Value::build_text(name.to_string()),
@@ -187,9 +206,9 @@ mod tests {
             .load_stored(&[row("table", 1, "t", 0, "{3=r/0}")])
             .unwrap();
 
-        let t = catalog
-            .get(&ObjectKey::new(ObjectKind::Table, NamespaceId::new(1), "t"))
-            .unwrap();
+        let key = ObjectKey::new(ObjectKind::Table, NamespaceId::new(1), "t");
+        assert_eq!(catalog.stored_rowid(&key), Some(1));
+        let t = catalog.get(&key).unwrap();
         assert_eq!(t.owner, RoleId::SUPERUSER);
         assert_eq!(
             t.acl.privileges_of(RoleId::from_stored(3).unwrap()),

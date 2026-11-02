@@ -19,6 +19,21 @@ use crate::{
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
 
+/// A view by its namespace and name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewRef {
+    pub namespace: NamespaceRef,
+    pub name: String,
+}
+
+/// A view that a program reads, and the view whose query reads it, if it
+/// is read through another view.
+#[derive(Debug, Clone)]
+pub struct ViewRead {
+    pub view: ViewRef,
+    pub through: Option<ViewRef>,
+}
+
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
 const HASH_TABLE_ID_BASE: usize = 1 << 30;
 
@@ -291,15 +306,20 @@ pub struct ProgramBuilder {
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
     /// again. Hence, the key is optional.
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
-    /// Every virtual table that the program opens a cursor on. Cursor ids
-    /// are reused, so `cursor_ref` alone does not list all of them.
-    pub opened_virtual_tables: Vec<Arc<VirtualTable>>,
+    /// Every virtual table that the program opens a cursor on, with the
+    /// table reference it was opened for. Cursor ids are reused, so
+    /// `cursor_ref` alone does not list all of them.
+    pub opened_virtual_tables: Vec<(Option<TableInternalId>, Arc<VirtualTable>)>,
     /// Every virtual table that the program inserts into, updates or deletes
     /// from.
     pub written_virtual_tables: Vec<Arc<VirtualTable>>,
-    /// Every view that the program reads, with its namespace. A view is
-    /// replaced by its query, so it opens no storage of its own.
-    pub referenced_views: Vec<(NamespaceRef, String)>,
+    /// Every view that the program reads. A view is replaced by its query,
+    /// so it opens no storage of its own.
+    pub referenced_views: Vec<ViewRead>,
+    /// The view whose query a table reference comes from, for every table
+    /// reference planned while a view was being expanded. Its accesses are
+    /// checked as the view's owner, not as the current role.
+    pub tables_read_through_views: HashMap<TableInternalId, ViewRef>,
     /// The first denial found in a trigger or foreign-key action subprogram
     /// of this program. The privilege checks report it after the program's
     /// own accesses pass.
@@ -328,7 +348,7 @@ pub struct ProgramBuilder {
     /// Stack of views currently being expanded, keyed by `(database_id, name)`
     /// so a view is distinguished from a same-named view in another attached or
     /// temp schema. Used to detect self-referential views.
-    views_being_expanded: Vec<(usize, String)>,
+    views_being_expanded: Vec<ViewRef>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub table_reference_counter: TableRefIdCounter,
@@ -846,6 +866,7 @@ impl ProgramBuilder {
             opened_virtual_tables: Vec::new(),
             written_virtual_tables: Vec::new(),
             referenced_views: Vec::new(),
+            tables_read_through_views: HashMap::default(),
             subprogram_denial: None,
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
@@ -966,7 +987,7 @@ impl ProgramBuilder {
     /// CTE context. Restore both stacks even when expansion returns an error.
     pub fn with_view_expansion<T>(
         &mut self,
-        database_id: usize,
+        namespace: NamespaceRef,
         name: &str,
         expand: impl FnOnce(&mut Self) -> crate::Result<T>,
     ) -> crate::Result<T> {
@@ -974,14 +995,16 @@ impl ProgramBuilder {
         if self
             .views_being_expanded
             .iter()
-            .any(|(db, n)| *db == database_id && n == name)
+            .any(|view| view.namespace == namespace && view.name == name)
         {
             crate::bail_parse_error!("view {} is circularly defined", name);
         }
 
         // push
-        self.views_being_expanded
-            .push((database_id, name.to_owned()));
+        self.views_being_expanded.push(ViewRef {
+            namespace,
+            name: name.to_owned(),
+        });
         let saved_ctes = std::mem::take(&mut self.ctes_being_defined);
 
         // expand
@@ -1320,7 +1343,9 @@ impl ProgramBuilder {
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
         if let CursorType::VirtualTable(virtual_table) = &cursor_type {
-            self.opened_virtual_tables.push(virtual_table.clone());
+            let table_reference = key.as_ref().map(|key| key.table_reference_id);
+            self.opened_virtual_tables
+                .push((table_reference, virtual_table.clone()));
         }
         if let Some(cursor) = self.free_cursor_ids.pop() {
             self.cursor_ref[cursor] = (key, cursor_type);
@@ -1398,6 +1423,19 @@ impl ProgramBuilder {
             return;
         }
         self.insns.push((insn, self.insns.len()));
+    }
+
+    /// The view whose query is being planned, if any.
+    pub fn view_being_expanded(&self) -> Option<ViewRef> {
+        self.views_being_expanded.last().cloned()
+    }
+
+    /// Records that the table reference `id` was planned for the query of
+    /// the view being expanded, if one is.
+    pub fn record_table_reference(&mut self, id: TableInternalId) {
+        if let Some(view) = self.view_being_expanded() {
+            self.tables_read_through_views.insert(id, view);
+        }
     }
 
     /// Keeps the first denial found in a subprogram of this program.

@@ -21,8 +21,10 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use turso_ext::VTabKind;
 use turso_parser::ast;
 
-use crate::schema::{Schema, SEQ_BACKING_TABLE_PREFIX};
-use crate::security::acl_catalog::ObjectKey;
+use std::sync::Arc;
+
+use crate::schema::{BTreeTable, Schema, SEQ_BACKING_TABLE_PREFIX};
+use crate::security::acl_catalog::{ObjectKey, ACL_TABLE_NAME, CREATE_ACL_TABLE_SQL};
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::privilege::{ObjectAccess, ObjectKind, Privilege, Privileges};
 use crate::security::roles::{
@@ -31,10 +33,11 @@ use crate::security::roles::{
 };
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
-use crate::vdbe::builder::{CursorType, ProgramBuilder};
+use crate::vdbe::builder::{CursorType, ProgramBuilder, ViewRef};
 use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::vtab::{VirtualTable, VirtualTableType};
-use crate::{bail_parse_error, LimboError, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
+use turso_parser::ast::TableInternalId;
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
@@ -143,6 +146,9 @@ fn statement_requirement(stmt: &ast::Stmt, resolver: &Resolver) -> Result<Option
         | ast::Stmt::Rollback { .. }
         | ast::Stmt::Savepoint { .. }
         | ast::Stmt::Release { .. } => return Ok(None),
+        // Checked when it is translated, against the owner and the grant
+        // options of the object.
+        ast::Stmt::Grant(_) => return Ok(None),
         ast::Stmt::CreateTable {
             temporary: true, ..
         }
@@ -477,30 +483,49 @@ pub fn storage_denial(
     resolver: &Resolver,
     write: Privilege,
 ) -> Option<PermissionDenied> {
-    let role = resolver.checked_role?;
-    let allows = |database_id: usize, key: &ObjectKey, privileges: Privileges| {
-        !object_access(resolver, database_id, key)
-            .acl
-            .privileges_of(role)
-            .intersection(privileges)
-            .is_empty()
+    let current_role = resolver.checked_role?;
+    // The query of a view runs with the privileges of the view's owner, as
+    // in PostgreSQL, so a role may read a table through a view it may read
+    // without reading the table itself.
+    let owner_of_view = |view: &ViewRef| {
+        let key = ObjectKey::new(ObjectKind::View, view.namespace.id, view.name.as_str());
+        object_access(resolver, view.namespace.database_id, &key).owner
     };
-    for (namespace, view_name) in &program.referenced_views {
-        let key = ObjectKey::new(ObjectKind::View, namespace.id, view_name.as_str());
+    let role_for_table_reference = |table_reference: Option<TableInternalId>| {
+        table_reference
+            .and_then(|id| program.tables_read_through_views.get(&id))
+            .map_or(current_role, owner_of_view)
+    };
+    let allows = |role: RoleId, database_id: usize, key: &ObjectKey, privileges: Privileges| {
+        resolver.schema().roles.is_superuser(role)
+            || !object_access(resolver, database_id, key)
+                .acl
+                .privileges_of(role)
+                .intersection(privileges)
+                .is_empty()
+    };
+    for read in &program.referenced_views {
+        let role = read.through.as_ref().map_or(current_role, owner_of_view);
+        let key = ObjectKey::new(
+            ObjectKind::View,
+            read.view.namespace.id,
+            read.view.name.as_str(),
+        );
         if !allows(
-            namespace.database_id,
+            role,
+            read.view.namespace.database_id,
             &key,
             Privileges::of(Privilege::Select),
         ) {
             return Some(PermissionDenied::privilege(
                 Action::Read,
-                Object::View(view_name.clone()),
+                Object::View(read.view.name.clone()),
             ));
         }
     }
     for virtual_table in &program.written_virtual_tables {
         let key = ObjectKey::root(ObjectKind::Table, virtual_table.name.as_str());
-        if !allows(MAIN_DB_ID, &key, Privileges::of(write)) {
+        if !allows(current_role, MAIN_DB_ID, &key, Privileges::of(write)) {
             return Some(PermissionDenied::privilege(
                 Action::Write,
                 Object::Table(virtual_table.name.clone()),
@@ -508,18 +533,29 @@ pub fn storage_denial(
         }
     }
     for (insn, _) in &program.insns {
-        let (action, db, root_page) = match insn {
-            Insn::OpenRead { db, root_page, .. } => (Action::Read, *db, *root_page),
+        let (action, db, root_page, cursor_id) = match insn {
+            Insn::OpenRead {
+                cursor_id,
+                db,
+                root_page,
+                ..
+            } => (Action::Read, *db, *root_page, Some(*cursor_id)),
             Insn::OpenWrite {
+                cursor_id,
                 db,
                 root_page: RegisterOrLiteral::Literal(root_page),
                 ..
-            } => (Action::Write, *db, *root_page),
-            Insn::ClearBtree { db, root, .. } => (Action::Write, *db, *root),
+            } => (Action::Write, *db, *root_page, Some(*cursor_id)),
+            Insn::ClearBtree { db, root, .. } => (Action::Write, *db, *root, None),
             // A table being created or destroyed was checked with the
             // statement, and its root page is not in the schema yet.
             _ => continue,
         };
+        let table_reference = cursor_id
+            .and_then(|cursor_id| program.cursor_ref.get(cursor_id))
+            .and_then(|(key, _)| key.as_ref())
+            .map(|key| key.table_reference_id);
+        let role = role_for_table_reference(table_reference);
         let stored = resolver.with_schema(db, |schema| object_with_root_page(schema, root_page));
         let (key, object) = match stored {
             StoredObject::Object { key, object } => (key, object),
@@ -543,13 +579,14 @@ pub fn storage_denial(
             (_, Action::Read) => Privileges::of(Privilege::Select),
             (_, _) => Privileges::of(write),
         };
-        if !allows(db, &key, privileges) {
+        if !allows(role, db, &key, privileges) {
             return Some(PermissionDenied::privilege(action, object));
         }
     }
-    for virtual_table in &program.opened_virtual_tables {
+    for (table_reference, virtual_table) in &program.opened_virtual_tables {
+        let role = role_for_table_reference(*table_reference);
         let (key, privilege, denial) = virtual_table_requirement(resolver, virtual_table);
-        if !allows(MAIN_DB_ID, &key, Privileges::of(privilege)) {
+        if !allows(role, MAIN_DB_ID, &key, Privileges::of(privilege)) {
             return Some(denial);
         }
     }
@@ -812,6 +849,346 @@ fn emit_role_name_index_entry(
         unpacked_count: Some(2),
         flags: IdxInsertFlags::new(),
     });
+}
+
+/// Grants or revokes privileges on objects. The grantor is the current role,
+/// which must own the object or hold the grant option for every privilege.
+/// A superuser grants as the owner. The new list is written to the ACL
+/// table, replacing the object's row if it has one, and the in-memory
+/// catalog is updated when the statement runs.
+pub fn translate_grant(
+    grant: &ast::GrantStmt,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Connection,
+) -> Result<()> {
+    let verb = if grant.is_grant { "GRANT" } else { "REVOKE" };
+    if !resolver.catalog.dialect.supports_roles() {
+        bail_parse_error!("{verb} is not supported");
+    }
+    let roles = &resolver.schema().roles;
+    let grantor = connection.current_role();
+    let grantor_is_superuser = roles.is_superuser(grantor);
+    let grantees = grant
+        .grantees
+        .iter()
+        .map(|grantee| match grantee {
+            ast::Grantee::Public => Ok(RoleId::PUBLIC),
+            ast::Grantee::Role(name) => roles
+                .get_by_name(name)
+                .map(|role| role.id)
+                .ok_or_else(|| LimboError::ParseError(format!("role \"{name}\" does not exist"))),
+        })
+        .collect::<Result<Vec<RoleId>>>()?;
+
+    // Resolve and check every object before emitting anything, so that a
+    // statement that fails changes nothing.
+    let mut changes = Vec::with_capacity(grant.objects.len());
+    for object in &grant.objects {
+        let (database_id, key, display) = resolve_grant_object(resolver, object)?;
+        if database_id != MAIN_DB_ID {
+            bail_parse_error!("{verb} on an attached database is not supported");
+        }
+        let privileges = privileges_for(grant, key.kind)?;
+        let mut access = object_access(resolver, database_id, &key);
+        let may_grant = access.is_owner(grantor)
+            || access
+                .acl
+                .grant_options_of(grantor)
+                .contains_all(privileges);
+        let effective_grantor = if grantor_is_superuser {
+            access.owner
+        } else if may_grant {
+            grantor
+        } else {
+            return Err(permission_denied(PermissionDenied::privilege(
+                Action::Grant,
+                display,
+            )));
+        };
+        for grantee in &grantees {
+            if grant.is_grant {
+                let grant_option = if grant.grant_option {
+                    privileges
+                } else {
+                    Privileges::NONE
+                };
+                access
+                    .acl
+                    .grant(*grantee, privileges, grant_option, effective_grantor);
+            } else {
+                access
+                    .acl
+                    .revoke(*grantee, privileges, grant.grant_option, effective_grantor);
+            }
+        }
+        let rowid = resolver.schema().acls.stored_rowid(&key);
+        changes.push((key, access, rowid));
+    }
+
+    let (acl_table, acl_root_page) = emit_acl_table(resolver, program)?;
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(acl_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: acl_root_page,
+        db: MAIN_DB_ID,
+    });
+    for (key, access, rowid) in changes {
+        let id_reg = program.alloc_register();
+        match rowid {
+            // The object has a row: seek to it, so that the insert below
+            // replaces it.
+            Some(rowid) => {
+                program.emit_insn(Insn::Integer {
+                    value: rowid,
+                    dest: id_reg,
+                });
+                let missing = program.allocate_label();
+                let write = program.allocate_label();
+                program.emit_insn(Insn::NotExists {
+                    cursor: cursor_id,
+                    rowid_reg: id_reg,
+                    target_pc: missing,
+                });
+                program.emit_insn(Insn::Goto { target_pc: write });
+                program.preassign_label_to_next_insn(missing);
+                program.emit_insn(Insn::Halt {
+                    constraint_info: None,
+                    err_code: crate::error::SQLITE_ERROR,
+                    description: format!(
+                        "{ACL_TABLE_NAME} has no row {rowid} for {} {}",
+                        key.kind.stored_name(),
+                        key.name
+                    ),
+                    on_error: None,
+                    description_reg: None,
+                });
+                program.preassign_label_to_next_insn(write);
+            }
+            None => program.emit_insn(Insn::NewRowid {
+                cursor: cursor_id,
+                rowid_reg: id_reg,
+                prev_largest_reg: 0,
+            }),
+        }
+        let first_column_reg = program.alloc_registers(6);
+        program.emit_insn(Insn::Null {
+            dest: first_column_reg,
+            dest_end: None,
+        });
+        program.emit_insn(Insn::String8 {
+            value: key.kind.stored_name().to_string(),
+            dest: first_column_reg + 1,
+        });
+        program.emit_insn(Insn::Integer {
+            value: key.namespace.as_u32() as i64,
+            dest: first_column_reg + 2,
+        });
+        program.emit_insn(Insn::String8 {
+            value: key.name.clone(),
+            dest: first_column_reg + 3,
+        });
+        program.emit_insn(Insn::Integer {
+            value: access.owner.get(),
+            dest: first_column_reg + 4,
+        });
+        program.emit_insn(Insn::String8 {
+            value: access.acl.to_stored(),
+            dest: first_column_reg + 5,
+        });
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(first_column_reg),
+            count: to_u32(6),
+            dest_reg: to_u32(record_reg),
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::Insert {
+            cursor: cursor_id,
+            key_reg: id_reg,
+            record_reg,
+            flag: InsertFlags::new().skip_last_rowid(),
+            table_name: ACL_TABLE_NAME.to_string(),
+        });
+        program.emit_insn(Insn::SetAcl {
+            db: MAIN_DB_ID,
+            id_reg,
+            key,
+            access,
+        });
+    }
+    Ok(())
+}
+
+/// The privileges a GRANT or REVOKE names, checked against what the kind of
+/// object can have. An empty list means `ALL`.
+fn privileges_for(grant: &ast::GrantStmt, kind: ObjectKind) -> Result<Privileges> {
+    let all = kind.all_privileges();
+    if grant.privileges.is_empty() {
+        return Ok(all);
+    }
+    grant
+        .privileges
+        .iter()
+        .map(|name| {
+            Privilege::from_name(name)
+                .filter(|privilege| all.contains(*privilege))
+                .ok_or_else(|| {
+                    // PostgreSQL calls a table or view a relation here.
+                    let kind_name = match kind {
+                        ObjectKind::Table | ObjectKind::View => "relation",
+                        kind => kind.stored_name(),
+                    };
+                    LimboError::ParseError(format!(
+                        "invalid privilege type {} for {kind_name}",
+                        name.to_uppercase()
+                    ))
+                })
+        })
+        .collect()
+}
+
+/// Resolves an object of GRANT or REVOKE to the database it is in, its key
+/// in the ACL catalog, and how a denial names it.
+fn resolve_grant_object(
+    resolver: &Resolver,
+    object: &ast::GrantObject,
+) -> Result<(usize, ObjectKey, Object)> {
+    Ok(match object {
+        ast::GrantObject::Table(name) => {
+            let namespace = resolver.resolve_existing_table(name)?;
+            let table_name = name.name.as_str();
+            let (kind, canonical_name, display) = resolver
+                .with_schema(namespace.database_id, |schema| {
+                    if let Some(view) = schema.get_view(namespace.id, table_name) {
+                        return Some((
+                            ObjectKind::View,
+                            view.name.clone(),
+                            Object::View(view.name.clone()),
+                        ));
+                    }
+                    let table = schema.get_table(namespace.id, table_name)?;
+                    let canonical = table.get_name().to_string();
+                    let display = if schema.is_materialized_view(namespace.id, &canonical) {
+                        Object::MaterializedView(canonical.clone())
+                    } else {
+                        Object::Table(canonical.clone())
+                    };
+                    let kind = if schema.is_materialized_view(namespace.id, &canonical) {
+                        ObjectKind::View
+                    } else {
+                        ObjectKind::Table
+                    };
+                    Some((kind, canonical, display))
+                })
+                .ok_or_else(|| LimboError::ParseError(format!("no such table: {table_name}")))?;
+            (
+                namespace.database_id,
+                ObjectKey::new(kind, namespace.id, canonical_name),
+                display,
+            )
+        }
+        ast::GrantObject::Sequence(name) => {
+            let sequence_name = name.name.as_str();
+            let namespace = resolver.resolve_existing_sequence(sequence_name)?;
+            let canonical = resolver
+                .with_schema(namespace.database_id, |schema| {
+                    schema
+                        .get_sequence(namespace.id, sequence_name)
+                        .map(|sequence| sequence.name.clone())
+                })
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!("sequence \"{sequence_name}\" does not exist"))
+                })?;
+            (
+                namespace.database_id,
+                ObjectKey::new(ObjectKind::Sequence, namespace.id, canonical.as_str()),
+                Object::Sequence(canonical),
+            )
+        }
+        ast::GrantObject::Function(name) => {
+            let function_name = name.as_str().to_lowercase();
+            let is_table_valued = resolver
+                .schema()
+                .get_table(NamespaceId::ROOT, &function_name)
+                .is_some();
+            let is_scalar = (0..=3).any(|arg_count| {
+                matches!(
+                    resolver.resolve_function(&function_name, arg_count),
+                    Ok(Some(_))
+                )
+            });
+            if !is_table_valued && !is_scalar {
+                bail_parse_error!("function {function_name} does not exist");
+            }
+            (
+                MAIN_DB_ID,
+                ObjectKey::root(ObjectKind::Function, function_name.as_str()),
+                Object::Function(function_name),
+            )
+        }
+        ast::GrantObject::Schema(name) => {
+            let schema_name = crate::util::normalize_ident(name.as_str());
+            let Some(namespace) = resolver.namespace_named(&schema_name) else {
+                bail_parse_error!("schema \"{schema_name}\" does not exist");
+            };
+            let canonical = schema_name_of(resolver, namespace);
+            (
+                namespace.database_id,
+                ObjectKey::root(ObjectKind::Schema, canonical.as_str()),
+                Object::Schema(canonical),
+            )
+        }
+        ast::GrantObject::Database => (
+            MAIN_DB_ID,
+            ObjectKey::root(ObjectKind::Database, MAIN_SCHEMA_NAME),
+            Object::Database(MAIN_SCHEMA_NAME.to_string()),
+        ),
+        ast::GrantObject::Type(name) => {
+            let type_name = name.as_str().to_string();
+            if resolver
+                .schema()
+                .get_type_def_unchecked(&type_name)
+                .is_none()
+            {
+                bail_parse_error!("type \"{type_name}\" does not exist");
+            }
+            (
+                MAIN_DB_ID,
+                ObjectKey::root(ObjectKind::Type, type_name.as_str()),
+                Object::Type(type_name),
+            )
+        }
+        ast::GrantObject::Setting(name) => {
+            let setting = name.as_str().to_lowercase();
+            (
+                MAIN_DB_ID,
+                ObjectKey::root(ObjectKind::Setting, setting.as_str()),
+                Object::Setting(setting),
+            )
+        }
+    })
+}
+
+/// Returns the ACL table and its root page, and bumps the schema cookie. If
+/// the table does not exist yet, emits bytecode that creates it, which bumps
+/// the cookie too, and returns the register that will hold its root page.
+fn emit_acl_table(
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<(Arc<BTreeTable>, RegisterOrLiteral<i64>)> {
+    if let Some(table) = resolver
+        .schema()
+        .get_btree_table(NamespaceId::ROOT, ACL_TABLE_NAME)
+    {
+        emit_schema_cookie(resolver, program);
+        let root_page = RegisterOrLiteral::Literal(table.root_page);
+        return Ok((table, root_page));
+    }
+    let created =
+        emit_create_internal_table(program, resolver, ACL_TABLE_NAME, CREATE_ACL_TABLE_SQL, &[])?;
+    Ok((created.table, created.root_page))
 }
 
 #[cfg(test)]
@@ -1097,6 +1474,319 @@ mod tests {
             denial(error),
             PermissionDenied::privilege(Action::Use, Object::Sequence("s".to_string()))
         );
+    }
+
+    #[test]
+    fn grant_select_lets_a_role_read_a_table_and_revoke_takes_it_back() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        grant(&conn, true, &["SELECT"], table("t"), &["alice"], false).unwrap();
+
+        set_role(&conn, "alice").unwrap();
+        assert_eq!(
+            query_rows(&conn, "SELECT x FROM t"),
+            vec![vec![Value::from_i64(1)]]
+        );
+        let insert = conn.execute("INSERT INTO t VALUES (2)").unwrap_err();
+        assert_eq!(
+            denial(insert),
+            PermissionDenied::privilege(Action::Write, Object::Table("t".to_string()))
+        );
+
+        reset_role(&conn).unwrap();
+        grant(&conn, false, &["SELECT"], table("t"), &["alice"], false).unwrap();
+        set_role(&conn, "alice").unwrap();
+        let select = conn.execute("SELECT x FROM t").unwrap_err();
+        assert_eq!(
+            denial(select),
+            PermissionDenied::privilege(Action::Read, Object::Table("t".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_view_is_read_with_the_privileges_of_its_owner() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT x FROM t").unwrap();
+        conn.execute("CREATE VIEW vv AS SELECT x FROM v").unwrap();
+        create_role(&conn, "alice").unwrap();
+        grant(&conn, true, &["SELECT"], table("v"), &["alice"], false).unwrap();
+        grant(&conn, true, &["SELECT"], table("vv"), &["alice"], false).unwrap();
+
+        set_role(&conn, "alice").unwrap();
+
+        assert_eq!(
+            query_rows(&conn, "SELECT x FROM v"),
+            vec![vec![Value::from_i64(1)]]
+        );
+        assert_eq!(
+            query_rows(&conn, "SELECT x FROM vv"),
+            vec![vec![Value::from_i64(1)]]
+        );
+        let direct = conn.execute("SELECT x FROM t").unwrap_err();
+        assert_eq!(
+            denial(direct),
+            PermissionDenied::privilege(Action::Read, Object::Table("t".to_string()))
+        );
+        let joined = conn
+            .execute("SELECT v.x FROM v JOIN t ON t.x = v.x")
+            .unwrap_err();
+        assert_eq!(
+            denial(joined),
+            PermissionDenied::privilege(Action::Read, Object::Table("t".to_string()))
+        );
+    }
+
+    #[test]
+    fn granted_privileges_survive_a_schema_reload() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        grant(
+            &conn,
+            true,
+            &["SELECT", "INSERT"],
+            table("t"),
+            &["alice"],
+            false,
+        )
+        .unwrap();
+
+        conn.reparse_schema().unwrap();
+
+        set_role(&conn, "alice").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        assert_eq!(
+            query_rows(&conn, "SELECT x FROM t"),
+            vec![vec![Value::from_i64(1)]]
+        );
+        let delete = conn.execute("DELETE FROM t").unwrap_err();
+        assert_eq!(
+            denial(delete),
+            PermissionDenied::privilege(Action::Write, Object::Table("t".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_grant_to_public_applies_to_every_role() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        grant(&conn, true, &["SELECT"], table("t"), &["public"], false).unwrap();
+
+        set_role(&conn, "alice").unwrap();
+
+        conn.execute("SELECT x FROM t").unwrap();
+    }
+
+    #[test]
+    fn revoking_a_registered_privilege_hides_a_catalog_table() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        grant(
+            &conn,
+            false,
+            &["SELECT"],
+            table("sqlite_schema"),
+            &["public"],
+            false,
+        )
+        .unwrap();
+
+        set_role(&conn, "alice").unwrap();
+
+        let error = conn.execute("SELECT name FROM sqlite_schema").unwrap_err();
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Read, Object::Table("sqlite_schema".to_string()))
+        );
+    }
+
+    #[test]
+    fn grant_usage_on_a_sequence_lets_a_role_advance_it() {
+        let conn = open_connection();
+        conn.execute("CREATE SEQUENCE s").unwrap();
+        create_role(&conn, "alice").unwrap();
+        grant(
+            &conn,
+            true,
+            &["USAGE"],
+            ast::GrantObject::Sequence(ast::QualifiedName::single(ast::Name::exact("s".into()))),
+            &["alice"],
+            false,
+        )
+        .unwrap();
+
+        set_role(&conn, "alice").unwrap();
+
+        assert_eq!(
+            query_rows(&conn, "SELECT nextval('s')"),
+            vec![vec![Value::from_i64(1)]]
+        );
+        assert_eq!(
+            query_rows(&conn, "SELECT currval('s')"),
+            vec![vec![Value::from_i64(1)]]
+        );
+    }
+
+    #[test]
+    fn grant_execute_on_a_restricted_function_lets_a_role_call_it() {
+        let conn = open_connection();
+        conn.set_load_extension_enabled(true);
+        create_role(&conn, "alice").unwrap();
+        grant(
+            &conn,
+            true,
+            &["EXECUTE"],
+            ast::GrantObject::Function(ast::Name::exact("load_extension".into())),
+            &["alice"],
+            false,
+        )
+        .unwrap();
+
+        set_role(&conn, "alice").unwrap();
+
+        // The call fails because there is no such extension, not because of
+        // the role.
+        let error = conn
+            .execute("SELECT load_extension('/nonexistent')")
+            .unwrap_err();
+        assert!(!matches!(error, LimboError::PermissionDenied(_)), "{error}");
+    }
+
+    #[test]
+    fn grant_create_on_a_schema_lets_a_role_create_a_table() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        grant(
+            &conn,
+            true,
+            &["CREATE"],
+            ast::GrantObject::Schema(ast::Name::exact("main".into())),
+            &["alice"],
+            false,
+        )
+        .unwrap();
+
+        set_role(&conn, "alice").unwrap();
+
+        conn.execute("CREATE TABLE made_by_alice (x)").unwrap();
+        conn.execute("CREATE SEQUENCE s").unwrap();
+    }
+
+    #[test]
+    fn only_the_owner_or_a_role_with_the_grant_option_may_grant() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        create_role(&conn, "bob").unwrap();
+        grant(&conn, true, &["SELECT"], table("t"), &["alice"], false).unwrap();
+
+        set_role(&conn, "alice").unwrap();
+        let error = grant(&conn, true, &["SELECT"], table("t"), &["bob"], false).unwrap_err();
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Grant, Object::Table("t".to_string()))
+        );
+
+        reset_role(&conn).unwrap();
+        grant(&conn, true, &["SELECT"], table("t"), &["alice"], true).unwrap();
+        set_role(&conn, "alice").unwrap();
+        grant(&conn, true, &["SELECT"], table("t"), &["bob"], false).unwrap();
+        set_role(&conn, "bob").unwrap();
+        conn.execute("SELECT x FROM t").unwrap();
+    }
+
+    #[test]
+    fn grant_rejects_a_privilege_the_object_cannot_have_and_unknown_names() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+
+        let execute = grant(&conn, true, &["EXECUTE"], table("t"), &["alice"], false).unwrap_err();
+        assert!(
+            execute
+                .to_string()
+                .contains("invalid privilege type EXECUTE for relation"),
+            "{execute}"
+        );
+        let nobody = grant(&conn, true, &["SELECT"], table("t"), &["nobody"], false).unwrap_err();
+        assert!(
+            nobody
+                .to_string()
+                .contains("role \"nobody\" does not exist"),
+            "{nobody}"
+        );
+        let missing = grant(
+            &conn,
+            true,
+            &["SELECT"],
+            table("missing"),
+            &["alice"],
+            false,
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("no such table"), "{missing}");
+    }
+
+    fn table(name: &str) -> ast::GrantObject {
+        ast::GrantObject::Table(ast::QualifiedName::single(ast::Name::exact(name.into())))
+    }
+
+    fn grant(
+        conn: &Arc<Connection>,
+        is_grant: bool,
+        privileges: &[&str],
+        object: ast::GrantObject,
+        grantees: &[&str],
+        grant_option: bool,
+    ) -> crate::Result<()> {
+        let stmt = ast::Stmt::Grant(ast::GrantStmt {
+            is_grant,
+            privileges: privileges.iter().map(|p| p.to_string()).collect(),
+            objects: vec![object],
+            grantees: grantees
+                .iter()
+                .map(|name| match *name {
+                    "public" => ast::Grantee::Public,
+                    name => ast::Grantee::Role(name.to_string()),
+                })
+                .collect(),
+            grant_option,
+        });
+        let sql = stmt.to_string();
+        let mut statement = conn.prepare_translated_cmd(ast::Cmd::Stmt(stmt), &sql)?;
+        statement.run_ignore_rows()
+    }
+
+    fn query_rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
+        conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+    }
+
+    fn open_connection() -> Arc<Connection> {
+        connect_with_roles()
+    }
+
+    /// Makes `name` the current role, as SET ROLE does.
+    fn set_role(conn: &Arc<Connection>, name: &str) -> crate::Result<()> {
+        let role = conn
+            .role_catalog()
+            .get_by_name(name)
+            .map(|role| role.id)
+            .ok_or_else(|| {
+                LimboError::InvalidArgument(format!("role \"{name}\" does not exist"))
+            })?;
+        conn.set_current_role(role);
+        Ok(())
+    }
+
+    /// Makes the superuser the current role again, as RESET ROLE does.
+    fn reset_role(conn: &Arc<Connection>) -> crate::Result<()> {
+        conn.set_current_role(crate::security::roles::RoleId::SUPERUSER);
+        Ok(())
     }
 
     fn denial(error: LimboError) -> PermissionDenied {
