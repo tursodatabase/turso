@@ -97,11 +97,11 @@ pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_type_operators::{custom_operator_call, emit_operator_call_on_registers};
-pub(crate) use custom_types::runs_custom_type_function;
 pub(crate) use custom_types::{
     emit_constraint_values_decode, emit_dml_expr_index_value, emit_store_value,
     emit_trigger_decode_registers, emit_type_expr, emit_user_facing_column_value,
 };
+pub(crate) use custom_types::{is_literal_of_input_type, runs_custom_type_function};
 pub use emission::{
     emit_function_call, emit_literal, process_returning_clause, ReturningBufferCtx,
 };

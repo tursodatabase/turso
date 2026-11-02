@@ -30,6 +30,15 @@ pub(super) fn literal_compatible_with_value_type(
         || literal_type.eq_ignore_ascii_case(value_input_type)
 }
 
+/// Whether `expr` is a literal of the type a custom type takes as input, such
+/// as `50` for a type based on integer. A comparison of the type's values
+/// with it is well typed, as it is for an operator of the type.
+pub(crate) fn is_literal_of_input_type(expr: &ast::Expr, type_def: &TypeDef) -> bool {
+    literal_type_name(expr_type::without_wrappers(expr)).is_some_and(|literal_type| {
+        literal_compatible_with_value_type(literal_type, type_def.value_input_type())
+    })
+}
+
 /// Whether a custom type's function runs the operator expression `expr`, such
 /// as `a < b` or `-a`. An operator that does not exist, such as `date * 2`,
 /// counts too: emitting it fails.

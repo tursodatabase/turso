@@ -221,13 +221,13 @@ SELECT CAST(42.5 AS cents);
 -- 4250
 ```
 
-This is useful for converting values to the encoded form outside of INSERT/UPDATE, such as in WHERE clauses and CHECK constraints.
+This is useful for converting values to the encoded form outside of INSERT/UPDATE, such as in WHERE clauses.
 
 A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the encoded value.
 
 ## CHECK Constraints with Custom Types
 
-In STRICT tables with custom types, CHECK constraints operate on the **stored** (encoded) values. When comparing a column of a custom type against a literal, use CAST to encode the literal:
+A CHECK constraint sees a custom-type column as a SELECT reads it, after DECODE. `CHECK (ceil(n) > 4)` on a `numeric` column computes from the number, and `CHECK (length(id) = 36)` on a `uuid` column measures the text form. In a STRICT table, a column of a custom type can be compared with a literal of the type it takes as input:
 
 ```sql
 CREATE TYPE cents BASE integer
@@ -236,11 +236,11 @@ CREATE TYPE cents BASE integer
 
 CREATE TABLE products (
     id INTEGER PRIMARY KEY,
-    price cents CHECK(price >= CAST(0 AS cents))
+    price cents CHECK(price >= 0)
 ) STRICT;
 ```
 
-A function can return a value of a custom type. It returns the value as a column read gives it, after DECODE. A CHECK constraint sees the stored values instead, so when the type's DECODE changes the value, a comparison of such a call with a column would be wrong. In a STRICT table, CREATE TABLE refuses `CHECK (owner = f())` on such a column, also through `coalesce()` or `nullif()`, with `cannot compare f() in a CHECK constraint: it returns <type> values in a different form than they are stored`. A CAST of the call compared with a column of the CAST's type, as in `owner text CHECK (owner = CAST(f() AS text))`, is accepted.
+Don't CAST the literal to the column's type: `CAST(0 AS cents)` gives the encoded value, which a CHECK compares with the decoded column, as a SELECT would.
 
 ## Inspecting Types
 

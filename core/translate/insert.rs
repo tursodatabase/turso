@@ -841,19 +841,17 @@ pub fn translate_insert(
         program,
         &ctx.table.check_constraints,
         resolver,
-        &ctx.table.name,
+        ctx.table,
         insertion.key_register(),
-        insertion.col_mappings.iter().filter_map(|m| {
-            m.column.name.as_deref().map(|n| {
-                // Rowid alias columns have NULL in their register (the real value
-                // lives in the key register), so point CHECK to the key register.
-                let reg = if m.column.is_rowid_alias() {
-                    insertion.key_register()
-                } else {
-                    m.register
-                };
-                (n, reg)
-            })
+        insertion.col_mappings.iter().map(|m| {
+            // Rowid alias columns have NULL in their register (the real value
+            // lives in the key register), so point CHECK to the key register.
+            let reg = if m.column.is_rowid_alias() {
+                insertion.key_register()
+            } else {
+                m.register
+            };
+            (m.column, reg)
         }),
         connection,
         ctx.on_conflict,
@@ -1962,10 +1960,7 @@ fn emit_notnulls(
         // ENCODE produces a non-NULL value but DECODE returns NULL.
         let has_decode = resolver
             .schema()
-            .resolve_type(&column_mapping.column.ty_str, ctx.table.is_strict)
-            .ok()
-            .flatten()
-            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()));
+            .column_has_decode(column_mapping.column, ctx.table.is_strict);
         let check_reg = if has_decode {
             let decoded_reg = program.alloc_register();
             crate::translate::expr::emit_user_facing_column_value(

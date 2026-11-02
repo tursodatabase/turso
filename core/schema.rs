@@ -1852,6 +1852,15 @@ impl Schema {
         column.is_array() || self.get_type_def(&column.ty_str, is_strict).is_some()
     }
 
+    /// Whether reading the column runs a DECODE, so a read gives a value other
+    /// than the stored one.
+    pub fn column_has_decode(&self, column: &Column, is_strict: bool) -> bool {
+        self.resolve_type(&column.ty_str, is_strict)
+            .ok()
+            .flatten()
+            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()))
+    }
+
     /// Look up a custom type definition by name without a strictness check.
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).

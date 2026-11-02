@@ -10,8 +10,8 @@ use super::{
     },
     expr::{
         bind_and_rewrite_expr, emit_constraint_values_decode, emit_stored_column,
-        emit_table_column, translate_expr_no_constant_opt, walk_expr, BindingBehavior,
-        NoConstantOptReason, WalkControl,
+        emit_table_column, emit_user_facing_column_value, translate_expr_no_constant_opt,
+        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -46,7 +46,9 @@ use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::Func,
     sync::Arc,
-    util::{check_expr_references_column, exprs_are_equivalent, parse_numeric_literal},
+    util::{
+        check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
+    },
     CaptureDataChangesExt, Connection, DatabaseCatalog, LimboError, Result, RwLock, SymbolTable,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -2367,16 +2369,17 @@ fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String
 }
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
-/// Takes column-to-register mappings as an iterator to avoid heap allocation.
+/// `stored_columns` gives each column's register, holding the row's stored
+/// value, after ENCODE.
 /// `halt_on_error` is the resolve type carried by the Halt of a failed CHECK.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
-    table_name: &str,
+    table: &BTreeTable,
     rowid_reg: usize,
-    column_mappings: impl Iterator<Item = (&'a str, usize)>,
+    stored_columns: impl Iterator<Item = (&'a Column, usize)>,
     connection: &Arc<Connection>,
     or_conflict: ResolveType,
     halt_on_error: Option<ResolveType>,
@@ -2387,7 +2390,41 @@ pub(crate) fn emit_check_constraints<'a>(
         return Ok(());
     }
 
-    let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
+    let table_name = table.name.as_str();
+    let mut stored_column_mappings = Vec::new();
+    // A CHECK sees the values a SELECT reads, so it reads a custom-type column
+    // after DECODE, as `ceil(n)` on a numeric must compute from 4.50, not
+    // from the stored blob. Only the columns the CHECKs name are decoded.
+    let mut column_mappings = Vec::new();
+    for (column, stored_reg) in stored_columns {
+        let Some(col_name) = column.name.as_deref() else {
+            continue;
+        };
+        stored_column_mappings.push((col_name, stored_reg));
+        let is_named_by_a_check = || {
+            let normalized_name = normalize_ident(col_name);
+            check_constraints
+                .iter()
+                .any(|check| check_expr_references_column(&check.expr, &normalized_name))
+        };
+        let register = if resolver.schema().column_has_decode(column, table.is_strict)
+            && is_named_by_a_check()
+        {
+            let decoded_reg = program.alloc_register();
+            emit_user_facing_column_value(
+                program,
+                stored_reg,
+                decoded_reg,
+                column,
+                table.is_strict,
+                resolver,
+            )?;
+            decoded_reg
+        } else {
+            stored_reg
+        };
+        column_mappings.push((col_name, register));
+    }
     let initial_cache_size = resolver.expr_to_reg_cache.len();
     let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
 
@@ -2456,7 +2493,7 @@ pub(crate) fn emit_check_constraints<'a>(
         skip_row_label,
         referenced_tables,
         table_name,
-        &column_mappings,
+        &stored_column_mappings,
     );
 
     // Always restore resolver state, even on error.

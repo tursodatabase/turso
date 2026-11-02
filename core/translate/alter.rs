@@ -722,17 +722,13 @@ fn emit_column_constraints_validation(
             program,
             &check_constraints,
             &mut check_resolver,
-            resolved_table.name.as_str(),
+            &resolved_table,
             rowid_reg,
             resolved_table
                 .columns()
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, col)| {
-                    col.name
-                        .as_deref()
-                        .map(|name| (name, dml_ctx.to_column_reg(idx)))
-                }),
+                .map(|(idx, col)| (col, dml_ctx.to_column_reg(idx))),
             connection,
             ast::ResolveType::Abort,
             check_halt_on_error,

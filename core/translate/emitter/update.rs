@@ -1910,21 +1910,15 @@ fn emit_update_insns<'a>(
                 program,
                 &relevant_checks,
                 &mut t_ctx.resolver,
-                &btree_table.name,
+                &btree_table,
                 effective_rowid_reg,
-                btree_table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, col)| {
-                        col.name.as_deref().map(|n| {
-                            if col.is_rowid_alias() {
-                                (n, effective_rowid_reg)
-                            } else {
-                                (n, layout.to_register(start, idx))
-                            }
-                        })
-                    }),
+                btree_table.columns().iter().enumerate().map(|(idx, col)| {
+                    if col.is_rowid_alias() {
+                        (col, effective_rowid_reg)
+                    } else {
+                        (col, layout.to_register(start, idx))
+                    }
+                }),
                 connection,
                 or_conflict,
                 check_halt_on_error,
