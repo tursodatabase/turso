@@ -1,8 +1,13 @@
+use crate::queued_io::QueuedIo;
 use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
+use turso_core::storage::database::DatabaseFile;
 use turso_core::SqliteDialect;
-use turso_core::{ConnectOpts, Database, OpenFlags};
+use turso_core::{
+    ConnectAsyncState, ConnectOpts, Database, IOResult, OpenDbAsyncState, OpenFlags, OpenOptions,
+    StepResult, Value, IO,
+};
 use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
 
 /// Regression test: DATABASE_MANAGER registry returns stale Database after
@@ -353,6 +358,86 @@ fn test_open_async_requires_storage() {
         matches!(*err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("storage")),
         "expected InvalidArgument about missing storage, got {err:?}"
     );
+}
+
+/// A host whose I/O completes only between calls cannot pump `io.step()`, so
+/// reopening a database with `open_async` and `connect_async` must hand every
+/// page read back to the caller.
+#[test]
+fn test_reopen_with_open_async_and_connect_async_without_blocking_io() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let path = "reopen-without-blocking-io.db";
+    {
+        let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect))?;
+        let conn = db.connect(ConnectOpts::new())?;
+        conn.execute("CREATE TABLE t1(a)")?;
+        conn.execute("INSERT INTO t1 VALUES (1)")?;
+        conn.close()?;
+    }
+
+    io.disable_step();
+    let file = io.open_file(path, OpenFlags::None, false)?;
+    let opts = OpenOptions::new(Arc::new(SqliteDialect)).storage(Arc::new(DatabaseFile::new(file)));
+    let mut open_state = OpenDbAsyncState::new();
+    let db = loop {
+        match Database::open_async(&mut open_state, io.clone(), path, &opts)? {
+            IOResult::Done(db) => break db,
+            IOResult::IO(_) => {
+                io.step_one()?;
+            }
+        }
+    };
+    let mut connect_state = ConnectAsyncState::new();
+    let conn = loop {
+        match db.connect_async(ConnectOpts::new(), &mut connect_state)? {
+            IOResult::Done(conn) => break conn,
+            IOResult::IO(_) => {
+                io.step_one()?;
+            }
+        }
+    };
+    let mut stmt = conn.prepare("SELECT a FROM t1")?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => rows.push(stmt.row().unwrap().get::<i64>(0)?),
+            StepResult::IO => {
+                io.step_one()?;
+            }
+            StepResult::Done => break,
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    assert_that!(rows).is_equal_to(vec![1]);
+    Ok(())
+}
+
+/// Dropping a `ConnectAsyncState` while it waits for page 1 must release the
+/// WAL read lock it holds, or every TRUNCATE checkpoint after it is busy.
+#[test]
+fn test_dropping_connect_async_state_mid_init_releases_read_lock() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file(io.clone(), "connect-async-drop.db", Arc::new(SqliteDialect))?;
+    let conn = db.connect(ConnectOpts::new())?;
+    conn.execute("CREATE TABLE t1(a)")?;
+    conn.execute("INSERT INTO t1 VALUES (1)")?;
+
+    let mut state = ConnectAsyncState::new();
+    for _ in 0..2 {
+        match db.connect_async(ConnectOpts::new(), &mut state)? {
+            IOResult::Done(_) => panic!("connect_async must wait for the header and page 1"),
+            IOResult::IO(_) => {
+                io.step_one()?;
+            }
+        }
+    }
+    drop(state);
+
+    let rows = conn
+        .prepare("PRAGMA wal_checkpoint(TRUNCATE)")?
+        .run_collect_rows()?;
+    assert_that!(rows[0][0].clone()).is_equal_to(Value::from_i64(0));
+    Ok(())
 }
 
 /// The registry-aware Database::open rejects a custom WAL path: the process

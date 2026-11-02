@@ -1,12 +1,15 @@
 use std::{
     collections::VecDeque,
     io::ErrorKind,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use turso_core::{
     io::{FileId, FileSyncType},
-    Buffer, Clock, Completion, CompletionError, File, MonotonicInstant, OpenFlags,
+    Buffer, Clock, Completion, CompletionError, File, LimboError, MonotonicInstant, OpenFlags,
     WallClockInstant, IO,
 };
 
@@ -42,6 +45,7 @@ struct QueuedIoState {
     pending: Mutex<VecDeque<QueuedIoOp>>,
     history: Mutex<Vec<QueuedIoEvent>>,
     fault: Mutex<Option<QueuedIoFault>>,
+    step_disabled: AtomicBool,
 }
 
 impl QueuedIoState {
@@ -50,6 +54,7 @@ impl QueuedIoState {
             pending: Mutex::new(VecDeque::new()),
             history: Mutex::new(Vec::new()),
             fault: Mutex::new(None),
+            step_disabled: AtomicBool::new(false),
         }
     }
 }
@@ -100,6 +105,21 @@ impl QueuedIo {
     pub(crate) fn clear_fault(&self) {
         *self.state.fault.lock().unwrap() = None;
     }
+
+    /// Makes `IO::step` fail, like a host whose I/O completes only between
+    /// calls into the database. Complete queued operations with `step_one`.
+    pub(crate) fn disable_step(&self) {
+        self.state.step_disabled.store(true, Ordering::Relaxed);
+    }
+
+    fn check_step_enabled(&self) -> turso_core::Result<()> {
+        if self.state.step_disabled.load(Ordering::Relaxed) {
+            return Err(LimboError::InternalError(
+                "queued_io: step is disabled".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Clock for QueuedIo {
@@ -132,10 +152,12 @@ impl IO for QueuedIo {
     }
 
     fn step(&self) -> turso_core::Result<()> {
+        self.check_step_enabled()?;
         self.step_one().map(|_| ())
     }
 
     fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.check_step_enabled()?;
         while completions.iter().any(|c| !c.finished()) {
             if self.step_one()?.is_none() {
                 break;
