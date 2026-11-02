@@ -3,7 +3,7 @@ use crate::HashMap;
 use crate::LimboError;
 
 use crate::ext::VTabImpl;
-use crate::function::{Deterministic, Func, MathFunc, ReturnType, ScalarFunc};
+use crate::function::{Deterministic, Func, ResultType, ReturnType};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
@@ -19,6 +19,7 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
+use crate::translate::expr::expr_type::iif_values;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
@@ -193,6 +194,12 @@ impl CheckExprType {
         matches!(self, Self::Integer | Self::Real)
     }
 
+    /// A value of unknown type, such as `coalesce(int_col, text_col)`, may be
+    /// a number, so arithmetic on it is allowed, as comparing it is.
+    fn may_be_numeric(&self) -> bool {
+        self.is_numeric() || *self == Self::Any
+    }
+
     fn is_compatible_with(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Null, _) | (_, Self::Null) => true,
@@ -293,7 +300,7 @@ fn resolve_check_expr_type(
         ast::Expr::Unary(op, inner) => match op {
             UnaryOperator::Negative | UnaryOperator::Positive => {
                 let inner_ty = resolve_check_expr_type(inner, columns, resolver)?;
-                if !inner_ty.is_numeric() && inner_ty != CheckExprType::Null {
+                if !inner_ty.may_be_numeric() && inner_ty != CheckExprType::Null {
                     bail_parse_error!(
                         "unary minus/plus requires a numeric type, got {}",
                         inner_ty.display_name()
@@ -313,14 +320,16 @@ fn resolve_check_expr_type(
                     if lty == CheckExprType::Null || rty == CheckExprType::Null {
                         return Ok(CheckExprType::Null);
                     }
-                    if !lty.is_numeric() || !rty.is_numeric() {
+                    if !lty.may_be_numeric() || !rty.may_be_numeric() {
                         bail_parse_error!(
                             "arithmetic requires numeric types, got {} and {}",
                             lty.display_name(),
                             rty.display_name()
                         );
                     }
-                    if lty == CheckExprType::Real || rty == CheckExprType::Real {
+                    if lty == CheckExprType::Any || rty == CheckExprType::Any {
+                        Ok(CheckExprType::Any)
+                    } else if lty == CheckExprType::Real || rty == CheckExprType::Real {
                         Ok(CheckExprType::Real)
                     } else {
                         Ok(CheckExprType::Integer)
@@ -409,34 +418,59 @@ fn resolve_func_return_type(
     if let Func::Agg(_) = func {
         bail_parse_error!("misuse of aggregate function {}()", name);
     }
-    match func.return_type() {
-        Some(ReturnType::Integer) => return Ok(CheckExprType::Integer),
-        Some(ReturnType::Real) => return Ok(CheckExprType::Real),
-        Some(ReturnType::Text) => return Ok(CheckExprType::Text),
-        Some(ReturnType::Blob) => return Ok(CheckExprType::Blob),
-        Some(ReturnType::Custom(type_name)) => {
+    let type_of = |arg: &ast::Expr| resolve_check_expr_type(arg, columns, resolver);
+    // A call with the wrong number of arguments is reported when it is translated.
+    let first_argument = || args.first().map(|arg| type_of(arg)).transpose();
+    match func.result_type() {
+        ResultType::Declared(ReturnType::Integer) => Ok(CheckExprType::Integer),
+        ResultType::Declared(ReturnType::Real) => Ok(CheckExprType::Real),
+        ResultType::Declared(ReturnType::Text) => Ok(CheckExprType::Text),
+        ResultType::Declared(ReturnType::Blob) => Ok(CheckExprType::Blob),
+        ResultType::Declared(ReturnType::Custom(type_name)) => {
             reject_value_unlike_stored_columns(name, type_name, resolver)?;
-            return resolve_type_name(type_name, resolver);
+            resolve_type_name(type_name, resolver)
         }
-        Some(ReturnType::Array) => return Ok(CheckExprType::Any),
-        None => {}
-    }
-    match func {
-        Func::Scalar(sf) => resolve_scalar_func_return_type(sf, args, columns, resolver),
+        ResultType::Declared(ReturnType::Array) => Ok(CheckExprType::Any),
+        ResultType::FirstArgument => Ok(first_argument()?.unwrap_or(CheckExprType::Any)),
+        ResultType::OneOfTheArguments => common_check_type(args.iter().map(|arg| type_of(arg))),
+        ResultType::OneOfTheIifValues => {
+            common_check_type(iif_values(args).map(|arg| type_of(arg)))
+        }
         // ceil, floor and trunc give an integer for an integer and a real for
-        // a real. A text argument is first converted to a number, which may
-        // be either. SQLite's other math functions return a real.
-        Func::Math(MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc) => {
-            match args.first() {
-                Some(arg) => Ok(match resolve_check_expr_type(arg, columns, resolver)? {
-                    ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null) => ty,
-                    _ => CheckExprType::Any,
-                }),
-                None => Ok(CheckExprType::Any),
+        // a real. A text or blob argument is first converted to a number,
+        // which may be either.
+        ResultType::NumberOfTheFirstArgumentsType => Ok(match first_argument()? {
+            Some(ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null)) => ty,
+            _ => CheckExprType::Any,
+        }),
+        // abs gives a real for text or a blob, without converting it first.
+        ResultType::RealForTextOtherwiseTheFirstArgumentsType => Ok(match first_argument()? {
+            Some(ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null)) => ty,
+            Some(CheckExprType::Text | CheckExprType::Blob) => CheckExprType::Real,
+            // A CHECK constraint sees a custom type's stored value, such as
+            // numeric's blob, so abs of it would not be the value's abs.
+            // Unary minus is refused for the same reason.
+            Some(CheckExprType::CustomType(type_name)) => {
+                bail_parse_error!(
+                    "cannot use {}() on a {} value in a CHECK constraint",
+                    name,
+                    type_name
+                )
             }
-        }
-        Func::Math(_) => Ok(CheckExprType::Real),
-        Func::External(_) => {
+            _ => CheckExprType::Any,
+        }),
+        ResultType::RealForARealArgument => Ok(CheckExprType::Real),
+        // substr returns a blob for a blob and text for a number or text.
+        ResultType::TextOrBlobLikeTheFirstArgument => Ok(match first_argument()? {
+            Some(ty @ (CheckExprType::Blob | CheckExprType::Any | CheckExprType::Null)) => ty,
+            // The stored value of a custom type may be a blob.
+            Some(CheckExprType::CustomType(_)) | None => CheckExprType::Any,
+            Some(CheckExprType::Integer | CheckExprType::Real | CheckExprType::Text) => {
+                CheckExprType::Text
+            }
+        }),
+        ResultType::ElementOfTheFirstArgument => Ok(CheckExprType::Any),
+        ResultType::Unknown if matches!(func, Func::External(_)) => {
             bail_parse_error!(
                 "cannot determine return type of function {}() in CHECK constraint; \
                  wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
@@ -444,7 +478,7 @@ fn resolve_func_return_type(
                 name
             );
         }
-        _ => Ok(CheckExprType::Any),
+        ResultType::Unknown => Ok(CheckExprType::Any),
     }
 }
 
@@ -471,75 +505,31 @@ fn reject_value_unlike_stored_columns(
     Ok(())
 }
 
-/// Resolve the return type of a scalar function that declares none, because
-/// its type depends on its arguments.
-fn resolve_scalar_func_return_type(
-    func: &ScalarFunc,
-    args: &[Box<ast::Expr>],
-    columns: &[&ast::ColumnDefinition],
-    resolver: &CatalogContext,
-) -> Result<CheckExprType> {
-    match func {
-        // substr returns a blob for a blob and text for a number or text.
-        ScalarFunc::Substr | ScalarFunc::Substring => {
-            let Some(arg) = args.first() else {
-                return Ok(CheckExprType::Any);
-            };
-            Ok(match resolve_check_expr_type(arg, columns, resolver)? {
-                ty @ (CheckExprType::Blob | CheckExprType::Any | CheckExprType::Null) => ty,
-                // The stored value of a custom type may be a blob.
-                CheckExprType::CustomType(_) => CheckExprType::Any,
-                CheckExprType::Integer | CheckExprType::Real | CheckExprType::Text => {
-                    CheckExprType::Text
-                }
-            })
+/// The type of a function that returns one of several values: the type they
+/// all share, REAL for a mix of integers and reals, and otherwise any type.
+/// NULL values don't count. If one value is of a custom type, the result is
+/// that type: a CHECK constraint sees it in its stored form, such as
+/// numeric's blob, so arithmetic on it must stay refused.
+fn common_check_type(types: impl Iterator<Item = Result<CheckExprType>>) -> Result<CheckExprType> {
+    let mut common = CheckExprType::Null;
+    let mut custom_type = None;
+    for ty in types {
+        let ty = ty?;
+        if custom_type.is_none() && matches!(ty, CheckExprType::CustomType(_)) {
+            custom_type = Some(ty.clone());
         }
-
-        // The type of the first argument: likely(x) is x.
-        ScalarFunc::Abs
-        | ScalarFunc::Nullif
-        | ScalarFunc::Likely
-        | ScalarFunc::Unlikely
-        | ScalarFunc::Likelihood => {
-            if let Some(arg) = args.first() {
-                resolve_check_expr_type(arg, columns, resolver)
-            } else {
-                Ok(CheckExprType::Any)
-            }
-        }
-
-        ScalarFunc::Coalesce | ScalarFunc::IfNull => {
-            for arg in args {
-                let ty = resolve_check_expr_type(arg, columns, resolver)?;
-                if ty != CheckExprType::Null {
-                    return Ok(ty);
-                }
-            }
-            Ok(CheckExprType::Null)
-        }
-
-        // SQLite's round() always returns a real.
-        ScalarFunc::Round => Ok(CheckExprType::Real),
-
-        ScalarFunc::Min | ScalarFunc::Max => {
-            if let Some(first) = args.first() {
-                resolve_check_expr_type(first, columns, resolver)
-            } else {
-                Ok(CheckExprType::Any)
-            }
-        }
-
-        ScalarFunc::Iif => {
-            // iif(cond, then_val, else_val) — return type of then_val
-            if args.len() >= 2 {
-                resolve_check_expr_type(&args[1], columns, resolver)
-            } else {
-                Ok(CheckExprType::Any)
-            }
-        }
-
-        _ => Ok(CheckExprType::Any),
+        common = match (common, ty) {
+            (common, CheckExprType::Null) => common,
+            (CheckExprType::Null, ty) => ty,
+            (common, ty) if common == ty => common,
+            (
+                CheckExprType::Integer | CheckExprType::Real,
+                CheckExprType::Integer | CheckExprType::Real,
+            ) => CheckExprType::Real,
+            _ => CheckExprType::Any,
+        };
     }
+    Ok(custom_type.unwrap_or(common))
 }
 
 /// Resolve a column's type from its definition.

@@ -7,9 +7,9 @@
 
 use turso_parser::ast;
 
-use super::custom_type_operators::find_operator_call;
+use super::custom_type_operators::{abs_of_custom_type, find_operator_call};
 use super::get_expr_affinity;
-use crate::function::{AggFunc, Func, ReturnType, ScalarFunc, WindowFunc};
+use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
@@ -176,6 +176,13 @@ impl<'a> TypeEnv<'a> {
             Self::Statement { tables, .. } => *tables,
             Self::Table { .. } => None,
         }
+    }
+
+    /// Whether custom-type columns are read in their stored form: in a CHECK
+    /// constraint.
+    pub(super) fn reads_stored_form(&self) -> bool {
+        self.resolver()
+            .is_some_and(|resolver| resolver.reads_stored_form)
     }
 
     fn resolver(&self) -> Option<&Resolver<'a>> {
@@ -739,7 +746,11 @@ fn binary_type(
 /// it: what the function returns. `None` means SQLite's operator runs. An
 /// operator that does not exist, such as `date * 2`, has no type: emitting it
 /// fails. `types` are the operands' types.
-fn custom_operator_type(expr: &ast::Expr, types: &[ExprType], env: &TypeEnv) -> Option<ExprType> {
+pub(super) fn custom_operator_type(
+    expr: &ast::Expr,
+    types: &[ExprType],
+    env: &TypeEnv,
+) -> Option<ExprType> {
     match find_operator_call(expr, types, env) {
         Ok(Some(call)) => Some(call_result_type(&call.result, env.schema())),
         Ok(None) => None,
@@ -831,13 +842,6 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
             1,
         ),
-        Func::Scalar(
-            ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
-        )
-        | Func::Agg(AggFunc::Max | AggFunc::Min) => {
-            common_type(args.iter().map(|arg| arg.as_ref()), env)
-        }
-        Func::Scalar(ScalarFunc::Iif) => common_type(args.iter().skip(1).map(|a| a.as_ref()), env),
         // A value of another row: its own argument's type, or for lag and
         // lead the common type of the argument and the default (the third
         // argument).
@@ -851,42 +855,87 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         Func::Window(WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue) => args
             .first()
             .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
-        // A call with the wrong number of arguments is reported when it is translated.
-        Func::Scalar(
-            ScalarFunc::Nullif
-            | ScalarFunc::Likely
-            | ScalarFunc::Unlikely
-            | ScalarFunc::Likelihood
-            | ScalarFunc::Abs
-            | ScalarFunc::ArrayElement,
-        ) if args.is_empty() => ExprType::Builtin(BuiltinType::Any),
-        // nullif returns its first argument or NULL; likely, unlikely and
-        // likelihood return their first argument unchanged.
-        Func::Scalar(
-            ScalarFunc::Nullif | ScalarFunc::Likely | ScalarFunc::Unlikely | ScalarFunc::Likelihood,
-        ) => type_of(&args[0], env),
-        Func::Scalar(ScalarFunc::Abs) => negated_type(type_of(&args[0], env), env.schema()),
-        Func::Scalar(ScalarFunc::ArrayElement) => match type_of(&args[0], env) {
-            ExprType::Array {
-                element,
-                dimensions,
-            } => ExprType::array(*element, dimensions - 1),
-            _ => ExprType::Builtin(BuiltinType::Any),
+        func => result_type(func.result_type(), args, env),
+    }
+}
+
+/// The type of a call to a function, from the way its result type follows
+/// from its arguments.
+fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) -> ExprType {
+    let any = ExprType::Builtin(BuiltinType::Any);
+    // A call with the wrong number of arguments is reported when it is translated.
+    let first_argument = || args.first().map(|arg| type_of(arg, env));
+    match result_type {
+        ResultType::Declared(return_type) => declared_return_type(return_type, args, env),
+        ResultType::FirstArgument => first_argument().unwrap_or(any),
+        ResultType::OneOfTheArguments => common_type(args.iter().map(|arg| arg.as_ref()), env),
+        ResultType::OneOfTheIifValues => common_type(iif_values(args).map(|arg| arg.as_ref()), env),
+        ResultType::NumberOfTheFirstArgumentsType => match first_argument() {
+            Some(ty) => negated_type(ty, env.schema()),
+            None => any,
         },
-        Func::Scalar(ScalarFunc::Round) | Func::Math(_) if func.return_type().is_none() => {
+        ResultType::RealForTextOtherwiseTheFirstArgumentsType => match first_argument() {
+            // A custom type with its own order and `-x`, such as numeric, has
+            // its own abs. For any other custom type abs runs on the stored
+            // value, so the type counts as the type it is stored as: abs of a
+            // uuid, stored as a blob, is a real.
+            Some(ty) => {
+                if let Some(abs_type) = args
+                    .first()
+                    .and_then(|arg| abs_of_custom_type(arg, &ty, env))
+                {
+                    return abs_type;
+                }
+                match sqlite_operand_type(ty.clone(), env.schema()) {
+                    ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob)
+                    | ExprType::Untyped => ExprType::Builtin(BuiltinType::Real),
+                    _ => negated_type(ty, env.schema()),
+                }
+            }
+            None => any,
+        },
+        ResultType::RealForARealArgument => {
             let is_real =
                 |arg: &ast::Expr| matches!(type_of(arg, env), ExprType::Builtin(BuiltinType::Real));
             if args.iter().any(|arg| is_real(arg)) {
                 ExprType::Builtin(BuiltinType::Real)
             } else {
-                ExprType::Builtin(BuiltinType::Any)
+                any
             }
         }
-        func => match func.return_type() {
-            Some(return_type) => declared_return_type(return_type, args, env),
-            None => ExprType::Builtin(BuiltinType::Any),
+        ResultType::TextOrBlobLikeTheFirstArgument => match first_argument() {
+            Some(ty @ (ExprType::Builtin(BuiltinType::Blob) | ExprType::Null)) => ty,
+            Some(
+                ExprType::Builtin(
+                    BuiltinType::Integer
+                    | BuiltinType::Real
+                    | BuiltinType::Numeric
+                    | BuiltinType::Decimal
+                    | BuiltinType::Text,
+                )
+                | ExprType::Untyped,
+            ) => ExprType::Builtin(BuiltinType::Text),
+            _ => any,
         },
+        ResultType::ElementOfTheFirstArgument => match first_argument() {
+            Some(ExprType::Array {
+                element,
+                dimensions,
+            }) => ExprType::array(*element, dimensions - 1),
+            _ => any,
+        },
+        ResultType::Unknown => any,
     }
+}
+
+/// The arguments of `iif(c1, v1, c2, v2, ..., else)` that it may return:
+/// every second one from the second on, and a last one without a condition.
+pub(crate) fn iif_values(args: &[Box<ast::Expr>]) -> impl Iterator<Item = &Box<ast::Expr>> {
+    let has_else = args.len() % 2 == 1;
+    args.iter()
+        .enumerate()
+        .filter(move |(i, _)| i % 2 == 1 || (has_else && *i == args.len() - 1))
+        .map(|(_, arg)| arg)
 }
 
 /// The type of a call to a function that declares the type it returns.

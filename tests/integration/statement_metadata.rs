@@ -400,7 +400,7 @@ mod tests {
             ("abs(x)", Some("INTEGER")),
             ("abs(x) * 2", Some("INTEGER")),
             ("abs(ratio)", Some("REAL")),
-            ("abs(label)", Some("NUMERIC")),
+            ("abs(label)", Some("REAL")),
             ("CASE WHEN x = 1 THEN x ELSE 0 END - 1", Some("INTEGER")),
             ("CASE WHEN x = 1 THEN x END", Some("INTEGER")),
             ("CASE x WHEN 1 THEN NULL ELSE ratio END", Some("REAL")),

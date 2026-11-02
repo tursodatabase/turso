@@ -1187,6 +1187,17 @@ fn translate_function_call_expr(
             }
         },
         Func::Scalar(srf) => {
+            if let (ScalarFunc::Abs, [arg]) = (srf, args.as_slice()) {
+                if let Some(reg) = emit_abs_with_type_operators(
+                    program,
+                    referenced_tables,
+                    arg,
+                    target_register,
+                    resolver,
+                )? {
+                    return Ok(reg);
+                }
+            }
             match srf {
                 ScalarFunc::Cast => {
                     unreachable!("this is always ast::Expr::Cast")
