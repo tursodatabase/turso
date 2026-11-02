@@ -153,7 +153,7 @@ impl InitLoop {
                         .position(|m| m.original_idx == table_index)
                         .expect("table must be in join_order");
                     let outer_table_idx =
-                        find_non_semi_anti_ancestor(join_order, tables.joined_tables(), join_idx);
+                        find_outer_table(join_order, tables.joined_tables(), join_idx);
                     // For hash join probe tables, loop_labels.next points to the probe
                     // cursor's Next (which advances to the next outer row), but we need
                     // to jump to the HashNext (which advances to the next hash match
