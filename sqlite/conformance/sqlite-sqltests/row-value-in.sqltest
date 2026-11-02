@@ -350,3 +350,25 @@ expect {
     1|0|1
     1|1|y
 }
+# In a list of two or more items a subquery is one term, as in SQLite; only
+# `x IN (SELECT ...)` and a list with that single subquery compare columns.
+test row-value-in-list-subquery-item-is-one-term {
+    SELECT ('a', 1) IN (('z', 2), (SELECT 'a', 1));
+}
+expect error {
+    element has 1 term - expected 2
+}
+
+test row-value-in-list-single-subquery-item-compares-columns {
+    SELECT ('a', 1) IN ((SELECT 'a', 1)), ('a', 1) IN ((SELECT 'z', 1)), 'a' IN ((SELECT 'a'), 'z');
+}
+expect {
+    1|0|1
+}
+
+test scalar-in-list-subquery-item-with-two-columns-is-an-error {
+    SELECT 'a' IN ((SELECT 'a', 1), 'z');
+}
+expect error {
+    sub-select returns 2 columns - expected 1
+}
