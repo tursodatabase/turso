@@ -385,44 +385,49 @@ class ConnectionSync(_Connection):
         super().__init__(conn, isolation_level=isolation_level, extra_io=_extra_io)
         self._sync: PyTursoSyncDatabase = sync
         self._http_ctx: _HttpContext = http_ctx
+        # The sync engine runs one operation at a time, so threads sharing this connection take turns
+        self._sync_lock = threading.Lock()
 
     def pull(self) -> bool:
         """
         Pull remote changes and apply locally.
         Returns True if new updates were pulled; False otherwise.
         """
-        # Wait for changes
-        changes = _run_op(self._sync, self._sync.wait_changes(), self._http_ctx)
-        # determine if empty before applying
-        if changes is None:
-            # Should not happen; treat as no changes
-            return False
-        is_empty = bool(changes.empty())
-        if is_empty:
-            return False
-        # Apply non-empty changes
-        op = self._sync.apply_changes(changes)
-        _run_op(self._sync, op, self._http_ctx)
-        return True
+        with self._sync_lock:
+            # Wait for changes
+            changes = _run_op(self._sync, self._sync.wait_changes(), self._http_ctx)
+            # determine if empty before applying
+            if changes is None:
+                # Should not happen; treat as no changes
+                return False
+            is_empty = bool(changes.empty())
+            if is_empty:
+                return False
+            # Apply non-empty changes
+            op = self._sync.apply_changes(changes)
+            _run_op(self._sync, op, self._http_ctx)
+            return True
 
     def push(self) -> None:
         """
         Push local changes to remote.
         """
-        _run_op(self._sync, self._sync.push_changes(), self._http_ctx)
+        with self._sync_lock:
+            _run_op(self._sync, self._sync.push_changes(), self._http_ctx)
 
     def checkpoint(self) -> None:
         """
         Checkpoint the WAL of the synced database.
         """
-        _run_op(self._sync, self._sync.checkpoint(), self._http_ctx)
+        with self._sync_lock:
+            _run_op(self._sync, self._sync.checkpoint(), self._http_ctx)
 
     def stats(self) -> PyTursoSyncDatabaseStats:
         """
         Collect stats about the synced database.
         """
-        stats = _run_op(self._sync, self._sync.stats(), self._http_ctx)
-        return stats
+        with self._sync_lock:
+            return _run_op(self._sync, self._sync.stats(), self._http_ctx)
 
 
 def connect_sync(
