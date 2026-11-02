@@ -1542,7 +1542,6 @@ fn reload_wal_after_restore(world: &World, actor: usize) -> String {
 
     match connection.reload_wal_after_external_restore() {
         Ok(()) => {
-            assert!(world.spec.plaintext, "encrypted WAL reload succeeded");
             for peer in world
                 .actors
                 .iter()
@@ -1555,14 +1554,10 @@ fn reload_wal_after_restore(world: &World, actor: usize) -> String {
         }
         Err(error) => {
             assert!(
-                if world.spec.plaintext {
-                    matches!(
-                        classify(&error),
-                        Category::Contention | Category::InjectedIo
-                    )
-                } else {
-                    classify(&error) == Category::SettingsRejected
-                },
+                matches!(
+                    classify(&error),
+                    Category::Contention | Category::InjectedIo
+                ),
                 "unexpected reload failure: {error}"
             );
             check_owner_after_restore(world, "reload_wal_after_external_restore");

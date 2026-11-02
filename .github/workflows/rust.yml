@@ -413,7 +413,8 @@ jobs:
             args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile savepoint_stress --io-backend=memory"
           - name: WriteStress
             iterations: 4
-            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_stress --io-backend=memory"
+            # Keep the padded-write workload's files on disk to fit the runner's memory budget.
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_stress --io-backend=default"
           - name: IOUring InsertHeavySpill
             iterations: 5
             args: "--io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill"
