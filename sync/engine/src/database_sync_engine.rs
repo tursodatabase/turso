@@ -1175,6 +1175,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     opts.protocol_version_hint,
                     partial_sync_opts,
                     opts.pull_bytes_threshold,
+                    local_crypto.as_ref(),
                 )
                 .await?;
                 let remote_pull_protocol = forced_protocol.unwrap_or(detected_protocol);
@@ -1433,6 +1434,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // logical log. Catch up with one incremental pull so a freshly
         // bootstrapped database is current at connect time, matching what
         // page-protocol bootstraps always provided.
+        if meta.fresh_bootstrap_catch_up_pending
+            && meta.remote_pull_protocol == RemotePullProtocol::MvccLogical
+        {
+            // An empty generation base has no page-one journal-mode header to inherit.
+            db.ensure_local_mvcc_journal_mode(coro).await?;
+        }
         db.catch_up_after_fresh_bootstrap(coro).await?;
 
         tracing::info!("sync engine was initialized");
