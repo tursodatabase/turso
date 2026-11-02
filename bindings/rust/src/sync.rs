@@ -2907,4 +2907,159 @@ mod tests {
         let rows = server.db_sql("SELECT count(*) FROM t").await.unwrap();
         assert_eq!(rows, vec![vec![Value::Text(TASKS.to_string())]]);
     }
+
+    // Sync calls are cancelled at random points (tokio::time::timeout), as a server would
+    // do with per-request deadlines, while local and remote writes happen concurrently.
+    // Afterwards every row must exist exactly once on both sides.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    pub async fn test_sync_cancelled_operations_lose_no_rows() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = Arc::new(TursoServer::new().await.unwrap());
+        server
+            .db_sql("CREATE TABLE t(id INTEGER PRIMARY KEY, origin TEXT)")
+            .await
+            .unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        db.pull().await.unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let record = |errors: &Arc<Mutex<Vec<String>>>, what: &str, r: crate::Result<()>| {
+            if let Err(e) = r {
+                errors.lock().unwrap().push(format!("{what}: {e}"));
+            }
+        };
+
+        const LOCAL_ROWS: i64 = 200;
+        const REMOTE_ROWS: i64 = 50;
+
+        let local_writer = tokio::spawn({
+            let db = db.clone();
+            let errors = errors.clone();
+            async move {
+                let conn = db.connect().await.unwrap();
+                for i in 0..LOCAL_ROWS {
+                    let started = Instant::now();
+                    loop {
+                        match conn
+                            .execute("INSERT INTO t VALUES (?, 'local')", (i,))
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(e)
+                                if super::is_sync_busy_error(&e)
+                                    && started.elapsed() < Duration::from_secs(5) =>
+                            {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                            Err(e) => panic!("local insert failed: {e}"),
+                        }
+                    }
+                    if i % 3 == 0 {
+                        let ms = rand::rng().random_range(0..8);
+                        if let Ok(r) =
+                            tokio::time::timeout(Duration::from_millis(ms), db.push()).await
+                        {
+                            record(&errors, "push", r);
+                        }
+                    }
+                }
+            }
+        });
+
+        let remote_writer = tokio::spawn({
+            let server = server.clone();
+            async move {
+                for j in 0..REMOTE_ROWS {
+                    server
+                        .db_sql(&format!(
+                            "INSERT INTO t VALUES ({}, 'remote')",
+                            1_000_000 + j
+                        ))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        });
+
+        let puller = tokio::spawn({
+            let db = db.clone();
+            let stop = stop.clone();
+            let errors = errors.clone();
+            async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let ms = rand::rng().random_range(0..8);
+                    if let Ok(r) = tokio::time::timeout(Duration::from_millis(ms), db.pull()).await
+                    {
+                        record(&errors, "pull", r.map(|_| ()));
+                    }
+                    let ms = rand::rng().random_range(0..8);
+                    if let Ok(r) =
+                        tokio::time::timeout(Duration::from_millis(ms), db.checkpoint()).await
+                    {
+                        record(&errors, "checkpoint", r);
+                    }
+                }
+            }
+        });
+
+        local_writer.await.unwrap();
+        remote_writer.await.unwrap();
+        stop.store(true, Ordering::Relaxed);
+        puller.await.unwrap();
+
+        db.push().await.unwrap();
+        db.pull().await.unwrap();
+
+        let conn = db.connect().await.unwrap();
+        let local = all_rows(
+            conn.query(
+                "SELECT origin, count(*) FROM t GROUP BY origin ORDER BY origin",
+                (),
+            )
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let integrity = all_rows(conn.query("PRAGMA integrity_check", ()).await.unwrap())
+            .await
+            .unwrap();
+        let remote = server
+            .db_sql("SELECT origin, count(*) FROM t GROUP BY origin ORDER BY origin")
+            .await
+            .unwrap();
+        let expected = vec![
+            vec![Value::Text("local".into()), Value::Integer(LOCAL_ROWS)],
+            vec![Value::Text("remote".into()), Value::Integer(REMOTE_ROWS)],
+        ];
+        let errors = errors.lock().unwrap();
+        eprintln!("non-timeout errors:\n{}", summarize_errors(&errors));
+        assert_eq!(integrity, vec![vec![Value::Text("ok".into())]]);
+        assert_eq!(local, expected, "local rows");
+        assert_eq!(
+            remote,
+            vec![
+                vec![
+                    Value::Text("local".into()),
+                    Value::Text(LOCAL_ROWS.to_string())
+                ],
+                vec![
+                    Value::Text("remote".into()),
+                    Value::Text(REMOTE_ROWS.to_string())
+                ],
+            ],
+            "remote rows"
+        );
+        assert!(errors.is_empty(), "{}", summarize_errors(&errors));
+    }
 }
