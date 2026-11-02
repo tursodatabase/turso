@@ -22,6 +22,7 @@ the host program handles it.
 | Term                   | Definition                                                                                   |
 |------------------------|----------------------------------------------------------------------------------------------|
 | **Authentication**     | Deciding who a client is and which role its connection runs as. The host program's job.      |
+| **Catalog**            | The tables that describe the database itself: its schema, namespaces, types, and roles.      |
 | **Client**             | Whoever sends SQL over a connection. Not trusted.                                            |
 | **Core**               | The database engine: it compiles and runs SQL, stores data, and enforces the security model. |
 | **Current role**       | The role a connection's statements are checked against; the session role until `SET ROLE`.   |
@@ -33,6 +34,8 @@ the host program handles it.
 | **Role**               | An identity that statements are checked against.                                             |
 | **Role catalog**       | The in-memory list of all roles of a database, kept with the schema.                         |
 | **Row-level security** | Policies that filter which rows of a table a role may read or change.                        |
+| **Schema**             | A namespace of a database that holds objects, such as `public`. Called a namespace in Core.  |
+| **Search path**        | The ordered list of schemas a connection looks a name up in when the name has no schema.     |
 | **Session role**       | The role the host program gave a connection when it opened it.                               |
 | **Superuser**          | A role that passes every privilege check.                                                    |
 
@@ -54,11 +57,13 @@ The attacker may try to:
 - reach the process or the filesystem through SQL, for example by loading an
   extension or copying from a file;
 - read stored data through a side door, such as a virtual table, a function,
-  or a catalog.
+  or a catalog;
+- make a name mean another object, for example by changing the search path or
+  by creating an object that shadows one.
 
 Turso defends against all of these. A statement cannot reach stored data,
 another role, or the host program without passing a check against the current
-role.
+role, and the check is made on the object a name resolved to, not on the name.
 
 Turso does not defend against:
 
@@ -118,8 +123,9 @@ cannot be read fails the open or the reload; a connection never continues with
 only the built-in roles.
 
 A connection has a session role and a current role. The host program chooses
-the session role when it opens the connection: the superuser, or a stored role
-by name. A name that does not exist fails the connection. The current role
+the session role when it opens the connection: the superuser, or a role by
+name. The name of the built-in superuser gives the superuser. A name that does
+not exist fails the connection, and so does the name of `public`. The current role
 starts out as the session role, and privilege checks run against the current
 role.
 
@@ -133,6 +139,46 @@ makes prepared statements prepare again. A query that is already returning rows
 is not checked again, as in PostgreSQL. The checks that run while a statement
 runs, such as those of `currval()`, use the role that is current at that time,
 and `current_user` returns it.
+
+## Schemas and the search path
+
+A schema is a namespace of a database that holds tables, views, indexes,
+triggers, sequences, and types. Core calls it a namespace. Every database has
+a root namespace, and a dialect that supports schemas, such as PostgreSQL,
+stores more of them in the `__turso_internal_namespaces` table. The PostgreSQL
+frontend gives every database the schema `public` and keeps every table in a
+schema. Creating and dropping a schema is DDL: it runs in the caller's
+transaction and bumps the schema cookie, so other connections see it when
+they reload the schema. On disk an object of a schema is stored under a name
+that starts with `__turso_ns<id>_`, but every lookup uses the schema's id and
+the object's name, so a role cannot reach an object of one schema by naming it
+in another.
+
+A name in a statement either has a schema, as in `app.t`, or not. A name with
+a schema is looked up in that schema only. A name without a schema is looked
+up through the connection's search path: an ordered list of schema names that
+the frontend sets, for example with `SET search_path`. Core looks the name up
+in each schema of the search path in order and takes the first match, skips
+names of schemas that do not exist, and creates an object whose name has no
+schema in the first schema of the search path. Without a search path, Core
+looks in the main database and then in the attached databases, as SQLite does.
+Any role may change the search path, and changing it makes prepared
+statements prepare again.
+
+The search path changes which object a name means, never what a role may do
+with it. Privileges are checked after a name has resolved, on the table, view,
+or virtual table itself, so a role that changes its search path, or that
+names a schema it may not create in, is checked exactly as if it had named
+the object directly. A denial for creating an object names the schema the
+object would be created in. The PostgreSQL frontend qualifies the name of a
+catalog table with the catalog before Core resolves it, so the search path
+does not apply to catalog names.
+
+Schemas have no owner and no privileges yet. `CREATE SCHEMA` and `DROP
+SCHEMA` are allowed only for a superuser, creating an object in any schema
+needs a privilege that cannot be granted yet, and every role may resolve names
+in every schema, where PostgreSQL requires the `USAGE` privilege on the
+schema.
 
 ## Privilege checks
 
@@ -207,6 +253,7 @@ Creating objects:
 | `CREATE TEMP TRIGGER`      | Needs the privilege to create temporary objects in the database |
 | `CREATE TRIGGER`           | Needs the privilege to create triggers on the table             |
 | `CREATE INDEX`             | Only the owner of the table                                     |
+| `CREATE SCHEMA`            | Needs the privilege to create in the database                   |
 
 Changing and dropping objects:
 
@@ -220,6 +267,7 @@ Changing and dropping objects:
 | `DROP TYPE`     | Only the owner of the type     |
 | `DROP DOMAIN`   | Only the owner of the domain   |
 | `DROP SEQUENCE` | Only the owner of the sequence |
+| `DROP SCHEMA`   | Only the owner of the schema   |
 
 Settings:
 
@@ -248,8 +296,11 @@ the program contains any of these, the statement is denied, and the denial
 names the object that the instruction touches: the table, the sequence, or the
 materialized view, or the table that an index belongs to. Because the check is
 on the compiled program and not on the SQL, a statement cannot reach stored
-data through a subquery, a trigger, a foreign key, or any other indirection
-without being checked.
+data through a subquery, a view, or any other rewrite of the query without
+being checked. The bodies of triggers and the actions of foreign keys are
+compiled into subprograms of the statement, which the check does not scan
+yet: today the statement's own access to the table that fires them is denied
+first, so nothing in them runs. See [Future work](#future-work).
 
 Three kinds of access do not open stored data of their own and are checked
 separately:
@@ -262,9 +313,12 @@ separately:
   statement opens is recorded. An internal or native virtual table is denied
   unless it declares that a role without privileges may read it, which the
   catalogs and `json_each()` do and which anything that reads pages or records
-  directly, such as `sqlite_dbpage` and `btree_dump()`, does not. `pragma_*()`
-  functions are denied like `PRAGMA`. Writes to a virtual table are always
-  denied.
+  directly, such as `sqlite_dbpage` and `btree_dump()`, does not. A
+  table-valued function of a C extension, such as `generate_series()`, is
+  readable by every role, and a virtual table of a C extension is not, so an
+  extension that the host program loads must not expose stored data or the
+  process through a table-valued function. `pragma_*()` functions are denied
+  like `PRAGMA`. Writes to a virtual table are always denied.
 - **Functions** that return stored state without reading storage, such as
   `currval()` and `load_extension()`, check the role when they run, because
   their argument may be a parameter that is not known when the statement is
@@ -288,7 +342,7 @@ The Postgres frontend exposes roles the way PostgreSQL does:
 
 - The built-in roles are named `postgres` and `public`. `pg_roles` lists the
   superuser with OID 10, the OID of the PostgreSQL bootstrap superuser, and
-  stored roles with OIDs from 16384 up. `public` has OID 0, as in PostgreSQL's
+  stored roles with OIDs from 16385 up. `public` has OID 0, as in PostgreSQL's
   access control lists, and is not listed. Only the superuser can log in.
 - `CREATE ROLE name` is translated to the core statement. Role options,
   `CREATE USER` and `CREATE GROUP` are rejected as not supported, and names
@@ -300,8 +354,12 @@ The Postgres frontend exposes roles the way PostgreSQL does:
   and `acldefault()` look roles up by OID.
 - A denial is worded as PostgreSQL words it: `permission denied for table t`,
   `must be owner of table t`, `permission denied for schema public`, and
-  `permission denied to create role`. The main database is reported as the
-  `public` schema.
+  `permission denied to create role`, and is reported with SQLSTATE `42501`,
+  `insufficient_privilege`. The main database is reported as the `public`
+  schema.
+- `SET search_path` sets the connection's search path, and `$user`, `main`
+  and `temp` are dropped from it, because there is no schema named after the
+  user and the core database names are not schemas.
 - Every `pg_catalog` table is readable by every role. The one value in them
   that is not schema, `last_value` in `pg_sequences`, is NULL for a role
   without privileges on the sequence, as in PostgreSQL.
@@ -310,8 +368,18 @@ The Postgres frontend exposes roles the way PostgreSQL does:
 
 Statements that the Postgres frontend runs itself, outside the core statement
 path, are not covered by the core checks and must check the role themselves.
-Today these are `CREATE SCHEMA`, `DROP SCHEMA` and `COPY ... FROM` a file, and
-all three are allowed only for a superuser.
+Today these are:
+
+- `CREATE SCHEMA`, `DROP SCHEMA` and `COPY ... FROM` a file, which are
+  allowed only for a superuser;
+- `COPY ... TO STDOUT`, which prepares a core `SELECT` of the table and is
+  checked like one;
+- `SET`, `SHOW`, `SET TRANSACTION` and `RESET`, which change or show the
+  session's settings and are allowed for every role, as in PostgreSQL;
+- `DISCARD ALL`, which resets the settings and the current role to the
+  session role, as `RESET ROLE` does, and is allowed for every role;
+- `REFRESH MATERIALIZED VIEW` and `COMMENT ON`, which do nothing and are
+  allowed for every role, where PostgreSQL requires the owner.
 
 Roles differ from PostgreSQL in two ways that clients may notice. Roles belong
 to a database file, where PostgreSQL shares them across a cluster. And the wire
@@ -330,7 +398,14 @@ In the order the pieces depend on each other:
   with `GRANT` and removed with `REVOKE`, with `public` as a grantee. The
   data check then consults the privileges of the current role instead
   of denying every access, and `CREATE` on the schema decides who may create
-  objects.
+  objects. Before any privilege can be granted, the data check must also scan
+  the subprograms of triggers and foreign-key actions, which it does not do
+  today, and table-valued functions of C extensions must declare whether a
+  role without privileges may read them, as native ones do.
+- **Schema privileges.** Record the owner of a schema, and the `USAGE` and
+  `CREATE` privileges on it. `CREATE SCHEMA` and `DROP SCHEMA` then stop being
+  superuser-only, and resolving a name in a schema needs `USAGE` on it, as in
+  PostgreSQL.
 - **Role membership.** Granting a role to another role, and `SET ROLE` for
   members, which removes the superuser-only rule for switching roles.
 - **Row-level security.** Policies attached to a table that filter the rows a
@@ -341,11 +416,11 @@ In the order the pieces depend on each other:
   program. Policies on a table are stored with the schema, like indexes and
   triggers.
 - **Role management.** `ALTER ROLE`, `DROP ROLE`, and role attributes such as
-  `SUPERUSER` and `CREATEROLE`.
+  `SUPERUSER` and `CREATEROLE`. A dropped role's id must not be given to a
+  new role, because a connection may still run as the dropped role; today a
+  role's id is its rowid in the roles table.
 - **Privilege inquiry.** `has_table_privilege()` and the other access
   privilege inquiry functions, and the `relacl` columns of the catalogs.
-- **Error codes.** The wire server reports denials with SQLSTATE `42501`,
-  `insufficient_privilege`, instead of a generic error.
 
 ## References
 
