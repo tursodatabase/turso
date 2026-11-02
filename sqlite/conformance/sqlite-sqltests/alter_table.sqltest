@@ -3612,3 +3612,69 @@ expect {
     1
     1
 }
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-updates-temp-views {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    CREATE TEMP VIEW tv1 AS SELECT x FROM t;
+    CREATE TEMP VIEW tv2 AS SELECT t.x FROM main.t;
+    ALTER TABLE t RENAME TO t2;
+    SELECT * FROM tv1;
+    SELECT * FROM tv2;
+}
+expect {
+    1
+    1
+}
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-table-keeps-temp-view-on-temp-table-with-same-name {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    CREATE TEMP TABLE t(x);
+    INSERT INTO temp.t VALUES (9);
+    CREATE TEMP VIEW tv1 AS SELECT x FROM t;
+    CREATE TEMP VIEW tv2 AS SELECT x FROM main.t;
+    ALTER TABLE main.t RENAME TO t2;
+    SELECT * FROM tv1;
+    SELECT * FROM tv2;
+}
+expect {
+    9
+    1
+}
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-attached-table-keeps-temp-view-on-main-table-with-same-name {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    CREATE TABLE aux.t(x);
+    INSERT INTO aux.t VALUES (2);
+    CREATE TEMP VIEW tv1 AS SELECT x FROM t;
+    CREATE TEMP VIEW tv2 AS SELECT x FROM aux.t;
+    ALTER TABLE aux.t RENAME TO t2;
+    SELECT * FROM tv1;
+    SELECT * FROM tv2;
+}
+expect {
+    1
+    2
+}
+
+@cross-check-integrity
+@skip-if mvcc "views not supported in MVCC mode"
+test alter-table-rename-column-updates-view-with-quote-in-name {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    CREATE VIEW "it's" AS SELECT a FROM t;
+    ALTER TABLE t RENAME COLUMN a TO b;
+    SELECT * FROM "it's";
+}
+expect {
+    1
+}

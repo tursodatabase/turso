@@ -2130,6 +2130,8 @@ pub enum Insn {
         namespace: NamespaceId,
         from: String,
         to: String,
+        /// Whether a name without a qualifier in a TEMP view means this table.
+        temp_unqualified_names_table: bool,
     },
     DropColumn {
         db: usize,

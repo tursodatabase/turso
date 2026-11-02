@@ -40,9 +40,9 @@ use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, rewrite_select_namespace_table_refs,
-    rewrite_select_table_refs, rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
-    trim_ascii_whitespace, RewrittenView,
+    rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_table_refs,
+    rewrite_view_for_table_rename, rewrite_view_sql_for_column_rename, trim_ascii_whitespace,
+    RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -17585,7 +17585,8 @@ pub fn op_rename_table(
             db,
             namespace,
             from,
-            to
+            to,
+            temp_unqualified_names_table
         },
         insn
     );
@@ -17739,41 +17740,26 @@ pub fn op_rename_table(
         }
 
         let qualifiers = table_qualifiers(schema, *namespace);
-        let mut view_rewrites = Vec::new();
-        let view_namespaces: Vec<NamespaceId> = schema.namespace_ids().collect();
-        for view_namespace in view_namespaces {
-            for (view_name, view) in schema.views(view_namespace) {
-                if !sql_might_reference_identifier(&view.sql, &normalized_from) {
-                    continue;
-                }
-                let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
-                    continue;
-                };
-                if let Some(rewrite) = rewrite_view_for_table_rename(
-                    stmt,
-                    &normalized_from,
-                    to,
-                    view_namespace == *namespace,
-                    qualifiers.as_deref(),
-                ) {
-                    view_rewrites.push((view_namespace, view_name.to_string(), rewrite));
-                }
-            }
-        }
-        for (view_namespace, view_name, (new_sql, new_select)) in view_rewrites {
-            let view = Arc::make_mut(
-                schema
-                    .view_mut(view_namespace, &view_name)
-                    .expect("view being rewritten should be in schema"),
-            );
-            view.sql = new_sql;
-            view.select_stmt = new_select;
-        }
+        rewrite_views_for_table_rename(schema, &conn, &normalized_from, |view_namespace, view| {
+            rewrite_view_for_table_rename(
+                view,
+                &normalized_from,
+                to,
+                view_namespace == *namespace,
+                qualifiers.as_deref(),
+            )
+        })?;
 
         Ok(())
     })??;
 
     if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
+        let renamed_db_name = conn
+            .namespace_name(*db)
+            .map(|name| normalize_ident(&name))
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("unknown database id {} during ALTER TABLE", *db))
+            })?;
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
             // A TEMP trigger may run on a table in another database. Triggers
             // are found by the name of that table. When the table is renamed,
@@ -17819,6 +17805,16 @@ pub fn op_rename_table(
                 let trigger = Arc::make_mut(trigger_arc);
                 rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
             }
+
+            rewrite_views_for_table_rename(schema, &conn, &normalized_from, |_, view| {
+                rewrite_view_for_table_rename(
+                    view,
+                    &normalized_from,
+                    to,
+                    *temp_unqualified_names_table,
+                    Some(std::slice::from_ref(&renamed_db_name)),
+                )
+            })?;
             Ok(())
         })??;
     }
@@ -17827,50 +17823,37 @@ pub fn op_rename_table(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// Renames the table `normalized_from` to `to` in a view. In a database
-/// with namespaces, `unqualified_names_table` says whether the view is in
-/// the table's namespace, and `table_qualifiers` are the names of that
-/// namespace; without namespaces both are ignored.
-fn rewrite_view_for_table_rename(
-    view: ast::Stmt,
+fn rewrite_views_for_table_rename(
+    schema: &mut Schema,
+    conn: &Connection,
     normalized_from: &str,
-    to: &str,
-    unqualified_names_table: bool,
-    table_qualifiers: Option<&[String]>,
-) -> Option<(String, ast::Select)> {
-    let ast::Stmt::CreateView {
-        temporary,
-        if_not_exists,
-        view_name,
-        columns,
-        mut select,
-    } = view
-    else {
-        panic!("rewrite_view_for_table_rename called with a statement that is not CREATE VIEW");
-    };
-    let old_select = select.clone();
-    match table_qualifiers {
-        Some(qualifiers) => rewrite_select_namespace_table_refs(
-            &mut select,
-            normalized_from,
-            to,
-            unqualified_names_table,
-            qualifiers,
-        ),
-        None => rewrite_select_table_refs(&mut select, normalized_from, to),
+    rewrite_view: impl Fn(NamespaceId, ast::Stmt) -> Option<(String, ast::Select)>,
+) -> crate::Result<()> {
+    let mut view_rewrites = Vec::new();
+    let view_namespaces: Vec<NamespaceId> = schema.namespace_ids().collect();
+    for view_namespace in view_namespaces {
+        for (view_name, view) in schema.views(view_namespace) {
+            if !sql_might_reference_identifier(&view.sql, normalized_from) {
+                continue;
+            }
+            let Some(ast::Cmd::Stmt(stmt)) = conn.dialect().parse(&view.sql)?.0 else {
+                continue;
+            };
+            if let Some(rewrite) = rewrite_view(view_namespace, stmt) {
+                view_rewrites.push((view_namespace, view_name.to_string(), rewrite));
+            }
+        }
     }
-    if select == old_select {
-        return None;
+    for (view_namespace, view_name, (new_sql, new_select)) in view_rewrites {
+        let view = Arc::make_mut(
+            schema
+                .view_mut(view_namespace, &view_name)
+                .expect("view being rewritten should be in schema"),
+        );
+        view.sql = new_sql;
+        view.select_stmt = new_select;
     }
-    let new_sql = ast::Stmt::CreateView {
-        temporary,
-        if_not_exists,
-        view_name,
-        columns,
-        select: select.clone(),
-    }
-    .to_string();
-    Some((new_sql, select))
+    Ok(())
 }
 
 /// The qualifiers that name `namespace` in the body of a view, or None when
