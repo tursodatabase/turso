@@ -191,6 +191,7 @@ pub fn py_turso_sync_new(
         .map(|c| c.reserved_bytes())
         .or(sync_config.reserved_bytes);
     let sync_config = rsapi::TursoDatabaseSyncConfig {
+        cipher: None,
         path: sync_config.path.clone(),
         remote_url: sync_config.remote_url.clone(),
         client_name: sync_config.client_name.clone(),
