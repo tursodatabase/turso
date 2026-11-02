@@ -300,6 +300,8 @@ pub struct AlterColumnData {
     pub rename: bool,
     pub rewritten_triggers: Vec<(NamespaceRef, String, String)>,
     pub renamed_index_methods: Vec<(String, Arc<dyn crate::index_method::IndexMethodAttachment>)>,
+    /// Automatic indexes to rename, as (old name, new name).
+    pub renamed_autoindexes: Vec<(String, String)>,
 }
 
 /// Data for IntegrityCk instruction (boxed to keep Insn small).

@@ -38,6 +38,7 @@ use crate::{
         check_expr_references_column, escape_sql_string_literal, is_builtin_strict_type,
         normalize_ident, parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
         rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
+        PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
     },
     vdbe::{
         affinity::Affinity,
@@ -1866,6 +1867,79 @@ pub fn translate_alter_table(
                 ));
             }
 
+            if !rename
+                && !btree.has_rowid
+                && btree.primary_key_is_inline
+                && btree.columns()[column_index].primary_key()
+            {
+                return Err(LimboError::ParseError(format!(
+                    "PRIMARY KEY missing on table {table_name}"
+                )));
+            }
+
+            // `a UNIQUE, UNIQUE (a DESC)` keeps one index, built for the column constraint.
+            // Once the column constraint is gone, the stored CREATE TABLE describes that index
+            // by the table constraint, which can sort differently, resolve conflicts
+            // differently, and give the index another automatic index number.
+            if !rename
+                && btree.unique_sets.iter().any(|set| {
+                    set.repeated_by_table_constraint
+                        && set.columns[0].name.eq_ignore_ascii_case(old_column_name)
+                })
+            {
+                return Err(LimboError::ParseError(format!(
+                    "cannot ALTER COLUMN \"{from}\": a table constraint repeats its PRIMARY KEY or UNIQUE constraint"
+                )));
+            }
+
+            // ALTER COLUMN replaces the whole column definition, so a PRIMARY KEY or UNIQUE
+            // written in the old definition is dropped together with its automatic index.
+            let dropped_autoindex = btree
+                .unique_sets
+                .iter()
+                .find(|set| !rename && set.is_column_constraint_of(old_column_name))
+                .map(|_| {
+                    table_indexes
+                        .iter()
+                        .find(|index| {
+                            split_autoindex_name(&index.name).is_some()
+                                && index.columns.len() == 1
+                                && index.columns[0].pos_in_table == column_index
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            LimboError::InternalError(format!(
+                                "no automatic index for the constraint on column {old_column_name}"
+                            ))
+                        })
+                })
+                .transpose()?;
+            // SQLite numbers automatic indexes by the order of the constraints in CREATE
+            // TABLE, so the ones after the dropped index move down by one.
+            let renamed_autoindexes: Vec<(String, String)> = match &dropped_autoindex {
+                None => Vec::new(),
+                Some(dropped) => {
+                    let (_, dropped_number) = split_autoindex_name(&dropped.name)
+                        .expect("dropped index should be an automatic index");
+                    table_indexes
+                        .iter()
+                        .filter_map(|index| {
+                            let (prefix, number) = split_autoindex_name(&index.name)?;
+                            (number > dropped_number)
+                                .then(|| (index.name.clone(), format!("{prefix}_{}", number - 1)))
+                        })
+                        .collect()
+                }
+            };
+            let table_indexes: Vec<_> = table_indexes
+                .into_iter()
+                .filter(|index| {
+                    dropped_autoindex
+                        .as_ref()
+                        .is_none_or(|dropped| dropped.name != index.name)
+                })
+                .collect();
+
             let (rewrites_physical_layout, virtual_generated_values_may_change, replacement_column) =
                 match rename {
                     true => (false, false, None),
@@ -2183,6 +2257,31 @@ pub fn translate_alter_table(
                 program.emit_string8_new_reg(definition.to_string());
                 program.mark_last_insn_constant();
 
+                let name_column = first_column + 1;
+                let next_row = program.allocate_label();
+                if let Some(dropped) = &dropped_autoindex {
+                    let dropped_name = program
+                        .emit_string8_new_reg(resolver.mangle_name(namespace, &dropped.name));
+                    program.mark_last_insn_constant();
+                    let keep_row = program.allocate_label();
+                    program.emit_insn(Insn::Ne {
+                        lhs: name_column,
+                        rhs: dropped_name,
+                        target_pc: keep_row,
+                        flags: CmpInsFlags::default(),
+                        collation: CollationSeq::NOCASE,
+                    });
+                    program.emit_insn(Insn::Delete {
+                        cursor_id,
+                        table_name: SQLITE_TABLEID.to_string(),
+                        is_part_of_update: false,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: next_row,
+                    });
+                    program.preassign_label_to_next_insn(keep_row);
+                }
+
                 let out = program.alloc_registers(sqlite_schema_column_len);
 
                 program.emit_insn(Insn::Function {
@@ -2199,6 +2298,22 @@ pub fn translate_alter_table(
                         collation: CollationSeq::BINARY,
                     },
                 });
+
+                for (old_name, new_name) in &renamed_autoindexes {
+                    let old_name =
+                        program.emit_string8_new_reg(resolver.mangle_name(namespace, old_name));
+                    program.mark_last_insn_constant();
+                    let not_renamed = program.allocate_label();
+                    program.emit_insn(Insn::Ne {
+                        lhs: name_column,
+                        rhs: old_name,
+                        target_pc: not_renamed,
+                        flags: CmpInsFlags::default(),
+                        collation: CollationSeq::NOCASE,
+                    });
+                    program.emit_string8(resolver.mangle_name(namespace, new_name), out + 1);
+                    program.preassign_label_to_next_insn(not_renamed);
+                }
 
                 let record = program.alloc_register();
 
@@ -2227,6 +2342,7 @@ pub fn translate_alter_table(
                     flag: crate::vdbe::insn::InsertFlags(0),
                     table_name: table_name.to_string(),
                 });
+                program.preassign_label_to_next_insn(next_row);
             });
 
             // Update trigger SQL for renamed columns
@@ -2382,6 +2498,20 @@ pub fn translate_alter_table(
                 );
             }
 
+            if let Some(dropped) = dropped_autoindex {
+                program.emit_insn(Insn::Destroy {
+                    db: database_id,
+                    root: dropped.root_page,
+                    former_root_reg: 0,
+                    is_temp: 0,
+                });
+                program.emit_insn(Insn::DropIndex {
+                    index: dropped,
+                    db: database_id,
+                    namespace: namespace.id,
+                });
+            }
+
             program.emit_insn(Insn::SetCookie {
                 db: database_id,
                 cookie: Cookie::SchemaVersion,
@@ -2398,12 +2528,22 @@ pub fn translate_alter_table(
                     rename,
                     rewritten_triggers: triggers_to_rewrite,
                     renamed_index_methods,
+                    renamed_autoindexes,
                 }),
             });
         }
     };
 
     Ok(())
+}
+
+/// Splits `sqlite_autoindex_<table>_<N>` into `sqlite_autoindex_<table>` and N.
+fn split_autoindex_name(name: &str) -> Option<(&str, u32)> {
+    if !name.starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX) {
+        return None;
+    }
+    let (prefix, number) = name.rsplit_once('_')?;
+    Some((prefix, number.parse().ok()?))
 }
 
 /// Reject ALTER TABLE on a plain or materialized view with SQLite's messages
