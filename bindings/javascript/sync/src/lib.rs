@@ -152,6 +152,7 @@ pub struct SyncEngineOpts {
     /// Base64-encoded encryption key for the Turso Cloud database.
     /// Must match the key used when creating the encrypted database.
     pub remote_encryption_key: Option<String>,
+    pub local_encryption_key: Option<String>,
     pub partial_sync_opts: Option<JsPartialSyncOpts>,
     /// Optional cap on the number of CDC operations packed into a single push
     /// batch. When set, push splits on transaction boundaries once the batch
@@ -170,6 +171,7 @@ pub struct SyncEngineOpts {
 }
 
 struct SyncEngineOptsFilled {
+    pub encryption: Option<turso_sync_engine::sync_encryption::SyncEncryption>,
     pub path: String,
     pub remote_url: Option<String>,
     pub client_name: String,
@@ -255,13 +257,39 @@ impl SyncEngine {
                 turso_node::browser::opfs()
             }
         };
-        let db_opts = match &opts.experimental {
-            Some(experimental) => turso_node::apply_experimental_features(
-                turso_core::DatabaseOpts::new(),
-                experimental,
-            ),
-            None => turso_core::DatabaseOpts::new(),
-        };
+        let mut experimental = opts.experimental.clone().unwrap_or_default();
+        let encryption = opts
+            .remote_encryption_cipher
+            .as_deref()
+            .filter(|cipher| {
+                opts.local_encryption_key.is_some()
+                    || !matches!(*cipher, "chacha20poly1305" | "chacha20-poly1305")
+            })
+            .map(|cipher| {
+                let cipher = turso_core::CipherMode::try_from(cipher)
+                    .map_err(|error| napi::Error::from_reason(error.to_string()))?;
+                let key = opts
+                    .local_encryption_key
+                    .as_deref()
+                    .map(turso_core::EncryptionKey::from_hex_string)
+                    .transpose()
+                    .map_err(|error| napi::Error::from_reason(error.to_string()))?;
+                turso_sync_engine::sync_encryption::SyncEncryption::new(cipher, key)
+                    .map_err(|error| napi::Error::from_reason(error.to_string()))
+            })
+            .transpose()?;
+        if opts.local_encryption_key.is_some() && encryption.is_none() {
+            return Err(napi::Error::from_reason(
+                "local sync encryption requires a shared cipher",
+            ));
+        }
+        if opts.local_encryption_key.is_some()
+            && !experimental.iter().any(|value| value == "encryption")
+        {
+            experimental.push("encryption".into());
+        }
+        let db_opts =
+            turso_node::apply_experimental_features(turso_core::DatabaseOpts::new(), &experimental);
         #[allow(clippy::arc_with_non_send_sync)]
         let db = Arc::new(Mutex::new(turso_node::Database::new_with_io(
             opts.path.clone(),
@@ -272,11 +300,43 @@ impl SyncEngine {
                 timeout: None,
                 default_query_timeout: None,
                 tracing: opts.tracing.clone(),
-                experimental: opts.experimental.clone(),
-                encryption: None, // Local encryption not supported in sync mode
+                experimental: Some(experimental),
+                encryption: opts.local_encryption_key.as_ref().map(|key| {
+                    turso_node::EncryptionOpts {
+                        cipher: match encryption.as_ref().unwrap().cipher() {
+                            turso_core::CipherMode::Aes256Gcm => {
+                                turso_node::EncryptionCipher::Aes256Gcm
+                            }
+                            turso_core::CipherMode::Aes128Gcm => {
+                                turso_node::EncryptionCipher::Aes128Gcm
+                            }
+                            turso_core::CipherMode::Aegis256 => {
+                                turso_node::EncryptionCipher::Aegis256
+                            }
+                            turso_core::CipherMode::Aegis256X2 => {
+                                turso_node::EncryptionCipher::Aegis256x2
+                            }
+                            turso_core::CipherMode::Aegis256X4 => {
+                                turso_node::EncryptionCipher::Aegis256x4
+                            }
+                            turso_core::CipherMode::Aegis128L => {
+                                turso_node::EncryptionCipher::Aegis128l
+                            }
+                            turso_core::CipherMode::Aegis128X2 => {
+                                turso_node::EncryptionCipher::Aegis128x2
+                            }
+                            turso_core::CipherMode::Aegis128X4 => {
+                                turso_node::EncryptionCipher::Aegis128x4
+                            }
+                            turso_core::CipherMode::None => unreachable!(),
+                        },
+                        hexkey: key.clone(),
+                    }
+                }),
             }),
         )?));
         let opts_filled = SyncEngineOptsFilled {
+            encryption,
             path: opts.path,
             remote_url: opts.remote_url,
             client_name: opts
@@ -359,7 +419,7 @@ impl SyncEngine {
     #[napi]
     pub fn connect(&mut self) -> napi::Result<GeneratorHolder> {
         let opts = DatabaseSyncEngineOpts {
-            encryption: None,
+            encryption: self.opts.encryption.clone(),
             client_name: self.opts.client_name.clone(),
             remote_url: self.opts.remote_url.clone(),
             wal_pull_batch_size: self.opts.wal_pull_batch_size as u64,
