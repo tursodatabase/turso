@@ -519,3 +519,212 @@ fn checked_add(offset: u64, length: usize) -> Result<u64> {
 fn invalid(message: &str) -> Error {
     Error::DatabaseSyncEngineError(message.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use genawaiter::{sync::Gen, GeneratorState};
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use turso_core::{io::FileSyncType, CipherMode, EncryptionKey, MemoryIO, OpenFlags, IO};
+
+    fn crypto() -> EncryptionContext {
+        EncryptionContext::new(
+            CipherMode::Aes256Gcm,
+            &EncryptionKey::new_256([3; 32]),
+            4096,
+        )
+        .expect("crypto")
+    }
+
+    fn run<T, F: Future<Output = Result<T>>>(f: impl FnOnce(Coro<()>) -> F) -> Result<T> {
+        let mut gen = Gen::new(|co| f(co.into()));
+        match gen.resume_with(Ok(())) {
+            GeneratorState::Complete(result) => result,
+            GeneratorState::Yielded(_) => panic!("MemoryIO should complete inline"),
+        }
+    }
+
+    fn memory_file() -> Arc<dyn File> {
+        MemoryIO::new()
+            .open_file("test-changes", OpenFlags::Create, false)
+            .expect("file")
+    }
+
+    #[test]
+    fn roundtrip_records_empty_downloads_and_slot_reuse() {
+        for encrypted in [false, true] {
+            let file = memory_file();
+            let mut changes = ChangesFile::new(file.clone(), encrypted.then(crypto));
+            run(|coro| async move {
+                changes.reset(&coro, ChangeKind::Logical).await?;
+                let empty = changes.finish(&coro).await?;
+                assert!(empty.is_empty());
+                assert_eq!(file.size()?, 0);
+                assert!(changes
+                    .open_reader(&coro, &empty)
+                    .await?
+                    .next_record(&coro)
+                    .await?
+                    .is_none());
+                assert!(changes.finish(&coro).await.is_err());
+                changes.reset(&coro, ChangeKind::Logical).await?;
+                let mut records = Vec::new();
+                for size in [1, 2, 32766, 32768, 100_000] {
+                    let record = vec![42; size];
+                    changes.append_record(&coro, &record).await?;
+                    records.push(record);
+                }
+                let batch = changes.finish(&coro).await?;
+                assert!(!batch.is_empty());
+                assert!(changes.open_reader(&coro, &empty).await.is_err());
+                let mut reader = changes.open_reader(&coro, &batch).await?;
+                for expected in records {
+                    assert_eq!(reader.next_record(&coro).await?, Some(expected));
+                }
+                assert!(reader.next_record(&coro).await?.is_none());
+                assert!(reader.next_record(&coro).await?.is_none());
+                drop(reader);
+                changes.reset(&coro, ChangeKind::Pages).await?;
+                changes.append_record(&coro, &[7; 4120]).await?;
+                let pages = changes.finish(&coro).await?;
+                let mut reader = changes.open_reader(&coro, &pages).await?;
+                assert_eq!(reader.next_record(&coro).await?, Some(vec![7; 4120]));
+                assert!(reader.next_record(&coro).await?.is_none());
+                Ok(())
+            })
+            .expect("roundtrip");
+        }
+    }
+
+    #[test]
+    fn logical_disk_format_has_one_delimiter_and_message_only_counts() {
+        for encrypted in [false, true] {
+            let file = memory_file();
+            let mut changes = ChangesFile::new(file.clone(), encrypted.then(crypto));
+            run(|coro| async move {
+                changes.reset(&coro, ChangeKind::Logical).await?;
+                let message = vec![42; CHUNK_SIZE + 1];
+                changes.append_record(&coro, &message).await?;
+                let sealed = changes.finish(&coro).await?;
+                let prefix_len = prost::length_delimiter_len(message.len());
+                assert_eq!(
+                    sealed.counts,
+                    ChangeCounts {
+                        records: 1,
+                        bytes: message.len() as u64
+                    }
+                );
+                assert_eq!(
+                    sealed.size as usize,
+                    prefix_len + message.len() + if encrypted { 2 * 28 } else { 0 }
+                );
+                let stored = changes.read_exact(&coro, 0, sealed.size as usize).await?;
+                let mut input = stored.as_slice();
+                assert_eq!(
+                    prost::decode_length_delimiter(&mut input).unwrap(),
+                    message.len()
+                );
+                if encrypted {
+                    // Decryption returns message bytes, with no nested delimiter.
+                    let first = sealed.identity.open_chunk(
+                        &crypto(),
+                        0,
+                        message.len() as u64,
+                        0,
+                        &input[..CHUNK_SIZE + 28],
+                    )?;
+                    assert_eq!(first, message[..CHUNK_SIZE]);
+                } else {
+                    assert_eq!(input, message);
+                }
+                let mut reopened = ChangesFile::new(file, encrypted.then(crypto));
+                assert!(reopened.sealed().is_err());
+                assert!(reopened.open_reader(&coro, &sealed).await.is_err());
+                reopened.reset(&coro, ChangeKind::Logical).await?;
+                assert!(reopened.finish(&coro).await?.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn encrypted_records_reject_reordering_and_old_batch_substitution() {
+        for kind in [ChangeKind::Logical, ChangeKind::Pages] {
+            for old_batch in [false, true] {
+                let mut changes = ChangesFile::new(memory_file(), Some(crypto()));
+                run(|coro| async move {
+                    let length = if kind == ChangeKind::Pages { 4120 } else { 100 };
+                    changes.reset(&coro, kind).await?;
+                    changes.append_record(&coro, &vec![1; length]).await?;
+                    changes.append_record(&coro, &vec![2; length]).await?;
+                    let first = changes.finish(&coro).await?;
+                    let stored = changes.read_exact(&coro, 0, first.size as usize).await?;
+                    let sealed = if old_batch {
+                        changes.reset(&coro, kind).await?;
+                        changes.append_record(&coro, &vec![1; length]).await?;
+                        changes.append_record(&coro, &vec![2; length]).await?;
+                        let sealed = changes.finish(&coro).await?;
+                        changes.write(&coro, 0, stored).await?;
+                        sealed
+                    } else {
+                        let half = stored.len() / 2;
+                        changes
+                            .write(&coro, 0, [&stored[half..], &stored[..half]].concat())
+                            .await?;
+                        first
+                    };
+                    let mut reader = changes.open_reader(&coro, &sealed).await?;
+                    assert!(matches!(
+                        reader.next_record(&coro).await,
+                        Err(Error::AuthenticationFailed)
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_payload_truncation_and_trailing_bytes_fail() {
+        for damage in [0, 1, 2] {
+            let file = memory_file();
+            let mut changes = ChangesFile::new(file.clone(), Some(crypto()));
+            run(|coro| async move {
+                changes.reset(&coro, ChangeKind::Logical).await?;
+                changes.append_record(&coro, &[9; 100]).await?;
+                let sealed = changes.finish(&coro).await?;
+                match damage {
+                    0 => {
+                        let mut reader = changes.open_reader(&coro, &sealed).await?;
+                        let pos = 1;
+                        let original = reader.file.read_exact(&coro, pos, 1).await?[0];
+                        reader.file.write(&coro, pos, vec![original ^ 1]).await?;
+                        assert!(matches!(
+                            reader.next_record(&coro).await,
+                            Err(Error::AuthenticationFailed)
+                        ));
+                        assert!(reader.next_record(&coro).await.is_err());
+                    }
+                    1 => {
+                        let c = file.truncate(sealed.size - 1, Completion::new_trunc(|_| {}))?;
+                        assert!(c.succeeded());
+                        assert!(changes.open_reader(&coro, &sealed).await.is_err());
+                    }
+                    2 => {
+                        changes.write(&coro, sealed.size, vec![0]).await?;
+                        assert!(changes.open_reader(&coro, &sealed).await.is_err());
+                    }
+                    _ => unreachable!(),
+                }
+                Ok(())
+            })
+            .expect("tamper test");
+        }
+    }
+
+}
