@@ -6289,6 +6289,200 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_matches_native_writer() {
+        use super::frame_codec::*;
+        use crate::{CipherMode, EncryptionContext, EncryptionKey};
+
+        for cipher in [
+            CipherMode::Aes128Gcm,
+            CipherMode::Aes256Gcm,
+            CipherMode::Aegis128L,
+            CipherMode::Aegis128X2,
+            CipherMode::Aegis128X4,
+            CipherMode::Aegis256,
+            CipherMode::Aegis256X2,
+            CipherMode::Aegis256X4,
+        ] {
+            let key = if cipher.required_key_size() == 16 {
+                EncryptionKey::new_128([42; 16])
+            } else {
+                EncryptionKey::new_256([42; 32])
+            };
+            let crypto = EncryptionContext::new(cipher, &key, 4096).expect("crypto");
+            for portable in [false, true] {
+                let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+                let file = open_test_file(&io, "codec.db-log");
+                let mut log = LogicalLog::new(file.clone(), io.clone(), Some(crypto.clone()));
+                for size in [0, 100, 32768, 100_000] {
+                    let rows = if size == 0 {
+                        Vec::new()
+                    } else {
+                        vec![make_test_row_version(
+                            (-2).into(),
+                            size,
+                            &"x".repeat(size as usize),
+                            size as u64,
+                        )]
+                    };
+                    let mut tx =
+                        crate::mvcc::database::LogRecord::for_test(size as u64, &rows, None);
+                    tx.portable_changes_enabled = portable;
+                    io.wait_for_completion(log.log_tx(tx).expect("write"))
+                        .expect("complete write");
+                }
+                let stored = read_file_bytes(file, &io);
+                let header = validate_log_header(&stored[..LOG_HDR_SIZE]).expect("header");
+                let mut source_crc = header.initial_crc();
+                let mut wire_crc = source_crc;
+                let mut offset = LOG_HDR_SIZE;
+                let mut normalized = header.bytes().to_vec();
+                let mut output = Vec::new();
+                while offset < stored.len() {
+                    let layout = inspect_frame_prefix(&stored[offset..], Some(&crypto))
+                        .expect("layout")
+                        .expect("complete prefix");
+                    let end = offset + layout.stored_size();
+                    let frame = validate_frame_into(
+                        &header,
+                        offset as u64,
+                        &stored[offset..end],
+                        source_crc,
+                        Some(&crypto),
+                        &mut output,
+                    )
+                    .expect("frame");
+                    assert_eq!(frame.source_end(), end as u64);
+                    assert_eq!(frame.wire_size(), layout.wire_size());
+                    let keyless = inspect_frame_prefix_with_overhead(
+                        &stored[offset..],
+                        Some((cipher.tag_size(), cipher.nonce_size())),
+                    )
+                    .expect("keyless layout")
+                    .expect("complete header");
+                    assert_eq!(keyless.stored_size(), layout.stored_size());
+                    assert_eq!(keyless.wire_size(), frame.wire_size());
+                    assert_eq!(frame.extension().is_empty(), !portable);
+                    let wire = plaintext_wire_parts(&frame, wire_crc);
+                    normalized.extend_from_slice(wire.header);
+                    normalized.extend_from_slice(wire.body);
+                    normalized.extend_from_slice(&wire.trailer);
+                    wire_crc = wire.next_crc;
+                    source_crc = frame.source_crc();
+                    offset = end;
+                }
+                let plain_file = open_test_file(&io, "normalized.db-log");
+                overwrite_file_bytes(plain_file.clone(), &io, &normalized);
+                let mut reader = StreamingLogicalLogReader::new(plain_file, None);
+                reader.read_header(&io).expect("wire header");
+                for expected_ops in [0, 1, 1, 1] {
+                    let ParseResult::Frame(frame) = io
+                        .block(|| reader.parse_next_transaction())
+                        .expect("wire decode")
+                    else {
+                        panic!("expected complete wire frame");
+                    };
+                    assert_eq!(frame.ops.len(), expected_ops);
+                }
+                assert!(matches!(
+                    io.block(|| reader.parse_next_transaction())
+                        .expect("wire EOF"),
+                    ParseResult::Eof
+                ));
+            }
+        }
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn strict_frame_codec_rejects_corruption_and_truncation() {
+        use super::frame_codec::*;
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let file = open_test_file(&io, "codec-corrupt.db-log");
+        let crypto = test_enc_ctx();
+        let mut tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version(
+                (-2).into(),
+                1,
+                &"private".repeat(10_000),
+                10,
+            )],
+            None,
+        );
+        tx.portable_changes_enabled = true;
+        write_first_encrypted_tx(file.clone(), &io, &crypto, tx);
+        let stored = read_file_bytes(file, &io);
+        let header = validate_log_header(&stored[..LOG_HDR_SIZE]).expect("header");
+        let frame = &stored[LOG_HDR_SIZE..];
+        let mut output = Vec::new();
+        for length in [0, 3, 23, 39, 40, 32768, frame.len() - 1] {
+            assert!(validate_frame_into(
+                &header,
+                56,
+                &frame[..length],
+                header.initial_crc(),
+                Some(&crypto),
+                &mut output
+            )
+            .is_err());
+        }
+        let mut corrupt = frame.to_vec();
+        corrupt[TX_EXT_HEADER_SIZE] ^= 1;
+        assert!(validate_frame_into(
+            &header,
+            56,
+            &corrupt,
+            header.initial_crc(),
+            Some(&crypto),
+            &mut output
+        )
+        .is_err());
+        let trailer = corrupt.len() - TX_TRAILER_SIZE;
+        let crc = crc32c::crc32c_append(header.initial_crc(), &corrupt[..trailer]);
+        corrupt[trailer..trailer + 4].copy_from_slice(&crc.to_le_bytes());
+        let error = validate_frame_into(
+            &header,
+            56,
+            &corrupt,
+            header.initial_crc(),
+            Some(&crypto),
+            &mut output,
+        )
+        .expect_err("recomputed CRC must not bypass authentication");
+        assert!(error.to_string().contains("authentication"));
+        assert!(output.is_empty());
+        assert!(validate_frame_into(
+            &header,
+            56,
+            frame,
+            header.initial_crc(),
+            Some(&wrong_key_enc_ctx()),
+            &mut output
+        )
+        .is_err());
+        let mut other_header = stored[..LOG_HDR_SIZE].to_vec();
+        other_header[8] ^= 1;
+        other_header[52..].fill(0);
+        let crc = crc32c::crc32c(&other_header);
+        other_header[52..].copy_from_slice(&crc.to_le_bytes());
+        let other_header = validate_log_header(&other_header).expect("valid different salt");
+        assert!(validate_frame_into(
+            &other_header,
+            56,
+            frame,
+            header.initial_crc(),
+            Some(&crypto),
+            &mut output
+        )
+        .is_err());
+        let mut overflow = frame[..TX_EXT_HEADER_SIZE].to_vec();
+        overflow[4..12].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(inspect_frame_prefix(&overflow, Some(&crypto)).is_err());
+        assert!(inspect_frame_prefix(&overflow, None).is_err());
+    }
+
     fn test_enc_ctx() -> crate::storage::encryption::EncryptionContext {
         use crate::storage::encryption::{CipherMode, EncryptionKey};
         let key = EncryptionKey::Key128([0x42u8; 16]);
