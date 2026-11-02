@@ -1369,7 +1369,15 @@ impl BTreeCursor {
         root_page: i64,
         table: &BTreeTable,
         num_columns: usize,
-    ) -> Self {
+    ) -> Result<Self> {
+        // SQLite stores such a column once per PRIMARY KEY entry and Turso
+        // stores it once, so Turso can neither read nor write SQLite's rows.
+        if table.primary_key_repeats_column_with_other_collation() {
+            return Err(LimboError::ParseError(format!(
+                "table {}: a WITHOUT ROWID PRIMARY KEY that lists a column more than once with different collations is not supported",
+                table.name
+            )));
+        }
         let pk_columns = table.primary_key_columns.iter().enumerate();
         let key_info = pk_columns.map(|(i, (col_name, order))| {
             let (_, column) = table
@@ -1385,7 +1393,12 @@ impl BTreeCursor {
             IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
                 .expect(crate::alloc::ALLOC_ERR_MSG),
         );
-        Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+        Ok(Self::new_with_index_info(
+            pager,
+            root_page,
+            num_columns,
+            Some(index_info),
+        ))
     }
 
     pub fn new_index(

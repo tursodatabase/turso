@@ -423,7 +423,7 @@ The following are available behind [experimental feature flags](/docs/sql-refere
 
 | Feature | Flag | Notes |
 |---------|------|-------|
-| `WITHOUT ROWID` | `--experimental-without-rowid` | WITHOUT ROWID tables have limitations; see the experimental features page. A `PRIMARY KEY` that lists a column more than once with different collations, such as `PRIMARY KEY(a COLLATE NOCASE, a)`, is rejected |
+| `WITHOUT ROWID` | `--experimental-without-rowid` | WITHOUT ROWID tables have limitations; see the experimental features page. A `PRIMARY KEY` that lists a column more than once with different collations, such as `PRIMARY KEY(a COLLATE NOCASE, a)`, is rejected, and such a table in an existing database (for example one created by SQLite) cannot be read or written |
 
 ## Examples
 
