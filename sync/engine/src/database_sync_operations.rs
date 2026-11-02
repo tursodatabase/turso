@@ -3465,9 +3465,15 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     protocol: DatabaseSyncEngineProtocolVersion,
     partial_sync: Option<PartialSyncOpts>,
     pull_bytes_threshold: Option<usize>,
+    local_crypto: Option<&turso_core::EncryptionContext>,
 ) -> Result<(DatabasePullRevision, RemotePullProtocol)> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
+            if local_crypto.is_some() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "encrypted bootstrap requires sync protocol V1".into(),
+                ));
+            }
             if partial_sync.is_some() {
                 return Err(Error::DatabaseSyncEngineError(
                     "can't bootstrap prefix of database with legacy protocol".to_string(),
@@ -3478,7 +3484,15 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
             Ok((revision, RemotePullProtocol::Pages))
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
-            bootstrap_db_file_v1(ctx, io, main_db_path, partial_sync, pull_bytes_threshold).await
+            bootstrap_db_file_v1(
+                ctx,
+                io,
+                main_db_path,
+                partial_sync,
+                pull_bytes_threshold,
+                local_crypto,
+            )
+            .await
         }
     }
 }
@@ -3510,6 +3524,7 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
     server_pages_selector: Vec<u8>,
     server_query_selector: String,
     truncate_on_first_response: bool,
+    local_crypto: Option<&turso_core::EncryptionContext>,
 ) -> Result<PullUpdatesRespProtoBody> {
     let request = PullUpdatesReqProtoBody {
         encoding: PageUpdatesEncodingReq::Raw as i32,
@@ -3548,19 +3563,18 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
     tracing::info!("bootstrap_db_file: got header={:?}", header);
     ensure_page_stream(&header, "pull_chunk_into_file")?;
     if truncate_on_first_response {
-        let c = Completion::new_trunc(move |result| {
-            let Ok(rc) = result else {
-                return;
-            };
-            assert!(rc as usize == 0);
-        });
-        let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
-        while !c.succeeded() {
-            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-        }
+        let size = header
+            .db_size
+            .checked_mul(PAGE_SIZE as u64)
+            .ok_or_else(|| {
+                Error::DatabaseSyncEngineError("bootstrap database size overflow".into())
+            })?;
+        let c = file.truncate(size, Completion::new_trunc(|_| {}))?;
+        wait_file_completion(ctx.coro, &c).await?;
     }
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
+    let written = local_crypto.map(|_| Arc::new(Mutex::new(None)));
     while let Some(page_data) = wait_proto_message::<Ctx, PageData>(
         ctx.coro,
         &completion,
@@ -3573,8 +3587,16 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
             "bootstrap_db_file: received page page_id={}",
             page_data.page_id
         );
-        let offset = page_data.page_id * PAGE_SIZE as u64;
-        let page = decode_page(&header, page_data)?;
+        if local_crypto.is_some() && page_data.page_id >= header.db_size {
+            return Err(Error::DatabaseSyncEngineError(
+                "bootstrap page exceeds database size".into(),
+            ));
+        }
+        let page_id = page_data.page_id;
+        let offset = page_id.checked_mul(PAGE_SIZE as u64).ok_or_else(|| {
+            Error::DatabaseSyncEngineError("bootstrap page offset overflow".into())
+        })?;
+        let mut page = decode_page(&header, page_data)?;
         if page.len() != PAGE_SIZE {
             return Err(Error::DatabaseSyncEngineError(format!(
                 "page has unexpected size: {} != {}",
@@ -3582,17 +3604,51 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
                 PAGE_SIZE
             )));
         }
+        if let Some(crypto) = local_crypto {
+            let reserved = usize::from(crypto.required_reserved_bytes());
+            if page_id == 0
+                && (!page.starts_with(b"SQLite format 3\0") || usize::from(page[20]) != reserved)
+            {
+                return Err(Error::DatabaseSyncEngineError(
+                    "bootstrap page header is incompatible with local encryption".into(),
+                ));
+            }
+            if page[PAGE_SIZE - reserved..].iter().any(|byte| *byte != 0) {
+                return Err(Error::DatabaseSyncEngineError(
+                    "bootstrap page encryption reserve is not empty".into(),
+                ));
+            }
+            let native_page_id = usize::try_from(page_id.checked_add(1).ok_or_else(|| {
+                Error::DatabaseSyncEngineError("bootstrap page number overflow".into())
+            })?)
+            .map_err(|_| {
+                Error::DatabaseSyncEngineError("bootstrap page number overflows usize".into())
+            })?;
+            page = crypto.encrypt_page(&page, native_page_id)?;
+        }
         buffer.as_mut_slice().copy_from_slice(&page);
-        let c = Completion::new_write(move |result| {
-            // todo(sivukhin): we need to error out in case of partial read
-            let Ok(size) = result else {
-                return;
-            };
-            assert!(size as usize == PAGE_SIZE);
-        });
-        let c = file.pwrite(offset, buffer.clone(), c)?;
-        while !c.succeeded() {
-            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+        if let Some(written) = &written {
+            *written.lock().unwrap() = None;
+            let result = written.clone();
+            let c = Completion::new_write(move |value| {
+                *result.lock().unwrap() = value.ok();
+            });
+            let c = file.pwrite(offset, buffer.clone(), c)?;
+            wait_file_completion(ctx.coro, &c).await?;
+            if *written.lock().unwrap() != Some(PAGE_SIZE as i32) {
+                return Err(Error::IoError("short bootstrap page write".into()));
+            }
+        } else {
+            let c = Completion::new_write(move |result| {
+                let Ok(size) = result else {
+                    return;
+                };
+                assert!(size as usize == PAGE_SIZE);
+            });
+            let c = file.pwrite(offset, buffer.clone(), c)?;
+            while !c.succeeded() {
+                ctx.coro.yield_(SyncEngineIoResult::IO).await?;
+            }
         }
     }
     Ok(header)
@@ -3604,7 +3660,21 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     main_db_path: &str,
     partial_sync: Option<PartialSyncOpts>,
     pull_bytes_threshold: Option<usize>,
+    local_crypto: Option<&turso_core::EncryptionContext>,
 ) -> Result<(DatabasePullRevision, RemotePullProtocol)> {
+    // A remote cipher also describes legacy cloud databases, which support
+    // chunked plaintext replicas. Native servers enforce their own selectors.
+    if local_crypto.is_some() && pull_bytes_threshold.is_some_and(|threshold| threshold > 0) {
+        return Err(Error::DatabaseSyncEngineError(
+            "pull_bytes_threshold must be unset or zero for encrypted bootstrap: filtered bootstrap requests are unsupported"
+                .into(),
+        ));
+    }
+    if local_crypto.is_some() && partial_sync.is_some() {
+        return Err(Error::DatabaseSyncEngineError(
+            "encrypted bootstrap requires a full database".into(),
+        ));
+    }
     if let Some(PartialSyncOpts {
         bootstrap_strategy: None,
         ..
@@ -3660,8 +3730,16 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     } else {
         Vec::new()
     };
-    let header =
-        pull_chunk_into_file(ctx, &file, "", first_selector, server_query_selector, true).await?;
+    let header = pull_chunk_into_file(
+        ctx,
+        &file,
+        "",
+        first_selector,
+        server_query_selector,
+        true,
+        local_crypto,
+    )
+    .await?;
 
     // Subsequent chunks (if any). Pin every chunk to the same `server_revision`
     // so the page set stays consistent across HTTP round-trips, and never go
@@ -3682,6 +3760,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
                 selector,
                 String::new(),
                 false,
+                local_crypto,
             )
             .await?;
             start = end;
@@ -6369,6 +6448,308 @@ mod tests {
             apply_mode,
             mvcc_log: None,
         }
+    }
+
+    #[test]
+    fn bootstrap_chunk_threshold_rejects_only_local_encryption() {
+        use crate::sync_encryption::SyncEncryption;
+        use turso_core::{CipherMode, EncryptionKey};
+
+        // Legacy encrypted cloud databases support chunked plaintext replicas.
+        // Local encryption still requires an unfiltered bootstrap.
+        for (request_config, local) in [(false, false), (true, false), (true, true), (false, true)]
+        {
+            for threshold in [None, Some(0), Some(super::PAGE_SIZE)] {
+                for existing in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("replica.db");
+                    if existing {
+                        std::fs::write(&path, b"existing contents").unwrap();
+                    }
+                    let config = SyncEncryption::new(
+                        CipherMode::Aes256Gcm,
+                        local.then(|| EncryptionKey::new_256([22; 32])),
+                    )
+                    .unwrap();
+                    let crypto = config.local_context().unwrap();
+                    let mut header = page_header(
+                        PullUpdatesStreamKind::Pages as i32,
+                        PullUpdatesApplyMode::Incremental as i32,
+                    );
+                    header.db_size = 0;
+                    let http = Arc::new(TestHttpIo {
+                        response: header.encode_length_delimited_to_vec(),
+                        chunk: 11,
+                        ..Default::default()
+                    });
+                    let stats = SyncEngineIoStats::new(http.clone());
+                    let io: Arc<dyn turso_core::IO> =
+                        Arc::new(turso_core::PlatformIO::new().unwrap());
+                    let key = crate::types::Secret::new("cloud-key");
+                    let mut generator = genawaiter::sync::Gen::new(|co| async {
+                        let coro: Coro<()> = co.into();
+                        let ctx = SyncOperationCtx::new(&coro, &stats, None, Some(&key))
+                            .with_encryption_config(request_config.then_some(&config));
+                        super::bootstrap_db_file_v1(
+                            &ctx,
+                            &io,
+                            path.to_str().unwrap(),
+                            None,
+                            threshold,
+                            crypto.as_ref(),
+                        )
+                        .await
+                    });
+                    let result = loop {
+                        match generator.resume_with(Ok(())) {
+                            genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                            genawaiter::GeneratorState::Complete(result) => break result,
+                        }
+                    };
+                    if local && threshold.is_some_and(|n| n > 0) {
+                        let error = result.unwrap_err();
+                        assert!(
+                            error.to_string().contains("pull_bytes_threshold"),
+                            "{error}"
+                        );
+                        assert!(http.request.lock().unwrap().is_none());
+                        if existing {
+                            assert_eq!(std::fs::read(&path).unwrap(), b"existing contents");
+                        } else {
+                            assert!(!path.exists());
+                        }
+                    } else {
+                        result.unwrap();
+                        let request = http.request.lock().unwrap();
+                        let body = &request.as_ref().unwrap().2;
+                        let request = PullUpdatesReqProtoBody::decode(body.as_slice()).unwrap();
+                        assert_eq!(
+                            !request.server_pages_selector.is_empty(),
+                            threshold.is_some_and(|n| n > 0),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plaintext_bootstrap_accepts_stale_wal_pages_after_shrink() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        {
+            let db = turso_core::Database::open_file_with_flags(
+                io.clone(),
+                source.to_str().unwrap(),
+                turso_core::OpenFlags::Create,
+                turso_core::DatabaseOpts::new(),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE items(value TEXT)").unwrap();
+            conn.execute("INSERT INTO items VALUES ('current page')")
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let pages = std::fs::read(source).unwrap();
+        let mut header = page_header(
+            PullUpdatesStreamKind::Pages as i32,
+            PullUpdatesApplyMode::Incremental as i32,
+        );
+        header.db_size = (pages.len() / super::PAGE_SIZE) as u64;
+        let mut response = header.encode_length_delimited_to_vec();
+        // The sample server scans retained WAL history. After VACUUM that
+        // history may include obsolete pages beyond the current database size.
+        response.extend(
+            PageData {
+                page_id: header.db_size + 3,
+                encoded_page: vec![0xab; super::PAGE_SIZE].into(),
+            }
+            .encode_length_delimited_to_vec(),
+        );
+        for (page_id, page) in pages.chunks_exact(super::PAGE_SIZE).enumerate() {
+            response.extend(
+                PageData {
+                    page_id: page_id as u64,
+                    encoded_page: page.to_vec().into(),
+                }
+                .encode_length_delimited_to_vec(),
+            );
+        }
+        for crypto in [None, Some(staging_test_crypto())] {
+            let target = dir.path().join(if crypto.is_some() {
+                "encrypted.db"
+            } else {
+                "plain.db"
+            });
+            let stats = SyncEngineIoStats::new(Arc::new(TestHttpIo {
+                response: response.clone(),
+                chunk: 101,
+                ..Default::default()
+            }));
+            let mut gen = genawaiter::sync::Gen::new(|co| async {
+                let coro: Coro<()> = co.into();
+                let ctx = SyncOperationCtx::new(&coro, &stats, None, None);
+                super::bootstrap_db_file_v1(
+                    &ctx,
+                    &io,
+                    target.to_str().unwrap(),
+                    None,
+                    None,
+                    crypto.as_ref(),
+                )
+                .await
+            });
+            let result = loop {
+                match gen.resume_with(Ok(())) {
+                    genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                    genawaiter::GeneratorState::Complete(result) => break result,
+                }
+            };
+            if crypto.is_some() {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("bootstrap page exceeds database size"));
+            } else {
+                result.unwrap();
+                let db = turso_core::Database::open_file_with_flags(
+                    io.clone(),
+                    target.to_str().unwrap(),
+                    turso_core::OpenFlags::Create,
+                    turso_core::DatabaseOpts::new(),
+                    None,
+                    Arc::new(SqliteDialect),
+                )
+                .unwrap();
+                let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
+                let rows = conn
+                    .prepare("SELECT value FROM items")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                assert_eq!(
+                    rows,
+                    vec![vec![turso_core::Value::Text(turso_core::types::Text::new(
+                        "current page"
+                    ))]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_encrypts_pages_with_the_local_key_before_writing() {
+        use turso_core::{CipherMode, EncryptionContext, EncryptionKey, OpenFlags};
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let target = dir.path().join("replica.db");
+        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let cipher = CipherMode::Aes256Gcm;
+        let source_key = EncryptionKey::new_256([11; 32]);
+        let local_key = EncryptionKey::new_256([22; 32]);
+        let source_config =
+            crate::sync_encryption::SyncEncryption::new(cipher, Some(source_key.clone())).unwrap();
+        let local_config =
+            crate::sync_encryption::SyncEncryption::new(cipher, Some(local_key.clone())).unwrap();
+        let source_crypto = EncryptionContext::new(cipher, &source_key, super::PAGE_SIZE).unwrap();
+        let local_crypto = EncryptionContext::new(cipher, &local_key, super::PAGE_SIZE).unwrap();
+        {
+            let db = turso_core::Database::open_file_with_flags(
+                core_io.clone(),
+                source.to_str().unwrap(),
+                OpenFlags::Create,
+                turso_core::DatabaseOpts::new().with_encryption(true),
+                source_config.local_options(),
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            let conn = db.connect(source_config.connect_options()).unwrap();
+            conn.execute("CREATE TABLE secrets(value TEXT)").unwrap();
+            conn.execute("INSERT INTO secrets VALUES ('bootstrap private value')")
+                .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        }
+        let stored = std::fs::read(&source).unwrap();
+        assert_eq!(stored.len() % super::PAGE_SIZE, 0);
+        assert!(stored.len() > super::PAGE_SIZE);
+        let mut header = page_header(
+            PullUpdatesStreamKind::Pages as i32,
+            PullUpdatesApplyMode::Incremental as i32,
+        );
+        header.db_size = (stored.len() / super::PAGE_SIZE) as u64;
+        let mut response = header.encode_length_delimited_to_vec();
+        for (index, page) in stored.chunks_exact(super::PAGE_SIZE).enumerate() {
+            let plaintext = source_crypto.decrypt_page(page, index + 1).unwrap();
+            let page = PageData {
+                page_id: index as u64,
+                encoded_page: plaintext.into(),
+            };
+            response.extend_from_slice(&page.encode_length_delimited_to_vec());
+        }
+        let http = Arc::new(TestHttpIo {
+            response,
+            chunk: 11,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let stats = SyncEngineIoStats::new(http);
+        let mut gen = genawaiter::sync::Gen::new(|co| async {
+            let coro: Coro<()> = co.into();
+            let ctx = SyncOperationCtx::new(&coro, &stats, None, None);
+            super::bootstrap_db_file_v1(
+                &ctx,
+                &core_io,
+                target.to_str().unwrap(),
+                None,
+                None,
+                Some(&local_crypto),
+            )
+            .await
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => core_io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.unwrap();
+                    break;
+                }
+            }
+        }
+        let stored = std::fs::read(&target).unwrap();
+        assert!(!stored
+            .windows(b"bootstrap private value".len())
+            .any(|bytes| bytes == b"bootstrap private value"));
+        assert!(source_crypto
+            .decrypt_page(&stored[..super::PAGE_SIZE], 1)
+            .is_err());
+        for (index, page) in stored.chunks_exact(super::PAGE_SIZE).enumerate() {
+            local_crypto.decrypt_page(page, index + 1).unwrap();
+        }
+        let db = turso_core::Database::open_file_with_flags(
+            core_io.clone(),
+            target.to_str().unwrap(),
+            OpenFlags::Create,
+            turso_core::DatabaseOpts::new().with_encryption(true),
+            local_config.local_options(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(local_config.connect_options()).unwrap();
+        let rows = conn
+            .prepare("SELECT value FROM secrets")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::Text(turso_core::types::Text::new(
+                "bootstrap private value"
+            ))]]
+        );
     }
 
     #[test]
