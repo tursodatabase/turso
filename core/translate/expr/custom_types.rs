@@ -20,22 +20,13 @@ pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
     }
 }
 
-/// Check if a literal type is compatible with a custom type's value input type.
-/// "any" matches everything; otherwise exact match (case-insensitive).
-pub(super) fn literal_compatible_with_value_type(
-    literal_type: &str,
-    value_input_type: &str,
-) -> bool {
-    value_input_type.eq_ignore_ascii_case("any")
-        || literal_type.eq_ignore_ascii_case(value_input_type)
-}
-
 /// Whether a custom type takes values of the SQL type `type_name` as input,
-/// such as `integer` for a type based on integer. A comparison of the type's
-/// values with such a value is well typed, as it is for an operator of the
-/// type.
+/// such as `integer` for a type based on integer. A type whose input type is
+/// `any` takes every value. A comparison of the type's values with such a
+/// value is well typed, as it is for an operator of the type.
 pub(crate) fn takes_input_of_type(type_def: &TypeDef, type_name: &str) -> bool {
-    literal_compatible_with_value_type(type_name, type_def.value_input_type())
+    let value_input_type = type_def.value_input_type();
+    value_input_type.eq_ignore_ascii_case("any") || type_name.eq_ignore_ascii_case(value_input_type)
 }
 
 /// Whether a custom type's function runs the operator expression `expr`, such
