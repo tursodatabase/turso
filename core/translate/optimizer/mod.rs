@@ -1,4 +1,5 @@
 use super::{
+    collate::CollationSeq,
     emitter::Resolver,
     expr_context::{ExprContext, ExprProperties, TableMetadata},
     plan::{
@@ -4326,12 +4327,15 @@ fn ephemeral_index_build(
                 GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
                 GeneratedType::NotGenerated => None,
             };
+            let is_search_column = constraint_refs
+                .iter()
+                .any(|constraint| constraint.table_col_pos == Some(i));
             IndexColumn {
                 name: c.name.clone().unwrap(),
                 order: SortOrder::Asc,
                 nulls_order: None,
                 pos_in_table: i,
-                collation: c.collation(),
+                collation: automatic_index_collation(c, is_search_column),
                 explicit_collation: None,
                 default: c.default.clone(),
                 expr: expr.map(Box::new),
@@ -4385,6 +4389,18 @@ fn ephemeral_index_build(
     };
 
     Ok(ephemeral_index)
+}
+
+/// The collation an automatic index compares a column with. As in SQLite,
+/// the columns after the search columns compare with BINARY. They only order
+/// rows whose search columns are equal, so a lookup never depends on their
+/// collation.
+fn automatic_index_collation(column: &Column, is_search_column: bool) -> CollationSeq {
+    if is_search_column {
+        column.collation()
+    } else {
+        CollationSeq::BINARY
+    }
 }
 
 /// Find conditions that can filter rows while an automatic index is built.
