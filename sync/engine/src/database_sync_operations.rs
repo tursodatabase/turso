@@ -3776,12 +3776,16 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
 
 /// fsync the given file, yielding on the coro until the sync completion finishes.
 pub async fn sync_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) -> Result<()> {
-    let c = Completion::new_sync(|_| {
-        // todo(sivukhin): we need to error out in case of failed sync
-    });
-    let c = file.sync(c, FileSyncType::Fsync)?;
-    while !c.succeeded() {
+    let c = file.sync(Completion::new_sync(|_| {}), FileSyncType::Fsync)?;
+    wait_file_completion(coro, &c).await
+}
+
+async fn wait_file_completion<Ctx>(coro: &Coro<Ctx>, completion: &Completion) -> Result<()> {
+    while !completion.finished() {
         coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    if let Some(error) = completion.get_error() {
+        return Err(Error::IoError(error.to_string()));
     }
     Ok(())
 }
