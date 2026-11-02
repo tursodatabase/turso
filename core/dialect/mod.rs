@@ -132,10 +132,6 @@ pub trait Dialect: Send + Sync + 'static {
         options
     }
 
-    fn random_value(&self, bits: i64) -> crate::Value {
-        crate::Value::from_i64(bits) // SQLite default
-    }
-
     /// Resolve a function name in user SQL to the engine's function IR.
     ///
     /// The dialect owns its scalar function surface: the SQLite dialect
@@ -238,6 +234,15 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a quoted string compared with a value of a custom type is
+    /// first converted to that type, the way it would be when stored.
+    ///
+    /// PostgreSQL converts it, so `time_col = '12:00'` matches a stored
+    /// `12:00:00`. SQLite compares the string as it is.
+    fn converts_strings_compared_with_custom_types(&self) -> bool {
+        false
+    }
+
     /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
     /// a table that has rows.
     ///
@@ -261,6 +266,16 @@ pub trait Dialect: Send + Sync + 'static {
     /// PostgreSQL's integer-to-boolean cast does. Otherwise the cast uses the
     /// type's ENCODE, which accepts only 0 and 1.
     fn casts_nonzero_integer_to_true(&self) -> bool {
+        false
+    }
+
+    /// Whether constraint errors report the values that broke the constraint.
+    ///
+    /// PostgreSQL shows them in the error DETAIL, so custom type and array
+    /// values are decoded before the error is raised. SQLite's messages name
+    /// only the columns, so no decode runs, and a DECODE that fails cannot
+    /// replace the constraint error.
+    fn constraint_errors_show_values(&self) -> bool {
         false
     }
 }

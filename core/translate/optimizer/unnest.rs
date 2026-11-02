@@ -425,6 +425,8 @@ fn rewrite_as_semi_or_anti_join(
         }
         plan.table_references.add_joined_table(table);
     }
+    plan.table_references
+        .take_scalar_subquery_affinities_from(&mut inner_plan.table_references);
 
     // The terms now run in the outer plan, so prior access choices do not apply.
     for mut term in inner_plan.where_clause {

@@ -399,6 +399,50 @@ test numeric-precision-overflow {
 expect error {
 }
 
+# Extra fractional digits round half away from zero, like PostgreSQL.
+@requires strict "uses STRICT tables"
+test numeric-insert-rounds-extra-digits {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 0.019), (2, 0.015), (3, 1.999), (4, '0.019'), (5, -0.015), (6, '-1.994');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|0.02
+    2|0.02
+    3|2.00
+    4|0.02
+    5|-0.02
+    6|-1.99
+}
+
+@requires strict "uses STRICT tables"
+test numeric-update-rounds-extra-digits {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1.00');
+    UPDATE t1 SET val = '2.345';
+    SELECT val FROM t1;
+}
+expect {
+    2.35
+}
+
+@requires strict "uses STRICT tables"
+test numeric-cast-rounds-extra-digits {
+    SELECT numeric_decode(CAST(0.019 AS numeric(10,2))), numeric_decode(CAST('-2.345' AS numeric(10,2)));
+}
+expect {
+    0.02|-2.35
+}
+
+# Rounding up can add a digit to the left of the decimal point.
+@requires strict "uses STRICT tables"
+test numeric-rounding-overflows-precision {
+    CREATE TABLE t1(val numeric(3,2)) STRICT;
+    INSERT INTO t1 VALUES ('9.999');
+}
+expect error {
+}
+
 @requires strict "uses STRICT tables"
 test numeric-null {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
@@ -580,4 +624,57 @@ test numeric-input-rejects-space-inside-the-number {
 }
 expect error {
     invalid input syntax for type numeric: "1 .5"
+}
+
+@requires strict "uses STRICT tables"
+test varchar-compare-with-longer-literal-with-and-without-index {
+    CREATE TABLE t1(v varchar(3)) STRICT;
+    CREATE TABLE t2(v varchar(3)) STRICT;
+    CREATE INDEX t2_v ON t2(v);
+    INSERT INTO t1 VALUES ('abc');
+    INSERT INTO t2 VALUES ('abc');
+    SELECT
+        (SELECT count(*) FROM t1 WHERE v = 'abcd'),
+        (SELECT count(*) FROM t2 WHERE v = 'abcd'),
+        (SELECT count(*) FROM t1 WHERE v < 'abcd'),
+        (SELECT count(*) FROM t2 WHERE v < 'abcd');
+}
+expect {
+    0|0|1|1
+}
+
+@requires strict "uses STRICT tables"
+test date-compare-with-other-text-with-and-without-index {
+    CREATE TABLE a(d date) STRICT;
+    CREATE TABLE b(d date) STRICT;
+    CREATE INDEX b_d ON b(d);
+    INSERT INTO a VALUES ('2026-10-08');
+    INSERT INTO b VALUES ('2026-10-08');
+    SELECT
+        (SELECT count(*) FROM a WHERE d = 'zzz'),
+        (SELECT count(*) FROM b WHERE d = 'zzz'),
+        (SELECT count(*) FROM a WHERE d = '2026-10-08T00:00'),
+        (SELECT count(*) FROM b WHERE d = '2026-10-08T00:00'),
+        (SELECT count(*) FROM a WHERE d IN ('zzz', '2026-10-08')),
+        (SELECT count(*) FROM b WHERE d IN ('zzz', '2026-10-08'));
+}
+expect {
+    0|0|0|0|1|1
+}
+
+@requires strict "uses STRICT tables"
+test timestamp-compare-with-other-text-with-and-without-index {
+    CREATE TABLE t1(ts timestamp) STRICT;
+    CREATE TABLE t2(ts timestamp) STRICT;
+    CREATE INDEX t2_ts ON t2(ts);
+    INSERT INTO t1 VALUES ('2026-10-08 12:00:00');
+    INSERT INTO t2 VALUES ('2026-10-08 12:00:00');
+    SELECT
+        (SELECT count(*) FROM t1 WHERE ts = '2026-10-08T12:00:00'),
+        (SELECT count(*) FROM t2 WHERE ts = '2026-10-08T12:00:00'),
+        (SELECT count(*) FROM t1 WHERE ts >= '2026-10-08T12:00'),
+        (SELECT count(*) FROM t2 WHERE ts >= '2026-10-08T12:00');
+}
+expect {
+    0|0|0|0
 }

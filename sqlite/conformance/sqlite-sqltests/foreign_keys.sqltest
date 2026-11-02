@@ -1,5 +1,55 @@
 @database :memory:
 
+test fk-pragma-no-op-in-transaction {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    PRAGMA foreign_keys=OFF;
+    PRAGMA foreign_keys;
+    ROLLBACK;
+    SAVEPOINT s;
+    PRAGMA foreign_keys=OFF;
+    PRAGMA foreign_keys;
+    RELEASE s;
+    PRAGMA foreign_keys;
+}
+expect {
+    1
+    1
+    1
+}
+
+test fk-pragma-no-op-in-transaction-cascade {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p(a PRIMARY KEY);
+    CREATE TABLE c(a REFERENCES p(a) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    BEGIN;
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p;
+    COMMIT;
+    SELECT count(*) FROM c;
+    PRAGMA foreign_keys;
+}
+expect {
+    1
+    0
+}
+
+test fk-pragma-off-in-transaction-still-blocks-parent-delete {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a PRIMARY KEY);
+    CREATE TABLE c(a REFERENCES p(a));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(1);
+    BEGIN;
+    PRAGMA foreign_keys=OFF;
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
 # A child row matches a parent key the way `parent_col = child_col` compares,
 # with affinity, also when the child column has no index.
 @cross-check-integrity

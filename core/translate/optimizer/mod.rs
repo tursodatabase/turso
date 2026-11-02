@@ -1346,10 +1346,8 @@ fn optimize_update_plan(
     if is_update_from {
         plan.safety.require(DmlSafetyReason::UpdateFrom);
     }
-    let mut target_tables = TableReferences::new(
-        vec![plan.target_table.clone()],
-        plan.from_tables.outer_query_refs().to_vec(),
-    );
+    let mut target_tables =
+        TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables);
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
@@ -1651,10 +1649,7 @@ fn build_update_write_set_plan(
         from_tables.add_joined_table(target_table);
         from_tables
     } else {
-        TableReferences::new(
-            vec![plan.target_table.clone()],
-            plan.from_tables.outer_query_refs().to_vec(),
-        )
+        TableReferences::for_update_target(plan.target_table.clone(), &plan.from_tables)
     };
     let rowid_internal_id = plan.target_table.internal_id;
 

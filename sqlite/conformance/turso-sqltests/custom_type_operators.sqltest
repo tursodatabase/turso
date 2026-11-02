@@ -458,14 +458,25 @@ expect {
 
 @requires strict "uses STRICT tables"
 test op-date-minus-value-of-unknown-type-error {
-    -- date() may return any value, so date() - d could be a date minus days or
-    -- a date minus a date. Casting it says which.
+    -- json_extract() may return a value of any type, so json_extract(...) - d
+    -- could be a date minus days or a date minus a date. Casting it says which.
+    CREATE TABLE t1(d date) STRICT;
+    INSERT INTO t1 VALUES ('2024-01-05');
+    SELECT json_extract('"2024-02-01"', '$') - d FROM t1;
+}
+expect error {
+    operator does not exist: value - date
+}
+
+@requires strict "uses STRICT tables"
+test op-text-minus-date-error {
+    -- date() returns text, and no operator subtracts a date from text.
     CREATE TABLE t1(d date) STRICT;
     INSERT INTO t1 VALUES ('2024-01-05');
     SELECT date('2024-02-01') - d FROM t1;
 }
 expect error {
-    operator does not exist: value - date
+    operator does not exist: text - date
 }
 
 @requires strict "uses STRICT tables"
@@ -678,6 +689,129 @@ test op-date-minus-subquery-and-coalesce {
 }
 expect {
     4|0|5|5
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-iif-with-several-conditions {
+    -- iif returns one of its values, never one of its conditions.
+    CREATE TABLE t(d date, i INTEGER) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', 1);
+    SELECT d - iif(i = 1, d, i = 2, d), d - iif(i = 2, d, i = 3, d, '2024-01-01') FROM t;
+}
+expect {
+    0|4
+}
+
+@requires strict "uses STRICT tables"
+test op-date-minus-number-of-unknown-kind {
+    -- ceil, floor and trunc of text, and text plus 0, give a number that may
+    -- be an integer, so they may be days to subtract from a date.
+    CREATE TABLE t(d date, s TEXT) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', '3');
+    SELECT d - floor(s), d - ceil('3'), d - trunc(NULL), d - (s + 0) FROM t;
+}
+expect {
+    2024-01-02|2024-01-02||2024-01-02
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-abs-of-text-error {
+    -- abs of text is a real, never days: abs('3') is 3.0.
+    CREATE TABLE t(d date, s TEXT) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', '3');
+    SELECT d + abs(s) FROM t;
+}
+expect error {
+    operator does not exist: date \+ real
+}
+
+@requires strict "uses STRICT tables"
+test op-date-plus-abs-of-numeric-error {
+    -- abs of a numeric is SQLite's abs, the real 3.0, so it is not a number of days.
+    CREATE TABLE t(d date, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES ('2024-01-05', 3);
+    SELECT d + abs(n) FROM t;
+}
+expect error {
+    a date can only be added to an integer number of days
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-plus-abs-of-numeric-is-numeric {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (4.5);
+    SELECT n + abs(n) FROM t;
+}
+expect {
+    9.00
+}
+
+@requires strict "uses STRICT tables"
+test op-abs-of-numeric-is-real {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (-1.5);
+    INSERT INTO t VALUES (NULL);
+    SELECT abs(n), typeof(abs(n)) FROM t ORDER BY rowid;
+}
+expect {
+    1.5|real
+    |null
+}
+
+@requires strict "uses STRICT tables"
+test op-abs-of-numeric-in-check-comparison-error {
+    -- A CHECK sees the stored numeric, a blob, so abs of it would be 0.0.
+    CREATE TABLE c(n numeric(10,2) CHECK(abs(n) > 0)) STRICT;
+}
+expect error {
+    cannot compare numeric with INTEGER
+}
+
+@requires strict "uses STRICT tables"
+test op-arithmetic-on-abs-of-numeric-in-check-error {
+    CREATE TABLE c(n numeric(10,2) CHECK(abs(n) + 0 > 0)) STRICT;
+}
+expect error {
+    arithmetic requires numeric types, got numeric and INTEGER
+}
+
+@requires strict "uses STRICT tables"
+test op-number-from-stored-numeric-in-check-error {
+    -- substr of the stored numeric is a blob, which is not a number.
+    CREATE TABLE c(n numeric(10,2) CHECK(substr(n, 1) + 0 > 0)) STRICT;
+}
+expect error {
+    arithmetic requires numeric types, got BLOB and INTEGER
+}
+
+@requires strict "uses STRICT tables"
+test op-number-not-from-numeric-value-in-check {
+    -- (n IS NULL) and length(n) are integers, whatever n holds.
+    CREATE TABLE c(n numeric(10,2), i INTEGER, CHECK((n IS NULL) + i > 0), CHECK(i + length(n) > 0)) STRICT;
+    INSERT INTO c VALUES (NULL, 1);
+    SELECT n, i FROM c;
+}
+expect {
+    |1
+}
+
+@requires strict "uses STRICT tables"
+test op-abs-of-numeric-in-check-without-comparison {
+    -- Outside a comparison CHECK does not type abs, so it still runs on the stored value.
+    CREATE TABLE c(n numeric(10,2) CHECK(abs(n) IS NOT NULL)) STRICT;
+    INSERT INTO c VALUES (-20);
+    SELECT n FROM c;
+}
+expect {
+    -20.00
+}
+
+@requires strict "uses STRICT tables"
+test op-minus-of-coalesce-of-numeric-in-check-error {
+    CREATE TABLE c(n numeric(10,2) CHECK(-coalesce(n, 0) < 0)) STRICT;
+}
+expect error {
+    unary minus/plus requires a numeric type, got numeric
 }
 
 @requires strict "uses STRICT tables"
@@ -1078,4 +1212,269 @@ expect {
     0|n|0
     1|1
     10
+}
+
+@requires strict "uses STRICT tables"
+test unchanged-decode-type-compares-literal-as-is-with-and-without-index {
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE plain(x upper_text) STRICT;
+    CREATE TABLE indexed(x upper_text PRIMARY KEY) STRICT;
+    INSERT INTO plain VALUES ('hello');
+    INSERT INTO indexed VALUES ('hello');
+    SELECT
+        (SELECT count(*) FROM plain WHERE x = 'hello'),
+        (SELECT count(*) FROM indexed WHERE x = 'hello'),
+        (SELECT count(*) FROM plain WHERE x = 'HELLO'),
+        (SELECT count(*) FROM indexed WHERE x = 'HELLO'),
+        (SELECT count(*) FROM plain WHERE x IN ('hello', 'HELLO')),
+        (SELECT count(*) FROM indexed WHERE x IN ('hello', 'HELLO'));
+}
+expect {
+    0|0|1|1|1|1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-join-different-scale {
+    -- 1.00 = 1.000, so the join must match these rows.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1);
+    SELECT a.x = b.y FROM a, b ORDER BY a.x;
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT a.x, b.y FROM a LEFT JOIN b ON a.x = b.y ORDER BY a.x;
+}
+expect {
+    1
+    0
+    1
+    1.00|1.000
+    2.00|
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-in-subquery-different-scale {
+    -- IN finds 1.00 equal to 1.000 and still returns NULL when it finds
+    -- no match but the subquery has a NULL.
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1, 1), (2, 2), (3, NULL);
+    INSERT INTO b VALUES (1);
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM b);
+    SELECT id, x IN (SELECT y FROM b), x NOT IN (SELECT y FROM b) FROM a ORDER BY id;
+    INSERT INTO b VALUES (NULL);
+    SELECT id, x IN (SELECT y FROM b), x NOT IN (SELECT y FROM b) FROM a ORDER BY id;
+}
+expect {
+    1
+    1|1|0
+    2|0|1
+    3||
+    1|1|0
+    2||
+    3||
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-in-subquery-on-indexed-column-different-scale {
+    -- An index search on c.z must find 1.000 for the value 1.00 of a.x.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE c(z numeric(10,3)) STRICT;
+    CREATE INDEX c_z ON c(z);
+    INSERT INTO a VALUES (1), (2.5);
+    INSERT INTO c VALUES (1), (1.25), (2.5);
+    SELECT count(*) FROM c WHERE z IN (SELECT x FROM a);
+    SELECT count(*) FROM c WHERE z NOT IN (SELECT x FROM a);
+}
+expect {
+    2
+    1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-row-value-in-subquery-different-scale {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x numeric(10,2), k INTEGER) STRICT;
+    CREATE TABLE b(y numeric(10,3), k INTEGER) STRICT;
+    INSERT INTO a VALUES (1, 1, 5), (2, 1, 6), (3, 1, 7);
+    INSERT INTO b VALUES (1, 5), (NULL, 6);
+    SELECT id, (x, k) IN (SELECT y, k FROM b), (x, k) NOT IN (SELECT y, k FROM b)
+    FROM a ORDER BY id;
+}
+expect {
+    1|1|0
+    2||
+    3|0|1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-correlated-subquery-different-scale {
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1), (1);
+    SELECT x, (SELECT count(*) FROM b WHERE b.y = a.x) FROM a ORDER BY x;
+}
+expect {
+    1.00|2
+    2.00|0
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-join-search-keeps-other-scale {
+    -- An index search must not encode 1.25 at scale 1, which gives 1.2,
+    -- also when 1.25 comes from a subquery.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,1)) STRICT;
+    INSERT INTO a VALUES (1.20), (1.25);
+    INSERT INTO b VALUES (1.2);
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a JOIN b ON b.y < a.x;
+    SELECT count(*) FROM a JOIN b ON b.y >= a.x;
+    SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y = a.x);
+    SELECT count(*) FROM a JOIN b ON b.y = (SELECT a.x);
+    SELECT count(*) FROM b WHERE b.y = (SELECT max(x) FROM a);
+    CREATE INDEX b_y ON b(y);
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a JOIN b ON b.y < a.x;
+    SELECT count(*) FROM a JOIN b ON b.y >= a.x;
+    SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y = a.x);
+    SELECT count(*) FROM a JOIN b ON b.y = (SELECT a.x);
+    SELECT count(*) FROM b WHERE b.y = (SELECT max(x) FROM a);
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    0
+    1
+    1
+    1
+    1
+    1
+    0
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-row-value-in-subquery-keeps-column-collations {
+    -- Each column uses its own collation: m is BINARY, n is NOCASE, and an
+    -- explicit COLLATE on the left side applies to its column only.
+    CREATE TABLE a(x numeric(10,2), n text COLLATE NOCASE, m text) STRICT;
+    CREATE TABLE b(y numeric(10,3), n text, m text) STRICT;
+    INSERT INTO a VALUES (1, 'abc', 'q');
+    INSERT INTO b VALUES (1, 'ABC', 'Q');
+    SELECT (n, x, m) IN (SELECT n, y, m FROM b) FROM a;
+    SELECT (x, n) IN (SELECT y, n FROM b) FROM a;
+    SELECT (m COLLATE NOCASE, x, n) IN (SELECT m, y, n FROM b) FROM a;
+    SELECT (m COLLATE NOCASE, x, m) IN (SELECT m, y, m FROM b) FROM a;
+}
+expect {
+    0
+    1
+    1
+    0
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-join-same-scale-uses-hash-join {
+    -- Equal numeric values with the same scale have equal bytes, so a hash
+    -- join can compare them.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,2)) STRICT;
+    INSERT INTO a VALUES (1), (2.5), (3);
+    INSERT INTO b VALUES (1.000), (2.50), (4);
+    EXPLAIN QUERY PLAN SELECT count(*) FROM a JOIN b ON a.x = b.y;
+    SELECT count(*) FROM a JOIN b ON a.x = b.y;
+}
+expect {
+    1|0|0|HASH JOIN b
+    2|0|0|SCAN a
+    2
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-with-view-subquery-and-cte-column {
+    -- A column read through a view, FROM-clause subquery, CTE or compound
+    -- SELECT compares as numeric too.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    CREATE TABLE c(z INTEGER) STRICT;
+    INSERT INTO a VALUES (1), (2);
+    INSERT INTO b VALUES (1);
+    INSERT INTO c VALUES (1);
+    CREATE VIEW v AS SELECT y FROM b;
+    SELECT count(*) FROM a JOIN v ON a.x = v.y;
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM v);
+    SELECT x, (SELECT count(*) FROM v WHERE v.y = a.x) FROM a ORDER BY x;
+    SELECT count(*) FROM a JOIN (SELECT y FROM b) s ON a.x = s.y;
+    WITH w AS (SELECT y FROM b) SELECT count(*) FROM a JOIN w ON a.x = w.y;
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM (SELECT y FROM b));
+    SELECT count(*) FROM a WHERE x IN (SELECT y FROM b UNION ALL SELECT y FROM b);
+    SELECT count(*) FROM a WHERE x IN (SELECT z FROM c UNION SELECT y FROM b);
+    SELECT count(*) FROM a JOIN c ON a.x = c.z;
+}
+expect {
+    1
+    1
+    1.00|1
+    2.00|0
+    1
+    1
+    1
+    1
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-with-expression-of-another-table {
+    -- The join, IN and DELETE must find the matches that `=` finds when the
+    -- other side is an expression. A constant still uses the index search.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    CREATE TABLE c(z INTEGER) STRICT;
+    INSERT INTO a VALUES (1), (2), (9);
+    INSERT INTO b VALUES (1);
+    INSERT INTO c VALUES (1), (2);
+    SELECT sum(a.x = c.z + 0) FROM a, c;
+    SELECT count(*) FROM a JOIN c ON a.x = c.z + 0;
+    SELECT count(*) FROM a JOIN b ON b.y + 0 = a.x;
+    SELECT count(*) FROM a WHERE x IN (SELECT y + 0 FROM b);
+    SELECT count(*) FROM a WHERE x IN (SELECT z + 0 FROM c);
+    CREATE INDEX a_x ON a(x);
+    EXPLAIN QUERY PLAN SELECT * FROM a WHERE x = 5;
+    DELETE FROM a WHERE x IN (SELECT y + 8 FROM b);
+    SELECT x FROM a ORDER BY x;
+}
+expect {
+    2
+    2
+    1
+    1
+    2
+    1|0|0|SEARCH a USING COVERING INDEX a_x (x=?)
+    1.00
+    2.00
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-eq-in-subquery-with-constant {
+    -- A constant on either side of IN compares as numeric, with and
+    -- without an index.
+    CREATE TABLE a(x numeric(10,2)) STRICT;
+    CREATE TABLE b(y numeric(10,3)) STRICT;
+    INSERT INTO a VALUES (1), (2), (9);
+    INSERT INTO b VALUES (1), (NULL);
+    SELECT count(*) FROM a WHERE x IN (SELECT 1.000);
+    SELECT count(*) FROM a WHERE x NOT IN (SELECT 1.000);
+    SELECT count(*) FROM b WHERE 1 IN (SELECT x FROM a);
+    CREATE INDEX a_x ON a(x);
+    SELECT count(*) FROM a WHERE x IN (SELECT 1.000);
+}
+expect {
+    1
+    2
+    2
+    1
 }

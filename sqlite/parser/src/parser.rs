@@ -3665,6 +3665,8 @@ impl<'a> Parser<'a> {
             match self.peek()? {
                 Some(tok) if tok.token_type == TK_COMMA => {
                     eat_assert!(self, TK_COMMA);
+                    // Only the first option may be missing; a comma always needs an option after it.
+                    peek_expect!(self, TK_WITHOUT, TK_ID);
                     self.parse_table_option(&mut result)?;
                 }
                 _ => break,

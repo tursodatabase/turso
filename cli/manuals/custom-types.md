@@ -155,7 +155,7 @@ SELECT id FROM t WHERE n = 4.504;    -- nothing: the constant is not rounded to 
 SELECT n FROM t UNION SELECT 4.5;    -- two rows: 4.5 equals 4.50
 ```
 
-A COLLATE on a value of such a type is an error (`collations are not supported by type numeric`).
+A COLLATE on a value of such a type is an error (`collations are not supported by type numeric`). So is a COLLATE on a column of such a type in a STRICT table, in `CREATE TABLE` (also in a `UNIQUE` or `PRIMARY KEY` constraint), `ALTER TABLE ADD COLUMN` and `ALTER TABLE ALTER COLUMN`, or in `CREATE INDEX`. A database that already has such a column keeps working, and the column sorts by the type's order.
 
 A window `RANGE` frame with an offset (`RANGE 1 PRECEDING`) computes its bounds with numeric's `+` and `-` when the `ORDER BY` value is a numeric. For arrays, such a frame is an error.
 

@@ -15,8 +15,7 @@ use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::numeric::decimal::{numeric_from_value, MAX_FRACTION_DIGITS};
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
-    SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
@@ -51,7 +50,7 @@ use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
 use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags};
-use crate::vdbe::metrics::HashJoinMetrics;
+use crate::vdbe::metrics::{HashJoinMetrics, StatementMetrics};
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
@@ -311,6 +310,13 @@ pub fn op_init(
     if unlikely(!target_pc.is_offset()) {
         return Err(unresolved_branch_target(*target_pc));
     }
+    // Each run of a program executes Init once, so it is where SQLITE_STMTSTATUS_RUN counts runs.
+    turso_debug_assert!(
+        state.pc == 0,
+        "Init must be the first instruction of a program",
+        { "pc": state.pc }
+    );
+    state.metrics.runs = state.metrics.runs.wrapping_add(1);
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2572,21 +2578,11 @@ pub fn op_type_check(
             let offset = table_reference.logical_to_physical_column(column_idx);
             assert!(offset < *count);
             let reg = &mut state.registers[*start_reg + offset];
-            // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
-            if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
-            {
-                bail_constraint_error!(
-                    "NOT NULL constraint failed: {}.{} ({})",
-                    &table_reference.name,
-                    col.name.as_deref().unwrap_or(""),
-                    SQLITE_CONSTRAINT
-                )
-            } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
-                // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
-                return Ok(());
-            } else if matches!(reg.get_value(), Value::Null) {
-                // STRICT only enforces type affinity on non-NULL values.
-                // NULL is valid in any column without NOT NULL constraint.
+            if matches!(reg.get_value(), Value::Null) {
+                // STRICT only checks the type of non-NULL values. A NULL in a NOT NULL
+                // column, a PRIMARY KEY of a STRICT table included, is for the NOT NULL
+                // check, which also applies the statement's OR IGNORE or OR REPLACE.
+                // An INTEGER PRIMARY KEY gets its rowid later.
                 return Ok(());
             }
             if let Some(expected_type) = col.strict_value_type() {
@@ -5866,12 +5862,18 @@ impl Default for OpProgramState {
 
 fn finish_subprogram(
     program: &Program,
-    statement: &Statement,
+    parent_metrics: &mut StatementMetrics,
+    statement: &mut Statement,
     is_trigger: bool,
     subprogram_aborted: bool,
     saved_last_insert_rowid: Option<i64>,
     saved_changes_value: Option<i64>,
 ) {
+    // Add the subprogram's counters to the parent's now, because the parent
+    // drops its cached subprogram statements when it is reset.
+    parent_metrics.merge(&statement.metrics());
+    statement.reset_metrics();
+
     let pending_changes = statement.n_total_change();
     if pending_changes != 0 {
         program.connection.add_total_changes(pending_changes);
@@ -6045,7 +6047,8 @@ pub fn op_program(
                                 subprogram_aborted = true;
                                 finish_subprogram(
                                     program,
-                                    &statement,
+                                    &mut state.metrics,
+                                    &mut statement,
                                     is_trigger,
                                     subprogram_aborted,
                                     saved_last_insert_rowid,
@@ -6065,7 +6068,8 @@ pub fn op_program(
                             subprogram_aborted = true;
                             finish_subprogram(
                                 program,
-                                &statement,
+                                &mut state.metrics,
+                                &mut statement,
                                 is_trigger,
                                 subprogram_aborted,
                                 saved_last_insert_rowid,
@@ -6077,7 +6081,8 @@ pub fn op_program(
                 }
                 finish_subprogram(
                     program,
-                    &statement,
+                    &mut state.metrics,
+                    &mut statement,
                     is_trigger,
                     subprogram_aborted,
                     saved_last_insert_rowid,
@@ -6125,7 +6130,8 @@ pub(super) fn abort_active_subprogram(
         let result = statement.abort_subprogram(err);
         finish_subprogram(
             program,
-            &statement,
+            &mut state.metrics,
+            &mut statement,
             is_trigger,
             true,
             saved_last_insert_rowid,
@@ -10598,7 +10604,7 @@ pub fn op_function(
             }
             ScalarFunc::Random => {
                 let bits = pager.io.generate_random_number();
-                let value = program.connection.dialect().random_value(bits);
+                let value = Value::from_i64(bits);
                 state.registers[*dest].set_value(value);
             }
             #[cfg(feature = "test_helper")]
@@ -11196,7 +11202,7 @@ pub fn op_function(
                 let input = state.registers[*start_reg].get_value();
                 let count = state.registers[*start_reg + 1].get_value();
                 state.registers[*dest]
-                    .set_value(crate::functions::string::exec_repeat(input, count));
+                    .set_value(crate::functions::string::exec_repeat(input, count)?);
             }
             ScalarFunc::Lpad => {
                 let input = state.registers[*start_reg].get_value();
@@ -11207,7 +11213,7 @@ pub fn op_function(
                     None
                 };
                 state.registers[*dest]
-                    .set_value(crate::functions::string::exec_lpad(input, length, fill));
+                    .set_value(crate::functions::string::exec_lpad(input, length, fill)?);
             }
             ScalarFunc::Rpad => {
                 let input = state.registers[*start_reg].get_value();
@@ -11218,7 +11224,7 @@ pub fn op_function(
                     None
                 };
                 state.registers[*dest]
-                    .set_value(crate::functions::string::exec_rpad(input, length, fill));
+                    .set_value(crate::functions::string::exec_rpad(input, length, fill)?);
             }
             ScalarFunc::BooleanToInt => {
                 check_arg_count!(arg_count, 1);
@@ -18103,7 +18109,7 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
-    let (old_column_name, is_strict) = conn.with_schema(*db, |schema| {
+    let (old_column_name, is_strict, new_column) = conn.with_schema(*db, |schema| {
         let table = schema
             .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
@@ -18114,12 +18120,13 @@ pub fn op_alter_column(
             .as_ref()
             .expect("column being ALTERed should be named")
             .clone();
-        (old_column_name, table.is_strict())
+        let new_column = table
+            .btree()
+            .expect("only btree tables can be altered")
+            .column_for_alter(*column_index, definition);
+        (old_column_name, table.is_strict(), new_column)
     });
-    let new_column = crate::schema::Column::from_definition(
-        definition,
-        FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
-    )?;
+    let new_column = new_column?;
     let new_name = definition.col_name.as_str().to_owned();
     let (domain_not_null, domain_checks) = if is_strict && !*rename {
         conn.with_schema(*db, |schema| schema.column_domain_constraints(&new_column))?
@@ -18490,17 +18497,19 @@ fn handle_text_sum(
     match parsed_number {
         ParsedNumber::Integer(i) => {
             if is_approx {
+                sum_state.ovrfl = false;
                 sum_state.approx = true;
                 match acc {
                     Value::Null => {
                         *acc = Value::from_f64(i as f64);
                     }
                     Value::Numeric(Numeric::Integer(acc_i)) => {
-                        *acc = Value::from_f64(*acc_i as f64);
-                        apply_kbn_step_int(acc, i, sum_state);
+                        let prev = *acc_i;
+                        kbn_init_from_int(acc, prev, sum_state);
+                        apply_kbn_step(acc, i as f64, sum_state);
                     }
                     Value::Numeric(Numeric::Float(_)) => {
-                        apply_kbn_step_int(acc, i, sum_state);
+                        apply_kbn_step(acc, i as f64, sum_state);
                     }
                     _ => unreachable!(),
                 }
@@ -18512,10 +18521,10 @@ fn handle_text_sum(
                     Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(i) {
                         Some(sum) => *acc = Value::from_i64(sum),
                         None => {
-                            let acc_f = *acc_i as f64;
-                            *acc = Value::from_f64(acc_f);
+                            let prev = *acc_i;
                             sum_state.approx = true;
                             sum_state.ovrfl = true;
+                            kbn_init_from_int(acc, prev, sum_state);
                             apply_kbn_step_int(acc, i, sum_state);
                         }
                     },
@@ -18527,9 +18536,10 @@ fn handle_text_sum(
             }
         }
         ParsedNumber::Float(f) => {
+            sum_state.ovrfl = false;
             if !sum_state.approx {
                 if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
+                    kbn_init_from_int(acc, current_sum, sum_state);
                 } else if matches!(*acc, Value::Null) {
                     *acc = Value::from_f64(0.0);
                 }
@@ -18538,9 +18548,10 @@ fn handle_text_sum(
             apply_kbn_step(acc, f, sum_state);
         }
         ParsedNumber::None => {
+            sum_state.ovrfl = false;
             if !sum_state.approx {
                 if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
+                    kbn_init_from_int(acc, current_sum, sum_state);
                 } else if matches!(*acc, Value::Null) {
                     *acc = Value::from_f64(0.0);
                 }

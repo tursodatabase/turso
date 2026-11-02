@@ -66,6 +66,7 @@ pub enum StatementStatusCounter {
     Sort,
     VmStep,
     Reprepare,
+    Run,
     RowsRead,
     RowsWritten,
 }
@@ -94,7 +95,11 @@ impl StatementOrigin {
 /// (`"INTEGER"`, `"TEXT"`, `"REAL"`). For a typed expression — CAST, rowid,
 /// or anything else SQLite's affinity rules can pin down — it's the
 /// inferred primitive. In both cases `array_dimensions` is `0`, `base_type`
-/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. When neither path
+/// is `None`, and `kind` is [`ColumnTypeKind::Builtin`]. An expression whose
+/// type is a custom type (`CAST(x AS cents)`, `coalesce(cents_col, 0)`, a
+/// function declared to return one) is reported exactly like a column of
+/// that type: `declared_name` is the type's name, `base_type` the primitive
+/// it is stored as, and `kind` its kind. When none of these paths
 /// produces a usable primitive (binary arithmetic that SQLite refuses to
 /// propagate through, BLOB literals, NULL literals, function calls without
 /// declared return affinity), `get_column_type_info` returns `Ok(None)`
@@ -377,6 +382,7 @@ impl Statement {
             StatementStatusCounter::Sort => metrics.sort_operations,
             StatementStatusCounter::VmStep => metrics.insn_executed,
             StatementStatusCounter::Reprepare => metrics.reprepares,
+            StatementStatusCounter::Run => metrics.runs,
             StatementStatusCounter::RowsRead => metrics.rows_read,
             StatementStatusCounter::RowsWritten => metrics.rows_written,
         }
@@ -395,6 +401,14 @@ impl Statement {
     /// This is used by async state machines that need to yield the completions.
     pub fn take_io_completions(&mut self) -> Option<crate::types::IOCompletions> {
         self.state.io_completions.take()
+    }
+
+    /// Clone the pending completion handle without removing it from the statement.
+    pub fn io_completions(&self) -> Option<crate::types::IOCompletions> {
+        self.state
+            .io_completions
+            .as_ref()
+            .map(|io| crate::types::IOCompletions(io.0.clone()))
     }
 
     fn arm_query_timeout_if_needed(&mut self) {
@@ -1632,6 +1646,11 @@ impl Statement {
         self.busy
     }
 
+    /// True once [Self::step] has returned a [StepResult::Row] since the last reset.
+    pub fn has_returned_row(&self) -> bool {
+        self.has_returned_row
+    }
+
     /// Internal method to get IO from a statement.
     /// Used by select internal crate
     ///
@@ -2254,6 +2273,80 @@ mod tests {
             }
         }
         assert_eq!(stmt.metrics().rows_written, 2);
+    }
+
+    #[test]
+    fn stmt_status_run_counts_each_run() {
+        let conn = open_test_connection().unwrap();
+        let mut stmt = conn.prepare("SELECT 1").unwrap();
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 0);
+
+        // A run is counted on its first step, not when it finishes.
+        assert!(stmt
+            .run_one_step_blocking(|| Ok(()), || Ok(()))
+            .unwrap()
+            .is_some());
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 1);
+        assert!(stmt
+            .run_one_step_blocking(|| Ok(()), || Ok(()))
+            .unwrap()
+            .is_none());
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 1);
+
+        stmt.reset().unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 2);
+        stmt.reset_stmt_status(StatementStatusCounter::Run);
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 0);
+
+        stmt.reset().unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::Run), 1);
+    }
+
+    /// Like SQLite, each trigger or foreign key action program that a
+    /// statement starts counts as a run of that statement.
+    #[test]
+    fn stmt_status_run_counts_trigger_and_foreign_key_action_programs() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("CREATE TABLE log(x)").unwrap();
+        conn.execute("CREATE TABLE log2(x)").unwrap();
+        // A trigger program with two statements is still one run.
+        conn.execute(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN \
+             INSERT INTO log VALUES (NEW.x); INSERT INTO log VALUES (NEW.x); END",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER tr_log AFTER INSERT ON log BEGIN INSERT INTO log2 VALUES (NEW.x); END",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE p(a PRIMARY KEY)").unwrap();
+        conn.execute("CREATE TABLE c(b REFERENCES p(a) ON DELETE CASCADE)")
+            .unwrap();
+        conn.execute("INSERT INTO p VALUES (1), (2)").unwrap();
+        conn.execute("INSERT INTO c VALUES (1), (2)").unwrap();
+
+        let mut insert = conn.prepare("INSERT INTO t VALUES (1), (2)").unwrap();
+        insert.run_ignore_rows().unwrap();
+        // 1 for the INSERT, 2 for `tr`, 4 for `tr_log`.
+        assert_eq!(insert.stmt_status(StatementStatusCounter::Run), 7);
+        let vm_steps_one_run = insert.stmt_status(StatementStatusCounter::VmStep);
+
+        // Resetting the statement keeps the counts of the trigger programs.
+        insert.reset().unwrap();
+        insert.run_ignore_rows().unwrap();
+        assert_eq!(insert.stmt_status(StatementStatusCounter::Run), 14);
+        assert_eq!(
+            insert.stmt_status(StatementStatusCounter::VmStep),
+            2 * vm_steps_one_run
+        );
+
+        let mut delete = conn.prepare("DELETE FROM p").unwrap();
+        delete.run_ignore_rows().unwrap();
+        assert_eq!(delete.stmt_status(StatementStatusCounter::Run), 3);
     }
 
     #[test]

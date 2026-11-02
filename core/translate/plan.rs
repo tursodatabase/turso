@@ -1923,6 +1923,8 @@ pub struct TableReferences {
     joined_tables: Vec<JoinedTable>,
     /// Tables from outer scopes that are referenced in this query scope.
     outer_query_refs: Vec<OuterQueryReference>,
+    /// The affinity of each single-column scalar subquery in this query scope.
+    scalar_subquery_affinities: Vec<(TableInternalId, Affinity)>,
 }
 
 impl Default for TableReferences {
@@ -1944,6 +1946,20 @@ impl TableReferences {
         Self {
             joined_tables,
             outer_query_refs,
+            scalar_subquery_affinities: Vec::new(),
+        }
+    }
+
+    /// The scope that an UPDATE reads its target table in. The WHERE terms were
+    /// planned against `from_tables`, so their scalar subqueries are recorded there.
+    pub(crate) fn for_update_target(
+        target_table: JoinedTable,
+        from_tables: &TableReferences,
+    ) -> Self {
+        Self {
+            joined_tables: vec![target_table],
+            outer_query_refs: from_tables.outer_query_refs.to_vec(),
+            scalar_subquery_affinities: from_tables.scalar_subquery_affinities.clone(),
         }
     }
 
@@ -1951,6 +1967,7 @@ impl TableReferences {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
+            scalar_subquery_affinities: Vec::new(),
         }
     }
 
@@ -1966,6 +1983,32 @@ impl TableReferences {
     /// Add a new [OuterQueryReference] to the query plan.
     pub fn add_outer_query_reference(&mut self, outer_query_reference: OuterQueryReference) {
         self.outer_query_refs.push(outer_query_reference);
+    }
+
+    /// Record the affinity of the column that a single-column scalar subquery selects.
+    pub(crate) fn add_scalar_subquery_affinity(
+        &mut self,
+        subquery_id: TableInternalId,
+        affinity: Affinity,
+    ) {
+        self.scalar_subquery_affinities
+            .push((subquery_id, affinity));
+    }
+
+    /// Take the recorded affinities of `other`, for when its WHERE terms move into this query.
+    pub(crate) fn take_scalar_subquery_affinities_from(&mut self, other: &mut TableReferences) {
+        self.scalar_subquery_affinities
+            .append(&mut other.scalar_subquery_affinities);
+    }
+
+    pub(crate) fn scalar_subquery_affinity(
+        &self,
+        subquery_id: TableInternalId,
+    ) -> Option<Affinity> {
+        self.scalar_subquery_affinities
+            .iter()
+            .find(|(id, _)| *id == subquery_id)
+            .map(|(_, affinity)| *affinity)
     }
 
     /// Returns an immutable reference to the [JoinedTable]s in the query plan.
@@ -2307,6 +2350,7 @@ impl TableReferences {
         let TableReferences {
             joined_tables,
             outer_query_refs,
+            scalar_subquery_affinities,
         } = other;
 
         // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
@@ -2315,6 +2359,10 @@ impl TableReferences {
         // and copying every element into a fresh buffer.
         take_or_append(&mut self.joined_tables, joined_tables);
         take_or_append(&mut self.outer_query_refs, outer_query_refs);
+        take_or_append(
+            &mut self.scalar_subquery_affinities,
+            scalar_subquery_affinities,
+        );
     }
 }
 

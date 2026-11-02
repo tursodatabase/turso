@@ -1,6 +1,7 @@
 import logging
 import os
 import sqlite3
+import sys
 
 import pytest
 import turso
@@ -461,6 +462,40 @@ def test_parameterized_query(provider):
     cursor.execute("SELECT * FROM test WHERE id = ?", (1,))
     row = cursor.fetchone()
     assert row == (1, "alice")
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_int_parameter_outside_64_bit_range_is_rejected(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE ids (ext INTEGER UNIQUE)")
+    for value in (2**63, 2**63 + 1, -(2**63) - 1):
+        with pytest.raises(OverflowError, match="Python int too large to convert to SQLite INTEGER"):
+            cursor.execute("INSERT INTO ids VALUES (?)", (value,))
+
+    cursor.execute("INSERT INTO ids VALUES (?)", (2**63 - 1,))
+    cursor.execute("INSERT INTO ids VALUES (?)", (-(2**63),))
+    cursor.execute("SELECT ext, typeof(ext) FROM ids ORDER BY ext")
+    assert cursor.fetchall() == [(-(2**63), "integer"), (2**63 - 1, "integer")]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_decimal_parameter_is_rejected(provider):
+    import decimal
+
+    module = turso if provider == "turso" else sqlite3
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE t (x)")
+    with pytest.raises(module.DatabaseError):
+        cursor.execute("INSERT INTO t VALUES (?)", (decimal.Decimal("12345678901234567.89"),))
+
+    cursor.execute("SELECT count(*) FROM t")
+    assert cursor.fetchone() == (0,)
 
     conn.close()
 
@@ -1474,6 +1509,79 @@ def test_in_transaction_toggle_with_commit(provider):
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "INSERT INTO t(nosuch) VALUES (1)",
+        "INSERT INTO nosuch VALUES (1)",
+        "UPDATE t SET",
+        "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
+    ],
+)
+def test_dml_that_fails_to_prepare_does_not_begin_transaction(provider, sql, tmp_path):
+    db_file = str(tmp_path / "failed_dml.db")
+    conn = connect(provider, db_file)
+    conn.execute("CREATE TABLE t(v INTEGER)")
+    conn.commit()
+
+    with pytest.raises((sqlite3.Error, turso.Error)):
+        conn.execute(sql)
+    assert not conn.in_transaction
+    assert conn.execute("SELECT count(*) FROM t").fetchone() == (0,)
+
+    # Without an open transaction, a commit from another connection is visible
+    other = connect(provider, db_file)
+    other.execute("INSERT INTO t VALUES (1)")
+    other.commit()
+    other.close()
+    assert conn.execute("SELECT count(*) FROM t").fetchone() == (1,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+@pytest.mark.parametrize("sql", ["INSERT INTO t(nosuch) VALUES (?)", "INSERT INTO nosuch VALUES (?)"])
+def test_executemany_that_fails_to_prepare_does_not_begin_transaction(provider, sql):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t(v INTEGER)")
+    conn.commit()
+    with pytest.raises((sqlite3.Error, turso.Error)):
+        conn.executemany(sql, [(1,)])
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_executemany_with_non_iterable_parameters_does_not_begin_transaction(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t(v INTEGER)")
+    conn.commit()
+    with pytest.raises(TypeError):
+        conn.executemany("INSERT INTO t VALUES (?)", None)
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_failed_dml_with_immediate_isolation_does_not_hold_write_lock(provider, tmp_path):
+    db_file = str(tmp_path / "failed_dml_immediate.db")
+    conn = connect(provider, db_file)
+    conn.execute("CREATE TABLE t(v INTEGER)")
+    conn.commit()
+    conn.isolation_level = "IMMEDIATE"
+
+    with pytest.raises((sqlite3.Error, turso.Error)):
+        conn.execute("INSERT INTO t(nosuch) VALUES (1)")
+    assert not conn.in_transaction
+
+    other = connect(provider, db_file)
+    other.execute("INSERT INTO t VALUES (1)")
+    other.commit()
+    other.close()
+    assert conn.execute("SELECT count(*) FROM t").fetchone() == (1,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_isolation_level_none_autocommit(provider, tmp_path):
     db_file = tmp_path / "auto_commit.db"
 
@@ -1494,6 +1602,66 @@ def test_isolation_level_none_autocommit(provider, tmp_path):
     cur2.execute("SELECT COUNT(*) FROM test")
     count = cur2.fetchone()[0]
     assert count == 1
+    conn2.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_set_isolation_level_none_commits_pending_transaction(provider, tmp_path):
+    db_file = str(tmp_path / "switch_isolation_level.db")
+    conn = connect(provider, db_file)
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    assert conn.in_transaction
+    conn.isolation_level = None
+    assert not conn.in_transaction
+    conn.execute("INSERT INTO t VALUES (2)")
+    assert not conn.in_transaction
+    conn.close()
+
+    conn2 = connect(provider, db_file)
+    assert conn2.execute("SELECT v FROM t ORDER BY v").fetchall() == [(1,), (2,)]
+    conn2.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_isolation_level_rejects_values_that_are_not_transaction_modes(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    default_level = conn.isolation_level
+    with pytest.raises(ValueError):
+        conn.isolation_level = "FOO"
+    with pytest.raises(TypeError):
+        conn.isolation_level = 1
+    assert conn.isolation_level == default_level
+    with pytest.raises(ValueError):
+        (turso if provider == "turso" else sqlite3).connect(":memory:", isolation_level="FOO")
+
+    for level in ["", "deferred", "Immediate", "EXCLUSIVE"]:
+        conn.isolation_level = level
+        assert conn.isolation_level == level.upper()
+        conn.execute("INSERT INTO t VALUES (1)")
+        assert conn.in_transaction
+        conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_set_autocommit_true_commits_pending_transaction(provider, tmp_path):
+    if provider == "sqlite3" and sys.version_info < (3, 12):
+        pytest.skip("sqlite3.Connection.autocommit requires Python 3.12")
+    db_file = str(tmp_path / "switch_autocommit.db")
+    conn = connect(provider, db_file)
+    conn.execute("CREATE TABLE t (v INTEGER)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    assert conn.in_transaction
+    conn.autocommit = True
+    assert not conn.in_transaction
+    conn.execute("INSERT INTO t VALUES (2)")
+    assert not conn.in_transaction
+    conn.close()
+
+    conn2 = connect(provider, db_file)
+    assert conn2.execute("SELECT v FROM t ORDER BY v").fetchall() == [(1,), (2,)]
     conn2.close()
 
 
@@ -1535,6 +1703,139 @@ def test_insert_returning_single_and_multiple_commit_without_consuming(provider)
         cur.fetchone()
         with pytest.raises(Exception):
             conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_delete_returning_runs_without_fetching(provider, tmp_path):
+    conn = connect(provider, str(tmp_path / "t.db"))
+    try:
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        conn.execute("INSERT INTO t(v) VALUES ('a'), ('b'), ('c')")
+        conn.commit()
+        with conn:
+            conn.execute("DELETE FROM t WHERE id > 1 RETURNING id")
+        assert conn.execute("SELECT count(*) FROM t").fetchone() == (1,)
+        with conn:
+            conn.execute("WITH d(i) AS (VALUES (1)) DELETE FROM t WHERE id IN (SELECT i FROM d) RETURNING id")
+        assert conn.execute("SELECT count(*) FROM t").fetchone() == (0,)
+    finally:
+        conn.close()
+    conn = connect(provider, str(tmp_path / "t.db"))
+    try:
+        assert conn.execute("SELECT count(*) FROM t").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_update_returning_commit_without_fetching(provider):
+    conn = connect(provider, ":memory:")
+    try:
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        conn.execute("INSERT INTO t(v) VALUES ('a'), ('b')")
+        conn.commit()
+        cur = conn.execute("UPDATE t SET v = 'z' RETURNING id")
+        with pytest.raises(Exception, match="SQL statements in progress"):
+            conn.commit()
+        assert cur.fetchall() == [(1,), (2,)]
+        conn.commit()
+        assert conn.execute("SELECT v FROM t ORDER BY id").fetchall() == [("z",), ("z",)]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_rollback_with_unread_update_returning(provider, tmp_path):
+    conn = connect(provider, str(tmp_path / "t.db"))
+    try:
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        conn.execute("INSERT INTO t(v) VALUES (1), (2), (3)")
+        conn.commit()
+        cur = conn.execute("UPDATE t SET v = 0 RETURNING id")
+        conn.rollback()
+        assert not conn.in_transaction
+        assert cur.fetchall() == [(1,), (2,), (3,)]
+        cur = conn.execute("DELETE FROM t WHERE id = 2 RETURNING id")
+        with pytest.raises(KeyError):
+            with conn:
+                conn.execute("UPDATE t SET v = 0 RETURNING id")
+                raise KeyError
+        assert not conn.in_transaction
+        assert cur.fetchall() == [(2,)]
+        conn.commit()
+    finally:
+        conn.close()
+    conn = connect(provider, str(tmp_path / "t.db"))
+    try:
+        assert conn.execute("SELECT v FROM t ORDER BY id").fetchall() == [(1,), (2,), (3,)]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_write_while_returning_rows_unread(provider):
+    conn = connect(provider, ":memory:")
+    try:
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        conn.commit()
+        cur = conn.execute("INSERT INTO t(v) VALUES (1), (2) RETURNING id")
+        conn.execute("INSERT INTO t(v) VALUES (3)")
+        conn.cursor().executemany("INSERT INTO t(v) VALUES (?)", [(4,)])
+        assert cur.fetchall() == [(1,), (2,)]
+        conn.commit()
+        assert conn.execute("SELECT v FROM t ORDER BY id").fetchall() == [(1,), (2,), (3,), (4,)]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_rollback_with_unread_select(provider, tmp_path):
+    conn = connect(provider, str(tmp_path / "t.db"))
+    try:
+        conn.execute("CREATE TABLE t(v INTEGER)")
+        conn.execute("INSERT INTO t VALUES (1), (2), (3)")
+        conn.commit()
+        conn.execute("INSERT INTO t VALUES (4)")
+        cur = conn.execute("SELECT v FROM t")
+        conn.rollback()
+        assert cur.fetchall() == [(1,), (2,), (3,)]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_write_while_endless_select_rows_unread(provider):
+    conn = connect(provider, ":memory:")
+    try:
+        cur = conn.execute("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c")
+        assert cur.fetchone() == (1,)
+        conn.execute("CREATE TABLE t(v INTEGER)")
+        conn.cursor().executemany("INSERT INTO t VALUES (?)", [(1,)])
+        conn.executescript("INSERT INTO t VALUES (2);")
+        assert cur.fetchmany(2) == [(2,), (3,)]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_with_block_raises_when_commit_fails(provider, tmp_path):
+    conn = connect(provider, str(tmp_path / "t.db"))
+    try:
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        conn.execute("INSERT INTO t(v) VALUES (1), (2), (3)")
+        conn.commit()
+        with pytest.raises(Exception, match="SQL statements in progress"):
+            with conn:
+                cur = conn.execute("UPDATE t SET v = 0 RETURNING id")
+        assert not conn.in_transaction
+        assert cur.fetchall() == [(1,), (2,), (3,)]
+    finally:
+        conn.close()
+    conn = connect(provider, str(tmp_path / "t.db"))
+    try:
+        assert conn.execute("SELECT v FROM t ORDER BY id").fetchall() == [(1,), (2,), (3,)]
     finally:
         conn.close()
 

@@ -124,7 +124,11 @@ pub(crate) fn expr_data_type(expr: &ast::Expr, metadata: &impl ExprProperties) -
         ast::Expr::Column { .. }
         | ast::Expr::RowId { .. }
         | ast::Expr::Cast { .. }
-        | ast::Expr::Subquery(_) => {
+        | ast::Expr::Subquery(_)
+        | ast::Expr::SubqueryResult {
+            query_type: ast::SubqueryType::RowValue { .. },
+            ..
+        } => {
             let aff = get_expr_affinity(expr, metadata);
             if aff.is_numeric() {
                 StorageClassMask::NUMERIC | StorageClassMask::BLOB

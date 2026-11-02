@@ -1,4 +1,4 @@
-use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
+use crate::{alloc, turso_assert, turso_assert_eq, types::AsValueRef, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
@@ -41,8 +41,9 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, explain::ExplainInfo, BranchOffset, CursorID, Insn, InsnReference,
-    PrepareContext, PreparedProgram, Program,
+    affinity::{apply_integer_affinity, Affinity},
+    explain::ExplainInfo,
+    BranchOffset, CursorID, Insn, InsnReference, PrepareContext, PreparedProgram, Program,
 };
 use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
@@ -2457,6 +2458,14 @@ impl ProgramBuilder {
                     }
                     either::Either::Right(val) => val,
                 };
+            }
+
+            if matches!(affinity, Affinity::Integer | Affinity::Numeric) {
+                if let Some(ValueRef::Numeric(integer)) =
+                    apply_integer_affinity(value.as_value_ref())
+                {
+                    value = Value::from(integer);
+                }
             }
 
             Some(value)

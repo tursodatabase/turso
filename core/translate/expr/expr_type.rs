@@ -9,7 +9,7 @@ use turso_parser::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
-use crate::function::{AggFunc, Func, ScalarFunc, WindowFunc};
+use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
@@ -816,7 +816,7 @@ fn arithmetic_type(lhs: &ExprType, rhs: &ExprType) -> ExprType {
 }
 
 fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> ExprType {
-    let Ok(Some(func)) = Func::resolve_function(name.as_str(), args.len()) else {
+    let Ok(Some(func)) = env.resolve_function(name.as_str(), args.len()) else {
         return ExprType::Builtin(BuiltinType::Any);
     };
     match func {
@@ -826,26 +826,11 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         Func::Scalar(ScalarFunc::StringToArray) => {
             ExprType::array(ExprType::Builtin(BuiltinType::Text), 1)
         }
-        // The other functions that build an array give an array of the type of
-        // their array argument: array_prepend(element, array) and
-        // array_cat(array1, array2) take it second when the first is not one.
-        Func::Scalar(f) if f.returns_array_blob() => args
-            .iter()
-            .map(|arg| type_of(arg, env))
-            .find(ExprType::is_array)
-            .unwrap_or_else(|| ExprType::array(ExprType::Builtin(BuiltinType::Any), 1)),
         Func::Agg(AggFunc::ArrayAgg) => ExprType::array(
             args.first()
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
             1,
         ),
-        Func::Scalar(
-            ScalarFunc::Coalesce | ScalarFunc::IfNull | ScalarFunc::Max | ScalarFunc::Min,
-        )
-        | Func::Agg(AggFunc::Max | AggFunc::Min) => {
-            common_type(args.iter().map(|arg| arg.as_ref()), env)
-        }
-        Func::Scalar(ScalarFunc::Iif) => common_type(args.iter().skip(1).map(|a| a.as_ref()), env),
         // A value of another row: its own argument's type, or for lag and
         // lead the common type of the argument and the default (the third
         // argument).
@@ -859,29 +844,106 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         Func::Window(WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue) => args
             .first()
             .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
-        // A call with the wrong number of arguments is reported when it is translated.
-        Func::Scalar(
-            ScalarFunc::Nullif
-            | ScalarFunc::Likely
-            | ScalarFunc::Unlikely
-            | ScalarFunc::Likelihood
-            | ScalarFunc::Abs
-            | ScalarFunc::ArrayElement,
-        ) if args.is_empty() => ExprType::Builtin(BuiltinType::Any),
-        // nullif returns its first argument or NULL; likely, unlikely and
-        // likelihood return their first argument unchanged.
-        Func::Scalar(
-            ScalarFunc::Nullif | ScalarFunc::Likely | ScalarFunc::Unlikely | ScalarFunc::Likelihood,
-        ) => type_of(&args[0], env),
-        Func::Scalar(ScalarFunc::Abs) => negated_type(type_of(&args[0], env), env.schema()),
-        Func::Scalar(ScalarFunc::ArrayElement) => match type_of(&args[0], env) {
-            ExprType::Array {
+        func => result_type(func.result_type(), args, env),
+    }
+}
+
+/// The type of a call to a function, from the way its result type follows
+/// from its arguments.
+fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) -> ExprType {
+    let any = ExprType::Builtin(BuiltinType::Any);
+    // A call with the wrong number of arguments is reported when it is translated.
+    let first_argument = || args.first().map(|arg| type_of(arg, env));
+    match result_type {
+        ResultType::Declared(return_type) => declared_return_type(return_type, args, env),
+        ResultType::FirstArgument => first_argument().unwrap_or(any),
+        ResultType::OneOfTheArguments => common_type(args.iter().map(|arg| arg.as_ref()), env),
+        ResultType::OneOfTheIifValues => common_type(iif_values(args).map(|arg| arg.as_ref()), env),
+        ResultType::NumberOfTheFirstArgumentsType => match first_argument() {
+            Some(ty) => negated_type(ty, env.schema()),
+            None => any,
+        },
+        ResultType::AbsOfTheFirstArgument => match first_argument() {
+            Some(ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob) | ExprType::Untyped) => {
+                ExprType::Builtin(BuiltinType::Real)
+            }
+            // abs of a custom type has the type of `-x`, so numeric's operators
+            // still apply to `n + abs(n)`.
+            Some(ty) => negated_type(ty, env.schema()),
+            None => any,
+        },
+        ResultType::RealForARealArgument => {
+            let is_real =
+                |arg: &ast::Expr| matches!(type_of(arg, env), ExprType::Builtin(BuiltinType::Real));
+            if args.iter().any(|arg| is_real(arg)) {
+                ExprType::Builtin(BuiltinType::Real)
+            } else {
+                any
+            }
+        }
+        ResultType::TextOrBlobLikeTheFirstArgument => match first_argument() {
+            Some(ty @ (ExprType::Builtin(BuiltinType::Blob) | ExprType::Null)) => ty,
+            Some(
+                ExprType::Builtin(
+                    BuiltinType::Integer
+                    | BuiltinType::Real
+                    | BuiltinType::Numeric
+                    | BuiltinType::Decimal
+                    | BuiltinType::Text,
+                )
+                | ExprType::Untyped,
+            ) => ExprType::Builtin(BuiltinType::Text),
+            _ => any,
+        },
+        ResultType::ElementOfTheFirstArgument => match first_argument() {
+            Some(ExprType::Array {
                 element,
                 dimensions,
-            } => ExprType::array(*element, dimensions - 1),
-            _ => ExprType::Builtin(BuiltinType::Any),
+            }) => ExprType::array(*element, dimensions - 1),
+            _ => any,
         },
-        _ => ExprType::Builtin(BuiltinType::Any),
+        ResultType::Unknown => any,
+    }
+}
+
+/// The arguments of `iif(c1, v1, c2, v2, ..., else)` that it may return:
+/// every second one from the second on, and a last one without a condition.
+pub(crate) fn iif_values(args: &[Box<ast::Expr>]) -> impl Iterator<Item = &Box<ast::Expr>> {
+    let has_else = args.len() % 2 == 1;
+    args.iter()
+        .enumerate()
+        .filter(move |(i, _)| i % 2 == 1 || (has_else && *i == args.len() - 1))
+        .map(|(_, arg)| arg)
+}
+
+/// The type of a call to a function that declares the type it returns.
+fn declared_return_type(
+    return_type: ReturnType,
+    args: &[Box<ast::Expr>],
+    env: &TypeEnv,
+) -> ExprType {
+    match return_type {
+        ReturnType::Integer => ExprType::Builtin(BuiltinType::Integer),
+        ReturnType::Real => ExprType::Builtin(BuiltinType::Real),
+        ReturnType::Text => ExprType::Builtin(BuiltinType::Text),
+        ReturnType::Blob => ExprType::Builtin(BuiltinType::Blob),
+        // A function may name a type created with CREATE TYPE that this
+        // schema doesn't have; then nothing is known about its values.
+        ReturnType::Custom(type_name) => match env.schema().get_type_def_unchecked(type_name) {
+            Some(type_def) => ExprType::Custom {
+                type_def: Arc::clone(type_def),
+                params: Vec::new(),
+            },
+            None => ExprType::Unknown,
+        },
+        // An array of the type of the array argument: array_prepend(element,
+        // array) and array_cat(array1, array2) take it second when the first
+        // is not one.
+        ReturnType::Array => args
+            .iter()
+            .map(|arg| type_of(arg, env))
+            .find(ExprType::is_array)
+            .unwrap_or_else(|| ExprType::array(ExprType::Builtin(BuiltinType::Any), 1)),
     }
 }
 

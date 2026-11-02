@@ -36,8 +36,9 @@ use crate::{
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, OperationMode, Resolver,
         },
         expr::{
-            emit_returning_results, emit_table_column, expr_type::column_custom_type_names,
-            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, NoConstantOptReason,
+            emit_constraint_values_decode, emit_returning_results, emit_table_column,
+            expr_type::column_custom_type_names, translate_expr, translate_expr_no_constant_opt,
+            walk_expr_mut, NoConstantOptReason,
         },
         insert::Insertion,
         plan::{ResultSetColumn, TableReferences},
@@ -1293,28 +1294,27 @@ pub fn emit_upsert(
                     .unwrap_or_default();
                 let is_pk = !pk_col_names.is_empty()
                     && idx_col_names == pk_col_names.iter().map(String::as_str).collect::<Vec<_>>();
-                let (constraint_info, err_code) = if is_pk {
+                let (mut constraint_info, err_code) = if is_pk {
                     (
-                        Some(Box::new(ConstraintInfo::primary_key(
+                        ConstraintInfo::primary_key(
                             table.get_name(),
                             pk_constraint_name,
                             pk_col_names,
                             regs,
-                        ))),
+                        ),
                         SQLITE_CONSTRAINT_PRIMARYKEY,
                     )
                 } else {
                     (
-                        Some(Box::new(ConstraintInfo::unique_index(
-                            table.get_name(),
-                            &idx_meta,
-                            regs,
-                        ))),
+                        ConstraintInfo::unique_index(table.get_name(), &idx_meta, regs),
                         SQLITE_CONSTRAINT_UNIQUE,
                     )
                 };
+                if let Some(bt) = table.btree() {
+                    emit_constraint_values_decode(program, resolver, &bt, &mut constraint_info)?;
+                }
                 program.emit_insn(Insn::Halt {
-                    constraint_info,
+                    constraint_info: Some(Box::new(constraint_info)),
                     err_code,
                     description,
                     on_error: constraint_on_error,

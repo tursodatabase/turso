@@ -183,7 +183,7 @@ impl<'a> Operand<'a> {
         let sqlite_type = sqlite_operand_type(expr_type.clone(), env.schema());
         let may_be_integer = matches!(
             sqlite_type,
-            ExprType::Builtin(BuiltinType::Integer | BuiltinType::Any)
+            ExprType::Builtin(BuiltinType::Integer | BuiltinType::Numeric | BuiltinType::Any)
         );
         let is_real = matches!(sqlite_type, ExprType::Builtin(BuiltinType::Real))
             && !matches!(expr_type, ExprType::Builtin(BuiltinType::Decimal));

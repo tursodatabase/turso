@@ -1676,14 +1676,14 @@ impl ProgramState {
             .expect("an instruction that reports IO leaves its completion in the state")
     }
 
-    /// Runs `f` on the metrics of this statement including its active and
-    /// cached subprograms, without copying them when there is no subprogram.
+    /// Runs `f` on the metrics of this statement including its active
+    /// subprogram, without copying them when there is no active subprogram.
     pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
-        let has_subprograms = matches!(
+        let has_active_subprogram = matches!(
             self.active_op_state.program_ref(),
             Some(OpProgramState::Step { .. })
-        ) || !self.subprogram_stmt_cache.is_empty();
-        if has_subprograms {
+        );
+        if has_active_subprogram {
             f(&self.metrics())
         } else {
             f(&self.metrics)
@@ -1695,18 +1695,12 @@ impl ProgramState {
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
-        for statement in self.subprogram_stmt_cache.values() {
-            metrics.merge(&statement.metrics());
-        }
         metrics
     }
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_metrics();
-        }
-        for statement in self.subprogram_stmt_cache.values_mut() {
             statement.reset_metrics();
         }
     }
@@ -1719,13 +1713,11 @@ impl ProgramState {
             crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
             crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
             crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
+            crate::statement::StatementStatusCounter::Run => self.metrics.runs = 0,
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_stmt_status(counter);
-        }
-        for statement in self.subprogram_stmt_cache.values_mut() {
             statement.reset_stmt_status(counter);
         }
     }

@@ -19,7 +19,7 @@ use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_co
 use crate::translate::planner::ROWID_STRS;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
-use crate::types::{IOResult, ImmutableRecord};
+use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
@@ -115,7 +115,7 @@ impl Trigger {
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::translate::collate::{CollationSeq, TextCollation};
+use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
 use crate::translate::expr::expr_type::ExprType;
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
@@ -3060,14 +3060,9 @@ impl Schema {
                         state.phase = MakeFromBtreePhase::BuildingIndexes;
                         continue;
                     };
-                    // The types table is (name TEXT PRIMARY KEY, sql TEXT).
-                    let ValueRef::Text(sql) = record.get_value(1)? else {
-                        return Err(LimboError::Corrupt(format!(
-                            "{TURSO_TYPES_TABLE_NAME} contains a row without CREATE TYPE sql"
-                        ))
-                        .into());
-                    };
-                    state.type_sqls.push(sql.as_str().to_string());
+                    state
+                        .type_sqls
+                        .push(Self::type_sql_from_record(&record.as_record_ref())?);
                     state.phase = MakeFromBtreePhase::LoadingTypesAdvance;
                 }
 
@@ -3108,6 +3103,17 @@ impl Schema {
                     return Ok(IOResult::Done(()));
                 }
             }
+        }
+    }
+
+    /// The CREATE TYPE statement stored in a row of the types table,
+    /// which is (name TEXT PRIMARY KEY, sql TEXT).
+    pub(crate) fn type_sql_from_record(record: &ImmutableRecordRef) -> Result<String> {
+        match record.get_value_opt(1) {
+            Some(ValueRef::Text(sql)) => Ok(sql.as_str().to_string()),
+            _ => Err(LimboError::Corrupt(format!(
+                "{TURSO_TYPES_TABLE_NAME} contains a row without CREATE TYPE sql"
+            ))),
         }
     }
 
@@ -5275,6 +5281,21 @@ impl BTreeTable {
         Ok(Arc::new(modified))
     }
 
+    /// Fails when a column or a key of a UNIQUE or PRIMARY KEY constraint has a
+    /// COLLATE and the column's type has its own order. Call this after
+    /// [Self::resolve_custom_types].
+    pub(crate) fn check_collates_are_allowed(&self) -> Result<()> {
+        for column in &self.columns {
+            key_collation(column.text_collation(), column.type_ordering())?;
+        }
+        for key in self.unique_sets.iter().flat_map(|set| &set.columns) {
+            if let Some((_, column)) = self.get_column(&key.name) {
+                key_collation(key.collation, column.type_ordering())?;
+            }
+        }
+        Ok(())
+    }
+
     /// Fill in what custom type columns get from their type:
     /// - SQLite's name-based type/affinity rules use the BASE type instead of
     ///   the custom type name (e.g. "doubled" contains "DOUB" which would
@@ -5306,6 +5327,38 @@ impl BTreeTable {
             self.check_constraints.try_extend(checks)?;
         }
         Ok(())
+    }
+
+    /// Builds the column that `ALTER COLUMN` puts at `column_index`. A table-level
+    /// PRIMARY KEY stays in the stored CREATE TABLE, so a column it names stays part of
+    /// the key, and the new type decides whether the column is a rowid alias.
+    pub fn column_for_alter(
+        &self,
+        column_index: usize,
+        definition: &ColumnDefinition,
+    ) -> Result<Column> {
+        let mut column = Column::from_definition(
+            definition,
+            FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, self.is_strict),
+        )?;
+        if self.columns()[column_index].primary_key() && !self.primary_key_is_inline {
+            if column.is_generated() {
+                bail_parse_error!(
+                    "generated column \"{}\" cannot be part of the PRIMARY KEY",
+                    definition.col_name.as_str()
+                );
+            }
+            column.set_primary_key(true);
+            column.set_rowid_alias(
+                self.has_rowid
+                    && self.primary_key_columns.len() == 1
+                    && definition
+                        .col_type
+                        .as_ref()
+                        .is_some_and(|ty| is_rowid_alias_type(&ty.name)),
+            );
+        }
+        Ok(column)
     }
 
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
@@ -7755,6 +7808,10 @@ impl Column {
     #[inline]
     pub fn hidden(&self) -> bool {
         self.info.hidden()
+    }
+    #[inline]
+    pub fn set_primary_key(&mut self, v: bool) {
+        self.info.set_primary_key(v)
     }
     #[inline]
     pub fn set_rowid_alias(&mut self, v: bool) {
@@ -10340,6 +10397,11 @@ mod column_info {
         #[inline]
         pub fn is_rowid_alias(&self) -> bool {
             self.0 & F_ROWID_ALIAS != 0
+        }
+
+        #[inline]
+        pub fn set_primary_key(&mut self, v: bool) {
+            self.set_flag(F_PRIMARY_KEY, v);
         }
 
         #[inline]
