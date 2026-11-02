@@ -381,6 +381,7 @@ impl Builder {
 
         // Build sync engine config.
         let sync_config = turso_sync_sdk_kit::rsapi::TursoDatabaseSyncConfig {
+            cipher: None,
             path: self.path.clone(),
             remote_url: url.clone(),
             client_name: self
