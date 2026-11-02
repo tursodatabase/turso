@@ -97,11 +97,26 @@ fn pad(input: &Value, length: &Value, fill: Option<&Value>, on_left: bool) -> Re
     if fill_chars.is_empty() {
         return Ok(Value::build_text(s));
     }
-    let pad: String = fill_chars
-        .iter()
-        .cycle()
-        .take(target_len - char_count)
-        .collect();
+    // The check above bounds the result in CHARACTERS, but the limit is on
+    // bytes, so a multi-byte fill could still build a multi-gigabyte string
+    // and abort before the downstream byte check ran: a 4-byte fill at a
+    // length of 1e9 reached about 12 GB. The padding is a cycle of
+    // `fill_chars`, so its byte length is exact arithmetic - there is no need
+    // to build it to find out.
+    let pad_chars = target_len - char_count;
+    let pad_bytes = (pad_chars / fill_chars.len())
+        .checked_mul(fill_str.len())
+        .and_then(|whole| {
+            fill_chars[..pad_chars % fill_chars.len()]
+                .iter()
+                .map(|c| c.len_utf8())
+                .try_fold(whole, usize::checked_add)
+        })
+        .and_then(|bytes| bytes.checked_add(s.len()));
+    if pad_bytes.is_none_or(|bytes| bytes > Value::MAX_BLOB_LENGTH as usize) {
+        return Err(LimboError::TooBig);
+    }
+    let pad: String = fill_chars.iter().cycle().take(pad_chars).collect();
     Ok(Value::build_text(if on_left {
         format!("{pad}{s}")
     } else {
@@ -228,6 +243,40 @@ mod tests {
                 "rpad should refuse length {n}"
             );
         }
+    }
+
+    #[test]
+    fn pad_rejects_a_multi_byte_fill_over_the_byte_limit() {
+        // Inside the limit in CHARACTERS, about 4 GB in bytes. Before this
+        // check the whole string was built and only then rejected, or the
+        // allocation aborted the process outright.
+        let emoji = "\u{1F600}";
+        assert!(matches!(
+            exec_lpad(&t("a"), &i(Value::MAX_BLOB_LENGTH), Some(&t(emoji))),
+            Err(LimboError::TooBig)
+        ));
+        assert!(matches!(
+            exec_rpad(&t("a"), &i(Value::MAX_BLOB_LENGTH), Some(&t(emoji))),
+            Err(LimboError::TooBig)
+        ));
+        // The arithmetic is exact rather than conservative, so a multi-byte
+        // fill that stays inside the limit must still work. A
+        // target_len * max_char_width estimate would wrongly refuse these.
+        assert_eq!(
+            exec_lpad(&t("a"), &i(3), Some(&t(emoji))).unwrap(),
+            t("\u{1F600}\u{1F600}a")
+        );
+        assert_eq!(
+            exec_rpad(&t("a"), &i(3), Some(&t(emoji))).unwrap(),
+            t("a\u{1F600}\u{1F600}")
+        );
+        // A mixed-width fill exercises the remainder term: the cycle stops
+        // part-way through fill_chars, so those characters are measured
+        // individually rather than assumed to be the widest.
+        assert_eq!(
+            exec_lpad(&t("a"), &i(4), Some(&t("a\u{1F600}"))).unwrap(),
+            t("a\u{1F600}aa")
+        );
     }
 
     #[test]
