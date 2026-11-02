@@ -298,9 +298,10 @@ materialized view, or the table that an index belongs to. Because the check is
 on the compiled program and not on the SQL, a statement cannot reach stored
 data through a subquery, a view, or any other rewrite of the query without
 being checked. The bodies of triggers and the actions of foreign keys are
-compiled into subprograms of the statement, which the check does not scan
-yet: today the statement's own access to the table that fires them is denied
-first, so nothing in them runs. See [Future work](#future-work).
+compiled into subprograms of the statement and checked the same way; their
+denial is reported after the statement's own accesses pass, so a role that
+may not change a table is told about the table before anything its triggers
+would touch, as in PostgreSQL.
 
 Three kinds of access do not open stored data of their own and are checked
 separately:
@@ -398,9 +399,7 @@ In the order the pieces depend on each other:
   with `GRANT` and removed with `REVOKE`, with `public` as a grantee. The
   data check then consults the privileges of the current role instead
   of denying every access, and `CREATE` on the schema decides who may create
-  objects. Before any privilege can be granted, the data check must also scan
-  the subprograms of triggers and foreign-key actions, which it does not do
-  today.
+  objects.
 - **Schema privileges.** Record the owner of a schema, and the `USAGE` and
   `CREATE` privileges on it. `CREATE SCHEMA` and `DROP SCHEMA` then stop being
   superuser-only, and resolving a name in a schema needs `USAGE` on it, as in

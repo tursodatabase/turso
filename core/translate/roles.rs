@@ -185,24 +185,35 @@ fn database_denial(action: Action) -> PermissionDenied {
 }
 
 /// Fails if the compiled program reads or writes a database object that the
-/// current role has no privileges on. Every access to stored data goes
-/// through one of the instructions checked here, so a statement cannot reach
-/// an object without being checked.
+/// current role has no privileges on.
 pub fn check_storage_access(program: &ProgramBuilder, resolver: &Resolver) -> Result<()> {
+    match storage_denial(program, resolver) {
+        None => Ok(()),
+        Some(denial) => Err(permission_denied(denial)),
+    }
+}
+
+/// Returns what the compiled program reads or writes that the current role
+/// has no privileges on. Every access to stored data goes through one of the
+/// instructions checked here, so a statement cannot reach an object without
+/// being checked. A trigger or foreign-key action is compiled into a
+/// subprogram, whose denial the subprogram's compiler records in `program`
+/// and which is returned after the program's own accesses pass.
+pub fn storage_denial(program: &ProgramBuilder, resolver: &Resolver) -> Option<PermissionDenied> {
     if !resolver.role_is_not_superuser {
-        return Ok(());
+        return None;
     }
     if let Some(view_name) = program.referenced_views.first() {
-        return Err(permission_denied(PermissionDenied::privilege(
+        return Some(PermissionDenied::privilege(
             Action::Read,
             Object::View(view_name.clone()),
-        )));
+        ));
     }
     if let Some(virtual_table) = program.written_virtual_tables.first() {
-        return Err(permission_denied(PermissionDenied::privilege(
+        return Some(PermissionDenied::privilege(
             Action::Write,
             Object::Table(virtual_table.name.clone()),
-        )));
+        ));
     }
     for (insn, _) in &program.insns {
         let (action, db, root_page) = match insn {
@@ -227,9 +238,7 @@ pub fn check_storage_access(program: &ProgramBuilder, resolver: &Resolver) -> Re
         if action == Action::Read && is_catalog_table(&object) {
             continue;
         }
-        return Err(permission_denied(PermissionDenied::privilege(
-            action, object,
-        )));
+        return Some(PermissionDenied::privilege(action, object));
     }
     for virtual_table in &program.opened_virtual_tables {
         let readable = match &virtual_table.vtab_type {
@@ -238,7 +247,7 @@ pub fn check_storage_access(program: &ProgramBuilder, resolver: &Resolver) -> Re
             VirtualTableType::Pragma(_) => false,
         };
         if !readable {
-            let denial = match virtual_table.kind {
+            return Some(match virtual_table.kind {
                 VTabKind::TableValuedFunction => PermissionDenied::privilege(
                     Action::Execute,
                     Object::Function(virtual_table.name.clone()),
@@ -247,11 +256,10 @@ pub fn check_storage_access(program: &ProgramBuilder, resolver: &Resolver) -> Re
                     Action::Read,
                     Object::Table(virtual_table.name.clone()),
                 ),
-            };
-            return Err(permission_denied(denial));
+            });
         }
     }
-    Ok(())
+    program.subprogram_denial.clone()
 }
 
 fn permission_denied(denial: PermissionDenied) -> LimboError {
@@ -599,6 +607,77 @@ mod tests {
                 Object::Function("closed_extension_rows".to_string())
             )
         );
+    }
+
+    #[test]
+    fn storage_access_in_trigger_and_foreign_key_subprograms_is_denied() {
+        let conn = connect_with_roles();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE secret (x)").unwrap();
+        conn.execute("CREATE TABLE log (x)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER read_secret AFTER INSERT ON log BEGIN SELECT x FROM secret; END",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE child (pid REFERENCES parent(id) ON DELETE CASCADE)")
+            .unwrap();
+        become_new_role(&conn, "alice");
+
+        assert_eq!(
+            subprogram_denial(&conn, "INSERT INTO log VALUES (1)"),
+            Some(PermissionDenied::privilege(
+                Action::Read,
+                Object::Table("secret".to_string())
+            ))
+        );
+        assert_eq!(
+            subprogram_denial(&conn, "DELETE FROM parent"),
+            Some(PermissionDenied::privilege(
+                Action::Write,
+                Object::Table("child".to_string())
+            ))
+        );
+        assert_eq!(
+            subprogram_denial(&conn, "INSERT INTO secret VALUES (1)"),
+            None
+        );
+    }
+
+    /// Compiles `sql` as `translate()` does, up to the privilege checks, and
+    /// returns the denial recorded from the statement's subprograms. The
+    /// statement's own accesses are denied first, so the subprograms can only
+    /// be checked this way until privileges can be granted.
+    fn subprogram_denial(conn: &Arc<Connection>, sql: &str) -> Option<PermissionDenied> {
+        use crate::translate::emitter::Resolver;
+        use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
+
+        let (Some(ast::Cmd::Stmt(stmt)), _) = conn.dialect().parse(sql).unwrap() else {
+            panic!("{sql} is not a statement");
+        };
+        let schema = conn.schema.read().clone();
+        let syms = conn.syms.read();
+        let qualifiers = conn.qualifiers(&schema);
+        let mut resolver = Resolver::new(
+            &schema,
+            conn.database_schemas(),
+            &conn.temp.database,
+            conn.attached_databases(),
+            &qualifiers,
+            &syms,
+            conn.experimental_custom_types_enabled(),
+            conn.get_dqs_dml().into(),
+            conn.dialect(),
+            None,
+        );
+        resolver.role_is_not_superuser = true;
+        let mut program =
+            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 2));
+        program.set_mvcc_enabled(conn.mvcc_enabled());
+        program.prologue();
+        crate::translate::translate_inner(stmt, &mut resolver, &mut program, conn, sql).unwrap();
+        program.subprogram_denial
     }
 
     #[test]

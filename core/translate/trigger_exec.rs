@@ -606,6 +606,10 @@ fn execute_trigger_commands(
         Ok(())
     })?;
     subprogram_builder.epilogue(resolver.schema());
+    program.record_subprogram_denial(crate::translate::roles::storage_denial(
+        &subprogram_builder,
+        resolver,
+    ));
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
     let subprogram_prepared = built_subprogram.prepared();
