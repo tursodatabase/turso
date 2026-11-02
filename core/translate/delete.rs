@@ -139,7 +139,7 @@ pub fn translate_delete(
         }
     }
 
-    optimize_plan(program, &mut delete_plan, resolver)?;
+    optimize_plan(program, &mut delete_plan, resolver, connection)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Re-check after optimization: chosen access paths can make "delete while scanning"
         // unsafe, so we may need to collect rowids first.
@@ -279,7 +279,16 @@ pub fn prepare_delete_plan(
     // to skip the rowset materialization.
     let has_delete_triggers = btree_table_for_triggers
         .as_ref()
-        .map(|bt| has_triggers_including_temp(resolver, namespace, TriggerEvent::Delete, None, bt))
+        .map(|bt| {
+            has_triggers_including_temp(
+                resolver,
+                namespace,
+                TriggerEvent::Delete,
+                None,
+                bt,
+                connection,
+            )
+        })
         .unwrap_or(false);
 
     let has_fk_actions = match btree_table_for_triggers.as_ref() {

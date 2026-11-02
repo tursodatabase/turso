@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -12,7 +12,6 @@ use turso_core::{
 };
 
 use crate::{
-    database_replay_generator::DatabaseReplayGenerator,
     database_sync_engine_io::SyncEngineIo,
     database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
@@ -26,9 +25,10 @@ use crate::{
         SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
-        run_stmt_ignore_rows, try_wal_watermark_read_page, DatabaseChangesIteratorMode,
-        DatabaseChangesIteratorOpts, DatabaseReplaySession, DatabaseReplaySessionOpts,
-        DatabaseTape, DatabaseTapeOpts, DatabaseWalSession, CDC_PRAGMA_NAME,
+        replay_without_triggers, run_stmt_ignore_rows, try_wal_watermark_read_page,
+        DatabaseChangesIteratorMode, DatabaseChangesIteratorOpts, DatabaseReplaySession,
+        DatabaseReplaySessionOpts, DatabaseTape, DatabaseTapeOpts, DatabaseWalSession,
+        CDC_PRAGMA_NAME,
     },
     errors::Error,
     io_operations::IoOperations,
@@ -1989,19 +1989,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         conn.execute("BEGIN IMMEDIATE")?;
         let mut logical_table_names_by_stable_id =
             self.meta().logical_table_names_by_stable_id.clone();
-        let mut replay = DatabaseReplaySession {
-            conn: conn.clone(),
-            cached_delete_stmt: HashMap::new(),
-            cached_insert_stmt: HashMap::new(),
-            cached_update_stmt: HashMap::new(),
-            in_txn: true,
-            generator: DatabaseReplayGenerator {
-                conn: conn.clone(),
-                opts: DatabaseReplaySessionOpts {
-                    use_implicit_rowid: true,
-                },
+        let mut replay = DatabaseReplaySession::new(
+            conn.clone(),
+            DatabaseReplaySessionOpts {
+                use_implicit_rowid: true,
             },
-        };
+        );
         let apply_result = async {
             let remote_apply_stats =
                 apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
@@ -2064,19 +2057,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             );
 
             if replayed_local_changes {
-                let mut local_replay = DatabaseReplaySession {
-                    conn: conn.clone(),
-                    cached_delete_stmt: HashMap::new(),
-                    cached_insert_stmt: HashMap::new(),
-                    cached_update_stmt: HashMap::new(),
-                    in_txn: true,
-                    generator: DatabaseReplayGenerator {
-                        conn: conn.clone(),
-                        opts: DatabaseReplaySessionOpts {
-                            use_implicit_rowid: false,
-                        },
+                let mut local_replay = DatabaseReplaySession::new(
+                    conn.clone(),
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
                     },
-                };
+                );
 
                 let mut transformed = if self.opts.use_transform {
                     let ctx = &SyncOperationCtx::new(
@@ -2544,19 +2530,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                         let replay_conn = logical_replay_conn
                                             .as_ref()
                                             .expect("replace-base replay connection should exist");
-                                        let mut replay = DatabaseReplaySession {
-                                            conn: replay_conn.clone(),
-                                            cached_delete_stmt: HashMap::new(),
-                                            cached_insert_stmt: HashMap::new(),
-                                            cached_update_stmt: HashMap::new(),
-                                            in_txn: true,
-                                            generator: DatabaseReplayGenerator {
-                                                conn: replay_conn.clone(),
-                                                opts: DatabaseReplaySessionOpts {
-                                                    use_implicit_rowid: true,
-                                                },
+                                        let mut replay = DatabaseReplaySession::new(
+                                            replay_conn.clone(),
+                                            DatabaseReplaySessionOpts {
+                                                use_implicit_rowid: true,
                                             },
-                                        };
+                                        );
                                         apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
                                             coro,
                                             &mut replay,
@@ -2825,107 +2804,109 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     cdc_enabled_for_local_replay = true;
                 }
 
-                let mut replay = DatabaseReplaySession {
-                    conn: phase_conn.clone(),
-                    cached_delete_stmt: HashMap::new(),
-                    cached_insert_stmt: HashMap::new(),
-                    cached_update_stmt: HashMap::new(),
-                    in_txn: true,
-                    generator: DatabaseReplayGenerator {
-                        conn: phase_conn.clone(),
-                        opts: DatabaseReplaySessionOpts {
+                // `phase_conn` is reused after this replay (CDC pragma updates, the
+                // commit below, and more), unlike the other `DatabaseReplaySession`
+                // call sites that each get their own connection and are done with it
+                // once the session ends. `replay_without_triggers` restores triggers
+                // on every exit path, success or error.
+                replay_without_triggers(phase_conn, || async {
+                    let mut replay = DatabaseReplaySession::new(
+                        phase_conn.clone(),
+                        DatabaseReplaySessionOpts {
                             use_implicit_rowid: raw_page_replay_on_sql_conn,
                         },
-                    },
-                };
-
-                let should_transform_local_change = |change: &DatabaseTapeRowChange| {
-                    is_logically_replayable_table(&change.table_name)
-                        && !self
-                            .opts
-                            .tables_ignore
-                            .iter()
-                            .any(|table| table == &change.table_name)
-                };
-                let transform_changes = if self.opts.use_transform {
-                    local_changes
-                        .iter()
-                        .filter(|change| should_transform_local_change(change))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
-                let mut transformed = if self.opts.use_transform {
-                    let ctx = &SyncOperationCtx::new(
-                        coro,
-                        &self.sync_engine_io,
-                        self.meta().remote_url(),
-                        self.opts.remote_encryption_key.as_ref(),
                     );
-                    Some(apply_transformation(ctx, &transform_changes, &replay.generator).await?)
-                } else {
-                    None
-                };
-                let mut transform_index = 0usize;
 
-                assert!(!replay.conn().get_auto_commit());
-                for (i, change) in local_changes.into_iter().enumerate() {
-                    let preserve_original_change_floor =
-                        matches!(&change.change, DatabaseTapeRowChangeType::Delete { .. });
-                    let original_change_floor = change.change_id.saturating_sub(1);
-                    let operation = if should_transform_local_change(&change) {
-                        if let Some(transformed) = &mut transformed {
-                            let transform_result = std::mem::replace(
-                                &mut transformed[transform_index],
-                                DatabaseRowTransformResult::Skip,
-                            );
-                            transform_index += 1;
-                            match transform_result {
-                                DatabaseRowTransformResult::Keep => {
-                                    DatabaseTapeOperation::RowChange(change)
+                    let should_transform_local_change = |change: &DatabaseTapeRowChange| {
+                        is_logically_replayable_table(&change.table_name)
+                            && !self
+                                .opts
+                                .tables_ignore
+                                .iter()
+                                .any(|table| table == &change.table_name)
+                    };
+                    let transform_changes = if self.opts.use_transform {
+                        local_changes
+                            .iter()
+                            .filter(|change| should_transform_local_change(change))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                    let mut transformed = if self.opts.use_transform {
+                        let ctx = &SyncOperationCtx::new(
+                            coro,
+                            &self.sync_engine_io,
+                            self.meta().remote_url(),
+                            self.opts.remote_encryption_key.as_ref(),
+                        );
+                        Some(apply_transformation(ctx, &transform_changes, &replay.generator).await?)
+                    } else {
+                        None
+                    };
+                    let mut transform_index = 0usize;
+
+                    assert!(!replay.conn().get_auto_commit());
+                    for (i, change) in local_changes.into_iter().enumerate() {
+                        let preserve_original_change_floor =
+                            matches!(&change.change, DatabaseTapeRowChangeType::Delete { .. });
+                        let original_change_floor = change.change_id.saturating_sub(1);
+                        let operation = if should_transform_local_change(&change) {
+                            if let Some(transformed) = &mut transformed {
+                                let transform_result = std::mem::replace(
+                                    &mut transformed[transform_index],
+                                    DatabaseRowTransformResult::Skip,
+                                );
+                                transform_index += 1;
+                                match transform_result {
+                                    DatabaseRowTransformResult::Keep => {
+                                        DatabaseTapeOperation::RowChange(change)
+                                    }
+                                    DatabaseRowTransformResult::Skip => continue,
+                                    DatabaseRowTransformResult::Rewrite(replay) => {
+                                        DatabaseTapeOperation::StmtReplay(replay)
+                                    }
                                 }
-                                DatabaseRowTransformResult::Skip => continue,
-                                DatabaseRowTransformResult::Rewrite(replay) => {
-                                    DatabaseTapeOperation::StmtReplay(replay)
-                                }
+                            } else {
+                                DatabaseTapeOperation::RowChange(change)
                             }
                         } else {
                             DatabaseTapeOperation::RowChange(change)
+                        };
+                        if had_cdc_table && !cdc_enabled_for_local_replay {
+                            tracing::info!(
+                                "apply_changes(path={}): reinitialize CDC pragma before unpushed local replay",
+                                self.main_db_path,
+                            );
+                            phase_conn
+                                .pragma_update(CDC_PRAGMA_NAME, "'full'")
+                                .map_err(|error| {
+                                    Error::DatabaseSyncEngineError(format!(
+                                        "failed to reinitialize CDC pragma before unpushed local replay: {error}",
+                                    ))
+                                })?;
+                            cdc_enabled_for_local_replay = true;
                         }
-                    } else {
-                        DatabaseTapeOperation::RowChange(change)
-                    };
-                    if had_cdc_table && !cdc_enabled_for_local_replay {
-                        tracing::info!(
-                            "apply_changes(path={}): reinitialize CDC pragma before unpushed local replay",
-                            self.main_db_path,
-                        );
-                        phase_conn
-                            .pragma_update(CDC_PRAGMA_NAME, "'full'")
-                            .map_err(|error| {
-                                Error::DatabaseSyncEngineError(format!(
-                                    "failed to reinitialize CDC pragma before unpushed local replay: {error}",
-                                ))
-                            })?;
-                        cdc_enabled_for_local_replay = true;
+                        if preserve_original_change_floor {
+                            preserve_local_replay_floor = Some(
+                                preserve_local_replay_floor.map_or(
+                                    original_change_floor,
+                                    |floor: i64| floor.min(original_change_floor),
+                                ),
+                            );
+                        }
+                        maybe_inject_replace_base_local_replay_failure(replace_base_pages, i)?;
+                        replay.replay(coro, operation).await.map_err(|error| {
+                            Error::DatabaseSyncEngineError(format!(
+                                "failed to replay local change after remote apply: {error}",
+                            ))
+                        })?;
                     }
-                    if preserve_original_change_floor {
-                        preserve_local_replay_floor = Some(
-                            preserve_local_replay_floor.map_or(
-                                original_change_floor,
-                                |floor: i64| floor.min(original_change_floor),
-                            ),
-                        );
-                    }
-                    maybe_inject_replace_base_local_replay_failure(replace_base_pages, i)?;
-                    replay.replay(coro, operation).await.map_err(|error| {
-                        Error::DatabaseSyncEngineError(format!(
-                            "failed to replay local change after remote apply: {error}",
-                        ))
-                    })?;
-                }
-                assert!(!replay.conn().get_auto_commit());
+                    assert!(!replay.conn().get_auto_commit());
+                    Ok(())
+                })
+                .await?;
             }
 
             if let Some(logical_conn) = logical_replay_conn {
