@@ -793,23 +793,20 @@ fn translate_cast_expr(
 
                 // Validate domain constraints on the encoded value
                 emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
+                emit_cast_result_form(program, &resolved.chain, target_register, resolver)?;
                 return Ok(target_register);
             }
 
-            // CAST gives the stored form: CAST(42 AS cents) → 4200. With type
-            // arguments it applies their limits too, as storing in a column
-            // of that type does: CAST('3.504' AS numeric(10,2)) is 3.50. A
-            // type that takes arguments, named without all of them, is
-            // SQLite's CAST: CAST(x AS NUMERIC) is a common SQLite idiom.
+            // CAST stores the value as a column of the type would, so with
+            // type arguments it applies their limits too: CAST('3.504' AS
+            // numeric(10,2)) is 3.50. A type that takes arguments, named
+            // without all of them, is SQLite's CAST: CAST(x AS NUMERIC) is a
+            // common SQLite idiom.
             let user_param_count = resolved.leaf().user_params().count();
             if user_param_count == 0 || ty_params.len() == user_param_count {
-                emit_store_value(
-                    program,
-                    &resolved.chain[..1],
-                    target_register,
-                    &ty_params,
-                    resolver,
-                )?;
+                let chain = &resolved.chain[..1];
+                emit_store_value(program, chain, target_register, &ty_params, resolver)?;
+                emit_cast_result_form(program, chain, target_register, resolver)?;
                 return Ok(target_register);
             }
         }
@@ -824,6 +821,24 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// Gives the stored value of a CAST in `reg` the form a column of the type has
+/// in the same expression, so that operators, functions and comparisons see
+/// both alike. A query reads columns decoded, so `CAST(42 AS cents)` is 42 and
+/// `-CAST(1.5 AS numeric(10,2))` runs numeric's `-` on 1.50. A CHECK
+/// constraint sees columns as stored, so there the CAST stays stored too:
+/// `CHECK (price >= CAST(1 AS cents))` compares the stored price with 100.
+fn emit_cast_result_form(
+    program: &mut ProgramBuilder,
+    chain: &[Arc<TypeDef>],
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if program.flags.suppress_custom_type_decode() {
+        return Ok(());
+    }
+    emit_decode(program, chain, reg, resolver)
 }
 
 /// True when a cast to `type_def` turns every nonzero integer into true.

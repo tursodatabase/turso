@@ -1102,6 +1102,18 @@ expect {
     0.25|0.25|0.50|-0.25|-0.25|-0.25|1|0|3|-1|-4|-1
 }
 
+# A CAST to numeric gives the value a numeric column reads, so numeric's
+# operators and functions such as abs see it as they see the column.
+@requires strict "uses STRICT tables"
+test op-numeric-cast-operand {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (-1.5);
+    SELECT CAST(1.5 AS numeric(10,2)), -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1, CAST(1.5 AS numeric(10,2)) * n, abs(CAST(-1.5 AS numeric(10,2))), abs(n) FROM t;
+}
+expect {
+    1.50|-1.50|2.50|-2.2500|1.5|1.5
+}
+
 @requires strict "uses STRICT tables"
 test op-date-negate-error {
     CREATE TABLE t(n numeric(10,2), d date) STRICT;

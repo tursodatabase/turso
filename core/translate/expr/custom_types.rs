@@ -121,24 +121,37 @@ pub(crate) fn emit_user_facing_column_value(
         return Ok(());
     }
     if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
-        if resolved.chain.iter().all(|td| td.decode().is_none()) {
-            return Ok(());
-        }
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg: dest_reg,
-            target_pc: skip_label,
-        });
-
-        // Apply decode in reverse order (parent/ancestor first, then child)
-        for td in resolved.chain.iter().rev() {
-            if let Some(decode_expr) = td.decode() {
-                emit_type_expr(program, decode_expr, dest_reg, dest_reg, resolver)?;
-            }
-        }
-
-        program.preassign_label_to_next_insn(skip_label);
+        emit_decode(program, &resolved.chain, dest_reg, resolver)?;
     }
+    Ok(())
+}
+
+/// Emits the DECODE of each of `chain`'s types on the stored value in `reg`,
+/// which turns it into the value a column of the type reads back. NULL is
+/// left as it is.
+pub(super) fn emit_decode(
+    program: &mut ProgramBuilder,
+    chain: &[crate::sync::Arc<TypeDef>],
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if chain.iter().all(|td| td.decode().is_none()) {
+        return Ok(());
+    }
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
+
+    // Apply decode in reverse order (parent/ancestor first, then child)
+    for td in chain.iter().rev() {
+        if let Some(decode_expr) = td.decode() {
+            emit_type_expr(program, decode_expr, reg, reg, resolver)?;
+        }
+    }
+
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 

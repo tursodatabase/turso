@@ -103,7 +103,7 @@ test cast-to-custom-type {
     SELECT CAST('hello' AS test_reverse);
 }
 expect {
-    olleh
+    hello
 }
 
 @requires strict "uses STRICT tables"
@@ -111,16 +111,44 @@ test cast-to-parametric-type {
     SELECT typeof(CAST(42 AS numeric(10,2)));
 }
 expect {
-    blob
+    text
+}
+
+# A CAST gives the value a column of the type reads back after ENCODE and
+# DECODE, so it compares equal to the column it was stored in.
+@requires strict "uses STRICT tables"
+test cast-to-custom-type-reads-like-a-column {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(p cents) STRICT;
+    INSERT INTO t VALUES (42);
+    SELECT CAST(42 AS cents), p = CAST(42 AS cents), p = CAST(43 AS cents) FROM t;
+}
+expect {
+    42|1|0
+}
+
+# A CHECK constraint sees the columns as stored, so a CAST in it gives the
+# stored value: 100 is stored as 10000, which the CHECK allows, and 101 as
+# 10100, which it does not.
+@requires strict "uses STRICT tables"
+test cast-to-custom-type-in-check-is-stored {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(p cents CHECK (p <= CAST(100 AS cents))) STRICT;
+    INSERT INTO t VALUES (100);
+    SELECT p FROM t;
+}
+expect {
+    100
 }
 
 @requires strict "uses STRICT tables"
-test cast-to-custom-type-encode-only {
+test cast-to-custom-type-in-check-is-stored-error {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    SELECT CAST(42 AS cents);
+    CREATE TABLE t(p cents CHECK (p <= CAST(100 AS cents))) STRICT;
+    INSERT INTO t VALUES (101);
 }
-expect {
-    4200
+expect error {
+    CHECK constraint failed
 }
 
 @requires strict "uses STRICT tables"

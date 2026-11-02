@@ -62,7 +62,7 @@ CREATE TYPE cents BASE integer
 The ENCODE expression is evaluated whenever a value is written to a column of this type. The DECODE expression is evaluated whenever a value is read. Both expressions use the identifier `value` to refer to the input.
 
 - **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST, and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first).
-- **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT.
+- **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT, and on CAST after ENCODE (see [CAST Support](#cast-support)).
 - **NULL handling**: NULL values bypass both ENCODE and DECODE. A NULL input produces a NULL output without evaluating the expression.
 
 ```sql
@@ -210,7 +210,7 @@ CREATE TYPE email BASE text
 
 ## CAST Support
 
-The CAST expression applies a custom type's ENCODE logic, and its COERCE logic when the CAST gives the type's arguments (see [COERCE](#coerce)):
+The CAST expression stores the value as a column of the type would, with the type's ENCODE logic and its COERCE logic when the CAST gives the type's arguments (see [COERCE](#coerce)), and gives the value such a column reads back, after DECODE. A CAST and a column of the type therefore compare equal when they hold the same value, and the type's operators treat them alike:
 
 ```sql
 CREATE TYPE cents BASE integer
@@ -218,12 +218,15 @@ CREATE TYPE cents BASE integer
     DECODE value / 100;
 
 SELECT CAST(42.5 AS cents);
--- 4250
+-- 42.5 (ENCODE gives 4250.0, DECODE gives back 42.5)
+
+SELECT -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1;
+-- -1.50|2.50
 ```
 
-This is useful for converting values to the encoded form outside of INSERT/UPDATE, such as in WHERE clauses.
+A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the value as the column holds it.
 
-A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the encoded value.
+In a CHECK constraint, which sees the columns as they are stored, a CAST gives the stored value instead, without DECODE (see below).
 
 ## CHECK Constraints with Custom Types
 

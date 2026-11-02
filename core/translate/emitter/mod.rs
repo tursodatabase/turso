@@ -2280,14 +2280,22 @@ fn emit_check_constraint_bytecode(
             )?;
         }
 
-        translate_expr_no_constant_opt(
+        // A CHECK constraint sees the columns as stored, so a CAST to a custom
+        // type in it gives the stored value too.
+        let decode_was_suppressed = program.flags.suppress_custom_type_decode();
+        program.flags.set_suppress_custom_type_decode(true);
+        let translated = translate_expr_no_constant_opt(
             program,
             referenced_tables,
             &rewritten_expr,
             expr_result_reg,
             resolver,
             NoConstantOptReason::RegisterReuse,
-        )?;
+        );
+        program
+            .flags
+            .set_suppress_custom_type_decode(decode_was_suppressed);
+        translated?;
 
         // CHECK constraint passes if the result is NULL or non-zero (truthy)
         let constraint_passed_label = program.allocate_label();

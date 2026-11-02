@@ -497,9 +497,11 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, translate_expr will skip custom type decode for Expr::Column.
-    /// This is used when building ORDER BY sort keys so the sorter compares
-    /// encoded (on-disk) values. Decode is presentation-only.
+    /// When set, custom-type values in the expression being translated keep
+    /// their stored form: a column is not decoded and a CAST to a custom type
+    /// gives the stored value. Set when building ORDER BY sort keys, so the
+    /// sorter compares stored values, and in CHECK constraints, which see the
+    /// columns as stored.
     pub const fn suppress_custom_type_decode(self) -> bool {
         self.get(Self::SUPPRESS_CUSTOM_TYPE_DECODE)
     }
