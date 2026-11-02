@@ -1640,21 +1640,27 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
     let mut previous_range_boundary: Option<(u64, u64)> = None;
 
     for range in &metadata.ranges {
-        if previous_range_boundary != Some((range.generation, range.start_offset)) {
+        if previous_range_boundary != Some((range.generation, range.start_offset))
+            || range.transmitted_length.is_some()
+        {
             running_crc = None;
         }
-        let range_len = usize::try_from(
-            range
-                .end_offset
-                .checked_sub(range.start_offset)
-                .ok_or_else(|| {
-                    Error::DatabaseSyncEngineError(format!(
-                        "invalid MVCC logical-log range {}..{}",
-                        range.start_offset, range.end_offset
-                    ))
-                })?,
-        )
-        .map_err(|_| {
+        let source_len = range
+            .end_offset
+            .checked_sub(range.start_offset)
+            .ok_or_else(|| {
+                Error::DatabaseSyncEngineError(format!(
+                    "invalid MVCC logical-log range {}..{}",
+                    range.start_offset, range.end_offset
+                ))
+            })?;
+        let wire_len = range.transmitted_length.unwrap_or(source_len);
+        if wire_len > source_len || (wire_len == 0) != (source_len == 0) {
+            return Err(Error::DatabaseSyncEngineError(
+                "invalid transmitted length for MVCC logical-log source range".to_string(),
+            ));
+        }
+        let range_len = usize::try_from(wire_len).map_err(|_| {
             Error::DatabaseSyncEngineError(
                 "MVCC logical-log range length overflows usize".to_string(),
             )
@@ -4970,6 +4976,20 @@ mod tests {
 
     #[test]
     fn pull_updates_v1_decodes_raw_mvcc_log_stream() {
+        check_pull_updates_v1_decodes_raw_mvcc_log_stream(false, false);
+    }
+
+    #[test]
+    fn pull_updates_v1_decodes_transformed_mvcc_log_stream_with_source_revision() {
+        check_pull_updates_v1_decodes_raw_mvcc_log_stream(true, false);
+    }
+
+    #[test]
+    fn pull_updates_v1_rejects_zero_wire_length_for_nonempty_source_range() {
+        check_pull_updates_v1_decodes_raw_mvcc_log_stream(true, true);
+    }
+
+    fn check_pull_updates_v1_decodes_raw_mvcc_log_stream(transformed: bool, invalid_length: bool) {
         let table_id = -42;
         let record = record(&[turso_core::Value::build_text("logical")]);
         let expected_txn = LogicalTxnData {
@@ -5007,7 +5027,7 @@ mod tests {
         let (raw_frame, _) =
             raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 1, crc_seed);
         let range_start = super::MVCC_LOG_HEADER_SIZE as u64;
-        let range_end = range_start + raw_frame.len() as u64;
+        let range_end = range_start + raw_frame.len() as u64 + if transformed { 28 } else { 0 };
         let header = PullUpdatesRespProtoBody {
             encrypted_sync: false,
             protocol: 0,
@@ -5021,6 +5041,11 @@ mod tests {
                 format: "lml3".to_string(),
                 checkpoint_transition: false,
                 ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    transmitted_length: transformed.then_some(if invalid_length {
+                        0
+                    } else {
+                        raw_frame.len() as u64
+                    }),
                     generation: 1,
                     start_offset: range_start,
                     end_offset: range_end,
@@ -5072,6 +5097,10 @@ mod tests {
             match gen.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(..) => {}
                 genawaiter::GeneratorState::Complete(result) => {
+                    if invalid_length {
+                        assert!(result.is_err());
+                        return;
+                    }
                     result.unwrap();
                     break;
                 }
