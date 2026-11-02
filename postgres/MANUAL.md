@@ -64,9 +64,9 @@ RESET ROLE
 
 **Description:**
 
-`SET ROLE` makes `role_name` the current role of the session. `current_user`
-and `current_role` return it, and `session_user` keeps returning the role
-that the session logged in as.
+`SET ROLE` makes `role_name` the current role of the session. Statements are
+then checked against that role. `current_user` and `current_role` return it,
+and `session_user` keeps returning the role that the session logged in as.
 
 `SET ROLE NONE` and `RESET ROLE` make the session's login role the current
 role again.
@@ -79,6 +79,11 @@ role again.
 
 **Notes:**
 
+Ownership, `GRANT` and table privileges are not supported yet. A role that is
+not a superuser may read and write the rows of every table and use every
+sequence, but it cannot create, alter or drop objects, create roles, or
+`COPY FROM` a file.
+
 `SET ROLE` is not supported inside a transaction block, and `SET LOCAL ROLE`
 is not supported.
 
@@ -87,6 +92,7 @@ is not supported.
 Switch to a role and back:
 
 ```sql
+CREATE TABLE accounts (id int);
 CREATE ROLE jonathan;
 SET ROLE jonathan;
 SELECT current_user, session_user;
@@ -97,6 +103,14 @@ SELECT current_user, session_user;
 --------------+--------------
  jonathan     | postgres
 (1 row)
+```
+
+```sql
+DROP TABLE accounts;
+```
+
+```
+ERROR:  must be owner of table accounts
 ```
 
 ```sql

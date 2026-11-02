@@ -296,6 +296,55 @@ expect error {
     role "public" does not exist
 }
 
+test role-without-privileges-can-select-without-tables {
+    CREATE ROLE sr_no_tables;
+    SET ROLE sr_no_tables;
+    SELECT 1 + 1, upper('x');
+}
+expect {
+    2|X
+}
+
+test role-without-privileges-cannot-create-table {
+    CREATE ROLE sr_creator;
+    SET ROLE sr_creator;
+    CREATE TABLE sr_created (x int);
+}
+expect error {
+    permission denied for schema public
+}
+
+test role-without-privileges-cannot-drop-table {
+    CREATE TABLE sr_drop (x int);
+    CREATE ROLE sr_dropper;
+    SET ROLE sr_dropper;
+    DROP TABLE sr_drop;
+}
+expect error {
+    must be owner of table sr_drop
+}
+
+test role-without-privileges-cannot-create-role {
+    CREATE ROLE sr_role_creator;
+    SET ROLE sr_role_creator;
+    CREATE ROLE sr_role_created;
+}
+expect error {
+    permission denied to create role
+}
+
+test reset-role-restores-superuser-privileges {
+    CREATE TABLE sr_restore (x int);
+    INSERT INTO sr_restore VALUES (1);
+    CREATE ROLE sr_restorer;
+    SET ROLE sr_restorer;
+    RESET ROLE;
+    SELECT x FROM sr_restore;
+}
+expect {
+    1
+}
+
 test pg-tables-does-not-list-the-roles-table {
     CREATE ROLE pt_role;
     SELECT count(*) FROM pg_tables WHERE tablename LIKE '%roles%';
@@ -326,4 +375,16 @@ test pg-get-constraintdef-finds-constraint-after-create-role {
 }
 expect {
     PRIMARY KEY (x)
+}
+
+test role-without-privileges-can-read-catalogs {
+    CREATE TABLE rc_table (x int);
+    CREATE ROLE rc_reader;
+    SET ROLE rc_reader;
+    SELECT CASE WHEN count(*) > 0 THEN 'readable' ELSE 'empty' END FROM pg_roles;
+    SELECT CASE WHEN count(*) > 0 THEN 'readable' ELSE 'empty' END FROM pg_class;
+}
+expect {
+    readable
+    readable
 }
