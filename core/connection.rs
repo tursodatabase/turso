@@ -4106,6 +4106,11 @@ impl Connection {
     /// leaves MVCC AUTOINCREMENT able to re-emit a rowid already in use after a
     /// WAL→MVCC mode switch, so errors propagate to fail the open rather than
     /// continue into a state where the next INSERT NULL collides on disk.
+    /// A row whose `name` is not text names no table and is logged and skipped
+    /// (WAL mode can never look it up); the table that row once described is
+    /// left without an imported watermark. Unlike WAL mode, which falls back
+    /// to the table's largest rowid when a sequence row is absent, this sync
+    /// has no such floor — closing that gap is a separate fix.
     pub(crate) fn sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(
         self: &Arc<Connection>,
         state: &mut SyncAutoincrementState,
@@ -4113,6 +4118,7 @@ impl Connection {
         use crate::schema::{autoincrement_sequence_name, SQLITE_SEQUENCE_TABLE_NAME};
         use crate::translate::sequence::sequence_backing_table_name;
         use crate::types::IOResult;
+        use crate::vdbe::execute::extract_int_value;
 
         loop {
             match state {
@@ -4134,9 +4140,19 @@ impl Connection {
                 }
                 SyncAutoincrementState::ReadSeqRows { stmt, rows } => {
                     crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        let name = row.get::<&str>(0)?.to_string();
-                        let seq = row.get::<i64>(1)?;
-                        rows.push((name, seq));
+                        // A row only matters for the table it names, so a
+                        // name that is not text names no table and the row is
+                        // skipped — WAL mode can never look it up either.
+                        // The seq value is coerced to an integer with the same
+                        // conversion the INSERT path uses.
+                        let Ok(name) = row.get::<&str>(0) else {
+                            tracing::warn!(
+                                "skipping sqlite_sequence row with non-text name during autoincrement sync"
+                            );
+                            return Ok(());
+                        };
+                        let seq = extract_int_value(row.get_value(1));
+                        rows.push((name.to_string(), seq));
                         Ok(())
                     }));
                     let rows = std::mem::take(rows);
