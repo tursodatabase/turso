@@ -289,6 +289,20 @@ expect error {
     UNIQUE constraint failed
 }
 
+# PRIMARY KEY(a COLLATE NOCASE, b, a) keys are equal only when a is equal under
+# both NOCASE and BINARY, so 'A' and 'a' are distinct keys.
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+test create_table_without_rowid_primary_key_repeated_column_collations {
+    CREATE TABLE t_wpkd(a, b, PRIMARY KEY(a COLLATE NOCASE, b, a)) WITHOUT ROWID;
+    INSERT INTO t_wpkd VALUES ('A', 1);
+    INSERT INTO t_wpkd VALUES ('a', 1);
+    SELECT a, b FROM t_wpkd ORDER BY a;
+}
+expect {
+    A|1
+    a|1
+}
+
 # A WITHOUT ROWID table is stored in primary key order, so a full scan returns
 # rows sorted by the PRIMARY KEY's collation.
 @skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"

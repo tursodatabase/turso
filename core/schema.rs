@@ -5727,6 +5727,47 @@ impl BTreeTable {
             })
     }
 
+    /// Collation of the WITHOUT ROWID table key field that stores the `i`-th
+    /// PRIMARY KEY entry, whose column is `column`. The table stores a column
+    /// once even when PRIMARY KEY(...) lists it more than once. When those
+    /// entries have different collations the field compares with BINARY,
+    /// because two texts are equal under every built-in collation only when
+    /// they are equal under BINARY.
+    pub fn without_rowid_key_collation(&self, i: usize, column: &Column) -> CollationSeq {
+        let (name, _) = &self.primary_key_columns[i];
+        let collation = self.primary_key_collation(i, column);
+        let repeated_with_other_collation =
+            self.primary_key_columns
+                .iter()
+                .enumerate()
+                .any(|(j, (other_name, _))| {
+                    j != i
+                        && other_name.eq_ignore_ascii_case(name)
+                        && self.primary_key_collation(j, column) != collation
+                });
+        if repeated_with_other_collation {
+            CollationSeq::Text(TextCollation::Binary)
+        } else {
+            collation
+        }
+    }
+
+    /// Collation of the `i`-th PRIMARY KEY entry, whose column is `column`:
+    /// the COLLATE written in PRIMARY KEY(...), or else the column's own.
+    pub fn primary_key_collation(&self, i: usize, column: &Column) -> CollationSeq {
+        self.primary_key_explicit_collation(i)
+            .map_or_else(|| column.collation(), CollationSeq::Text)
+    }
+
+    /// The COLLATE written for the `i`-th entry of PRIMARY KEY(...), if any.
+    pub fn primary_key_explicit_collation(&self, i: usize) -> Option<TextCollation> {
+        self.unique_sets
+            .iter()
+            .find(|unique_set| unique_set.is_primary_key)
+            .and_then(|unique_set| unique_set.columns.get(i))
+            .and_then(|column| column.collation)
+    }
+
     fn primary_key_constraint_collation(&self, column_name: &str) -> Option<TextCollation> {
         self.unique_sets
             .iter()
@@ -8167,16 +8208,14 @@ impl Index {
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
-            let explicit_collation = constraint_columns.get(i).and_then(|c| c.collation);
             primary_keys
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col_name),
                     order: *order,
                     nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
-                    collation: explicit_collation
-                        .map_or_else(|| column.collation(), CollationSeq::Text),
-                    explicit_collation,
+                    collation: table.primary_key_collation(i, column),
+                    explicit_collation: table.primary_key_explicit_collation(i),
                     default: column.default.clone(),
                     expr: None,
                 })
