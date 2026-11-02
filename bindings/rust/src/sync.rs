@@ -2867,4 +2867,44 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    // Each task does what a web request would: open a connection, write a row, push.
+    // Only user statements may see Busy; sync operations must wait their turn instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    pub async fn test_sync_connect_write_push_per_task() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(id INTEGER)").await.unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        db.pull().await.unwrap();
+
+        const TASKS: i64 = 30;
+        let mut tasks = Vec::new();
+        for i in 0..TASKS {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                let conn = db.connect().await.unwrap();
+                loop {
+                    match conn.execute("INSERT INTO t VALUES (?)", (i,)).await {
+                        Ok(_) => break,
+                        Err(e) if super::is_sync_busy_error(&e) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(e) => panic!("insert failed: {e}"),
+                    }
+                }
+                db.push().await.unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let rows = server.db_sql("SELECT count(*) FROM t").await.unwrap();
+        assert_eq!(rows, vec![vec![Value::Text(TASKS.to_string())]]);
+    }
 }

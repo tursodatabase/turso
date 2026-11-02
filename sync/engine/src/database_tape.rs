@@ -31,6 +31,7 @@ const DEFAULT_CDC_TABLE_NAME: &str = "turso_cdc";
 const DEFAULT_CDC_MODE: &str = "full";
 const DEFAULT_CHANGES_BATCH_SIZE: usize = 100;
 pub const CDC_PRAGMA_NAME: &str = "capture_data_changes_conn";
+const CDC_PRAGMA_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct DatabaseTapeOpts {
@@ -175,8 +176,13 @@ impl DatabaseTape {
             connection.wal_auto_actions_disable();
         }
         tracing::debug!("set '{CDC_PRAGMA_NAME}' for new connection");
+        // The CDC pragma takes a write transaction, so it must wait for other writers
+        // instead of failing a sync operation with "database is busy".
+        connection.set_busy_timeout(CDC_PRAGMA_BUSY_TIMEOUT);
         let mut stmt = connection.prepare(&self.pragma_query)?;
         run_stmt_ignore_rows(coro, &mut stmt).await?;
+        drop(stmt);
+        connection.set_busy_timeout(std::time::Duration::ZERO);
         // Cache CDC version from turso_cdc_version table
         if self.cdc_version.read().unwrap().is_none() {
             let version = Self::read_cdc_version(coro, &connection, &self.cdc_table).await?;
