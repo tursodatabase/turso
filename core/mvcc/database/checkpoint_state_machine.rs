@@ -4,8 +4,8 @@ use crate::alloc::{
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    type_sql_from_record, types_table_root_page, DeleteRowStateMachine, IndexRowsEntry, MVTableId,
-    MvStore, RowID, RowKey, RowVersion, RowVersions, SortableIndexKey, TxTimestampOrID, WalPos,
+    types_table_root_page, DeleteRowStateMachine, IndexRowsEntry, MVTableId, MvStore, RowID,
+    RowKey, RowVersion, RowVersions, SortableIndexKey, TxTimestampOrID, WalPos,
     WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
     SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
@@ -3896,7 +3896,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
                 type_rows.sort_unstable_by_key(|(rowid, _)| **rowid);
                 let type_sqls = type_rows
                     .into_iter()
-                    .map(|(_, record)| type_sql_from_record(record))
+                    .map(|(_, record)| Schema::type_sql_from_record(record))
                     .collect::<Result<std::vec::Vec<_>>>()?;
                 let tvfs = MvStore::<Clock, A>::capture_table_valued_functions(
                     &self.connection.schema.read(),

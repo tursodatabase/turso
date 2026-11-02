@@ -292,6 +292,40 @@ mod tests {
         assert_eq!(rows, vec![(4, 1)]);
     }
 
+    /// Under MVCC a passive checkpoint builds its own schema to write index
+    /// rows. An index on a domain over numeric must keep the numeric order
+    /// there, or the checkpointed index rows are out of order.
+    #[test]
+    fn test_mvcc_passive_checkpoint_keeps_domain_index_order() {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_experimental_mvcc_passive_checkpoint(true);
+        let db = TempDatabase::builder()
+            .with_opts(opts)
+            .with_mvcc(true)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE DOMAIN dn AS numeric").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n dn) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX t_n ON t(n)").unwrap();
+        for i in 1..=300 {
+            conn.execute(format!("INSERT INTO t VALUES ({i}, {i}.5)"))
+                .unwrap();
+        }
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+        for sql in [
+            "SELECT id FROM t INDEXED BY t_n WHERE n > 299 ORDER BY id",
+            "SELECT id FROM t NOT INDEXED WHERE n > 299 ORDER BY id",
+        ] {
+            let rows: Vec<(i64,)> = conn.exec_rows(sql);
+            assert_eq!(rows, vec![(299,), (300,)], "{sql}");
+        }
+    }
+
     #[test]
     fn test_reopen_fails_when_stored_custom_type_does_not_parse() {
         let temp_dir = TempDir::new().unwrap();

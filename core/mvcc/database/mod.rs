@@ -9995,9 +9995,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         record_bytes,
                         ..
                     } if Some(rowid.table_id) == types_table_id => {
-                        let sql = type_sql_from_record(&ImmutableRecordRef::from_bin_record(
-                            record_bytes,
-                        ))?;
+                        let sql = Schema::type_sql_from_record(
+                            &ImmutableRecordRef::from_bin_record(record_bytes),
+                        )?;
                         type_sqls_after
                             .get_or_insert_with(|| type_sqls.clone())
                             .insert(rowid.row_id.to_int_or_panic(), sql);
@@ -10735,17 +10735,6 @@ pub(crate) fn types_table_root_page(record: &ImmutableRecordRef) -> Option<i64> 
     match record.get_value_opt(3) {
         Some(ValueRef::Numeric(Numeric::Integer(root_page))) if is_types_table => Some(root_page),
         _ => None,
-    }
-}
-
-/// The CREATE TYPE statement stored in a `(name, sql)` row of the types table.
-pub(crate) fn type_sql_from_record(record: &ImmutableRecordRef) -> Result<String> {
-    match record.get_value_opt(1) {
-        Some(ValueRef::Text(sql)) => Ok(sql.as_str().to_string()),
-        _ => Err(LimboError::Corrupt(format!(
-            "{} contains a row without CREATE TYPE sql",
-            crate::schema::TURSO_TYPES_TABLE_NAME
-        ))),
     }
 }
 

@@ -19,7 +19,7 @@ use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_co
 use crate::translate::planner::ROWID_STRS;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
-use crate::types::{IOResult, ImmutableRecord};
+use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::CursorID;
@@ -3060,14 +3060,9 @@ impl Schema {
                         state.phase = MakeFromBtreePhase::BuildingIndexes;
                         continue;
                     };
-                    // The types table is (name TEXT PRIMARY KEY, sql TEXT).
-                    let ValueRef::Text(sql) = record.get_value(1)? else {
-                        return Err(LimboError::Corrupt(format!(
-                            "{TURSO_TYPES_TABLE_NAME} contains a row without CREATE TYPE sql"
-                        ))
-                        .into());
-                    };
-                    state.type_sqls.push(sql.as_str().to_string());
+                    state
+                        .type_sqls
+                        .push(Self::type_sql_from_record(&record.as_record_ref())?);
                     state.phase = MakeFromBtreePhase::LoadingTypesAdvance;
                 }
 
@@ -3108,6 +3103,17 @@ impl Schema {
                     return Ok(IOResult::Done(()));
                 }
             }
+        }
+    }
+
+    /// The CREATE TYPE statement stored in a row of the types table,
+    /// which is (name TEXT PRIMARY KEY, sql TEXT).
+    pub(crate) fn type_sql_from_record(record: &ImmutableRecordRef) -> Result<String> {
+        match record.get_value_opt(1) {
+            Some(ValueRef::Text(sql)) => Ok(sql.as_str().to_string()),
+            _ => Err(LimboError::Corrupt(format!(
+                "{TURSO_TYPES_TABLE_NAME} contains a row without CREATE TYPE sql"
+            ))),
         }
     }
 
