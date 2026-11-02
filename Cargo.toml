@@ -251,3 +251,14 @@ large_stack_frames = "deny"
 large_types_passed_by_value = "deny"
 redundant_clone = "deny"
 assigning_clones = "deny"
+
+# Read by blaze (https://github.com/indexable-inc/blaze), not by cargo. Blaze runs build
+# scripts in a sandbox, which has no network and gives a script only the environment
+# variables that it knows.
+[workspace.metadata.blaze.sandbox]
+# libsqlite3-sys reads this variable, which .cargo/config.toml sets.
+build-script-env = ["LIBSQLITE3_FLAGS"]
+# hegeltest-c runs `cargo metadata`, which downloads the crates.io index.
+# turso_sqlite3 adds the target profile directory (for example target/debug) to the library
+# search path, so that its compat test links libturso_sqlite3. The sandbox refuses that path.
+unsandboxed-build-scripts = ["hegeltest-c", "turso_sqlite3"]
