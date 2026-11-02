@@ -42,7 +42,7 @@ func prepExec(t *testing.T, conn TursoConnection, sql string) uint64 {
 	stmt, err := turso_connection_prepare_single(conn, sql)
 	require.NoError(t, err)
 	defer func() {
-		_ = turso_statement_finalize(stmt)
+		_, _ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 	}()
 	_, changes, err := turso_statement_execute(stmt)
@@ -108,14 +108,14 @@ func TestPrepareFirstMultipleStatements(t *testing.T) {
 			assert.Equal(t, int64(1), v)
 			require.False(t, stepRow(t, stmt))
 		}
-		_ = turso_statement_finalize(stmt)
+		_, _ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 		start += tail
 	}
 	// Verify result
 	stmt := prepStmt(t, conn.conn, "SELECT a FROM t")
 	defer func() {
-		_ = turso_statement_finalize(stmt)
+		_, _ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 	}()
 	require.True(t, stepRow(t, stmt))
@@ -135,13 +135,13 @@ func TestInsertReturningMultiplePartialFetchCommits(t *testing.T) {
 	assert.Equal(t, int64(1), first)
 
 	// Do not consume all rows; finalize early
-	_ = turso_statement_finalize(stmt)
+	_, _ = turso_statement_finalize(stmt)
 	turso_statement_deinit(stmt)
 
 	// Ensure both rows were inserted
 	stmt2 := prepStmt(t, conn.conn, "SELECT COUNT(*) FROM t")
 	defer func() {
-		_ = turso_statement_finalize(stmt2)
+		_, _ = turso_statement_finalize(stmt2)
 		turso_statement_deinit(stmt2)
 	}()
 	require.True(t, stepRow(t, stmt2))
@@ -161,7 +161,7 @@ func TestInsertReturningWithExplicitTransactionAndPartialFetch(t *testing.T) {
 	v := turso_statement_row_value_int(stmt, 0)
 	assert.Equal(t, int64(10), v)
 	// finalize without consuming all rows
-	_ = turso_statement_finalize(stmt)
+	_, _ = turso_statement_finalize(stmt)
 	turso_statement_deinit(stmt)
 	// Commit should still succeed
 	prepExec(t, conn.conn, "COMMIT")
@@ -169,7 +169,7 @@ func TestInsertReturningWithExplicitTransactionAndPartialFetch(t *testing.T) {
 	// Verify data
 	stmt2 := prepStmt(t, conn.conn, "SELECT COUNT(*) FROM t")
 	defer func() {
-		_ = turso_statement_finalize(stmt2)
+		_, _ = turso_statement_finalize(stmt2)
 		turso_statement_deinit(stmt2)
 	}()
 	require.True(t, stepRow(t, stmt2))
@@ -185,7 +185,7 @@ func TestOnConflictDoNothingReturning(t *testing.T) {
 
 	stmt := prepStmt(t, conn.conn, "INSERT INTO t(a) VALUES(1) ON CONFLICT(a) DO NOTHING RETURNING a")
 	defer func() {
-		_ = turso_statement_finalize(stmt)
+		_, _ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 	}()
 	// Should produce no rows and be done
@@ -196,7 +196,7 @@ func TestOnConflictDoNothingReturning(t *testing.T) {
 	// Ensure count unchanged
 	stmt2 := prepStmt(t, conn.conn, "SELECT COUNT(*) FROM t")
 	defer func() {
-		_ = turso_statement_finalize(stmt2)
+		_, _ = turso_statement_finalize(stmt2)
 		turso_statement_deinit(stmt2)
 	}()
 	require.True(t, stepRow(t, stmt2))
@@ -212,7 +212,7 @@ func TestSubqueries(t *testing.T) {
 
 	stmt := prepStmt(t, conn.conn, "SELECT a FROM (SELECT a FROM t WHERE a > 1) WHERE a < 4 ORDER BY a")
 	defer func() {
-		_ = turso_statement_finalize(stmt)
+		_, _ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 	}()
 
@@ -237,7 +237,7 @@ func TestJoin(t *testing.T) {
 
 	stmt := prepStmt(t, conn.conn, "SELECT t1.id, t1.name, t2.age FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id")
 	defer func() {
-		_ = turso_statement_finalize(stmt)
+		_, _ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 	}()
 
@@ -269,7 +269,7 @@ func TestAlterTable(t *testing.T) {
 
 	stmt := prepStmt(t, conn.conn, "SELECT name FROM t WHERE id = 1")
 	defer func() {
-		_ = turso_statement_finalize(stmt)
+		_, _ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 	}()
 	require.True(t, stepRow(t, stmt))
@@ -283,7 +283,7 @@ func TestGenerateSeries(t *testing.T) {
 
 	stmt := prepStmt(t, conn.conn, "SELECT value FROM generate_series(1,5)")
 	defer func() {
-		_ = turso_statement_finalize(stmt)
+		_, _ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 	}()
 
@@ -303,7 +303,7 @@ func TestJSONFunctionsBindings(t *testing.T) {
 
 	stmt := prepStmt(t, conn.conn, "SELECT json_extract('{\"x\": [1,2,3]}', '$.x[1]'), json_array_length('[1,2,3]')")
 	defer func() {
-		_ = turso_statement_finalize(stmt)
+		_, _ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 	}()
 
@@ -332,13 +332,13 @@ func TestBindingsPositionalAndNamed(t *testing.T) {
 	require.NoError(t, turso_statement_bind_positional_null(stmt, 5))
 	_, _, err := turso_statement_execute(stmt)
 	require.NoError(t, err)
-	_ = turso_statement_finalize(stmt)
+	_, _ = turso_statement_finalize(stmt)
 	turso_statement_deinit(stmt)
 
 	// Named parameters mapped to positional via named_position
 	stmt2 := prepStmt(t, conn.conn, "INSERT INTO t(i,r,s,b,n) VALUES (:i,:r,:s,:b,:n)")
 	defer func() {
-		_ = turso_statement_finalize(stmt2)
+		_, _ = turso_statement_finalize(stmt2)
 		turso_statement_deinit(stmt2)
 	}()
 	posI := turso_statement_named_position(stmt2, ":i")
@@ -363,7 +363,7 @@ func TestBindingsPositionalAndNamed(t *testing.T) {
 	// Verify retrieved values using row value helpers
 	stmt3 := prepStmt(t, conn.conn, "SELECT i,r,s,b,n FROM t")
 	defer func() {
-		_ = turso_statement_finalize(stmt3)
+		_, _ = turso_statement_finalize(stmt3)
 		turso_statement_deinit(stmt3)
 	}()
 
@@ -398,7 +398,7 @@ func TestColumnMetadata(t *testing.T) {
 
 	stmt := prepStmt(t, conn.conn, "SELECT id, name FROM t")
 	defer func() {
-		_ = turso_statement_finalize(stmt)
+		_, _ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 	}()
 	cc := turso_statement_column_count(stmt)
