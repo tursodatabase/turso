@@ -7688,6 +7688,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             && tx.header.read().schema_cookie.get() != global_schema_cookie
     }
 
+    /// Whether a transaction other than `tx_id` is `Preparing` (it will eventually
+    /// commit), or is `Committed` after `tx_id`'s begin timestamp but may not have
+    /// raised `last_committed_tx_ts` yet.
+    fn has_committing_tx_other_than(&self, tx_id: TxID) -> bool {
+        let begin_ts = self.txs.get(&tx_id).map(|tx| tx.value().begin_ts);
+        self.txs.iter().any(|entry| {
+            *entry.key() != tx_id
+                && match entry.value().state.load() {
+                    TransactionState::Preparing(_) => true,
+                    TransactionState::Committed(end_ts) => {
+                        begin_ts.is_some_and(|begin_ts| end_ts > begin_ts)
+                    }
+                    _ => false,
+                }
+        })
+    }
+
     /// Acquires the exclusive transaction lock to the given transaction ID.
     fn acquire_exclusive_tx(
         &self,
@@ -7700,13 +7717,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // Re-entrant upgrade attempt for the same transaction.
             return Ok(());
         }
-        // If another transaction is committing or committed after this transaction's
-        // begin timestamp, no point in letting this txn progress. This mimics regular
-        // (non-CONCURRENT) sqlite transaction behavior.
+        // if some other transaction is preparing, or committed after our begin_ts, then we
+        // cannot let this tx continue
+        if self.has_committing_tx_other_than(*tx_id) {
+            return Err(LimboError::Busy);
+        }
+        // after we acquired begin_ts, we will check if some other txn committed in the meantime.
+        // If so, no point in letting this txn to progress as it's begin_ts is less than
+        // other txn's commit ts.
         // do note that this is an optimistic / early check. We need to check this again after this
         // txn gets exclusive txn status. check below after the CAS
-        if self.has_commit_newer_than(*tx_id) {
-            return Err(LimboError::Busy);
+        if let Some(tx) = self.txs.get(tx_id) {
+            let tx = tx.value();
+            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+                // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
+                // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
+                return Err(LimboError::Busy);
+            }
         }
         #[cfg(any(test, injected_yields))]
         if let Some(yield_context) = yield_context {
@@ -7730,6 +7757,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             Ordering::Acquire,
         ) {
             Ok(_) => {
+                if self.has_committing_tx_other_than(*tx_id) {
+                    self.release_exclusive_tx(tx_id);
+                    return Err(LimboError::Busy);
+                }
                 // we will check again, if some other txn committed in the meantime.
                 // we did this check previously too, but we will have to do this again.
                 // consider this timeline of events:
@@ -7747,9 +7778,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // we can also be sure that once we get the exclusive txn status, no other txn can sneak in and commit,
                 // because to commit, we make sure that there is no other exclusive txn. Check
                 // `CommitState::Initial`.
-                if self.has_commit_newer_than(*tx_id) {
-                    self.release_exclusive_tx(tx_id);
-                    return Err(LimboError::Busy);
+                if let Some(tx) = self.txs.get(tx_id) {
+                    let tx = tx.value();
+                    if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+                        self.release_exclusive_tx(tx_id);
+                        return Err(LimboError::Busy);
+                    }
                 }
                 Ok(())
             }
@@ -7758,29 +7792,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 Err(LimboError::Busy)
             }
         }
-    }
-
-    /// Whether a transaction other than `tx_id` is `Preparing` (it will eventually
-    /// commit), or committed after `tx_id`'s begin timestamp.
-    fn has_commit_newer_than(&self, tx_id: TxID) -> bool {
-        let begin_ts = self.txs.get(&tx_id).map(|tx| tx.value().begin_ts);
-        // A committing transaction is `Committed` in `txs` before it raises
-        // `last_committed_tx_ts`, and raises it before it leaves `txs`. Scanning
-        // `txs` before loading the timestamp therefore sees every such commit.
-        let committing = self.txs.iter().any(|entry| {
-            *entry.key() != tx_id
-                && match entry.value().state.load() {
-                    TransactionState::Preparing(_) => true,
-                    TransactionState::Committed(end_ts) => {
-                        begin_ts.is_some_and(|begin_ts| end_ts > begin_ts)
-                    }
-                    _ => false,
-                }
-        });
-        committing
-            || begin_ts.is_some_and(|begin_ts| {
-                begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire)
-            })
     }
 
     /// Release the exclusive transaction lock if held by the this transaction.
