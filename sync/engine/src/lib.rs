@@ -9,6 +9,7 @@ pub mod database_tape;
 pub mod errors;
 pub mod io_operations;
 pub mod server_proto;
+pub mod sync_encryption;
 pub mod types;
 pub mod wal_session;
 
