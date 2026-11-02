@@ -148,6 +148,40 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-group-by-and-distinct-use-stored-value {
+    -- 15 and 12 both read as 1, but `=` compares the stored 15 and 12, so
+    -- they are different values for GROUP BY and DISTINCT too.
+    CREATE TYPE tenth BASE integer ENCODE value DECODE value / 10;
+    CREATE TABLE g(c tenth, k int) STRICT;
+    INSERT INTO g VALUES (15, 1), (12, 2), (15, 3);
+    SELECT 'join', count(*) FROM g a JOIN g b ON a.c = b.c;
+    SELECT 'group by', group_concat(c || ':' || n, ' ') FROM (SELECT c, count(*) n FROM g GROUP BY c ORDER BY c);
+    SELECT 'having', count(*) FROM (SELECT c FROM g GROUP BY c HAVING count(*) > 1);
+    SELECT 'distinct', count(*) FROM (SELECT DISTINCT c FROM g);
+    SELECT 'distinct order by', count(*) FROM (SELECT DISTINCT c FROM g ORDER BY k);
+    SELECT 'distinct two columns', count(*) FROM (SELECT DISTINCT c, 1 FROM g);
+    SELECT 'count distinct', count(DISTINCT c), sum(DISTINCT c) FROM g;
+    SELECT 'count distinct grouped', count(DISTINCT c) FROM g GROUP BY k > 0;
+    SELECT 'aggregate order by', group_concat(k ORDER BY c, k), group_concat(DISTINCT c ORDER BY c) FROM g;
+    CREATE INDEX gi ON g(c);
+    SELECT 'group by index', group_concat(c || ':' || n, ' ') FROM (SELECT c, count(*) n FROM g GROUP BY c);
+    SELECT 'count distinct grouped by index', group_concat(n) FROM (SELECT c, count(DISTINCT c) n FROM g GROUP BY c);
+}
+expect {
+    join|5
+    group by|1:1 1:2
+    having|1
+    distinct|2
+    distinct order by|2
+    distinct two columns|2
+    count distinct|2|2
+    count distinct grouped|2
+    aggregate order by|2,1,3|1,1
+    group by index|1:1 1:2
+    count distinct grouped by index|1,1
+}
+
+@requires strict "uses STRICT tables"
 test cmp-numeric-compound-with-integer-compares-as-numeric {
     -- An integer mixed with numeric is a numeric, so 10 and 10.00 are one value.
     CREATE TABLE a(n numeric(10,2)) STRICT;
@@ -1332,7 +1366,8 @@ expect {
 # A text value compared with a date is cast to date first, the way SQLite
 # applies a column's affinity, so '2024-01-01 10:00' equals the date
 # 2024-01-01 in every plan: a hash join, a scan, an IN subquery, a scalar
-# subquery and a row value. A date function's text result is cast too.
+# subquery, a row value, a row subquery and the arguments of scalar max, min
+# and nullif. A date function's text result is cast too.
 @requires strict "uses STRICT tables"
 test cmp-date-with-text-casts-the-text {
     CREATE TABLE d(x date) STRICT;
@@ -1345,6 +1380,9 @@ test cmp-date-with-text-casts-the-text {
     SELECT 'in text', group_concat(s) FROM t WHERE t.s IN (SELECT x FROM d);
     SELECT 'scalar', group_concat(d.x) FROM d WHERE d.x = (SELECT s FROM t LIMIT 1);
     SELECT 'row', group_concat(d.x) FROM d, t WHERE (d.x, d.x) = (t.s, t.s);
+    SELECT 'row subquery', group_concat(d.x) FROM d WHERE (d.x, 1) = (SELECT s, 1 FROM t LIMIT 1);
+    SELECT 'subquery row', group_concat(d.x) FROM d WHERE (SELECT s, 1 FROM t LIMIT 1) = (d.x, 1);
+    SELECT 'max', d.x, max(d.x, t.s), min(d.x, t.s), nullif(d.x, t.s) FROM d, t WHERE t.s < '2024-01-02' ORDER BY d.x;
     SELECT 'date()', group_concat(d.x) FROM d WHERE d.x > date('2024-01-01', '+0 day');
 }
 expect {
@@ -1354,6 +1392,10 @@ expect {
     in text|2024-01-01 10:00
     scalar|2024-01-01
     row|2024-01-01
+    row subquery|2024-01-01
+    subquery row|2024-01-01
+    max|2024-01-01|2024-01-01|2024-01-01|
+    max|2024-01-02|2024-01-02|2024-01-01|2024-01-02
     date()|2024-01-02
 }
 

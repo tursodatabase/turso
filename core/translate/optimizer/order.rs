@@ -7,7 +7,6 @@ use crate::{
     translate::{
         collate::CollationSeq,
         emitter::Resolver,
-        expr::stored_comparison_type,
         expression_index::normalize_expr_for_index_matching,
         optimizer::access_method::AccessMethodParams,
         optimizer::constraints::{
@@ -192,17 +191,8 @@ pub fn compute_order_target(
                     .iter()
                     .any(|group_by_expr| exprs_are_equivalent(expr, group_by_expr))
             });
-            // The GROUP BY sorter sorts a custom type by the values it reads
-            // as, but ORDER BY sorts it by its stored form (see
-            // `stored_comparison_type`), so the groups can't stand in for the
-            // ORDER BY sort.
-            let mut order_by_compares_stored_form = false;
-            for (expr, _, _) in order_by.iter() {
-                order_by_compares_stored_form |=
-                    stored_comparison_type([expr.as_ref()], Some(tables), resolver)?.is_some();
-            }
             // If not, let's try to target an ordering that matches the group by -- we don't care about ASC/DESC
-            if !group_by_contains_all || order_by_compares_stored_form {
+            if !group_by_contains_all {
                 return OrderTarget::maybe_from_iterator(
                     group_by
                         .exprs

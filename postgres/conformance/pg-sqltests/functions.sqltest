@@ -1441,6 +1441,18 @@ expect {
     1 year 9 mons 7 days|1 year 9 mons 7 days 03:04:05
 }
 
+test greatest-and-least-of-a-timestamp-and-a-date {
+    CREATE TABLE trips (started date, ended timestamp);
+    INSERT INTO trips VALUES ('2025-01-02', '2025-01-01 10:00'), ('2025-01-01', '2025-01-03 10:00');
+    SELECT greatest(ended, started), least(ended, started) FROM trips ORDER BY started;
+    SELECT count(*) FROM trips WHERE greatest(ended, started) > started;
+}
+expect {
+    2025-01-03 10:00:00|2025-01-01 00:00:00
+    2025-01-02 00:00:00|2025-01-01 10:00:00
+    1
+}
+
 test age-reads-untyped-text-as-a-timestamp {
     SELECT age('2026-10-08', '2025-01-01 01:02'),
            age('2026-10-08', '2025-01-01T01:02:03'),

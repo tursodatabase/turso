@@ -15,7 +15,8 @@ use super::{
     expr::{
         emit_array_decode,
         expr_type::{type_of, TypeEnv},
-        translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
+        stored_comparison_type, translate_compared_expr, translate_expr,
+        translate_expr_no_constant_opt, NoConstantOptReason,
     },
     plan::{Distinctness, QueryDestination, ResultSetColumn, SelectPlan, TableReferences},
 };
@@ -131,7 +132,10 @@ pub fn emit_select_result(
     if let Distinctness::Distinct { ctx } = &plan.distinctness {
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         let num_regs = plan.result_columns.len();
-        distinct_ctx.emit_deduplication_insns(program, num_regs, start_reg);
+        let key_start_reg =
+            emit_distinct_key_stored_forms(program, plan, |i| start_reg + i, resolver)?
+                .unwrap_or(start_reg);
+        distinct_ctx.emit_deduplication_insns(program, num_regs, key_start_reg);
     }
 
     if has_distinct {
@@ -142,6 +146,54 @@ pub fn emit_select_result(
 
     emit_result_row_and_limit(program, plan, start_reg, limit_ctx, label_on_limit_reached)?;
     Ok(())
+}
+
+/// SELECT DISTINCT finds two rows equal when `=` does, so a result column of a
+/// custom type is compared in its stored form (see [translate_compared_expr]).
+/// When a result column has such a type, emits the key SELECT DISTINCT
+/// compares into new registers and returns the first of them: the stored form
+/// of those columns, and a copy of `column_reg(i)` for the others. Returns
+/// None when the result columns themselves are the key.
+pub(crate) fn emit_distinct_key_stored_forms(
+    program: &mut ProgramBuilder,
+    plan: &SelectPlan,
+    column_reg: impl Fn(usize) -> usize,
+    resolver: &Resolver,
+) -> Result<Option<usize>> {
+    let mut stored_forms = Vec::with_capacity(plan.result_columns.len());
+    for rc in &plan.result_columns {
+        stored_forms.push(stored_comparison_type(
+            [&rc.expr],
+            Some(&plan.table_references),
+            resolver,
+        )?);
+    }
+    if stored_forms.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let key_start_reg = program.alloc_registers(plan.result_columns.len());
+    for (i, (rc, stored_form)) in plan.result_columns.iter().zip(&stored_forms).enumerate() {
+        match stored_form {
+            Some(stored_form) => {
+                translate_compared_expr(
+                    program,
+                    Some(&plan.table_references),
+                    &rc.expr,
+                    key_start_reg + i,
+                    resolver,
+                    Some(stored_form),
+                )?;
+            }
+            None => {
+                program.emit_insn(Insn::Copy {
+                    src_reg: column_reg(i),
+                    dst_reg: key_start_reg + i,
+                    extra_amount: 0,
+                });
+            }
+        }
+    }
+    Ok(Some(key_start_reg))
 }
 
 /// Emits bytecode to send column values to a destination.

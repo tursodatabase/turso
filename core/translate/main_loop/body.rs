@@ -1,3 +1,5 @@
+use crate::translate::expr::{stored_comparison_type, translate_compared_expr};
+use crate::translate::group_by::sorter_holds_stored_column;
 use crate::translate::plan::Operation::HashJoin;
 use crate::translate::plan::SimpleAggregate;
 use crate::translate::{order_by::EmitOrderBy, window::EmitWindow};
@@ -154,15 +156,28 @@ fn emit_loop_source<'a>(
             //   SELECT col1, col2, SUM(col3) FROM table GROUP BY col1
             //   - col1 is added first (from GROUP BY)
             //   - col2 is added second (non-aggregate, in SELECT, not in GROUP BY)
-            for (expr, _) in t_ctx.non_aggregate_expressions.iter() {
+            let group_by_len = plan
+                .group_by
+                .as_ref()
+                .map_or(0, |group_by| group_by.exprs.len());
+            for (i, (expr, _)) in t_ctx.non_aggregate_expressions.iter().enumerate() {
                 let key_reg = cur_reg;
                 cur_reg += 1;
-                translate_expr(
+                // A custom type groups by its stored form, as it compares, so
+                // `GROUP BY c` puts two rows in one group exactly when `=`
+                // finds them equal.
+                let compared_as = if i < group_by_len {
+                    stored_comparison_type([*expr], Some(&plan.table_references), &t_ctx.resolver)?
+                } else {
+                    None
+                };
+                translate_compared_expr(
                     program,
                     Some(&plan.table_references),
                     expr,
                     key_reg,
                     &t_ctx.resolver,
+                    compared_as.as_ref(),
                 )?;
             }
 
@@ -178,13 +193,24 @@ fn emit_loop_source<'a>(
                     for leaf_expr in t_ctx.agg_leaf_columns.iter() {
                         let reg = cur_reg;
                         cur_reg += 1;
-                        translate_expr(
+                        let suppressed = program.flags.suppress_custom_type_decode();
+                        let stored = sorter_holds_stored_column(
+                            leaf_expr,
+                            &plan.table_references,
+                            t_ctx.resolver.schema(),
+                        );
+                        program
+                            .flags
+                            .set_suppress_custom_type_decode(suppressed || stored);
+                        let result = translate_expr(
                             program,
                             Some(&plan.table_references),
                             leaf_expr,
                             reg,
                             &t_ctx.resolver,
-                        )?;
+                        );
+                        program.flags.set_suppress_custom_type_decode(suppressed);
+                        result?;
                     }
                     sorter_insert(
                         program,

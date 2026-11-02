@@ -631,11 +631,79 @@ fn plan_subqueries_with_outer_query_access<'a>(
         for expr in exprs {
             walk_expr_mut(expr, &mut |expr: &mut ast::Expr| {
                 cast_compared_operands(expr, &env, resolver)?;
+                cast_compared_row_subquery(expr, out_subqueries, referenced_tables, resolver)?;
                 Ok(WalkControl::Continue)
             })?;
         }
     }
 
+    Ok(())
+}
+
+/// `(a, b) = (SELECT x, y ...)` compares a with x and b with y, so they are
+/// cast as the operands of `(a, b) IN (SELECT x, y ...)` are (see
+/// `cast_in_subquery_operands`).
+fn cast_compared_row_subquery(
+    expr: &mut ast::Expr,
+    subqueries: &mut [NonFromClauseSubquery],
+    referenced_tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<()> {
+    let ast::Expr::Binary(lhs, op, rhs) = expr else {
+        return Ok(());
+    };
+    if !op.is_comparison() {
+        return Ok(());
+    }
+    let (row, subquery_id) = match (lhs.as_mut(), rhs.as_mut()) {
+        (
+            row @ ast::Expr::Parenthesized(_),
+            ast::Expr::SubqueryResult {
+                subquery_id,
+                query_type: SubqueryType::RowValue { .. },
+                ..
+            },
+        )
+        | (
+            ast::Expr::SubqueryResult {
+                subquery_id,
+                query_type: SubqueryType::RowValue { .. },
+                ..
+            },
+            row @ ast::Expr::Parenthesized(_),
+        ) => (row, *subquery_id),
+        _ => return Ok(()),
+    };
+    // A one-column row is a scalar, which `cast_compared_operands` casts.
+    if matches!(row, ast::Expr::Parenthesized(exprs) if exprs.len() < 2) {
+        return Ok(());
+    }
+    let Some(subquery) = subqueries
+        .iter_mut()
+        .find(|subquery| subquery.internal_id == subquery_id)
+    else {
+        return Ok(());
+    };
+    let SubqueryState::Unevaluated { plan: Some(plan) } = &mut subquery.state else {
+        return Ok(());
+    };
+    cast_in_subquery_operands(row, Some(referenced_tables), plan, resolver)?;
+    // The outer query reads the types of the subquery's columns from here.
+    let Plan::Select(select) = plan.as_ref() else {
+        unreachable!("a subquery compared with a row value is a single SELECT");
+    };
+    let result_reg_start = resolver
+        .row_value_subqueries
+        .get(subquery_id)
+        .expect("a planned row value subquery is registered")
+        .result_reg_start;
+    resolver.row_value_subqueries.insert(
+        subquery_id,
+        RowValueSubquery {
+            result_reg_start,
+            columns: row_value_subquery_columns(select, resolver),
+        },
+    );
     Ok(())
 }
 
@@ -881,18 +949,7 @@ fn get_subquery_parser<'a>(
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
-                let env = TypeEnv::new(Some(&plan.table_references), resolver);
-                let columns: Vec<_> = plan
-                    .result_columns
-                    .iter()
-                    .map(|result_col| RowValueSubqueryColumn {
-                        affinity: get_expr_affinity(
-                            &result_col.expr,
-                            &ExprContext::new(Some(&plan.table_references), resolver),
-                        ),
-                        expr_type: type_of(&result_col.expr, &env),
-                    })
-                    .collect();
+                let columns = row_value_subquery_columns(&plan, resolver);
                 if let [column] = columns.as_slice() {
                     referenced_tables.add_scalar_subquery_affinity(subquery_id, column.affinity);
                 }
@@ -1149,6 +1206,25 @@ fn get_subquery_parser<'a>(
             _ => Ok(WalkControl::Continue),
         }
     })
+}
+
+/// What the outer query knows about the result columns of `plan`, a subquery
+/// that gives one row.
+fn row_value_subquery_columns(
+    plan: &SelectPlan,
+    resolver: &Resolver,
+) -> Vec<RowValueSubqueryColumn> {
+    let env = TypeEnv::new(Some(&plan.table_references), resolver);
+    plan.result_columns
+        .iter()
+        .map(|result_col| RowValueSubqueryColumn {
+            affinity: get_expr_affinity(
+                &result_col.expr,
+                &ExprContext::new(Some(&plan.table_references), resolver),
+            ),
+            expr_type: type_of(&result_col.expr, &env),
+        })
+        .collect()
 }
 
 /// Recollect all aggregates after subquery planning.

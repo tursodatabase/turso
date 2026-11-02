@@ -20,7 +20,7 @@ use super::{
     emitter::{Resolver, TranslateCtx},
     expr::{emit_decode, stored_comparison_type, translate_compared_expr, translate_expr},
     plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
-    result_row::{emit_offset, emit_result_row_and_limit},
+    result_row::{emit_distinct_key_stored_forms, emit_offset, emit_result_row_and_limit},
 };
 
 use crate::translate::eqp::{EqpDetail, EqpSortMethod};
@@ -531,42 +531,36 @@ impl EmitOrderBy {
                 prev = Some(sorter_idx);
             }
 
-            if needs_reordering {
+            let column_reg = |select_idx: usize| {
+                start_reg
+                    + sort_metadata
+                        .remappings
+                        .get(select_idx)
+                        .expect("remapping must exist for all result columns")
+                        .orderby_sorter_idx
+            };
+            let key_start_reg = if let Some(key_start_reg) =
+                emit_distinct_key_stored_forms(program, plan, column_reg, resolver)?
+            {
+                key_start_reg
+            } else if needs_reordering {
                 // Allocate registers for reordered result columns.
                 // TODO: it may be possible to optimize this to minimize the number of Insn::Copy we do, but for now
                 // we will just allocate a new reg for every result column.
                 let reordered_start_reg = program.alloc_registers(result_columns.len());
-
-                for (select_idx, _rc) in result_columns.iter().enumerate() {
-                    let remapping = sort_metadata
-                        .remappings
-                        .get(select_idx)
-                        .expect("remapping must exist for all result columns");
-
-                    let src_reg = start_reg + remapping.orderby_sorter_idx;
-                    let dst_reg = reordered_start_reg + select_idx;
-
+                for select_idx in 0..result_columns.len() {
                     program.emit_insn(Insn::Copy {
-                        src_reg,
-                        dst_reg,
+                        src_reg: column_reg(select_idx),
+                        dst_reg: reordered_start_reg + select_idx,
                         extra_amount: 0,
                     });
                 }
-
-                distinct_ctx.emit_deduplication_insns(
-                    program,
-                    result_columns.len(),
-                    reordered_start_reg,
-                );
+                reordered_start_reg
             } else {
                 // Result columns are already in SELECT order, use them directly
-                let start_reg = sort_metadata
-                    .remappings
-                    .first()
-                    .map(|r| start_reg + r.orderby_sorter_idx)
-                    .expect("remapping must exist for all result columns");
-                distinct_ctx.emit_deduplication_insns(program, result_columns.len(), start_reg);
-            }
+                column_reg(0)
+            };
+            distinct_ctx.emit_deduplication_insns(program, result_columns.len(), key_start_reg);
         }
 
         if *use_heap_sort {

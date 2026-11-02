@@ -4,7 +4,10 @@ use turso_parser::ast::{self, SortOrder};
 
 use super::{
     emitter::TranslateCtx,
-    expr::{translate_condition_expr, translate_expr, ConditionMetadata},
+    expr::{
+        emit_decode, stored_comparison_type, translate_condition_expr, translate_expr,
+        ConditionMetadata,
+    },
     plan::{Distinctness, GroupBy, SelectPlan, SubqueryEvalPhase, SubqueryOrigin},
     result_row::emit_select_result,
 };
@@ -12,7 +15,7 @@ use crate::translate::{
     aggregation::{emit_aggregate_final, emit_aggregate_step, AggArgumentSource},
     expression_index::selected_expression_index,
     order_by::EmitOrderBy,
-    plan::{Aggregate, NonFromClauseSubquery},
+    plan::{Aggregate, NonFromClauseSubquery, TableReferences},
     subquery::emit_non_from_clause_subqueries_for_phase,
 };
 use crate::translate::{
@@ -22,7 +25,7 @@ use crate::translate::{
 };
 use crate::{
     emit_explain,
-    schema::PseudoCursorType,
+    schema::{PseudoCursorType, Schema},
     translate::collate::CollationSeq,
     util::exprs_are_equivalent,
     vdbe::{
@@ -767,10 +770,15 @@ pub fn group_by_process_single_group(
             let cache_len = t_ctx.resolver.expr_to_reg_cache.len();
             let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
             for (i, leaf_expr) in t_ctx.agg_leaf_columns.drain(..).enumerate() {
+                let needs_decode = sorter_holds_stored_column(
+                    &leaf_expr,
+                    &plan.table_references,
+                    t_ctx.resolver.schema(),
+                );
                 t_ctx.resolver.cache_expr_reg(
                     std::borrow::Cow::Owned(leaf_expr),
                     leaf_regs + i,
-                    false,
+                    needs_decode,
                 );
             }
             t_ctx.resolver.enable_expr_to_reg_cache();
@@ -912,6 +920,16 @@ pub fn group_by_process_single_group(
             {
                 if *expr_appears_in_result_columns {
                     program.emit_column_or_rowid(*pseudo_cursor, sorter_column_index, next_reg);
+                    // A GROUP BY key of a custom type is in its stored form.
+                    if sorter_column_index < group_by.exprs.len() {
+                        if let Some(stored_form) = stored_comparison_type(
+                            [*expr],
+                            Some(&plan.table_references),
+                            &t_ctx.resolver,
+                        )? {
+                            emit_decode(program, &stored_form.chain, next_reg, &t_ctx.resolver)?;
+                        }
+                    }
                     t_ctx.resolver.cache_expr_reg(
                         std::borrow::Cow::Borrowed(expr),
                         next_reg,
@@ -955,6 +973,25 @@ pub fn group_by_process_single_group(
     });
 
     Ok(())
+}
+
+/// Whether the GROUP BY sorter holds `leaf_expr`, an aggregate's input, as
+/// stored: a column whose read runs a DECODE goes in without it, as in a hash
+/// join payload, so an aggregate that compares a custom type in its stored
+/// form, such as `count(DISTINCT c)`, reads the stored value. Reading the
+/// column back from the sorter runs the DECODE.
+pub(crate) fn sorter_holds_stored_column(
+    leaf_expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+) -> bool {
+    let ast::Expr::Column { table, column, .. } = leaf_expr else {
+        return false;
+    };
+    referenced_tables
+        .find_table_by_internal_id(*table)
+        .and_then(|(_, table)| Some((table.get_column_at(*column)?, table.is_strict())))
+        .is_some_and(|(column, is_strict)| schema.column_has_decode(column, is_strict))
 }
 
 /// Emits the bytecode for processing the aggregation phase of a GROUP BY clause.

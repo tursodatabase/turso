@@ -371,6 +371,36 @@ impl<'a> AggArgumentSource<'a> {
         }
         Ok(reg)
     }
+
+    /// For a DISTINCT aggregate, skips the aggregate step when the first
+    /// argument, in `arg_reg`, equals one the aggregate has already seen. A
+    /// custom type is compared in its stored form, as `=` compares it, so
+    /// `count(DISTINCT c)` counts the values `=` finds different.
+    fn emit_distinct_check(
+        &self,
+        program: &mut ProgramBuilder,
+        referenced_tables: &TableReferences,
+        resolver: &Resolver,
+        arg_reg: usize,
+    ) -> Result<()> {
+        if !matches!(self.distinctness(), Distinctness::Distinct { .. }) {
+            return Ok(());
+        }
+        let stored_form =
+            stored_comparison_type([self.arg_at(0)], Some(referenced_tables), resolver)?;
+        let key_reg = match stored_form {
+            Some(stored_form) => self.translate_compared(
+                program,
+                referenced_tables,
+                resolver,
+                0,
+                Some(&stored_form),
+            )?,
+            None => arg_reg,
+        };
+        handle_distinct(program, self.distinctness(), key_reg);
+        Ok(())
+    }
 }
 
 /// The custom type whose stored form the values of a min or max aggregate
@@ -413,15 +443,25 @@ pub fn emit_aggregate_step(
     let column_count = key_count + 1 + 2 * aggregate.args.len();
     let start = program.alloc_registers(column_count);
     let args_start = start + key_count + 1;
+    let dedups_after_sort = dedups_after_sort(aggregate, tables, resolver)?;
     for (i, term) in aggregate.order_by().iter().enumerate() {
-        translate_expr(program, Some(tables), &term.expr, start + i, resolver)?;
+        // A custom type sorts by its stored form, as the query's ORDER BY does.
+        let compared_as = stored_comparison_type([term.expr.as_ref()], Some(tables), resolver)?;
+        translate_compared_expr(
+            program,
+            Some(tables),
+            &term.expr,
+            start + i,
+            resolver,
+            compared_as.as_ref(),
+        )?;
     }
     program.emit_insn(Insn::Sequence {
         cursor_id,
         target_reg: start + key_count,
     });
     for i in 0..aggregate.args.len() {
-        let src_reg = if aggregate.distinct_uses_order_key() {
+        let src_reg = if dedups_after_sort {
             start
         } else {
             source.translate(program, tables, resolver, i)?
@@ -438,13 +478,27 @@ pub fn emit_aggregate_step(
             dest_reg: args_start + aggregate.args.len() + i,
         });
     }
-    if !aggregate.distinct_uses_order_key() {
-        handle_distinct(program, &aggregate.distinctness, args_start);
+    if !dedups_after_sort {
+        source.emit_distinct_check(program, tables, resolver, args_start)?;
     }
     let record_reg = program.alloc_register();
     super::order_by::sorter_insert(program, start, column_count, cursor_id, record_reg);
     program.constant_spans_invalidate_after(span_idx);
     Ok(target_register)
+}
+
+/// Whether an ordered DISTINCT aggregate whose argument is its only sort key,
+/// as `group_concat(DISTINCT c ORDER BY c)`, skips duplicates after sorting
+/// instead of as rows come in. Not when the key is a custom type's stored form:
+/// the sorted rows then hold only the read values, and two stored values that
+/// read the same are still distinct.
+fn dedups_after_sort(
+    aggregate: &Aggregate,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<bool> {
+    Ok(aggregate.distinct_uses_order_key()
+        && stored_comparison_type([&aggregate.args[0]], Some(tables), resolver)?.is_none())
 }
 
 pub fn emit_aggregate_final(
@@ -493,7 +547,7 @@ pub fn emit_aggregate_final(
             });
         }
         let mut sorted_aggregate = aggregate.clone();
-        let duplicate = if aggregate.distinct_uses_order_key() {
+        let duplicate = if dedups_after_sort(aggregate, tables, resolver)? {
             let label = program.allocate_label();
             let Distinctness::Distinct { ctx: Some(ctx) } = &mut sorted_aggregate.distinctness
             else {
@@ -556,7 +610,7 @@ pub(crate) fn open_aggregate_sorter(
         resolver,
     )?;
     data.order_collations_nulls.try_push((
-        if aggregate.distinct_uses_order_key() {
+        if dedups_after_sort(aggregate, tables, resolver)? {
             ast::SortOrder::Desc
         } else {
             ast::SortOrder::Asc
@@ -600,7 +654,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("avg bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct_check(program, referenced_tables, resolver, expr_reg)?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -632,7 +686,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("count bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct_check(program, referenced_tables, resolver, expr_reg)?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -658,7 +712,7 @@ pub fn translate_aggregation_step(
             };
 
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct_check(program, referenced_tables, resolver, expr_reg)?;
 
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
@@ -690,7 +744,7 @@ pub fn translate_aggregation_step(
                 0,
                 compared_as.as_ref(),
             )?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct_check(program, referenced_tables, resolver, expr_reg)?;
             let arg_collation =
                 ExprContext::new(Some(referenced_tables), resolver).expr_collation(expr)?;
             program.emit_insn(Insn::AggStep {
@@ -710,7 +764,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("max bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct_check(program, referenced_tables, resolver, expr_reg)?;
             let value_reg = agg_arg_source.translate(program, referenced_tables, resolver, 1)?;
 
             program.emit_insn(Insn::AggStep {
@@ -730,7 +784,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("max bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct_check(program, referenced_tables, resolver, expr_reg)?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -768,7 +822,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("sum bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct_check(program, referenced_tables, resolver, expr_reg)?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -785,7 +839,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("total bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct_check(program, referenced_tables, resolver, expr_reg)?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -803,7 +857,7 @@ pub fn translate_aggregation_step(
                 crate::bail_parse_error!("array_agg bad number of arguments");
             }
             let expr_reg = agg_arg_source.translate(program, referenced_tables, resolver, 0)?;
-            handle_distinct(program, agg_arg_source.distinctness(), expr_reg);
+            agg_arg_source.emit_distinct_check(program, referenced_tables, resolver, expr_reg)?;
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -890,7 +944,12 @@ pub fn translate_aggregation_step(
                 }
                 // invariant: distinct aggregates are only supported for single-argument functions
                 if argc == 1 {
-                    handle_distinct(program, agg_arg_source.distinctness(), expr_reg + i);
+                    agg_arg_source.emit_distinct_check(
+                        program,
+                        referenced_tables,
+                        resolver,
+                        expr_reg + i,
+                    )?;
                 }
             }
             program.emit_insn(Insn::AggStep {

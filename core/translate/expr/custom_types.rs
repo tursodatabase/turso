@@ -617,9 +617,9 @@ pub(crate) fn stored_comparison_type_across_queries<'a, 'c, 's: 'c>(
     // Binding casts a value of no custom type that changes per row, as in
     // `date_col = text_col`, to the compared type (see
     // `cast_compared_operands`). One left here is in a comparison that binding
-    // doesn't rewrite, such as min/max or a row value. It would have to go
-    // through ENCODE on every row, but a hash join or an IN subquery compares
-    // it as it is, so the answer would depend on the plan.
+    // doesn't rewrite. It would have to go through ENCODE on every row, but a
+    // hash join or an IN subquery compares it as it is, so the answer would
+    // depend on the plan.
     if let Some(compared_as) = &found {
         let other_type = varying_others
             .iter()
@@ -695,6 +695,18 @@ pub(crate) fn cast_compared_operands(
         } => std::iter::once(base.as_mut())
             .chain(when_then_pairs.iter_mut().map(|(when, _)| when.as_mut()))
             .collect(),
+        // Scalar min and max, as `max(d, s)`, and nullif compare their
+        // arguments with each other.
+        ast::Expr::FunctionCall { name, args, .. }
+            if matches!(
+                resolver.resolve_function(name.as_str(), args.len()),
+                Ok(Some(Func::Scalar(
+                    ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Nullif
+                )))
+            ) =>
+        {
+            args.iter_mut().map(|arg| arg.as_mut()).collect()
+        }
         _ => return Ok(()),
     };
     cast_compared_operands_in_place(operands, env, resolver)
