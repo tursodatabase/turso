@@ -96,6 +96,10 @@ jobs:
         working-directory: ${{ env.working-directory }}
         run: uv run pytest tests/test_database_aio.py
 
+      - name: Test encrypted sync bindings
+        working-directory: ${{ env.working-directory }}
+        run: uv run pytest tests/test_sync_encryption.py
+
       - name: Run Pytest (sync)
         working-directory: ${{ env.working-directory }}
         if: runner.os != 'Windows'
