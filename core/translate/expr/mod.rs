@@ -50,6 +50,7 @@ mod custom_types;
 mod emission;
 pub(crate) mod expr_type;
 pub(crate) mod functions;
+mod rewrite;
 mod translator;
 mod utils;
 mod vectors;
@@ -79,6 +80,7 @@ use expr_type::*;
 use functions::*;
 #[allow(unused_imports)]
 use metadata::*;
+use rewrite::*;
 #[allow(unused_imports)]
 use translator::*;
 #[allow(unused_imports)]
@@ -120,6 +122,7 @@ pub(crate) use emission::{
     seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
+pub(crate) use rewrite::{apply_static_rewrites, BetweenToComparisons};
 pub(crate) use translator::is_sqlite_cast_to;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,

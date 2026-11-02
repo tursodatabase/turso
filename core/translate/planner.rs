@@ -4,7 +4,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::plan::NamedWindowBound;
 use super::{
-    expr::{walk_expr, walk_expr_mut},
+    expr::walk_expr,
     plan::{
         alias_or_stored_name, left_using_column_sources, merge_columns, query_output_columns,
         resolve_unqualified_column, Aggregate, ColumnUsedMask, Distinctness, EvalAt,
@@ -18,9 +18,10 @@ use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
     expr::{
-        expr_contains_function_that_changes_within_statement,
+        apply_static_rewrites, expr_contains_function_that_changes_within_statement,
         expr_contains_nondeterministic_scalar_function, expr_vector_size,
-        integer_literal_truth_value, unwrap_parens, BindingBehavior, WalkControl,
+        integer_literal_truth_value, unwrap_parens, BetweenToComparisons, BindingBehavior,
+        WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -2612,7 +2613,7 @@ pub fn parse_where(
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
-            rewrite_between_exprs(&mut expr.expr, Some(resolver))?;
+            apply_static_rewrites(&mut expr.expr, &[&BetweenToComparisons], Some(resolver))?;
             bind_and_rewrite_expr(
                 &mut expr.expr,
                 Some(table_references),
@@ -2650,90 +2651,6 @@ pub fn parse_where(
         Ok(())
     } else {
         Ok(())
-    }
-}
-
-pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -> Result<()> {
-    walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
-        if let Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } = e
-        {
-            if is_literal_between_bound(start) && is_literal_between_bound(end) {
-                let mut lhs_has_subquery = false;
-                walk_expr(lhs, &mut |expr| {
-                    if matches!(
-                        expr,
-                        Expr::Subquery(_)
-                            | Expr::Exists(_)
-                            | Expr::InSelect { .. }
-                            | Expr::SubqueryResult { .. }
-                    ) {
-                        lhs_has_subquery = true;
-                        return Ok(WalkControl::SkipChildren);
-                    }
-                    Ok(WalkControl::Continue)
-                })?;
-                let lhs_is_nondeterministic = match resolver {
-                    Some(resolver) => {
-                        expr_contains_nondeterministic_scalar_function(lhs, resolver)?
-                    }
-                    None => false,
-                };
-                if lhs_has_subquery || lhs_is_nondeterministic {
-                    return Ok(WalkControl::Continue);
-                }
-            }
-
-            let lhs_expr = std::mem::take(lhs.as_mut());
-            let start_expr = std::mem::take(start.as_mut());
-            let end_expr = std::mem::take(end.as_mut());
-
-            let (lower, upper, combine_op) = if *not {
-                (
-                    Expr::Binary(
-                        Box::new(lhs_expr.clone()),
-                        ast::Operator::Less,
-                        Box::new(start_expr),
-                    ),
-                    Expr::Binary(
-                        Box::new(lhs_expr),
-                        ast::Operator::Greater,
-                        Box::new(end_expr),
-                    ),
-                    ast::Operator::Or,
-                )
-            } else {
-                (
-                    Expr::Binary(
-                        Box::new(lhs_expr.clone()),
-                        ast::Operator::GreaterEquals,
-                        Box::new(start_expr),
-                    ),
-                    Expr::Binary(
-                        Box::new(lhs_expr),
-                        ast::Operator::LessEquals,
-                        Box::new(end_expr),
-                    ),
-                    ast::Operator::And,
-                )
-            };
-            *e = Expr::Binary(Box::new(lower), combine_op, Box::new(upper));
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
-fn is_literal_between_bound(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal(_) => true,
-        Expr::Unary(_, inner) => is_literal_between_bound(inner),
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_literal_between_bound(&exprs[0]),
-        _ => false,
     }
 }
 
