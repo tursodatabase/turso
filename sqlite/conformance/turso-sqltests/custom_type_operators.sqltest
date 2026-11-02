@@ -788,6 +788,42 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test op-number-from-numeric-through-a-function-in-check-error {
+    -- substr(n, 1) is computed from the stored blob, so a number made from it is wrong.
+    CREATE TABLE a(n numeric(10,2) CHECK(substr(n, 1) + 0 > 0)) STRICT;
+}
+expect error {
+    cannot use arithmetic on a numeric value in a CHECK constraint
+}
+
+@requires strict "uses STRICT tables"
+test op-minus-of-numeric-through-a-function-in-check-error {
+    CREATE TABLE b(n numeric(10,2) CHECK(-substr(n, 1) < 0)) STRICT;
+}
+expect error {
+    cannot use unary minus/plus on a numeric value in a CHECK constraint
+}
+
+@requires strict "uses STRICT tables"
+test op-abs-of-numeric-through-a-function-in-check-error {
+    CREATE TABLE c(n numeric(10,2) CHECK(abs(substr(n, 1)) > 0)) STRICT;
+}
+expect error {
+    cannot use abs\(\) on a numeric value in a CHECK constraint
+}
+
+@requires strict "uses STRICT tables"
+test op-number-from-varchar-in-check {
+    -- varchar is stored as it is read, so a number computed from it is right.
+    CREATE TABLE v(s varchar(5) CHECK(length(s) + 1 < 5)) STRICT;
+    INSERT INTO v VALUES ('abc');
+    SELECT s FROM v;
+}
+expect {
+    abc
+}
+
+@requires strict "uses STRICT tables"
 test op-minus-of-coalesce-of-numeric-in-check-error {
     CREATE TABLE c(n numeric(10,2) CHECK(-coalesce(n, 0) < 0)) STRICT;
 }
