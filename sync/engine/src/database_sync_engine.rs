@@ -647,15 +647,16 @@ fn resolve_remote_pull_protocol(
 fn ensure_logical_mvcc_pull_supported(
     partial_sync_active: bool,
     remote_encryption_key: Option<&Secret>,
+    encryption: Option<&crate::sync_encryption::SyncEncryption>,
 ) -> Result<()> {
     if partial_sync_active {
         return Err(Error::DatabaseSyncEngineError(
             "MVCC logical sync does not support partial sync; disable partialSyncExperimental for this database".to_string(),
         ));
     }
-    if remote_encryption_key.is_some() {
+    if remote_encryption_key.is_some() && encryption.is_none() {
         return Err(Error::DatabaseSyncEngineError(
-            "MVCC logical sync does not support encrypted remote databases".to_string(),
+            "encrypted MVCC logical sync requires an explicit cipher".to_string(),
         ));
     }
     Ok(())
@@ -1015,7 +1016,11 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         .to_string(),
                 ));
             }
-            ensure_logical_mvcc_pull_supported(partial, opts.remote_encryption_key.as_ref())?;
+            ensure_logical_mvcc_pull_supported(
+                partial,
+                opts.remote_encryption_key.as_ref(),
+                opts.encryption.as_ref(),
+            )?;
         }
 
         let configuration = DatabaseSavedConfiguration {
@@ -1038,6 +1043,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     ensure_logical_mvcc_pull_supported(
                         partial,
                         opts.remote_encryption_key.as_ref(),
+                        opts.encryption.as_ref(),
                     )?;
                 }
                 if metadata_changed {
@@ -1061,7 +1067,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         &sync_engine_io,
                         opts.remote_url.clone(),
                         opts.remote_encryption_key.as_ref(),
-                    ),
+                    )
+                    .with_encryption_config(opts.encryption.as_ref()),
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
@@ -1074,6 +1081,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     ensure_logical_mvcc_pull_supported(
                         partial,
                         opts.remote_encryption_key.as_ref(),
+                        opts.encryption.as_ref(),
                     )?;
                 }
                 let meta = DatabaseMetadata {
@@ -1837,6 +1845,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     ensure_logical_mvcc_pull_supported(
                         self.opts.partial_sync_opts.is_some(),
                         self.opts.remote_encryption_key.as_ref(),
+                        self.opts.encryption.as_ref(),
                     )?;
                     // Deferred replicas may still be in WAL mode locally; the
                     // MVCC page base must be applied to an MVCC-mode database.
@@ -2118,7 +2127,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         &self.sync_engine_io,
                         self.meta().remote_url(),
                         self.opts.remote_encryption_key.as_ref(),
-                    );
+                    ).with_encryption_config(self.opts.encryption.as_ref());
                     Some(apply_transformation(ctx, &local_changes, &local_replay.generator).await?)
                 } else {
                     None
@@ -2888,7 +2897,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             &self.sync_engine_io,
                             self.meta().remote_url(),
                             self.opts.remote_encryption_key.as_ref(),
-                        );
+                        ).with_encryption_config(self.opts.encryption.as_ref());
                         Some(apply_transformation(ctx, &transform_changes, &replay.generator).await?)
                     } else {
                         None
@@ -3200,7 +3209,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             &self.sync_engine_io,
             self.meta().remote_url(),
             self.opts.remote_encryption_key.as_ref(),
-        );
+        )
+        .with_encryption_config(self.opts.encryption.as_ref());
         let (pull_gen, replay_floor_change_id, change_id) =
             push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
 
@@ -3355,17 +3365,19 @@ mod tests {
     fn logical_mvcc_pull_with_partial_sync_is_a_hard_error() {
         // Silent downgrade to page pull would just defer the failure to an
         // opaque server-side protocol error on every incremental pull.
-        assert!(ensure_logical_mvcc_pull_supported(true, None).is_err());
+        assert!(ensure_logical_mvcc_pull_supported(true, None, None).is_err());
     }
 
     #[test]
     fn logical_mvcc_pull_with_remote_encryption_is_a_hard_error() {
-        assert!(ensure_logical_mvcc_pull_supported(false, Some(&Secret::new("key"))).is_err());
+        assert!(
+            ensure_logical_mvcc_pull_supported(false, Some(&Secret::new("key")), None).is_err()
+        );
     }
 
     #[test]
     fn logical_mvcc_pull_remains_enabled_for_plain_full_sync() {
-        assert!(ensure_logical_mvcc_pull_supported(false, None).is_ok());
+        assert!(ensure_logical_mvcc_pull_supported(false, None, None).is_ok());
     }
 
     #[test]

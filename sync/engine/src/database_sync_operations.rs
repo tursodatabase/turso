@@ -799,6 +799,7 @@ pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connecti
 
 /// HTTP header key for the encryption key, for the encrypted Turso Cloud databases
 pub const ENCRYPTION_KEY_HEADER: &str = "x-turso-encryption-key";
+pub const ENCRYPTION_CIPHER_HEADER: &str = "x-turso-encryption-cipher";
 
 pub struct SyncOperationCtx<'a, IO: SyncEngineIo, Ctx> {
     pub coro: &'a Coro<Ctx>,
@@ -807,6 +808,7 @@ pub struct SyncOperationCtx<'a, IO: SyncEngineIo, Ctx> {
     pub remote_url: Option<String>,
     // optional remote encryption key for the encrypted Turso Cloud databases, base64 encoded
     pub remote_encryption_key: Option<Secret>,
+    encryption_cipher: Option<turso_core::CipherMode>,
 }
 
 impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
@@ -823,7 +825,15 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
             io,
             remote_url: remote_url.map(|x| x.to_string()),
             remote_encryption_key: remote_encryption_key.cloned(),
+            encryption_cipher: None,
         }
+    }
+    pub fn with_encryption_config(
+        mut self,
+        config: Option<&crate::sync_encryption::SyncEncryption>,
+    ) -> Self {
+        self.encryption_cipher = config.map(|config| config.cipher());
+        self
     }
     pub fn http(
         &self,
@@ -832,12 +842,27 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> Result<IO::DataCompletionBytes> {
+        if self.encryption_cipher.is_some() && self.remote_encryption_key.is_none() {
+            return Err(Error::DatabaseSyncEngineError(
+                "cloud key is required for encrypted sync requests".into(),
+            ));
+        }
         let encryption_header = self
             .remote_encryption_key
             .as_ref()
             .map(|key| (ENCRYPTION_KEY_HEADER, key.expose()));
 
-        let all_headers: Vec<_> = headers.iter().copied().chain(encryption_header).collect();
+        let cipher_name = self.encryption_cipher.map(|cipher| cipher.to_string());
+        let cipher_header = cipher_name
+            .as_deref()
+            .filter(|_| self.remote_encryption_key.is_some())
+            .map(|cipher| (ENCRYPTION_CIPHER_HEADER, cipher));
+        let all_headers: Vec<_> = headers
+            .iter()
+            .copied()
+            .chain(encryption_header)
+            .chain(cipher_header)
+            .collect();
 
         self.io
             .http(self.remote_url.as_deref(), method, path, body, &all_headers)
@@ -1924,7 +1949,7 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
         logical_updates,
         long_poll_timeout.map(|x| x.as_millis()).unwrap_or(0)
     );
-    if logical_updates && ctx.remote_encryption_key.is_some() {
+    if logical_updates && ctx.remote_encryption_key.is_some() && ctx.encryption_cipher.is_none() {
         return Err(Error::DatabaseSyncEngineError(
             "MVCC logical pull is not supported with encrypted remote databases".to_string(),
         ));
@@ -4212,6 +4237,43 @@ mod tests {
     fn test_remote_encryption_key_header_constant() {
         use super::ENCRYPTION_KEY_HEADER;
         assert_eq!(ENCRYPTION_KEY_HEADER, "x-turso-encryption-key");
+    }
+
+    #[test]
+    fn request_sends_cipher_and_cloud_key_without_local_key() {
+        let io = Arc::new(TestHttpIo {
+            response: Vec::new(),
+            chunk: 7,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let config = crate::sync_encryption::SyncEncryption::new(
+            turso_core::CipherMode::Aes256Gcm,
+            Some(turso_core::EncryptionKey::new_256([0xab; 32])),
+        )
+        .expect("local config");
+        let mut gen = genawaiter::sync::Gen::new(|co| async {
+            let coro: Coro<()> = co.into();
+            let stats = SyncEngineIoStats::new(io.clone());
+            let cloud_key = crate::types::Secret::new("Y2xvdWQta2V5");
+            let ctx = SyncOperationCtx::new(&coro, &stats, None, Some(&cloud_key))
+                .with_encryption_config(Some(&config));
+            let _completion = ctx
+                .http("POST", "/v2/pipeline", None, &[])
+                .expect("request");
+        });
+        assert!(matches!(
+            gen.resume_with(Ok(())),
+            genawaiter::GeneratorState::Complete(())
+        ));
+        let headers = io.headers.lock().expect("headers");
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == super::ENCRYPTION_CIPHER_HEADER && value == "aes256gcm"));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == super::ENCRYPTION_KEY_HEADER && value == "Y2xvdWQta2V5"));
+        assert!(!format!("{headers:?}").contains(&"ab".repeat(32)));
     }
 
     /// `reset_wal_file` resets the revert WAL and then records the new revert
