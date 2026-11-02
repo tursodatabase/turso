@@ -15,6 +15,7 @@ use turso_core::{
 };
 
 use crate::{
+    changes_file::ChangesFile,
     client_proto::{
         LogicalOp, LogicalOpType, LogicalSchemaAction, LogicalSchemaKind, LogicalTxnData,
     },
@@ -33,6 +34,7 @@ use crate::{
         PullUpdatesApplyMode, PullUpdatesProtocol, PullUpdatesReqProtoBody,
         PullUpdatesRespProtoBody, PullUpdatesStreamKind, Stmt, StmtResult, StreamRequest,
     },
+    sync_cipher::ChangeKind,
     types::{
         parse_bin_record, Coro, DatabasePullRevision, DatabaseRowMutation,
         DatabaseRowTransformResult, DatabaseSchemaKind, DatabaseSchemaReplay,
@@ -668,21 +670,15 @@ async fn replay_logical_transactions_from_file<Ctx>(
         LogicalReplayTableMap::from_persisted(std::mem::take(table_names_by_stable_id));
     loop {
         while let Some(txn) = take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
-            let mut decoded_table_map = table_map.clone();
-            let operations =
-                logical_txn_to_tape_operations_with_table_map(&txn, &mut decoded_table_map)?;
-            if let Some(excluded_client_id) = excluded_client_id {
-                if logical_txn_acknowledges_client(&txn, excluded_client_id)? {
-                    continue;
-                }
-            }
-            table_map = decoded_table_map;
-            for operation in operations {
-                for row in logical_operations_touched_rows(std::slice::from_ref(&operation)) {
-                    stats.touched_rows.insert(row);
-                }
-                replay.replay(coro, operation).await?;
-            }
+            replay_logical_transaction(
+                coro,
+                replay,
+                &txn,
+                excluded_client_id,
+                &mut table_map,
+                &mut stats,
+            )
+            .await?;
         }
         if file_offset >= size {
             if bytes.is_empty() {
@@ -693,6 +689,66 @@ async fn replay_logical_transactions_from_file<Ctx>(
             ));
         }
         read_proto_file_chunk(coro, txns_file, size, &mut file_offset, &mut bytes).await?;
+    }
+    *table_names_by_stable_id = table_map.into_persisted();
+    Ok(stats)
+}
+
+async fn replay_logical_transaction<Ctx>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    txn: &LogicalTxnData,
+    excluded_client_id: Option<&str>,
+    table_map: &mut LogicalReplayTableMap,
+    stats: &mut LogicalReplayApplyStats,
+) -> Result<()> {
+    let mut decoded_table_map = table_map.clone();
+    let operations = logical_txn_to_tape_operations_with_table_map(txn, &mut decoded_table_map)?;
+    if let Some(excluded_client_id) = excluded_client_id {
+        if logical_txn_acknowledges_client(txn, excluded_client_id)? {
+            return Ok(());
+        }
+    }
+    *table_map = decoded_table_map;
+    for operation in operations {
+        for row in logical_operations_touched_rows(std::slice::from_ref(&operation)) {
+            stats.touched_rows.insert(row);
+        }
+        replay.replay(coro, operation).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn apply_logical_transactions_staging_without_commit<Ctx>(
+    coro: &Coro<Ctx>,
+    replay: &mut DatabaseReplaySession,
+    staging: &mut ChangesFile,
+    excluded_client_id: &str,
+    table_names_by_stable_id: &mut BTreeMap<u64, String>,
+) -> Result<LogicalReplayApplyStats> {
+    let mut reader = staging.open_reader(coro, Some(ChangeKind::Logical)).await?;
+    let mut stats = LogicalReplayApplyStats::default();
+    let mut table_map =
+        LogicalReplayTableMap::from_persisted(std::mem::take(table_names_by_stable_id));
+    while let Some(record) = reader.next_record(coro).await? {
+        let mut bytes = record.as_slice();
+        let txn = LogicalTxnData::decode(&mut bytes).map_err(|error| {
+            Error::DatabaseSyncEngineError(format!("invalid staged logical transaction: {error}"))
+        })?;
+        if !bytes.is_empty() {
+            return Err(Error::DatabaseSyncEngineError(
+                "logical change record contains trailing bytes".into(),
+            ));
+        }
+        replay_logical_transaction(
+            coro,
+            replay,
+            &txn,
+            Some(excluded_client_id),
+            &mut table_map,
+            &mut stats,
+        )
+        .await?;
     }
     *table_names_by_stable_id = table_map.into_persisted();
     Ok(stats)
@@ -717,25 +773,31 @@ pub async fn apply_logical_transactions_file_without_commit_excluding_client_txn
     .await
 }
 
-pub struct MutexSlot<T: Clone> {
-    pub value: T,
+pub struct MutexSlot<T> {
+    pub value: Option<T>,
     pub slot: Arc<Mutex<Option<T>>>,
 }
 
-impl<T: Clone> Drop for MutexSlot<T> {
-    fn drop(&mut self) {
-        self.slot.lock().unwrap().replace(self.value.clone());
+impl<T> MutexSlot<T> {
+    pub fn value_mut(&mut self) -> &mut T {
+        self.value.as_mut().expect("acquired slot has a value")
     }
 }
 
-pub(crate) fn acquire_slot<T: Clone>(slot: &Arc<Mutex<Option<T>>>) -> Result<MutexSlot<T>> {
+impl<T> Drop for MutexSlot<T> {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap() = self.value.take();
+    }
+}
+
+pub(crate) fn acquire_slot<T>(slot: &Arc<Mutex<Option<T>>>) -> Result<MutexSlot<T>> {
     let Some(value) = slot.lock().unwrap().take() else {
         return Err(Error::DatabaseSyncEngineError(
             "changes file already acquired by another operation".to_string(),
         ));
     };
     Ok(MutexSlot {
-        value,
+        value: Some(value),
         slot: slot.clone(),
     })
 }
@@ -1955,6 +2017,57 @@ pub async fn wal_apply_from_file<Ctx>(
     }
     assert!(db_size > 0);
     Ok(db_size)
+}
+
+pub(crate) async fn wal_apply_from_staging<Ctx>(
+    coro: &Coro<Ctx>,
+    staging: &mut ChangesFile,
+    session: &mut DatabaseWalSession,
+) -> Result<u32> {
+    let mut reader = staging.open_reader(coro, Some(ChangeKind::Pages)).await?;
+    let mut db_size = 0;
+    while let Some(record) = reader.next_record(coro).await? {
+        if record.len() != WAL_FRAME_SIZE {
+            return Err(Error::DatabaseSyncEngineError(
+                "invalid staged page record size".into(),
+            ));
+        }
+        let info = WalFrameInfo::from_frame_header(&record);
+        db_size = info.db_size;
+        session.append_page(info.page_no, &record[WAL_FRAME_HEADER..])?;
+    }
+    if !reader.is_empty() && db_size == 0 {
+        return Err(Error::DatabaseSyncEngineError(
+            "page changes lack a final commit marker".into(),
+        ));
+    }
+    Ok(db_size)
+}
+
+pub(crate) async fn wal_pull_to_staging<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    staging: &mut ChangesFile,
+    revision: &Option<DatabasePullRevision>,
+    batch_size: u64,
+    long_poll_timeout: Option<std::time::Duration>,
+) -> Result<DatabasePullRevision> {
+    match revision {
+        Some(DatabasePullRevision::Legacy { .. }) => {
+            staging.prepare_legacy(ctx.coro).await?;
+            wal_pull_to_file(
+                ctx,
+                staging.raw_file(),
+                revision,
+                batch_size,
+                long_poll_timeout,
+            )
+            .await
+        }
+        Some(DatabasePullRevision::V1 { revision }) => {
+            wal_pull_to_staging_v1(ctx, staging, revision, long_poll_timeout).await
+        }
+        None => wal_pull_to_staging_v1(ctx, staging, "", long_poll_timeout).await,
+    }
 }
 
 pub async fn wal_pull_to_file<IO: SyncEngineIo, Ctx>(

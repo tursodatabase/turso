@@ -144,7 +144,7 @@ pub struct TursoDatabaseSyncChanges {
 
 impl TursoDatabaseSyncChanges {
     pub fn empty(&self) -> bool {
-        self.changes.file_slot.is_none()
+        self.changes.is_empty()
     }
     pub fn to_capi(self: Box<Self>) -> *mut capi::c::turso_sync_changes_t {
         Box::into_raw(self) as *mut capi::c::turso_sync_changes_t

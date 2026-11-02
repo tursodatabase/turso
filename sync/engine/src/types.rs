@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
 
 use serde::{Deserialize, Serialize};
@@ -102,7 +102,7 @@ pub enum DbChangesStreamKind {
 pub struct DbChangesStatus {
     pub time: turso_core::WallClockInstant,
     pub revision: DatabasePullRevision,
-    pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
+    pub(crate) file_slot: Option<MutexSlot<crate::changes_file::ChangesFile>>,
     pub stream_kind: DbChangesStreamKind,
 }
 
