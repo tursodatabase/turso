@@ -4,7 +4,9 @@ use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::alloc::TursoVecExt;
+use crate::connection::PrepareOptions;
 use crate::schema::Schema;
+use crate::statement::StatementOrigin;
 use crate::types::IOResult;
 use crate::util::normalize_ident;
 use crate::{Connection, Result, Statement, TransactionState, Value};
@@ -162,7 +164,11 @@ pub fn refresh_analyze_stats_nonblock(
                     return Ok(IOResult::Done(()));
                 }
                 let mv_tx = conn.get_mv_tx();
-                let mut stmt = conn.prepare(STATS_QUERY)?;
+                let mut stmt = conn.prepare_with_origin_and_options(
+                    STATS_QUERY,
+                    StatementOrigin::Root,
+                    &PrepareOptions::engine_metadata_read(),
+                )?;
                 stmt.set_mv_tx(mv_tx);
                 *st = RefreshAnalyzeStatsState::Running {
                     stmt: Box::new(stmt),

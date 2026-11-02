@@ -5,7 +5,7 @@
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
-use crate::security::roles::{ROLES_TABLE_NAME, SELECT_ROLES_SQL};
+use crate::security::roles::ROLES_TABLE_NAME;
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -1835,7 +1835,7 @@ impl Database {
                             .is_some();
                         *conn.schema.write() = schema;
                         if has_roles_table {
-                            state.roles_stmt = Some(Box::new(conn.prepare(SELECT_ROLES_SQL)?));
+                            state.roles_stmt = Some(Box::new(conn.prepare_roles_read()?));
                         }
                     }
                     if let Some(stmt) = state.roles_stmt.as_mut() {
