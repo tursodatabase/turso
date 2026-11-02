@@ -1,0 +1,74 @@
+name: ORM test suites
+
+# Runs popular ORMs' own test suites on SQLite and on Turso, nightly. A job
+# fails when a test that passes on SQLite fails on Turso and is not listed in
+# the suite's known-failures.txt, or when a listed test now passes. Pull
+# requests run it only when they change the harness itself.
+on:
+  pull_request:
+    paths:
+      - "testing/orm-suites/**"
+      - ".github/workflows/orm-suites.yml"
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orm-suites-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  suite:
+    name: ${{ matrix.suite }}
+    # GitHub-hosted: Blacksmith runners collect every JUnit file a job writes and
+    # would report the known Turso failures from the result files as test failures.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - python/sqlalchemy
+          - python/django
+          - python/peewee
+          - go/gorm
+          - go/sqlx
+          - go/bun
+          - js/kysely
+          - js/knex
+          - js/drizzle
+          - js/typeorm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: orm-suites-${{ matrix.suite }}
+      - uses: astral-sh/setup-uv@v6
+        if: startsWith(matrix.suite, 'python/')
+      - uses: actions/setup-go@v5
+        if: startsWith(matrix.suite, 'go/')
+        with:
+          go-version: "1.24.10"
+      - uses: actions/setup-node@v5
+        if: startsWith(matrix.suite, 'js/')
+        with:
+          # Drizzle's better-sqlite3 does not build on Node 26.
+          node-version: ${{ matrix.suite == 'js/drizzle' && 22 || 26 }}
+      - name: Enable corepack (yarn)
+        if: startsWith(matrix.suite, 'js/')
+        run: corepack enable
+      - name: Run ${{ matrix.suite }}
+        run: |
+          echo "| suite | score | new failures | no longer failing |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          testing/orm-suites/run.sh ${{ matrix.suite }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: orm-suite-${{ strategy.job-index }}
+          path: testing/orm-suites/results/
+          retention-days: 14
