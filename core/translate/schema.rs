@@ -194,6 +194,12 @@ impl CheckExprType {
         matches!(self, Self::Integer | Self::Real)
     }
 
+    /// A value of unknown type, such as `coalesce(int_col, text_col)`, may be
+    /// a number, so arithmetic on it is allowed, as comparing it is.
+    fn may_be_numeric(&self) -> bool {
+        self.is_numeric() || *self == Self::Any
+    }
+
     fn is_compatible_with(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Null, _) | (_, Self::Null) => true,
@@ -294,7 +300,7 @@ fn resolve_check_expr_type(
         ast::Expr::Unary(op, inner) => match op {
             UnaryOperator::Negative | UnaryOperator::Positive => {
                 let inner_ty = resolve_check_expr_type(inner, columns, resolver)?;
-                if !inner_ty.is_numeric() && inner_ty != CheckExprType::Null {
+                if !inner_ty.may_be_numeric() && inner_ty != CheckExprType::Null {
                     bail_parse_error!(
                         "unary minus/plus requires a numeric type, got {}",
                         inner_ty.display_name()
@@ -314,14 +320,16 @@ fn resolve_check_expr_type(
                     if lty == CheckExprType::Null || rty == CheckExprType::Null {
                         return Ok(CheckExprType::Null);
                     }
-                    if !lty.is_numeric() || !rty.is_numeric() {
+                    if !lty.may_be_numeric() || !rty.may_be_numeric() {
                         bail_parse_error!(
                             "arithmetic requires numeric types, got {} and {}",
                             lty.display_name(),
                             rty.display_name()
                         );
                     }
-                    if lty == CheckExprType::Real || rty == CheckExprType::Real {
+                    if lty == CheckExprType::Any || rty == CheckExprType::Any {
+                        Ok(CheckExprType::Any)
+                    } else if lty == CheckExprType::Real || rty == CheckExprType::Real {
                         Ok(CheckExprType::Real)
                     } else {
                         Ok(CheckExprType::Integer)

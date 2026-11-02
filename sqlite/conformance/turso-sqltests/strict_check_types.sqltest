@@ -531,6 +531,30 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test function-call-coalesce-of-mixed-types-in-arithmetic {
+    -- coalesce of an integer and text may be a number, so arithmetic on it is allowed.
+    CREATE TABLE t(
+        a INTEGER,
+        b TEXT,
+        CHECK(coalesce(a, b) + 1 > 0),
+        CHECK(-ifnull(a, 'none') < 1)
+    ) STRICT;
+    INSERT INTO t VALUES (5, 'x');
+    SELECT * FROM t;
+}
+expect {
+    5|x
+}
+
+@requires strict "uses STRICT tables"
+test arithmetic-on-text-column-error {
+    CREATE TABLE t(a TEXT, CHECK(a + 1 > 0)) STRICT;
+}
+expect error {
+    arithmetic requires numeric types, got TEXT and INTEGER
+}
+
+@requires strict "uses STRICT tables"
 test function-call-upper-valid {
     CREATE TABLE t(a TEXT CHECK(upper(a) = a)) STRICT;
     INSERT INTO t VALUES('HELLO');
