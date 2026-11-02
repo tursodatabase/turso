@@ -1802,6 +1802,28 @@ expect {
     500.25|750.50
 }
 
+# In a BEFORE UPDATE trigger, NEW of a column the SET clause does not name
+# holds the value read from the table. The trigger sees it decoded, as it sees
+# a SET column's value and as an AFTER trigger sees the row.
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test trigger-before-update-new-decoded-for-columns-not-set {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(w integer, y cents AS (w), c cents, n numeric(10,2)) STRICT;
+    CREATE TABLE log(t text, y integer, c integer, n text) STRICT;
+    CREATE TRIGGER b BEFORE UPDATE ON t
+    BEGIN INSERT INTO log VALUES ('before', NEW.y, NEW.c, CAST(NEW.n AS TEXT)); END;
+    CREATE TRIGGER a AFTER UPDATE ON t
+    BEGIN INSERT INTO log VALUES ('after', NEW.y, NEW.c, CAST(NEW.n AS TEXT)); END;
+    INSERT INTO t VALUES (3, 5, 1.5);
+    UPDATE t SET w = 7;
+    SELECT * FROM log;
+}
+expect {
+    before|7|5|1.50
+    after|7|5|1.50
+}
+
 # AFTER DELETE trigger should see decoded OLD values
 @requires strict "uses STRICT tables"
 @requires trigger "uses triggers"

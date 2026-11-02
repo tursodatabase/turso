@@ -30,7 +30,7 @@ use crate::{
         trigger_exec::{fire_trigger, TriggerContext},
     },
     vdbe::{
-        builder::{CursorKey, CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, DmlRowForm, ProgramBuilder},
         insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
     },
     CaptureDataChangesExt, Connection,
@@ -1004,6 +1004,7 @@ fn emit_delete_insns_when_triggers_present(
             let trigger_ctx = TriggerContext::new(
                 btree_table,
                 None, // No NEW for DELETE
+                DmlRowForm::Stored,
                 Some(old_registers),
             );
 
@@ -1067,6 +1068,7 @@ fn emit_delete_insns_when_triggers_present(
             let trigger_ctx_after = TriggerContext::new(
                 btree_table,
                 None, // No NEW for DELETE
+                DmlRowForm::Stored,
                 Some(old_registers),
             );
 

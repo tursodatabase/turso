@@ -343,16 +343,18 @@ fn emit_expr_with_bindings(
     result
 }
 
-/// Decode custom type columns for AFTER trigger NEW registers.
+/// Decode the custom type columns of a trigger's NEW or OLD row.
 ///
-/// For each column with a custom type decode expression, copies the encoded register
-/// to a new register and emits the decode expression. NULL values are skipped.
-/// Returns a Vec of registers: one per column (decoded or original) plus the rowid at the end.
+/// For each column that `holds_stored_value` and has a custom type decode
+/// expression, copies the encoded register to a new register and emits the
+/// decode expression. NULL values are skipped. Returns a Vec of registers: one
+/// per column (decoded or original) plus the rowid at the end.
 pub(crate) fn emit_trigger_decode_registers(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     columns: &[Column],
     source_regs: &dyn Fn(usize) -> usize,
+    holds_stored_value: &dyn Fn(usize) -> bool,
     rowid_reg: usize,
     is_strict: bool,
 ) -> Result<Vec<usize>> {
@@ -360,6 +362,9 @@ pub(crate) fn emit_trigger_decode_registers(
         .iter()
         .enumerate()
         .map(|(i, col)| -> Result<usize> {
+            if !holds_stored_value(i) {
+                return Ok(source_regs(i));
+            }
             if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
                 if resolved.chain.iter().any(|td| td.decode().is_some()) {
                     let decoded_reg = program.alloc_register();

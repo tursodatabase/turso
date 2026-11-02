@@ -894,8 +894,8 @@ pub fn emit_upsert(
             .collect();
         if !relevant_before_update_triggers.is_empty() {
             // NEW row values are in new_start registers. At this point they are
-            // encoded (post-encode for STRICT custom types). Mark new_encoded=true
-            // so fire_trigger's decode_trigger_registers will decode them.
+            // encoded (post-encode for STRICT custom types), so fire_trigger's
+            // decode_trigger_registers decodes them.
             let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
             let new_registers: Vec<usize> = (0..num_cols)
                 .map(|i| layout.to_register(new_start, i))
@@ -904,13 +904,13 @@ pub fn emit_upsert(
 
             // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
             // clauses should not suppress errors. Override conflict resolution to Abort.
-            // Use new_after variant because NEW values are encoded at this point.
-            let trigger_ctx = TriggerContext::new_after_with_override_conflict(
+            let trigger_ctx = TriggerContext::new(
                 btree_table.clone(),
                 Some(new_registers),
+                DmlRowForm::Stored,
                 Some(old_registers.clone()),
-                ast::ResolveType::Abort,
-            );
+            )
+            .with_override_conflict(ast::ResolveType::Abort);
 
             for trigger in relevant_before_update_triggers {
                 fire_trigger(
@@ -1631,12 +1631,13 @@ pub fn emit_upsert(
             // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
             // clauses should not suppress errors. Override conflict resolution to Abort.
             // NEW values are encoded at this point; fire_trigger will decode them.
-            let trigger_ctx_after = TriggerContext::new_after_with_override_conflict(
+            let trigger_ctx_after = TriggerContext::new(
                 btree_table,
                 Some(new_registers_after),
+                DmlRowForm::Stored,
                 Some(old_regs),
-                ast::ResolveType::Abort,
-            );
+            )
+            .with_override_conflict(ast::ResolveType::Abort);
 
             // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
             // not skip post-row work (RETURNING).

@@ -641,26 +641,18 @@ pub fn translate_insert(
         //    trigger statements (per SQLite semantics, the outer statement's
         //    conflict resolution overrides the trigger body's)
         // 3. Otherwise, don't override (use statement's own conflict resolution)
-        let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
-            TriggerContext::new_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers),
-                None, // No OLD for INSERT
-                override_conflict,
-            )
-        } else if let Some(statement_on_conflict) = ctx.statement_on_conflict {
-            TriggerContext::new_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers),
-                None, // No OLD for INSERT
-                statement_on_conflict,
-            )
-        } else {
-            TriggerContext::new(
-                btree_table.clone(),
-                Some(new_registers),
-                None, // No OLD for INSERT
-            )
+        let trigger_ctx = TriggerContext::new(
+            btree_table.clone(),
+            Some(new_registers),
+            DmlRowForm::UserFacing,
+            None, // No OLD for INSERT
+        );
+        let trigger_ctx = match program
+            .trigger_conflict_override
+            .or(ctx.statement_on_conflict)
+        {
+            Some(override_conflict) => trigger_ctx.with_override_conflict(override_conflict),
+            None => trigger_ctx,
         };
         for trigger in relevant_before_triggers {
             fire_trigger(
@@ -1059,22 +1051,18 @@ pub fn translate_insert(
             .chain(std::iter::once(key_reg))
             .collect();
         // Determine the conflict resolution to propagate to AFTER triggers (same logic as BEFORE)
-        let trigger_ctx_after = if let Some(override_conflict) = program.trigger_conflict_override {
-            TriggerContext::new_after_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers_after),
-                None,
-                override_conflict,
-            )
-        } else if let Some(statement_on_conflict) = ctx.statement_on_conflict {
-            TriggerContext::new_after_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers_after),
-                None,
-                statement_on_conflict,
-            )
-        } else {
-            TriggerContext::new_after(btree_table.clone(), Some(new_registers_after), None)
+        let trigger_ctx_after = TriggerContext::new(
+            btree_table.clone(),
+            Some(new_registers_after),
+            DmlRowForm::Stored,
+            None,
+        );
+        let trigger_ctx_after = match program
+            .trigger_conflict_override
+            .or(ctx.statement_on_conflict)
+        {
+            Some(override_conflict) => trigger_ctx_after.with_override_conflict(override_conflict),
+            None => trigger_ctx_after,
         };
         // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
         // not skip post-row work (FK counters, autoincrement, CDC, RETURNING).
