@@ -863,11 +863,12 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
             Some(ty) => negated_type(ty, env.schema()),
             None => any,
         },
-        ResultType::RealForTextOtherwiseTheFirstArgumentsType => match first_argument() {
+        ResultType::AbsOfTheFirstArgument => match first_argument() {
             Some(ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob) | ExprType::Untyped) => {
                 ExprType::Builtin(BuiltinType::Real)
             }
-            // abs of a custom type keeps main's type, the type of `-x`.
+            // abs of a custom type has the type of `-x`, so numeric's operators
+            // still apply to `n + abs(n)`.
             Some(ty) => negated_type(ty, env.schema()),
             None => any,
         },

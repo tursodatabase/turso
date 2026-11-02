@@ -1201,7 +1201,7 @@ impl ScalarFunc {
             | Self::Unlikely
             | Self::Likelihood
             | Self::TestUintDecode => ResultType::FirstArgument,
-            Self::Abs => ResultType::RealForTextOtherwiseTheFirstArgumentsType,
+            Self::Abs => ResultType::AbsOfTheFirstArgument,
             // A real for a real argument; see MathFunc::result_type.
             Self::Round => ResultType::RealForARealArgument,
             Self::Substr | Self::Substring => ResultType::TextOrBlobLikeTheFirstArgument,
@@ -1869,8 +1869,11 @@ pub enum ReturnType {
 }
 
 /// How the type of a function's result follows from the types of its
-/// arguments. Every place that needs the type of a call reads it from here, so
-/// they can't disagree about a function.
+/// arguments. Query typing (`type_of`) and the STRICT CHECK checker
+/// (`resolve_func_return_type`) both read it, so each function states its rule
+/// once. They still read a few rules differently, because a CHECK constraint
+/// sees a custom-type column as its stored value, such as numeric's blob, while
+/// a query sees the decoded value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultType {
     /// Every non-NULL result has this type, whatever the arguments.
@@ -1889,7 +1892,7 @@ pub enum ResultType {
     NumberOfTheFirstArgumentsType,
     /// `abs`: like NumberOfTheFirstArgumentsType, but a text or blob argument
     /// is not converted first and gives a real: `abs('3')` is 3.0.
-    RealForTextOtherwiseTheFirstArgumentsType,
+    AbsOfTheFirstArgument,
     /// A number that is a real when an argument is a real. SQLite always
     /// returns a real, but PostgreSQL computes these exactly for an exact
     /// argument (`round(0.25, 1)` and `mod(10, 4)`), so without a real
