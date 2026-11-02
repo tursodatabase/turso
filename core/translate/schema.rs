@@ -20,7 +20,7 @@ use crate::translate::emitter::{
     OperationMode, Resolver,
 };
 use crate::translate::expr::expr_type::iif_values;
-use crate::translate::expr::{is_literal_of_input_type, walk_expr, WalkControl};
+use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
@@ -221,6 +221,18 @@ impl CheckExprType {
             Self::CustomType(name) => name.as_str(),
         }
     }
+
+    /// The name a custom type uses for this as its input type, such as
+    /// `integer`. None for a value that is not one of SQLite's storage types.
+    fn sql_type_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Integer => Some("integer"),
+            Self::Real => Some("real"),
+            Self::Text => Some("text"),
+            Self::Blob => Some("blob"),
+            Self::Any | Self::Null | Self::CustomType(_) => None,
+        }
+    }
 }
 
 /// Resolve the type of an expression node in a CHECK constraint.
@@ -358,7 +370,7 @@ fn resolve_check_expr_type(
                 | Operator::GreaterEquals => {
                     let lty = resolve_check_expr_type(lhs, columns, resolver)?;
                     let rty = resolve_check_expr_type(rhs, columns, resolver)?;
-                    if !can_compare((lhs, &lty), (rhs, &rty), resolver) {
+                    if !can_compare(&lty, &rty, resolver) {
                         bail_parse_error!(
                             "type mismatch in CHECK constraint: cannot compare {} with {}",
                             lty.display_name(),
@@ -560,7 +572,7 @@ fn validate_check_types_in_expr(
                 | Operator::GreaterEquals => {
                     let lty = resolve_check_expr_type(lhs, columns, resolver)?;
                     let rty = resolve_check_expr_type(rhs, columns, resolver)?;
-                    if !can_compare((lhs, &lty), (rhs, &rty), resolver) {
+                    if !can_compare(&lty, &rty, resolver) {
                         bail_parse_error!(
                             "type mismatch in CHECK constraint: cannot compare {} with {}",
                             lty.display_name(),
@@ -585,14 +597,14 @@ fn validate_check_types_in_expr(
             let lty = resolve_check_expr_type(lhs, columns, resolver)?;
             let sty = resolve_check_expr_type(start, columns, resolver)?;
             let ety = resolve_check_expr_type(end, columns, resolver)?;
-            if !can_compare((lhs, &lty), (start, &sty), resolver) {
+            if !can_compare(&lty, &sty, resolver) {
                 bail_parse_error!(
                     "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
                     lty.display_name(),
                     sty.display_name()
                 );
             }
-            if !can_compare((lhs, &lty), (end, &ety), resolver) {
+            if !can_compare(&lty, &ety, resolver) {
                 bail_parse_error!(
                     "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
                     lty.display_name(),
@@ -604,7 +616,7 @@ fn validate_check_types_in_expr(
             let lty = resolve_check_expr_type(lhs, columns, resolver)?;
             for item in rhs {
                 let ity = resolve_check_expr_type(item, columns, resolver)?;
-                if !can_compare((lhs, &lty), (item, &ity), resolver) {
+                if !can_compare(&lty, &ity, resolver) {
                     bail_parse_error!(
                         "type mismatch in CHECK IN list: cannot compare {} with {}",
                         lty.display_name(),
@@ -649,24 +661,21 @@ fn validate_check_types_in_expr(
 }
 
 /// Whether a CHECK constraint may compare two values of these types. A value
-/// of a custom type may also be compared with a literal of the type it takes
-/// as input, as in `amount < 50`: the CHECK sees the value a read gives, as
-/// a SELECT does.
-fn can_compare(
-    (lhs, lty): (&ast::Expr, &CheckExprType),
-    (rhs, rty): (&ast::Expr, &CheckExprType),
-    resolver: &CatalogContext,
-) -> bool {
-    let is_literal_for = |literal: &ast::Expr, ty: &CheckExprType| {
-        let CheckExprType::CustomType(type_name) = ty else {
+/// of a custom type may also be compared with any value of the type it takes
+/// as input, as in `amount < 50` or `amount > -5 - 1`: the CHECK sees the
+/// value a read gives, as a SELECT does.
+fn can_compare(lty: &CheckExprType, rty: &CheckExprType, resolver: &CatalogContext) -> bool {
+    let is_input_for = |value: &CheckExprType, ty: &CheckExprType| {
+        let (CheckExprType::CustomType(type_name), Some(value_type)) = (ty, value.sql_type_name())
+        else {
             return false;
         };
         resolver
             .schema()
             .get_type_def_unchecked(type_name)
-            .is_some_and(|type_def| is_literal_of_input_type(literal, type_def))
+            .is_some_and(|type_def| takes_input_of_type(type_def, value_type))
     };
-    lty.is_compatible_with(rty) || is_literal_for(rhs, lty) || is_literal_for(lhs, rty)
+    lty.is_compatible_with(rty) || is_input_for(rty, lty) || is_input_for(lty, rty)
 }
 
 fn validate(

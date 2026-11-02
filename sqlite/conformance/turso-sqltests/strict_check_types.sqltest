@@ -368,8 +368,8 @@ expect error {
     CHECK constraint failed
 }
 
-# A minus sign in front of a number keeps it a literal of the type's input
-# type, so -5 compares with a custom-type column like 5 does.
+# -5 is an integer like 5, so it compares with a cents column, whose type
+# takes integers as input, as 5 does.
 @requires strict "uses STRICT tables"
 test custom-type-negative-literals {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
@@ -389,6 +389,44 @@ test custom-type-negative-literal-check-violation {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(amount cents CHECK(amount > -5)) STRICT;
     INSERT INTO t VALUES(-6);
+}
+expect error {
+    CHECK constraint failed
+}
+
+# A CHECK sees a custom-type column as a SELECT reads it, so the column
+# compares with any integer value when its type takes integers as input: an
+# expression such as -5 - 1 or another integer column, not only a literal.
+@requires strict "uses STRICT tables"
+test custom-type-compares-with-values-of-its-input-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(
+        amount cents CHECK(amount > -5 - 1),
+        lim integer,
+        CHECK(amount < lim)
+    ) STRICT;
+    INSERT INTO t VALUES(-5, 0);
+    SELECT amount, lim FROM t;
+}
+expect {
+    -5|0
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-input-type-expression-check-violation {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount > -5 - 1)) STRICT;
+    INSERT INTO t VALUES(-6);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-integer-column-check-violation {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents, lim integer, CHECK(amount < lim)) STRICT;
+    INSERT INTO t VALUES(60, 50);
 }
 expect error {
     CHECK constraint failed
