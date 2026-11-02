@@ -702,6 +702,7 @@ impl TursoSyncServer {
         let db_size = current_db_size_pages(&conn, wal_state.max_frame)?;
 
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             server_revision: server_revision.to_string(),
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -836,6 +837,7 @@ impl TursoSyncServer {
                         end_offset: snapshot.end_offset,
                         starts_with_header: start_offset == 0,
                         crc_seed,
+                        transmitted_length: None,
                     }],
                 }),
                 log[start..end].to_vec(),
@@ -843,6 +845,7 @@ impl TursoSyncServer {
         };
 
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             server_revision: format!("g1:o{}", snapshot.end_offset),
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -896,6 +899,7 @@ impl TursoSyncServer {
         db_size: u64,
     ) -> Result<HttpResponse> {
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             server_revision,
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
@@ -925,6 +929,7 @@ impl TursoSyncServer {
         let (db_size, pages) = self.read_replace_base_pages(db)?;
 
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             server_revision,
             db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),

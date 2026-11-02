@@ -799,6 +799,7 @@ pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connecti
 
 /// HTTP header key for the encryption key, for the encrypted Turso Cloud databases
 pub const ENCRYPTION_KEY_HEADER: &str = "x-turso-encryption-key";
+pub const ENCRYPTION_CIPHER_HEADER: &str = "x-turso-encryption-cipher";
 
 pub struct SyncOperationCtx<'a, IO: SyncEngineIo, Ctx> {
     pub coro: &'a Coro<Ctx>,
@@ -807,6 +808,8 @@ pub struct SyncOperationCtx<'a, IO: SyncEngineIo, Ctx> {
     pub remote_url: Option<String>,
     // optional remote encryption key for the encrypted Turso Cloud databases, base64 encoded
     pub remote_encryption_key: Option<Secret>,
+    encryption_cipher: Option<String>,
+    require_native_encrypted_sync: bool,
 }
 
 impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
@@ -823,8 +826,33 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
             io,
             remote_url: remote_url.map(|x| x.to_string()),
             remote_encryption_key: remote_encryption_key.cloned(),
+            encryption_cipher: None,
+            require_native_encrypted_sync: false,
         }
     }
+    pub fn with_encryption_config(
+        mut self,
+        config: Option<&crate::sync_encryption::SyncEncryption>,
+    ) -> Self {
+        self.encryption_cipher = config.map(|config| config.cipher().to_string());
+        self.require_native_encrypted_sync =
+            config.is_some_and(|config| config.local_key().is_some());
+        self
+    }
+    fn validate_encryption_response(&self, header: &PullUpdatesRespProtoBody) -> Result<()> {
+        if self.encryption_cipher.is_some()
+            && (self.require_native_encrypted_sync
+                || detect_remote_pull_protocol(header) == RemotePullProtocol::MvccLogical)
+            && !header.encrypted_sync
+        {
+            return Err(Error::DatabaseSyncEngineError(
+                "server did not acknowledge native encrypted sync support and cipher validation"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn http(
         &self,
         method: &str,
@@ -832,12 +860,27 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> Result<IO::DataCompletionBytes> {
+        if self.encryption_cipher.is_some() && self.remote_encryption_key.is_none() {
+            return Err(Error::DatabaseSyncEngineError(
+                "cloud key is required for encrypted sync requests".into(),
+            ));
+        }
         let encryption_header = self
             .remote_encryption_key
             .as_ref()
             .map(|key| (ENCRYPTION_KEY_HEADER, key.expose()));
 
-        let all_headers: Vec<_> = headers.iter().copied().chain(encryption_header).collect();
+        let cipher_header = self
+            .encryption_cipher
+            .as_deref()
+            .filter(|_| self.remote_encryption_key.is_some())
+            .map(|cipher| (ENCRYPTION_CIPHER_HEADER, cipher));
+        let all_headers: Vec<_> = headers
+            .iter()
+            .copied()
+            .chain(encryption_header)
+            .chain(cipher_header)
+            .collect();
 
         self.io
             .http(self.remote_url.as_deref(), method, path, body, &all_headers)
@@ -1924,7 +1967,7 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
         logical_updates,
         long_poll_timeout.map(|x| x.as_millis()).unwrap_or(0)
     );
-    if logical_updates && ctx.remote_encryption_key.is_some() {
+    if logical_updates && ctx.remote_encryption_key.is_some() && ctx.encryption_cipher.is_none() {
         return Err(Error::DatabaseSyncEngineError(
             "MVCC logical pull is not supported with encrypted remote databases".to_string(),
         ));
@@ -1968,6 +2011,7 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
             "no header returned in the pull-updates protobuf call".to_string(),
         ));
     };
+    ctx.validate_encryption_response(&header)?;
     tracing::info!(
         "pull_updates_v1: got header: remote_url={:?} server_revision={} stream_kind={} apply_mode={} db_size={} raw_encoding={:?} zstd_encoding={:?} mvcc_log={:?}",
         ctx.remote_url,
@@ -2132,6 +2176,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
             "no header returned in the pull-updates protobuf call".to_string(),
         ));
     };
+    ctx.validate_encryption_response(&header)?;
     tracing::info!("wal_pull_to_file: got header={:?}", header);
     ensure_incremental_page_stream(&header, "wal_pull_to_file_v1")?;
 
@@ -2257,6 +2302,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
             "no header returned in the pull-updates protobuf call".to_string(),
         ));
     };
+    ctx.validate_encryption_response(&header)?;
     tracing::info!("pull_pages_v1: got header={:?}", header);
     ensure_page_stream(&header, "pull_pages_v1")?;
 
@@ -3449,6 +3495,7 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
             "no header returned in the pull-updates protobuf call".to_string(),
         ));
     };
+    ctx.validate_encryption_response(&header)?;
     tracing::info!("bootstrap_db_file: got header={:?}", header);
     ensure_page_stream(&header, "pull_chunk_into_file")?;
     if truncate_on_first_response {
@@ -4210,6 +4257,88 @@ mod tests {
         assert_eq!(ENCRYPTION_KEY_HEADER, "x-turso-encryption-key");
     }
 
+    #[test]
+    fn request_sends_cipher_and_cloud_key_without_local_key() {
+        let io = Arc::new(TestHttpIo {
+            response: Vec::new(),
+            chunk: 7,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let config = crate::sync_encryption::SyncEncryption::new(
+            turso_core::CipherMode::Aes256Gcm,
+            Some(turso_core::EncryptionKey::new_256([0xab; 32])),
+        )
+        .expect("local config");
+        let mut gen = genawaiter::sync::Gen::new(|co| async {
+            let coro: Coro<()> = co.into();
+            let stats = SyncEngineIoStats::new(io.clone());
+            let cloud_key = crate::types::Secret::new("Y2xvdWQta2V5");
+            let ctx = SyncOperationCtx::new(&coro, &stats, None, Some(&cloud_key))
+                .with_encryption_config(Some(&config));
+            let _completion = ctx
+                .http("POST", "/v2/pipeline", None, &[])
+                .expect("request");
+        });
+        assert!(matches!(
+            gen.resume_with(Ok(())),
+            genawaiter::GeneratorState::Complete(())
+        ));
+        let headers = io.headers.lock().expect("headers");
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == super::ENCRYPTION_CIPHER_HEADER && value == "aes256gcm"));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == super::ENCRYPTION_KEY_HEADER && value == "Y2xvdWQta2V5"));
+        assert!(!format!("{headers:?}").contains(&"ab".repeat(32)));
+    }
+
+    #[test]
+    fn encrypted_capability_is_required_for_native_sync_and_local_encryption_only() {
+        use crate::server_proto::PullUpdatesProtocol;
+        let io = Arc::new(TestHttpIo {
+            response: Vec::new(),
+            chunk: 7,
+            request: Mutex::new(None),
+            headers: Mutex::new(Vec::new()),
+        });
+        let mut generator = genawaiter::sync::Gen::new(|co| async {
+            let coro: Coro<()> = co.into();
+            let stats = SyncEngineIoStats::new(io);
+            for local_key in [None, Some(turso_core::EncryptionKey::new_256([22; 32]))] {
+                let local = local_key.is_some();
+                let config = crate::sync_encryption::SyncEncryption::new(
+                    turso_core::CipherMode::Aes256Gcm,
+                    local_key,
+                )
+                .unwrap();
+                let ctx = SyncOperationCtx::new(&coro, &stats, None, None)
+                    .with_encryption_config(Some(&config));
+                for protocol in [
+                    PullUpdatesProtocol::Pages,
+                    PullUpdatesProtocol::Unspecified,
+                    PullUpdatesProtocol::MvccLogical,
+                ] {
+                    let mut header = PullUpdatesRespProtoBody {
+                        protocol: protocol as i32,
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        ctx.validate_encryption_response(&header).is_err(),
+                        local || protocol == PullUpdatesProtocol::MvccLogical
+                    );
+                    header.encrypted_sync = true;
+                    assert!(ctx.validate_encryption_response(&header).is_ok());
+                }
+            }
+        });
+        assert!(matches!(
+            generator.resume_with(Ok(())),
+            genawaiter::GeneratorState::Complete(())
+        ));
+    }
+
     /// `reset_wal_file` resets the revert WAL and then records the new revert
     /// watermark durably in the metadata. If the truncation isn't fsynced, a
     /// crash could leave stale revert frames on disk, so the function must issue
@@ -4633,6 +4762,7 @@ mod tests {
             raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 3, initial_crc);
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
             db_size: 0,
@@ -4644,6 +4774,7 @@ mod tests {
                 format: "lml3".to_string(),
                 checkpoint_transition: false,
                 ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    transmitted_length: None,
                     generation: 1,
                     start_offset: 0,
                     end_offset,
@@ -4722,6 +4853,7 @@ mod tests {
             raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 4, initial_crc);
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
             db_size: 0,
@@ -4733,6 +4865,7 @@ mod tests {
                 format: "lml3".to_string(),
                 checkpoint_transition: false,
                 ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    transmitted_length: None,
                     generation: 1,
                     start_offset: 0,
                     end_offset,
@@ -4807,6 +4940,7 @@ mod tests {
         let range_start = super::MVCC_LOG_HEADER_SIZE as u64;
         let range_end = range_start + raw_frame.len() as u64;
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: format!("g1:o{range_end}"),
             db_size: 0,
@@ -4891,6 +5025,7 @@ mod tests {
     fn pull_updates_v1_accepts_page_stream_when_logical_pull_is_requested() {
         let page = vec![7u8; super::PAGE_SIZE];
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: "g1:o45".to_string(),
             db_size: 1,
@@ -4977,6 +5112,7 @@ mod tests {
     fn pull_updates_v1_preserves_replace_base_page_fallback() {
         let page = vec![9u8; super::PAGE_SIZE];
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: "g1:o80".to_string(),
             db_size: 1,
@@ -5051,6 +5187,7 @@ mod tests {
     #[test]
     fn wal_pull_to_file_v1_rejects_replace_base_page_stream() {
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: "g1:o80".to_string(),
             db_size: 1,
@@ -5117,6 +5254,7 @@ mod tests {
     fn pull_pages_v1_accepts_replace_base_page_stream_for_revision_pinned_reads() {
         let page = vec![11u8; super::PAGE_SIZE];
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: "g1:o80".to_string(),
             db_size: 3,
@@ -5246,6 +5384,7 @@ mod tests {
         let range_start = super::MVCC_LOG_HEADER_SIZE as u64;
         let range_end = range_start + frame.len() as u64;
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: format!("g1:o{range_end}"),
             db_size: 0,
@@ -5257,6 +5396,7 @@ mod tests {
                 format: "lml3".to_string(),
                 checkpoint_transition: false,
                 ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    transmitted_length: None,
                     generation: 1,
                     start_offset: range_start,
                     end_offset: range_end,
@@ -5290,6 +5430,7 @@ mod tests {
         log_header[super::MVCC_LOG_HEADER_CRC_START] ^= 0x01;
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
             db_size: 0,
@@ -5301,6 +5442,7 @@ mod tests {
                 format: "lml3".to_string(),
                 checkpoint_transition: false,
                 ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    transmitted_length: None,
                     generation: 1,
                     start_offset: 0,
                     end_offset,
@@ -5325,6 +5467,7 @@ mod tests {
         frame[super::MVCC_TX_EXT_HEADER_SIZE + super::MVCC_EXTENSION_RECORD_HEADER_SIZE] ^= 0x01;
         let end_offset = (log_header.len() + frame.len()) as u64;
         let header = PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: format!("g1:o{end_offset}"),
             db_size: 0,
@@ -5336,6 +5479,7 @@ mod tests {
                 format: "lml3".to_string(),
                 checkpoint_transition: false,
                 ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    transmitted_length: None,
                     generation: 1,
                     start_offset: 0,
                     end_offset,
@@ -5860,6 +6004,7 @@ mod tests {
 
     fn page_header(stream_kind: i32, apply_mode: i32) -> PullUpdatesRespProtoBody {
         PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             protocol: 0,
             server_revision: "rev".to_string(),
             db_size: 1,
@@ -5969,6 +6114,7 @@ mod tests {
         use crate::types::RemotePullProtocol;
 
         let header = |protocol: i32| PullUpdatesRespProtoBody {
+            encrypted_sync: false,
             server_revision: "g1:o0".to_string(),
             db_size: 0,
             raw_encoding: Some(PageSetRawEncodingProto {}),
