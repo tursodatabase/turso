@@ -930,11 +930,12 @@ impl Repl {
                     }
 
                     self.interrupt_count.store(0, Ordering::Release);
-                    self.read_state.process(&line);
+                    let line_start = self.input_buf.len();
                     self.input_buf.push_str(&line);
                     if !self.input_buf.ends_with(char::is_whitespace) {
                         self.input_buf.push('\n');
                     }
+                    self.update_read_state(line_start);
                     self.consume(false);
                 }
                 Err(ReadlineError::Interrupted) => {
@@ -968,8 +969,19 @@ impl Repl {
                 self.consume(true);
                 break;
             }
-            self.read_state.process(&self.input_buf[prev_len..]);
+            self.update_read_state(prev_len);
             self.consume(false);
+        }
+    }
+
+    /// Scans the whole input again, because a string or comment can span
+    /// lines. A line can only make the input complete if it has a semicolon
+    /// or ends a `/*` comment after one, so other lines are skipped.
+    fn update_read_state(&mut self, line_start: usize) {
+        let line = &self.input_buf[line_start..];
+        if line.contains(';') || line.contains("*/") {
+            self.read_state = ReadState::default();
+            self.read_state.process(&self.input_buf);
         }
     }
 }

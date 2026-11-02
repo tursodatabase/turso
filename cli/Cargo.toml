@@ -63,7 +63,6 @@ mimalloc = { workspace = true, optional = true }
 prost = "0.14.1"
 roaring = "0.11.2"
 bytes = "1.11.1"
-itertools.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [

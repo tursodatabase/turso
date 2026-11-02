@@ -80,14 +80,13 @@ impl<'a> Iterator for Tokenizer<'a> {
             let c = self.chars.next()?;
 
             let token = match c {
+                // A string or quoted identifier is one ordinary token. When it
+                // is not closed, it runs to the end of the input, which is then
+                // never complete.
                 '\'' | '"' | '`' | '[' => {
                     let end_char = if c == '[' { ']' } else { c };
-                    // Consumes all tokens between the delimeters
-                    self.chars
-                        .by_ref()
-                        .take_while_inclusive(|&ch| ch != end_char)
-                        .for_each(drop);
-                    continue;
+                    self.chars.by_ref().find(|&ch| ch == end_char);
+                    Token::TkOther
                 }
                 '$' => {
                     // Try to read a dollar-quote tag: $<optional_ident>$
@@ -119,9 +118,8 @@ impl<'a> Iterator for Tokenizer<'a> {
                                 break;
                             }
                         }
-                        continue;
                     }
-                    // Not a dollar-quote (e.g. $1 positional param) — treat as other
+                    // A dollar-quoted string, or a bare `$` or `$1` parameter
                     Token::TkOther
                 }
                 // Handle Comments
@@ -132,15 +130,20 @@ impl<'a> Iterator for Tokenizer<'a> {
                     continue;
                 }
                 '/' if self.chars.peek() == Some(&'*') => {
-                    // Consumes until you find a `*/`
-                    let _ = self.chars.by_ref().try_fold(false, |saw_star, c| {
+                    self.chars.next(); // Consume `*`
+                                       // Consumes until you find a `*/`
+                    let closed = self.chars.by_ref().try_fold(false, |saw_star, c| {
                         if saw_star && c == '/' {
                             ControlFlow::Break(())
                         } else {
                             ControlFlow::Continue(c == '*')
                         }
                     });
-                    continue;
+                    if closed.is_break() {
+                        continue;
+                    }
+                    // An unclosed comment makes the input incomplete.
+                    Token::TkOther
                 }
                 ';' => Token::TkSemi,
                 c if c.is_ascii_whitespace() => Token::TkWhitespace,
@@ -378,6 +381,29 @@ mod tests {
     fn test_escaped_quotes() {
         assert!(is_complete("SELECT 'it''s';"));
         assert!(is_complete(r#"SELECT "col""name";"#));
+    }
+
+    #[test]
+    fn test_string_after_semicolon() {
+        assert!(!is_complete("SELECT 1; 'x'"));
+        assert!(!is_complete("SELECT 1; \"x\""));
+        assert!(!is_complete("SELECT 1; $$x$$"));
+        assert!(is_complete("SELECT 1; 'x';"));
+    }
+
+    #[test]
+    fn test_unterminated_string_or_comment() {
+        assert!(!is_complete("SELECT 1; 'x"));
+        assert!(!is_complete("SELECT 1; $$x"));
+        assert!(!is_complete("SELECT 1; /* x"));
+        assert!(!is_complete("SELECT 1; /*/"));
+        assert!(is_complete("SELECT 1; /**/"));
+    }
+
+    #[test]
+    fn test_string_across_lines() {
+        assert!(is_complete("SELECT 'a;\nb';\n"));
+        assert!(!is_complete("SELECT 'a;\n"));
     }
 
     #[test]

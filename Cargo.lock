@@ -6105,7 +6105,6 @@ dependencies = [
  "futures",
  "glob",
  "indicatif",
- "itertools 0.14.0",
  "logos",
  "miette",
  "num_cpus",
@@ -7092,7 +7091,6 @@ dependencies = [
  "dirs 5.0.1",
  "env_logger",
  "include_dir",
- "itertools 0.14.0",
  "libc",
  "limbo_completion",
  "miette",
@@ -7461,6 +7459,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_ext",
+ "turso_parser",
  "vcpkg",
 ]
 
