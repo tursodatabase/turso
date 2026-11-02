@@ -21,6 +21,8 @@ use crate::{
 
 #[derive(Clone)]
 pub struct TursoDatabaseSyncConfig {
+    /// Shared native cipher for local and cloud encryption.
+    pub cipher: Option<String>,
     pub remote_url: Option<String>,
     pub path: String,
     pub client_name: String,
@@ -69,6 +71,11 @@ impl TursoDatabaseSyncConfig {
         }
         let config = *config;
         Ok(Self {
+            cipher: if config.remote_encryption_cipher.is_null() {
+                None
+            } else {
+                Some(str_from_c_str(config.remote_encryption_cipher)?.to_string())
+            },
             path: str_from_c_str(config.path)?.to_string(),
             remote_url: if config.remote_url.is_null() {
                 None
@@ -254,7 +261,39 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         // sync engine opens internally (e.g. the revert connection), so they
         // match the main database opened via TursoDatabase below.
         let db_opts = db_config.database_opts();
+        let local_encryption = db_config
+            .encryption
+            .as_ref()
+            .map(turso_sync_engine::sync_encryption::SyncEncryption::from_local_options)
+            .transpose()
+            .map_err(|error| TursoError::Misuse(error.to_string()))?;
+        let cipher = sync_config
+            .cipher
+            .as_deref()
+            // ChaCha is supported by legacy remote encryption, but not native core.
+            .filter(|cipher| {
+                local_encryption.is_some()
+                    || !matches!(*cipher, "chacha20poly1305" | "chacha20-poly1305")
+            })
+            .map(turso_core::CipherMode::try_from)
+            .transpose()
+            .map_err(|error| TursoError::Misuse(error.to_string()))?;
+        if let (Some(local), Some(cipher)) = (&local_encryption, cipher) {
+            if local.cipher() != cipher {
+                return Err(TursoError::Misuse(
+                    "sync uses a single cipher for both local and cloud encryption".into(),
+                ));
+            }
+        }
+        let encryption = match local_encryption {
+            Some(config) => Some(config),
+            None => cipher
+                .map(|cipher| turso_sync_engine::sync_encryption::SyncEncryption::new(cipher, None))
+                .transpose()
+                .map_err(|error| TursoError::Misuse(error.to_string()))?,
+        };
         let sync_engine_opts = turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts {
+            encryption,
             remote_url: sync_config.remote_url.clone(),
             client_name: sync_config.client_name.clone(),
             tables_ignore: vec![],
@@ -277,10 +316,20 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             logical_mvcc_pull: sync_config.logical_mvcc_pull,
         };
         let is_memory = db_config.path == ":memory:";
+        let local_crypto = sync_engine_opts
+            .local_encryption_context()
+            .map_err(|error| TursoError::Misuse(error.to_string()))?;
+        if local_crypto.is_some() && db_config.page_codec.is_some() {
+            return Err(TursoError::Misuse(
+                "built-in encryption cannot be combined with an external page codec".into(),
+            ));
+        }
         let db_io: Option<Arc<dyn IO>> = if let Some(io) = &db_config.io {
             Some(io.clone())
         } else if is_memory {
             Some(Arc::new(MemoryIO::new()))
+        } else if local_crypto.is_some() {
+            Some(persistent_io(false).map_err(|error| TursoError::Misuse(error.to_string()))?)
         } else {
             // persitent IO initialized later in order to read metadata first and decide if we need partial DB IO
             None
@@ -307,13 +356,16 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         let sync_engine = self.sync_engine.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
-                let metadata = database_sync_engine::DatabaseSyncEngine::read_db_meta(
-                    &coro,
-                    io.clone(),
-                    sync_engine_io.clone(),
-                    &main_db_path,
-                )
-                .await?;
+                let local_crypto = sync_engine_opts.local_encryption_context()?;
+                let metadata =
+                    database_sync_engine::DatabaseSyncEngine::read_db_meta_with_encryption(
+                        &coro,
+                        io.clone(),
+                        sync_engine_io.clone(),
+                        &main_db_path,
+                        local_crypto.as_ref(),
+                    )
+                    .await?;
                 let Some(metadata) = metadata else {
                     return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
                         "metadata not found".to_string(),
@@ -362,13 +414,16 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         let sync_engine = self.sync_engine.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
-                let metadata = database_sync_engine::DatabaseSyncEngine::read_db_meta(
-                    &coro,
-                    io.clone(),
-                    sync_engine_io.clone(),
-                    &main_db_path,
-                )
-                .await?;
+                let local_crypto = sync_engine_opts.local_encryption_context()?;
+                let metadata =
+                    database_sync_engine::DatabaseSyncEngine::read_db_meta_with_encryption(
+                        &coro,
+                        io.clone(),
+                        sync_engine_io.clone(),
+                        &main_db_path,
+                        local_crypto.as_ref(),
+                    )
+                    .await?;
                 let io = match io {
                     Some(io) => io,
                     None => persistent_io(if let Some(metadata) = &metadata {
@@ -610,6 +665,73 @@ mod tests {
     use super::{TursoDatabaseSync, TursoDatabaseSyncConfig};
 
     #[test]
+    fn local_encryption_reaches_sync_engine_before_metadata_io() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let config = TursoDatabaseConfig {
+            path: ":memory:".into(),
+            experimental_features: Some("encryption".into()),
+            async_io: true,
+            encryption: Some(turso_core::EncryptionOpts {
+                cipher: "aes256gcm".into(),
+                hexkey: "ab".repeat(32),
+            }),
+            vfs: Default::default(),
+            io: Some(io.clone()),
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        };
+        let sync_config = TursoDatabaseSyncConfig {
+            cipher: None,
+            remote_url: None,
+            path: ":memory:".into(),
+            client_name: "test".into(),
+            long_poll_timeout_ms: None,
+            bootstrap_if_empty: false,
+            reserved_bytes: None,
+            partial_sync_opts: None,
+            remote_encryption_key: None,
+            push_operations_threshold: None,
+            pull_bytes_threshold: None,
+            logical_mvcc_pull: None,
+        };
+        let mut legacy_database = config.clone();
+        legacy_database.encryption = None;
+        let mut legacy_sync = sync_config.clone();
+        legacy_sync.cipher = Some("chacha20poly1305".into());
+        let legacy =
+            TursoDatabaseSync::<Vec<u8>>::new(legacy_database, legacy_sync.clone()).unwrap();
+        assert!(legacy.sync_engine_opts.encryption.is_none());
+        assert!(TursoDatabaseSync::<Vec<u8>>::new(config.clone(), legacy_sync).is_err());
+        let mut mismatched = sync_config.clone();
+        mismatched.cipher = Some("aes128gcm".into());
+        assert!(TursoDatabaseSync::<Vec<u8>>::new(config.clone(), mismatched).is_err());
+        let mut disabled = config.clone();
+        disabled.experimental_features = None;
+        assert!(TursoDatabaseSync::<Vec<u8>>::new(disabled, sync_config.clone()).is_err());
+        let sync = TursoDatabaseSync::<Vec<u8>>::new(config, sync_config).expect("sync config");
+        let encryption = sync
+            .sync_engine_opts
+            .encryption
+            .as_ref()
+            .expect("engine crypto");
+        assert_eq!(encryption.cipher(), turso_core::CipherMode::Aes256Gcm);
+        assert_eq!(
+            encryption.local_key().expect("local key").as_slice(),
+            &[0xab; 32]
+        );
+        assert!(Arc::ptr_eq(sync.db_io.as_ref().expect("IO"), &io));
+        assert!(!format!("{:?}", sync.sync_engine_opts).contains(&"ab".repeat(32)));
+        assert!(
+            sync.create().resume().is_err(),
+            "encrypted creation without cloud credentials and bootstrap must fail"
+        );
+        assert!(io
+            .open_file(":memory:-info", OpenFlags::None, false)
+            .is_err());
+    }
+
+    #[test]
     fn create_writes_sync_metadata_through_the_io_from_the_database_config() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let sync = TursoDatabaseSync::<Vec<u8>>::new(
@@ -625,6 +747,7 @@ mod tests {
                 open_flags: OpenFlags::default(),
             },
             TursoDatabaseSyncConfig {
+                cipher: None,
                 remote_url: None,
                 path: ":memory:".to_string(),
                 client_name: "test".to_string(),
