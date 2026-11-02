@@ -738,7 +738,20 @@ fn translate_cast_expr(
     let ast::Expr::Cast { expr, type_name } = expr else {
         unreachable!("translate_cast_expr expects Expr::Cast");
     };
-    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+    // A CAST to a custom type gives the value in the form a column of the type
+    // has in the same expression, so that operators, functions and comparisons
+    // see both alike. A query reads columns decoded, so `CAST(42 AS cents)` is
+    // 42 and `-CAST(1.5 AS numeric(10,2))` runs numeric's `-` on 1.50. A CHECK
+    // constraint and an ORDER BY key see columns as stored, and there the CAST
+    // stays stored too. That choice is about the CAST's result only: its
+    // operand is an ordinary value, read decoded.
+    let result_is_stored = program.flags.suppress_custom_type_decode();
+    program.flags.set_suppress_custom_type_decode(false);
+    let translated = translate_expr(program, referenced_tables, expr, target_register, resolver);
+    program
+        .flags
+        .set_suppress_custom_type_decode(result_is_stored);
+    translated?;
 
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
 
@@ -758,7 +771,7 @@ fn translate_cast_expr(
             super::arrays::emit_array_encode(program, target_register, &column, resolver, "")?;
             return Ok(target_register);
         }
-        if let Some(resolved) = resolver.schema().resolve_type_unchecked(cast_type_name)? {
+        if let Some(chain) = custom_type_cast_chain(tn, resolver.schema())? {
             // Build ty_params from AST TypeSize so parametric types
             // (e.g. numeric(10,2)) get their parameters passed through.
             let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
@@ -769,46 +782,25 @@ fn translate_cast_expr(
                 None => Vec::new(),
             };
 
-            // Domains: store the value as a column of the domain does, which
-            // runs the ENCODE and COERCE of the types under it, then check
-            // the domain's constraints on the stored value.
-            if resolved.is_domain() {
-                // A cast to a domain over boolean gives true for every
-                // nonzero integer in dialects whose integer-to-boolean cast
-                // does, before boolean's ENCODE sees the value.
-                if resolved
-                    .chain
+            // A cast to a domain over boolean gives true for every nonzero
+            // integer in dialects whose integer-to-boolean cast does, before
+            // boolean's ENCODE sees the value.
+            let is_domain = chain[0].is_domain;
+            if is_domain
+                && chain
                     .iter()
                     .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
-                {
-                    emit_integer_to_boolean_cast(program, target_register);
-                }
-                emit_store_value(
-                    program,
-                    &resolved.chain,
-                    target_register,
-                    &ty_params,
-                    resolver,
-                )?;
-
-                // Validate domain constraints on the encoded value
-                emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
-                emit_cast_result_form(program, &resolved.chain, target_register, resolver)?;
-                return Ok(target_register);
+            {
+                emit_integer_to_boolean_cast(program, target_register);
             }
-
-            // CAST stores the value as a column of the type would, so with
-            // type arguments it applies their limits too: CAST('3.504' AS
-            // numeric(10,2)) is 3.50. A type that takes arguments, named
-            // without all of them, is SQLite's CAST: CAST(x AS NUMERIC) is a
-            // common SQLite idiom.
-            let user_param_count = resolved.leaf().user_params().count();
-            if user_param_count == 0 || ty_params.len() == user_param_count {
-                let chain = &resolved.chain[..1];
-                emit_store_value(program, chain, target_register, &ty_params, resolver)?;
-                emit_cast_result_form(program, chain, target_register, resolver)?;
-                return Ok(target_register);
+            emit_store_value(program, &chain, target_register, &ty_params, resolver)?;
+            if is_domain {
+                emit_domain_cast_constraints(program, &chain, target_register, resolver)?;
             }
+            if !result_is_stored {
+                emit_decode(program, &chain, target_register, resolver)?;
+            }
+            return Ok(target_register);
         }
     }
 
@@ -823,22 +815,39 @@ fn translate_cast_expr(
     Ok(target_register)
 }
 
-/// Gives the stored value of a CAST in `reg` the form a column of the type has
-/// in the same expression, so that operators, functions and comparisons see
-/// both alike. A query reads columns decoded, so `CAST(42 AS cents)` is 42 and
-/// `-CAST(1.5 AS numeric(10,2))` runs numeric's `-` on 1.50. A CHECK
-/// constraint sees columns as stored, so there the CAST stays stored too:
-/// `CHECK (price >= CAST(1 AS cents))` compares the stored price with 100.
-fn emit_cast_result_form(
-    program: &mut ProgramBuilder,
-    chain: &[Arc<TypeDef>],
-    reg: usize,
-    resolver: &Resolver,
-) -> Result<()> {
-    if program.flags.suppress_custom_type_decode() {
-        return Ok(());
+/// The custom types a CAST to `type_name` stores its value as, the way a
+/// column of the type stores it, or None when the CAST is SQLite's CAST. A
+/// domain stores through every type under it, then checks its constraints on
+/// the stored value. A CAST with type arguments applies their limits too:
+/// CAST('3.504' AS numeric(10,2)) is 3.50. A type that takes arguments, named
+/// without all of them, is SQLite's CAST: CAST(x AS NUMERIC) is a common
+/// SQLite idiom. Array types are not covered here.
+pub(crate) fn custom_type_cast_chain(
+    type_name: &ast::Type,
+    schema: &crate::schema::Schema,
+) -> Result<Option<Vec<Arc<TypeDef>>>> {
+    if type_name.array_dimensions > 0 {
+        return Ok(None);
     }
-    emit_decode(program, chain, reg, resolver)
+    let Some(mut resolved) =
+        schema.resolve_type_unchecked(&crate::util::dequote(&type_name.name))?
+    else {
+        return Ok(None);
+    };
+    if resolved.is_domain() {
+        return Ok(Some(resolved.chain));
+    }
+    let type_arg_count = match &type_name.size {
+        Some(ast::TypeSize::MaxSize(_)) => 1,
+        Some(ast::TypeSize::TypeSize(..)) => 2,
+        None => 0,
+    };
+    let user_param_count = resolved.leaf().user_params().count();
+    if user_param_count != 0 && type_arg_count != user_param_count {
+        return Ok(None);
+    }
+    resolved.chain.truncate(1);
+    Ok(Some(resolved.chain))
 }
 
 /// True when a cast to `type_def` turns every nonzero integer into true.

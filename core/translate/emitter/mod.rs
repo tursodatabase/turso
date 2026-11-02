@@ -10,8 +10,9 @@ use super::{
     },
     expr::{
         bind_and_rewrite_expr, emit_constraint_values_decode, emit_stored_column,
-        emit_table_column, emit_user_facing_column_value, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
+        emit_table_column, emit_user_facing_column_value, translate_check_expr,
+        translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
+        WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -2280,22 +2281,13 @@ fn emit_check_constraint_bytecode(
             )?;
         }
 
-        // A CHECK constraint sees the columns as stored, so a CAST to a custom
-        // type in it gives the stored value too.
-        let decode_was_suppressed = program.flags.suppress_custom_type_decode();
-        program.flags.set_suppress_custom_type_decode(true);
-        let translated = translate_expr_no_constant_opt(
+        translate_check_expr(
             program,
             referenced_tables,
             &rewritten_expr,
             expr_result_reg,
             resolver,
-            NoConstantOptReason::RegisterReuse,
-        );
-        program
-            .flags
-            .set_suppress_custom_type_decode(decode_was_suppressed);
-        translated?;
+        )?;
 
         // CHECK constraint passes if the result is NULL or non-zero (truthy)
         let constraint_passed_label = program.allocate_label();

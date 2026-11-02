@@ -129,7 +129,7 @@ pub(crate) fn emit_user_facing_column_value(
 /// Emits the DECODE of each of `chain`'s types on the stored value in `reg`,
 /// which turns it into the value a column of the type reads back. NULL is
 /// left as it is.
-pub(super) fn emit_decode(
+pub(crate) fn emit_decode(
     program: &mut ProgramBuilder,
     chain: &[crate::sync::Arc<TypeDef>],
     reg: usize,
@@ -193,7 +193,7 @@ pub(super) fn emit_domain_cast_constraints(
                 .insert("value".to_string(), reg);
 
             let expr_result_reg = program.alloc_register();
-            translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
+            translate_check_expr(program, None, &dc.check, expr_result_reg, resolver)?;
 
             program.id_register_overrides.remove("value");
 
@@ -226,6 +226,33 @@ pub(super) fn emit_domain_cast_constraints(
         }
     }
     Ok(())
+}
+
+/// Translates the expression of a CHECK constraint, a table's or a domain's.
+/// A CHECK sees the values it checks as stored, so a CAST to a custom type in
+/// it gives the stored value too: `CHECK (price >= CAST(1 AS cents))` compares
+/// the stored price with 100.
+pub(crate) fn translate_check_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let decode_was_suppressed = program.flags.suppress_custom_type_decode();
+    program.flags.set_suppress_custom_type_decode(true);
+    let translated = translate_expr_no_constant_opt(
+        program,
+        referenced_tables,
+        expr,
+        target_register,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    );
+    program
+        .flags
+        .set_suppress_custom_type_decode(decode_was_suppressed);
+    translated
 }
 
 /// Emits what storing the value in `reg` as a value of `chain`'s types runs:

@@ -151,6 +151,30 @@ expect error {
     CHECK constraint failed
 }
 
+# A domain's CHECK sees the value as stored, on a CAST to the domain as on an
+# INSERT into a column of it, so CAST(100 AS cents) in it is the stored 10000.
+@requires strict "uses STRICT tables"
+test cast-to-domain-check-with-cast-is-stored {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN dc AS cents CHECK (value <= CAST(100 AS cents));
+    CREATE TABLE t(p dc) STRICT;
+    INSERT INTO t VALUES (50);
+    SELECT CAST(50 AS dc), p FROM t;
+}
+expect {
+    50|50
+}
+
+@requires strict "uses STRICT tables"
+test cast-to-domain-check-with-cast-is-stored-error {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN dc AS cents CHECK (value <= CAST(100 AS cents));
+    SELECT CAST(101 AS dc);
+}
+expect error {
+    violates check constraint
+}
+
 @requires strict "uses STRICT tables"
 test cast-to-varchar {
     SELECT CAST('hello' AS varchar(3));
@@ -952,6 +976,25 @@ expect {
     banana
     apple
     cherry
+}
+
+# A CAST to test_reverse is a value of the type, so ORDER BY on it sorts by the
+# stored value like ORDER BY on a column of the type, and still reads decoded.
+@requires strict "uses STRICT tables"
+test order-by-cast-to-custom-type-sorts-like-column {
+    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TABLE t1(val test_reverse, plain text) STRICT;
+    INSERT INTO t1 VALUES ('apple', 'apple');
+    INSERT INTO t1 VALUES ('banana', 'banana');
+    INSERT INTO t1 VALUES ('cherry', 'cherry');
+    SELECT group_concat(plain) FROM (SELECT plain FROM t1 ORDER BY CAST(plain AS test_reverse));
+    SELECT group_concat(c) FROM (SELECT CAST(plain AS test_reverse) AS c FROM t1 ORDER BY CAST(plain AS test_reverse));
+    SELECT group_concat(c) FROM (SELECT CAST(val AS test_reverse) AS c FROM t1 ORDER BY CAST(val AS test_reverse));
+}
+expect {
+    banana,apple,cherry
+    banana,apple,cherry
+    banana,apple,cherry
 }
 
 @requires strict "uses STRICT tables"
