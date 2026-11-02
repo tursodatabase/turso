@@ -1,4 +1,6 @@
-import { statSync, unlinkSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readdirSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test as baseTest, expect } from 'vitest'
 import { connect, Database, DatabaseRowMutation, DatabaseRowTransformResult, retryFetch } from './promise.js'
 import { TursoServer } from './turso-server.js'
@@ -1361,3 +1363,48 @@ test('push hands the request body to fetch as bytes without inflating memory', a
     expect(rssGrowth).toBeLessThan(6 * bodyBytes);
     console.log(`push body=${(bodyBytes / 1024 / 1024).toFixed(1)}MiB rssGrowth=${(rssGrowth / 1024 / 1024).toFixed(0)}MiB (${(rssGrowth / bodyBytes).toFixed(1)}x)`);
 }, 120000)
+
+test('restoring local files from backup rejects push instead of silently dropping writes', async ({ server }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'turso-sync-backup-'));
+    const localPath = join(dir, 'device.db');
+    const checkPath = join(dir, 'check.db');
+    const deviceFiles = () => readdirSync(dir).filter(f => f.startsWith('device.db'));
+
+    try {
+        let db = await connect({ path: localPath, url: server.dbUrl() });
+        await db.exec('CREATE TABLE IF NOT EXISTS t (id TEXT PRIMARY KEY)');
+        await (await db.prepare('INSERT INTO t VALUES (?)')).run('one');
+        await db.push();
+        await db.close();
+
+        const savedDir = mkdtempSync(join(dir, 'saved-'));
+        for (const f of deviceFiles()) {
+            copyFileSync(join(dir, f), join(savedDir, f));
+        }
+
+        db = await connect({ path: localPath, url: server.dbUrl() });
+        await (await db.prepare('INSERT INTO t VALUES (?)')).run('two');
+        await db.push();
+        await db.close();
+
+        for (const f of deviceFiles()) {
+            unlinkSync(join(dir, f));
+        }
+        for (const f of readdirSync(savedDir)) {
+            copyFileSync(join(savedDir, f), join(dir, f));
+        }
+
+        db = await connect({ path: localPath, url: server.dbUrl() });
+        await (await db.prepare('INSERT INTO t VALUES (?)')).run('three');
+        await expect(db.push()).rejects.toThrow(/protocol error/);
+        await db.close();
+
+        const check = await connect({ path: checkPath, url: server.dbUrl() });
+        await check.pull();
+        const rows = (await (await check.prepare('SELECT id FROM t ORDER BY id')).all()).map((r: any) => r.id);
+        expect(rows).toEqual(['one', 'two']);
+        await check.close();
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+})
