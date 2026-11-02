@@ -3975,6 +3975,150 @@ expect error {
     subqueries prohibited in generated columns
 }
 
+# --- RAISE prohibited outside triggers ---
+
+test gencol_error_raise_ignore {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_abort {
+    CREATE TABLE t1(a, b AS (RAISE(ABORT, 'x')));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_nested {
+    CREATE TABLE t1(a, b AS (coalesce(a, RAISE(FAIL, 'x'))) VIRTUAL);
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+# SQLite's parser replaces `X AND Y` with 0 when X or Y is the integer 0 and
+# neither calls a function, so a RAISE inside it is never compiled.
+test gencol_raise_in_and_with_zero_is_accepted {
+    CREATE TABLE t1(a, b AS (0 AND RAISE(IGNORE)));
+    CREATE TABLE t2(a, b AS (RAISE(ABORT, 'x') AND (a AND 0)));
+    CREATE TABLE t3(a, b AS (a + (a IN () AND RAISE(IGNORE))));
+    CREATE TABLE t4(a, b AS (NOT (0x0 AND (RAISE(FAIL, 'x')))));
+    CREATE TABLE t5(a, b AS (abs(a) AND (0 AND RAISE(IGNORE))));
+    SELECT name FROM sqlite_schema ORDER BY name;
+}
+expect {
+    t1
+    t2
+    t3
+    t4
+    t5
+}
+
+test gencol_error_raise_in_and_with_function_call {
+    CREATE TABLE t1(a, b AS (0 AND coalesce(a, RAISE(IGNORE))));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_in_and_with_like {
+    CREATE TABLE t1(a, b AS (0 AND a LIKE 'x' AND RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_in_and_with_false {
+    CREATE TABLE t1(a, b AS (false AND RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_in_and_with_negative_zero {
+    CREATE TABLE t1(a, b AS (-0 AND RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+test gencol_error_raise_in_or_with_one {
+    CREATE TABLE t1(a, b AS (1 OR RAISE(IGNORE)));
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
+# CREATE TABLE IF NOT EXISTS on an existing name does nothing, so the
+# RAISE is never compiled.
+test gencol_raise_if_not_exists_table {
+    CREATE TABLE t1(a);
+    CREATE TABLE IF NOT EXISTS t1(a, b AS (RAISE(IGNORE)));
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    t1
+}
+
+test gencol_raise_if_not_exists_view {
+    CREATE VIEW v1 AS SELECT 1;
+    CREATE TABLE IF NOT EXISTS v1(a, b AS (RAISE(IGNORE)));
+    SELECT name FROM sqlite_schema;
+}
+expect {
+    v1
+}
+
+# SQLite finds the RAISE after every other column check, so those errors
+# are reported first.
+test gencol_raise_after_unknown_column {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), c AS (zzz));
+}
+expect error {
+    no such column: zzz
+}
+
+test gencol_raise_after_aggregate {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), c AS (max(a, 1) + count(*)));
+}
+expect error {
+    (aggregate functions prohibited|misuse of aggregate function)
+}
+
+test gencol_raise_after_generated_column_loop {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE) + c), c AS (b));
+}
+expect error {
+    (circular dependency|generated column loop)
+}
+
+test gencol_raise_after_generated_primary_key {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), PRIMARY KEY(b));
+}
+expect error {
+    generated column.*cannot be part of the PRIMARY KEY
+}
+
+test gencol_raise_after_unknown_primary_key_column {
+    CREATE TABLE t1(a, b AS (RAISE(IGNORE)), PRIMARY KEY(zz));
+}
+expect error {
+    (no such column: zz|Column zz not found)
+}
+
+# SQLite checks RAISE only at CREATE TABLE: ADD COLUMN stores the column and
+# the error is reported when a statement reads it.
+test gencol_alter_add_raise_fails_on_read {
+    CREATE TABLE t1(a);
+    ALTER TABLE t1 ADD COLUMN b AS (RAISE(IGNORE));
+    SELECT a, b FROM t1;
+}
+expect error {
+    RAISE\(\) may only be used within a trigger-program
+}
+
 # --- Aggregates prohibited ---
 
 test gencol_error_aggregate {
