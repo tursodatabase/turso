@@ -622,6 +622,8 @@ public class TursoConnection : DbConnection
             BootstrapIfEmpty = _connectionOptions.BootstrapIfEmpty,
             PartialSync = partialSync,
             RemoteEncryption = _connectionOptions.GetRemoteEncryption(),
+            LocalEncryptionKey = string.IsNullOrWhiteSpace(_connectionOptions.LocalEncryptionKey)
+                ? null : _connectionOptions.LocalEncryptionKey,
             PushOperationsThreshold = _connectionOptions.PushOperationsThreshold == 0
                 ? null
                 : _connectionOptions.PushOperationsThreshold,
