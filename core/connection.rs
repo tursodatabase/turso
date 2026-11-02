@@ -4,6 +4,7 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
+use crate::security::acl_catalog::{ACL_TABLE_NAME, SELECT_ACL_SQL};
 use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
@@ -292,6 +293,12 @@ enum ReparsePhase {
     BuildIndexes { type_sqls: Vec<String> },
     /// Loading roles from the roles table into the role catalog.
     LoadRoles {
+        stmt: Box<Statement>,
+        rows: Vec<Vec<Value>>,
+    },
+    /// Loading owners and access control lists from the access control
+    /// table into the ACL catalog.
+    LoadAcls {
         stmt: Box<Statement>,
         rows: Vec<Vec<Value>>,
     },
@@ -1795,6 +1802,18 @@ impl Connection {
                         Ok(())
                     }));
                     inner.fresh.roles = Arc::new(RoleCatalog::new(rows)?);
+                    inner.phase = self.load_acls_phase(&inner.fresh)?;
+                }
+                ReparsePhase::LoadAcls { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        turso_assert!(
+                            !matches!(self.get_tx_state(), TransactionState::None),
+                            "access control lists must be read in a transaction"
+                        );
+                        rows.push(row.get_values().cloned().collect());
+                        Ok(())
+                    }));
+                    Arc::make_mut(&mut inner.fresh.acls).load_stored(rows)?;
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1824,36 +1843,55 @@ impl Connection {
     }
 
     /// Returns the phase that loads the roles table into `fresh`, or the
-    /// stats refresh phase if the dialect has no roles or the database has no
-    /// roles table. The fresh
-    /// schema is installed first, because the current schema may not contain
-    /// the roles table yet.
+    /// next phase if the dialect has no roles or the database has no roles
+    /// table.
     fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
-        if !self.db.dialect().supports_roles()
-            || !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
-        {
-            return Ok(ReparsePhase::RefreshStats {
+        match self.prepare_security_table_read(fresh, ROLES_TABLE_NAME, SELECT_ROLES_SQL)? {
+            Some(stmt) => Ok(ReparsePhase::LoadRoles {
+                stmt: Box::new(stmt),
+                rows: Vec::new(),
+            }),
+            None => self.load_acls_phase(fresh),
+        }
+    }
+
+    /// Returns the phase that loads the access control table into `fresh`,
+    /// or the stats refresh phase if the dialect has no roles or the database
+    /// has no access control table.
+    fn load_acls_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        match self.prepare_security_table_read(fresh, ACL_TABLE_NAME, SELECT_ACL_SQL)? {
+            Some(stmt) => Ok(ReparsePhase::LoadAcls {
+                stmt: Box::new(stmt),
+                rows: Vec::new(),
+            }),
+            None => Ok(ReparsePhase::RefreshStats {
                 stats: Default::default(),
-            });
+            }),
+        }
+    }
+
+    /// Prepares `sql`, which reads `table` of the fresh schema, or returns
+    /// `None` if the dialect has no roles or the table does not exist. The
+    /// fresh schema is installed first, because the current schema may not
+    /// contain the table yet. The table belongs to the engine, so its name is
+    /// looked up in every database, whatever the search path says, and the
+    /// read is a top-level statement, so it runs in its own read transaction
+    /// when the schema is read outside a transaction.
+    fn prepare_security_table_read(
+        self: &Arc<Connection>,
+        fresh: &Schema,
+        table: &str,
+        sql: &str,
+    ) -> Result<Option<Statement>> {
+        if !self.db.dialect().supports_roles() || !fresh.has_table(NamespaceId::ROOT, table) {
+            return Ok(None);
         }
         self.with_schema_mut(|schema| {
             *schema = fresh.try_clone()?;
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
-        let stmt = self.prepare_roles_read()?;
-        Ok(ReparsePhase::LoadRoles {
-            stmt: Box::new(stmt),
-            rows: Vec::new(),
-        })
-    }
-
-    /// Prepares the read of the roles table, for opening the database and
-    /// for reading the schema again. The table belongs to the engine, so its
-    /// name is looked up in every database, whatever the search path says.
-    /// The read is a top-level statement, so it runs in its own read
-    /// transaction when the schema is read outside a transaction.
-    pub(crate) fn prepare_roles_read(self: &Arc<Connection>) -> Result<Statement> {
-        self.prepare_with_origin(SELECT_ROLES_SQL, StatementOrigin::EngineMetadataRead)
+        let stmt = self.prepare_with_origin(sql, StatementOrigin::EngineMetadataRead)?;
+        Ok(Some(stmt))
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
