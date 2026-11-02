@@ -2913,19 +2913,28 @@ pub unsafe extern "C" fn sqlite3_result_text(
     context: *mut ffi::c_void,
     text: *const ffi::c_char,
     len: ffi::c_int,
-    _destroy: *mut ffi::c_void,
+    destructor: Option<extern "C" fn(*mut ffi::c_void)>,
 ) {
-    if context.is_null() || text.is_null() {
+    if text.is_null() {
+        sqlite3_result_null(context);
         return;
     }
-    let ctx = &mut *(context as *mut SqliteContext);
-    let s = if len < 0 {
-        CStr::from_ptr(text).to_string_lossy().into_owned()
-    } else {
-        let bytes = std::slice::from_raw_parts(text.cast::<u8>(), len as usize);
-        String::from_utf8_lossy(bytes).into_owned()
-    };
-    ctx.result = ExtValue::from_text(s);
+    if !context.is_null() {
+        let ctx = &mut *(context as *mut SqliteContext);
+        let s = if len < 0 {
+            CStr::from_ptr(text).to_string_lossy().into_owned()
+        } else {
+            let bytes = std::slice::from_raw_parts(text.cast::<u8>(), len as usize);
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        ctx.result = ExtValue::from_text(s);
+    }
+    // Turso never keeps the caller's buffer, so release it now unless it is SQLITE_TRANSIENT (-1).
+    if let Some(destructor_fn) = destructor {
+        if destructor_fn as usize != usize::MAX {
+            destructor_fn(text as *mut _);
+        }
+    }
 }
 
 #[no_mangle]
@@ -2933,14 +2942,23 @@ pub unsafe extern "C" fn sqlite3_result_blob(
     context: *mut ffi::c_void,
     blob: *const ffi::c_void,
     len: ffi::c_int,
-    _destroy: *mut ffi::c_void,
+    destructor: Option<extern "C" fn(*mut ffi::c_void)>,
 ) {
-    if context.is_null() || blob.is_null() || len < 0 {
+    if blob.is_null() {
+        sqlite3_result_null(context);
         return;
     }
-    let ctx = &mut *(context as *mut SqliteContext);
-    let bytes = std::slice::from_raw_parts(blob.cast::<u8>(), len as usize).to_vec();
-    ctx.result = ExtValue::from_blob(bytes);
+    if !context.is_null() && len >= 0 {
+        let ctx = &mut *(context as *mut SqliteContext);
+        let bytes = std::slice::from_raw_parts(blob.cast::<u8>(), len as usize).to_vec();
+        ctx.result = ExtValue::from_blob(bytes);
+    }
+    // Turso never keeps the caller's buffer, so release it now unless it is SQLITE_TRANSIENT (-1).
+    if let Some(destructor_fn) = destructor {
+        if destructor_fn as usize != usize::MAX {
+            destructor_fn(blob as *mut _);
+        }
+    }
 }
 
 #[no_mangle]
