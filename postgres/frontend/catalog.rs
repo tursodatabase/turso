@@ -61,8 +61,8 @@ impl Dialect for PostgresDialect {
             None => sql.len(),
         };
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        match translator.translate(&parse_result) {
-            Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
+        match translator.translate_with_prereqs(&parse_result) {
+            Ok(translated) => Ok((Some(translated.cmd), consumed)),
             Err(_) => turso_core::dialect::sqlite::parse(sql),
         }
     }
@@ -4012,6 +4012,26 @@ mod tests {
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.set_search_path(Some(vec!["public".to_string()]));
         conn
+    }
+
+    #[test]
+    fn dialect_parse_preserves_explain_command() {
+        use turso_parser::ast::{Cmd, EqpFormat};
+
+        for sql in ["EXPLAIN SELECT 7", "EXPLAIN SELECT 7::text"] {
+            let (cmd, consumed) = PostgresDialect.parse(sql).unwrap();
+            assert_eq!(consumed, sql.len());
+            assert!(
+                matches!(
+                    cmd,
+                    Some(Cmd::ExplainQueryPlan {
+                        format: EqpFormat::Text,
+                        ..
+                    })
+                ),
+                "{cmd:?}"
+            );
+        }
     }
 
     #[test]

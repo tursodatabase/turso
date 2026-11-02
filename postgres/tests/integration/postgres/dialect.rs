@@ -4314,6 +4314,52 @@ fn test_postgres_statement_reprepare_uses_pg_dialect(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_explain_reprepare_preserves_plan_and_refreshes_schema(db: TempDatabase) {
+    use turso_core::StatementStatusCounter;
+
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE explained (x int)").unwrap();
+    for sql in [
+        "EXPLAIN SELECT x FROM explained WHERE x = $1",
+        "EXPLAIN SELECT x::text FROM explained WHERE x = $1",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.bind_at(1.try_into().unwrap(), Value::from_i64(7))
+            .unwrap();
+        let columns = stmt.num_columns();
+        let other = db.connect_postgres();
+        other
+            .execute("CREATE INDEX explained_x ON explained (x)")
+            .unwrap();
+
+        let rows = stmt.run_collect_rows().unwrap();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().any(|row| row
+                .iter()
+                .any(|value| value.to_string().contains("explained_x"))),
+            "{rows:?}"
+        );
+        assert_eq!(stmt.num_columns(), columns);
+        assert!(stmt.stmt_status(StatementStatusCounter::Reprepare) > 0);
+
+        stmt.reset().unwrap();
+        stmt.reset_stmt_status(StatementStatusCounter::Reprepare);
+        other.execute("DROP INDEX explained_x").unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|row| row
+                .iter()
+                .all(|value| !value.to_string().contains("explained_x"))),
+            "{rows:?}"
+        );
+        assert_eq!(stmt.num_columns(), columns);
+        assert!(stmt.stmt_status(StatementStatusCounter::Reprepare) > 0);
+    }
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_eq_any_bound_array_param(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE t (id int)").unwrap();
