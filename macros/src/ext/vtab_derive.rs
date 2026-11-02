@@ -313,6 +313,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
                 let module = ::turso_ext::VTabModuleImpl {
                     name: name_c,
                     readonly: <#struct_name as ::turso_ext::VTabModule>::READONLY,
+                    readable_without_privileges: <#struct_name as ::turso_ext::VTabModule>::READABLE_WITHOUT_PRIVILEGES,
                     create: Self::#create_fn_name,
                     open: Self::#open_fn_name,
                     close: Self::#close_fn_name,

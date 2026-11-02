@@ -313,12 +313,12 @@ separately:
   statement opens is recorded. An internal or native virtual table is denied
   unless it declares that a role without privileges may read it, which the
   catalogs and `json_each()` do and which anything that reads pages or records
-  directly, such as `sqlite_dbpage` and `btree_dump()`, does not. A
-  table-valued function of a C extension, such as `generate_series()`, is
-  readable by every role, and a virtual table of a C extension is not, so an
-  extension that the host program loads must not expose stored data or the
-  process through a table-valued function. `pragma_*()` functions are denied
-  like `PRAGMA`. Writes to a virtual table are always denied.
+  directly, such as `sqlite_dbpage` and `btree_dump()`, does not. A table
+  or table-valued function of a C extension declares the same thing with
+  `READABLE_WITHOUT_PRIVILEGES`, which `generate_series()` and
+  `completion()` do, so an extension written before roles existed is denied
+  to every role but the superuser. `pragma_*()` functions are denied like
+  `PRAGMA`. Writes to a virtual table are always denied.
 - **Functions** that return stored state without reading storage, such as
   `currval()` and `load_extension()`, check the role when they run, because
   their argument may be a parameter that is not known when the statement is
@@ -400,8 +400,7 @@ In the order the pieces depend on each other:
   of denying every access, and `CREATE` on the schema decides who may create
   objects. Before any privilege can be granted, the data check must also scan
   the subprograms of triggers and foreign-key actions, which it does not do
-  today, and table-valued functions of C extensions must declare whether a
-  role without privileges may read them, as native ones do.
+  today.
 - **Schema privileges.** Record the owner of a schema, and the `USAGE` and
   `CREATE` privileges on it. `CREATE SCHEMA` and `DROP SCHEMA` then stop being
   superuser-only, and resolving a name in a schema needs `USAGE` on it, as in

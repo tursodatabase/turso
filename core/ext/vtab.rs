@@ -78,7 +78,7 @@ impl ExtensionTable {
 
     pub(crate) fn readable_without_privileges(&self) -> bool {
         match self {
-            Self::C(_) => false,
+            Self::C(table) => table.readable_without_privileges(),
             Self::Native(table) => table.readable_without_privileges(),
         }
     }

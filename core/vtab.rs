@@ -384,6 +384,9 @@ impl ExtVirtualTable {
     pub(crate) fn readonly(&self) -> bool {
         self.implementation.readonly
     }
+    pub(crate) fn readable_without_privileges(&self) -> bool {
+        self.implementation.readable_without_privileges
+    }
     pub(crate) fn best_index(
         &self,
         constraints: &[ConstraintInfo],

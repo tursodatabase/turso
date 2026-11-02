@@ -21,7 +21,6 @@ use crate::namespace::NamespaceId;
 use turso_ext::VTabKind;
 use turso_parser::ast;
 
-use crate::ext::ExtensionTable;
 use crate::schema::{Schema, SEQ_BACKING_TABLE_PREFIX};
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::{
@@ -235,9 +234,6 @@ pub fn check_storage_access(program: &ProgramBuilder, resolver: &Resolver) -> Re
     for virtual_table in &program.opened_virtual_tables {
         let readable = match &virtual_table.vtab_type {
             VirtualTableType::Internal(table) => table.read().readable_without_privileges(),
-            VirtualTableType::External(ExtensionTable::C(_)) => {
-                virtual_table.kind == VTabKind::TableValuedFunction
-            }
             VirtualTableType::External(table) => table.readable_without_privileges(),
             VirtualTableType::Pragma(_) => false,
         };
@@ -465,7 +461,10 @@ mod tests {
 
     use turso_parser::ast;
 
-    use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
+    use turso_ext::{
+        ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabCursor, VTabKind, VTabModule,
+        VTabModuleDerive, VTable,
+    };
 
     use crate::native_ext::{TableUpdate, VirtualTable, VirtualTableCursor, VirtualTableModule};
     use crate::security::permission::{Action, Object, PermissionDenied};
@@ -568,6 +567,36 @@ mod tests {
             PermissionDenied::privilege(
                 Action::Execute,
                 Object::Function("closed_rows".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn role_without_privileges_may_use_only_extension_table_valued_functions_that_allow_it() {
+        // A table-valued function registered through a connection is added
+        // to the database's schema, which the next connection starts from.
+        let registering_conn = connect_with_roles();
+        registering_conn.register_static_extension(|api| unsafe {
+            OpenExtensionRows::register_OpenExtensionRows(api);
+            ClosedExtensionRows::register_ClosedExtensionRows(api);
+        });
+        let conn = registering_conn
+            .db
+            .connect(crate::ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
+        become_new_role(&conn, "alice");
+
+        conn.execute("SELECT * FROM open_extension_rows()").unwrap();
+        #[cfg(feature = "series")]
+        conn.execute("SELECT * FROM generate_series(1, 3)").unwrap();
+        let closed = conn
+            .execute("SELECT * FROM closed_extension_rows()")
+            .unwrap_err();
+        assert_eq!(
+            denial(closed),
+            PermissionDenied::privilege(
+                Action::Execute,
+                Object::Function("closed_extension_rows".to_string())
             )
         );
     }
@@ -726,6 +755,81 @@ mod tests {
 
         fn rowid(&self) -> i64 {
             unreachable!("an empty table has no rows")
+        }
+    }
+
+    /// A table-valued function of a C extension that says a role without
+    /// privileges may read it.
+    #[derive(Debug, Default, VTabModuleDerive)]
+    struct OpenExtensionRows;
+
+    impl VTabModule for OpenExtensionRows {
+        type Table = ExtensionTable;
+        const NAME: &'static str = "open_extension_rows";
+        const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
+        const READABLE_WITHOUT_PRIVILEGES: bool = true;
+
+        fn create(_args: &[turso_ext::Value]) -> Result<(String, Self::Table), ResultCode> {
+            Ok(("CREATE TABLE x(value INTEGER)".to_string(), ExtensionTable))
+        }
+    }
+
+    /// A table-valued function of a C extension that keeps the default, like
+    /// one written before roles existed.
+    #[derive(Debug, Default, VTabModuleDerive)]
+    struct ClosedExtensionRows;
+
+    impl VTabModule for ClosedExtensionRows {
+        type Table = ExtensionTable;
+        const NAME: &'static str = "closed_extension_rows";
+        const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
+
+        fn create(_args: &[turso_ext::Value]) -> Result<(String, Self::Table), ResultCode> {
+            Ok(("CREATE TABLE x(value INTEGER)".to_string(), ExtensionTable))
+        }
+    }
+
+    struct ExtensionTable;
+
+    impl VTable for ExtensionTable {
+        type Cursor = ExtensionCursor;
+        type Error = ResultCode;
+
+        fn open(
+            &self,
+            _conn: Option<Arc<turso_ext::Connection>>,
+        ) -> Result<Self::Cursor, Self::Error> {
+            Ok(ExtensionCursor)
+        }
+    }
+
+    struct ExtensionCursor;
+
+    impl VTabCursor for ExtensionCursor {
+        type Error = ResultCode;
+
+        fn filter(
+            &mut self,
+            _args: &[turso_ext::Value],
+            _idx_info: Option<(&str, i32)>,
+        ) -> ResultCode {
+            ResultCode::OK
+        }
+
+        fn rowid(&self) -> i64 {
+            0
+        }
+
+        fn column(&self, _idx: u32) -> Result<turso_ext::Value, Self::Error> {
+            Ok(turso_ext::Value::null())
+        }
+
+        fn eof(&self) -> bool {
+            true
+        }
+
+        fn next(&mut self) -> ResultCode {
+            ResultCode::EOF
         }
     }
 }
