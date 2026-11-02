@@ -11,7 +11,10 @@ use turso_parser::{
 use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
-    schema::{validate_check_expr, validate_default_expr, SQLITE_TABLEID},
+    schema::{
+        validate_check_expr, validate_default_expr, validate_generated_function_calls,
+        SQLITE_TABLEID,
+    },
     update::translate_update_for_schema_change,
 };
 use crate::{
@@ -1186,6 +1189,7 @@ pub fn translate_alter_table(
                 for c in &col_def.constraints {
                     if let ast::ColumnConstraint::Generated { expr, .. } = &c.constraint {
                         crate::schema::validate_generated_expr(expr)?;
+                        validate_generated_function_calls(expr, &resolver.catalog)?;
                     }
                 }
             }
@@ -1946,6 +1950,7 @@ pub fn translate_alter_table(
                 for constraint in &definition.constraints {
                     if let ast::ColumnConstraint::Generated { expr, .. } = &constraint.constraint {
                         crate::schema::validate_generated_expr(expr)?;
+                        validate_generated_function_calls(expr, &resolver.catalog)?;
                     }
                 }
 
