@@ -1824,6 +1824,36 @@ expect {
     after|7|5|1.50
 }
 
+# ALTER TABLE ADD COLUMN checks existing rows against the DEFAULT as a SELECT
+# reads it: a row stored before the column existed reads DEFAULT 5 as 5, for
+# the new column and for one added by an earlier ALTER.
+@requires strict "uses STRICT tables"
+test alter-add-column-check-sees-custom-type-default-as-read {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id integer primary key, w integer) STRICT;
+    INSERT INTO t VALUES (1, 3);
+    ALTER TABLE t ADD COLUMN a cents DEFAULT 5 CHECK (a > 4);
+    ALTER TABLE t ADD COLUMN n numeric(10,2) DEFAULT 1.5 CHECK (n > 1);
+    ALTER TABLE t ADD COLUMN c integer DEFAULT 9 CHECK (c > a);
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|3|5|1.50|9
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-column-check-violation-on-custom-type-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id integer primary key, w integer) STRICT;
+    INSERT INTO t VALUES (1, 3);
+    ALTER TABLE t ADD COLUMN b cents DEFAULT 5 CHECK (b < 4);
+}
+expect error {
+    CHECK constraint failed: b < 4
+}
+
 # AFTER DELETE trigger should see decoded OLD values
 @requires strict "uses STRICT tables"
 @requires trigger "uses triggers"

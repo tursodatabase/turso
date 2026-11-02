@@ -659,7 +659,13 @@ fn emit_column_constraints_validation(
             continue;
         }
 
-        program.emit_column_or_rowid(cursor_id, idx, layout.to_register(base_dest_reg, idx));
+        emit_stored_column(
+            program,
+            cursor_id,
+            idx,
+            layout.to_register(base_dest_reg, idx),
+            resolver,
+        )?;
     }
 
     let dml_ctx = DmlColumnContext::layout(
