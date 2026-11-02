@@ -547,7 +547,7 @@ def test_ipaddr():
 
     turso.run_test_fn(
         "SELECT ipfamily('192.168.1.1');",
-        lambda res: "error: no such function: " in res,
+        lambda res: "no such function: ipfamily" in res,
         "ipfamily function returns null when ext not loaded",
     )
     turso.execute_dot(f".load {ext_path}")
@@ -670,7 +670,7 @@ def test_fuzzy():
     ext_path = f"{DEBUG_DIR}/liblimbo_fuzzy"
     turso.run_test_fn(
         "SELECT fuzzy_leven('awesome', 'aewsme');",
-        lambda res: "error: no such function: " in res,
+        lambda res: "no such function: fuzzy_leven" in res,
         "fuzzy levenshtein function returns null when ext not loaded",
     )
     turso.execute_dot(f".load {ext_path}")

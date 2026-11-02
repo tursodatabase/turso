@@ -2838,7 +2838,7 @@ impl Program {
                 // its own rows, so roll back the whole transaction while
                 // returning the real preparation error to the caller.
                 let rollback_error =
-                    LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
+                    LimboError::Raise(ResolveType::Rollback, prepare_error.clone());
                 if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
                     tracing::error!(
                         "Abort also failed after FAIL index-method preparation: \

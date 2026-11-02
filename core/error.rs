@@ -9,6 +9,10 @@ pub enum ConstraintKind {
     ForeignKey,
     NotNull,
     Check,
+    /// A trigger's RAISE(ABORT | FAIL | ROLLBACK, ...).
+    Trigger,
+    /// A value whose type does not match a STRICT table's column type.
+    Datatype,
     Other,
 }
 
@@ -20,6 +24,8 @@ impl ConstraintKind {
             Self::ForeignKey => SQLITE_CONSTRAINT_FOREIGNKEY,
             Self::NotNull => SQLITE_CONSTRAINT_NOTNULL,
             Self::Check => SQLITE_CONSTRAINT_CHECK,
+            Self::Trigger => SQLITE_CONSTRAINT_TRIGGER,
+            Self::Datatype => SQLITE_CONSTRAINT_DATATYPE,
             Self::Other => SQLITE_CONSTRAINT,
         }
     }
@@ -127,8 +133,10 @@ pub enum LimboError {
     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
     ForeignKeyConstraint(String),
+    /// An error that halts the statement with its own resolve type (RAISE, a
+    /// constraint-level ON CONFLICT clause, or a trigger step's OR clause).
     #[error("{1}")]
-    Raise(turso_parser::ast::ResolveType, String),
+    Raise(turso_parser::ast::ResolveType, Box<LimboError>),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     #[error("Extension error: {0}")]
@@ -268,6 +276,7 @@ impl LimboError {
         let code = match self {
             Self::ConstraintViolation(violation) => violation.kind.sqlite_extended_result_code(),
             Self::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT_FOREIGNKEY,
+            Self::Raise(_, error) => return error.sqlite_extended_result_code(),
             _ => return self.sqlite_result_code(),
         };
         code as i32
@@ -466,6 +475,7 @@ pub const SQLITE_CONSTRAINT_PRIMARYKEY: usize = SQLITE_CONSTRAINT | (6 << 8);
 pub const SQLITE_CONSTRAINT_FOREIGNKEY: usize = SQLITE_CONSTRAINT | (3 << 8);
 pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
 pub const SQLITE_CONSTRAINT_TRIGGER: usize = SQLITE_CONSTRAINT | (7 << 8);
+pub const SQLITE_CONSTRAINT_DATATYPE: usize = SQLITE_CONSTRAINT | (12 << 8);
 pub const SQLITE_FULL: usize = 13; // we want this in autoincrement - incase if user inserts max allowed int
 pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
 

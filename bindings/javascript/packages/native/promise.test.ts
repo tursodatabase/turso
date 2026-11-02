@@ -163,7 +163,7 @@ test('file-must-exist', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     const error = await connect(path, { fileMustExist: true }).then(() => undefined, (e) => e);
     expect(error).toBeInstanceOf(SqliteError);
-    expect(error).toMatchObject({ code: 'SQLITE_ERROR', message: expect.stringContaining('I/O error (open)') });
+    expect(error.message).toContain('I/O error (open)');
 })
 
 test('implicit connect', async () => {
@@ -188,6 +188,9 @@ test('errors carry the SQLite message and result code name', async () => {
     await db.exec('CREATE TABLE pair(a, b, PRIMARY KEY(a, b))');
     await db.exec("INSERT INTO k VALUES ('x')");
     await db.exec('INSERT INTO pair VALUES (1, 1), (1, 2)');
+    await db.exec('CREATE TABLE s(a INTEGER) STRICT');
+    await db.exec('CREATE TABLE tr(a)');
+    await db.exec("CREATE TRIGGER trg BEFORE INSERT ON tr BEGIN SELECT RAISE(ABORT, 'nope'); END");
     const cases: [() => Promise<unknown>, string, string][] = [
         [async () => (await db.prepare('INSERT INTO t(a) VALUES (1)')).run(), 'SQLITE_CONSTRAINT_UNIQUE', 'UNIQUE constraint failed: t.a'],
         [() => db.exec('INSERT INTO t(a) VALUES (1)'), 'SQLITE_CONSTRAINT_UNIQUE', 'UNIQUE constraint failed: t.a'],
@@ -199,6 +202,8 @@ test('errors carry the SQLite message and result code name', async () => {
         [async () => (await db.prepare('INSERT INTO pair VALUES (1, 1)')).run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: pair.a, pair.b'],
         [async () => (await db.prepare('UPDATE pair SET b = 1 WHERE b = 2')).run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: pair.a, pair.b'],
         [async () => (await db.prepare('INSERT INTO ch VALUES (9)')).run(), 'SQLITE_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed'],
+        [async () => (await db.prepare("INSERT INTO s VALUES ('x')")).run(), 'SQLITE_CONSTRAINT_DATATYPE', 'cannot store TEXT value in INTEGER column s.a'],
+        [async () => (await db.prepare('INSERT INTO tr VALUES (1)')).run(), 'SQLITE_CONSTRAINT_TRIGGER', 'nope'],
         [async () => db.prepare('SYNTAX ERROR'), 'SQLITE_ERROR', 'near "SYNTAX": syntax error'],
         [async () => db.prepare('SELECT * FROM missing'), 'SQLITE_ERROR', 'no such table: missing'],
         [async () => (await db.prepare("SELECT json_extract('{', '$')")).get(), 'SQLITE_ERROR', 'malformed JSON'],

@@ -1936,7 +1936,7 @@ mod tests {
     }
 
     fn constraint_error_cases(
-    ) -> [(&'static str, crate::ConstraintKind, &'static str, bool, i32); 12] {
+    ) -> [(&'static str, crate::ConstraintKind, &'static str, bool, i32); 13] {
         [
             (
                 "INSERT INTO parent VALUES (1, 'b', 1)",
@@ -2022,7 +2022,44 @@ mod tests {
                 false,
                 1555,
             ),
+            (
+                "INSERT INTO strict_int VALUES ('x')",
+                crate::ConstraintKind::Datatype,
+                "cannot store TEXT value in INTEGER column strict_int.a",
+                false,
+                3091,
+            ),
         ]
+    }
+
+    /// RAISE and a constraint's own ON CONFLICT clause halt with their own
+    /// resolve type, and the error still reports the halt's result code.
+    #[test]
+    fn errors_with_their_own_resolve_type_keep_the_extended_result_code() {
+        for (sql, message, extended_code) in [
+            ("INSERT INTO raise_abort VALUES (1)", "nope", 1811),
+            (
+                "INSERT INTO unique_rollback VALUES (1)",
+                "UNIQUE constraint failed: unique_rollback.a",
+                2067,
+            ),
+        ] {
+            let conn = constraint_test_connection();
+            let mut stmt = conn.prepare(sql).unwrap();
+            let error = loop {
+                match stmt.step_with_structured_errors() {
+                    Err(error) => break error,
+                    Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. }) => {
+                        stmt.pager.io.step().unwrap();
+                    }
+                    Ok(result) => panic!("expected constraint error, got {result:?}: {sql}"),
+                }
+            };
+            assert!(matches!(error, LimboError::Raise(..)), "{sql}: {error:?}");
+            assert_eq!(error.to_string(), message, "{sql}");
+            assert_eq!(error.sqlite_result_code(), 19, "{sql}");
+            assert_eq!(error.sqlite_extended_result_code(), extended_code, "{sql}");
+        }
     }
 
     fn constraint_test_connection() -> Arc<crate::Connection> {
@@ -2040,6 +2077,11 @@ mod tests {
             "INSERT INTO text_key VALUES ('k')",
             "CREATE TABLE pair_key (a, b, PRIMARY KEY (a, b))",
             "INSERT INTO pair_key VALUES (1, 1), (1, 2)",
+            "CREATE TABLE strict_int (a INTEGER) STRICT",
+            "CREATE TABLE raise_abort (a)",
+            "CREATE TRIGGER raise_abort_trigger BEFORE INSERT ON raise_abort BEGIN SELECT RAISE(ABORT, 'nope'); END",
+            "CREATE TABLE unique_rollback (a UNIQUE ON CONFLICT ROLLBACK)",
+            "INSERT INTO unique_rollback VALUES (1)",
         ] {
             conn.execute(sql).unwrap();
         }

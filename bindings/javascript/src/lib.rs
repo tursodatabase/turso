@@ -261,7 +261,9 @@ fn sqlite_result_code_name(code: i32) -> &'static str {
         787 => "SQLITE_CONSTRAINT_FOREIGNKEY",
         1299 => "SQLITE_CONSTRAINT_NOTNULL",
         1555 => "SQLITE_CONSTRAINT_PRIMARYKEY",
+        1811 => "SQLITE_CONSTRAINT_TRIGGER",
         2067 => "SQLITE_CONSTRAINT_UNIQUE",
+        3091 => "SQLITE_CONSTRAINT_DATATYPE",
         // An extended code without a name here is reported by its primary code.
         code if code > 0xff => sqlite_result_code_name(code & 0xff),
         1 => "SQLITE_ERROR",

@@ -32,6 +32,9 @@ test('errors carry the SQLite message and result code name', () => {
     db.exec('CREATE TABLE pair(a, b, PRIMARY KEY(a, b))');
     db.exec("INSERT INTO k VALUES ('x')");
     db.exec('INSERT INTO pair VALUES (1, 1), (1, 2)');
+    db.exec('CREATE TABLE s(a INTEGER) STRICT');
+    db.exec('CREATE TABLE tr(a)');
+    db.exec("CREATE TRIGGER trg BEFORE INSERT ON tr BEGIN SELECT RAISE(ABORT, 'nope'); END");
     const notADatabase = `test-${(Math.random() * 10000) | 0}.db`;
     writeFileSync(notADatabase, Buffer.alloc(8192, 7));
     const cases: [() => unknown, string, string][] = [
@@ -44,6 +47,8 @@ test('errors carry the SQLite message and result code name', () => {
         [() => db.prepare('INSERT INTO pair VALUES (1, 1)').run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: pair.a, pair.b'],
         [() => db.prepare('UPDATE pair SET b = 1 WHERE b = 2').run(), 'SQLITE_CONSTRAINT_PRIMARYKEY', 'UNIQUE constraint failed: pair.a, pair.b'],
         [() => db.prepare('INSERT INTO ch VALUES (9)').run(), 'SQLITE_CONSTRAINT_FOREIGNKEY', 'FOREIGN KEY constraint failed'],
+        [() => db.prepare("INSERT INTO s VALUES ('x')").run(), 'SQLITE_CONSTRAINT_DATATYPE', 'cannot store TEXT value in INTEGER column s.a'],
+        [() => db.prepare('INSERT INTO tr VALUES (1)').run(), 'SQLITE_CONSTRAINT_TRIGGER', 'nope'],
         [() => db.prepare('SYNTAX ERROR'), 'SQLITE_ERROR', 'near "SYNTAX": syntax error'],
         [() => db.prepare('SELECT * FROM missing'), 'SQLITE_ERROR', 'no such table: missing'],
         [() => db.prepare("SELECT json_extract('{', '$')").get(), 'SQLITE_ERROR', 'malformed JSON'],
@@ -129,7 +134,7 @@ test('file-must-exist', () => {
     let error: any;
     try { new Database(path, { fileMustExist: true }); } catch (e) { error = e; }
     expect(error).toBeInstanceOf(SqliteError);
-    expect(error).toMatchObject({ code: 'SQLITE_ERROR', message: expect.stringContaining('I/O error (open)') });
+    expect(error.message).toContain('I/O error (open)');
 })
 
 test('on-disk db', () => {

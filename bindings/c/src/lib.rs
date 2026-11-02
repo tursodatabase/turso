@@ -3955,6 +3955,8 @@ mod tests {
             turso_core::ConstraintKind::ForeignKey,
             turso_core::ConstraintKind::NotNull,
             turso_core::ConstraintKind::Check,
+            turso_core::ConstraintKind::Trigger,
+            turso_core::ConstraintKind::Datatype,
             turso_core::ConstraintKind::Other,
         ] {
             let error = turso_core::LimboError::ConstraintViolation(Box::new(
