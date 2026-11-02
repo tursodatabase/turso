@@ -1,0 +1,13 @@
+Inserts better-sqlite3::updates columns with raw value when inserting a duplicate key to unique column and merge with update data is specified
+Schema (misc) better-sqlite3 invalid field sqlite3 only::should throw when referencing a non-existent column
+Schema (misc) better-sqlite3::supports named foreign keys
+Schema (misc) better-sqlite3::supports named primary keys
+Schema (misc) better-sqlite3::supports named unique keys
+Schema Foreign keys better-sqlite3 Schema (Foreign keys) drop foreign key::correctly drops foreign key
+Schema Foreign keys better-sqlite3 createForeignKey::creates new foreign key
+Schema Primary keys better-sqlite3 createPrimaryKey::creates a compound primary key
+Schema Primary keys better-sqlite3 createPrimaryKey::creates a compound primary key with a custom constraint name provided directly as a string
+Schema Primary keys better-sqlite3 createPrimaryKey::creates a compound primary key with a custom constraint name provided in the options object
+Schema Primary keys better-sqlite3 createPrimaryKey::creates a new primary key
+Schema Primary keys better-sqlite3 createPrimaryKey::creates a primary key with a custom constraint name
+Schema alter nullable better-sqlite3 dropNullable::sets column to be not nullable
