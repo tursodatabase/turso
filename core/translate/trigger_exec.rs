@@ -619,10 +619,10 @@ fn execute_trigger_commands(
     // below (`translate_inner` needs it), so the scope closure takes
     // `resolver` as a parameter rather than capturing the outer binding -
     // see `Resolver::with_database_scope_mut`.
+    subprogram_builder.prologue();
     resolver.with_trigger_scope(trigger_namespace, trigger.name.clone(), |resolver| {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
-            subprogram_builder.prologue();
             translate_inner(
                 stmt,
                 resolver,

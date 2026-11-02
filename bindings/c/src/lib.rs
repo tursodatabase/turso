@@ -1609,10 +1609,10 @@ pub unsafe extern "C" fn sqlite3_stmt_status(
         SQLITE_STMTSTATUS_SORT => turso_core::StatementStatusCounter::Sort,
         SQLITE_STMTSTATUS_VM_STEP => turso_core::StatementStatusCounter::VmStep,
         SQLITE_STMTSTATUS_REPREPARE => turso_core::StatementStatusCounter::Reprepare,
+        SQLITE_STMTSTATUS_RUN => turso_core::StatementStatusCounter::Run,
         LIBSQL_STMTSTATUS_ROWS_READ => turso_core::StatementStatusCounter::RowsRead,
         LIBSQL_STMTSTATUS_ROWS_WRITTEN => turso_core::StatementStatusCounter::RowsWritten,
         SQLITE_STMTSTATUS_AUTOINDEX
-        | SQLITE_STMTSTATUS_RUN
         | SQLITE_STMTSTATUS_FILTER_MISS
         | SQLITE_STMTSTATUS_FILTER_HIT
         | SQLITE_STMTSTATUS_MEMUSED => return 0,
@@ -4246,7 +4246,7 @@ mod tests {
             );
             assert_eq!(
                 sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_RUN, 0),
-                0
+                1
             );
             assert_eq!(
                 sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_FILTER_HIT, 0),
