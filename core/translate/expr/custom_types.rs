@@ -362,24 +362,19 @@ pub(crate) fn emit_trigger_decode_registers(
         .iter()
         .enumerate()
         .map(|(i, col)| -> Result<usize> {
-            if !holds_stored_value(i) {
+            if !holds_stored_value(i) || !resolver.schema().column_has_decode(col, is_strict) {
                 return Ok(source_regs(i));
             }
-            if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
-                if resolved.chain.iter().any(|td| td.decode().is_some()) {
-                    let decoded_reg = program.alloc_register();
-                    emit_user_facing_column_value(
-                        program,
-                        source_regs(i),
-                        decoded_reg,
-                        col,
-                        is_strict,
-                        resolver,
-                    )?;
-                    return Ok(decoded_reg);
-                }
-            }
-            Ok(source_regs(i))
+            let decoded_reg = program.alloc_register();
+            emit_user_facing_column_value(
+                program,
+                source_regs(i),
+                decoded_reg,
+                col,
+                is_strict,
+                resolver,
+            )?;
+            Ok(decoded_reg)
         })
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
