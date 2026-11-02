@@ -20,10 +20,11 @@ use crate::{
             emit_make_record, prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
-            bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
-            process_returning_clause, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
+            bind_and_rewrite_expr, emit_constraint_values_decode, emit_returning_results,
+            emit_returning_scan_back, process_returning_clause,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, walk_expr, BindingBehavior,
+            NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
@@ -768,7 +769,7 @@ pub fn translate_insert(
     };
     let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
     if !types_checked_first {
-        emit_notnulls(program, &ctx, &insertion, resolver, |column| {
+        emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
             !column.is_virtual_generated() && !has_custom_type(column)
         })?;
     }
@@ -799,7 +800,7 @@ pub fn translate_insert(
             table_reference: Arc::clone(type_check_table),
         });
     }
-    emit_notnulls(program, &ctx, &insertion, resolver, |column| {
+    emit_notnulls(program, &ctx, &insertion, resolver, true, |column| {
         !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
     })?;
 
@@ -829,6 +830,7 @@ pub fn translate_insert(
             &ctx,
             &insertion,
             resolver,
+            true,
             Column::is_virtual_generated,
         )?;
     }
@@ -1888,6 +1890,7 @@ fn emit_notnulls(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     resolver: &Resolver,
+    row_is_encoded: bool,
     include_column: impl Fn(&Column) -> bool,
 ) -> Result<()> {
     for column_mapping in insertion
@@ -2009,17 +2012,36 @@ fn emit_notnulls(
                 .as_deref()
                 .unwrap_or("")
                 .to_string();
+            let mut constraint_info = ConstraintInfo {
+                kind: crate::ConstraintKind::NotNull,
+                constraint_name: None,
+                index_name: None,
+                table_name: ctx.table.name.as_str().to_string(),
+                column_names: vec![col_name],
+                violation_regs: all_regs,
+                row_col_names: all_names,
+                parent_table: None,
+            };
+            // HaltIfNull runs for every row, so jump over the decode of the
+            // reported row unless the value is NULL.
+            let value_not_null = program.allocate_label();
+            let table_has_custom_type = ctx.table.columns().iter().any(|column| {
+                resolver
+                    .schema()
+                    .column_has_custom_type(column, ctx.table.is_strict)
+            });
+            if row_is_encoded
+                && table_has_custom_type
+                && resolver.catalog.dialect.constraint_errors_show_values()
+            {
+                program.emit_insn(Insn::NotNull {
+                    reg: check_reg,
+                    target_pc: value_not_null,
+                });
+                emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
+            }
             program.emit_insn(Insn::HaltIfNull {
-                constraint_info: Some(Box::new(ConstraintInfo {
-                    kind: crate::ConstraintKind::NotNull,
-                    constraint_name: None,
-                    index_name: None,
-                    table_name: ctx.table.name.as_str().to_string(),
-                    column_names: vec![col_name],
-                    violation_regs: all_regs,
-                    row_col_names: all_names,
-                    parent_table: None,
-                })),
+                constraint_info: Some(Box::new(constraint_info)),
                 target_reg: check_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: {
@@ -2046,6 +2068,7 @@ fn emit_notnulls(
                 },
                 on_error: program.constraint_halt_on_error(effective),
             });
+            program.preassign_label_to_next_insn(value_not_null);
         }
     }
     Ok(())
@@ -3063,19 +3086,21 @@ fn emit_pk_uniqueness_check(
                 .map(|(name, _)| format!("{}.{}", ctx.table.name, name))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let mut constraint_info = ConstraintInfo::primary_key(
+                ctx.table.name.as_str(),
+                ctx.table.primary_key_constraint_name.clone(),
+                ctx.table
+                    .primary_key_columns
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .collect(),
+                (0..ctx.table.primary_key_columns.len())
+                    .map(|i| pk_regs + i)
+                    .collect(),
+            );
+            emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
             program.emit_insn(Insn::Halt {
-                constraint_info: Some(Box::new(ConstraintInfo::primary_key(
-                    ctx.table.name.as_str(),
-                    ctx.table.primary_key_constraint_name.clone(),
-                    ctx.table
-                        .primary_key_columns
-                        .iter()
-                        .map(|(n, _)| n.clone())
-                        .collect(),
-                    (0..ctx.table.primary_key_columns.len())
-                        .map(|i| pk_regs + i)
-                        .collect(),
-                ))),
+                constraint_info: Some(Box::new(constraint_info)),
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                 description: raw_desc,
                 on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
@@ -3307,12 +3332,14 @@ fn emit_unique_index_check(
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
         let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+        let mut constraint_info = ConstraintInfo::unique_index(
+            ctx.table.name.as_str(),
+            index,
+            (0..num_cols).map(|i| idx_start_reg + i).collect(),
+        );
+        emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
         program.emit_insn(Insn::Halt {
-            constraint_info: Some(Box::new(ConstraintInfo::unique_index(
-                ctx.table.name.as_str(),
-                index,
-                (0..num_cols).map(|i| idx_start_reg + i).collect(),
-            ))),
+            constraint_info: Some(Box::new(constraint_info)),
             err_code: SQLITE_CONSTRAINT_UNIQUE,
             description: raw_desc,
             on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
@@ -3352,12 +3379,14 @@ fn emit_unique_index_check(
         } else {
             // ABORT/FAIL/ROLLBACK: halt on conflict.
             let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+            let mut constraint_info = ConstraintInfo::unique_index(
+                ctx.table.name.as_str(),
+                index,
+                (0..num_cols).map(|i| idx_start_reg + i).collect(),
+            );
+            emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
             program.emit_insn(Insn::Halt {
-                constraint_info: Some(Box::new(ConstraintInfo::unique_index(
-                    ctx.table.name.as_str(),
-                    index,
-                    (0..num_cols).map(|i| idx_start_reg + i).collect(),
-                ))),
+                constraint_info: Some(Box::new(constraint_info)),
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: raw_desc,
                 on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
@@ -4092,14 +4121,9 @@ pub fn emit_fk_child_insert_checks(
                         }
                     })
                     .collect();
-                emit_fk_restrict_halt(
-                    program,
-                    Some(Box::new(fk_constraint_info(
-                        child_tbl.name.as_str(),
-                        &fk_ref.fk,
-                        fk_col_regs,
-                    ))),
-                )?;
+                let constraint_info =
+                    fk_constraint_info(program, resolver, child_tbl, &fk_ref.fk, fk_col_regs)?;
+                emit_fk_restrict_halt(program, Some(Box::new(constraint_info)))?;
             }
             program.preassign_label_to_next_insn(fk_ok);
         } else {
@@ -4212,14 +4236,9 @@ pub fn emit_fk_child_insert_checks(
                                 }
                             })
                             .collect();
-                        emit_fk_restrict_halt(
-                            p,
-                            Some(Box::new(fk_constraint_info(
-                                child_tbl.name.as_str(),
-                                &fk_ref.fk,
-                                fk_col_regs,
-                            ))),
-                        )?;
+                        let constraint_info =
+                            fk_constraint_info(p, resolver, child_tbl, &fk_ref.fk, fk_col_regs)?;
+                        emit_fk_restrict_halt(p, Some(Box::new(constraint_info)))?;
                     }
                     Ok(())
                 },
