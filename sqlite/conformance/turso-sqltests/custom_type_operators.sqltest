@@ -727,44 +727,54 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test op-date-plus-abs-of-numeric-error {
-    -- abs of a numeric is a numeric, so it is not a number of days.
+    -- abs of a numeric is SQLite's abs, a real, so it is not a number of days.
     CREATE TABLE t(d date, n numeric(10,2)) STRICT;
     INSERT INTO t VALUES ('2024-01-05', 3);
     SELECT d + abs(n) FROM t;
 }
 expect error {
-    operator does not exist: date \+ numeric
+    operator does not exist: date \+ real
 }
 
 @requires strict "uses STRICT tables"
-test op-abs-of-numeric-is-numeric {
+test op-abs-of-numeric-is-real {
     CREATE TABLE t(n numeric(10,2)) STRICT;
     INSERT INTO t VALUES (-1.5);
     INSERT INTO t VALUES (NULL);
-    SELECT abs(n), typeof(abs(n)), abs(n) * 3, typeof(abs(n) * 3) FROM t ORDER BY rowid;
+    SELECT abs(n), typeof(abs(n)) FROM t ORDER BY rowid;
 }
 expect {
-    1.50|text|4.50|text
-    |null||null
-}
-
-@requires strict "uses STRICT tables"
-test op-numeric-with-abs-of-numeric-is-exact {
-    CREATE TABLE t(n numeric(10,2), m numeric(10,2)) STRICT;
-    INSERT INTO t VALUES (3, -0.20);
-    SELECT n + abs(m), n - abs(m), n * abs(m) FROM t;
-}
-expect {
-    3.20|2.80|0.6000
+    1.5|real
+    |null
 }
 
 @requires strict "uses STRICT tables"
 test op-abs-of-numeric-in-check-comparison-error {
-    -- A CHECK sees the stored numeric, so abs of it is not the number's abs.
+    -- A CHECK sees the stored numeric, a blob, so abs of it is a real.
     CREATE TABLE c(n numeric(10,2) CHECK(abs(n) <> n)) STRICT;
 }
 expect error {
-    cannot use abs\(\) on a numeric value in a CHECK constraint
+    cannot compare REAL with
+}
+
+@requires strict "uses STRICT tables"
+test op-number-from-stored-numeric-in-check-error {
+    -- substr of the stored numeric is a blob, which is not a number.
+    CREATE TABLE c(n numeric(10,2) CHECK(substr(n, 1) + 0 > 0)) STRICT;
+}
+expect error {
+    arithmetic requires numeric types, got BLOB and INTEGER
+}
+
+@requires strict "uses STRICT tables"
+test op-number-not-from-numeric-value-in-check {
+    -- (n IS NULL) and length(n) are integers, whatever n holds.
+    CREATE TABLE c(n numeric(10,2), i INTEGER, CHECK((n IS NULL) + i > 0), CHECK(i + length(n) > 0)) STRICT;
+    INSERT INTO c VALUES (NULL, 1);
+    SELECT n, i FROM c;
+}
+expect {
+    |1
 }
 
 @requires strict "uses STRICT tables"
@@ -776,51 +786,6 @@ test op-abs-of-numeric-in-check-without-comparison {
 }
 expect {
     -20.00
-}
-
-@requires strict "uses STRICT tables"
-test op-abs-of-coalesce-of-numeric-in-check-error {
-    -- coalesce(n, 0) may be the stored numeric, so abs of it is refused like abs(n).
-    CREATE TABLE c(n numeric(10,2) CHECK(abs(coalesce(n, 0)) > 4)) STRICT;
-}
-expect error {
-    cannot use abs\(\) on a numeric value in a CHECK constraint
-}
-
-@requires strict "uses STRICT tables"
-test op-number-from-numeric-through-a-function-in-check-error {
-    -- substr(n, 1) is computed from the stored blob, so a number made from it is wrong.
-    CREATE TABLE a(n numeric(10,2) CHECK(substr(n, 1) + 0 > 0)) STRICT;
-}
-expect error {
-    cannot use arithmetic on a numeric value in a CHECK constraint
-}
-
-@requires strict "uses STRICT tables"
-test op-minus-of-numeric-through-a-function-in-check-error {
-    CREATE TABLE b(n numeric(10,2) CHECK(-substr(n, 1) < 0)) STRICT;
-}
-expect error {
-    cannot use unary minus/plus on a numeric value in a CHECK constraint
-}
-
-@requires strict "uses STRICT tables"
-test op-abs-of-numeric-through-a-function-in-check-error {
-    CREATE TABLE c(n numeric(10,2) CHECK(abs(substr(n, 1)) > 0)) STRICT;
-}
-expect error {
-    cannot use abs\(\) on a numeric value in a CHECK constraint
-}
-
-@requires strict "uses STRICT tables"
-test op-number-from-varchar-in-check {
-    -- varchar is stored as it is read, so a number computed from it is right.
-    CREATE TABLE v(s varchar(5) CHECK(length(s) + 1 < 5)) STRICT;
-    INSERT INTO v VALUES ('abc');
-    SELECT s FROM v;
-}
-expect {
-    abc
 }
 
 @requires strict "uses STRICT tables"

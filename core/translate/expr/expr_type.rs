@@ -7,7 +7,7 @@
 
 use turso_parser::ast;
 
-use super::custom_type_operators::{abs_of_custom_type, find_operator_call};
+use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
@@ -176,13 +176,6 @@ impl<'a> TypeEnv<'a> {
             Self::Statement { tables, .. } => *tables,
             Self::Table { .. } => None,
         }
-    }
-
-    /// Whether custom-type columns are read in their stored form: in a CHECK
-    /// constraint.
-    pub(super) fn reads_stored_form(&self) -> bool {
-        self.resolver()
-            .is_some_and(|resolver| resolver.reads_stored_form)
     }
 
     fn resolver(&self) -> Option<&Resolver<'a>> {
@@ -746,11 +739,7 @@ fn binary_type(
 /// it: what the function returns. `None` means SQLite's operator runs. An
 /// operator that does not exist, such as `date * 2`, has no type: emitting it
 /// fails. `types` are the operands' types.
-pub(super) fn custom_operator_type(
-    expr: &ast::Expr,
-    types: &[ExprType],
-    env: &TypeEnv,
-) -> Option<ExprType> {
+fn custom_operator_type(expr: &ast::Expr, types: &[ExprType], env: &TypeEnv) -> Option<ExprType> {
     match find_operator_call(expr, types, env) {
         Ok(Some(call)) => Some(call_result_type(&call.result, env.schema())),
         Ok(None) => None,
@@ -875,23 +864,15 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
             None => any,
         },
         ResultType::RealForTextOtherwiseTheFirstArgumentsType => match first_argument() {
-            // A custom type with its own order and `-x`, such as numeric, has
-            // its own abs. For any other custom type abs runs on the stored
-            // value, so the type counts as the type it is stored as: abs of a
-            // uuid, stored as a blob, is a real.
-            Some(ty) => {
-                if let Some(abs_type) = args
-                    .first()
-                    .and_then(|arg| abs_of_custom_type(arg, &ty, env))
-                {
-                    return abs_type;
+            // abs of a custom type is SQLite's abs, so the type counts as the
+            // type it is stored as: abs of a numeric or uuid, stored as a
+            // blob, is a real.
+            Some(ty) => match sqlite_operand_type(ty.clone(), env.schema()) {
+                ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob) | ExprType::Untyped => {
+                    ExprType::Builtin(BuiltinType::Real)
                 }
-                match sqlite_operand_type(ty.clone(), env.schema()) {
-                    ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob)
-                    | ExprType::Untyped => ExprType::Builtin(BuiltinType::Real),
-                    _ => negated_type(ty, env.schema()),
-                }
-            }
+                _ => negated_type(ty, env.schema()),
+            },
             None => any,
         },
         ResultType::RealForARealArgument => {

@@ -137,9 +137,6 @@ impl From<bool> for DoubleQuotedDml {
 pub struct Resolver<'a> {
     pub(crate) catalog: CatalogContext<'a>,
     pub expr_to_reg_cache_enabled: bool,
-    /// Set while a CHECK constraint is translated: a custom-type column is read
-    /// in its stored form there, so the type's own operators cannot run on it.
-    pub(crate) reads_stored_form: bool,
     /// Cache entries for previously translated expressions.
     /// The `needs_custom_type_decode` flag is true for hash-join payload registers
     /// that contain raw encoded values and need DECODE applied when read.
@@ -380,7 +377,6 @@ impl<'a> Resolver<'a> {
                 search_path,
             ),
             expr_to_reg_cache_enabled: false,
-            reads_stored_form: false,
             expr_to_reg_cache: Vec::new(),
             register_columns: HashMap::default(),
             row_value_subqueries: Rc::default(),
@@ -415,7 +411,6 @@ impl<'a> Resolver<'a> {
         Resolver {
             catalog: self.catalog.fork(),
             expr_to_reg_cache_enabled: false,
-            reads_stored_form: false,
             expr_to_reg_cache: Vec::new(),
             register_columns: HashMap::default(),
             row_value_subqueries: self.row_value_subqueries.fork(),
@@ -432,7 +427,6 @@ impl<'a> Resolver<'a> {
         Resolver {
             catalog: self.catalog.fork(),
             expr_to_reg_cache_enabled: self.expr_to_reg_cache_enabled,
-            reads_stored_form: self.reads_stored_form,
             expr_to_reg_cache: self.expr_to_reg_cache.clone(),
             register_columns: self.register_columns.clone(),
             row_value_subqueries: self.row_value_subqueries.fork(),
@@ -2441,7 +2435,6 @@ pub(crate) fn emit_check_constraints<'a>(
     }
 
     resolver.enable_expr_to_reg_cache();
-    resolver.reads_stored_form = true;
 
     let result = emit_check_constraint_bytecode(
         program,
@@ -2458,7 +2451,6 @@ pub(crate) fn emit_check_constraints<'a>(
     // Always restore resolver state, even on error.
     resolver.expr_to_reg_cache.truncate(initial_cache_size);
     resolver.expr_to_reg_cache_enabled = false;
-    resolver.reads_stored_form = false;
 
     result
 }

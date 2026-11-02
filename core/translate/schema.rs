@@ -306,13 +306,9 @@ fn resolve_check_expr_type(
                         inner_ty.display_name()
                     );
                 }
-                refuse_numbers_from_stored_values(inner, "unary minus/plus", columns, resolver)?;
                 Ok(inner_ty)
             }
-            UnaryOperator::BitwiseNot => {
-                refuse_numbers_from_stored_values(inner, "arithmetic", columns, resolver)?;
-                Ok(CheckExprType::Integer)
-            }
+            UnaryOperator::BitwiseNot => Ok(CheckExprType::Integer),
             UnaryOperator::Not => Ok(CheckExprType::Integer),
         },
         ast::Expr::Binary(lhs, op, rhs) => {
@@ -331,8 +327,6 @@ fn resolve_check_expr_type(
                             rty.display_name()
                         );
                     }
-                    refuse_numbers_from_stored_values(lhs, "arithmetic", columns, resolver)?;
-                    refuse_numbers_from_stored_values(rhs, "arithmetic", columns, resolver)?;
                     if lty == CheckExprType::Any || rty == CheckExprType::Any {
                         Ok(CheckExprType::Any)
                     } else if lty == CheckExprType::Real || rty == CheckExprType::Real {
@@ -341,16 +335,12 @@ fn resolve_check_expr_type(
                         Ok(CheckExprType::Integer)
                     }
                 }
-                Operator::Modulus
-                | Operator::BitwiseAnd
+                Operator::Modulus => Ok(CheckExprType::Integer),
+                Operator::Concat => Ok(CheckExprType::Text),
+                Operator::BitwiseAnd
                 | Operator::BitwiseOr
                 | Operator::LeftShift
-                | Operator::RightShift => {
-                    refuse_numbers_from_stored_values(lhs, "arithmetic", columns, resolver)?;
-                    refuse_numbers_from_stored_values(rhs, "arithmetic", columns, resolver)?;
-                    Ok(CheckExprType::Integer)
-                }
-                Operator::Concat => Ok(CheckExprType::Text),
+                | Operator::RightShift => Ok(CheckExprType::Integer),
                 // Logical: recurse to find nested comparisons
                 Operator::And | Operator::Or => {
                     // The result of AND/OR is boolean (integer), but we need to
@@ -431,6 +421,14 @@ fn resolve_func_return_type(
     let type_of = |arg: &ast::Expr| resolve_check_expr_type(arg, columns, resolver);
     // A call with the wrong number of arguments is reported when it is translated.
     let first_argument = || args.first().map(|arg| type_of(arg)).transpose();
+    // A function that computes a new value from its argument, such as abs or
+    // substr, computes it from what the CHECK constraint sees: a custom-type
+    // column in its stored form, such as numeric's blob.
+    let first_argument_as_stored = || {
+        first_argument()?
+            .map(|ty| stored_check_type(ty, resolver))
+            .transpose()
+    };
     match func.result_type() {
         ResultType::Declared(ReturnType::Integer) => Ok(CheckExprType::Integer),
         ResultType::Declared(ReturnType::Real) => Ok(CheckExprType::Real),
@@ -449,43 +447,28 @@ fn resolve_func_return_type(
         // ceil, floor and trunc give an integer for an integer and a real for
         // a real. A text or blob argument is first converted to a number,
         // which may be either.
-        ResultType::NumberOfTheFirstArgumentsType => Ok(match first_argument()? {
+        ResultType::NumberOfTheFirstArgumentsType => Ok(match first_argument_as_stored()? {
             Some(ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null)) => ty,
             _ => CheckExprType::Any,
         }),
         // abs gives a real for text or a blob, without converting it first.
         ResultType::RealForTextOtherwiseTheFirstArgumentsType => {
-            let ty = match first_argument()? {
+            Ok(match first_argument_as_stored()? {
                 Some(ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null)) => {
                     ty
                 }
                 Some(CheckExprType::Text | CheckExprType::Blob) => CheckExprType::Real,
-                // A CHECK constraint sees a custom type's stored value, such as
-                // numeric's blob, so abs of it would not be the value's abs.
-                // Unary minus is refused for the same reason.
-                Some(CheckExprType::CustomType(type_name)) => {
-                    bail_parse_error!(
-                        "cannot use {}() on a {} value in a CHECK constraint",
-                        name,
-                        type_name
-                    )
-                }
-                Some(CheckExprType::Any) | None => CheckExprType::Any,
-            };
-            if let Some(arg) = args.first() {
-                refuse_numbers_from_stored_values(arg, &format!("{name}()"), columns, resolver)?;
-            }
-            Ok(ty)
+                _ => CheckExprType::Any,
+            })
         }
         ResultType::RealForARealArgument => Ok(CheckExprType::Real),
         // substr returns a blob for a blob and text for a number or text.
-        ResultType::TextOrBlobLikeTheFirstArgument => Ok(match first_argument()? {
+        ResultType::TextOrBlobLikeTheFirstArgument => Ok(match first_argument_as_stored()? {
             Some(ty @ (CheckExprType::Blob | CheckExprType::Any | CheckExprType::Null)) => ty,
-            // The stored value of a custom type may be a blob.
-            Some(CheckExprType::CustomType(_)) | None => CheckExprType::Any,
             Some(CheckExprType::Integer | CheckExprType::Real | CheckExprType::Text) => {
                 CheckExprType::Text
             }
+            Some(CheckExprType::CustomType(_)) | None => CheckExprType::Any,
         }),
         ResultType::ElementOfTheFirstArgument => Ok(CheckExprType::Any),
         ResultType::Unknown if matches!(func, Func::External(_)) => {
@@ -510,61 +493,30 @@ fn reject_value_unlike_stored_columns(
     type_name: &str,
     resolver: &CatalogContext,
 ) -> Result<()> {
-    if reads_values_unlike_stored(type_name, resolver)? {
-        bail_parse_error!(
-            "cannot compare {}() in a CHECK constraint: it returns {} values in a \
-             different form than they are stored",
-            name,
-            type_name
-        );
+    if let Some(resolved) = resolver.schema().resolve_type_unchecked(type_name)? {
+        if !resolved.is_domain() && !resolved.reads_stored_values_unchanged() {
+            bail_parse_error!(
+                "cannot compare {}() in a CHECK constraint: it returns {} values in a \
+                 different form than they are stored",
+                name,
+                type_name
+            );
+        }
     }
     Ok(())
 }
 
-/// A CHECK constraint sees a custom-type column as it is stored. For a type
-/// whose DECODE changes the value, such as numeric stored as a blob, a number
-/// computed from the column, even through other functions as in
-/// `substr(n, 1) + 0`, would be computed from the stored form, so the CHECK
-/// constraint is refused.
-fn refuse_numbers_from_stored_values(
-    expr: &ast::Expr,
-    operation: &str,
-    columns: &[&ast::ColumnDefinition],
-    resolver: &CatalogContext,
-) -> Result<()> {
-    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        let column_name = match e {
-            ast::Expr::Id(name) | ast::Expr::Name(name) => name.as_str(),
-            ast::Expr::Qualified(_, name) => name.as_str(),
-            _ => return Ok(WalkControl::Continue),
-        };
-        let column_name = normalize_ident(column_name);
-        let column = columns
-            .iter()
-            .find(|col| normalize_ident(col.col_name.as_str()) == column_name);
-        if let Some(column) = column {
-            if let CheckExprType::CustomType(type_name) = resolve_column_type(column, resolver)? {
-                if reads_values_unlike_stored(&type_name, resolver)? {
-                    bail_parse_error!(
-                        "cannot use {} on a {} value in a CHECK constraint",
-                        operation,
-                        type_name
-                    );
-                }
-            }
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    Ok(())
-}
-
-/// Whether reading a value of this type gives something other than what is
-/// stored, as for numeric (a blob, read as text) or uuid.
-fn reads_values_unlike_stored(type_name: &str, resolver: &CatalogContext) -> Result<bool> {
-    Ok(resolver
-        .schema()
-        .resolve_type_unchecked(type_name)?
-        .is_some_and(|resolved| !resolved.is_domain() && !resolved.reads_stored_values_unchanged()))
+/// The type a CHECK constraint sees for a value of type `ty`: for a custom type
+/// whose DECODE changes the value, the type it is stored as, such as BLOB for
+/// numeric.
+fn stored_check_type(ty: CheckExprType, resolver: &CatalogContext) -> Result<CheckExprType> {
+    let CheckExprType::CustomType(type_name) = &ty else {
+        return Ok(ty);
+    };
+    match resolver.schema().resolve_type_unchecked(type_name)? {
+        Some(resolved) => resolve_type_name(&resolved.primitive, resolver),
+        None => bail_parse_error!("unknown type '{}' in CHECK constraint", type_name),
+    }
 }
 
 /// The type of a function that returns one of several values: the type they
