@@ -5323,6 +5323,38 @@ impl BTreeTable {
         Ok(())
     }
 
+    /// Builds the column that `ALTER COLUMN` puts at `column_index`. A table-level
+    /// PRIMARY KEY stays in the stored CREATE TABLE, so a column it names stays part of
+    /// the key, and the new type decides whether the column is a rowid alias.
+    pub fn column_for_alter(
+        &self,
+        column_index: usize,
+        definition: &ColumnDefinition,
+    ) -> Result<Column> {
+        let mut column = Column::from_definition(
+            definition,
+            FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, self.is_strict),
+        )?;
+        if self.columns()[column_index].primary_key() && !self.primary_key_is_inline {
+            if column.is_generated() {
+                bail_parse_error!(
+                    "generated column \"{}\" cannot be part of the PRIMARY KEY",
+                    definition.col_name.as_str()
+                );
+            }
+            column.set_primary_key(true);
+            column.set_rowid_alias(
+                self.has_rowid
+                    && self.primary_key_columns.len() == 1
+                    && definition
+                        .col_type
+                        .as_ref()
+                        .is_some_and(|ty| is_rowid_alias_type(&ty.name)),
+            );
+        }
+        Ok(column)
+    }
+
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
         self.columns
             .iter()
@@ -7770,6 +7802,10 @@ impl Column {
     #[inline]
     pub fn hidden(&self) -> bool {
         self.info.hidden()
+    }
+    #[inline]
+    pub fn set_primary_key(&mut self, v: bool) {
+        self.info.set_primary_key(v)
     }
     #[inline]
     pub fn set_rowid_alias(&mut self, v: bool) {
@@ -10355,6 +10391,11 @@ mod column_info {
         #[inline]
         pub fn is_rowid_alias(&self) -> bool {
             self.0 & F_ROWID_ALIAS != 0
+        }
+
+        #[inline]
+        pub fn set_primary_key(&mut self, v: bool) {
+            self.set_flag(F_PRIMARY_KEY, v);
         }
 
         #[inline]

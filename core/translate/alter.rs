@@ -572,10 +572,12 @@ fn emit_add_column_default_type_validation(
 }
 
 /// Validate NOT NULL and CHECK constraints for a new or altered column by
-/// scanning each existing row, computing virtual generated columns as needed.
+/// scanning each existing row of `original_table` as if it had the columns of
+/// `table`, computing virtual generated columns as needed.
 #[allow(clippy::too_many_arguments)]
 fn emit_column_constraints_validation(
     program: &mut ProgramBuilder,
+    original_table: &BTreeTable,
     table: &BTreeTable,
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
@@ -656,6 +658,16 @@ fn emit_column_constraints_validation(
     let base_dest_reg = program.alloc_registers(layout.column_count());
     for (idx, table_column) in resolved_table.columns().iter().enumerate() {
         if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
+            continue;
+        }
+        // A rowid alias is stored as NULL in the record, also when the new
+        // definition makes the column an ordinary one.
+        if original_table.columns()[idx].is_rowid_alias() {
+            program.emit_insn(Insn::Copy {
+                src_reg: rowid_reg,
+                dst_reg: layout.to_register(base_dest_reg, idx),
+                extra_amount: 0,
+            });
             continue;
         }
 
@@ -1509,6 +1521,7 @@ pub fn translate_alter_table(
             emit_column_constraints_validation(
                 program,
                 &btree,
+                &btree,
                 &column,
                 &constraints,
                 resolver,
@@ -1870,16 +1883,47 @@ pub fn translate_alter_table(
                 ));
             }
 
+            // The new definition replaces the old one in the stored CREATE TABLE, so a
+            // PRIMARY KEY or UNIQUE written in the old column would disappear while its
+            // automatic index stays. A rowid alias has no automatic index.
+            if !rename {
+                let old_column = &btree.columns()[column_index];
+                if old_column.primary_key()
+                    && btree.primary_key_is_inline
+                    && !old_column.is_rowid_alias()
+                {
+                    return Err(LimboError::ParseError(
+                        "PRIMARY KEY constraint cannot be altered".to_string(),
+                    ));
+                }
+                if old_column.unique() {
+                    return Err(LimboError::ParseError(
+                        "UNIQUE constraint cannot be altered".to_string(),
+                    ));
+                }
+            }
+
             let (rewrites_physical_layout, virtual_generated_values_may_change, replacement_column) =
                 match rename {
                     true => (false, false, None),
                     false => {
-                        let replacement_column = Column::from_definition(
-                            &definition,
-                            FromDefinitionFlags::empty()
-                                .with(FromDefinitionFlags::InStrictTable, btree.is_strict),
-                        )?;
+                        let replacement_column =
+                            btree.column_for_alter(column_index, &definition)?;
                         let old_column = &btree.columns()[column_index];
+                        // Switching between a rowid alias and a key with an automatic
+                        // index would need that index created or dropped.
+                        if old_column.primary_key()
+                            && !btree.primary_key_is_inline
+                            && old_column.is_rowid_alias() != replacement_column.is_rowid_alias()
+                        {
+                            return Err(LimboError::ParseError(
+                                "PRIMARY KEY constraint cannot be altered".to_string(),
+                            ));
+                        }
+                        // A rowid alias is stored as NULL in the record, so existing rows
+                        // must be rewritten to hold the value once the column is ordinary.
+                        let stops_being_rowid_alias =
+                            old_column.is_rowid_alias() && !replacement_column.is_rowid_alias();
                         let becomes_generated =
                             !old_column.is_generated() && replacement_column.is_generated();
                         // Toggling the virtual-generated bit changes whether the column
@@ -1908,6 +1952,7 @@ pub fn translate_alter_table(
                                 resolver.schema(),
                             );
                         let rewrites_physical_layout = becomes_generated
+                            || stops_being_rowid_alias
                             || virtuality_changed
                             || affinity_changed
                             || strict_type_changed;
@@ -2319,6 +2364,7 @@ pub fn translate_alter_table(
                 let altered_table = Arc::new(altered_table);
                 emit_column_constraints_validation(
                     program,
+                    &original_btree,
                     &altered_table,
                     &altered_table.columns()[column_index],
                     &definition.constraints,
