@@ -2578,12 +2578,21 @@ impl Database {
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
         self.ensure_external_restore_supported()?;
+        self.reload_wal_after_external_restore_with_encryption_key(None)
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reload_wal_after_external_restore_with_encryption_key(
+        self: &Arc<Self>,
+        encryption_key: Option<EncryptionKey>,
+    ) -> Result<()> {
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"
                     .to_string(),
             ));
         }
+        self.validate_external_restore_encryption(encryption_key.as_ref())?;
         let flags = self.open_flags;
         #[cfg(host_shared_wal)]
         let shared_authority = self.open_shared_wal_coordination_for_open()?;
@@ -2624,18 +2633,20 @@ impl Database {
             .replace_after_external_restore(new_shared_wal.into_inner());
         if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
         {
+            let pager = self._init(encryption_key.as_ref(), None)?;
+            let encryption_context = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
                 self.open_flags,
                 self.durable_storage.clone(),
-                None,
+                encryption_context,
                 self.allocators.mv_store.clone(),
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
             let mvcc_bootstrap_conn = self._connect(
-                ConnectOpts::new(SessionRole::Superuser),
+                ConnectOpts::new(SessionRole::Superuser).with_encryption_key(encryption_key),
                 ConnectionContext::default(),
                 true,
                 None,
@@ -2652,6 +2663,44 @@ impl Database {
         } else {
             self.mv_store.store(None);
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    fn validate_external_restore_encryption(&self, key: Option<&EncryptionKey>) -> Result<()> {
+        let cipher = self.encryption_cipher();
+        if cipher == CipherMode::None {
+            if key.is_some() {
+                return Err(LimboError::InvalidArgument(
+                    "database was opened without encryption".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let key = key.ok_or_else(|| {
+            LimboError::InvalidArgument("encrypted database requires an encryption key".into())
+        })?;
+        let mut context = self.pager_state.verify_encryption_key(key)?;
+        let mut state = DbHeaderReadState::default();
+        let header = self.io.block(|| self.read_db_header_buf(&mut state))?;
+        let (reserved, page_size) = Self::plain_header_page_info(&header, true)?;
+        if reserved as usize != cipher.metadata_size()
+            || self
+                .pager_state
+                .page_size()
+                .is_some_and(|current| current != page_size)
+        {
+            return Err(LimboError::InvalidArgument(
+                "external restore cannot change the encrypted database page layout".into(),
+            ));
+        }
+        context.set_page_size(page_size);
+        let mut io_ctx = IOContext::default();
+        io_ctx.set_encryption(context);
+        let buf = Arc::new(Buffer::new_temporary(page_size.get() as usize));
+        let completion = new_header_read_completion(buf);
+        let completion = self.db_file.read_page(1, &io_ctx, completion)?;
+        self.io.wait_for_completion(completion)?;
         Ok(())
     }
 
