@@ -235,6 +235,8 @@ fn translate_statement(
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::CreateRole { .. }
+            | ast::Stmt::CreatePolicy(..)
+            | ast::Stmt::DropPolicy { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -568,8 +570,20 @@ fn translate_statement(
         ast::Stmt::DropSchema { name } => {
             schema::translate_drop_schema(&name, resolver, program)?;
         }
-        ast::Stmt::CreatePolicy(..) => bail_parse_error!("CREATE POLICY is not supported"),
-        ast::Stmt::DropPolicy { .. } => bail_parse_error!("DROP POLICY is not supported"),
+        ast::Stmt::CreatePolicy(policy) => {
+            row_security::translate_create_policy(&policy, resolver, program)?
+        }
+        ast::Stmt::DropPolicy {
+            if_exists,
+            policy_name,
+            tbl_name,
+        } => row_security::translate_drop_policy(
+            &policy_name,
+            &tbl_name,
+            if_exists,
+            resolver,
+            program,
+        )?,
     };
 
     if is_write {
