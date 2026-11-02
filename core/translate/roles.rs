@@ -6,10 +6,10 @@
 //! prepare again, so a statement always runs with the privileges of the
 //! current role.
 //!
-//! Ownership and `GRANT` do not exist yet, so a role that is not a superuser
-//! has no privileges on any database object. It may still run statements that
-//! touch no database object, such as `SELECT 1`, switch roles, and read the
-//! catalog: the schema table, the types table and the role table.
+//! A statement needs a privilege on every object it uses, which the object's
+//! access control list grants, or it must be run by the object's owner or a
+//! superuser. Every role may read the catalog: the schema table, the types
+//! table and the role table.
 //!
 //! Only statements from the user are checked. Statements that the engine
 //! prepares for itself run SQL that the engine wrote, such as reads of
@@ -17,40 +17,132 @@
 //! statement whose rows reach the user, the PRAGMA that a PRAGMA table
 //! function runs, is checked when the function is compiled.
 
-use crate::namespace::NamespaceId;
+use crate::namespace::{NamespaceId, NamespaceRef};
 use turso_ext::VTabKind;
 use turso_parser::ast;
 
 use crate::schema::{Schema, SEQ_BACKING_TABLE_PREFIX};
+use crate::security::acl_catalog::ObjectKey;
 use crate::security::permission::{Action, Object, PermissionDenied};
+use crate::security::privilege::{ObjectAccess, ObjectKind, Privilege, Privileges};
 use crate::security::roles::{
-    CREATE_ROLES_NAME_INDEX_SQL, CREATE_ROLES_TABLE_SQL, ROLES_NAME_INDEX_NAME, ROLES_TABLE_NAME,
+    RoleId, CREATE_ROLES_NAME_INDEX_SQL, CREATE_ROLES_TABLE_SQL, ROLES_NAME_INDEX_NAME,
+    ROLES_TABLE_NAME,
 };
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
-use crate::vtab::VirtualTableType;
+use crate::vtab::{VirtualTable, VirtualTableType};
 use crate::{bail_parse_error, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
-/// Fails if a role that is not a superuser may not run `stmt` at all. Uses of
-/// sequences and PRAGMAs inside the statement are checked when they are
-/// compiled, by [check_sequence_change] and [check_pragma_function], so that
-/// the views a query reads are checked too.
-pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
-    let denial = match stmt {
-        ast::Stmt::Select(_) => return Ok(()),
-        ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => {
-            write_denial(tbl_name)
+/// Fails if the current role may not run `stmt` at all. Statements that pass
+/// are checked again by [`check_storage_access`] once they are compiled.
+pub fn check_statement_privileges(stmt: &ast::Stmt, resolver: &Resolver) -> Result<()> {
+    let Some(role) = resolver.checked_role else {
+        return Ok(());
+    };
+    let Some(requirement) = statement_requirement(stmt, resolver)? else {
+        return Ok(());
+    };
+    if requirement.is_met_by(role, resolver) {
+        Ok(())
+    } else {
+        Err(permission_denied(requirement.denial))
+    }
+}
+
+/// What a statement needs from the current role on one object.
+enum Need {
+    /// Any one of these privileges.
+    Privileges(Privileges),
+    /// To own the object.
+    Owner,
+    /// To be the superuser. Used for what no privilege covers, such as
+    /// maintenance of the whole database.
+    Superuser,
+}
+
+struct Requirement {
+    database_id: usize,
+    key: ObjectKey,
+    need: Need,
+    /// Reported when the requirement is not met.
+    denial: PermissionDenied,
+}
+
+impl Requirement {
+    fn privilege(
+        database_id: usize,
+        key: ObjectKey,
+        privilege: Privilege,
+        denial: PermissionDenied,
+    ) -> Self {
+        Self {
+            database_id,
+            key,
+            need: Need::Privileges(Privileges::of(privilege)),
+            denial,
         }
-        ast::Stmt::Update(update) => write_denial(&update.tbl_name),
-        ast::Stmt::Begin { .. }
+    }
+
+    fn owner(database_id: usize, key: ObjectKey, denial: PermissionDenied) -> Self {
+        Self {
+            database_id,
+            key,
+            need: Need::Owner,
+            denial,
+        }
+    }
+
+    fn superuser(denial: PermissionDenied) -> Self {
+        Self {
+            database_id: MAIN_DB_ID,
+            key: ObjectKey::root(ObjectKind::Database, MAIN_SCHEMA_NAME),
+            need: Need::Superuser,
+            denial,
+        }
+    }
+
+    /// Whether `role`, which is not a superuser, meets the requirement.
+    fn is_met_by(&self, role: RoleId, resolver: &Resolver) -> bool {
+        let access = object_access(resolver, self.database_id, &self.key);
+        match self.need {
+            Need::Privileges(privileges) => !access
+                .acl
+                .privileges_of(role)
+                .intersection(privileges)
+                .is_empty(),
+            Need::Owner => access.is_owner(role),
+            Need::Superuser => false,
+        }
+    }
+}
+
+/// The owner and list of the object `key` in database `database_id`. An
+/// object without a list is owned by the superuser and has the default list
+/// of its kind.
+fn object_access(resolver: &Resolver, database_id: usize, key: &ObjectKey) -> ObjectAccess {
+    resolver
+        .with_schema(database_id, |schema| schema.acls.get(key).cloned())
+        .unwrap_or_else(|| ObjectAccess::default_for(key.kind, RoleId::SUPERUSER))
+}
+
+/// Returns what `stmt` needs before it is compiled, or `None` for a
+/// statement whose accesses are all checked on the compiled program.
+fn statement_requirement(stmt: &ast::Stmt, resolver: &Resolver) -> Result<Option<Requirement>> {
+    let requirement = match stmt {
+        ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. }
+        | ast::Stmt::Begin { .. }
         | ast::Stmt::Commit { .. }
         | ast::Stmt::Rollback { .. }
         | ast::Stmt::Savepoint { .. }
-        | ast::Stmt::Release { .. } => return Ok(()),
+        | ast::Stmt::Release { .. } => return Ok(None),
         ast::Stmt::CreateTable {
             temporary: true, ..
         }
@@ -59,97 +151,209 @@ pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
         }
         | ast::Stmt::CreateTrigger {
             temporary: true, ..
-        } => PermissionDenied::privilege(
-            Action::CreateTemporary,
-            Object::Database(MAIN_SCHEMA_NAME.to_string()),
-        ),
-        ast::Stmt::CreateTable { tbl_name, .. } => create_in_schema_denial(tbl_name),
-        ast::Stmt::CreateView { view_name, .. }
-        | ast::Stmt::CreateMaterializedView { view_name, .. } => create_in_schema_denial(view_name),
-        ast::Stmt::CreateVirtualTable(create) => create_in_schema_denial(&create.tbl_name),
-        ast::Stmt::CreateSequence { seq_name, .. } => create_in_schema_denial(seq_name),
-        ast::Stmt::CreateType { .. } | ast::Stmt::CreateDomain { .. } => {
+        } => Requirement::privilege(
+            MAIN_DB_ID,
+            ObjectKey::root(ObjectKind::Database, MAIN_SCHEMA_NAME),
+            Privilege::Temporary,
             PermissionDenied::privilege(
-                Action::Create,
-                Object::Schema(MAIN_SCHEMA_NAME.to_string()),
+                Action::CreateTemporary,
+                Object::Database(MAIN_SCHEMA_NAME.to_string()),
+            ),
+        ),
+        ast::Stmt::CreateTable { tbl_name, .. } => create_in_schema(resolver, tbl_name)?,
+        ast::Stmt::CreateView { view_name, .. }
+        | ast::Stmt::CreateMaterializedView { view_name, .. } => {
+            create_in_schema(resolver, view_name)?
+        }
+        ast::Stmt::CreateVirtualTable(create) => create_in_schema(resolver, &create.tbl_name)?,
+        ast::Stmt::CreateSequence { seq_name, .. } => create_in_schema(resolver, seq_name)?,
+        ast::Stmt::CreateType { type_name, .. } => create_in_schema(
+            resolver,
+            &ast::QualifiedName::single(ast::Name::exact(type_name.clone())),
+        )?,
+        ast::Stmt::CreateDomain { domain_name, .. } => create_in_schema(
+            resolver,
+            &ast::QualifiedName::single(ast::Name::exact(domain_name.clone())),
+        )?,
+        ast::Stmt::CreateIndex { tbl_name, .. } => {
+            let Ok(namespace) = resolver.resolve_existing_table_named(tbl_name.as_str()) else {
+                return Ok(None);
+            };
+            Requirement::owner(
+                namespace.database_id,
+                ObjectKey::new(ObjectKind::Table, namespace.id, tbl_name.as_str()),
+                PermissionDenied::owner(
+                    Action::Alter,
+                    Object::Table(tbl_name.as_str().to_string()),
+                ),
             )
         }
-        ast::Stmt::CreateIndex { tbl_name, .. } => {
-            PermissionDenied::owner(Action::Alter, Object::Table(tbl_name.as_str().to_string()))
+        ast::Stmt::CreateTrigger { tbl_name, .. } => {
+            let Ok(namespace) = resolver.resolve_existing_table(tbl_name) else {
+                return Ok(None);
+            };
+            Requirement::privilege(
+                namespace.database_id,
+                ObjectKey::new(ObjectKind::Table, namespace.id, tbl_name.name.as_str()),
+                Privilege::Trigger,
+                PermissionDenied::privilege(
+                    Action::CreateTrigger,
+                    Object::Table(tbl_name.name.as_str().to_string()),
+                ),
+            )
         }
-        ast::Stmt::CreateTrigger { tbl_name, .. } => PermissionDenied::privilege(
-            Action::CreateTrigger,
-            Object::Table(tbl_name.name.as_str().to_string()),
-        ),
-        ast::Stmt::AlterTable(alter) => PermissionDenied::owner(
-            Action::Alter,
-            Object::Table(alter.name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropTable { tbl_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::Table(tbl_name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropIndex { idx_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::Index(idx_name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropView { view_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::View(view_name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropTrigger { trigger_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::Trigger(trigger_name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropType { type_name, .. } => {
-            PermissionDenied::owner(Action::Drop, Object::Type(type_name.to_string()))
+        ast::Stmt::AlterTable(alter) => {
+            let Ok(namespace) = resolver.resolve_existing_table(&alter.name) else {
+                return Ok(None);
+            };
+            Requirement::owner(
+                namespace.database_id,
+                ObjectKey::new(ObjectKind::Table, namespace.id, alter.name.name.as_str()),
+                PermissionDenied::owner(
+                    Action::Alter,
+                    Object::Table(alter.name.name.as_str().to_string()),
+                ),
+            )
         }
-        ast::Stmt::DropDomain { domain_name, .. } => {
-            PermissionDenied::owner(Action::Drop, Object::Type(domain_name.to_string()))
+        ast::Stmt::DropTable { tbl_name, .. } => {
+            let Ok(namespace) = resolver.resolve_existing_table(tbl_name) else {
+                return Ok(None);
+            };
+            Requirement::owner(
+                namespace.database_id,
+                ObjectKey::new(ObjectKind::Table, namespace.id, tbl_name.name.as_str()),
+                PermissionDenied::owner(
+                    Action::Drop,
+                    Object::Table(tbl_name.name.as_str().to_string()),
+                ),
+            )
         }
-        ast::Stmt::DropSequence { seq_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::Sequence(seq_name.name.as_str().to_string()),
-        ),
-        ast::Stmt::CreateSchema { .. } => database_denial(Action::Create),
-        ast::Stmt::DropSchema { name } => {
-            PermissionDenied::owner(Action::Drop, Object::Schema(name.as_str().to_string()))
+        ast::Stmt::DropView { view_name, .. } => {
+            let Ok(namespace) = resolver.resolve_existing_table(view_name) else {
+                return Ok(None);
+            };
+            Requirement::owner(
+                namespace.database_id,
+                ObjectKey::new(ObjectKind::View, namespace.id, view_name.name.as_str()),
+                PermissionDenied::owner(
+                    Action::Drop,
+                    Object::View(view_name.name.as_str().to_string()),
+                ),
+            )
         }
-        ast::Stmt::CreateRole { role_name } => {
-            PermissionDenied::privilege(Action::Create, Object::Role(role_name.clone()))
+        ast::Stmt::DropIndex { idx_name, .. } => {
+            let Ok(namespace) = resolver.resolve_existing_index(idx_name) else {
+                return Ok(None);
+            };
+            let Some(table_name) = resolver.with_schema(namespace.database_id, |schema| {
+                table_of_index(schema, namespace.id, idx_name.name.as_str())
+            }) else {
+                return Ok(None);
+            };
+            Requirement::owner(
+                namespace.database_id,
+                ObjectKey::new(ObjectKind::Table, namespace.id, table_name),
+                PermissionDenied::owner(
+                    Action::Drop,
+                    Object::Index(idx_name.name.as_str().to_string()),
+                ),
+            )
         }
-        ast::Stmt::Pragma {
-            name,
-            body: Some(_),
-        } => PermissionDenied::privilege(
-            Action::Write,
-            Object::Setting(name.name.as_str().to_string()),
+        ast::Stmt::DropTrigger { trigger_name, .. } => {
+            let Ok(namespace) = resolver.resolve_existing_trigger(trigger_name) else {
+                return Ok(None);
+            };
+            let Some(table_name) = resolver.with_schema(namespace.database_id, |schema| {
+                schema
+                    .get_trigger(namespace.id, trigger_name.name.as_str())
+                    .map(|trigger| trigger.table_name.clone())
+            }) else {
+                return Ok(None);
+            };
+            Requirement::owner(
+                namespace.database_id,
+                ObjectKey::new(ObjectKind::Table, namespace.id, table_name),
+                PermissionDenied::owner(
+                    Action::Drop,
+                    Object::Trigger(trigger_name.name.as_str().to_string()),
+                ),
+            )
+        }
+        ast::Stmt::DropType { type_name, .. } => Requirement::owner(
+            MAIN_DB_ID,
+            ObjectKey::root(ObjectKind::Type, type_name.to_string()),
+            PermissionDenied::owner(Action::Drop, Object::Type(type_name.to_string())),
         ),
-        ast::Stmt::Pragma { name, body: None } => PermissionDenied::privilege(
-            Action::Read,
-            Object::Setting(name.name.as_str().to_string()),
+        ast::Stmt::DropDomain { domain_name, .. } => Requirement::owner(
+            MAIN_DB_ID,
+            ObjectKey::root(ObjectKind::Type, domain_name.to_string()),
+            PermissionDenied::owner(Action::Drop, Object::Type(domain_name.to_string())),
         ),
-        ast::Stmt::Analyze { .. } => database_denial(Action::Analyze),
-        ast::Stmt::Vacuum { .. } => database_denial(Action::Vacuum),
-        ast::Stmt::Reindex { .. } => database_denial(Action::Reindex),
-        ast::Stmt::Optimize { .. } => database_denial(Action::Optimize),
-        ast::Stmt::Attach { .. } => database_denial(Action::Attach),
-        ast::Stmt::Detach { .. } => database_denial(Action::Detach),
+        ast::Stmt::DropSequence { seq_name, .. } => {
+            let Ok(namespace) = resolver.resolve_existing_sequence(seq_name.name.as_str()) else {
+                return Ok(None);
+            };
+            Requirement::owner(
+                namespace.database_id,
+                ObjectKey::new(ObjectKind::Sequence, namespace.id, seq_name.name.as_str()),
+                PermissionDenied::owner(
+                    Action::Drop,
+                    Object::Sequence(seq_name.name.as_str().to_string()),
+                ),
+            )
+        }
+        ast::Stmt::CreateSchema { .. } => Requirement::privilege(
+            MAIN_DB_ID,
+            ObjectKey::root(ObjectKind::Database, MAIN_SCHEMA_NAME),
+            Privilege::Create,
+            database_denial(Action::Create),
+        ),
+        ast::Stmt::DropSchema { name } => Requirement::owner(
+            MAIN_DB_ID,
+            ObjectKey::root(ObjectKind::Schema, name.as_str()),
+            PermissionDenied::owner(Action::Drop, Object::Schema(name.as_str().to_string())),
+        ),
+        ast::Stmt::CreateRole { role_name } => Requirement::superuser(PermissionDenied::privilege(
+            Action::Create,
+            Object::Role(role_name.clone()),
+        )),
+        ast::Stmt::Pragma { name, body } => {
+            let setting = name.name.as_str().to_lowercase();
+            let (privilege, action) = match body {
+                Some(_) => (Privilege::Set, Action::Write),
+                None => (Privilege::Select, Action::Read),
+            };
+            Requirement::privilege(
+                MAIN_DB_ID,
+                ObjectKey::root(ObjectKind::Setting, setting.clone()),
+                privilege,
+                PermissionDenied::privilege(action, Object::Setting(setting)),
+            )
+        }
+        ast::Stmt::Analyze { .. } => Requirement::superuser(database_denial(Action::Analyze)),
+        ast::Stmt::Vacuum { .. } => Requirement::superuser(database_denial(Action::Vacuum)),
+        ast::Stmt::Reindex { .. } => Requirement::superuser(database_denial(Action::Reindex)),
+        ast::Stmt::Optimize { .. } => Requirement::superuser(database_denial(Action::Optimize)),
+        ast::Stmt::Attach { .. } => Requirement::superuser(database_denial(Action::Attach)),
+        ast::Stmt::Detach { .. } => Requirement::superuser(database_denial(Action::Detach)),
     };
-    Err(permission_denied(denial))
+    Ok(Some(requirement))
 }
 
-fn write_denial(tbl_name: &ast::QualifiedName) -> PermissionDenied {
-    PermissionDenied::privilege(
-        Action::Write,
-        Object::Table(tbl_name.name.as_str().to_string()),
-    )
-}
-
-/// Fails if the statement is compiled for a role that is not a superuser,
-/// which may not change `sequence` with `nextval()` or `setval()`.
-pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Result<()> {
-    if !resolver.role_is_not_superuser {
+/// Fails if the statement is checked against a role that may not change
+/// `sequence` with `nextval()` or `setval()`. The check runs when the call
+/// is compiled, so a call in a view is checked too.
+pub(crate) fn check_sequence_change(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    sequence: &str,
+) -> Result<()> {
+    let Some(role) = resolver.checked_role else {
+        return Ok(());
+    };
+    let key = ObjectKey::new(ObjectKind::Sequence, namespace.id, sequence);
+    let privileges = Privileges::from_iter([Privilege::Usage, Privilege::Update]);
+    if holds_any(resolver, role, namespace.database_id, &key, privileges) {
         return Ok(());
     }
     Err(permission_denied(PermissionDenied::privilege(
@@ -158,12 +362,22 @@ pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Resu
     )))
 }
 
-/// Fails if the statement is compiled for a role that is not a superuser,
-/// which may not read a table-valued PRAGMA function. The function runs
-/// `pragma_name` as a statement of the engine's own, which is not checked, so
-/// the PRAGMA is checked here as if it was run directly.
+/// Fails if the statement is checked against a role that may not read a
+/// table-valued PRAGMA function. The function runs `pragma_name` as a
+/// statement of the engine's own, which is not checked, so the PRAGMA is
+/// checked here as if it was run directly.
 pub(crate) fn check_pragma_function(resolver: &Resolver, pragma_name: &str) -> Result<()> {
-    if !resolver.role_is_not_superuser {
+    let Some(role) = resolver.checked_role else {
+        return Ok(());
+    };
+    let key = ObjectKey::root(ObjectKind::Setting, pragma_name.to_lowercase());
+    if holds_any(
+        resolver,
+        role,
+        MAIN_DB_ID,
+        &key,
+        Privileges::of(Privilege::Select),
+    ) {
         return Ok(());
     }
     Err(permission_denied(PermissionDenied::privilege(
@@ -172,22 +386,81 @@ pub(crate) fn check_pragma_function(resolver: &Resolver, pragma_name: &str) -> R
     )))
 }
 
-fn create_in_schema_denial(name: &ast::QualifiedName) -> PermissionDenied {
-    let schema = name
-        .namespace
-        .as_ref()
-        .map_or(MAIN_SCHEMA_NAME, |namespace| namespace.as_str());
-    PermissionDenied::privilege(Action::Create, Object::Schema(schema.to_string()))
+/// Whether `role` holds any of `privileges` on the object `key`.
+fn holds_any(
+    resolver: &Resolver,
+    role: RoleId,
+    database_id: usize,
+    key: &ObjectKey,
+    privileges: Privileges,
+) -> bool {
+    !object_access(resolver, database_id, key)
+        .acl
+        .privileges_of(role)
+        .intersection(privileges)
+        .is_empty()
+}
+
+/// The requirement for creating an object named `name`: the `CREATE`
+/// privilege on the schema it is created in.
+fn create_in_schema(resolver: &Resolver, name: &ast::QualifiedName) -> Result<Requirement> {
+    let namespace = resolver.resolve_namespace_for_create(name)?;
+    let schema_name = schema_name_of(resolver, namespace);
+    Ok(Requirement::privilege(
+        namespace.database_id,
+        ObjectKey::root(ObjectKind::Schema, schema_name.clone()),
+        Privilege::Create,
+        PermissionDenied::privilege(Action::Create, Object::Schema(schema_name)),
+    ))
+}
+
+/// The name of a namespace: the database's name for its root, such as
+/// `main`, or the schema's name.
+fn schema_name_of(resolver: &Resolver, namespace: NamespaceRef) -> String {
+    if namespace.id.is_root() {
+        return resolver
+            .namespace_name(namespace.database_id)
+            .unwrap_or_else(|| MAIN_SCHEMA_NAME.to_string());
+    }
+    resolver
+        .with_schema(namespace.database_id, |schema| {
+            schema.namespace_name(namespace.id).map(str::to_string)
+        })
+        .unwrap_or_else(|| MAIN_SCHEMA_NAME.to_string())
+}
+
+fn table_of_index(schema: &Schema, namespace: NamespaceId, index_name: &str) -> Option<String> {
+    schema.tables(namespace).find_map(|table| {
+        let btree = table.btree()?;
+        schema
+            .get_indices(namespace, &btree.name)
+            .any(|index| index.name == index_name)
+            .then(|| btree.name.clone())
+    })
 }
 
 fn database_denial(action: Action) -> PermissionDenied {
     PermissionDenied::privilege(action, Object::Database(MAIN_SCHEMA_NAME.to_string()))
 }
 
+/// The privilege a statement needs on a table it writes.
+pub fn write_privilege(stmt: &ast::Stmt) -> Privilege {
+    match stmt {
+        ast::Stmt::Update(_) => Privilege::Update,
+        ast::Stmt::Delete { .. } => Privilege::Delete,
+        _ => Privilege::Insert,
+    }
+}
+
 /// Fails if the compiled program reads or writes a database object that the
-/// current role has no privileges on.
-pub fn check_storage_access(program: &ProgramBuilder, resolver: &Resolver) -> Result<()> {
-    match storage_denial(program, resolver) {
+/// current role has no privileges on. `write` is the privilege the program
+/// needs on a table it writes.
+pub fn check_storage_access(
+    program: &ProgramBuilder,
+    resolver: &Resolver,
+    write: Privilege,
+) -> Result<()> {
+    match storage_denial(program, resolver, write) {
         None => Ok(()),
         Some(denial) => Err(permission_denied(denial)),
     }
@@ -199,77 +472,146 @@ pub fn check_storage_access(program: &ProgramBuilder, resolver: &Resolver) -> Re
 /// being checked. A trigger or foreign-key action is compiled into a
 /// subprogram, whose denial the subprogram's compiler records in `program`
 /// and which is returned after the program's own accesses pass.
-pub fn storage_denial(program: &ProgramBuilder, resolver: &Resolver) -> Option<PermissionDenied> {
-    if !resolver.role_is_not_superuser {
-        return None;
+pub fn storage_denial(
+    program: &ProgramBuilder,
+    resolver: &Resolver,
+    write: Privilege,
+) -> Option<PermissionDenied> {
+    let role = resolver.checked_role?;
+    let allows = |database_id: usize, key: &ObjectKey, privileges: Privileges| {
+        !object_access(resolver, database_id, key)
+            .acl
+            .privileges_of(role)
+            .intersection(privileges)
+            .is_empty()
+    };
+    for (namespace, view_name) in &program.referenced_views {
+        let key = ObjectKey::new(ObjectKind::View, namespace.id, view_name.as_str());
+        if !allows(
+            namespace.database_id,
+            &key,
+            Privileges::of(Privilege::Select),
+        ) {
+            return Some(PermissionDenied::privilege(
+                Action::Read,
+                Object::View(view_name.clone()),
+            ));
+        }
     }
-    if let Some(view_name) = program.referenced_views.first() {
-        return Some(PermissionDenied::privilege(
-            Action::Read,
-            Object::View(view_name.clone()),
-        ));
-    }
-    if let Some(virtual_table) = program.written_virtual_tables.first() {
-        return Some(PermissionDenied::privilege(
-            Action::Write,
-            Object::Table(virtual_table.name.clone()),
-        ));
+    for virtual_table in &program.written_virtual_tables {
+        let key = ObjectKey::root(ObjectKind::Table, virtual_table.name.as_str());
+        if !allows(MAIN_DB_ID, &key, Privileges::of(write)) {
+            return Some(PermissionDenied::privilege(
+                Action::Write,
+                Object::Table(virtual_table.name.clone()),
+            ));
+        }
     }
     for (insn, _) in &program.insns {
         let (action, db, root_page) = match insn {
-            Insn::OpenRead { db, root_page, .. } => (Action::Read, *db, Some(*root_page)),
+            Insn::OpenRead { db, root_page, .. } => (Action::Read, *db, *root_page),
             Insn::OpenWrite {
                 db,
                 root_page: RegisterOrLiteral::Literal(root_page),
                 ..
-            } => (Action::Write, *db, Some(*root_page)),
-            Insn::OpenWrite { db, .. } => (Action::Write, *db, None),
-            Insn::ClearBtree { db, root, .. } | Insn::Destroy { db, root, .. } => {
-                (Action::Write, *db, Some(*root))
-            }
-            Insn::CreateBtree { db, .. } => (Action::Write, *db, None),
+            } => (Action::Write, *db, *root_page),
+            Insn::ClearBtree { db, root, .. } => (Action::Write, *db, *root),
+            // A table being created or destroyed was checked with the
+            // statement, and its root page is not in the schema yet.
             _ => continue,
         };
-        let object = root_page
-            .and_then(|root_page| {
-                resolver.with_schema(db, |schema| object_with_root_page(schema, root_page))
-            })
-            .unwrap_or(Object::Storage);
-        if action == Action::Read && is_catalog_table(&object) {
+        let stored = resolver.with_schema(db, |schema| object_with_root_page(schema, root_page));
+        let (key, object) = match stored {
+            StoredObject::Object { key, object } => (key, object),
+            StoredObject::EngineOwned => continue,
+            StoredObject::Unknown => {
+                return Some(PermissionDenied::privilege(action, Object::Storage))
+            }
+        };
+        if action == Action::Write && crate::schema::is_system_table(&key.name) {
+            // The engine writes the schema and its own bookkeeping tables
+            // on behalf of a statement that was checked already.
             continue;
         }
-        return Some(PermissionDenied::privilege(action, object));
+        let privileges = match (key.kind, action) {
+            (ObjectKind::Sequence, Action::Read) => {
+                Privileges::from_iter([Privilege::Usage, Privilege::Select])
+            }
+            (ObjectKind::Sequence, _) => {
+                Privileges::from_iter([Privilege::Usage, Privilege::Update])
+            }
+            (_, Action::Read) => Privileges::of(Privilege::Select),
+            (_, _) => Privileges::of(write),
+        };
+        if !allows(db, &key, privileges) {
+            return Some(PermissionDenied::privilege(action, object));
+        }
     }
     for virtual_table in &program.opened_virtual_tables {
-        let readable = match &virtual_table.vtab_type {
-            VirtualTableType::Internal(table) => table.read().readable_without_privileges(),
-            VirtualTableType::External(table) => table.readable_without_privileges(),
-            VirtualTableType::Pragma(_) => false,
-        };
-        if !readable {
-            return Some(match virtual_table.kind {
-                VTabKind::TableValuedFunction => PermissionDenied::privilege(
-                    Action::Execute,
-                    Object::Function(virtual_table.name.clone()),
-                ),
-                VTabKind::VirtualTable => PermissionDenied::privilege(
-                    Action::Read,
-                    Object::Table(virtual_table.name.clone()),
-                ),
-            });
+        let (key, privilege, denial) = virtual_table_requirement(resolver, virtual_table);
+        if !allows(MAIN_DB_ID, &key, Privileges::of(privilege)) {
+            return Some(denial);
         }
     }
     program.subprogram_denial.clone()
+}
+
+/// What reading a virtual table needs. A `pragma_*()` function is the
+/// setting it shows. A table-valued function is a function, unless the
+/// dialect registered the privileges of a table under its name, as it does
+/// for a catalog table. Anything else is a table.
+fn virtual_table_requirement(
+    resolver: &Resolver,
+    virtual_table: &VirtualTable,
+) -> (ObjectKey, Privilege, PermissionDenied) {
+    let name = virtual_table.name.as_str();
+    if let VirtualTableType::Pragma(_) = &virtual_table.vtab_type {
+        let setting = name.strip_prefix("pragma_").unwrap_or(name).to_lowercase();
+        return (
+            ObjectKey::root(ObjectKind::Setting, setting),
+            Privilege::Select,
+            PermissionDenied::privilege(Action::Execute, Object::Function(name.to_string())),
+        );
+    }
+    let (namespace, bare_name) = resolver.schema().demangle_name(name);
+    let table_key = ObjectKey::new(ObjectKind::Table, namespace, bare_name);
+    let registered_as_table = resolver.schema().acls.get(&table_key).is_some();
+    if virtual_table.kind == VTabKind::TableValuedFunction && !registered_as_table {
+        return (
+            ObjectKey::root(ObjectKind::Function, name),
+            Privilege::Execute,
+            PermissionDenied::privilege(Action::Execute, Object::Function(name.to_string())),
+        );
+    }
+    (
+        table_key,
+        Privilege::Select,
+        PermissionDenied::privilege(Action::Read, Object::Table(bare_name.to_string())),
+    )
 }
 
 fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
 }
 
+/// What a root page holds, for a privilege check.
+enum StoredObject {
+    Object {
+        key: ObjectKey,
+        /// How a denial names the object.
+        object: Object,
+    },
+    /// Bookkeeping the engine keeps for other objects, such as the state of
+    /// a materialized view, which the privileges of those objects cover.
+    EngineOwned,
+    /// No object of the schema has this root page.
+    Unknown,
+}
+
 /// Returns the object stored at `root_page`. An index is reported as the
-/// table it belongs to.
-fn object_with_root_page(schema: &Schema, root_page: i64) -> Option<Object> {
-    let (namespace, table_name) = schema.namespace_ids().find_map(|namespace| {
+/// table it belongs to, and the backing table of a sequence as the sequence.
+fn object_with_root_page(schema: &Schema, root_page: i64) -> StoredObject {
+    let found = schema.namespace_ids().find_map(|namespace| {
         schema.tables(namespace).find_map(|table| {
             let btree = table.btree()?;
             let has_root_page = btree.root_page == root_page
@@ -278,28 +620,32 @@ fn object_with_root_page(schema: &Schema, root_page: i64) -> Option<Object> {
                     .any(|index| index.root_page == root_page);
             has_root_page.then(|| (namespace, btree.name.clone()))
         })
-    })?;
+    });
+    let Some((namespace, table_name)) = found else {
+        return StoredObject::Unknown;
+    };
     if let Some(sequence_name) = table_name.strip_prefix(SEQ_BACKING_TABLE_PREFIX) {
-        let (_, sequence_name) = schema.demangle_name(sequence_name);
-        return Some(Object::Sequence(sequence_name.to_string()));
+        let (sequence_namespace, sequence_name) = schema.demangle_name(sequence_name);
+        return StoredObject::Object {
+            key: ObjectKey::new(ObjectKind::Sequence, sequence_namespace, sequence_name),
+            object: Object::Sequence(sequence_name.to_string()),
+        };
+    }
+    if crate::schema::is_materialized_view_state_table(&table_name)
+        || table_name == crate::schema::SQLITE_SEQUENCE_TABLE_NAME
+    {
+        return StoredObject::EngineOwned;
     }
     if schema.is_materialized_view(namespace, &table_name) {
-        return Some(Object::MaterializedView(table_name));
+        return StoredObject::Object {
+            key: ObjectKey::new(ObjectKind::View, namespace, table_name.as_str()),
+            object: Object::MaterializedView(table_name),
+        };
     }
-    Some(Object::Table(table_name))
-}
-
-fn is_catalog_table(object: &Object) -> bool {
-    matches!(
-        object,
-        Object::Table(name)
-            if [
-                crate::schema::SCHEMA_TABLE_NAME,
-                crate::schema::TURSO_TYPES_TABLE_NAME,
-                ROLES_TABLE_NAME,
-            ]
-            .contains(&name.as_str())
-    )
+    StoredObject::Object {
+        key: ObjectKey::new(ObjectKind::Table, namespace, table_name.as_str()),
+        object: Object::Table(table_name),
+    }
 }
 
 /// Creates a role that is not a superuser and cannot log in.
@@ -551,68 +897,32 @@ mod tests {
     }
 
     #[test]
-    fn role_without_privileges_may_read_native_virtual_tables_that_allow_it() {
+    fn a_virtual_table_is_a_table_and_a_table_valued_function_is_a_function() {
         let options = OpenOptions::new(Arc::new(SqliteWithRoles))
-            .native_module(
-                "open_rows",
-                VTabKind::VirtualTable,
-                EmptyModule { readable: true },
-            )
-            .native_module(
-                "closed_rows",
-                VTabKind::VirtualTable,
-                EmptyModule { readable: false },
-            );
+            .native_module("rows", VTabKind::VirtualTable, EmptyModule)
+            .native_module("rows_of", VTabKind::TableValuedFunction, EmptyModule);
         let conn = connect_with_roles_and(options);
-        conn.execute("CREATE VIRTUAL TABLE open_table USING open_rows")
-            .unwrap();
-        conn.execute("CREATE VIRTUAL TABLE closed_table USING closed_rows")
+        conn.execute("CREATE VIRTUAL TABLE rows_table USING rows")
             .unwrap();
         become_new_role(&conn, "alice");
 
-        conn.execute("SELECT * FROM open_table").unwrap();
-        let closed = conn.execute("SELECT * FROM closed_table").unwrap_err();
+        // Nothing granted SELECT on the table; every role may execute a
+        // function by default.
+        let table = conn.execute("SELECT * FROM rows_table").unwrap_err();
         assert_eq!(
-            denial(closed),
-            PermissionDenied::privilege(Action::Read, Object::Table("closed_table".to_string()))
+            denial(table),
+            PermissionDenied::privilege(Action::Read, Object::Table("rows_table".to_string()))
         );
+        conn.execute("SELECT * FROM rows_of()").unwrap();
     }
 
     #[test]
-    fn role_without_privileges_may_use_only_native_table_valued_functions_that_allow_it() {
-        let options = OpenOptions::new(Arc::new(SqliteWithRoles))
-            .native_module(
-                "open_rows",
-                VTabKind::TableValuedFunction,
-                EmptyModule { readable: true },
-            )
-            .native_module(
-                "closed_rows",
-                VTabKind::TableValuedFunction,
-                EmptyModule { readable: false },
-            );
-        let conn = connect_with_roles_and(options);
-        become_new_role(&conn, "alice");
-
-        conn.execute("SELECT * FROM open_rows()").unwrap();
-        let closed = conn.execute("SELECT * FROM closed_rows()").unwrap_err();
-        assert_eq!(
-            denial(closed),
-            PermissionDenied::privilege(
-                Action::Execute,
-                Object::Function("closed_rows".to_string())
-            )
-        );
-    }
-
-    #[test]
-    fn role_without_privileges_may_use_only_extension_table_valued_functions_that_allow_it() {
+    fn an_extension_table_valued_function_is_a_function_too() {
         // A table-valued function registered through a connection is added
         // to the database's schema, which the next connection starts from.
         let registering_conn = connect_with_roles();
         registering_conn.register_static_extension(|api| unsafe {
-            OpenExtensionRows::register_OpenExtensionRows(api);
-            ClosedExtensionRows::register_ClosedExtensionRows(api);
+            ExtensionRows::register_ExtensionRows(api);
         });
         let conn = registering_conn
             .db
@@ -620,18 +930,40 @@ mod tests {
             .unwrap();
         become_new_role(&conn, "alice");
 
-        conn.execute("SELECT * FROM open_extension_rows()").unwrap();
+        conn.execute("SELECT * FROM extension_rows()").unwrap();
         #[cfg(feature = "series")]
         conn.execute("SELECT * FROM generate_series(1, 3)").unwrap();
-        let closed = conn
-            .execute("SELECT * FROM closed_extension_rows()")
-            .unwrap_err();
+    }
+
+    #[test]
+    fn functions_registered_as_superuser_only_are_denied() {
+        let conn = connect_with_roles();
+        conn.set_load_extension_enabled(true);
+        become_new_role(&conn, "alice");
+
+        let error = conn.execute("SELECT load_extension('x')").unwrap_err();
         assert_eq!(
-            denial(closed),
+            denial(error),
             PermissionDenied::privilege(
                 Action::Execute,
-                Object::Function("closed_extension_rows".to_string())
+                Object::Function("load_extension".to_string())
             )
+        );
+    }
+
+    #[test]
+    fn every_role_may_read_the_catalog_tables() {
+        let conn = connect_with_roles();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        become_new_role(&conn, "alice");
+
+        conn.execute("SELECT name FROM sqlite_schema").unwrap();
+        conn.execute("SELECT name FROM __turso_internal_roles")
+            .unwrap();
+        let error = conn.execute("SELECT x FROM t").unwrap_err();
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Read, Object::Table("t".to_string()))
         );
     }
 
@@ -649,24 +981,24 @@ mod tests {
             .unwrap();
         conn.execute("CREATE TABLE child (pid REFERENCES parent(id) ON DELETE CASCADE)")
             .unwrap();
-        become_new_role(&conn, "alice");
+        let alice = become_new_role(&conn, "alice");
 
         assert_eq!(
-            subprogram_denial(&conn, "INSERT INTO log VALUES (1)"),
+            subprogram_denial(&conn, alice, "INSERT INTO log VALUES (1)"),
             Some(PermissionDenied::privilege(
                 Action::Read,
                 Object::Table("secret".to_string())
             ))
         );
         assert_eq!(
-            subprogram_denial(&conn, "DELETE FROM parent"),
+            subprogram_denial(&conn, alice, "DELETE FROM parent"),
             Some(PermissionDenied::privilege(
                 Action::Write,
                 Object::Table("child".to_string())
             ))
         );
         assert_eq!(
-            subprogram_denial(&conn, "INSERT INTO secret VALUES (1)"),
+            subprogram_denial(&conn, alice, "INSERT INTO secret VALUES (1)"),
             None
         );
     }
@@ -675,7 +1007,11 @@ mod tests {
     /// returns the denial recorded from the statement's subprograms. The
     /// statement's own accesses are denied first, so the subprograms can only
     /// be checked this way until privileges can be granted.
-    fn subprogram_denial(conn: &Arc<Connection>, sql: &str) -> Option<PermissionDenied> {
+    fn subprogram_denial(
+        conn: &Arc<Connection>,
+        role: crate::security::roles::RoleId,
+        sql: &str,
+    ) -> Option<PermissionDenied> {
         use crate::translate::emitter::Resolver;
         use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
 
@@ -697,7 +1033,7 @@ mod tests {
             conn.dialect(),
             None,
         );
-        resolver.role_is_not_superuser = true;
+        resolver.checked_role = Some(role);
         let mut program =
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 32, 2));
         program.set_mvcc_enabled(conn.mvcc_enabled());
@@ -707,11 +1043,11 @@ mod tests {
     }
 
     #[test]
-    fn role_without_privileges_cannot_change_virtual_tables_it_may_read() {
+    fn role_without_privileges_cannot_change_virtual_tables() {
         let options = OpenOptions::new(Arc::new(SqliteWithRoles)).native_module(
             "open_rows",
             VTabKind::VirtualTable,
-            EmptyModule { readable: true },
+            EmptyModule,
         );
         let conn = connect_with_roles_and(options);
         conn.execute("CREATE VIRTUAL TABLE open_table USING open_rows")
@@ -779,9 +1115,7 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct EmptyModule {
-        readable: bool,
-    }
+    struct EmptyModule;
 
     impl VirtualTableModule for EmptyModule {
         type Table = EmptyTable;
@@ -791,16 +1125,12 @@ mod tests {
         }
 
         fn create(&self, _args: &[Value]) -> crate::Result<Self::Table> {
-            Ok(EmptyTable {
-                readable: self.readable,
-            })
+            Ok(EmptyTable)
         }
     }
 
     #[derive(Debug)]
-    struct EmptyTable {
-        readable: bool,
-    }
+    struct EmptyTable;
 
     impl VirtualTable for EmptyTable {
         type Cursor = EmptyCursor;
@@ -819,10 +1149,6 @@ mod tests {
 
         fn readonly(&self) -> bool {
             false
-        }
-
-        fn readable_without_privileges(&self) -> bool {
-            self.readable
         }
 
         fn create_update(&mut self, _args: Vec<Value>) -> crate::Result<Box<dyn TableUpdate>> {
@@ -863,30 +1189,13 @@ mod tests {
         }
     }
 
-    /// A table-valued function of a C extension that says a role without
-    /// privileges may read it.
+    /// A table-valued function of a C extension.
     #[derive(Debug, Default, VTabModuleDerive)]
-    struct OpenExtensionRows;
+    struct ExtensionRows;
 
-    impl VTabModule for OpenExtensionRows {
+    impl VTabModule for ExtensionRows {
         type Table = ExtensionTable;
-        const NAME: &'static str = "open_extension_rows";
-        const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
-        const READABLE_WITHOUT_PRIVILEGES: bool = true;
-
-        fn create(_args: &[turso_ext::Value]) -> Result<(String, Self::Table), ResultCode> {
-            Ok(("CREATE TABLE x(value INTEGER)".to_string(), ExtensionTable))
-        }
-    }
-
-    /// A table-valued function of a C extension that keeps the default, like
-    /// one written before roles existed.
-    #[derive(Debug, Default, VTabModuleDerive)]
-    struct ClosedExtensionRows;
-
-    impl VTabModule for ClosedExtensionRows {
-        type Table = ExtensionTable;
-        const NAME: &'static str = "closed_extension_rows";
+        const NAME: &'static str = "extension_rows";
         const VTAB_KIND: VTabKind = VTabKind::TableValuedFunction;
 
         fn create(_args: &[turso_ext::Value]) -> Result<(String, Self::Table), ResultCode> {

@@ -384,9 +384,6 @@ impl ExtVirtualTable {
     pub(crate) fn readonly(&self) -> bool {
         self.implementation.readonly
     }
-    pub(crate) fn readable_without_privileges(&self) -> bool {
-        self.implementation.readable_without_privileges
-    }
     pub(crate) fn best_index(
         &self,
         constraints: &[ConstraintInfo],
@@ -634,12 +631,6 @@ pub trait InternalVirtualTable: std::fmt::Debug + Send + Sync {
         order_by: &[turso_ext::OrderByInfo],
     ) -> Result<turso_ext::IndexInfo, ResultCode>;
     fn sql(&self) -> String;
-    /// Whether a role that is not a superuser may read this table. A table
-    /// that reads stored data directly, without the privilege checks on
-    /// tables, must keep the default.
-    fn readable_without_privileges(&self) -> bool {
-        false
-    }
 }
 
 pub trait InternalVirtualTableCursor: Send + Sync {

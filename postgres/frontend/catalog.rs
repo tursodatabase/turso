@@ -1218,10 +1218,6 @@ impl VirtualTableModule for EmptyPgCatalogTable {
 impl VirtualTable for EmptyPgCatalogTable {
     type Cursor = EmptyPgCatalogCursor;
 
-    fn readable_without_privileges(&self) -> bool {
-        true
-    }
-
     fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(EmptyPgCatalogCursor)
     }
@@ -2362,7 +2358,12 @@ impl SnapshotRows for PgSequencesTable {
                 let seq_name = seq.name.clone();
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
-                let last_value = if conn.current_role_is_superuser() {
+                let may_read = conn.current_role_may(
+                    turso_core::MAIN_DB_ID,
+                    &ObjectKey::new(ObjectKind::Sequence, namespace, seq_name.as_str()),
+                    Privileges::from_iter([Privilege::Usage, Privilege::Select]),
+                );
+                let last_value = if may_read {
                     Value::from_i64(
                         conn.get_sequence_currval(
                             turso_core::MAIN_DB_ID,
@@ -3263,10 +3264,6 @@ impl<T: SnapshotRows> VirtualTableModule for SnapshotCatalog<T> {
 impl<T: SnapshotRows> VirtualTable for SnapshotCatalog<T> {
     type Cursor = SnapshotCursor;
 
-    fn readable_without_privileges(&self) -> bool {
-        true
-    }
-
     fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(SnapshotCursor {
             conn,
@@ -3474,10 +3471,6 @@ impl VirtualTableCursor for PgInputErrorInfoCursor {
 
 impl VirtualTable for PgInputErrorInfoTable {
     type Cursor = PgInputErrorInfoCursor;
-
-    fn readable_without_privileges(&self) -> bool {
-        true
-    }
 
     fn open(&self, _conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(PgInputErrorInfoCursor::new())
@@ -3736,10 +3729,6 @@ impl VirtualTableCursor for PgGetTableDefCursor {
 
 impl VirtualTable for PgGetTableDefTable {
     type Cursor = PgGetTableDefCursor;
-
-    fn readable_without_privileges(&self) -> bool {
-        true
-    }
 
     fn open(&self, conn: Arc<Connection>) -> Result<Self::Cursor> {
         Ok(PgGetTableDefCursor::new(conn))

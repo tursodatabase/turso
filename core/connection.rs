@@ -4,7 +4,8 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
-use crate::security::acl_catalog::{ACL_TABLE_NAME, SELECT_ACL_SQL};
+use crate::security::acl_catalog::{ObjectKey, ACL_TABLE_NAME, SELECT_ACL_SQL};
+use crate::security::privilege::{ObjectAccess, Privileges};
 use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
@@ -3692,6 +3693,41 @@ impl Connection {
 
     pub fn current_role_is_superuser(&self) -> bool {
         self.role_catalog().is_superuser(self.current_role())
+    }
+
+    /// Whether the current role holds any of `privileges` on the object
+    /// `key` of database `database_id`. A superuser holds every privilege,
+    /// and an object without a list has the default list of its kind.
+    pub fn current_role_may(
+        &self,
+        database_id: usize,
+        key: &ObjectKey,
+        privileges: Privileges,
+    ) -> bool {
+        if self.current_role_is_superuser() {
+            return true;
+        }
+        !self
+            .object_access(database_id, key)
+            .acl
+            .privileges_of(self.current_role())
+            .intersection(privileges)
+            .is_empty()
+    }
+
+    /// Whether the current role owns the object `key` of database
+    /// `database_id`, or is a superuser.
+    pub fn current_role_owns(&self, database_id: usize, key: &ObjectKey) -> bool {
+        self.current_role_is_superuser()
+            || self
+                .object_access(database_id, key)
+                .is_owner(self.current_role())
+    }
+
+    fn object_access(&self, database_id: usize, key: &ObjectKey) -> ObjectAccess {
+        self.maybe_update_schema();
+        self.with_schema(database_id, |schema| schema.acls.get(key).cloned())
+            .unwrap_or_else(|| ObjectAccess::default_for(key.kind, RoleId::SUPERUSER))
     }
 
     /// Statements prepared under the previous role are prepared again, because

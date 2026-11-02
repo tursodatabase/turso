@@ -159,15 +159,12 @@ pub fn translate(
     })?;
 
     let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
-    if check_privileges
-        && !resolver
-            .schema()
-            .roles
-            .is_superuser(connection.current_role())
-    {
-        resolver.role_is_not_superuser = true;
-        roles::check_statement_privileges(&stmt)?;
+    let role = connection.current_role();
+    if check_privileges && !resolver.schema().roles.is_superuser(role) {
+        resolver.checked_role = Some(role);
+        roles::check_statement_privileges(&stmt, &resolver)?;
     }
+    let write_privilege = roles::write_privilege(&stmt);
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -186,7 +183,7 @@ pub fn translate(
 
     program.epilogue(schema);
 
-    roles::check_storage_access(&program, &resolver)?;
+    roles::check_storage_access(&program, &resolver, write_privilege)?;
 
     program.build(connection, change_cnt_on, input)
 }

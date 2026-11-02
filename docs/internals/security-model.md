@@ -11,11 +11,12 @@ what the role is allowed to do. Turso has no authentication; instead, it assumes
 the host program handles it.
 
 > [!NOTE]
-> Roles are implemented. Privileges, including ownership, are in scope: the
-> checks that enforce them exist, but nothing can grant them yet, so a role
-> that is not a superuser has none. Row-level security is in scope and not
-> implemented. Authentication is out of scope for Core: it belongs to the host
-> program or the frontend.
+> Roles and privileges are implemented: every object has an owner and an
+> access control list, and the checks consult them. `GRANT` and `REVOKE` do
+> not exist yet, so a role that is not a superuser holds only what every role
+> holds by default. Row-level security is in scope and not implemented.
+> Authentication is out of scope for Core: it belongs to the host program or
+> the frontend.
 
 ## Glossary
 
@@ -28,7 +29,8 @@ the host program handles it.
 | **Current role**       | The role a connection's statements are checked against; the session role until `SET ROLE`.   |
 | **Frontend**           | The SQL dialect layer on top of Core, such as the SQLite or Postgres frontend.               |
 | **Host program**       | The program that embeds Turso Database and opens connections. Trusted.                       |
-| **Owner**              | The role that created an object.                                                             |
+| **Access control list**| The privileges every role holds on one object, and who granted them. ACL for short.          |
+| **Owner**              | The role that created an object. It holds every privilege on it and may grant them.          |
 | **Privilege**          | Permission for a role to do one action on one object, such as reading a table.               |
 | **Privilege check**    | The check that denies a statement whose current role lacks a privilege it needs.             |
 | **Role**               | An identity that statements are checked against.                                             |
@@ -76,13 +78,13 @@ Turso does not defend against:
 - bugs in code the host program runs with the connection, such as native
   extensions.
 
-| Area               | Status                                        |
-|--------------------|-----------------------------------------------|
-| Roles              | In scope, implemented                         |
-| Privileges         | In scope, checks implemented, granting is not |
-| Ownership          | In scope, not implemented                     |
-| Row-level security | In scope, not implemented                     |
-| Authentication     | Out of scope for Core                         |
+| Area               | Status                                                  |
+|--------------------|---------------------------------------------------------|
+| Roles              | In scope, implemented                                   |
+| Privileges         | In scope, lists and checks implemented, `GRANT` is not  |
+| Ownership          | In scope, stored; `CREATE` does not record it yet       |
+| Row-level security | In scope, not implemented                               |
+| Authentication     | Out of scope for Core                                   |
 
 ## Authentication
 
@@ -200,11 +202,39 @@ A denial is data, not a message: the action that was denied, the object it was
 denied on, and whether the role lacked a privilege or was not the owner. Each
 frontend turns that into the wording its users expect.
 
-Privileges cannot be granted yet and objects have no owner, so a role that is
-not a superuser has no privileges on any database object. It may run statements
-that touch no object, such as `SELECT 1`, switch roles, and read the catalogs.
-The checks below are written so that adding granted privileges and ownership
-later changes what is allowed, not where the checks run.
+### Privileges and access control lists
+
+A privilege is a right to do one kind of action on one object. Which
+privileges an object can have depends on its kind, as in PostgreSQL: a table
+or view has `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`
+and `TRIGGER`; a sequence `USAGE`, `SELECT` and `UPDATE`; a function
+`EXECUTE`; a schema `USAGE` and `CREATE`; the database `CREATE` and
+`TEMPORARY`; a type `USAGE`; a setting `SELECT` and `SET`.
+
+Every object has an owner and an access control list: the privileges each
+role holds on the object, with the grant option, and the role that granted
+them. The list is stored in the `__turso_internal_acl` table, one row per
+object, and loaded with the schema like the roles. An object without a row
+has the default list of its kind: its owner holds every privilege and may
+grant them, and `public` holds what every role may do with such an object by
+default, which is `EXECUTE` on a function, `USAGE` on a type, `TEMPORARY` on
+the database, and nothing on stored data, schemas or settings. Objects that
+no statement created, such as the schema table, have no owner's list, so the
+dialect registers theirs when it registers the objects: Core makes its
+catalog tables readable by every role and `load_extension()`,
+`sqlite_dbpage()` and `btree_dump()` usable by the superuser only, and the
+PostgreSQL dialect adds its `pg_catalog` tables and `USAGE` on the `public`
+schema. Every other built-in function is executable by every role, as a
+function is by default, so neither `json_each()` nor `generate_series()`
+needs an entry, and neither does a table-valued function of an extension.
+
+A check asks whether the current role holds one of the privileges the
+statement needs on the object, or owns it. A superuser passes every check. A
+role holds a privilege if it was granted to the role or to `public`. Until
+`GRANT` exists, an object that no row and no dialect names is owned by the
+superuser and grants nothing to `public`, so a role that is not a superuser
+can read the catalogs and execute functions, run statements that touch no
+object, such as `SELECT 1`, and switch roles, and nothing else.
 
 ### Statements
 
@@ -251,12 +281,12 @@ Creating objects:
 | `CREATE SEQUENCE`          | Needs the privilege to create in the schema                     |
 | `CREATE TYPE`              | Needs the privilege to create in the schema                     |
 | `CREATE DOMAIN`            | Needs the privilege to create in the schema                     |
-| `CREATE TEMP TABLE`        | Needs the privilege to create temporary objects in the database |
-| `CREATE TEMP VIEW`         | Needs the privilege to create temporary objects in the database |
-| `CREATE TEMP TRIGGER`      | Needs the privilege to create temporary objects in the database |
-| `CREATE TRIGGER`           | Needs the privilege to create triggers on the table             |
+| `CREATE TEMP TABLE`        | Needs `TEMPORARY` on the database, which every role holds       |
+| `CREATE TEMP VIEW`         | Needs `TEMPORARY` on the database, which every role holds       |
+| `CREATE TEMP TRIGGER`      | Needs `TEMPORARY` on the database, which every role holds       |
+| `CREATE TRIGGER`           | Needs `TRIGGER` on the table                                    |
 | `CREATE INDEX`             | Only the owner of the table                                     |
-| `CREATE SCHEMA`            | Needs the privilege to create in the database                   |
+| `CREATE SCHEMA`            | Needs `CREATE` on the database                                  |
 
 Changing and dropping objects:
 
@@ -276,28 +306,34 @@ Settings:
 
 | Statement             | Rule                                      |
 |-----------------------|-------------------------------------------|
-| `PRAGMA name`         | Needs the privilege to read the setting   |
-| `PRAGMA name = value` | Needs the privilege to change the setting |
+| `PRAGMA name`         | Needs `SELECT` on the setting             |
+| `PRAGMA name = value` | Needs `SET` on the setting                |
 
 Maintenance and attached databases:
 
-| Statement  | Rule                                            |
-|------------|-------------------------------------------------|
-| `ANALYZE`  | Needs the privilege to analyze the database     |
-| `VACUUM`   | Needs the privilege to vacuum the database      |
-| `REINDEX`  | Needs the privilege to reindex the database     |
-| `OPTIMIZE` | Needs the privilege to optimize the database    |
-| `ATTACH`   | Needs the privilege to attach to the database   |
-| `DETACH`   | Needs the privilege to detach from the database |
+| Statement  | Rule           |
+|------------|----------------|
+| `ANALYZE`  | Superuser only |
+| `VACUUM`   | Superuser only |
+| `REINDEX`  | Superuser only |
+| `OPTIMIZE` | Superuser only |
+| `ATTACH`   | Superuser only |
+| `DETACH`   | Superuser only |
 
 ### Data
 
 The second check runs after the statement is compiled, on the bytecode. Every
 access to stored data goes through a small set of instructions: opening a table
-or index for reading or writing, clearing it, creating it, or destroying it. If
-the program contains any of these, the statement is denied, and the denial
-names the object that the instruction touches: the table, the sequence, or the
-materialized view, or the table that an index belongs to. Because the check is
+or index for reading or writing, or clearing it. For each one the check finds
+the object that owns the root page, the table, the sequence, or the
+materialized view, or the table that an index belongs to, and asks for
+`SELECT` on a read, and on a write for the privilege the statement needs:
+`INSERT`, `UPDATE` or `DELETE`. A sequence needs `USAGE` or `SELECT` to be
+read and `USAGE` or `UPDATE` to be advanced. The denial names the object. The
+engine's own bookkeeping, the schema table on a `CREATE`, `sqlite_sequence`
+on an insert into an `AUTOINCREMENT` table, and the state of a materialized
+view, is written on behalf of a statement that passed its check and is not
+checked again. Because the check is
 on the compiled program and not on the SQL, a statement cannot reach stored
 data through a subquery, a view, or any other rewrite of the query without
 being checked. The bodies of triggers and the actions of foreign keys are
@@ -310,27 +346,24 @@ Three kinds of access do not open stored data of their own and are checked
 separately:
 
 - **Views** are replaced by their query when a statement is compiled. Every
-  view a statement reads is recorded by name and denied as reading the view,
-  so a view over a table is reported as the view, and a view that reads no
-  table is still denied.
+  view a statement reads is recorded with its schema and needs `SELECT` on
+  the view, so a view over a table is reported as the view, and a view that
+  reads no table is still checked.
 - **Virtual tables** read through their own code. Every virtual table a
-  statement opens is recorded. An internal or native virtual table is denied
-  unless it declares that a role without privileges may read it, which the
-  catalogs and `json_each()` do and which anything that reads pages or records
-  directly, such as `sqlite_dbpage` and `btree_dump()`, does not. A table
-  or table-valued function of a C extension declares the same thing with
-  `READABLE_WITHOUT_PRIVILEGES`, which `generate_series()` and
-  `completion()` do, so an extension written before roles existed is denied
-  to every role but the superuser. `pragma_*()` functions are denied like
-  `PRAGMA`. Writes to a virtual table are always denied.
+  statement opens is recorded. A `pragma_*()` function is the setting it
+  shows and needs `SELECT` on it, like `PRAGMA`. A table-valued function is
+  a function and needs `EXECUTE`, which every role holds by default, unless
+  the dialect registered the privileges of a table under its name, as the
+  PostgreSQL dialect does for `pg_class`; then it is that table and needs
+  `SELECT`. Any other virtual table is a table. So `json_each()` and
+  `generate_series()` work for every role, `sqlite_dbpage()` and
+  `btree_dump()` only for the superuser, and a virtual table made with
+  `CREATE VIRTUAL TABLE` only for roles granted `SELECT` on it. Writes to a
+  virtual table need the statement's write privilege on it.
 - **Functions** that return stored state without reading storage, such as
   `currval()` and `load_extension()`, check the role when they run, because
   their argument may be a parameter that is not known when the statement is
   prepared.
-
-Every role may read the catalogs: the schema table, the types table, and the
-roles table. They hold the schema and the role names, which PostgreSQL also
-lets every role see, and a connection reads them to reload its own schema.
 
 ## Frontends
 
@@ -374,7 +407,8 @@ Statements that the Postgres frontend runs itself, outside the core statement
 path, are not covered by the core checks and must check the role themselves.
 Today these are:
 
-- `CREATE SCHEMA`, `DROP SCHEMA` and `COPY ... FROM` a file, which are
+- `CREATE SCHEMA`, which needs `CREATE` on the database, `DROP SCHEMA`,
+  which needs the owner of the schema, and `COPY ... FROM` a file, which is
   allowed only for a superuser;
 - `COPY ... TO STDOUT`, which prepares a core `SELECT` of the table and is
   checked like one;
@@ -398,11 +432,10 @@ In the order the pieces depend on each other:
   trigger, sequence and type. The denials that today say "not the owner" then
   pass for the owner, and `DROP`, `ALTER` and `CREATE INDEX` become usable by
   roles other than the superuser.
-- **Granted privileges.** Store privileges per object and per role, assigned
-  with `GRANT` and removed with `REVOKE`, with `public` as a grantee. The
-  data check then consults the privileges of the current role instead
-  of denying every access, and `CREATE` on the schema decides who may create
-  objects.
+- **`GRANT` and `REVOKE`.** Write the access control lists: a grantor who
+  owns the object or holds the grant option adds or removes privileges for a
+  role or for `public`, and the rows of the access control table change in
+  the grantor's transaction like any DDL.
 - **Schema privileges.** Record the owner of a schema, and the `USAGE` and
   `CREATE` privileges on it. `CREATE SCHEMA` and `DROP SCHEMA` then stop being
   superuser-only, and resolving a name in a schema needs `USAGE` on it, as in

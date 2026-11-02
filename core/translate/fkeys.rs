@@ -1911,6 +1911,7 @@ fn emit_fk_action_subprogram(
             program.is_mvcc_enabled(),
         );
         let entry = compile_stack.push(foreign_key, parent_change);
+        let write_privilege = crate::translate::roles::write_privilege(&stmt);
         subprogram_builder.prologue();
         translate_inner(
             stmt,
@@ -1923,6 +1924,7 @@ fn emit_fk_action_subprogram(
         program.record_subprogram_denial(crate::translate::roles::storage_denial(
             &subprogram_builder,
             resolver,
+            write_privilege,
         ));
         let built = subprogram_builder.build(connection.clone(), true, description)?;
         let prepared = built.prepared().clone();

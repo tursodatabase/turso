@@ -13,7 +13,9 @@ use crate::settings::{
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::schema::Table;
+use turso_core::security::acl_catalog::ObjectKey;
 use turso_core::security::permission::{Action, Object, PermissionDenied};
+use turso_core::security::privilege::{ObjectKind, Privilege, Privileges};
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
@@ -1701,12 +1703,27 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         | FrontendStmt::ResetAll
         | FrontendStmt::DiscardAll
         | FrontendStmt::CopyTo(_) => return Ok(()),
-        FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
-            Action::Create,
-            Object::Database(catalog::db_name_from_path(conn.db_file_path())),
-        ),
+        FrontendStmt::CreateSchema(_) => {
+            let database = ObjectKey::root(ObjectKind::Database, "main");
+            if conn.current_role_may(
+                turso_core::MAIN_DB_ID,
+                &database,
+                Privileges::of(Privilege::Create),
+            ) {
+                return Ok(());
+            }
+            PermissionDenied::privilege(
+                Action::Create,
+                Object::Database(catalog::db_name_from_path(conn.db_file_path())),
+            )
+        }
         FrontendStmt::DropSchema(stmt) => {
-            PermissionDenied::owner(Action::Drop, Object::Schema(stmt.name.to_lowercase()))
+            let schema_name = stmt.name.to_lowercase();
+            let schema = ObjectKey::root(ObjectKind::Schema, schema_name.as_str());
+            if conn.current_role_owns(turso_core::MAIN_DB_ID, &schema) {
+                return Ok(());
+            }
+            PermissionDenied::owner(Action::Drop, Object::Schema(schema_name))
         }
         FrontendStmt::CopyFrom(stmt) => {
             PermissionDenied::privilege(Action::Read, Object::File(stmt.filename.clone()))

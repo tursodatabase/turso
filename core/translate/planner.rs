@@ -2198,7 +2198,9 @@ fn parse_table(
         schema.get_view(namespace.id, table_name.as_str())
     });
     if let Some(view) = regular_view {
-        program.referenced_views.push(view.name.clone());
+        program
+            .referenced_views
+            .push((namespace, view.name.clone()));
         // Views are essentially query aliases, so just Expand the view as a subquery.
         let has_alias = maybe_alias.is_some();
         let view_alias = maybe_alias

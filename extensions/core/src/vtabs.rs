@@ -17,9 +17,6 @@ pub type RegisterModuleFn = unsafe extern "C" fn(
 pub struct VTabModuleImpl {
     pub name: *const c_char,
     pub readonly: bool,
-    /// Whether a role that is not a superuser may read the table. See
-    /// [`VTabModule::READABLE_WITHOUT_PRIVILEGES`].
-    pub readable_without_privileges: bool,
     pub create: VtabFnCreate,
     pub open: VtabFnOpen,
     pub close: VtabFnClose,
@@ -140,10 +137,6 @@ pub trait VTabModule: 'static {
     const VTAB_KIND: VTabKind;
     const NAME: &'static str;
     const READONLY: bool = true;
-    /// Whether a role that is not a superuser may read the table. Keep the
-    /// default for a table that reads stored data, a file, or the process:
-    /// a role without privileges must not reach them through the table.
-    const READABLE_WITHOUT_PRIVILEGES: bool = false;
 
     /// Creates a new instance of a virtual table.
     /// Returns a tuple where the first element is the table's schema.

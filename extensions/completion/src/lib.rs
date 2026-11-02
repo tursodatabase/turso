@@ -69,7 +69,6 @@ impl VTabModule for CompletionVTabModule {
     type Table = CompletionTable;
     const NAME: &'static str = "completion";
     const VTAB_KIND: turso_ext::VTabKind = turso_ext::VTabKind::TableValuedFunction;
-    const READABLE_WITHOUT_PRIVILEGES: bool = true;
 
     fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
         let schema = "CREATE TABLE completion (

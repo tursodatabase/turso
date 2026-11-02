@@ -17,7 +17,9 @@ use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
 };
+use crate::security::acl_catalog::ObjectKey;
 use crate::security::permission::{Action, Object, PermissionDenied};
+use crate::security::privilege::{ObjectKind, Privilege, Privileges};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
@@ -10456,7 +10458,11 @@ pub fn op_function(
                 // on a dropped sequence reports "does not exist" rather
                 // than silently returning the stale per-session value.
                 let (namespace, sequence) = program.connection.find_sequence(&seq_name)?;
-                if !program.connection.current_role_is_superuser() {
+                if !program.connection.current_role_may(
+                    namespace.database_id,
+                    &ObjectKey::new(ObjectKind::Sequence, namespace.id, sequence.name.as_str()),
+                    Privileges::from_iter([Privilege::Usage, Privilege::Select]),
+                ) {
                     return Err(crate::LimboError::PermissionDenied(Box::new(
                         PermissionDenied::privilege(
                             Action::Use,
@@ -10811,7 +10817,11 @@ pub fn op_function(
                 if !program.connection.can_load_extensions() {
                     crate::bail_parse_error!("runtime extension loading is disabled");
                 }
-                if !program.connection.current_role_is_superuser() {
+                if !program.connection.current_role_may(
+                    crate::MAIN_DB_ID,
+                    &ObjectKey::root(ObjectKind::Function, "load_extension"),
+                    Privileges::of(Privilege::Execute),
+                ) {
                     return Err(LimboError::PermissionDenied(Box::new(
                         PermissionDenied::privilege(
                             Action::Execute,
@@ -11126,7 +11136,11 @@ pub fn op_function(
                     }
                 };
                 let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
-                if !program.connection.current_role_is_superuser() {
+                if !program.connection.current_role_may(
+                    namespace.database_id,
+                    &ObjectKey::new(ObjectKind::Sequence, namespace.id, sequence.name.as_str()),
+                    Privileges::from_iter([Privilege::Usage, Privilege::Select]),
+                ) {
                     return Err(LimboError::PermissionDenied(Box::new(
                         PermissionDenied::privilege(
                             Action::Use,
