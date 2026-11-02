@@ -17,8 +17,8 @@ use crate::translate::{
     },
     expr::expr_type::{type_of, type_ordering, TypeEnv},
     expr::{
-        bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
-        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
+        translate_expr, unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -1326,8 +1326,13 @@ fn emit_index_column_value_from_cursor(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> crate::Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
+    let table_ref_id = table_references
+        .joined_tables()
+        .first()
+        .expect("CREATE INDEX reads one table")
+        .internal_id;
+    if let Some(expr) = idx_col.expression() {
+        let mut expr = expr.clone();
         bind_and_rewrite_expr(
             &mut expr,
             Some(table_references),
@@ -1335,26 +1340,25 @@ fn emit_index_column_value_from_cursor(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        let self_table_context =
-            table_references
-                .joined_tables()
-                .first()
-                .map(|jt| SelfTableContext::ForSelect {
-                    table_ref_id: jt.internal_id,
-                    referenced_tables: table_references.clone(),
-                });
-        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
+        let self_table_context = SelfTableContext::ForSelect {
+            table_ref_id,
+            referenced_tables: table_references.clone(),
+        };
+        resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
             translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
             Ok(())
         })?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            let column = &table.columns()[idx_col.pos_in_table];
-            if column.is_virtual_generated() {
-                program.emit_column_affinity(dest_reg, column.affinity());
-            }
-        }
+    } else if table.columns()[idx_col.pos_in_table].is_virtual_generated() {
+        emit_table_column(
+            program,
+            table_cursor_id,
+            table_ref_id,
+            table_references,
+            &table.columns()[idx_col.pos_in_table],
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     } else {
         emit_stored_column(
             program,

@@ -29,7 +29,7 @@ use crate::instrument;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, Index, IndexColumn, Schema,
-    Table, EXPR_INDEX_SENTINEL,
+    Table,
 };
 use crate::translate::expr::expr_type::{column_type, BuiltinType, ExprType};
 use crate::translate::fkeys::FkActionCompileStack;
@@ -2066,8 +2066,8 @@ pub(crate) fn emit_index_column_value_old_image(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
+    if let Some(expr) = idx_col.expression() {
+        let mut expr = expr.clone();
         bind_and_rewrite_expr(
             &mut expr,
             Some(table_references),
@@ -2091,16 +2091,6 @@ pub(crate) fn emit_index_column_value_old_image(
             )?;
             Ok(())
         })?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            if let Some(table) = program.btree_table_from_cursor(table_cursor_id) {
-                let column = &table.columns()[idx_col.pos_in_table];
-                if column.is_virtual_generated() {
-                    program.emit_column_affinity(dest_reg, column.affinity());
-                }
-            }
-        }
     } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
         emit_table_column(
             program,
@@ -2187,8 +2177,8 @@ fn emit_index_column_value_new_image(
     layout: &ColumnLayout,
     table: &Arc<BTreeTable>,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let expr = expr.as_ref().clone();
+    if let Some(expr) = idx_col.expression() {
+        let expr = expr.clone();
         let column_regs: Vec<usize> = columns
             .iter()
             .enumerate()

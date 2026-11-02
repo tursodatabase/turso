@@ -7920,6 +7920,8 @@ pub struct IndexColumn {
     pub explicit_collation: Option<TextCollation>,
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
+    /// A column that is a virtual generated column also has its expression
+    /// here, but it is still a column: see [IndexColumn::expression].
     pub expr: Option<Box<Expr>>,
 }
 
@@ -7964,6 +7966,22 @@ impl IndexColumn {
             explicit_collation: None,
             default: None,
             expr: None,
+        }
+    }
+
+    /// The expression of an expression index column such as `lower(name)`.
+    /// None for a table column, including a virtual generated column: its
+    /// value is read like any column's, with the column type's ENCODE, so an
+    /// index on it holds the same values as an index on a stored column.
+    pub fn expression(&self) -> Option<&Expr> {
+        if self.pos_in_table == EXPR_INDEX_SENTINEL {
+            Some(
+                self.expr
+                    .as_deref()
+                    .expect("an expression index column has an expression"),
+            )
+        } else {
+            None
         }
     }
 

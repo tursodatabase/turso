@@ -2054,3 +2054,72 @@ test virtual-numeric-column-rounds-to-its-scale {
 expect {
     0.33
 }
+
+# A join searches the inner table through an automatic index on y. Its keys
+# hold y in stored form, and the search key from a.s or a.y is stored the
+# same way.
+@requires strict "uses STRICT tables"
+test virtual-custom-type-column-in-an-automatic-index {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(w integer, y cents AS (w), s cents) STRICT;
+    INSERT INTO t(w, s) VALUES (3, 3), (1, 1);
+    SELECT 'join', count(*) FROM t a JOIN t b ON a.s = b.y;
+    SELECT 'self', count(*) FROM t a JOIN t b ON a.y = b.y;
+    SELECT 'left', count(b.w) FROM t a LEFT JOIN t b ON a.s = b.y;
+    SELECT 'exists', count(*) FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.y = a.s);
+}
+expect {
+    join|2
+    self|2
+    left|2
+    exists|2
+}
+
+# CREATE INDEX on existing rows, and every later write, store the same keys
+# for y as an index on a stored column of the type.
+@requires strict "uses STRICT tables"
+test virtual-custom-type-column-index-built-after-rows {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id integer PRIMARY KEY, w integer UNIQUE, y cents AS (w)) STRICT;
+    INSERT INTO t(id, w) VALUES (1, 3), (2, 1);
+    CREATE INDEX t_y ON t(y);
+    SELECT 'create', sum(w) FROM t WHERE y IN (1, 3);
+    PRAGMA integrity_check;
+    UPDATE t SET w = 13 WHERE id = 1;
+    INSERT INTO t(id, w) VALUES (3, 1) ON CONFLICT (w) DO UPDATE SET w = 20;
+    INSERT OR REPLACE INTO t(id, w) VALUES (1, 7);
+    DELETE FROM t WHERE id = 2;
+    SELECT 'writes', w, y FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    create|4
+    ok
+    writes|7|7
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test virtual-numeric-column-multi-row-insert {
+    CREATE TABLE t(w real, n numeric(10,2) AS (w)) STRICT;
+    INSERT INTO t(w) VALUES (3.5), (1.25);
+    SELECT n FROM t ORDER BY w;
+}
+expect {
+    1.25
+    3.50
+}
+
+# A hash join carries y from the build table to the result.
+@requires strict "uses STRICT tables"
+test virtual-custom-type-column-through-a-hash-join {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(w integer, y cents AS (w)) STRICT;
+    CREATE TABLE u(k integer) STRICT;
+    INSERT INTO t(w) VALUES (3);
+    INSERT INTO u VALUES (3);
+    SELECT t.y FROM t JOIN u ON t.w = u.k;
+}
+expect {
+    3
+}

@@ -1,3 +1,4 @@
+use crate::alloc::TursoFromIterator;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::translate::collate::CollationSeq;
@@ -10,7 +11,7 @@ use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
         self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
-        EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
+        SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
@@ -33,8 +34,8 @@ use crate::{
             open_read_table, table_scan_match_any, ForeignKeyActions,
         },
         plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
+            ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination,
+            ResultSetColumn, TableReferences,
         },
         planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
@@ -3282,7 +3283,7 @@ fn emit_unique_index_check(
         .columns
         .iter()
         .map(|ic| {
-            if ic.expr.is_some() {
+            if ic.expression().is_some() {
                 Affinity::Blob.aff_mask()
             } else {
                 ctx.table.columns()[ic.pos_in_table].affinity().aff_mask()
@@ -3606,8 +3607,8 @@ fn emit_index_column_value_for_insert(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let expr = expr.as_ref().clone();
+    if let Some(expr) = idx_col.expression() {
+        let expr = expr.clone();
         let columns: Vec<Column> = insertion
             .col_mappings
             .iter()
@@ -3633,14 +3634,6 @@ fn emit_index_column_value_for_insert(
             table,
             dest_reg,
         )?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            let column = &table.columns()[idx_col.pos_in_table];
-            if column.is_virtual_generated() {
-                program.emit_column_affinity(dest_reg, column.affinity());
-            }
-        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(
@@ -4414,6 +4407,8 @@ pub fn emit_parent_side_fk_decrement_on_insert(
 /// Emit encode expressions for columns with custom types.
 /// For each column that has a custom type with an encode expression,
 /// evaluates the expression with `value` bound to the column register.
+/// Virtual columns are skipped: their registers are not computed yet, and
+/// `compute_virtual_columns` encodes them when it computes them.
 fn emit_custom_type_encode(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -4426,12 +4421,19 @@ fn emit_custom_type_encode(
         .map(|m| m.column.clone())
         .collect();
     let layout = ColumnLayout::from_columns(&columns)?;
+    let stored_columns = ColumnMask::try_from_iter(
+        columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.is_virtual_generated())
+            .map(|(i, _)| i),
+    )?;
     crate::translate::expr::emit_custom_type_encode_columns(
         program,
         resolver,
         &columns,
         insertion.first_col_register(),
-        None, // INSERT: encode all columns
+        Some(&stored_columns),
         table_name,
         &layout,
     )

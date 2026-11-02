@@ -43,8 +43,8 @@ pub(super) fn encode_seek_keys_for_custom_types(
             break;
         }
         let idx_col = &seek_index.columns[idx_col_pos];
-        // An expression column holds the expression's value, not the column's.
-        if idx_col.expr.is_some() {
+        // An expression column holds the expression's value, not a column's.
+        if idx_col.expression().is_some() {
             continue;
         }
         let table_col = match columns.get(idx_col.pos_in_table) {
