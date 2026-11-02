@@ -750,11 +750,19 @@ expect {
 
 @requires strict "uses STRICT tables"
 test op-abs-of-numeric-in-check-comparison-error {
-    -- A CHECK sees the stored numeric, a blob, so abs of it is a real.
-    CREATE TABLE c(n numeric(10,2) CHECK(abs(n) <> n)) STRICT;
+    -- A CHECK sees the stored numeric, a blob, so abs of it would be 0.0.
+    CREATE TABLE c(n numeric(10,2) CHECK(abs(n) > 0)) STRICT;
 }
 expect error {
-    cannot compare REAL with
+    cannot compare numeric with INTEGER
+}
+
+@requires strict "uses STRICT tables"
+test op-arithmetic-on-abs-of-numeric-in-check-error {
+    CREATE TABLE c(n numeric(10,2) CHECK(abs(n) + 0 > 0)) STRICT;
+}
+expect error {
+    arithmetic requires numeric types, got numeric and INTEGER
 }
 
 @requires strict "uses STRICT tables"

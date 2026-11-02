@@ -452,15 +452,19 @@ fn resolve_func_return_type(
             _ => CheckExprType::Any,
         }),
         // abs gives a real for text or a blob, without converting it first.
-        ResultType::RealForTextOtherwiseTheFirstArgumentsType => {
-            Ok(match first_argument_as_stored()? {
-                Some(ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null)) => {
-                    ty
-                }
-                Some(CheckExprType::Text | CheckExprType::Blob) => CheckExprType::Real,
-                _ => CheckExprType::Any,
-            })
-        }
+        // abs of a custom type keeps the type, as on main, so comparing it with
+        // a number or computing with it is refused: here abs would run on the
+        // stored value, such as numeric's blob, and give 0.0.
+        ResultType::RealForTextOtherwiseTheFirstArgumentsType => Ok(match first_argument()? {
+            Some(
+                ty @ (CheckExprType::Integer
+                | CheckExprType::Real
+                | CheckExprType::Null
+                | CheckExprType::CustomType(_)),
+            ) => ty,
+            Some(CheckExprType::Text | CheckExprType::Blob) => CheckExprType::Real,
+            Some(CheckExprType::Any) | None => CheckExprType::Any,
+        }),
         ResultType::RealForARealArgument => Ok(CheckExprType::Real),
         // substr returns a blob for a blob and text for a number or text.
         ResultType::TextOrBlobLikeTheFirstArgument => Ok(match first_argument_as_stored()? {
