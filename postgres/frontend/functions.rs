@@ -4,7 +4,7 @@ use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
-use turso_core::security::roles::RoleId;
+use turso_core::security::roles::{RoleCatalog, RoleId};
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
@@ -101,10 +101,10 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             exec_current_schemas(connection, args[0].get_value())?
         },
         "current_user" | "current_role" | "user"(FunctionArity::Exact(0), false) => {
-            role_name(connection, connection.current_role())
+            role_name(connection, connection.current_role())?
         },
         "session_user"(FunctionArity::Exact(0), false) => {
-            role_name(connection, connection.session_role())
+            role_name(connection, connection.session_role())?
         },
         "pg_backend_pid"(FunctionArity::Exact(0), true) => std::process::id() as i64,
         // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -651,11 +651,20 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
-fn role_name(conn: &Connection, role: RoleId) -> String {
-    crate::catalog::postgres_roles(&conn.role_catalog())
-        .find(|found| found.id == role)
-        .expect("the role of a connection is in its role catalog")
-        .name
+fn role_name(conn: &Connection, role: RoleId) -> Result<String> {
+    role_name_in(&conn.role_catalog(), role)
+}
+
+/// The role of a connection is normally in the catalog, but it may have been
+/// dropped by another connection since the connection was opened.
+fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> {
+    match crate::catalog::postgres_roles(roles).find(|found| found.id == role) {
+        Some(role) => Ok(role.name),
+        None => Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_OBJECT,
+            format!("invalid role OID: {}", crate::catalog::role_oid(role)),
+        )),
+    }
 }
 
 fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
@@ -1576,4 +1585,29 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_name_of_a_role_that_is_not_in_the_catalog_is_an_error() {
+        let with_alice = RoleCatalog::new(&[vec![
+            Value::from_i64(1),
+            Value::build_text("alice"),
+            Value::from_i64(0),
+        ]])
+        .unwrap();
+        let without_alice = RoleCatalog::new(&[]).unwrap();
+        let alice = with_alice.get_by_name("alice").unwrap().id;
+        assert_eq!(role_name_in(&with_alice, alice).unwrap(), "alice");
+
+        let error = role_name_in(&without_alice, alice).unwrap_err();
+        assert_eq!(error.to_string(), "invalid role OID: 16385");
+        assert_eq!(
+            role_name_in(&without_alice, RoleId::SUPERUSER).unwrap(),
+            "postgres"
+        );
+    }
 }
