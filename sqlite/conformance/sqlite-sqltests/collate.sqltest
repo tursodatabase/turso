@@ -2429,3 +2429,21 @@ test scalar-min-max-result-collation {
 expect {
     1|0
 }
+
+# The join searches q through an automatic index on b. The index also holds a, which it compares
+# with BINARY as SQLite does, so it cannot provide the NOCASE order of a and the query sorts.
+test collate-automatic-index-other-columns-do-not-provide-order {
+    CREATE TABLE p(b);
+    CREATE TABLE q(b, a COLLATE NOCASE);
+    INSERT INTO p VALUES (1), (2);
+    INSERT INTO q VALUES (2, 'b'), (2, 'C'), (2, 'a'), (3, 'B'), (3, 'c'), (3, 'A'), (9, 'z');
+    SELECT p.b, q.a FROM p JOIN q ON q.b > p.b AND q.b < p.b + 2 ORDER BY p.rowid, q.b, q.a;
+}
+expect {
+    1|a
+    1|b
+    1|C
+    2|A
+    2|B
+    2|c
+}
