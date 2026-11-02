@@ -126,7 +126,9 @@ typedef struct
     bool partial_bootstrap_prefetch;
     // optional base64-encoded encryption key for remote encrypted databases
     const char *remote_encryption_key;
-    // optional encryption cipher name (e.g. "aes256gcm", "chacha20poly1305")
+    // Shared cipher for cloud and local sync encryption (e.g. "aes256gcm").
+    // Must match the database encryption configuration when supplied.
+    // "chacha20poly1305" is supported only for legacy remote encryption.
     const char *remote_encryption_cipher;
     // optional cap on the number of CDC operations packed into a single push HTTP batch.
     // when > 0, push splits on transaction boundaries once the current batch has accumulated
