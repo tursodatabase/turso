@@ -12,7 +12,7 @@ use turso_core::{
 };
 
 use crate::{
-    database_sync_engine_io::SyncEngineIo,
+    database_sync_engine_io::{DataCompletion, SyncEngineIo},
     database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
         acquire_slot,
@@ -978,11 +978,52 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
     ) -> Result<Option<DatabaseMetadata>> {
+        Self::read_db_meta_with_encryption(coro, io, sync_engine_io, main_db_path, None).await
+    }
+
+    pub async fn read_db_meta_with_encryption<Ctx>(
+        coro: &Coro<Ctx>,
+        io: Option<Arc<dyn turso_core::IO>>,
+        sync_engine_io: SyncEngineIoStats<IO>,
+        main_db_path: &str,
+        crypto: Option<&turso_core::EncryptionContext>,
+    ) -> Result<Option<DatabaseMetadata>> {
         let path = create_meta_path(main_db_path);
         let is_memory = is_memory(main_db_path);
-        let meta = full_read(coro, io, sync_engine_io.io.clone(), &path, is_memory).await?;
+        let meta = if is_memory {
+            full_read(coro, io, sync_engine_io.io.clone(), &path, true).await?
+        } else {
+            let completion = sync_engine_io.full_read(&path)?;
+            let data = wait_all_results(coro, &completion, None).await?;
+            match completion.status()? {
+                // Hosts can keep metadata outside core's filesystem (localStorage
+                // and OPFS in browsers). Their existence result is authoritative.
+                Some(404) => None,
+                Some(204) => Some(data),
+                _ if !data.is_empty() => Some(data),
+                _ => {
+                    // Older hosts report missing and empty files identically.
+                    if crypto.is_some() {
+                        let io = io.as_ref().ok_or_else(|| {
+                            Error::DatabaseSyncEngineError(
+                                "local IO must be initialized before reading encrypted metadata"
+                                    .into(),
+                            )
+                        })?;
+                        if let Some(file) = io.try_open(&path)? {
+                            if file.size()? == 0 {
+                                return Err(Error::DatabaseSyncEngineError(
+                                    "encrypted sync metadata file is empty".into(),
+                                ));
+                            }
+                        }
+                    }
+                    None
+                }
+            }
+        };
         match meta {
-            Some(meta) => Ok(Some(DatabaseMetadata::load(&meta)?)),
+            Some(meta) => Ok(Some(DatabaseMetadata::load_with_encryption(&meta, crypto)?)),
             None => Ok(None),
         }
     }
@@ -1053,7 +1094,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         sync_engine_io.io.clone(),
                         &meta_path,
                         is_memory(main_db_path),
-                        meta.dump()?,
+                        meta.dump_with_encryption(local_crypto.as_ref())?,
                     )
                     .await?;
                 }
@@ -1085,6 +1126,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     )?;
                 }
                 let meta = DatabaseMetadata {
+                    encryption_cipher: None,
                     version: DATABASE_METADATA_VERSION.to_string(),
                     client_unique_id,
                     synced_revision: Some(revision.clone()),
@@ -1107,7 +1149,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     logical_table_names_by_stable_id: Default::default(),
                     saved_configuration: Some(configuration),
                 };
-                tracing::info!("write meta after successful bootstrap: meta={meta:?}");
+                tracing::info!("write metadata after successful bootstrap");
 
                 full_write(
                     coro,
@@ -1115,7 +1157,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     sync_engine_io.io.clone(),
                     &meta_path,
                     is_memory(main_db_path),
-                    meta.dump()?,
+                    meta.dump_with_encryption(local_crypto.as_ref())?,
                 )
                 .await?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
@@ -1137,6 +1179,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 // until the first server contact; the first pull resolves it.
                 let remote_pull_protocol = forced_protocol.unwrap_or(RemotePullProtocol::Unknown);
                 let meta = DatabaseMetadata {
+                    encryption_cipher: None,
                     version: DATABASE_METADATA_VERSION.to_string(),
                     client_unique_id,
                     synced_revision: None,
@@ -1154,14 +1197,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     logical_table_names_by_stable_id: Default::default(),
                     saved_configuration: Some(configuration),
                 };
-                tracing::info!("write meta after successful bootstrap: meta={meta:?}");
+                tracing::info!("write metadata after successful bootstrap");
                 full_write(
                     coro,
                     io.clone(),
                     sync_engine_io.io.clone(),
                     &meta_path,
                     is_memory(main_db_path),
-                    meta.dump()?,
+                    meta.dump_with_encryption(local_crypto.as_ref())?,
                 )
                 .await?;
                 // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
@@ -1270,7 +1313,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 "meta must be initialized before open".to_string(),
             ));
         };
-        let meta = DatabaseMetadata::load(&meta)?;
+        let meta = DatabaseMetadata::load_with_encryption(&meta, local_crypto.as_ref())?;
 
         // DB wasn't synced with remote but will be encrypted on remote - so we must properly set reserved bytes field in advance
         if meta.synced_revision.is_none() && opts.reserved_bytes != 0 {
@@ -1348,8 +1391,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             main_db_path,
         )
         .await?;
-        let meta = Self::read_db_meta(coro, Some(io.clone()), sync_engine_io.clone(), main_db_path)
-            .await?;
+        let meta = Self::read_db_meta_with_encryption(
+            coro,
+            Some(io.clone()),
+            sync_engine_io.clone(),
+            main_db_path,
+            local_crypto.as_ref(),
+        )
+        .await?;
         let meta = Self::bootstrap_db(
             coro,
             io.clone(),
@@ -3264,14 +3313,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<()> {
         let mut meta = self.meta().clone();
         update(&mut meta);
-        tracing::info!("update_meta: {meta:?}");
+        tracing::info!("update sync metadata");
         full_write(
             coro,
             self.io.clone(),
             self.sync_engine_io.io.clone(),
             &self.meta_path,
             is_memory(&self.main_db_path),
-            meta.dump()?,
+            meta.dump_with_encryption(self.local_crypto.as_ref())?,
         )
         .await?;
         // todo: what happen if we will actually update the metadata on disk but fail and so in memory state will not be updated
@@ -4103,6 +4152,7 @@ mod tests {
                 .unwrap();
 
         let meta = DatabaseMetadata {
+            encryption_cipher: None,
             version: DATABASE_METADATA_VERSION.to_string(),
             client_unique_id: "initial-client".to_string(),
             synced_revision: None,
@@ -4253,6 +4303,7 @@ mod tests {
             .unwrap();
         let slot = Arc::new(Mutex::new(None));
         let meta = DatabaseMetadata {
+            encryption_cipher: None,
             version: DATABASE_METADATA_VERSION.to_string(),
             client_unique_id: "client-a".to_string(),
             synced_revision: Some(DatabasePullRevision::V1 {
@@ -4431,6 +4482,7 @@ mod tests {
             revision: "g1:o1".to_string(),
         };
         let meta = DatabaseMetadata {
+            encryption_cipher: None,
             version: DATABASE_METADATA_VERSION.to_string(),
             client_unique_id: "client-a".to_string(),
             synced_revision: Some(old_revision.clone()),
@@ -5073,6 +5125,7 @@ mod tests {
                 .unwrap();
 
         let meta = DatabaseMetadata {
+            encryption_cipher: None,
             version: DATABASE_METADATA_VERSION.to_string(),
             client_unique_id: "legacy-client".to_string(),
             synced_revision: Some(DatabasePullRevision::Legacy {

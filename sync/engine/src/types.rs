@@ -163,6 +163,8 @@ pub enum RemotePullProtocol {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DatabaseMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_cipher: Option<String>,
     pub version: String,
     /// Unique identifier of the client - generated on sync startup
     pub client_unique_id: String,
@@ -223,6 +225,51 @@ pub enum DatabaseSyncEngineProtocolVersion {
 }
 
 impl DatabaseMetadata {
+    pub fn load_with_encryption(
+        data: &[u8],
+        crypto: Option<&turso_core::EncryptionContext>,
+    ) -> Result<Self> {
+        let Some(crypto) = crypto else {
+            if data.starts_with(b"TSYNMETA") {
+                return Err(Error::DatabaseSyncEngineError(
+                    "encrypted sync metadata requires a local key".into(),
+                ));
+            }
+            let meta = Self::load(data)?;
+            if meta.encryption_cipher.is_some() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "encrypted sync metadata cannot be stored as plaintext".into(),
+                ));
+            }
+            return Ok(meta);
+        };
+        let plaintext = crate::sync_cipher::open_metadata(crypto, data)?;
+        let meta = Self::load(&plaintext)?;
+        if meta.encryption_cipher.as_deref() != Some(crypto.cipher_mode().to_string().as_str()) {
+            return Err(Error::DatabaseSyncEngineError(
+                "sync metadata cipher does not match configuration".into(),
+            ));
+        }
+        Ok(meta)
+    }
+
+    pub fn dump_with_encryption(
+        &self,
+        crypto: Option<&turso_core::EncryptionContext>,
+    ) -> Result<Vec<u8>> {
+        let Some(crypto) = crypto else {
+            if self.encryption_cipher.is_some() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "encrypted sync metadata requires a local key".into(),
+                ));
+            }
+            return self.dump();
+        };
+        let mut meta = self.clone();
+        meta.encryption_cipher = Some(crypto.cipher_mode().to_string());
+        crate::sync_cipher::seal_metadata(crypto, &meta.dump()?)
+    }
+
     pub fn remote_url(&self) -> Option<String> {
         self.saved_configuration
             .as_ref()
