@@ -2140,15 +2140,15 @@ __metadata:
   languageName: node
   linkType: hard
 
-"emnapi@npm:1.4.5":
-  version: 1.4.5
-  resolution: "emnapi@npm:1.4.5"
+"emnapi@npm:1.8.1":
+  version: 1.8.1
+  resolution: "emnapi@npm:1.8.1"
   peerDependencies:
     node-addon-api: ">= 6.1.0"
   peerDependenciesMeta:
     node-addon-api:
       optional: true
-  checksum: 10c0/9bd37977040130b718f4d7d24f9255f52f993134b7dfcfb8b066f9c62be74e7c39b2ab936a6cc6f7713c72e38af97c07627aa74e9751cf64053bf0d4b7cd1e90
+  checksum: 10c0/a95b167083ee485a84a06202b693f9588bc32080dba82b5752bf805959e97005db1e0cb82ebfe9f35129858b7325f7161c63e97dc78e756a8d6a61443eca79bc
   languageName: node
   linkType: hard
 
