@@ -1,0 +1,51 @@
+name: Actions lockfile
+
+# Checks .github/actions.lock.json with gh-actions-lockfile
+# (https://github.com/gjtorikian/gh-actions-lockfile). The check fails when:
+# - a workflow uses an action that is not in the lockfile, or the lockfile
+#   has an action that no workflow uses anymore,
+# - a tag or branch in the lockfile now points to a different commit,
+# - the code of a locked commit no longer matches its integrity hash,
+# - a locked action version has a known security advisory.
+#
+# After you add, remove or change an action in a workflow, or when this check
+# finds that a tag or branch moved, update the lockfile from the repository
+# root (needs Node.js 24.4+) and commit it:
+#
+#   GITHUB_TOKEN=$(gh auth token) npx gh-actions-lockfile@1.2.1 generate
+#
+# Read the lockfile diff before you commit it. A moved tag is usually a new
+# release, but it can also be a supply chain attack.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions.lock.json"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions.lock.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify actions lockfile
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - uses: gjtorikian/gh-actions-lockfile@8abbeb1fe0a4bf20279c81fa206e6a2fc862a830 # v1.2.1
+        with:
+          mode: verify
+          # PR comments need pull-requests: write, and v1.2.1 fails to post
+          # them anyway. Keep this job read-only.
+          comment: false
