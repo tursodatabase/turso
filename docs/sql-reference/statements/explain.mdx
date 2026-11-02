@@ -8,6 +8,12 @@ sidebarTitle: EXPLAIN
 
 The EXPLAIN statement displays information about how Turso executes a SQL statement. There are two forms: `EXPLAIN` shows the virtual machine bytecode, and `EXPLAIN QUERY PLAN` shows the high-level query execution strategy.
 
+## PostgreSQL frontend
+
+In the PostgreSQL frontend, `EXPLAIN statement` returns the high-level query
+plan. Prepared EXPLAIN statements retain this output format when schema changes
+cause them to be prepared again; the plan reflects the updated schema.
+
 ## Syntax
 
 ```sql
