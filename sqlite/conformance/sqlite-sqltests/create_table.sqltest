@@ -308,3 +308,61 @@ test create_table_existing_table_reported_before_body_errors {
 expect error {
     table t already exists
 }
+
+# SQLite keeps the six standard type names (ANY, BLOB, INT, INTEGER, REAL, TEXT)
+# in upper case however they were written, with or without quotes; every other
+# type name keeps its spelling.
+test create_table_standard_type_names_are_declared_in_upper_case {
+    CREATE TABLE t(id integer primary key, x);
+    CREATE TABLE u(a int, b text, c real, d blob, e any, f Varchar, g INTEGER(4), h numeric, i "integer", j [Int], k Int Primary Key, l text collate nocase, m "INTEGER" not null, n integer unsigned);
+    ALTER TABLE u ADD COLUMN o integer;
+    SELECT name, type FROM pragma_table_info('t');
+    SELECT name, type FROM pragma_table_info('u');
+}
+expect {
+    id|INTEGER
+    x|
+    a|INT
+    b|TEXT
+    c|REAL
+    d|BLOB
+    e|ANY
+    f|Varchar
+    g|INTEGER(4)
+    h|numeric
+    i|INTEGER
+    j|INT
+    k|INT
+    l|TEXT
+    m|INTEGER
+    n|integer unsigned
+    o|INTEGER
+}
+
+# A type with parameters, or a quoted name followed by more text, is not a
+# standard type name, so it keeps its spelling.
+test create_table_type_names_with_parameters_keep_their_spelling {
+    CREATE TABLE t(a int(4), b integer(2,3), c text(10), d "int" x, e "INT""EGER");
+    SELECT name, type FROM pragma_table_info('t');
+}
+expect {
+    a|int(4)
+    b|integer(2,3)
+    c|text(10)
+    d|int
+    e|INT"EGER
+}
+
+# A view column takes the declared type of the table column it reads.
+test create_table_standard_type_names_reach_views_and_strict_tables {
+    CREATE TABLE t(a int, b Text) STRICT;
+    CREATE VIEW v AS SELECT a, b FROM t;
+    SELECT name, type FROM pragma_table_info('t');
+    SELECT name, type FROM pragma_table_info('v');
+}
+expect {
+    a|INT
+    b|TEXT
+    a|INT
+    b|TEXT
+}
