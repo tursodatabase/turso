@@ -10,10 +10,10 @@ use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{ConnectOpts, Database, Value};
-use turso_pg::{split_statements, PgConnection, TransactionState};
+use turso_pg::{split_statements, PgConnection, StatementResultKind, TransactionState};
 use turso_pg_parser::cmdtag::CommandTag;
 use turso_pg_parser::copy::{parse_copy_to_stdout, CopyToStdout};
-use turso_pg_parser::{returns_rows, ParseResult};
+use turso_pg_parser::ParseResult;
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -190,7 +190,7 @@ impl SimpleQueryHandler for TursoPgHandler {
             let mut stmt = conn.prepare(sql).map_err(pg_error)?;
             let parsed = parse_statement(sql)?;
 
-            if stmt.num_columns() == 0 || !returns_rows(&parsed) {
+            if stmt.result_kind() != StatementResultKind::Rows {
                 responses.push(execute_non_query(&mut stmt, &parsed)?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
@@ -349,7 +349,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         bind_portal_parameters(&mut stmt, portal)?;
 
         let parsed = parse_statement(query)?;
-        if stmt.num_columns() == 0 || !returns_rows(&parsed) {
+        if stmt.result_kind() != StatementResultKind::Rows {
             return execute_non_query(&mut stmt, &parsed)
                 .map(|response| with_transaction_state(conn, response));
         }
@@ -375,7 +375,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
 
-        let fields = describe_fields(&stmt, &target.statement, &Format::UnifiedText)?;
+        let fields = describe_fields(&stmt, &Format::UnifiedText);
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -392,25 +392,17 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .prepare(&portal.statement.statement)
             .map_err(pg_error)?;
 
-        let fields = describe_fields(
-            &stmt,
-            &portal.statement.statement,
-            &portal.result_column_format,
-        )?;
+        let fields = describe_fields(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
     }
 }
 
-/// The fields of the rows that `sql` returns, or none if it returns no rows.
-fn describe_fields(
-    stmt: &turso_pg::Statement,
-    sql: &str,
-    format: &Format,
-) -> PgWireResult<Vec<FieldInfo>> {
-    if !returns_rows(&parse_statement(sql)?) {
-        return Ok(vec![]);
+/// The fields of an ordinary result set, or none for commands and COPY.
+fn describe_fields(stmt: &turso_pg::Statement, format: &Format) -> Vec<FieldInfo> {
+    if stmt.result_kind() != StatementResultKind::Rows {
+        return vec![];
     }
-    Ok(build_field_info(stmt, format))
+    build_field_info(stmt, format)
 }
 
 fn parse_statement(sql: &str) -> PgWireResult<ParseResult> {
@@ -927,6 +919,27 @@ mod tests {
     }
 
     #[test]
+    fn command_results_send_no_rows_and_still_apply_transaction_state() {
+        let (mut client, _) = copy_test_client();
+        client
+            .simple_query("CREATE TABLE command_results (v INT)")
+            .unwrap();
+        let messages = query_messages(&mut client,
+            "BEGIN; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY; LOCK TABLE command_results IN ACCESS SHARE MODE");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"CCCZ");
+        assert_eq!(messages.last().unwrap().1, b"T");
+        let messages = query_messages(&mut client, "INSERT INTO command_results VALUES (1)");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"EZ");
+        assert_eq!(messages.last().unwrap().1, b"E");
+        let messages = query_messages(&mut client, "COMMIT");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"CZ");
+        assert_eq!(messages[0].1, b"ROLLBACK\0");
+        assert_eq!(messages.last().unwrap().1, b"I");
+        let messages = query_messages(&mut client, "SELECT v FROM command_results WHERE false");
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), b"TCZ");
+    }
+
+    #[test]
     fn copy_to_stdout_sends_text_in_statement_order() {
         let (mut client, conn) = copy_test_client();
         let events = client
@@ -1312,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_access_share_lock_has_no_result_fields() {
+    fn commands_and_copy_have_no_ordinary_result_fields() {
         let (_io, db) = turso_pg::open_database(
             ":memory:",
             None,
@@ -1322,24 +1335,20 @@ mod tests {
         .unwrap();
         let conn = turso_pg::PgConnection::connect(&db).unwrap();
         conn.execute("CREATE TABLE items (v INTEGER)").unwrap();
-        let stmt = conn
-            .prepare("LOCK TABLE items IN ACCESS SHARE MODE")
-            .unwrap();
-        for format in [Format::UnifiedText, Format::UnifiedBinary] {
-            assert!(
-                describe_fields(&stmt, "LOCK TABLE items IN ACCESS SHARE MODE", &format)
-                    .unwrap()
-                    .is_empty()
-            );
+        for sql in [
+            "LOCK TABLE items IN ACCESS SHARE MODE",
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+            "RESET ALL",
+            "COPY items TO STDOUT",
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            for format in [Format::UnifiedText, Format::UnifiedBinary] {
+                assert!(describe_fields(&stmt, &format).is_empty(), "{sql}");
+            }
         }
         let sql = "SELECT 'LOCK TABLE items'";
         let query = conn.prepare(sql).unwrap();
-        assert_eq!(
-            describe_fields(&query, sql, &Format::UnifiedText)
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(describe_fields(&query, &Format::UnifiedText).len(), 1);
     }
 
     #[test]

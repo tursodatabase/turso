@@ -10,7 +10,7 @@ use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
 use crate::settings::{
     find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SettingScope,
 };
-use crate::statement::{PgTxState, PostRunFn, TxRole};
+use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::schema::Table;
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
@@ -192,6 +192,7 @@ impl PgConnection {
         result
             .map(|stmt| {
                 crate::Statement::new(stmt)
+                    .with_result_kind(StatementResultKind::CopyOut)
                     .with_tx_tracking(
                         Arc::clone(&self.inner.conn),
                         Arc::clone(&self.inner.tx),
@@ -377,8 +378,13 @@ fn prepare_statement_inner(
     // The single definition of what counts as the transaction's first
     // query, for every kind of statement this function returns.
     let marks_query_start = execution_takes_snapshot(&parse_result);
+    let result_kind = if turso_pg_parser::returns_rows(&parse_result) {
+        StatementResultKind::Rows
+    } else {
+        StatementResultKind::Command
+    };
 
-    if let Some(stmt) = try_prepare_special(pg_conn, sql, &parse_result)? {
+    if let Some(stmt) = try_prepare_special(pg_conn, sql, &parse_result, result_kind)? {
         return Ok(stmt
             .with_tx_tracking(
                 Arc::clone(&pg_conn.conn),
@@ -430,6 +436,7 @@ fn prepare_statement_inner(
             .map_err(schema_error)
             .map(|s| {
                 crate::Statement::new(s)
+                    .with_result_kind(result_kind)
                     .with_tx_tracking(conn, tx, role)
                     .with_query_start_marking(marks_query_start)
                     .with_post_run(post_run)
@@ -462,6 +469,7 @@ fn prepare_statement_inner(
             },
         ),
     )
+    .with_result_kind(result_kind)
     .with_tx_tracking(conn, tx, role)
     .with_query_start_marking(marks_query_start)
     .with_post_run(post_run))
@@ -1590,6 +1598,7 @@ fn try_prepare_special(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
     parse_result: &turso_pg_parser::ParseResult,
+    mut result_kind: StatementResultKind,
 ) -> Result<Option<crate::Statement>> {
     let Some(stmt) =
         frontend_stmt(sql, parse_result).map_err(|e| translation_error(&pg_conn.conn, e))?
@@ -1603,6 +1612,7 @@ fn try_prepare_special(
             crate::Statement::new(handle_pg_show(pg_conn, &show_stmt)?)
         }
         FrontendStmt::CopyTo(copy) => {
+            result_kind = StatementResultKind::CopyOut;
             crate::Statement::new(crate::copy::prepare_copy_to_stdout(&pg_conn.conn, &copy)?)
         }
         stmt @ (FrontendStmt::ResetAll
@@ -1616,7 +1626,7 @@ fn try_prepare_special(
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
     };
-    Ok(Some(stmt))
+    Ok(Some(stmt.with_result_kind(result_kind)))
 }
 
 /// The engine error for an error of the translator.

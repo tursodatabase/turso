@@ -1187,6 +1187,7 @@ fn serial_prerequisites_yield_to_the_caller() {
         let mut yields = 0;
         let mut explicit_yields = 0;
         loop {
+            assert_eq!(stmt.result_kind(), turso_pg::StatementResultKind::Command);
             let before = io.steps.load(std::sync::atomic::Ordering::Relaxed);
             let result = match method {
                 0 => stmt.step(),
@@ -1476,7 +1477,9 @@ fn session_statements_yield_to_the_caller() {
             data.path().display()
         ))
         .unwrap();
+    assert_eq!(copy.result_kind(), turso_pg::StatementResultKind::Command);
     drive_prerequisites(&io, &mut copy).unwrap();
+    assert_eq!(copy.result_kind(), turso_pg::StatementResultKind::Command);
     assert_eq!(copy.n_change(), 2);
     assert_eq!(
         conn.prepare("SELECT id, payload FROM app.t ORDER BY id")
@@ -1503,7 +1506,9 @@ fn session_statements_yield_to_the_caller() {
     );
     copy.reset().unwrap();
     std::fs::write(data.path(), "").unwrap();
+    assert_eq!(copy.result_kind(), turso_pg::StatementResultKind::Command);
     drive_prerequisites(&io, &mut copy).unwrap();
+    assert_eq!(copy.result_kind(), turso_pg::StatementResultKind::Command);
     assert_eq!(copy.n_change(), 0);
     let mut invalid_copy = conn
         .prepare(format!(
@@ -1890,4 +1895,152 @@ fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>)
     let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();
     conn.set_foreign_keys_enabled(true);
     (io, conn)
+}
+
+#[test]
+fn result_kind_uses_original_sql_and_survives_reset() {
+    use turso_pg::StatementResultKind::{Command, Rows};
+
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE results (v INTEGER)").unwrap();
+    for (sql, kind) in [
+        (
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
+            Command,
+        ),
+        ("SET application_name = 'metadata'", Command),
+        ("RESET ALL", Command),
+        ("COMMENT ON TABLE results IS 'metadata'", Command),
+        ("INSERT INTO results VALUES (1)", Command),
+        ("UPDATE results SET v = 2", Command),
+        ("DELETE FROM results", Command),
+        ("SELECT 'LOCK TABLE results'", Rows),
+        ("SELECT v FROM results WHERE false", Rows),
+        ("SHOW application_name", Rows),
+        ("EXPLAIN SELECT v FROM results", Rows),
+        ("INSERT INTO results VALUES (3) RETURNING v", Rows),
+        ("UPDATE results SET v = 4 RETURNING v", Rows),
+        ("DELETE FROM results RETURNING v", Rows),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(stmt.result_kind(), kind, "{sql}");
+        for _ in 0..2 {
+            stmt.run_ignore_rows().unwrap();
+            assert_eq!(stmt.result_kind(), kind, "{sql}");
+            stmt.reset().unwrap();
+            assert_eq!(stmt.result_kind(), kind, "{sql}");
+        }
+    }
+    conn.execute("BEGIN").unwrap();
+    let mut lock = conn
+        .prepare("LOCK TABLE results IN ACCESS SHARE MODE")
+        .unwrap();
+    assert_eq!(lock.result_kind(), Command);
+    assert!(lock.num_columns() > 0);
+    for _ in 0..2 {
+        lock.run_ignore_rows().unwrap();
+        lock.reset().unwrap();
+        assert_eq!(lock.result_kind(), Command);
+    }
+    conn.execute("COMMIT").unwrap();
+    let mut stmt = conn.prepare("SELECT $1 WHERE false").unwrap();
+    stmt.bind_at(1.try_into().unwrap(), Value::from_i64(7))
+        .unwrap();
+    assert_eq!(stmt.result_kind(), Rows);
+    assert_eq!(stmt.num_columns(), 1);
+    assert!(stmt.run_collect_rows().unwrap().is_empty());
+
+    for (stmt, expected) in conn
+        .query_runner(b"SET application_name = 'runner'; SELECT 1")
+        .zip([Command, Rows])
+    {
+        let mut stmt = stmt.unwrap().unwrap();
+        assert_eq!(stmt.result_kind(), expected);
+        stmt.run_ignore_rows().unwrap();
+    }
+}
+
+#[test]
+fn result_kind_preserves_copy_rows_on_both_prepare_paths() {
+    use turso_pg::StatementResultKind::CopyOut;
+
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE copy_results (v INTEGER)")
+        .unwrap();
+    let sql = "COPY copy_results (v) TO STDOUT";
+    let spec = turso_pg_parser::copy::parse_copy_to_stdout(sql)
+        .unwrap()
+        .unwrap();
+    let mut statements = [
+        conn.prepare(sql).unwrap(),
+        conn.prepare_copy_to_stdout(&spec).unwrap(),
+    ];
+    for stmt in &mut statements {
+        assert_eq!(stmt.result_kind(), CopyOut);
+        assert_eq!(stmt.num_columns(), 1);
+        assert_eq!(stmt.get_column_name(0), "v");
+        assert!(stmt.run_collect_rows().unwrap().is_empty());
+        stmt.reset().unwrap();
+    }
+    conn.execute("INSERT INTO copy_results VALUES (42)")
+        .unwrap();
+    for stmt in &mut statements {
+        assert_eq!(stmt.result_kind(), CopyOut);
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![Value::from_i64(42)]]
+        );
+    }
+    assert!(conn
+        .prepare("COPY copy_results TO STDOUT WITH (FORMAT binary)")
+        .is_err());
+    assert!(conn.prepare("COPY (SELECT 1) TO STDOUT").is_err());
+}
+
+#[test]
+fn command_result_kind_preserves_effects_errors_and_completion() {
+    use turso_pg::StatementResultKind::Command;
+
+    let (_io, conn) = pg_connection();
+    conn.execute("CREATE TABLE command_results (v INTEGER)")
+        .unwrap();
+    let mut set = conn
+        .prepare("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .unwrap();
+    assert_eq!(set.result_kind(), Command);
+    assert!(!conn.inner().is_tx_read_only());
+    conn.execute("BEGIN").unwrap();
+    assert!(!conn.inner().is_tx_read_only());
+    set.run_ignore_rows().unwrap();
+    assert!(conn.inner().is_tx_read_only());
+    assert_eq!(
+        exec_err(&conn, "INSERT INTO command_results VALUES (1)").sqlstate,
+        "25006"
+    );
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    assert_eq!(commit.result_kind(), Command);
+    commit.run_ignore_rows().unwrap();
+    assert_eq!(commit.command_tag_override(), Some("ROLLBACK"));
+    commit.reset().unwrap();
+    assert_eq!(commit.result_kind(), Command);
+    assert_eq!(commit.command_tag_override(), None);
+    conn.execute("BEGIN").unwrap();
+    commit.run_ignore_rows().unwrap();
+    assert_eq!(commit.command_tag_override(), None);
+
+    set.reset().unwrap();
+    conn.execute("BEGIN").unwrap();
+    set.run_ignore_rows().unwrap();
+    conn.execute("SELECT 1").unwrap();
+    let mut write = conn.prepare("SET TRANSACTION READ WRITE").unwrap();
+    assert_eq!(write.result_kind(), Command);
+    assert_eq!(write.run_ignore_rows().unwrap_err().sqlstate, "25001");
+    conn.execute("ROLLBACK").unwrap();
+
+    let mut schema = conn.prepare("CREATE SCHEMA metadata_schema").unwrap();
+    assert_eq!(schema.result_kind(), Command);
+    schema.run_ignore_rows().unwrap();
+    schema.reset().unwrap();
+    assert_eq!(schema.result_kind(), Command);
+    assert!(schema.run_ignore_rows().is_err());
 }
