@@ -253,6 +253,8 @@ use crate::{
 use crate::storage::encryption::EncryptionContext;
 use crate::File;
 
+#[cfg(feature = "conn_raw_api")]
+pub mod frame_codec;
 mod serializer;
 use serializer::EncryptedPayload;
 #[cfg(feature = "conn_raw_api")]
