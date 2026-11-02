@@ -144,6 +144,10 @@ jobs:
         run: npm run typescript
         working-directory: ${{ env.working-directory }}
 
+      - name: Test encrypted sync configuration
+        run: npm run test:encryption
+        working-directory: ${{ env.working-directory }}
+
       - name: Upload TypeScript build
         uses: actions/upload-artifact@v4
         with:
