@@ -1,0 +1,19 @@
+@database :memory:
+
+test pragma-collation-list-builtins {
+    PRAGMA collation_list;
+}
+expect {
+    0|RTRIM
+    1|NOCASE
+    2|BINARY
+}
+
+test pragma-collation-list-table-valued {
+    SELECT name FROM pragma_collation_list ORDER BY seq;
+}
+expect {
+    RTRIM
+    NOCASE
+    BINARY
+}
