@@ -31,7 +31,7 @@ import { drainSyncIo } from './internal/ioProcessor';
  * Check if config has sync properties (url field)
  */
 function isSyncConfig(opts: DatabaseOpts): boolean {
-  return opts.url !== undefined && opts.url !== null;
+  return opts.localEncryptionKey != null || (opts.url !== undefined && opts.url !== null);
 }
 
 /**
@@ -156,10 +156,16 @@ export class Database {
       url = this._opts.url;
     }
 
+    if (this._opts.localEncryptionKey != null && this._opts.remoteEncryption == null) {
+      throw new Error('localEncryptionKey requires remoteEncryption.cipher');
+    }
     // Build dbConfig (path normalization happens in C++ JSI layer)
     const dbConfig = {
       path: this._opts.path,
-      async_io: true, // use async IO for synced database as we have network IO loop externally from the turso core
+      async_io: true,
+      experimental_features: this._opts.localEncryptionKey != null ? 'encryption' : undefined,
+      encryption_cipher: this._opts.localEncryptionKey != null ? this._opts.remoteEncryption?.cipher : undefined,
+      encryption_hexkey: this._opts.localEncryptionKey,
     };
 
     // Calculate reserved bytes from cipher
@@ -170,7 +176,7 @@ export class Database {
       remoteUrl: url,
       clientName: this._opts.clientName || 'turso-sync-react-native',
       longPollTimeoutMs: this._opts.longPollTimeoutMs,
-      bootstrapIfEmpty: this._opts.bootstrapIfEmpty ?? true,
+      bootstrapIfEmpty: this._opts.bootstrapIfEmpty ?? (url != null),
       reservedBytes: reservedBytes,
       // Remote encryption options (key is passed to sync engine for HTTP headers)
       remoteEncryptionKey: this._opts.remoteEncryption?.key,
