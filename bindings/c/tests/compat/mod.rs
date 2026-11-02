@@ -824,6 +824,47 @@ mod tests {
     }
 
     #[test]
+    fn test_bind_destructor_runs_when_parameter_index_is_invalid() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DESTROYED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn destroy_value(ptr: *mut libc::c_void) {
+            drop(Box::from_raw(ptr as *mut u8));
+            DESTROYED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe {
+            DESTROYED.store(0, Ordering::SeqCst);
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, c"SELECT ?".as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let text = Box::into_raw(Box::new(b'x'));
+            assert_eq!(
+                sqlite3_bind_text(stmt, 2, text as *const libc::c_char, 1, Some(destroy_value)),
+                SQLITE_RANGE
+            );
+            assert_eq!(DESTROYED.load(Ordering::SeqCst), 1);
+
+            let blob = Box::into_raw(Box::new(b'x'));
+            assert_eq!(
+                sqlite3_bind_blob(stmt, 2, blob as *const libc::c_void, 1, Some(destroy_value)),
+                SQLITE_RANGE
+            );
+            assert_eq!(DESTROYED.load(Ordering::SeqCst), 2);
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
     fn test_sqlite3_bind_blob() {
         unsafe {
             let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
