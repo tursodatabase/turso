@@ -1668,6 +1668,29 @@ expect {
     3|3|3|
 }
 
+# The materialized hash build input runs the RIGHT JOIN and its unmatched-row
+# pass. So the plan shows the RIGHT-JOIN pass in the materialization only, and
+# not again after the hash join of the main plan.
+@skip-if sqlite "SQLite does not materialize a hash build input"
+test right-join-in-materialized-hash-build-prefix-plan-shows-one-unmatched-pass {
+    CREATE TABLE t0(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t2(a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE t3(a INTEGER, b INTEGER, c INTEGER);
+    INSERT INTO t0 VALUES (1, 1, 2);
+    INSERT INTO t2 VALUES (1, 2, NULL);
+    ANALYZE;
+    EXPLAIN QUERY PLAN
+    SELECT t0.c, t1.a, t2.c, t3.a
+    FROM t0
+    RIGHT JOIN t1 ON t1.a = t0.c
+    JOIN t2 ON t2.a = t1.c
+    LEFT JOIN t3 ON t3.a = t2.c;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input for t2.*RIGHT-JOIN t1.*HASH JOIN t3\s*\z
+}
+
 @cross-check-integrity
 test left-hash-join-on-left-in-list-preserves-unmatched-rows {
     CREATE TABLE l(id INTEGER PRIMARY KEY, x INTEGER);
