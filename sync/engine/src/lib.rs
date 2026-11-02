@@ -1,4 +1,5 @@
 pub mod alloc;
+mod changes_file;
 pub mod client_proto;
 pub mod database_replay_generator;
 pub mod database_sync_engine;
