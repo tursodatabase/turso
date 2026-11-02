@@ -864,15 +864,11 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
             None => any,
         },
         ResultType::RealForTextOtherwiseTheFirstArgumentsType => match first_argument() {
-            // abs of a custom type is SQLite's abs, so the type counts as the
-            // type it is stored as: abs of a numeric or uuid, stored as a
-            // blob, is a real.
-            Some(ty) => match sqlite_operand_type(ty.clone(), env.schema()) {
-                ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob) | ExprType::Untyped => {
-                    ExprType::Builtin(BuiltinType::Real)
-                }
-                _ => negated_type(ty, env.schema()),
-            },
+            Some(ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob) | ExprType::Untyped) => {
+                ExprType::Builtin(BuiltinType::Real)
+            }
+            // abs of a custom type keeps main's type, the type of `-x`.
+            Some(ty) => negated_type(ty, env.schema()),
             None => any,
         },
         ResultType::RealForARealArgument => {

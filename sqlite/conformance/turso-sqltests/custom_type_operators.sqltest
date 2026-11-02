@@ -727,13 +727,23 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test op-date-plus-abs-of-numeric-error {
-    -- abs of a numeric is SQLite's abs, a real, so it is not a number of days.
+    -- abs of a numeric is SQLite's abs, the real 3.0, so it is not a number of days.
     CREATE TABLE t(d date, n numeric(10,2)) STRICT;
     INSERT INTO t VALUES ('2024-01-05', 3);
     SELECT d + abs(n) FROM t;
 }
 expect error {
-    operator does not exist: date \+ real
+    a date can only be added to an integer number of days
+}
+
+@requires strict "uses STRICT tables"
+test op-numeric-plus-abs-of-numeric-is-numeric {
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (4.5);
+    SELECT n + abs(n) FROM t;
+}
+expect {
+    9.00
 }
 
 @requires strict "uses STRICT tables"
