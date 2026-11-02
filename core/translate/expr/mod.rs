@@ -100,7 +100,6 @@ pub(crate) use custom_type_operators::{custom_operator_call, emit_operator_call_
 pub(crate) use custom_types::{
     emit_constraint_values_decode, emit_decode, emit_dml_expr_index_value, emit_store_value,
     emit_trigger_decode_registers, emit_type_expr, emit_user_facing_column_value,
-    translate_check_expr,
 };
 pub(crate) use custom_types::{is_literal_of_input_type, runs_custom_type_function};
 pub use emission::{

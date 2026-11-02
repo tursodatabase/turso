@@ -10,9 +10,8 @@ use super::{
     },
     expr::{
         bind_and_rewrite_expr, emit_constraint_values_decode, emit_stored_column,
-        emit_table_column, emit_user_facing_column_value, translate_check_expr,
-        translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
-        WalkControl,
+        emit_table_column, emit_user_facing_column_value, translate_expr_no_constant_opt,
+        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -2281,12 +2280,13 @@ fn emit_check_constraint_bytecode(
             )?;
         }
 
-        translate_check_expr(
+        translate_expr_no_constant_opt(
             program,
             referenced_tables,
             &rewritten_expr,
             expr_result_reg,
             resolver,
+            NoConstantOptReason::RegisterReuse,
         )?;
 
         // CHECK constraint passes if the result is NULL or non-zero (truthy)

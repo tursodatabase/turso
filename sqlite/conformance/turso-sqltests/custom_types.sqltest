@@ -127,11 +127,10 @@ expect {
     42|1|0
 }
 
-# A CHECK constraint sees the columns as stored, so a CAST in it gives the
-# stored value: 100 is stored as 10000, which the CHECK allows, and 101 as
-# 10100, which it does not.
+# A CHECK constraint sees a column and a CAST to its type in the same form, so
+# the CHECK allows 100 and rejects 101.
 @requires strict "uses STRICT tables"
-test cast-to-custom-type-in-check-is-stored {
+test cast-to-custom-type-in-check-compares-with-column {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(p cents CHECK (p <= CAST(100 AS cents))) STRICT;
     INSERT INTO t VALUES (100);
@@ -142,7 +141,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test cast-to-custom-type-in-check-is-stored-error {
+test cast-to-custom-type-in-check-compares-with-column-error {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(p cents CHECK (p <= CAST(100 AS cents))) STRICT;
     INSERT INTO t VALUES (101);
@@ -151,10 +150,10 @@ expect error {
     CHECK constraint failed
 }
 
-# A domain's CHECK sees the value as stored, on a CAST to the domain as on an
-# INSERT into a column of it, so CAST(100 AS cents) in it is the stored 10000.
+# A domain's CHECK sees the value after DECODE, on a CAST to the domain as on
+# an INSERT into a column of it, and CAST(100 AS cents) in it is 100.
 @requires strict "uses STRICT tables"
-test cast-to-domain-check-with-cast-is-stored {
+test cast-to-domain-check-sees-decoded-value {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE DOMAIN dc AS cents CHECK (value <= CAST(100 AS cents));
     CREATE TABLE t(p dc) STRICT;
@@ -166,7 +165,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-test cast-to-domain-check-with-cast-is-stored-error {
+test cast-to-domain-check-sees-decoded-value-error {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE DOMAIN dc AS cents CHECK (value <= CAST(100 AS cents));
     SELECT CAST(101 AS dc);

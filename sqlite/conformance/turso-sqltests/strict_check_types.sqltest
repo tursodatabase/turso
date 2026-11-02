@@ -370,15 +370,60 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test custom-type-cast-in-check-compares-like-select {
-    -- CAST(50 AS cents) gives the stored form, 5000, and the CHECK compares
-    -- it with the value a read gives, 60, as a SELECT does.
+    -- CAST(50 AS cents) gives 50, the value a read gives, and the CHECK
+    -- compares it with the amount as a SELECT does.
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
-    INSERT INTO t VALUES(60);
+    INSERT INTO t VALUES(40);
     SELECT amount, amount < CAST(50 AS cents) FROM t;
 }
 expect {
-    60|1
+    40|1
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-cast-in-check-compares-like-select-error {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
+    INSERT INTO t VALUES(60);
+}
+expect error {
+    CHECK constraint failed: amount < CAST\(50 AS cents\)
+}
+
+# A CAST gives the decoded value whether or not it is inside another CAST.
+@requires strict "uses STRICT tables"
+test cast-inside-cast-in-check-gives-decoded-value {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(i integer CHECK (CAST(CAST(i AS cents) AS integer) = 6 AND CAST(i AS cents) = 6)) STRICT;
+    INSERT INTO t VALUES (6);
+    SELECT i FROM t;
+}
+expect {
+    6
+}
+
+@requires strict "uses STRICT tables"
+test integrity-check-sees-custom-type-column-like-insert {
+    -- INSERT and integrity_check both run the CHECK on the decoded 'ba'.
+    CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
+    CREATE TABLE t(s rev CHECK (s LIKE 'b%')) STRICT;
+    INSERT INTO t VALUES ('ba');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test integrity-check-sees-cast-in-check-like-insert {
+    CREATE TYPE rev BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
+    CREATE TABLE t(s text CHECK (CAST(s AS rev) LIKE 'b%')) STRICT;
+    INSERT INTO t VALUES ('ba');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
 }
 
 # ============================================================================

@@ -738,20 +738,11 @@ fn translate_cast_expr(
     let ast::Expr::Cast { expr, type_name } = expr else {
         unreachable!("translate_cast_expr expects Expr::Cast");
     };
-    // A CAST to a custom type gives the value in the form a column of the type
-    // has in the same expression, so that operators, functions and comparisons
-    // see both alike. A query reads columns decoded, so `CAST(42 AS cents)` is
-    // 42 and `-CAST(1.5 AS numeric(10,2))` runs numeric's `-` on 1.50. A CHECK
-    // constraint and an ORDER BY key see columns as stored, and there the CAST
-    // stays stored too. That choice is about the CAST's result only: its
-    // operand is an ordinary value, read decoded.
-    let result_is_stored = program.flags.suppress_custom_type_decode();
-    program.flags.set_suppress_custom_type_decode(false);
-    let translated = translate_expr(program, referenced_tables, expr, target_register, resolver);
-    program
-        .flags
-        .set_suppress_custom_type_decode(result_is_stored);
-    translated?;
+    // A CAST to a custom type gives the value a column of the type reads, after
+    // ENCODE and then DECODE, so that operators, functions and comparisons see
+    // both alike: `CAST(42 AS cents)` is 42, and `-CAST(1.5 AS numeric(10,2))`
+    // runs numeric's `-` on 1.50.
+    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
 
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
 
@@ -794,11 +785,11 @@ fn translate_cast_expr(
                 emit_integer_to_boolean_cast(program, target_register);
             }
             emit_store_value(program, &chain, target_register, &ty_params, resolver)?;
+            emit_decode(program, &chain, target_register, resolver)?;
+            // The domain's CHECKs see the value after DECODE, as they do on a
+            // column of the domain.
             if is_domain {
                 emit_domain_cast_constraints(program, &chain, target_register, resolver)?;
-            }
-            if !result_is_stored {
-                emit_decode(program, &chain, target_register, resolver)?;
             }
             return Ok(target_register);
         }

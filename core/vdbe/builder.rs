@@ -497,12 +497,9 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, custom-type values in the expression being translated keep
-    /// their stored form: a column is not decoded and a CAST to a custom type
-    /// gives the stored value (its operand is still read decoded). Set when
-    /// building ORDER BY sort keys, so the
-    /// sorter compares stored values, and in CHECK constraints, which see the
-    /// columns as stored.
+    /// When set, a custom-type column is read in its stored form, without
+    /// DECODE. Set when an ORDER BY key is such a column, so the sorter
+    /// compares stored values.
     pub const fn suppress_custom_type_decode(self) -> bool {
         self.get(Self::SUPPRESS_CUSTOM_TYPE_DECODE)
     }
