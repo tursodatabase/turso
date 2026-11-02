@@ -5844,6 +5844,7 @@ mod tests {
 
     fn push_test_opts() -> DatabaseSyncEngineOpts {
         DatabaseSyncEngineOpts {
+            encryption: None,
             remote_url: None,
             client_name: "test-client".to_string(),
             tables_ignore: Vec::new(),

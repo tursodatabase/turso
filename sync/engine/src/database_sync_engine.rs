@@ -45,6 +45,7 @@ use crate::{
 
 #[derive(Clone, Debug)]
 pub struct DatabaseSyncEngineOpts {
+    pub encryption: Option<crate::sync_encryption::SyncEncryption>,
     pub remote_url: Option<String>,
     pub client_name: String,
     pub tables_ignore: Vec<String>,
@@ -80,7 +81,8 @@ pub struct DatabaseSyncEngineOpts {
     /// a single HTTP round-trip. Currently applied only to the bootstrap phase
     /// — incremental pulls are unaffected. **No-op when partial-sync uses the
     /// `Query` bootstrap strategy** — the server picks the page set, so the
-    /// client can't chunk it locally.
+    /// client can't chunk it locally. Locally encrypted bootstrap rejects positive
+    /// values; use `None` or zero for its unfiltered bootstrap request.
     pub pull_bytes_threshold: Option<usize>,
     /// Sync-protocol override for incremental pulls.
     ///
@@ -95,6 +97,52 @@ pub struct DatabaseSyncEngineOpts {
 pub struct DataStats {
     pub written_bytes: AtomicUsize,
     pub read_bytes: AtomicUsize,
+}
+
+impl DatabaseSyncEngineOpts {
+    pub fn local_encryption_context(&self) -> Result<Option<turso_core::EncryptionContext>> {
+        let crypto = self
+            .encryption
+            .as_ref()
+            .map(|config| config.local_context())
+            .transpose()?
+            .flatten();
+        if crypto.is_some() {
+            if !self.db_opts.enable_encryption {
+                return Err(Error::DatabaseSyncEngineError(
+                    "encryption must be enabled in database options".into(),
+                ));
+            }
+            if self.partial_sync_opts.is_some()
+                || self.protocol_version_hint == DatabaseSyncEngineProtocolVersion::Legacy
+            {
+                return Err(Error::DatabaseSyncEngineError(
+                    "local encryption requires full sync with protocol V1".into(),
+                ));
+            }
+        }
+        Ok(crypto)
+    }
+
+    fn connect_options(&self) -> ConnectOpts {
+        self.encryption
+            .as_ref()
+            .map(|config| config.connect_options())
+            .unwrap_or_else(ConnectOpts::new)
+    }
+
+    fn local_key(&self) -> Option<turso_core::EncryptionKey> {
+        self.encryption
+            .as_ref()
+            .and_then(|config| config.local_key())
+            .cloned()
+    }
+
+    fn local_options(&self) -> Option<turso_core::EncryptionOpts> {
+        self.encryption
+            .as_ref()
+            .and_then(|config| config.local_options())
+    }
 }
 
 impl Default for DataStats {
@@ -3744,6 +3792,7 @@ mod tests {
 
     fn default_test_opts() -> DatabaseSyncEngineOpts {
         DatabaseSyncEngineOpts {
+            encryption: None,
             remote_url: None,
             client_name: "test-client".to_string(),
             tables_ignore: vec![],
