@@ -1,0 +1,155 @@
+@database database/unknown_collation.db readonly
+
+# The fixture was created with Python's sqlite3 module after registering a collation named
+# `reverse`:
+#
+#   create table t1(a collate reverse, b);
+#   create index i1 on t1(a);
+#   create table t2(a, b);
+#   create index i2 on t2(a collate reverse);
+#   create table t3(a, unique(a collate reverse));
+#   create table t4(a collate reverse, b);
+#   create index i4 on t4(b) where a = 'x';
+#   insert into t1 values('a', 1), ('b', 2);
+#   insert into t2 values('a', 1), ('b', 2);
+#   insert into t3 values('a'), ('b');
+#   insert into t4 values('x', 1), ('X', 2), ('y', 3);
+#
+# Without that collation the database still opens. Only statements that compare or sort with it
+# fail. Writes and ALTER TABLE need a writable copy of the fixture and are tested in
+# tests/integration/query_processing/test_ddl.rs.
+
+test column-with-unknown-collation-is-readable {
+    SELECT a FROM t1;
+}
+expect unordered {
+    a
+    b
+}
+
+test column-with-unknown-collation-cannot-be-sorted {
+    SELECT a FROM t1 ORDER BY a;
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test column-with-unknown-collation-cannot-be-compared {
+    SELECT a FROM t1 WHERE a = 'a';
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test column-with-unknown-collation-can-be-tested-for-null {
+    SELECT count(*) FROM t1 WHERE a IS NULL;
+}
+expect {
+    0
+}
+
+test column-with-unknown-collation-can-be-tested-for-null-in-result {
+    SELECT a IS NULL, a IS (NULL) FROM t1;
+}
+expect {
+    0|0
+    0|0
+}
+
+test index-with-unknown-collation-is-not-used-for-comparison {
+    SELECT a FROM t2 WHERE a = 'a';
+}
+expect {
+    a
+}
+
+test index-with-unknown-collation-is-not-used-for-sorting {
+    SELECT a FROM t2 ORDER BY a;
+}
+expect {
+    a
+    b
+}
+
+test unique-constraint-with-unknown-collation-is-not-used-for-comparison {
+    SELECT a FROM t3 WHERE a = 'a';
+}
+expect {
+    a
+}
+
+test column-with-unknown-collation-cannot-be-compared-without-matching-rows {
+    SELECT a FROM t1 WHERE b = 3 AND a = 'a';
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test index-on-column-with-unknown-collation-cannot-be-created {
+    CREATE INDEX i5 ON t1(a);
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test column-with-unknown-collation-cannot-be-distinct {
+    SELECT DISTINCT a FROM t1;
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test union-all-reads-column-with-unknown-collation {
+    SELECT a FROM t1 UNION ALL SELECT 'q';
+}
+expect unordered {
+    a
+    b
+    q
+}
+
+test union-all-with-unknown-collation-cannot-be-sorted {
+    SELECT a FROM t1 UNION ALL SELECT 'q' ORDER BY 1;
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test union-with-unknown-collation-cannot-remove-duplicates {
+    SELECT a FROM t1 UNION ALL SELECT 'q' UNION SELECT 'z';
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+# The partial index i4 holds the rows where a = 'x', so a query that uses it does not need to
+# compare a again. The query still needs the collation of a.
+test partial-index-on-column-with-unknown-collation-cannot-skip-the-comparison {
+    SELECT b FROM t4 WHERE a = 'x' AND b > 0;
+}
+expect error {
+    no such collation sequence: reverse
+}
+
+test index-with-unknown-collation-cannot-be-forced {
+    SELECT a FROM t2 INDEXED BY i2 WHERE a = 'a';
+}
+expect error {
+    no query solution
+}
+
+test missing-index-cannot-be-forced {
+    SELECT a FROM t2 INDEXED BY nope;
+}
+expect error {
+    no such index: nope
+}
+
+# A join without a usable index searches t1 through an automatic index on b. The index also holds
+# a, which the query reads but never compares.
+test join-reads-column-with-unknown-collation-through-automatic-index {
+    SELECT y.a FROM t2 x JOIN t1 y ON y.b > x.b;
+}
+expect {
+    b
+}

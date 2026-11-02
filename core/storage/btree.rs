@@ -1370,16 +1370,15 @@ impl BTreeCursor {
         table: &BTreeTable,
         num_columns: usize,
     ) -> Self {
-        let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
-            let (_, column) = table
-                .get_column(col_name)
-                .expect("WITHOUT ROWID primary key column should exist");
-            crate::types::KeyInfo {
+        let key_info = table
+            .primary_key_columns
+            .iter()
+            .zip(table.without_rowid_key_collations())
+            .map(|((_, order), collation)| crate::types::KeyInfo {
                 sort_order: *order,
-                collation: column.collation(),
+                collation,
                 nulls_order: None,
-            }
-        });
+            });
         let index_info = Arc::new(
             IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
                 .expect(crate::alloc::ALLOC_ERR_MSG),

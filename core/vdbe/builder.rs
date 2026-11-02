@@ -353,6 +353,10 @@ pub struct ProgramBuilder {
     free_register_ranges: Vec<Range<usize>>,
     next_free_cursor_id: usize,
     free_cursor_ids: Vec<usize>,
+    /// The first unknown collation that the key of a cursor's b-tree compares
+    /// with. A b-tree compares keys without the statement, so it cannot look
+    /// the collation up (see [crate::translate::collate::TextCollation::Unknown]).
+    unknown_key_collation: Option<CollationSeq>,
     next_hash_table_id: usize,
     pub table_references: TableReferences,
     /// Current parsing nesting level
@@ -845,6 +849,7 @@ impl ProgramBuilder {
             free_register_ranges: Vec::new(),
             next_free_cursor_id: 0,
             free_cursor_ids: Vec::new(),
+            unknown_key_collation: None,
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
@@ -1320,6 +1325,9 @@ impl ProgramBuilder {
     }
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
+        if self.unknown_key_collation.is_none() {
+            self.unknown_key_collation = unknown_key_collation(&cursor_type);
+        }
         if let Some(cursor) = self.free_cursor_ids.pop() {
             self.cursor_ref[cursor] = (key, cursor_type);
             return cursor;
@@ -2598,6 +2606,18 @@ impl ProgramBuilder {
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<Program> {
+        if let Some(collation) = self.unknown_key_collation {
+            let name = collation.name();
+            if connection.syms.read().resolve_collation(&name).is_some() {
+                crate::bail_parse_error!(
+                    "custom collations are not supported in indexes or WITHOUT ROWID tables"
+                );
+            }
+            crate::bail_parse_error!("no such collation sequence: {name}");
+        }
+        for (insn, _) in &self.insns {
+            reject_unknown_collations(insn)?;
+        }
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(
             prepare_context,
@@ -2606,6 +2626,37 @@ impl ProgramBuilder {
             sql,
         )?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
+    }
+}
+
+fn unknown_key_collation(cursor_type: &CursorType) -> Option<CollationSeq> {
+    match cursor_type {
+        CursorType::BTreeIndex(index) => index.unknown_collation(),
+        // A table SQLite wrote is ordered by the PRIMARY KEY collation, so it
+        // cannot be written while that collation is unknown either.
+        CursorType::BTreeTable(table) if !table.has_rowid => table
+            .without_rowid_key_collations()
+            .chain(table.primary_key_constraint_collations())
+            .find(|collation| collation.is_unknown()),
+        _ => None,
+    }
+}
+
+/// Translation looks up every unknown collation a statement compares with
+/// (see [crate::translate::collate::TextCollation::Unknown]), so one left in
+/// an instruction is a bug that would panic when the instruction compares.
+fn reject_unknown_collations(insn: &Insn) -> crate::Result<()> {
+    let mut unknown = None;
+    insn.for_each_collation(|collation| {
+        if collation.is_unknown() {
+            unknown.get_or_insert(collation);
+        }
+    });
+    match unknown {
+        Some(collation) => Err(crate::LimboError::InternalError(format!(
+            "the statement did not look up collation {collation}"
+        ))),
+        None => Ok(()),
     }
 }
 
