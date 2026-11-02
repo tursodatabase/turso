@@ -2450,6 +2450,14 @@ impl Database {
     /// Rebuild the process-local shared WAL view after a caller restores the
     /// database and WAL files outside the pager.
     pub fn reload_wal_after_external_restore(self: &Arc<Self>) -> Result<()> {
+        self.reload_wal_after_external_restore_with_encryption_key(None)
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn reload_wal_after_external_restore_with_encryption_key(
+        self: &Arc<Self>,
+        encryption_key: Option<EncryptionKey>,
+    ) -> Result<()> {
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"
@@ -2496,12 +2504,14 @@ impl Database {
             .replace_after_external_restore(new_shared_wal.into_inner());
         if self.mvcc_enabled() || journal_mode::logical_log_exists(std::path::Path::new(&self.path))
         {
+            let pager = self._init(encryption_key.as_ref(), None)?;
+            let encryption_context = pager.io_ctx.read().encryption_context().cloned();
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
                 self.open_flags,
                 self.durable_storage.clone(),
-                None,
+                encryption_context,
                 self.allocators.mv_store.clone(),
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
@@ -2509,7 +2519,7 @@ impl Database {
             let mvcc_bootstrap_conn = self._connect(
                 true,
                 None,
-                None,
+                encryption_key,
                 None,
                 ConnectionContext::default(),
                 StatsRefresh::Blocking,
@@ -3753,6 +3763,71 @@ mod database_tests {
         DatabaseStorage, EncryptionOpts, EngineDialect, IOResult, LimboError, OpenDbAsyncState,
         OpenFlags, OpenOptions, PlatformIO, IO,
     };
+
+    #[cfg(all(feature = "fs", feature = "encryption", feature = "conn_raw_api"))]
+    #[test]
+    fn encrypted_mvcc_reload_preserves_key_and_log_encryption() -> crate::Result<()> {
+        let dir = tempfile::TempDir::new().expect("temporary directory");
+        let path = dir.path().join("reload.db");
+        let path = path.to_str().expect("UTF-8 path");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
+        let encryption = EncryptionOpts {
+            cipher: "aes256gcm".into(),
+            hexkey: "17".repeat(32),
+        };
+        let key = EncryptionKey::from_hex_string(&encryption.hexkey)?;
+        let options = DatabaseOpts::new().with_encryption(true);
+        {
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                path,
+                OpenFlags::Create,
+                options,
+                Some(encryption.clone()),
+                Arc::new(EngineDialect),
+            )?;
+            let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key.clone())))?;
+            conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+            conn.execute("CREATE TABLE t(value TEXT)")?;
+            conn.execute("INSERT INTO t VALUES ('before reload')")?;
+            conn.reload_wal_after_external_restore()?;
+            drop(conn);
+            db.reload_wal_after_external_restore_with_encryption_key(Some(key.clone()))?;
+            let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key.clone())))?;
+            conn.execute("INSERT INTO t VALUES ('after reload')")?;
+        }
+        {
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                path,
+                OpenFlags::None,
+                options,
+                Some(encryption.clone()),
+                Arc::new(EngineDialect),
+            )?;
+            let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key.clone())))?;
+            let mut stmt = conn.prepare("SELECT value FROM t ORDER BY rowid")?;
+            for expected in ["before reload", "after reload"] {
+                assert!(matches!(stmt.step()?, crate::StepResult::Row));
+                assert_eq!(stmt.row().expect("row").get::<String>(0)?, expected);
+            }
+            assert!(matches!(stmt.step()?, crate::StepResult::Done));
+            drop(stmt);
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        }
+        let db = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::None,
+            options,
+            Some(encryption),
+            Arc::new(EngineDialect),
+        )?;
+        let conn = db.connect(ConnectOpts::new().with_encryption_key(Some(key)))?;
+        let rows = conn.prepare("SELECT count(*) FROM t")?.run_collect_rows()?;
+        assert_eq!(rows, vec![vec![crate::Value::from_i64(2)]]);
+        Ok(())
+    }
 
     #[test]
     fn memory_path_classifies_named_memory_databases() {
