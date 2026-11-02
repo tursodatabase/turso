@@ -1973,3 +1973,64 @@ func TestFTS(t *testing.T) {
 		require.Greater(t, count, 0)
 	})
 }
+
+// TestStatementsFailAfterEngineRollback covers
+// https://github.com/tursodatabase/turso/issues/11217.
+//
+// When a BEGIN CONCURRENT statement hits a write-write conflict, the engine
+// rolls the transaction back and the connection returns to autocommit mode.
+// Statements that still think they run inside the transaction must fail
+// instead of silently autocommitting.
+func TestStatementsFailAfterEngineRollback(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := path.Join(dir, "tx_rollback.db")
+
+	db, err := sql.Open("turso", dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+
+	_, err = db.ExecContext(ctx, "PRAGMA journal_mode='mvcc'")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO t VALUES (1, 0), (2, 0)")
+	require.NoError(t, err)
+
+	connA, err := db.Conn(ctx)
+	require.NoError(t, err)
+	defer connA.Close()
+	connB, err := db.Conn(ctx)
+	require.NoError(t, err)
+	defer connB.Close()
+
+	_, err = connA.ExecContext(ctx, "BEGIN CONCURRENT")
+	require.NoError(t, err)
+	_, err = connB.ExecContext(ctx, "BEGIN CONCURRENT")
+	require.NoError(t, err)
+
+	_, err = connA.ExecContext(ctx, "UPDATE t SET v = 1 WHERE id = 1")
+	require.NoError(t, err)
+	_, err = connB.ExecContext(ctx, "UPDATE t SET v = 2 WHERE id = 1")
+	require.Error(t, err, "expected write-write conflict")
+
+	// The engine rolled connB's transaction back; this statement must fail
+	// rather than autocommit.
+	_, err = connB.ExecContext(ctx, "UPDATE t SET v = 42 WHERE id = 2")
+	require.Error(t, err)
+
+	// The blocked write must not have silently committed.
+	var v int
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT v FROM t WHERE id = 2").Scan(&v))
+	require.Equal(t, 0, v)
+
+	// COMMIT still reports the engine's truth and leaves the connection
+	// usable for autocommit work.
+	_, err = connB.ExecContext(ctx, "COMMIT")
+	require.Error(t, err)
+	_, err = connB.ExecContext(ctx, "UPDATE t SET v = 5 WHERE id = 2")
+	require.NoError(t, err)
+
+	_, err = connA.ExecContext(ctx, "COMMIT")
+	require.NoError(t, err)
+}
