@@ -5728,21 +5728,16 @@ impl BTreeTable {
     /// True when PRIMARY KEY(...) lists a column more than once with
     /// different collations, e.g. PRIMARY KEY(a COLLATE NOCASE, a).
     pub fn primary_key_repeats_column_with_other_collation(&self) -> bool {
-        let collations = self
-            .primary_key_columns
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (name, _))| {
-                let (_, column) = self.get_column(name)?;
-                Some((name, self.primary_key_collation(i, column)))
+        let collation_of = |i: usize| {
+            let (name, _) = &self.primary_key_columns[i];
+            self.get_column(name)
+                .map(|(_, column)| self.primary_key_collation(i, column))
+        };
+        let names = &self.primary_key_columns;
+        (0..names.len()).any(|i| {
+            (i + 1..names.len()).any(|j| {
+                names[i].0.eq_ignore_ascii_case(&names[j].0) && collation_of(i) != collation_of(j)
             })
-            .collect::<Vec<_>>();
-        collations.iter().enumerate().any(|(i, (name, collation))| {
-            collations[i + 1..]
-                .iter()
-                .any(|(other_name, other_collation)| {
-                    other_name.eq_ignore_ascii_case(name) && other_collation != collation
-                })
         })
     }
 
