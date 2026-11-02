@@ -261,6 +261,7 @@ impl LimboError {
             Self::Interrupt => 9,
             Self::Corrupt(_) => 11,
             Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
+            Self::CompletionError(CompletionError::IOError(_, "open")) => 14,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,
             Self::NotADB => 26,

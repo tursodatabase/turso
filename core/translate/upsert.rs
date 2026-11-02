@@ -1279,9 +1279,9 @@ pub fn emit_upsert(
                     flags: CmpInsFlags::default(),
                     collation: CollationSeq::for_internal_values(),
                 });
-                let description = format_unique_violation_desc(table.get_name(), &idx_meta);
-                let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();
                 let bt = table.require_btree()?;
+                let description = format_unique_violation_desc(&bt, &idx_meta);
+                let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();
                 let mut constraint_info = ConstraintInfo::unique_index(&bt, &idx_meta, regs);
                 emit_constraint_values_decode(program, resolver, &bt, &mut constraint_info)?;
                 let err_code = constraint_info.kind.sqlite_extended_result_code();

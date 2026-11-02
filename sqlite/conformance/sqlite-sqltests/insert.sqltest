@@ -972,6 +972,47 @@ expect error {
     ^UNIQUE constraint failed: index 't_plus'$
 }
 
+# Error patterns ignore case; (?-i) makes these check the case of the names.
+@cross-check-integrity
+test insert-unique-conflict-uses-the-column-name-from-create-table {
+    CREATE TABLE t (Id TEXT, PRIMARY KEY (ID));
+    INSERT INTO t VALUES ('x');
+    INSERT INTO t VALUES ('x');
+}
+expect error {
+    (?-i)^UNIQUE constraint failed: t\.Id$
+}
+
+@cross-check-integrity
+test update-unique-conflict-uses-the-column-name-from-create-table {
+    CREATE TABLE t (Bb, UNIQUE (BB));
+    INSERT INTO t VALUES (1), (2);
+    UPDATE t SET bb = 1;
+}
+expect error {
+    (?-i)^UNIQUE constraint failed: t\.Bb$
+}
+
+@cross-check-integrity
+test upsert-unique-conflict-uses-the-column-name-from-create-table {
+    CREATE TABLE t (Bb UNIQUE, Cc UNIQUE);
+    INSERT INTO t VALUES (1, 1), (2, 2);
+    INSERT INTO t VALUES (1, 9) ON CONFLICT (bb) DO UPDATE SET cc = 2;
+}
+expect error {
+    (?-i)^UNIQUE constraint failed: t\.Cc$
+}
+
+@cross-check-integrity
+test create-unique-index-on-duplicates-uses-the-column-name-from-create-table {
+    CREATE TABLE t (Bb);
+    INSERT INTO t VALUES (1), (1);
+    CREATE UNIQUE INDEX i ON t (BB);
+}
+expect error {
+    (?-i)^UNIQUE constraint failed: t\.Bb$
+}
+
 # RETURNING clause tests
 @cross-check-integrity
 test returning-basic-column {

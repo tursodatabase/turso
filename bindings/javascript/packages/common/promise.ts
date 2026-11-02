@@ -1,6 +1,6 @@
 import { AsyncLock } from "./async-lock.js";
 import { bindParams } from "./bind.js";
-import { convertError, stepSync } from "./sqlite-error.js";
+import { convertError, prepareStatement, resetStatement, stepSync } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP, DatabaseOpts } from "./types.js";
 
 // The engine returned STEP_SLEEP: it wants the statement stepped again after a
@@ -341,14 +341,10 @@ class Database {
       throw new RangeError("The supplied SQL string contains no statements");
     }
 
-    try {
-      if (this.connected) {
-        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
-      } else {
-        return new Statement(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
-      }
-    } catch (err) {
-      throw convertError(err);
+    if (this.connected) {
+      return new Statement(maybeValue(prepareStatement(this.db, sql)), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
+    } else {
+      return new Statement(maybePromise(() => this.connect().then(() => prepareStatement(this.db, sql))), this.db, this.execLock, this.ioStep) as unknown as Promise<Statement>;
     }
   }
 
@@ -846,7 +842,7 @@ async function executeBatch(
         const lastInsertRowid = rowidAfter !== rowidBefore ? rowidAfter : undefined;
         return makeResultSet(columnNames, columnTypes, rows, rowsAffected, lastInsertRowid);
       } finally {
-        nativeStmt.reset();
+        resetStatement(nativeStmt);
       }
     } finally {
       nativeStmt.finalize();
@@ -1012,11 +1008,7 @@ class Transaction {
     if (!sql) {
       throw new RangeError("The supplied SQL string contains no statements");
     }
-    try {
-      return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.gate, this.ioStep) as unknown as Promise<Statement>;
-    } catch (err) {
-      throw convertError(err);
-    }
+    return new Statement(maybeValue(prepareStatement(this.db, sql)), this.db, this.gate, this.ioStep) as unknown as Promise<Statement>;
   }
 
   /**
@@ -1254,7 +1246,7 @@ class Statement {
 
       return { changes, lastInsertRowid };
     } finally {
-      stmt.reset();
+      resetStatement(stmt);
       this.execLock.release();
     }
   }
@@ -1293,7 +1285,7 @@ class Statement {
       }
       return row;
     } finally {
-      stmt.reset();
+      resetStatement(stmt);
       this.execLock.release();
     }
   }
@@ -1329,7 +1321,7 @@ class Statement {
         }
       }
     } finally {
-      stmt.reset();
+      resetStatement(stmt);
       this.execLock.release();
     }
   }
@@ -1369,7 +1361,7 @@ class Statement {
       return rows;
     }
     finally {
-      stmt.reset();
+      resetStatement(stmt);
       this.execLock.release();
     }
   }

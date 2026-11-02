@@ -1,5 +1,5 @@
 import { bindParams } from "./bind.js";
-import { convertError, ioLoopSync, stepSync } from "./sqlite-error.js";
+import { convertError, ioLoopSync, prepareStatement, resetStatement, stepSync } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP } from "./types.js";
 
 function isQueryOptions(value) {
@@ -143,11 +143,7 @@ class Database {
       throw new RangeError("The supplied SQL string contains no statements");
     }
 
-    try {
-      return new Statement(this.db.prepare(sql), this.db);
-    } catch (err) {
-      throw convertError(err);
-    }
+    return new Statement(prepareStatement(this.db, sql), this.db);
   }
 
   /**
@@ -321,7 +317,7 @@ class Database {
               : this.db.totalChanges() !== totalChangesBefore ? this.db.changes() : 0;
             results.push(makeResultSet(columnNames, columnTypes, rows, rowsAffected));
           } finally {
-            stmt.reset();
+            resetStatement(stmt);
           }
         } finally {
           stmt.finalize();
@@ -438,7 +434,7 @@ class Statement {
     const totalChangesBefore = this.db.totalChanges();
 
     const { params, queryOptions } = splitBindParameters(bindParameters);
-    this.stmt.reset();
+    resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
     bindParams(this.stmt, toBindArgs(params));
     for (; ;) {
@@ -469,7 +465,7 @@ class Statement {
    */
   get(...bindParameters) {
     const { params, queryOptions } = splitBindParameters(bindParameters);
-    this.stmt.reset();
+    resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
     bindParams(this.stmt, toBindArgs(params));
     let row = undefined;
@@ -496,7 +492,7 @@ class Statement {
    */
   *iterate(...bindParameters) {
     const { params, queryOptions } = splitBindParameters(bindParameters);
-    this.stmt.reset();
+    resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
     bindParams(this.stmt, toBindArgs(params));
 
@@ -522,7 +518,7 @@ class Statement {
    */
   all(...bindParameters) {
     const { params, queryOptions } = splitBindParameters(bindParameters);
-    this.stmt.reset();
+    resetStatement(this.stmt);
     this.stmt.setQueryTimeout(queryOptions);
     bindParams(this.stmt, toBindArgs(params));
     const rows: any[] = [];

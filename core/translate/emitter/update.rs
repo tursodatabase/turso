@@ -2175,7 +2175,7 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Halt {
                         constraint_info: Some(Box::new(constraint_info)),
                         err_code,
-                        description: format_unique_violation_desc(table_name, index),
+                        description: format_unique_violation_desc(&btree_table, index),
                         on_error: program.constraint_halt_on_error(idx_conflict),
                         description_reg: None,
                     });

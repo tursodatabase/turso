@@ -3318,7 +3318,7 @@ fn emit_unique_index_check(
         }
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
-        let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+        let raw_desc = format_unique_violation_desc(ctx.table, index);
         let mut constraint_info = ConstraintInfo::unique_index(
             ctx.table,
             index,
@@ -3366,7 +3366,7 @@ fn emit_unique_index_check(
             });
         } else {
             // ABORT/FAIL/ROLLBACK: halt on conflict.
-            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+            let raw_desc = format_unique_violation_desc(ctx.table, index);
             let mut constraint_info = ConstraintInfo::unique_index(
                 ctx.table,
                 index,
@@ -3568,14 +3568,20 @@ fn translate_virtual_table_insert(
 /// Build the UNIQUE constraint error description to match sqlite
 /// columns:     `t.c1` or `t.k, t.c1`
 /// expressions: `index 'i'`
-pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
+pub fn format_unique_violation_desc(table: &BTreeTable, index: &Index) -> String {
     if index.columns.iter().any(|c| c.expression().is_some()) {
         return format!("index '{}'", index.name);
     }
     index
         .columns
         .iter()
-        .map(|c| format!("{table_name}.{}", c.name))
+        .map(|c| {
+            let column = table.columns()[c.pos_in_table]
+                .name
+                .as_deref()
+                .expect("index column must name a table column");
+            format!("{}.{column}", table.name)
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }

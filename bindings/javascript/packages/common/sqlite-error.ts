@@ -26,10 +26,28 @@ export class SqliteError extends Error {
   }
 }
 
+/** Prepares SQL on a native database and throws its errors as `SqliteError`. */
+export function prepareStatement(db: NativeDatabase, sql: string): NativeStatement {
+  try {
+    return db.prepare(sql);
+  } catch (err) {
+    throw convertError(err);
+  }
+}
+
 /** Steps a native statement or executor and throws its errors as `SqliteError`. */
 export function stepSync(stmt: NativeStatement | NativeExecutor): StepResult {
   try {
     return stmt.stepSync();
+  } catch (err) {
+    throw convertError(err);
+  }
+}
+
+/** Resets a native statement and throws its errors as `SqliteError`. */
+export function resetStatement(stmt: NativeStatement) {
+  try {
+    stmt.reset();
   } catch (err) {
     throw convertError(err);
   }

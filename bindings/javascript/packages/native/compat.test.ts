@@ -134,6 +134,7 @@ test('file-must-exist', () => {
     let error: any;
     try { new Database(path, { fileMustExist: true }); } catch (e) { error = e; }
     expect(error).toBeInstanceOf(SqliteError);
+    expect(error.code).toBe('SQLITE_CANTOPEN');
     expect(error.message).toContain('I/O error (open)');
 })
 

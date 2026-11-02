@@ -163,6 +163,7 @@ test('file-must-exist', async () => {
     const path = `test-${(Math.random() * 10000) | 0}.db`;
     const error = await connect(path, { fileMustExist: true }).then(() => undefined, (e) => e);
     expect(error).toBeInstanceOf(SqliteError);
+    expect(error.code).toBe('SQLITE_CANTOPEN');
     expect(error.message).toContain('I/O error (open)');
 })
 
@@ -206,6 +207,7 @@ test('errors carry the SQLite message and result code name', async () => {
         [async () => (await db.prepare('INSERT INTO tr VALUES (1)')).run(), 'SQLITE_CONSTRAINT_TRIGGER', 'nope'],
         [async () => db.prepare('SYNTAX ERROR'), 'SQLITE_ERROR', 'near "SYNTAX": syntax error'],
         [async () => db.prepare('SELECT * FROM missing'), 'SQLITE_ERROR', 'no such table: missing'],
+        [async () => (await new Database(':memory:').prepare('SELECT * FROM missing')).all(), 'SQLITE_ERROR', 'no such table: missing'],
         [async () => (await db.prepare("SELECT json_extract('{', '$')")).get(), 'SQLITE_ERROR', 'malformed JSON'],
         [() => connect(notADatabase), 'SQLITE_NOTADB', 'file is not a database'],
     ];
