@@ -67,7 +67,7 @@ pub fn emit_select_plan(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    optimize_plan(program, &mut plan, resolver)?;
+    optimize_plan(program, &mut plan, resolver, connection)?;
     let num_result_cols;
     let opts = match &plan {
         Plan::Select(select) => {
@@ -1863,7 +1863,7 @@ fn is_constant_or_group_by(
             if exprs_are_equivalent(e, group_by_expr)
                 && ExprContext::new(Some(table_references), resolver)
                     .expr_collation(group_by_expr)?
-                    == CollationSeq::Binary
+                    == CollationSeq::BINARY
             {
                 *e = Expr::Literal(ast::Literal::Null);
                 return Ok(WalkControl::SkipChildren);

@@ -363,3 +363,24 @@ expect {
     1
     2
 }
+
+test nextval-no-args {
+    SELECT nextval();
+}
+expect error {
+    wrong number of arguments to function nextval()
+}
+
+test setval-no-args {
+    SELECT setval();
+}
+expect error {
+    wrong number of arguments to function setval()
+}
+
+test currval-no-args {
+    SELECT currval();
+}
+expect error {
+    wrong number of arguments to function currval()
+}

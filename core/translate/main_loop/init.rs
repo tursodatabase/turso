@@ -602,10 +602,10 @@ fn right_join_metadata(
                     .name
                     .clone()
                     .unwrap_or_default();
-                IndexColumn::new(&name, key_position, CollationSeq::Binary)
+                IndexColumn::new(&name, key_position, CollationSeq::BINARY)
             })
             .try_collect::<crate::alloc::Vec<_>>()?,
-        None => crate::alloc::vec![IndexColumn::new("rowid", 0, CollationSeq::Binary)],
+        None => crate::alloc::vec![IndexColumn::new("rowid", 0, CollationSeq::BINARY)],
     };
     let key_len = key_columns.len();
     let matched_rows_index = Arc::new(Index {

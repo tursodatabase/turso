@@ -438,3 +438,30 @@ test temp-does-not-name-a-schema {
 expect error {
     schema "temp" does not exist
 }
+
+test create-index-on-schema-qualified-table-indexes-that-table {
+    CREATE SCHEMA IF NOT EXISTS idx_s;
+    DROP TABLE IF EXISTS idx_s.t;
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE t (x int);
+    CREATE TABLE idx_s.t (x int);
+    CREATE UNIQUE INDEX idx_s_t_x ON idx_s.t (x);
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (1);
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
+test create-index-on-schema-qualified-table-constrains-that-table {
+    CREATE SCHEMA IF NOT EXISTS idx_s2;
+    DROP TABLE IF EXISTS idx_s2.t;
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE t (x int);
+    CREATE TABLE idx_s2.t (x int);
+    CREATE UNIQUE INDEX idx_s2_t_x ON idx_s2.t (x);
+    INSERT INTO idx_s2.t VALUES (1);
+    INSERT INTO idx_s2.t VALUES (1);
+}
+expect error {}

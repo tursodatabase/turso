@@ -26,6 +26,7 @@ use crate::translate::plan::{
     plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, JoinInfo, JoinOrigin,
     NonFromClauseSubquery, Plan, SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
+use crate::translate::planner::table_mask_from_expr;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -1254,6 +1255,7 @@ fn one_table_in_expr(expr: &ast::Expr) -> Option<TableInternalId> {
 pub(super) fn tables_in_hashable_equal_test(
     expr: &ast::Expr,
     tables: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
     resolver: &Resolver,
 ) -> Result<Option<(TableInternalId, TableInternalId)>> {
     let Ok(Some((left, operator, right))) = as_binary_components(expr) else {
@@ -1266,14 +1268,22 @@ pub(super) fn tables_in_hashable_equal_test(
     else {
         return Ok(None);
     };
-    if !comparison_collation(
-        left,
-        right,
-        &ExprContext::new(Some(tables), resolver),
-        &resolver.catalog,
-    )?
-    .can_hash()
-    {
+    // A subquery in a key can read other tables of the join. The key is computed
+    // in the loop of its own table, before the loops of those tables run.
+    let reads_only = |side: &ast::Expr, table: TableInternalId| -> Result<bool> {
+        let Some(table_idx) = tables
+            .joined_tables()
+            .iter()
+            .position(|t| t.internal_id == table)
+        else {
+            return Ok(false);
+        };
+        Ok(table_mask_from_expr(side, tables, subqueries)?.is_only(table_idx))
+    };
+    if !reads_only(left, left_table)? || !reads_only(right, right_table)? {
+        return Ok(None);
+    }
+    if !comparison_collation(left, right, &ExprContext::new(Some(tables), resolver))?.can_hash() {
         return Ok(None);
     }
     Ok(Some((left_table, right_table)))
@@ -2121,6 +2131,7 @@ fn materialized_subquery_ephemeral_index(
                 nulls_order: None,
                 pos_in_table: col_pos,
                 collation: column.collation(),
+                explicit_collation: None,
                 default: column.default.clone(),
                 expr: None,
             })
@@ -2138,6 +2149,7 @@ fn materialized_subquery_ephemeral_index(
                 nulls_order: None,
                 pos_in_table: col_pos,
                 collation: column.collation(),
+                explicit_collation: None,
                 default: column.default.clone(),
                 expr: None,
             })

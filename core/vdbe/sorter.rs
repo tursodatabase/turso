@@ -13,7 +13,7 @@ use std::rc::Rc;
 use crate::alloc::vec;
 use crate::alloc::*;
 use crate::io::TempFile;
-use crate::types::{cmp_in_column, cmp_with_sort, IOCompletions, ValueIterator};
+use crate::types::{cmp_in_column, IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
@@ -23,11 +23,6 @@ use crate::{
     Result,
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
-
-/// A custom comparison function for sorting custom type columns.
-/// Takes two value references and returns an Ordering.
-/// Used when a custom type defines a `<` operator for correct sort behavior.
-pub type SortComparator = Arc<dyn Fn(&ValueRef, &ValueRef) -> Result<Ordering> + Send + Sync>;
 
 /// Bit position of the 3-bit class rank in a normalized key.
 const NORM_CLASS_SHIFT: u32 = 61;
@@ -41,20 +36,16 @@ const NORM_CLASS_SHIFT: u32 = 61;
 ///
 /// Invariant: `norm < other_norm` implies the full key comparison orders this
 /// record first, so the sort comparator only falls back to the full (collation
-/// and comparator aware) comparison when two normalized keys are equal. The
+/// aware) comparison when two normalized keys are equal. The
 /// returned `decisive` flag is true when equal normalized keys additionally
 /// prove the full keys are equal, letting the comparator skip the fallback.
-fn normalized_first_key(
-    values: &[ValueRef<'_>],
-    key_info: &[KeyInfo],
-    comparators: &[Option<SortComparator>],
-) -> (u64, bool) {
+fn normalized_first_key(values: &[ValueRef<'_>], key_info: &[KeyInfo]) -> (u64, bool) {
     use crate::numeric::Numeric;
     let (Some(value), Some(key)) = (values.first(), key_info.first()) else {
         return (0, false);
     };
-    if comparators.first().is_some_and(|c| c.is_some()) {
-        // Custom ordering: the normalized key cannot mirror it.
+    if !matches!(key.collation, CollationSeq::Text(_)) {
+        // A type's order: the normalized key cannot mirror it.
         return (0, false);
     }
     let (norm, mut decisive) = match value {
@@ -99,7 +90,7 @@ fn normalized_first_key(
             ((1u64 << NORM_CLASS_SHIFT) | (monotone >> 3), exact)
         }
         ValueRef::Text(t) => {
-            if key.collation != CollationSeq::Binary {
+            if key.collation != CollationSeq::BINARY {
                 // Non-binary collation: constant key, always full comparison.
                 (2u64 << NORM_CLASS_SHIFT, false)
             } else {
@@ -166,9 +157,6 @@ pub struct Sorter {
     key_len: usize,
     /// The key info.
     pub index_key_info: Rc<Vec<KeyInfo>>,
-    /// Per-column custom comparators for custom type ordering.
-    /// When present, used instead of standard ValueRef comparison for that column.
-    comparators: Rc<Vec<Option<SortComparator>>>,
     /// Sorted chunks stored on disk.
     chunks: Vec<SortedChunk>,
     /// The heap of records consumed from the chunks and their corresponding chunk index.
@@ -206,7 +194,6 @@ impl Sorter {
         order: &[SortOrder],
         collations: Vec<CollationSeq>,
         nulls_orders: Vec<Option<turso_parser::ast::NullsOrder>>,
-        comparators: Vec<Option<SortComparator>>,
         max_buffer_size_bytes: usize,
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
@@ -229,7 +216,6 @@ impl Sorter {
             current: None,
             key_len: order.len(),
             index_key_info: Rc::new(index_key_info),
-            comparators: Rc::new(comparators),
             chunks: vec![],
             chunk_heap: TursoAllocExt::new(),
             max_buffer_size: max_buffer_size_bytes,
@@ -403,7 +389,6 @@ impl Sorter {
                         record,
                         self.key_len,
                         &self.index_key_info,
-                        &self.comparators,
                     )?;
                     let record_ref = self.arena.try_alloc(sortable_record)?;
                     // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
@@ -509,7 +494,6 @@ impl Sorter {
                         record,
                         self.key_len,
                         self.index_key_info.clone(),
-                        self.comparators.clone(),
                     )?)),
                     chunk_idx,
                 ))?;
@@ -893,8 +877,6 @@ struct ArenaSortableRecord {
     /// Shared KeyInfo owned by Sorter. Avoids Rc refcount overhead that would
     /// leak when arena.reset() skips Drop.
     index_key_info: NonNull<[KeyInfo]>,
-    /// Shared comparators owned by Sorter. Same safety model as index_key_info.
-    comparators: NonNull<[Option<SortComparator>]>,
     /// Order-preserving prefix of the first key column; see [normalized_first_key].
     norm_key: u64,
     /// True when equal `norm_key`s prove the full keys are equal.
@@ -907,7 +889,6 @@ impl ArenaSortableRecord {
         record: &ImmutableRecord,
         key_len: usize,
         index_key_info: &[KeyInfo],
-        comparators: &[Option<SortComparator>],
     ) -> Result<Self> {
         let payload = arena.try_alloc_slice_copy(record.get_payload())?;
 
@@ -927,13 +908,11 @@ impl ArenaSortableRecord {
         }
 
         let key_values = key_values.into_bump_slice();
-        let (norm_key, norm_decisive) =
-            normalized_first_key(key_values, index_key_info, comparators);
+        let (norm_key, norm_decisive) = normalized_first_key(key_values, index_key_info);
         Ok(Self {
             payload: NonNull::from(payload),
             key_values: NonNull::from(key_values),
             index_key_info: NonNull::from(index_key_info),
-            comparators: NonNull::from(comparators),
             norm_key,
             norm_decisive,
         })
@@ -965,23 +944,15 @@ impl ArenaSortableRecord {
     fn full_cmp(&self, other: &Self) -> Ordering {
         let self_values = self.key_values();
         let other_values = other.key_values();
-        // SAFETY: index_key_info and comparators point to Sorter-owned data that outlives all records.
+        // SAFETY: index_key_info points to Sorter-owned data that outlives all records.
         let index_key_info = unsafe { self.index_key_info.as_ref() };
-        let comparators = unsafe { self.comparators.as_ref() };
 
-        for (i, ((&self_val, &other_val), key_info)) in self_values
+        for ((&self_val, &other_val), key_info) in self_values
             .iter()
             .zip(other_values.iter())
             .zip(index_key_info.iter())
-            .enumerate()
         {
-            let cmp = if let Some(Some(comparator)) = comparators.get(i) {
-                let base =
-                    comparator(&self_val, &other_val).expect("Memory allocation failed here");
-                cmp_with_sort(base, &self_val, &other_val, key_info)
-            } else {
-                cmp_in_column(&self_val, &other_val, key_info)
-            };
+            let cmp = cmp_in_column(&self_val, &other_val, key_info);
             if cmp != Ordering::Equal {
                 return cmp;
             }
@@ -1022,7 +993,6 @@ struct BoxedSortableRecord {
     record: ImmutableRecord,
     key_values: Vec<ValueRef<'static>>,
     index_key_info: Rc<Vec<KeyInfo>>,
-    comparators: Rc<Vec<Option<SortComparator>>>,
     deserialization_error: Option<LimboError>,
     /// Order-preserving prefix of the first key column; see [normalized_first_key].
     norm_key: u64,
@@ -1035,7 +1005,6 @@ impl BoxedSortableRecord {
         record: ImmutableRecord,
         key_len: usize,
         index_key_info: Rc<Vec<KeyInfo>>,
-        comparators: Rc<Vec<Option<SortComparator>>>,
     ) -> Result<Self> {
         let mut value_iterator = record.iter()?;
         let mut key_values = Vec::try_with_capacity_ext(key_len)?;
@@ -1065,13 +1034,11 @@ impl BoxedSortableRecord {
             }
         }
 
-        let (norm_key, norm_decisive) =
-            normalized_first_key(&key_values, &index_key_info, &comparators);
+        let (norm_key, norm_decisive) = normalized_first_key(&key_values, &index_key_info);
         Ok(Self {
             record,
             key_values,
             index_key_info,
-            comparators,
             deserialization_error,
             norm_key,
             norm_decisive,
@@ -1082,19 +1049,13 @@ impl BoxedSortableRecord {
 impl BoxedSortableRecord {
     /// Full key comparison; only reached when the normalized keys tie.
     fn full_cmp(&self, other: &Self) -> Ordering {
-        for (i, ((&self_val, &other_val), key_info)) in self
+        for ((&self_val, &other_val), key_info) in self
             .key_values
             .iter()
             .zip(other.key_values.iter())
             .zip(self.index_key_info.iter())
-            .enumerate()
         {
-            let cmp = if let Some(Some(comparator)) = self.comparators.get(i) {
-                comparator(&self_val, &other_val).expect("Memory allocation failed here")
-            } else {
-                key_info.collation.compare(self_val, other_val)
-            };
-            let cmp = cmp_with_sort(cmp, &self_val, &other_val, key_info);
+            let cmp = cmp_in_column(&self_val, &other_val, key_info);
             if cmp != Ordering::Equal {
                 return cmp;
             }
@@ -1215,7 +1176,7 @@ mod tests {
             } else {
                 SortOrder::Desc
             },
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::BINARY,
             nulls_order: match rng.next_u64() % 3 {
                 0 => None,
                 1 => Some(NullsOrder::First),
@@ -1235,14 +1196,11 @@ mod tests {
             let va = [gen_value(&mut rng), gen_value(&mut rng)];
             let vb = [gen_value(&mut rng), gen_value(&mut rng)];
             let keys = [gen_key(&mut rng), gen_key(&mut rng)];
-            let comparators: [Option<SortComparator>; 2] = [None, None];
             let ra = [va[0].as_value_ref(), va[1].as_value_ref()];
             let rb = [vb[0].as_value_ref(), vb[1].as_value_ref()];
 
-            let (norm_a, dec_a) =
-                normalized_first_key(&ra[..ncols], &keys[..ncols], &comparators[..ncols]);
-            let (norm_b, dec_b) =
-                normalized_first_key(&rb[..ncols], &keys[..ncols], &comparators[..ncols]);
+            let (norm_a, dec_a) = normalized_first_key(&ra[..ncols], &keys[..ncols]);
+            let (norm_b, dec_b) = normalized_first_key(&rb[..ncols], &keys[..ncols]);
             // The normalized key only ever reflects the first column.
             let a = &ra[0];
             let b = &rb[0];
@@ -1290,8 +1248,7 @@ mod tests {
         for _ in 0..attempts {
             let mut sorter = Sorter::new(
                 &[SortOrder::Asc],
-                try_vec![CollationSeq::Binary].unwrap(),
-                try_vec![None].unwrap(),
+                try_vec![CollationSeq::BINARY].unwrap(),
                 try_vec![None].unwrap(),
                 256,
                 64,
@@ -1344,8 +1301,7 @@ mod tests {
         let min_read_buffer_size = 4096;
         let mut sorter = Sorter::new(
             &[SortOrder::Asc],
-            try_vec![CollationSeq::Binary].unwrap(),
-            try_vec![None].unwrap(),
+            try_vec![CollationSeq::BINARY].unwrap(),
             try_vec![None].unwrap(),
             max_buffer_size,
             min_read_buffer_size,
@@ -1406,8 +1362,7 @@ mod tests {
             let io = Arc::new(crate::io::MemoryYieldIO::new());
             let mut sorter = Sorter::new(
                 &[SortOrder::Asc],
-                try_vec![CollationSeq::Binary].unwrap(),
-                try_vec![None].unwrap(),
+                try_vec![CollationSeq::BINARY].unwrap(),
                 try_vec![None].unwrap(),
                 2000 * 1024,
                 4096,
@@ -1461,8 +1416,7 @@ mod tests {
         let io = Arc::new(crate::io::MemoryYieldIO::new());
         let mut sorter = Sorter::new(
             &[SortOrder::Asc],
-            try_vec![CollationSeq::Binary].unwrap(),
-            try_vec![None].unwrap(),
+            try_vec![CollationSeq::BINARY].unwrap(),
             try_vec![None].unwrap(),
             2048,
             64,
@@ -1554,9 +1508,8 @@ mod tests {
         let io = Arc::new(PlatformIO::new().unwrap());
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, second_order],
-            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![CollationSeq::BINARY, CollationSeq::BINARY].unwrap(),
             try_vec![None, second_nulls].unwrap(),
-            try_vec![None, None].unwrap(),
             1 << 20,
             64,
             io.clone(),
@@ -1595,8 +1548,7 @@ mod tests {
         let io = Arc::new(PlatformIO::new().unwrap());
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, SortOrder::Asc],
-            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
-            try_vec![None, None].unwrap(),
+            try_vec![CollationSeq::BINARY, CollationSeq::BINARY].unwrap(),
             try_vec![None, None].unwrap(),
             // Tiny buffer so the sorter spills to multiple chunk files.
             256,
@@ -1646,9 +1598,8 @@ mod tests {
         let io = Arc::new(PlatformIO::new().unwrap());
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, SortOrder::Asc],
-            try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![CollationSeq::BINARY, CollationSeq::BINARY].unwrap(),
             try_vec![None, Some(turso_parser::ast::NullsOrder::Last)].unwrap(),
-            try_vec![None, None].unwrap(),
             256,
             64,
             io.clone(),

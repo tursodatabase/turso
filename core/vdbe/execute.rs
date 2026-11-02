@@ -12,11 +12,10 @@ use crate::mvcc::database::{
 };
 use crate::mvcc::MvccClock;
 use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
-use crate::numeric::decimal::numeric_from_value;
+use crate::numeric::decimal::{numeric_from_value, MAX_FRACTION_DIGITS};
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
-    SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
@@ -51,7 +50,7 @@ use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
 use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags};
-use crate::vdbe::metrics::HashJoinMetrics;
+use crate::vdbe::metrics::{HashJoinMetrics, StatementMetrics};
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::ValueIteratorExt;
@@ -87,8 +86,8 @@ use crate::{
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
-            exec_date, exec_date_minus, exec_date_plus, exec_datetime_full, exec_julianday,
-            exec_strftime, exec_time, exec_unixepoch,
+            exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full,
+            exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
         printf::exec_printf,
     },
@@ -153,7 +152,7 @@ impl OpenedBTree {
 
 use super::{
     array::{
-        array_values_from_blob, compare_arrays, compute_array_length, compute_array_length_at_dim,
+        array_values_from_blob, compute_array_length, compute_array_length_at_dim,
         exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
         exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
         exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
@@ -161,7 +160,7 @@ use super::{
     },
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
-        IvmSumKind, RegisterOrLiteral, SortComparatorType, SorterOpenData,
+        IvmSumKind, RegisterOrLiteral, SorterOpenData,
     },
     CommitState,
 };
@@ -276,128 +275,6 @@ impl<T> OrOverflow<T> for Option<T> {
     }
 }
 
-/// Create a sort comparator closure from a SortComparatorType enum.
-fn make_sort_comparator(
-    cmp_type: &SortComparatorType,
-) -> Result<crate::vdbe::sorter::SortComparator> {
-    use std::cmp::Ordering;
-    let cmp: crate::vdbe::sorter::SortComparator = match cmp_type {
-        SortComparatorType::NumericLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => {
-                        // Decode from ValueRef to Value for numeric_from_value
-                        let a_val = a.to_owned()?;
-                        let b_val = b.to_owned()?;
-                        match (numeric_from_value(&a_val), numeric_from_value(&b_val)) {
-                            (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
-                            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                        }
-                    }
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::StringReverse => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                fn reverse_str(v: &ValueRef) -> String {
-                    match v {
-                        ValueRef::Text(t) => t.to_string().chars().rev().collect(),
-                        _ => String::new(),
-                    }
-                }
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => reverse_str(a).cmp(&reverse_str(b)),
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::TestUintLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                fn to_u64(v: &ValueRef) -> Option<u64> {
-                    match v {
-                        ValueRef::Null => None,
-                        ValueRef::Numeric(Numeric::Integer(i)) => {
-                            if *i >= 0 {
-                                Some(*i as u64)
-                            } else {
-                                None
-                            }
-                        }
-                        ValueRef::Text(t) => t.to_string().parse::<u64>().ok(),
-                        _ => None,
-                    }
-                }
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    _ => match (to_u64(a), to_u64(b)) {
-                        (Some(a), Some(b)) => a.cmp(&b),
-                        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                    },
-                };
-                Ok(res)
-            })
-        }
-        SortComparatorType::ArrayLt => {
-            std::sync::Arc::new(|a: &ValueRef, b: &ValueRef| -> Result<Ordering> {
-                let res = match (a, b) {
-                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
-                    (ValueRef::Null, _) => Ordering::Less,
-                    (_, ValueRef::Null) => Ordering::Greater,
-                    (ValueRef::Blob(a_blob), ValueRef::Blob(b_blob)) => {
-                        crate::vdbe::array::compare_arrays(a_blob, b_blob)
-                            .unwrap_or(Ordering::Equal)
-                    }
-                    (ValueRef::Text(a_text), ValueRef::Text(b_text)) => {
-                        let a_vals = crate::vdbe::array::parse_text_array(a_text);
-                        let b_vals = crate::vdbe::array::parse_text_array(b_text);
-                        match (a_vals, b_vals) {
-                            (Some(av), Some(bv)) => {
-                                let a_blob = crate::vdbe::array::values_to_record_blob(&av)?;
-                                let b_blob = crate::vdbe::array::values_to_record_blob(&bv)?;
-                                if let (Value::Blob(ab), Value::Blob(bb)) = (&a_blob, &b_blob) {
-                                    crate::vdbe::array::compare_arrays(ab, bb)
-                                        .unwrap_or(Ordering::Equal)
-                                } else {
-                                    Ordering::Equal
-                                }
-                            }
-                            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                        }
-                    }
-                    _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-                };
-                Ok(res)
-            })
-        }
-    };
-    Ok(cmp)
-}
-
-/// Compare two values using the specified collation for text values.
-/// Non-text values are compared using their natural ordering.
-fn compare_with_collation(
-    lhs: &Value,
-    rhs: &Value,
-    collation: CollationSeq,
-    collation_comparator: &Option<crate::vdbe::sorter::SortComparator>,
-) -> Result<std::cmp::Ordering> {
-    match (lhs, rhs, collation_comparator) {
-        (Value::Text(_), Value::Text(_), Some(comparator)) => {
-            comparator(&lhs.as_ref(), &rhs.as_ref())
-        }
-        _ => Ok(collation.compare(lhs.as_ref(), rhs.as_ref())),
-    }
-}
-
 fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool {
     match op {
         ComparisonOp::Eq => order.is_eq(),
@@ -433,6 +310,13 @@ pub fn op_init(
     if unlikely(!target_pc.is_offset()) {
         return Err(unresolved_branch_target(*target_pc));
     }
+    // Each run of a program executes Init once, so it is where SQLITE_STMTSTATUS_RUN counts runs.
+    turso_debug_assert!(
+        state.pc == 0,
+        "Init must be the first instruction of a program",
+        { "pc": state.pc }
+    );
+    state.metrics.runs = state.metrics.runs.wrapping_add(1);
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1107,12 +991,17 @@ macro_rules! comparison_opcode {
                 return Err(unresolved_branch_target(*target_pc));
             };
 
-            // Two integers compare directly: no NULL handling, affinity or collation.
+            // Two integers compare directly: no NULL handling, affinity or
+            // text collation. A type's order may place integers differently.
             if let (
                 Register::Value(Value::Numeric(Numeric::Integer(l))),
                 Register::Value(Value::Numeric(Numeric::Integer(r))),
-            ) = (&state.registers[*lhs], &state.registers[*rhs])
-            {
+                true,
+            ) = (
+                &state.registers[*lhs],
+                &state.registers[*rhs],
+                matches!(collation, CollationSeq::Text(_)),
+            ) {
                 let jumps = $jumps;
                 state.pc = if jumps(*l, *r) {
                     target_pc
@@ -1154,7 +1043,7 @@ fn texts_compare_as_bytes(
     flags: crate::vdbe::insn::CmpInsFlags,
     collation: CollationSeq,
 ) -> bool {
-    if collation != CollationSeq::Binary {
+    if collation != CollationSeq::BINARY {
         return false;
     }
     !flags.get_affinity().is_numeric()
@@ -1209,20 +1098,6 @@ fn op_comparison_slow(
             };
             take_jump_if!(should_jump);
         }
-        (Value::Blob(lb), Value::Blob(rb)) if flags.has_array_cmp() => {
-            // Element-wise array comparison
-            if let Ok(ord) = compare_arrays(lb, rb) {
-                let should_jump = match op {
-                    ComparisonOp::Eq => ord.is_eq(),
-                    ComparisonOp::Ne => !ord.is_eq(),
-                    ComparisonOp::Lt => ord.is_lt(),
-                    ComparisonOp::Le => ord.is_le(),
-                    ComparisonOp::Gt => ord.is_gt(),
-                    ComparisonOp::Ge => ord.is_ge(),
-                };
-                take_jump_if!(should_jump);
-            }
-        }
         (_, _) => {}
     }
 
@@ -1238,7 +1113,7 @@ fn op_comparison_slow(
     let rhs_for_compare = new_rhs
         .as_ref()
         .map_or(Either::Left(rhs_value), Either::Right);
-    let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation);
+    let should_jump = op.compare(lhs_for_compare, rhs_for_compare, collation)?;
 
     match (new_lhs, new_rhs) {
         (Some(new_lhs), None) => {
@@ -2703,21 +2578,11 @@ pub fn op_type_check(
             let offset = table_reference.logical_to_physical_column(column_idx);
             assert!(offset < *count);
             let reg = &mut state.registers[*start_reg + offset];
-            // INT PRIMARY KEY is not row_id_alias so we throw error if this col is NULL
-            if !col.is_rowid_alias() && col.primary_key() && matches!(reg.get_value(), Value::Null)
-            {
-                bail_constraint_error!(
-                    "NOT NULL constraint failed: {}.{} ({})",
-                    &table_reference.name,
-                    col.name.as_deref().unwrap_or(""),
-                    SQLITE_CONSTRAINT
-                )
-            } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
-                // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
-                return Ok(());
-            } else if matches!(reg.get_value(), Value::Null) {
-                // STRICT only enforces type affinity on non-NULL values.
-                // NULL is valid in any column without NOT NULL constraint.
+            if matches!(reg.get_value(), Value::Null) {
+                // STRICT only checks the type of non-NULL values. A NULL in a NOT NULL
+                // column, a PRIMARY KEY of a STRICT table included, is for the NOT NULL
+                // check, which also applies the statement's OR IGNORE or OR REPLACE.
+                // An INTEGER PRIMARY KEY gets its rowid later.
                 return Ok(());
             }
             if let Some(expected_type) = col.strict_value_type() {
@@ -5281,6 +5146,7 @@ pub fn op_transaction_inner(
                             "write statement started with view changes left by an earlier statement"
                         );
                         state.is_active_write = true;
+                        state.tx_read_only_at_start = program.connection.is_tx_read_only();
                         if is_main_db {
                             state.write_baseline = WriteBaseline::capture(
                                 mv_store.as_deref(),
@@ -5354,7 +5220,8 @@ pub fn op_auto_commit(
         AutoCommit {
             auto_commit,
             rollback,
-            concurrent
+            concurrent,
+            read_only
         },
         insn
     );
@@ -5460,6 +5327,7 @@ pub fn op_auto_commit(
                 }
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_tx_read_only(false);
                 conn.set_cdc_transaction_id(-1);
             }
             TxOp::Commit => {
@@ -5480,6 +5348,7 @@ pub fn op_auto_commit(
                 check_deferred_fk_on_commit(&conn)?;
                 vtab_commit_all(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_tx_read_only(false);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
             TxOp::Begin => {
@@ -5513,23 +5382,15 @@ pub fn op_auto_commit(
                 // Read: a SELECT in autocommit mode is still open; leave as-is — the
                 //       next write inside the explicit transaction will upgrade to Write.
                 conn.auto_commit.store(false, Ordering::SeqCst);
+                conn.set_tx_read_only(*read_only);
                 return Ok(InsnFunctionStepResult::Done);
             }
         }
     } else {
         return match &tx_op {
-            TxOp::Begin => Err(LimboError::TxError(
-                "cannot start a transaction within a transaction".to_string(),
-            )
-            .into()),
-            TxOp::Commit => Err(LimboError::TxError(
-                "cannot commit - no transaction is active".to_string(),
-            )
-            .into()),
-            TxOp::Rollback => Err(LimboError::TxError(
-                "cannot rollback - no transaction is active".to_string(),
-            )
-            .into()),
+            TxOp::Begin => Err(LimboError::TransactionAlreadyActive.into()),
+            TxOp::Commit => Err(LimboError::NoActiveTransaction { op: "commit" }.into()),
+            TxOp::Rollback => Err(LimboError::NoActiveTransaction { op: "rollback" }.into()),
         };
     }
 
@@ -5874,6 +5735,7 @@ fn release_commit_insn() -> Insn {
         auto_commit: true,
         rollback: false,
         concurrent: false,
+        read_only: false,
     }
 }
 
@@ -6000,12 +5862,18 @@ impl Default for OpProgramState {
 
 fn finish_subprogram(
     program: &Program,
-    statement: &Statement,
+    parent_metrics: &mut StatementMetrics,
+    statement: &mut Statement,
     is_trigger: bool,
     subprogram_aborted: bool,
     saved_last_insert_rowid: Option<i64>,
     saved_changes_value: Option<i64>,
 ) {
+    // Add the subprogram's counters to the parent's now, because the parent
+    // drops its cached subprogram statements when it is reset.
+    parent_metrics.merge(&statement.metrics());
+    statement.reset_metrics();
+
     let pending_changes = statement.n_total_change();
     if pending_changes != 0 {
         program.connection.add_total_changes(pending_changes);
@@ -6179,7 +6047,8 @@ pub fn op_program(
                                 subprogram_aborted = true;
                                 finish_subprogram(
                                     program,
-                                    &statement,
+                                    &mut state.metrics,
+                                    &mut statement,
                                     is_trigger,
                                     subprogram_aborted,
                                     saved_last_insert_rowid,
@@ -6199,7 +6068,8 @@ pub fn op_program(
                             subprogram_aborted = true;
                             finish_subprogram(
                                 program,
-                                &statement,
+                                &mut state.metrics,
+                                &mut statement,
                                 is_trigger,
                                 subprogram_aborted,
                                 saved_last_insert_rowid,
@@ -6211,7 +6081,8 @@ pub fn op_program(
                 }
                 finish_subprogram(
                     program,
-                    &statement,
+                    &mut state.metrics,
+                    &mut statement,
                     is_trigger,
                     subprogram_aborted,
                     saved_last_insert_rowid,
@@ -6259,7 +6130,8 @@ pub(super) fn abort_active_subprogram(
         let result = statement.abort_subprogram(err);
         finish_subprogram(
             program,
-            &statement,
+            &mut state.metrics,
+            &mut statement,
             is_trigger,
             true,
             saved_last_insert_rowid,
@@ -7551,7 +7423,6 @@ fn update_agg_payload(
     maybe_arg2: Option<&Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut crate::alloc::Vec<Value>,
     collation: CollationSeq,
-    comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
 ) -> Result<()> {
     match func {
         AggFunc::Count => {
@@ -7724,15 +7595,7 @@ fn update_agg_payload(
                 return Ok(());
             }
             use std::cmp::Ordering;
-            let comparator = comparator()?;
-            // Use custom type comparator if available, otherwise fall back to collation
-            let cmp = if let Some(ref cmp_fn) = comparator {
-                let arg_ref = arg.as_ref();
-                let payload_ref = payload[0].as_ref();
-                cmp_fn(&arg_ref, &payload_ref)?
-            } else {
-                compare_with_collation(arg, &payload[0], collation, &comparator)?
-            };
+            let cmp = collation.compare(arg.as_ref(), payload[0].as_ref());
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
                 AggFunc::Min => cmp == Ordering::Less,
@@ -9024,7 +8887,6 @@ pub fn op_agg_inverse(
             col,
             delimiter: _,
             func,
-            comparator: _,
         },
         insn
     );
@@ -9458,7 +9320,7 @@ pub fn op_agg_step(
                     }
                 }
             }
-            AggFunc::Min | AggFunc::Max if data.comparator.is_none() => {
+            AggFunc::Min | AggFunc::Max if matches!(data.collation, CollationSeq::Text(_)) => {
                 if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
                     state.registers[data.col]
                 {
@@ -9492,7 +9354,6 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
         col,
         delimiter,
         func,
-        comparator,
         collation,
     } = data;
 
@@ -9543,9 +9404,6 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
     }
 
     let collation = *collation;
-    let comparator_factory = move || -> Result<Option<crate::vdbe::sorter::SortComparator>> {
-        comparator.as_ref().map(make_sort_comparator).transpose()
-    };
 
     // Step the aggregate
     match func {
@@ -9586,14 +9444,7 @@ fn op_agg_step_slow(state: &mut ProgramState, data: &AggStepData) -> InsnResult 
                 .into());
             };
             let payload = agg.payload_vec_mut();
-            update_agg_payload(
-                func,
-                arg,
-                maybe_arg2.as_ref(),
-                payload,
-                collation,
-                comparator_factory,
-            )?;
+            update_agg_payload(func, arg, maybe_arg2.as_ref(), payload, collation)?;
         }
     };
 
@@ -9734,7 +9585,6 @@ pub fn op_sorter_open(
         cursor_id,
         columns: _,
         order_collations_nulls,
-        comparators,
     } = data.as_ref();
     // be careful here - we must not use any async operations after pager.with_header because this op-code has no proper state-machine
     let page_size = match pager.with_header(|header| header.page_size) {
@@ -9761,23 +9611,11 @@ pub fn op_sorter_open(
         collations.push(*coll);
         nulls_orders.push(*nulls);
     }
-    let mut sort_comparators =
-        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
-    for idx in 0..order_collations_nulls.len() {
-        let comparator = comparators
-            .get(idx)
-            .and_then(|c| c.as_ref())
-            .map(make_sort_comparator)
-            .transpose()?;
-        // Preallocated for every ORDER BY term above, so this push cannot grow the vector.
-        sort_comparators.push(comparator);
-    }
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
         nulls_orders,
-        sort_comparators,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
@@ -10634,6 +10472,9 @@ pub fn op_function(
                 }
             }
             ScalarFunc::SetVal => {
+                if program.connection.is_tx_read_only() {
+                    return Err(LimboError::ReadOnly.into());
+                }
                 // Pre-write validation: argument type + range check. The
                 // translator emits this Function call before the inline
                 // DELETE-all + INSERT bytecode, so any error returned here
@@ -10763,18 +10604,19 @@ pub fn op_function(
             }
             ScalarFunc::Random => {
                 let bits = pager.io.generate_random_number();
-                let value = program.connection.dialect().random_value(bits);
+                let value = Value::from_i64(bits);
                 state.registers[*dest].set_value(value);
             }
             #[cfg(feature = "test_helper")]
             ScalarFunc::TestNondetCounter => {
-                // Test-only: process-global atomic counter that increments on
-                // every evaluation. Used in sqltests to verify that the
-                // planner does not deduplicate equivalent SQL calls that
-                // contain nondeterministic functions.
-                static TEST_NONDET_COUNTER: std::sync::atomic::AtomicI64 =
-                    std::sync::atomic::AtomicI64::new(0);
-                let value = TEST_NONDET_COUNTER.fetch_add(1, Ordering::Relaxed);
+                // Test-only: per-connection counter that increments on every
+                // evaluation. Used in sqltests to verify that the planner does
+                // not deduplicate equivalent SQL calls that contain
+                // nondeterministic functions.
+                let value = program
+                    .connection
+                    .test_nondet_counter
+                    .fetch_add(1, Ordering::Relaxed);
                 state.registers[*dest].set_int(value);
             }
             ScalarFunc::Trim => {
@@ -11351,59 +11193,6 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::TestUintAdd
-            | ScalarFunc::TestUintSub
-            | ScalarFunc::TestUintMul
-            | ScalarFunc::TestUintDiv => {
-                check_arg_count!(arg_count, 2);
-                let a = parse_test_uint(&state.registers[*start_reg])?;
-                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
-                let result = match (a, b) {
-                    (Some(a), Some(b)) => {
-                        let r = match scalar_func {
-                            ScalarFunc::TestUintAdd => a.checked_add(b),
-                            ScalarFunc::TestUintSub => a.checked_sub(b),
-                            ScalarFunc::TestUintMul => a.checked_mul(b),
-                            ScalarFunc::TestUintDiv => {
-                                if b == 0 {
-                                    None
-                                } else {
-                                    Some(a / b)
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-                        match r {
-                            Some(v) => Value::build_text(v.to_string()),
-                            None => {
-                                return Err(LimboError::InternalError(
-                                    "test_uint arithmetic overflow/underflow".to_string(),
-                                )
-                                .into());
-                            }
-                        }
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
-            ScalarFunc::TestUintLt | ScalarFunc::TestUintEq => {
-                check_arg_count!(arg_count, 2);
-                let a = parse_test_uint(&state.registers[*start_reg])?;
-                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
-                let result = match (a, b) {
-                    (Some(a), Some(b)) => {
-                        let cmp = match scalar_func {
-                            ScalarFunc::TestUintLt => a < b,
-                            ScalarFunc::TestUintEq => a == b,
-                            _ => unreachable!(),
-                        };
-                        Value::from_i64(if cmp { 1 } else { 0 })
-                    }
-                    _ => Value::Null,
-                };
-                state.registers[*dest].set_value(result);
-            }
             ScalarFunc::StringReverse => {
                 check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
@@ -11438,7 +11227,7 @@ pub fn op_function(
                 let input = state.registers[*start_reg].get_value();
                 let count = state.registers[*start_reg + 1].get_value();
                 state.registers[*dest]
-                    .set_value(crate::functions::string::exec_repeat(input, count));
+                    .set_value(crate::functions::string::exec_repeat(input, count)?);
             }
             ScalarFunc::Lpad => {
                 let input = state.registers[*start_reg].get_value();
@@ -11449,7 +11238,7 @@ pub fn op_function(
                     None
                 };
                 state.registers[*dest]
-                    .set_value(crate::functions::string::exec_lpad(input, length, fill));
+                    .set_value(crate::functions::string::exec_lpad(input, length, fill)?);
             }
             ScalarFunc::Rpad => {
                 let input = state.registers[*start_reg].get_value();
@@ -11460,7 +11249,7 @@ pub fn op_function(
                     None
                 };
                 state.registers[*dest]
-                    .set_value(crate::functions::string::exec_rpad(input, length, fill));
+                    .set_value(crate::functions::string::exec_rpad(input, length, fill)?);
             }
             ScalarFunc::BooleanToInt => {
                 check_arg_count!(arg_count, 1);
@@ -11546,14 +11335,16 @@ pub fn op_function(
                 let val = &state.registers[*start_reg];
                 let precision_reg = &state.registers[*start_reg + 1];
                 let scale_reg = &state.registers[*start_reg + 2];
+                // COERCE runs on the value ENCODE stored, so the value is a
+                // stored numeric.
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
-                    other => {
+                    Value::Blob(stored) => {
                         use crate::numeric::decimal::{
-                            bigdecimal_to_blob, validate_precision_scale,
+                            bigdecimal_to_blob, blob_to_bigdecimal, validate_precision_scale,
                         };
 
-                        let bd = numeric_from_value(other)?;
+                        let bd = blob_to_bigdecimal(stored)?;
                         let (
                             Value::Numeric(Numeric::Integer(precision)),
                             Value::Numeric(Numeric::Integer(scale)),
@@ -11566,6 +11357,13 @@ pub fn op_function(
                         };
                         let fitted = validate_precision_scale(&bd, *precision, *scale)?;
                         Value::from_blob(bigdecimal_to_blob(&fitted))
+                    }
+                    other => {
+                        return Err(LimboError::InternalError(format!(
+                            "numeric_fit expects a stored numeric, got {}",
+                            other.value_type()
+                        ))
+                        .into());
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -11591,7 +11389,8 @@ pub fn op_function(
             ScalarFunc::NumericAdd
             | ScalarFunc::NumericSub
             | ScalarFunc::NumericMul
-            | ScalarFunc::NumericDiv => {
+            | ScalarFunc::NumericDiv
+            | ScalarFunc::NumericMod => {
                 check_arg_count!(arg_count, 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();
                 let rhs_val = state.registers[*start_reg + 1].get_value().clone();
@@ -11600,11 +11399,20 @@ pub fn op_function(
                     _ => {
                         let a = numeric_from_value(&lhs_val)?;
                         let b = numeric_from_value(&rhs_val)?;
+                        // The result keeps every decimal of its operands, as in
+                        // PostgreSQL: 1.00 * 3 is 3.00 and 0.00 + 3 is 3.00. A
+                        // product may have more decimals than a numeric can hold,
+                        // so PostgreSQL rounds it to the most a numeric can hold.
+                        let (a_scale, b_scale) =
+                            (a.fractional_digit_count(), b.fractional_digit_count());
                         let res = match scalar_func {
-                            ScalarFunc::NumericAdd => a + b,
-                            ScalarFunc::NumericSub => a - b,
-                            ScalarFunc::NumericMul => a * b,
-                            ScalarFunc::NumericDiv => {
+                            ScalarFunc::NumericAdd => (a + b).with_scale(a_scale.max(b_scale)),
+                            ScalarFunc::NumericSub => (a - b).with_scale(a_scale.max(b_scale)),
+                            ScalarFunc::NumericMul => (a * b).with_scale_round(
+                                (a_scale + b_scale).min(MAX_FRACTION_DIGITS),
+                                bigdecimal::RoundingMode::HalfUp,
+                            ),
+                            ScalarFunc::NumericDiv | ScalarFunc::NumericMod => {
                                 use bigdecimal::Zero;
                                 if b.is_zero() {
                                     return Err(LimboError::Constraint(
@@ -11612,34 +11420,34 @@ pub fn op_function(
                                     )
                                     .into());
                                 }
-                                a / b
+                                if matches!(scalar_func, ScalarFunc::NumericDiv) {
+                                    a / b
+                                } else {
+                                    // The remainder has the dividend's sign.
+                                    (a % b).with_scale(a_scale.max(b_scale))
+                                }
                             }
                             _ => unreachable!(),
                         };
+                        crate::numeric::decimal::check_numeric_limits(&res)?;
                         Value::build_text(crate::numeric::decimal::format_numeric(&res))
                     }
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
-                check_arg_count!(arg_count, 2);
-                let lhs_val = state.registers[*start_reg].get_value().clone();
-                let rhs_val = state.registers[*start_reg + 1].get_value().clone();
-                match (&lhs_val, &rhs_val) {
-                    (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
-                    _ => {
-                        let a = numeric_from_value(&lhs_val)?;
-                        let b = numeric_from_value(&rhs_val)?;
-                        let cmp_result = match scalar_func {
-                            ScalarFunc::NumericLt => a < b,
-                            ScalarFunc::NumericEq => a == b,
-                            _ => unreachable!(),
-                        };
-                        state.registers[*dest].set_int(cmp_result as i64)
-                    }
+            ScalarFunc::NumericNeg => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value().clone();
+                let result = match val {
+                    Value::Null => Value::Null,
+                    // Negating keeps the decimal places: -(1.50) is -1.50.
+                    _ => Value::build_text(crate::numeric::decimal::format_numeric(
+                        &-numeric_from_value(&val)?,
+                    )),
                 };
+                state.registers[*dest].set_value(result);
             }
-            ScalarFunc::DatePlus | ScalarFunc::DateMinus => {
+            ScalarFunc::DatePlus | ScalarFunc::DateMinus | ScalarFunc::DateDiff => {
                 check_arg_count!(arg_count, 2);
                 let lhs = state.registers[*start_reg].get_value();
                 let rhs = state.registers[*start_reg + 1].get_value();
@@ -11647,6 +11455,7 @@ pub fn op_function(
                 let result = match scalar_func {
                     ScalarFunc::DatePlus => exec_date_plus(&clock, lhs, rhs)?,
                     ScalarFunc::DateMinus => exec_date_minus(&clock, lhs, rhs)?,
+                    ScalarFunc::DateDiff => exec_date_diff(&clock, lhs, rhs)?,
                     _ => unreachable!(),
                 };
                 state.registers[*dest].set_value(result);
@@ -13038,6 +12847,35 @@ fn normalize_table_change_record(
     Ok(values)
 }
 
+/// The backstop behind the read-only transaction checks: the compile-time
+/// check rejects write statements and the sequence opcodes reject evaluated
+/// nextval/setval, but every database write must pass through a write opcode,
+/// so a write path that misses those checks fails here instead of writing.
+/// Ephemeral B-trees (sorters, materialized subqueries) are not database
+/// writes. Uses the mode captured when the statement started writing, so a
+/// statement already in flight when the transaction turns read-only keeps
+/// its mode, like a resumed portal in PostgreSQL.
+fn check_db_write_allowed(
+    program: &Program,
+    state: &ProgramState,
+    cursor_id: Option<usize>,
+) -> Result<(), Box<LimboError>> {
+    if !state.tx_read_only_at_start {
+        return Ok(());
+    }
+    if let Some(cursor_id) = cursor_id {
+        if program
+            .prepared()
+            .explain
+            .ephemeral_cursors
+            .contains(&cursor_id)
+        {
+            return Ok(());
+        }
+    }
+    Err(Box::new(LimboError::ReadOnly))
+}
+
 pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -13054,6 +12892,7 @@ pub fn op_insert(
         },
         insn
     );
+    check_db_write_allowed(program, state, Some(*cursor_id))?;
 
     loop {
         match state.active_op_state.insert().sub_state {
@@ -13517,6 +13356,7 @@ pub fn op_delete(
         },
         insn
     );
+    check_db_write_allowed(program, state, Some(*cursor_id))?;
 
     loop {
         match state.active_op_state.delete().sub_state {
@@ -13664,6 +13504,7 @@ pub fn op_idx_delete(
         },
         insn
     );
+    check_db_write_allowed(program, state, Some(*cursor_id))?;
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
         return_if_io!(
@@ -13788,6 +13629,7 @@ pub fn op_idx_insert(
         },
         *insn
     );
+    check_db_write_allowed(program, state, Some(cursor_id))?;
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[cursor_id] {
         let Some(start) = unpacked_start else {
@@ -14737,6 +14579,7 @@ pub fn op_create_btree(
 ) -> InsnResult {
     load_insn!(CreateBtree { db, root, flags }, insn);
 
+    check_db_write_allowed(program, state, None)?;
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
@@ -14918,6 +14761,7 @@ pub fn op_destroy(
         },
         insn
     );
+    check_db_write_allowed(program, state, None)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         // MVCC only does pager operations in checkpoint
@@ -14965,6 +14809,7 @@ pub fn op_clear_btree(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
+    check_db_write_allowed(program, state, None)?;
     match op_clear_btree_inner(program, state, insn, pager) {
         Ok(result) => Ok(result),
         Err(err) => {
@@ -15668,6 +15513,9 @@ pub fn op_sequence_begin_inner_tx(
     );
 
     let conn = program.connection.clone();
+    if conn.is_tx_read_only() {
+        return Err(LimboError::ReadOnly.into());
+    }
     let Some(mv_store) = conn.mv_store_for_db(*db) else {
         // WAL mode: no inner tx needed. The WAL single-writer lock
         // already serializes writes across processes.
@@ -16183,8 +16031,10 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
-                let populate_result = schema.populate_materialized_views_then_indices(
+                // The schema already holds every stored type.
+                let populate_result = schema.populate_types_views_then_indices(
                     &syms,
+                    &[],
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,
@@ -16653,6 +16503,7 @@ pub fn op_set_cookie(
         },
         insn
     );
+    check_db_write_allowed(program, state, None)?;
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     if let Some(mv_store) = mv_store.as_ref() {
@@ -17834,6 +17685,7 @@ pub fn op_rename_table(
                 }
 
                 normalized_to.clone_into(&mut btree.name);
+                normalized_to.clone_into(&mut btree.declared_name);
             }
             Table::Virtual(vtab) => {
                 Arc::make_mut(vtab).name.clone_from(&normalized_to);
@@ -17909,7 +17761,9 @@ pub fn op_rename_table(
             if let Some(mut backing_arc) = schema.take_table(NamespaceId::ROOT, &old_backing_table)
             {
                 if let Table::BTree(btree_arc) = Arc::make_mut(&mut backing_arc) {
-                    Arc::make_mut(btree_arc).name.clone_from(&new_backing_table);
+                    let btree = Arc::make_mut(btree_arc);
+                    btree.name.clone_from(&new_backing_table);
+                    btree.declared_name.clone_from(&new_backing_table);
                 }
                 schema.insert_table(NamespaceId::ROOT, new_backing_table, backing_arc);
             }
@@ -18280,7 +18134,7 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
-    let (old_column_name, is_strict) = conn.with_schema(*db, |schema| {
+    let (old_column_name, is_strict, new_column) = conn.with_schema(*db, |schema| {
         let table = schema
             .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
@@ -18291,12 +18145,13 @@ pub fn op_alter_column(
             .as_ref()
             .expect("column being ALTERed should be named")
             .clone();
-        (old_column_name, table.is_strict())
+        let new_column = table
+            .btree()
+            .expect("only btree tables can be altered")
+            .column_for_alter(*column_index, definition);
+        (old_column_name, table.is_strict(), new_column)
     });
-    let new_column = crate::schema::Column::from_definition(
-        definition,
-        FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
-    )?;
+    let new_column = new_column?;
     let new_name = definition.col_name.as_str().to_owned();
     let (domain_not_null, domain_checks) = if is_strict && !*rename {
         conn.with_schema(*db, |schema| schema.column_domain_constraints(&new_column))?
@@ -18667,17 +18522,19 @@ fn handle_text_sum(
     match parsed_number {
         ParsedNumber::Integer(i) => {
             if is_approx {
+                sum_state.ovrfl = false;
                 sum_state.approx = true;
                 match acc {
                     Value::Null => {
                         *acc = Value::from_f64(i as f64);
                     }
                     Value::Numeric(Numeric::Integer(acc_i)) => {
-                        *acc = Value::from_f64(*acc_i as f64);
-                        apply_kbn_step_int(acc, i, sum_state);
+                        let prev = *acc_i;
+                        kbn_init_from_int(acc, prev, sum_state);
+                        apply_kbn_step(acc, i as f64, sum_state);
                     }
                     Value::Numeric(Numeric::Float(_)) => {
-                        apply_kbn_step_int(acc, i, sum_state);
+                        apply_kbn_step(acc, i as f64, sum_state);
                     }
                     _ => unreachable!(),
                 }
@@ -18689,10 +18546,10 @@ fn handle_text_sum(
                     Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(i) {
                         Some(sum) => *acc = Value::from_i64(sum),
                         None => {
-                            let acc_f = *acc_i as f64;
-                            *acc = Value::from_f64(acc_f);
+                            let prev = *acc_i;
                             sum_state.approx = true;
                             sum_state.ovrfl = true;
+                            kbn_init_from_int(acc, prev, sum_state);
                             apply_kbn_step_int(acc, i, sum_state);
                         }
                     },
@@ -18704,9 +18561,10 @@ fn handle_text_sum(
             }
         }
         ParsedNumber::Float(f) => {
+            sum_state.ovrfl = false;
             if !sum_state.approx {
                 if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
+                    kbn_init_from_int(acc, current_sum, sum_state);
                 } else if matches!(*acc, Value::Null) {
                     *acc = Value::from_f64(0.0);
                 }
@@ -18715,9 +18573,10 @@ fn handle_text_sum(
             apply_kbn_step(acc, f, sum_state);
         }
         ParsedNumber::None => {
+            sum_state.ovrfl = false;
             if !sum_state.approx {
                 if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
-                    *acc = Value::from_f64(current_sum as f64);
+                    kbn_init_from_int(acc, current_sum, sum_state);
                 } else if matches!(*acc, Value::Null) {
                     *acc = Value::from_f64(0.0);
                 }
@@ -19771,31 +19630,6 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     // but return false to indicate the conversion wasn't "complete"
     *value = Value::from_f64(fl);
     false
-}
-
-fn parse_test_uint(reg: &Register) -> Result<Option<u64>> {
-    match reg.get_value() {
-        Value::Null => Ok(None),
-        Value::Numeric(Numeric::Integer(i)) => {
-            if *i < 0 {
-                Err(LimboError::InternalError(
-                    "test_uint: negative value".to_string(),
-                ))
-            } else {
-                Ok(Some(*i as u64))
-            }
-        }
-        Value::Text(t) => {
-            let s = t.to_string();
-            let v = s
-                .parse::<u64>()
-                .map_err(|_| LimboError::InternalError(format!("test_uint: invalid uint: {s}")))?;
-            Ok(Some(v))
-        }
-        _ => Err(LimboError::InternalError(
-            "test_uint: unsupported type".to_string(),
-        )),
-    }
 }
 
 // Compat for applications that test for SQLite.
@@ -20981,7 +20815,7 @@ mod tests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![CollationSeq::BINARY],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             ..Default::default()
@@ -21640,8 +21474,7 @@ mod tests {
             &Value::Null,
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5)); // unchanged
@@ -21655,8 +21488,7 @@ mod tests {
             &Value::from_i64(42),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(6));
@@ -21676,8 +21508,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10));
@@ -21687,8 +21518,7 @@ mod tests {
             &Value::from_i64(5),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(15));
@@ -21708,8 +21538,7 @@ mod tests {
             &Value::Null,
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(10)); // unchanged
@@ -21724,8 +21553,7 @@ mod tests {
             &Value::from_i64(5),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(5));
@@ -21736,8 +21564,7 @@ mod tests {
             &Value::from_i64(3),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21748,8 +21575,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_i64(3));
@@ -21768,8 +21594,7 @@ mod tests {
             &Value::from_i64(10),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(10.0));
@@ -21780,8 +21605,7 @@ mod tests {
             &Value::from_i64(20),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(30.0));
@@ -21832,8 +21656,7 @@ mod tests {
             &Value::from_i64(9007199254740994),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
         update_agg_payload(
@@ -21841,8 +21664,7 @@ mod tests {
             &Value::from_i64(-9007199254740993),
             None,
             &mut payload,
-            CollationSeq::Binary,
-            || Ok(None),
+            CollationSeq::BINARY,
         )
         .unwrap();
 

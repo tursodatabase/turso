@@ -185,14 +185,20 @@ fn coerce_to_f64(value: &Value) -> f64 {
     }
 }
 
+/// The part of `s` before the first NUL character. SQLite reads the format
+/// string and string arguments as C strings, so they end at the first NUL.
+fn until_nul(s: &str) -> &str {
+    s.find('\0').map_or(s, |end| &s[..end])
+}
+
 /// Coerce a Value to String for string specifiers.
 fn coerce_to_string(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
         Value::Numeric(Numeric::Integer(i)) => i.to_string(),
         Value::Numeric(Numeric::Float(f)) => format_float(f64::from(*f)),
-        Value::Text(t) => t.as_str().to_string(),
-        Value::Blob(b) => String::from_utf8_lossy(b).to_string(),
+        Value::Text(t) => until_nul(t.as_str()).to_string(),
+        Value::Blob(b) => until_nul(&String::from_utf8_lossy(b)).to_string(),
     }
 }
 
@@ -1363,6 +1369,8 @@ pub fn exec_printf_values(format: &Value, args: &[&Value]) -> crate::Result<Valu
         }
     };
 
+    let format_str = until_nul(format_str);
+
     let mut result = String::new();
     let mut args_index = 0;
     let mut chars = format_str.chars().peekable();
@@ -2162,6 +2170,32 @@ mod tests {
             exec_printf(&[text("%Q"), text("a\nb")]).unwrap(),
             *text("'a\nb'").get_value()
         );
+    }
+
+    #[test]
+    fn test_nul_ends_format_and_string_args() {
+        // SQLite stops the format string and string arguments at the first NUL.
+        assert_eq!(
+            exec_printf(&[text("a\0b%d"), integer(5)]).unwrap(),
+            *text("a").get_value()
+        );
+        assert_eq!(
+            exec_printf(&[text("%s-%d"), text("a\0b"), integer(1)]).unwrap(),
+            *text("a-1").get_value()
+        );
+        assert_eq!(
+            exec_printf(&[
+                text("%5s|%q|%Q|%w"),
+                text("a\0b"),
+                text("c\0d"),
+                text("e\0f"),
+                text("g\0h")
+            ])
+            .unwrap(),
+            *text("    a|c|'e'|g").get_value()
+        );
+        // A format string that is empty up to the NUL gives NULL, like ''.
+        assert_eq!(exec_printf(&[text("\0x")]).unwrap(), Value::Null);
     }
 
     #[test]

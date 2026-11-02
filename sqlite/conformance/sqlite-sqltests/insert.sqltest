@@ -2244,3 +2244,13 @@ expect {
     591505|updated
     591506|generated
 }
+
+@cross-check-integrity
+test insert-or-ignore-strict-generated-column-skips-null-primary-key {
+    CREATE TABLE t(id INT PRIMARY KEY, a INT, c INT AS (a)) STRICT;
+    INSERT OR IGNORE INTO t(id, a) VALUES (NULL, 1);
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}

@@ -268,14 +268,7 @@ impl DatabaseTape {
         tracing::debug!("opening replay session");
         let conn = self.connect(coro).await?;
         conn.execute("BEGIN IMMEDIATE")?;
-        Ok(DatabaseReplaySession {
-            conn: conn.clone(),
-            cached_delete_stmt: HashMap::new(),
-            cached_insert_stmt: HashMap::new(),
-            cached_update_stmt: HashMap::new(),
-            in_txn: true,
-            generator: DatabaseReplayGenerator { conn, opts },
-        })
+        Ok(DatabaseReplaySession::new(conn, opts))
     }
 }
 
@@ -603,6 +596,31 @@ async fn replay_stmt<Ctx>(
 }
 
 impl DatabaseReplaySession {
+    /// Starts a replay session on `conn`. The session reproduces a captured
+    /// transaction's complete effect (user writes and trigger writes are both
+    /// captured as plain rows) by replaying each captured row as data, so
+    /// `conn` must not also run its own triggers on top of that — it would
+    /// apply a trigger's effect twice (#10147).
+    ///
+    /// This turns triggers off on `conn` but never turns them back on: every
+    /// caller except one hands this a connection from `connect_untracked`
+    /// that is only ever used for replay and then dropped, so there is
+    /// nothing to restore. The one exception (`phase_conn` in
+    /// `DatabaseSyncEngine::apply_changes_internal`, which keeps using the
+    /// connection after replay) turns triggers back on itself once its
+    /// replay loop is done.
+    pub(crate) fn new(conn: Arc<turso_core::Connection>, opts: DatabaseReplaySessionOpts) -> Self {
+        conn.set_triggers_enabled(false);
+        Self {
+            conn: conn.clone(),
+            cached_delete_stmt: HashMap::new(),
+            cached_insert_stmt: HashMap::new(),
+            cached_update_stmt: HashMap::new(),
+            in_txn: true,
+            generator: DatabaseReplayGenerator { conn, opts },
+        }
+    }
+
     fn clear_cached_statements(&mut self) {
         self.cached_delete_stmt.clear();
         self.cached_insert_stmt.clear();
@@ -618,6 +636,29 @@ impl DatabaseReplaySession {
         };
         format!("DROP {object} IF EXISTS {}", quote_ident(name))
     }
+}
+
+/// Runs `body` with triggers off on `conn`, then turns them back on whether
+/// `body` succeeds or fails. For the one replay connection that keeps being
+/// used after its replay loop ends (`phase_conn` in
+/// `DatabaseSyncEngine::apply_changes_internal`, which reuses an existing
+/// connection to rebase unpushed local changes instead of replaying onto a
+/// fresh one): a captured change's trigger writes are replayed as their own
+/// rows, so `conn` must not also re-fire its own copy of the trigger while
+/// `body` runs (#10147), but it must have triggers back on for whatever runs
+/// after.
+pub(crate) async fn replay_without_triggers<F, Fut, T>(
+    conn: &Arc<turso_core::Connection>,
+    body: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    conn.set_triggers_enabled(false);
+    let result = body().await;
+    conn.set_triggers_enabled(true);
+    result
 }
 
 impl DatabaseReplaySession {
@@ -915,12 +956,15 @@ mod tests {
 
     use crate::{
         database_tape::{
-            run_stmt_once, DatabaseChangesIteratorOpts, DatabaseReplaySessionOpts, DatabaseTape,
+            replay_without_triggers, run_stmt_once, DatabaseChangesIteratorOpts,
+            DatabaseReplaySessionOpts, DatabaseTape,
         },
+        errors::Error,
         types::{
             Coro, DatabaseSchemaKind, DatabaseSchemaReplay, DatabaseStatementReplay,
             DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType,
         },
+        Result,
     };
 
     #[test]
@@ -952,6 +996,112 @@ mod tests {
             }
         };
         assert_eq!(rows, vec![] as Vec<Vec<turso_core::Value>>);
+    }
+
+    fn replay_opts() -> DatabaseReplaySessionOpts {
+        DatabaseReplaySessionOpts {
+            use_implicit_rowid: true,
+        }
+    }
+
+    // `DatabaseReplaySession::new` turns triggers off on its connection but never
+    // turns them back on: every caller except the rebase of unpushed local changes
+    // in `DatabaseSyncEngine::apply_changes_internal` hands it a connection that is
+    // only ever used for replay and then dropped, so there is nothing to restore.
+    #[test]
+    pub fn test_database_replay_session_turns_off_triggers_and_does_not_restore_on_drop() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db =
+            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                assert!(conn.triggers_enabled());
+
+                let session = super::DatabaseReplaySession::new(conn.clone(), replay_opts());
+                assert!(!conn.triggers_enabled());
+                drop(session);
+                assert!(!conn.triggers_enabled());
+            }
+        });
+        while let genawaiter::GeneratorState::Yielded(..) = gen.resume_with(Ok(())) {
+            io.step().unwrap();
+        }
+    }
+
+    // `replay_without_triggers` is what the rebase of unpushed local changes uses
+    // to turn triggers back on for `phase_conn`, which (unlike every other replay
+    // connection) keeps being used after its replay loop ends. It must restore
+    // triggers whether the body succeeds or fails.
+    #[test]
+    pub fn test_replay_without_triggers_restores_on_success() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db =
+            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                assert!(conn.triggers_enabled());
+
+                let result: Result<()> = replay_without_triggers(&conn, || async {
+                    assert!(!conn.triggers_enabled());
+                    Ok(())
+                })
+                .await;
+                assert!(result.is_ok());
+                assert!(conn.triggers_enabled());
+            }
+        });
+        while let genawaiter::GeneratorState::Yielded(..) = gen.resume_with(Ok(())) {
+            io.step().unwrap();
+        }
+    }
+
+    #[test]
+    pub fn test_replay_without_triggers_restores_on_error() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db =
+            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                assert!(conn.triggers_enabled());
+
+                let result: Result<()> = replay_without_triggers(&conn, || async {
+                    assert!(!conn.triggers_enabled());
+                    Err(Error::DatabaseSyncEngineError(
+                        "injected failure".to_string(),
+                    ))
+                })
+                .await;
+                assert!(result.is_err());
+                assert!(conn.triggers_enabled());
+            }
+        });
+        while let genawaiter::GeneratorState::Yielded(..) = gen.resume_with(Ok(())) {
+            io.step().unwrap();
+        }
     }
 
     #[test]
@@ -1923,6 +2073,364 @@ mod tests {
                 turso_core::Value::Text(turso_core::types::Text::new("b"))
             ]]
         );
+    }
+
+    /// A `DatabaseReplaySession` (what the MVCC logical pull and the rebase of
+    /// unpushed local changes use locally, not the push to a remote server —
+    /// see #10147) replaying onto a database with the same AFTER INSERT
+    /// trigger as the source must not also re-fire its own copy of the
+    /// trigger: the trigger's write was already captured as its own CDC row
+    /// and is replayed directly. Replaying the user's write with triggers off
+    /// leaves exactly one `audit` row, not two.
+    ///
+    /// `audit` has no INTEGER PRIMARY KEY, so a second physical INSERT can
+    /// never be hidden by an `ON CONFLICT(id) DO UPDATE` match the way it
+    /// could with one (see #10149): two writes to `audit` always mean two
+    /// separate rows.
+    #[test]
+    pub fn test_database_tape_replay_session_applies_trigger_write_once_no_audit_pk() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, Arc::new(SqliteDialect)).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let schema = [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, x)",
+            "CREATE TABLE audit(msg)",
+            "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN \
+             INSERT INTO audit(msg) VALUES ('inserted ' || new.id); END",
+        ];
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                for stmt in schema {
+                    conn1.execute(stmt).unwrap();
+                }
+                conn1.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+                // The remote has the exact same schema, including the trigger.
+                let conn2 = db2.connect(&coro).await.unwrap();
+                for stmt in schema {
+                    conn2.execute(stmt).unwrap();
+                }
+
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let opts = Default::default();
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+                let mut stmt = conn2
+                    .prepare("SELECT msg FROM audit ORDER BY rowid")
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(rows) => break rows,
+            }
+        };
+        tracing::info!("rows: {:?}", rows);
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::Text(turso_core::types::Text::new(
+                "inserted 1"
+            ))]],
+            "remote must end up with exactly 1 audit row with no PK to hide a second insert behind"
+        );
+    }
+
+    /// A `DatabaseReplaySession` (local pull/rebase replay, not the push to a
+    /// remote server — see #10147) replaying onto a database that does NOT
+    /// have the trigger (only the source database does). The trigger's write
+    /// still must reach the destination: it was captured as its own CDC row,
+    /// and that is the only place the destination can ever get it from
+    /// (triggers are never pushed, only their writes are). A "skip trigger
+    /// rows" fix would get this case wrong.
+    #[test]
+    pub fn test_database_tape_replay_session_applies_trigger_write_without_the_trigger() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, Arc::new(SqliteDialect)).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1
+                    .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+                    .unwrap();
+                conn1
+                    .execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, msg)")
+                    .unwrap();
+                conn1
+                    .execute(
+                        "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN \
+                         INSERT INTO audit(msg) VALUES ('inserted ' || new.id); END",
+                    )
+                    .unwrap();
+                conn1.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+
+                // The remote has the same tables, but not the trigger.
+                let conn2 = db2.connect(&coro).await.unwrap();
+                conn2
+                    .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x)")
+                    .unwrap();
+                conn2
+                    .execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, msg)")
+                    .unwrap();
+
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let opts = Default::default();
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+                let mut rows = Vec::new();
+                let mut stmt = conn2
+                    .prepare("SELECT id, msg FROM audit ORDER BY id")
+                    .unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                let mut t_rows = Vec::new();
+                let mut stmt = conn2.prepare("SELECT id FROM t").unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    t_rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                (rows, t_rows)
+            }
+        });
+        let (rows, t_rows) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(rows) => break rows,
+            }
+        };
+        tracing::info!("rows: {:?}, t_rows: {:?}", rows, t_rows);
+        assert_eq!(
+            rows,
+            vec![vec![
+                turso_core::Value::from_i64(1),
+                turso_core::Value::Text(turso_core::types::Text::new("inserted 1"))
+            ]],
+            "the trigger's captured write must reach the remote even though the \
+             remote has no copy of the trigger to produce it locally"
+        );
+        assert_eq!(t_rows, vec![vec![turso_core::Value::from_i64(1)]]);
+    }
+
+    /// A `DatabaseReplaySession` (local pull/rebase replay, not the push to a
+    /// remote server — see #10147) replaying a local UPDATE that fired an
+    /// AFTER UPDATE trigger must advance the destination's step count by
+    /// exactly one, not two (once from the destination's own trigger
+    /// re-firing when the `t` UPDATE is replayed, once from replaying the
+    /// trigger's own captured step row). The trigger records each step as its
+    /// own row rather than mutating an absolute column value: replaying an
+    /// UPDATE writes the captured column's exact after-value, which would
+    /// silently absorb an extra step from the destination's own trigger
+    /// re-firing and hide the bug.
+    #[test]
+    pub fn test_database_tape_replay_session_applies_trigger_counter_step_once() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, Arc::new(SqliteDialect)).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let schema = [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, x)",
+            "CREATE TABLE counter_steps(n INTEGER)",
+            "CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN \
+             INSERT INTO counter_steps(n) VALUES (1); END",
+        ];
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                for stmt in schema {
+                    conn1.execute(stmt).unwrap();
+                }
+                conn1.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+                conn1.execute("UPDATE t SET x = 'b' WHERE id = 1").unwrap();
+
+                // The remote has the exact same schema, including the trigger.
+                let conn2 = db2.connect(&coro).await.unwrap();
+                for stmt in schema {
+                    conn2.execute(stmt).unwrap();
+                }
+
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let opts = Default::default();
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+                let mut stmt = conn2.prepare("SELECT n FROM counter_steps").unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(rows) => break rows,
+            }
+        };
+        tracing::info!("rows: {:?}", rows);
+        assert_eq!(
+            rows,
+            vec![vec![turso_core::Value::from_i64(1)]],
+            "remote must end up with exactly one counter step for one local update"
+        );
+    }
+
+    /// `ON DELETE CASCADE`: the remote has the same FK. Pushing a local DELETE
+    /// on the parent replays both the user's DELETE and the FK-action DELETE on
+    /// the child. Unlike the trigger case this is harmless: re-deleting an
+    /// already-deleted (or already-cascaded) child row is a no-op.
+    #[test]
+    pub fn test_database_tape_replay_fk_cascade_delete_is_harmless_on_remote() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, Arc::new(SqliteDialect)).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let schema = [
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER \
+             REFERENCES parent(id) ON DELETE CASCADE)",
+        ];
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1.execute("PRAGMA foreign_keys = ON").unwrap();
+                for stmt in schema {
+                    conn1.execute(stmt).unwrap();
+                }
+                conn1.execute("INSERT INTO parent VALUES (1)").unwrap();
+                conn1.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+                conn1.execute("DELETE FROM parent WHERE id = 1").unwrap();
+
+                // The remote has the exact same schema, including the FK.
+                let conn2 = db2.connect(&coro).await.unwrap();
+                conn2.execute("PRAGMA foreign_keys = ON").unwrap();
+                for stmt in schema {
+                    conn2.execute(stmt).unwrap();
+                }
+                conn2.execute("INSERT INTO parent VALUES (1)").unwrap();
+                conn2.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let opts = Default::default();
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+                let mut parent_rows = Vec::new();
+                let mut stmt = conn2.prepare("SELECT id FROM parent").unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    parent_rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                let mut child_rows = Vec::new();
+                let mut stmt = conn2.prepare("SELECT id FROM child").unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    child_rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                (parent_rows, child_rows)
+            }
+        });
+        let (parent_rows, child_rows) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(rows) => break rows,
+            }
+        };
+        tracing::info!(
+            "parent_rows: {:?}, child_rows: {:?}",
+            parent_rows,
+            child_rows
+        );
+        assert_eq!(parent_rows, Vec::<Vec<turso_core::Value>>::new());
+        assert_eq!(child_rows, Vec::<Vec<turso_core::Value>>::new());
     }
 
     #[test]

@@ -2687,3 +2687,26 @@ expect {
     rowid
     1
 }
+
+# A trigger body is compiled into a program of its own, whose subqueries are
+# numbered from the start again. Its scalar subquery must not take the place of
+# the RETURNING clause's, which would lose the TEXT affinity of `a` and compare
+# '1' with 1 as different.
+@cross-check-integrity
+test returning-subquery-affinity-with-trigger-subquery {
+    CREATE TABLE t(a TEXT, i INTEGER);
+    CREATE TABLE log(m);
+    INSERT INTO t VALUES ('1', 1);
+    CREATE TRIGGER tr_update BEFORE UPDATE ON t BEGIN
+        INSERT INTO log VALUES ((SELECT a FROM t));
+    END;
+    CREATE TRIGGER tr_insert AFTER INSERT ON t BEGIN
+        INSERT INTO log VALUES ((SELECT a FROM t LIMIT 1));
+    END;
+    UPDATE t SET i = 2 RETURNING (SELECT a FROM t) = 1;
+    INSERT INTO t VALUES ('2', 2) RETURNING (SELECT a FROM t WHERE i = 2 LIMIT 1) = 1;
+}
+expect {
+    1
+    1
+}

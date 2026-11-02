@@ -5711,9 +5711,11 @@ mod tests {
                 let opts = push_test_opts();
                 let conn = db.connect(&coro).await.unwrap();
 
-                conn.execute("CREATE TABLE t(x)").unwrap();
+                conn.execute("CREATE TABLE \"T\"(x)").unwrap();
                 conn.execute("INSERT INTO t VALUES (1)").unwrap();
                 conn.execute("INSERT INTO t VALUES (2), (3)").unwrap();
+                conn.execute("UPDATE t SET x = 4 WHERE x = 1").unwrap();
+                conn.execute("DELETE FROM t WHERE x = 2").unwrap();
                 let after_writes = count_local_changes(&coro, &conn, &opts, 0).await.unwrap();
 
                 update_last_change_id(&coro, &conn, "client-a", 1, 0)
@@ -5765,12 +5767,12 @@ mod tests {
             }
         };
 
-        assert_eq!(after_writes, 4);
+        assert_eq!(after_writes, 6);
         assert_eq!(after_second_high_water_mark, after_first_high_water_mark);
         assert_eq!(
             with_ignored_table,
-            after_second_high_water_mark - 3,
-            "the three rows written to t must drop out"
+            after_second_high_water_mark - 5,
+            "all five changes to t must drop out"
         );
         assert!(cdc_rows > after_second_high_water_mark);
     }

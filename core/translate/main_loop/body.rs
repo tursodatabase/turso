@@ -1,9 +1,6 @@
 use crate::translate::plan::Operation::HashJoin;
 use crate::translate::plan::SimpleAggregate;
-use crate::translate::{
-    order_by::{custom_type_comparator, EmitOrderBy},
-    window::EmitWindow,
-};
+use crate::translate::{order_by::EmitOrderBy, window::EmitWindow};
 use crate::vdbe::insn::AggStepData;
 
 use super::*;
@@ -259,18 +256,12 @@ fn emit_loop_source<'a>(
                     None
                 };
 
-                let comparator = custom_type_comparator(
-                    &min_max.argument,
-                    &plan.table_references,
-                    &t_ctx.resolver,
-                );
                 program.emit_insn(Insn::AggStep {
                     data: Box::new(AggStepData {
                         acc_reg: start_reg,
                         col: expr_reg,
                         delimiter: 0,
                         func: crate::function::AccumulatorFunc::Agg(min_max.func.clone()),
-                        comparator,
                         collation: min_max.collation,
                     }),
                 });

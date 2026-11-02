@@ -2103,3 +2103,42 @@ fn test_savepoint_rollback_after_ddl_upgrade_keeps_exclusivity(
     );
     Ok(())
 }
+
+/// Regression test for https://github.com/tursodatabase/turso/issues/11163:
+/// reopening an MVCC database whose `sqlite_sequence` contains a row with a
+/// NULL name must succeed. A name that is not text names no table, so the
+/// WAL→MVCC autoincrement watermark sync skips the row like WAL mode does.
+/// The seq value is coerced to an integer the way the INSERT path does it.
+#[test]
+fn test_mvcc_open_tolerates_null_sqlite_sequence_name() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new("test_mvcc_null_sqlite_sequence_name.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t1(i INTEGER PRIMARY KEY AUTOINCREMENT)")?;
+    conn.execute("CREATE TABLE t2(i INTEGER PRIMARY KEY AUTOINCREMENT)")?;
+    conn.execute("CREATE TABLE t3(i INTEGER PRIMARY KEY AUTOINCREMENT)")?;
+    conn.execute("INSERT INTO t1 VALUES(NULL)")?;
+    conn.execute("INSERT INTO t2 VALUES(NULL)")?;
+    conn.execute("INSERT INTO t3 VALUES(NULL)")?;
+    // A NULL name and a non-text name both make a row name no table.
+    conn.execute("UPDATE sqlite_sequence SET name=NULL WHERE name='t1'")?;
+    conn.execute("UPDATE sqlite_sequence SET name=5 WHERE name='t2'")?;
+    // A text seq is coerced to its integer prefix like the INSERT path does.
+    conn.execute("UPDATE sqlite_sequence SET seq='5abc' WHERE name='t3'")?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    // Drop the cached Database so the reopen below really runs MVCC
+    // bootstrap: opening a still-live path returns the existing instance.
+    let path = tmp_db.path.clone();
+    conn.close()?;
+    drop(conn);
+    drop(tmp_db);
+    let tmp_db = TempDatabase::new_with_existent(&path);
+    let conn = tmp_db.connect_limbo();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM sqlite_sequence");
+    assert_eq!(rows, vec![(3,)]);
+    // The coerced text sequence still hands out the next watermark.
+    conn.execute("INSERT INTO t3 VALUES(NULL)")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT seq FROM sqlite_sequence WHERE name='t3'");
+    assert_eq!(rows, vec![(6,)]);
+    Ok(())
+}

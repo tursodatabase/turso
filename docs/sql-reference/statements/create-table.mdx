@@ -57,6 +57,8 @@ FOREIGN KEY (column-name [, column-name ...]) REFERENCES foreign-table [(column-
 | `table-name` | The name of the table to create. |
 | `STRICT` | Enables strict type checking on the table. See [STRICT Tables](#strict-tables). |
 
+When several table options are given (for example `STRICT, WITHOUT ROWID`), they are separated by commas, and a comma must be followed by another option.
+
 ## Column Definitions
 
 Each column definition specifies a column name, an optional type, and zero or more column constraints.

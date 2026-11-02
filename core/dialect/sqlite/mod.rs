@@ -216,6 +216,23 @@ fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
 /// directly, because the translated AST always references the engine
 /// surface regardless of the frontend dialect.
 pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
+    let func = resolve_builtin_function_name(name, arg_count)?;
+    // Reject scalar calls whose argument count is not in `arities()`.
+    if let Some(Func::Scalar(srf)) = &func {
+        let arities = srf.arities();
+        if !arities.contains(&-1) && !arities.contains(&(arg_count as i32)) {
+            crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+        }
+    }
+    Ok(func)
+}
+
+/// Resolves a built-in function by name without checking the argument count
+/// of scalar functions.
+pub(crate) fn resolve_builtin_function_name(
+    name: &str,
+    arg_count: usize,
+) -> crate::Result<Option<Func>> {
     let normalized_name = crate::util::normalize_ident(name);
     match normalized_name.as_str() {
         "avg" => {
@@ -534,12 +551,6 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         // Test type functions (for custom type system testing)
         "test_uint_encode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintEncode))),
         "test_uint_decode" => Ok(Some(Func::Scalar(ScalarFunc::TestUintDecode))),
-        "test_uint_add" => Ok(Some(Func::Scalar(ScalarFunc::TestUintAdd))),
-        "test_uint_sub" => Ok(Some(Func::Scalar(ScalarFunc::TestUintSub))),
-        "test_uint_mul" => Ok(Some(Func::Scalar(ScalarFunc::TestUintMul))),
-        "test_uint_div" => Ok(Some(Func::Scalar(ScalarFunc::TestUintDiv))),
-        "test_uint_lt" => Ok(Some(Func::Scalar(ScalarFunc::TestUintLt))),
-        "test_uint_eq" => Ok(Some(Func::Scalar(ScalarFunc::TestUintEq))),
         #[cfg(feature = "test_helper")]
         "test_nondet_counter" => Ok(Some(Func::Scalar(ScalarFunc::TestNondetCounter))),
         "string_reverse" | "reverse" => Ok(Some(Func::Scalar(ScalarFunc::StringReverse))),
@@ -559,10 +570,11 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),
         "numeric_mul" => Ok(Some(Func::Scalar(ScalarFunc::NumericMul))),
         "numeric_div" => Ok(Some(Func::Scalar(ScalarFunc::NumericDiv))),
-        "numeric_lt" => Ok(Some(Func::Scalar(ScalarFunc::NumericLt))),
-        "numeric_eq" => Ok(Some(Func::Scalar(ScalarFunc::NumericEq))),
+        "numeric_mod" => Ok(Some(Func::Scalar(ScalarFunc::NumericMod))),
+        "numeric_neg" => Ok(Some(Func::Scalar(ScalarFunc::NumericNeg))),
         "date_plus" => Ok(Some(Func::Scalar(ScalarFunc::DatePlus))),
         "date_minus" => Ok(Some(Func::Scalar(ScalarFunc::DateMinus))),
+        "date_diff" => Ok(Some(Func::Scalar(ScalarFunc::DateDiff))),
         // Array construction / element access (desugared from syntax)
         "array" => Ok(Some(Func::Scalar(ScalarFunc::Array))),
         "array_element" => Ok(Some(Func::Scalar(ScalarFunc::ArrayElement))),

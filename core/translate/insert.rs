@@ -1,3 +1,4 @@
+use crate::alloc::TursoFromIterator;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::translate::collate::CollationSeq;
@@ -10,7 +11,7 @@ use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
         self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
-        EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
+        SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
@@ -20,10 +21,11 @@ use crate::{
             emit_make_record, prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
-            bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
-            process_returning_clause, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
+            bind_and_rewrite_expr, emit_constraint_values_decode, emit_returning_results,
+            emit_returning_scan_back, process_returning_clause,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, walk_expr, BindingBehavior,
+            NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, child_index_for_fk, emit_fk_restrict_halt,
@@ -32,8 +34,8 @@ use crate::{
             open_read_table, table_scan_match_any, ForeignKeyActions,
         },
         plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
+            ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination,
+            ResultSetColumn, TableReferences,
         },
         planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
@@ -53,7 +55,9 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         affinity::Affinity,
-        builder::{CursorKey, CursorType, DmlColumnContext, ProgramBuilder, ProgramBuilderOpts},
+        builder::{
+            CursorKey, CursorType, DmlColumnContext, DmlRowForm, ProgramBuilder, ProgramBuilderOpts,
+        },
         insn::{
             to_u32, CmpInsFlags, ConstraintInfo, IdxInsertFlags, InsertFlags, Insn,
             RegisterOrLiteral,
@@ -561,10 +565,12 @@ pub fn translate_insert(
         TriggerTime::Before,
         None,
         &btree_table,
+        connection,
     );
 
-    let dml_ctx =
-        DmlColumnContext::from_column_reg_mapping(insertion.col_mappings.iter().map(|cm| {
+    // The inserted values are the user's values until ENCODE runs below.
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(
+        insertion.col_mappings.iter().map(|cm| {
             (
                 cm.column,
                 if cm.column.is_rowid_alias() {
@@ -573,7 +579,9 @@ pub fn translate_insert(
                     cm.register
                 },
             )
-        }));
+        }),
+        DmlRowForm::UserFacing,
+    );
 
     let has_before_triggers = !relevant_before_triggers.is_empty();
     if has_before_triggers {
@@ -634,26 +642,18 @@ pub fn translate_insert(
         //    trigger statements (per SQLite semantics, the outer statement's
         //    conflict resolution overrides the trigger body's)
         // 3. Otherwise, don't override (use statement's own conflict resolution)
-        let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
-            TriggerContext::new_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers),
-                None, // No OLD for INSERT
-                override_conflict,
-            )
-        } else if let Some(statement_on_conflict) = ctx.statement_on_conflict {
-            TriggerContext::new_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers),
-                None, // No OLD for INSERT
-                statement_on_conflict,
-            )
-        } else {
-            TriggerContext::new(
-                btree_table.clone(),
-                Some(new_registers),
-                None, // No OLD for INSERT
-            )
+        let trigger_ctx = TriggerContext::new(
+            btree_table.clone(),
+            Some(new_registers),
+            DmlRowForm::UserFacing,
+            None, // No OLD for INSERT
+        );
+        let trigger_ctx = match program
+            .trigger_conflict_override
+            .or(ctx.statement_on_conflict)
+        {
+            Some(override_conflict) => trigger_ctx.with_override_conflict(override_conflict),
+            None => trigger_ctx,
         };
         for trigger in relevant_before_triggers {
             fire_trigger(
@@ -730,7 +730,7 @@ pub fn translate_insert(
     // see the rowids this statement has used unless they are written first.
     if let Some(meta) = ctx
         .autoincrement_meta
-        .filter(|_| any_trigger_inserts_into(resolver, ctx.namespace, &ctx.table.name))
+        .filter(|meta| meta.trigger_inserts_into_table)
     {
         emit_write_sqlite_sequence(program, resolver, ctx.namespace.database_id, meta)?;
     }
@@ -763,7 +763,7 @@ pub fn translate_insert(
     };
     let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
     if !types_checked_first {
-        emit_notnulls(program, &ctx, &insertion, resolver, |column| {
+        emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
             !column.is_virtual_generated() && !has_custom_type(column)
         })?;
     }
@@ -794,7 +794,7 @@ pub fn translate_insert(
             table_reference: Arc::clone(type_check_table),
         });
     }
-    emit_notnulls(program, &ctx, &insertion, resolver, |column| {
+    emit_notnulls(program, &ctx, &insertion, resolver, true, |column| {
         !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
     })?;
 
@@ -803,7 +803,7 @@ pub fn translate_insert(
         compute_virtual_columns(
             program,
             &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
+            &dml_ctx.with_form(DmlRowForm::Stored),
             resolver,
             &btree_table,
         )?;
@@ -824,31 +824,32 @@ pub fn translate_insert(
             &ctx,
             &insertion,
             resolver,
+            true,
             Column::is_virtual_generated,
         )?;
     }
 
     // Evaluate CHECK constraints after NOT NULL default substitution and before index mutations.
+    let check_halt_on_error = program.constraint_halt_on_error(ctx.on_conflict);
     emit_check_constraints(
         program,
         &ctx.table.check_constraints,
         resolver,
-        &ctx.table.name,
+        ctx.table,
         insertion.key_register(),
-        insertion.col_mappings.iter().filter_map(|m| {
-            m.column.name.as_deref().map(|n| {
-                // Rowid alias columns have NULL in their register (the real value
-                // lives in the key register), so point CHECK to the key register.
-                let reg = if m.column.is_rowid_alias() {
-                    insertion.key_register()
-                } else {
-                    m.register
-                };
-                (n, reg)
-            })
+        insertion.col_mappings.iter().map(|m| {
+            // Rowid alias columns have NULL in their register (the real value
+            // lives in the key register), so point CHECK to the key register.
+            let reg = if m.column.is_rowid_alias() {
+                insertion.key_register()
+            } else {
+                m.register
+            };
+            (m.column, reg)
         }),
         connection,
         ctx.on_conflict,
+        check_halt_on_error,
         ctx.loop_labels.row_done,
         Some(&table_references),
     )?;
@@ -910,9 +911,11 @@ pub fn translate_insert(
     // wrong index entries. Collations likewise: a rewritten reference to a
     // NOCASE column must keep comparing case-insensitively.
     for cm in &insertion.col_mappings {
+        let register_column =
+            RegisterColumn::table_column(cm.column, ctx.table.is_strict, resolver.schema());
         resolver
             .register_columns
-            .insert(cm.register, RegisterColumn::table_column(cm.column));
+            .insert(cm.register, register_column);
     }
     resolver
         .register_columns
@@ -1030,6 +1033,7 @@ pub fn translate_insert(
         TriggerTime::After,
         None,
         &btree_table,
+        connection,
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
@@ -1049,22 +1053,18 @@ pub fn translate_insert(
             .chain(std::iter::once(key_reg))
             .collect();
         // Determine the conflict resolution to propagate to AFTER triggers (same logic as BEFORE)
-        let trigger_ctx_after = if let Some(override_conflict) = program.trigger_conflict_override {
-            TriggerContext::new_after_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers_after),
-                None,
-                override_conflict,
-            )
-        } else if let Some(statement_on_conflict) = ctx.statement_on_conflict {
-            TriggerContext::new_after_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers_after),
-                None,
-                statement_on_conflict,
-            )
-        } else {
-            TriggerContext::new_after(btree_table.clone(), Some(new_registers_after), None)
+        let trigger_ctx_after = TriggerContext::new(
+            btree_table.clone(),
+            Some(new_registers_after),
+            DmlRowForm::Stored,
+            None,
+        );
+        let trigger_ctx_after = match program
+            .trigger_conflict_override
+            .or(ctx.statement_on_conflict)
+        {
+            Some(override_conflict) => trigger_ctx_after.with_override_conflict(override_conflict),
+            None => trigger_ctx_after,
         };
         // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
         // not skip post-row work (FK counters, autoincrement, CDC, RETURNING).
@@ -1354,7 +1354,9 @@ fn emit_write_sqlite_sequence(
     database_id: usize,
     meta: AutoincMeta,
 ) -> Result<()> {
-    reload_autoincrement_state(program, meta);
+    if meta.trigger_inserts_into_table {
+        reload_autoincrement_state(program, meta);
+    }
     let write_label = program.allocate_label();
     let done_label = program.allocate_label();
     program.emit_insn(Insn::IsNull {
@@ -1401,7 +1403,7 @@ fn emit_partial_index_check(
         .iter()
         .map(|cm| cm.column.clone())
         .collect();
-    let mut column_regs: Vec<usize> = insertion
+    let column_regs: Vec<usize> = insertion
         .col_mappings
         .iter()
         .map(|cm| {
@@ -1418,10 +1420,9 @@ fn emit_partial_index_check(
         resolver,
         expr,
         &columns,
-        &mut column_regs,
+        &column_regs,
         table,
         reg,
-        true,
     )?;
     let skip_label = program.allocate_label();
     program.emit_insn(Insn::IfNot {
@@ -1582,7 +1583,9 @@ fn emit_rowid_generation(
             insertion.key_register(),
         )?;
     } else if let Some(meta) = ctx.autoincrement_meta {
-        reload_autoincrement_state(program, meta);
+        if meta.trigger_inserts_into_table {
+            reload_autoincrement_state(program, meta);
+        }
         let r_max = program.alloc_register();
 
         let dummy_reg = program.alloc_register();
@@ -1786,6 +1789,11 @@ fn open_autoincrement_state(
         r_seq_rowid,
         table_name_reg,
         r_max_rowid: program.alloc_register(),
+        trigger_inserts_into_table: any_trigger_inserts_into(
+            resolver,
+            ctx.namespace,
+            &ctx.table.name,
+        ),
     });
 
     program.emit_insn(Insn::Integer {
@@ -1833,8 +1841,8 @@ fn reload_autoincrement_state(program: &mut ProgramBuilder, meta: AutoincMeta) {
         lhs: table_name_reg,
         rhs: name_col_reg,
         target_pc: found_label,
-        flags: Default::default(),
-        collation: super::collate::CollationSeq::NoCase,
+        flags: CmpInsFlags::default().jump_if_null(),
+        collation: super::collate::CollationSeq::NOCASE,
     });
     program.emit_insn(Insn::Copy {
         src_reg: name_col_reg,
@@ -1871,6 +1879,7 @@ fn emit_notnulls(
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
     resolver: &Resolver,
+    row_is_encoded: bool,
     include_column: impl Fn(&Column) -> bool,
 ) -> Result<()> {
     for column_mapping in insertion
@@ -1942,10 +1951,7 @@ fn emit_notnulls(
         // ENCODE produces a non-NULL value but DECODE returns NULL.
         let has_decode = resolver
             .schema()
-            .resolve_type(&column_mapping.column.ty_str, ctx.table.is_strict)
-            .ok()
-            .flatten()
-            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()));
+            .column_has_decode(column_mapping.column, ctx.table.is_strict);
         let check_reg = if has_decode {
             let decoded_reg = program.alloc_register();
             crate::translate::expr::emit_user_facing_column_value(
@@ -1992,17 +1998,36 @@ fn emit_notnulls(
                 .as_deref()
                 .unwrap_or("")
                 .to_string();
+            let mut constraint_info = ConstraintInfo {
+                kind: crate::ConstraintKind::NotNull,
+                constraint_name: None,
+                index_name: None,
+                table_name: ctx.table.name.as_str().to_string(),
+                column_names: vec![col_name],
+                violation_regs: all_regs,
+                row_col_names: all_names,
+                parent_table: None,
+            };
+            // HaltIfNull runs for every row, so jump over the decode of the
+            // reported row unless the value is NULL.
+            let value_not_null = program.allocate_label();
+            let table_has_custom_type = ctx.table.columns().iter().any(|column| {
+                resolver
+                    .schema()
+                    .column_has_custom_type(column, ctx.table.is_strict)
+            });
+            if row_is_encoded
+                && table_has_custom_type
+                && resolver.catalog.dialect.constraint_errors_show_values()
+            {
+                program.emit_insn(Insn::NotNull {
+                    reg: check_reg,
+                    target_pc: value_not_null,
+                });
+                emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
+            }
             program.emit_insn(Insn::HaltIfNull {
-                constraint_info: Some(Box::new(ConstraintInfo {
-                    kind: crate::ConstraintKind::NotNull,
-                    constraint_name: None,
-                    index_name: None,
-                    table_name: ctx.table.name.as_str().to_string(),
-                    column_names: vec![col_name],
-                    violation_regs: all_regs,
-                    row_col_names: all_names,
-                    parent_table: None,
-                })),
+                constraint_info: Some(Box::new(constraint_info)),
                 target_reg: check_reg,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
                 description: {
@@ -2029,6 +2054,7 @@ fn emit_notnulls(
                 },
                 on_error: program.constraint_halt_on_error(effective),
             });
+            program.preassign_label_to_next_insn(value_not_null);
         }
     }
     Ok(())
@@ -2304,6 +2330,7 @@ fn init_source_emission<'a>(
         TriggerEvent::Insert,
         None,
         ctx.table.as_ref(),
+        connection,
     );
 
     let (num_values, cursor_id) = match body {
@@ -2522,6 +2549,10 @@ pub struct AutoincMeta {
     r_seq_rowid: usize,
     table_name_reg: usize,
     r_max_rowid: usize,
+    /// A trigger inserts into this table. Such an INSERT runs as its own
+    /// program and moves sqlite_sequence on disk, so this statement has to
+    /// read sqlite_sequence again before using it.
+    trigger_inserts_into_table: bool,
 }
 
 pub static ROWID_COLUMN: std::sync::LazyLock<Column> = std::sync::LazyLock::new(|| {
@@ -3042,19 +3073,21 @@ fn emit_pk_uniqueness_check(
                 .map(|(name, _)| format!("{}.{}", ctx.table.name, name))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let mut constraint_info = ConstraintInfo::primary_key(
+                ctx.table.name.as_str(),
+                ctx.table.primary_key_constraint_name.clone(),
+                ctx.table
+                    .primary_key_columns
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .collect(),
+                (0..ctx.table.primary_key_columns.len())
+                    .map(|i| pk_regs + i)
+                    .collect(),
+            );
+            emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
             program.emit_insn(Insn::Halt {
-                constraint_info: Some(Box::new(ConstraintInfo::primary_key(
-                    ctx.table.name.as_str(),
-                    ctx.table.primary_key_constraint_name.clone(),
-                    ctx.table
-                        .primary_key_columns
-                        .iter()
-                        .map(|(n, _)| n.clone())
-                        .collect(),
-                    (0..ctx.table.primary_key_columns.len())
-                        .map(|i| pk_regs + i)
-                        .collect(),
-                ))),
+                constraint_info: Some(Box::new(constraint_info)),
                 err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                 description: raw_desc,
                 on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
@@ -3241,7 +3274,7 @@ fn emit_unique_index_check(
         .columns
         .iter()
         .map(|ic| {
-            if ic.expr.is_some() {
+            if ic.expression().is_some() {
                 Affinity::Blob.aff_mask()
             } else {
                 ctx.table.columns()[ic.pos_in_table].affinity().aff_mask()
@@ -3286,12 +3319,14 @@ fn emit_unique_index_check(
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
         let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+        let mut constraint_info = ConstraintInfo::unique_index(
+            ctx.table.name.as_str(),
+            index,
+            (0..num_cols).map(|i| idx_start_reg + i).collect(),
+        );
+        emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
         program.emit_insn(Insn::Halt {
-            constraint_info: Some(Box::new(ConstraintInfo::unique_index(
-                ctx.table.name.as_str(),
-                index,
-                (0..num_cols).map(|i| idx_start_reg + i).collect(),
-            ))),
+            constraint_info: Some(Box::new(constraint_info)),
             err_code: SQLITE_CONSTRAINT_UNIQUE,
             description: raw_desc,
             on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
@@ -3331,12 +3366,14 @@ fn emit_unique_index_check(
         } else {
             // ABORT/FAIL/ROLLBACK: halt on conflict.
             let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+            let mut constraint_info = ConstraintInfo::unique_index(
+                ctx.table.name.as_str(),
+                index,
+                (0..num_cols).map(|i| idx_start_reg + i).collect(),
+            );
+            emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
             program.emit_insn(Insn::Halt {
-                constraint_info: Some(Box::new(ConstraintInfo::unique_index(
-                    ctx.table.name.as_str(),
-                    index,
-                    (0..num_cols).map(|i| idx_start_reg + i).collect(),
-                ))),
+                constraint_info: Some(Box::new(constraint_info)),
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: raw_desc,
                 on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
@@ -3561,14 +3598,14 @@ fn emit_index_column_value_for_insert(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let expr = expr.as_ref().clone();
+    if let Some(expr) = idx_col.expression() {
+        let expr = expr.clone();
         let columns: Vec<Column> = insertion
             .col_mappings
             .iter()
             .map(|cm| cm.column.clone())
             .collect();
-        let mut column_regs: Vec<usize> = insertion
+        let column_regs: Vec<usize> = insertion
             .col_mappings
             .iter()
             .map(|cm| {
@@ -3584,19 +3621,10 @@ fn emit_index_column_value_for_insert(
             resolver,
             expr,
             &columns,
-            &mut column_regs,
+            &column_regs,
             table,
             dest_reg,
-            idx_col.pos_in_table == EXPR_INDEX_SENTINEL,
         )?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            let column = &table.columns()[idx_col.pos_in_table];
-            if column.is_virtual_generated() {
-                program.emit_column_affinity(dest_reg, column.affinity());
-            }
-        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(
@@ -3798,11 +3826,12 @@ fn emit_update_sqlite_sequence(
     });
 
     program.preassign_label_to_next_insn(update_existing_label);
+    // A trigger may have moved the cursor or removed the row since it was found.
     program.emit_insn(Insn::Insert {
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: autoincrement_bookkeeping_insert_flags(),
+        flag: autoincrement_bookkeeping_insert_flags().require_seek(),
         table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
     });
 
@@ -4071,14 +4100,9 @@ pub fn emit_fk_child_insert_checks(
                         }
                     })
                     .collect();
-                emit_fk_restrict_halt(
-                    program,
-                    Some(Box::new(fk_constraint_info(
-                        child_tbl.name.as_str(),
-                        &fk_ref.fk,
-                        fk_col_regs,
-                    ))),
-                )?;
+                let constraint_info =
+                    fk_constraint_info(program, resolver, child_tbl, &fk_ref.fk, fk_col_regs)?;
+                emit_fk_restrict_halt(program, Some(Box::new(constraint_info)))?;
             }
             program.preassign_label_to_next_insn(fk_ok);
         } else {
@@ -4191,14 +4215,9 @@ pub fn emit_fk_child_insert_checks(
                                 }
                             })
                             .collect();
-                        emit_fk_restrict_halt(
-                            p,
-                            Some(Box::new(fk_constraint_info(
-                                child_tbl.name.as_str(),
-                                &fk_ref.fk,
-                                fk_col_regs,
-                            ))),
-                        )?;
+                        let constraint_info =
+                            fk_constraint_info(p, resolver, child_tbl, &fk_ref.fk, fk_col_regs)?;
+                        emit_fk_restrict_halt(p, Some(Box::new(constraint_info)))?;
                     }
                     Ok(())
                 },
@@ -4379,6 +4398,8 @@ pub fn emit_parent_side_fk_decrement_on_insert(
 /// Emit encode expressions for columns with custom types.
 /// For each column that has a custom type with an encode expression,
 /// evaluates the expression with `value` bound to the column register.
+/// Virtual columns are skipped: their registers are not computed yet, and
+/// `compute_virtual_columns` encodes them when it computes them.
 fn emit_custom_type_encode(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -4391,12 +4412,19 @@ fn emit_custom_type_encode(
         .map(|m| m.column.clone())
         .collect();
     let layout = ColumnLayout::from_columns(&columns)?;
+    let stored_columns = ColumnMask::try_from_iter(
+        columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.is_virtual_generated())
+            .map(|(i, _)| i),
+    )?;
     crate::translate::expr::emit_custom_type_encode_columns(
         program,
         resolver,
         &columns,
         insertion.first_col_register(),
-        None, // INSERT: encode all columns
+        Some(&stored_columns),
         table_name,
         &layout,
     )

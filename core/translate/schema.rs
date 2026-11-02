@@ -3,13 +3,13 @@ use crate::HashMap;
 use crate::LimboError;
 
 use crate::ext::VTabImpl;
-use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
+use crate::function::{Deterministic, Func, ResultType, ReturnType};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, SchemaObjectType, Table, Type, SQLITE_SEQUENCE_TABLE_NAME,
-    TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, Schema, SchemaObjectType, Table, Type, TypeDef,
+    SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -19,7 +19,8 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
-use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::expr::expr_type::iif_values;
+use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
@@ -28,7 +29,8 @@ use crate::translate::sequence::bind_sequence_names;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::{
     column_declared_type, dequote, escape_sql_string_literal, is_builtin_strict_type,
-    normalize_ident, quote_identifier, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    normalize_ident, quote_identifier, walk_expr_with_subqueries, walk_schema_expressions,
+    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
@@ -192,6 +194,12 @@ impl CheckExprType {
         matches!(self, Self::Integer | Self::Real)
     }
 
+    /// A value of unknown type, such as `coalesce(int_col, text_col)`, may be
+    /// a number, so arithmetic on it is allowed, as comparing it is.
+    fn may_be_numeric(&self) -> bool {
+        self.is_numeric() || *self == Self::Any
+    }
+
     fn is_compatible_with(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Null, _) | (_, Self::Null) => true,
@@ -211,6 +219,18 @@ impl CheckExprType {
             Self::Any => "ANY",
             Self::Null => "NULL",
             Self::CustomType(name) => name.as_str(),
+        }
+    }
+
+    /// The name a custom type uses for this as its input type, such as
+    /// `integer`. None for a value that is not one of SQLite's storage types.
+    fn sql_type_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Integer => Some("integer"),
+            Self::Real => Some("real"),
+            Self::Text => Some("text"),
+            Self::Blob => Some("blob"),
+            Self::Any | Self::Null | Self::CustomType(_) => None,
         }
     }
 }
@@ -292,7 +312,7 @@ fn resolve_check_expr_type(
         ast::Expr::Unary(op, inner) => match op {
             UnaryOperator::Negative | UnaryOperator::Positive => {
                 let inner_ty = resolve_check_expr_type(inner, columns, resolver)?;
-                if !inner_ty.is_numeric() && inner_ty != CheckExprType::Null {
+                if !inner_ty.may_be_numeric() && inner_ty != CheckExprType::Null {
                     bail_parse_error!(
                         "unary minus/plus requires a numeric type, got {}",
                         inner_ty.display_name()
@@ -312,14 +332,16 @@ fn resolve_check_expr_type(
                     if lty == CheckExprType::Null || rty == CheckExprType::Null {
                         return Ok(CheckExprType::Null);
                     }
-                    if !lty.is_numeric() || !rty.is_numeric() {
+                    if !lty.may_be_numeric() || !rty.may_be_numeric() {
                         bail_parse_error!(
                             "arithmetic requires numeric types, got {} and {}",
                             lty.display_name(),
                             rty.display_name()
                         );
                     }
-                    if lty == CheckExprType::Real || rty == CheckExprType::Real {
+                    if lty == CheckExprType::Any || rty == CheckExprType::Any {
+                        Ok(CheckExprType::Any)
+                    } else if lty == CheckExprType::Real || rty == CheckExprType::Real {
                         Ok(CheckExprType::Real)
                     } else {
                         Ok(CheckExprType::Integer)
@@ -348,7 +370,7 @@ fn resolve_check_expr_type(
                 | Operator::GreaterEquals => {
                     let lty = resolve_check_expr_type(lhs, columns, resolver)?;
                     let rty = resolve_check_expr_type(rhs, columns, resolver)?;
-                    if !lty.is_compatible_with(&rty) {
+                    if !can_compare(&lty, &rty, resolver) {
                         bail_parse_error!(
                             "type mismatch in CHECK constraint: cannot compare {} with {}",
                             lty.display_name(),
@@ -397,7 +419,7 @@ fn resolve_check_expr_type(
     }
 }
 
-/// Resolve the return type of a built-in function for CHECK constraint type checking.
+/// Resolve the return type of a function for CHECK constraint type checking.
 fn resolve_func_return_type(
     func: &Func,
     name: &str,
@@ -405,13 +427,60 @@ fn resolve_func_return_type(
     columns: &[&ast::ColumnDefinition],
     resolver: &CatalogContext,
 ) -> Result<CheckExprType> {
-    match func {
-        Func::Scalar(sf) => resolve_scalar_func_return_type(sf, args, columns, resolver),
-        Func::Math(mf) => resolve_math_func_return_type(mf),
-        #[cfg(feature = "json")]
-        Func::Json(jf) => resolve_json_func_return_type(jf),
-        Func::Agg(_) => bail_parse_error!("misuse of aggregate function {}()", name),
-        Func::External(_) => {
+    if let Func::Agg(_) = func {
+        bail_parse_error!("misuse of aggregate function {}()", name);
+    }
+    let type_of = |arg: &ast::Expr| resolve_check_expr_type(arg, columns, resolver);
+    // A call with the wrong number of arguments is reported when it is translated.
+    // A function that computes a new value from a custom-type value, such as
+    // abs or substr of a numeric, computes it from the value a read gives,
+    // after DECODE. Its type is not declared, so the result's type is unknown.
+    let first_argument = || args.first().map(|arg| type_of(arg)).transpose();
+    match func.result_type() {
+        ResultType::Declared(ReturnType::Integer) => Ok(CheckExprType::Integer),
+        ResultType::Declared(ReturnType::Real) => Ok(CheckExprType::Real),
+        ResultType::Declared(ReturnType::Text) => Ok(CheckExprType::Text),
+        ResultType::Declared(ReturnType::Blob) => Ok(CheckExprType::Blob),
+        ResultType::Declared(ReturnType::Custom(type_name)) => {
+            resolve_type_name(type_name, resolver)
+        }
+        ResultType::Declared(ReturnType::Array) => Ok(CheckExprType::Any),
+        ResultType::FirstArgument => Ok(first_argument()?.unwrap_or(CheckExprType::Any)),
+        ResultType::OneOfTheArguments => common_check_type(args.iter().map(|arg| type_of(arg))),
+        ResultType::OneOfTheIifValues => {
+            common_check_type(iif_values(args).map(|arg| type_of(arg)))
+        }
+        // ceil, floor and trunc give an integer for an integer and a real for
+        // a real. A text or blob argument is first converted to a number,
+        // which may be either.
+        ResultType::NumberOfTheFirstArgumentsType => Ok(match first_argument()? {
+            Some(ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null)) => ty,
+            _ => CheckExprType::Any,
+        }),
+        // abs gives a real for text or a blob, without converting it first.
+        // abs of a custom type keeps the type, as in a query, so the type's
+        // operators still apply to `abs(n) + n`.
+        ResultType::AbsOfTheFirstArgument => Ok(match first_argument()? {
+            Some(
+                ty @ (CheckExprType::Integer
+                | CheckExprType::Real
+                | CheckExprType::Null
+                | CheckExprType::CustomType(_)),
+            ) => ty,
+            Some(CheckExprType::Text | CheckExprType::Blob) => CheckExprType::Real,
+            Some(CheckExprType::Any) | None => CheckExprType::Any,
+        }),
+        ResultType::RealForARealArgument => Ok(CheckExprType::Real),
+        // substr returns a blob for a blob and text for a number or text.
+        ResultType::TextOrBlobLikeTheFirstArgument => Ok(match first_argument()? {
+            Some(ty @ (CheckExprType::Blob | CheckExprType::Any | CheckExprType::Null)) => ty,
+            Some(CheckExprType::Integer | CheckExprType::Real | CheckExprType::Text) => {
+                CheckExprType::Text
+            }
+            Some(CheckExprType::CustomType(_)) | None => CheckExprType::Any,
+        }),
+        ResultType::ElementOfTheFirstArgument => Ok(CheckExprType::Any),
+        ResultType::Unknown if matches!(func, Func::External(_)) => {
             bail_parse_error!(
                 "cannot determine return type of function {}() in CHECK constraint; \
                  wrap with CAST to specify the type, e.g. CAST({}(...) AS INTEGER)",
@@ -419,7 +488,7 @@ fn resolve_func_return_type(
                 name
             );
         }
-        _ => Ok(CheckExprType::Any),
+        ResultType::Unknown => Ok(CheckExprType::Any),
     }
 }
 
@@ -599,7 +668,25 @@ fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<Che
         | JsonFunc::JsonbExtract
         | JsonFunc::JsonArrowExtract
         | JsonFunc::JsonArrowShiftExtract => Ok(CheckExprType::Any),
+/// The type of a function that returns one of several values: the type they
+/// all share, REAL for a mix of integers and reals, and otherwise any type.
+/// NULL values don't count.
+fn common_check_type(types: impl Iterator<Item = Result<CheckExprType>>) -> Result<CheckExprType> {
+    let mut common = CheckExprType::Null;
+    for ty in types {
+        let ty = ty?;
+        common = match (common, ty) {
+            (common, CheckExprType::Null) => common,
+            (CheckExprType::Null, ty) => ty,
+            (common, ty) if common == ty => common,
+            (
+                CheckExprType::Integer | CheckExprType::Real,
+                CheckExprType::Integer | CheckExprType::Real,
+            ) => CheckExprType::Real,
+            _ => CheckExprType::Any,
+        };
     }
+    Ok(common)
 }
 
 /// Resolve a column's type from its definition.
@@ -661,7 +748,7 @@ fn validate_check_types_in_expr(
                 | Operator::GreaterEquals => {
                     let lty = resolve_check_expr_type(lhs, columns, resolver)?;
                     let rty = resolve_check_expr_type(rhs, columns, resolver)?;
-                    if !lty.is_compatible_with(&rty) {
+                    if !can_compare(&lty, &rty, resolver) {
                         bail_parse_error!(
                             "type mismatch in CHECK constraint: cannot compare {} with {}",
                             lty.display_name(),
@@ -686,14 +773,14 @@ fn validate_check_types_in_expr(
             let lty = resolve_check_expr_type(lhs, columns, resolver)?;
             let sty = resolve_check_expr_type(start, columns, resolver)?;
             let ety = resolve_check_expr_type(end, columns, resolver)?;
-            if !lty.is_compatible_with(&sty) {
+            if !can_compare(&lty, &sty, resolver) {
                 bail_parse_error!(
                     "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
                     lty.display_name(),
                     sty.display_name()
                 );
             }
-            if !lty.is_compatible_with(&ety) {
+            if !can_compare(&lty, &ety, resolver) {
                 bail_parse_error!(
                     "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
                     lty.display_name(),
@@ -705,7 +792,7 @@ fn validate_check_types_in_expr(
             let lty = resolve_check_expr_type(lhs, columns, resolver)?;
             for item in rhs {
                 let ity = resolve_check_expr_type(item, columns, resolver)?;
-                if !lty.is_compatible_with(&ity) {
+                if !can_compare(&lty, &ity, resolver) {
                     bail_parse_error!(
                         "type mismatch in CHECK IN list: cannot compare {} with {}",
                         lty.display_name(),
@@ -749,10 +836,29 @@ fn validate_check_types_in_expr(
     Ok(())
 }
 
+/// Whether a CHECK constraint may compare two values of these types. A value
+/// of a custom type may also be compared with any value of the type it takes
+/// as input, as in `amount < 50` or `amount > -5 - 1`: the CHECK sees the
+/// value a read gives, as a SELECT does.
+fn can_compare(lty: &CheckExprType, rty: &CheckExprType, resolver: &CatalogContext) -> bool {
+    let is_input_for = |value: &CheckExprType, ty: &CheckExprType| {
+        let (CheckExprType::CustomType(type_name), Some(value_type)) = (ty, value.sql_type_name())
+        else {
+            return false;
+        };
+        resolver
+            .schema()
+            .get_type_def_unchecked(type_name)
+            .is_some_and(|type_def| takes_input_of_type(type_def, value_type))
+    };
+    lty.is_compatible_with(rty) || is_input_for(rty, lty) || is_input_for(lty, rty)
+}
+
 fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
     resolver: &CatalogContext,
+    is_nested: bool,
 ) -> Result<()> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
         options,
@@ -774,6 +880,9 @@ fn validate(
                         validate_check_expr(expr, table_name, &column_names, resolver)?;
                     }
                     ast::ColumnConstraint::Default(expr) => validate_default_expr(expr, col_i)?,
+                    ast::ColumnConstraint::Generated { expr, .. } => {
+                        validate_generated_function_calls(expr, resolver)?;
+                    }
                     ast::ColumnConstraint::Collate { collation_name } => {
                         let collation = resolver.resolve_collation(collation_name.as_str())?;
                         if collation.is_custom() {
@@ -816,6 +925,9 @@ fn validate(
                         table_name,
                         c.col_name
                     );
+                }
+                if col_type.is_array() {
+                    resolver.schema().check_array_element_type(type_name)?;
                 }
 
                 // Domain types require STRICT tables because domain constraints
@@ -889,21 +1001,58 @@ fn validate(
             }
         }
 
-        let table = create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
-        if !table.has_rowid {
-            if table.has_autoincrement {
-                bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
+        // Rules for new tables only: VACUUM creates the tables the database
+        // already has as nested statements, and those may break these rules.
+        if !is_nested {
+            let mut table =
+                create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
+            if !table.has_rowid {
+                if table.has_autoincrement {
+                    bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
+                }
+                if table.primary_key_columns.is_empty() {
+                    bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
+                }
+                if table.unique_sets.iter().any(|us| !us.is_primary_key) {
+                    bail_parse_error!(
+                        "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
+                    );
+                }
+            } else if table.has_autoincrement {
+                // SQLite allows AUTOINCREMENT only on a key declared exactly as
+                // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size
+                // such as INTEGER(8) and an inline DESC are not. This is checked
+                // here rather than in `create_table` so that databases where older
+                // Turso versions stored such tables still open.
+                let (pk_name, pk_order) = &table.primary_key_columns[0];
+                let is_integer_primary_key = table.get_column(pk_name).is_some_and(|(_, col)| {
+                    col.ty_str.eq_ignore_ascii_case("INTEGER") && col.ty_params.is_empty()
+                }) && !(table.primary_key_is_inline
+                    && *pk_order == ast::SortOrder::Desc);
+                if !is_integer_primary_key {
+                    bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
+                }
             }
-            if table.primary_key_columns.is_empty() {
-                bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
-            }
-            if table.unique_sets.iter().any(|us| !us.is_primary_key) {
-                bail_parse_error!(
-                    "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
-                );
-            }
+            table.resolve_custom_types(resolver.schema());
+            table.check_collates_are_allowed()?;
         }
     }
+    Ok(())
+}
+
+/// Rejects a function call in a generated column expression whose argument
+/// count the function does not take. `validate_generated_expr` does not check
+/// counts because it also runs when the schema loads.
+pub(crate) fn validate_generated_function_calls(
+    expr: &ast::Expr,
+    resolver: &CatalogContext,
+) -> Result<()> {
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::FunctionCall { name, args, .. } = e {
+            resolver.resolve_function(name.as_str(), args.len())?;
+        }
+        Ok(WalkControl::Continue)
+    })?;
     Ok(())
 }
 
@@ -1193,9 +1342,6 @@ pub fn translate_create_table(
         name: resolver.name_in_sql(namespace, &tbl_name.name),
         alias: None,
     };
-    validate(&body, &normalized_tbl_name, &resolver.catalog)?;
-    let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
-        && bind_default_sequence_names(&mut body, resolver)?;
 
     // Gate array column types behind the experimental custom types flag.
     if !connection.experimental_custom_types_enabled() {
@@ -1265,6 +1411,17 @@ pub fn translate_create_table(
             }
         }
     }
+
+    // Like SQLite, the body is only checked when the table is really created,
+    // so IF NOT EXISTS on an existing table succeeds whatever the body says.
+    validate(
+        &body,
+        &normalized_tbl_name,
+        &resolver.catalog,
+        connection.is_nested_stmt(),
+    )?;
+    let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
+        && bind_default_sequence_names(&mut body, resolver)?;
 
     let mut has_autoincrement = false;
     if let ast::CreateTableBody::ColumnsAndConstraints {
@@ -2291,7 +2448,7 @@ pub fn translate_drop_table(
         rhs: table_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: CollationSeq::NoCase,
+        collation: CollationSeq::NOCASE,
     });
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id_0,
@@ -2733,8 +2890,8 @@ pub fn translate_drop_table(
             lhs: seq_table_name_reg,
             rhs: dropped_table_name_reg,
             target_pc: continue_loop_label,
-            flags: CmpInsFlags::default(),
-            collation: CollationSeq::NoCase,
+            flags: CmpInsFlags::default().jump_if_null(),
+            collation: CollationSeq::NOCASE,
         });
 
         program.emit_insn(Insn::Delete {
@@ -3355,7 +3512,7 @@ pub fn translate_drop_type(
         bail_parse_error!("cannot drop built-in type: {normalized_name}");
     }
 
-    // Check if any table in any database uses this type
+    // Check if anything in any database uses this type
     let registry_key = type_registry_key(type_name);
     let mut database_ids = resolver.attached_database_ids_in_search_order()?;
     database_ids.set(MAIN_DB_ID)?;
@@ -3363,33 +3520,16 @@ pub fn translate_drop_type(
         database_ids.set(crate::TEMP_DB_ID)?;
     }
     for database_id in database_ids {
-        let column_using_type = resolver.with_schema(database_id, |schema| {
-            schema
-                .namespace_ids()
-                .flat_map(|namespace| schema.tables(namespace))
-                .find_map(|table| {
-                    table
-                        .columns()
-                        .iter()
-                        .find(|col| type_registry_key(&col.ty_str) == registry_key)
-                        .map(|col| {
-                            (
-                                col.name.as_deref().unwrap_or("?").to_string(),
-                                table.get_name().to_string(),
-                            )
-                        })
-                })
-        });
-        if let Some((column_name, table_name)) = column_using_type {
-            bail_parse_error!(
-                "cannot drop type {normalized_name}: used by column {column_name} in table {table_name}"
-            );
+        let type_use =
+            resolver.with_schema(database_id, |schema| find_type_use(schema, &registry_key))?;
+        if let Some(type_use) = type_use {
+            bail_parse_error!("cannot drop type {normalized_name}: used by {type_use}");
         }
     }
 
     // Check if any other type/domain depends on this type
     for (name, td) in resolver.schema().type_registry.iter() {
-        if type_registry_key(td.base()) == registry_key {
+        if type_registry_key(name) != registry_key && type_def_uses_type(td, &registry_key)? {
             bail_parse_error!(
                 "cannot drop type {}: type {} depends on it",
                 normalized_name,
@@ -3473,4 +3613,84 @@ pub fn translate_drop_type(
     });
 
     Ok(())
+}
+
+/// Describes the first object in `schema` that uses the type: a column of
+/// that type, or any stored expression that casts to it.
+fn find_type_use(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
+    for namespace in schema.namespace_ids() {
+        for table in schema.tables(namespace) {
+            for column in table.columns() {
+                if type_registry_key(&column.ty_str) == registry_key {
+                    return Ok(Some(format!(
+                        "column {} in table {}",
+                        column.name.as_deref().unwrap_or("?"),
+                        table.get_name()
+                    )));
+                }
+            }
+        }
+    }
+    let mut type_use = None;
+    walk_schema_expressions(schema, &mut |owner, expr| {
+        if type_use.is_none() && is_cast_to_type(expr, registry_key) {
+            type_use = Some(owner.to_string());
+        }
+        Ok(if type_use.is_some() {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })?;
+    Ok(type_use)
+}
+
+fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
+    if type_registry_key(type_def.base()) == registry_key {
+        return Ok(true);
+    }
+    let struct_field_types = type_def
+        .struct_def()
+        .into_iter()
+        .flat_map(|def| def.fields.iter().map(|field| &field.type_name));
+    let union_variant_types = type_def
+        .union_def()
+        .into_iter()
+        .flat_map(|def| def.variants.iter().map(|variant| &variant.type_name));
+    if struct_field_types
+        .chain(union_variant_types)
+        .any(|name| type_registry_key(name) == registry_key)
+    {
+        return Ok(true);
+    }
+    let exprs = [
+        type_def.encode(),
+        type_def.coerce(),
+        type_def.decode(),
+        type_def.default_expr(),
+    ];
+    let domain_checks = type_def.domain_checks.iter().map(|c| c.check.as_ref());
+    for expr in exprs.into_iter().flatten().chain(domain_checks) {
+        if expr_casts_to_type(expr, registry_key)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn expr_casts_to_type(expr: &ast::Expr, registry_key: &str) -> Result<bool> {
+    let mut found = false;
+    walk_expr_with_subqueries(expr, &mut |expr| {
+        found |= is_cast_to_type(expr, registry_key);
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
+}
+
+fn is_cast_to_type(expr: &ast::Expr, registry_key: &str) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Cast { type_name: Some(type_name), .. }
+            if type_registry_key(&type_name.name) == registry_key
+    )
 }

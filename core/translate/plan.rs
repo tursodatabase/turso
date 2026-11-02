@@ -1,6 +1,6 @@
 use crate::namespace::NamespaceRef;
 use crate::{
-    alloc::{self, TursoIteratorExt, TursoVecExt},
+    alloc::{self, TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
         BTreeTable, ColDef, Column, FromClauseSubquery, Index, ParenthesizedJoinColumnSource,
@@ -8,7 +8,7 @@ use crate::{
         ROWID_SENTINEL, SCHEMA_TABLE_NAME_ALT, TEMP_SCHEMA_TABLE_NAME_ALT,
     },
     translate::{
-        collate::CollationSeq,
+        collate::{expr_text_collation, CollationSeq},
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
@@ -39,7 +39,7 @@ use turso_parser::ast::{
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
-use super::expr::expr_type::{type_of, TypeEnv};
+use super::expr::expr_type::{compound_column_type, type_of, type_ordering, ExprType};
 
 /// Infer the affinity of a subquery result column from its expression.
 ///
@@ -1923,6 +1923,8 @@ pub struct TableReferences {
     joined_tables: Vec<JoinedTable>,
     /// Tables from outer scopes that are referenced in this query scope.
     outer_query_refs: Vec<OuterQueryReference>,
+    /// The affinity of each single-column scalar subquery in this query scope.
+    scalar_subquery_affinities: Vec<(TableInternalId, Affinity)>,
 }
 
 impl Default for TableReferences {
@@ -1944,6 +1946,20 @@ impl TableReferences {
         Self {
             joined_tables,
             outer_query_refs,
+            scalar_subquery_affinities: Vec::new(),
+        }
+    }
+
+    /// The scope that an UPDATE reads its target table in. The WHERE terms were
+    /// planned against `from_tables`, so their scalar subqueries are recorded there.
+    pub(crate) fn for_update_target(
+        target_table: JoinedTable,
+        from_tables: &TableReferences,
+    ) -> Self {
+        Self {
+            joined_tables: vec![target_table],
+            outer_query_refs: from_tables.outer_query_refs.to_vec(),
+            scalar_subquery_affinities: from_tables.scalar_subquery_affinities.clone(),
         }
     }
 
@@ -1951,6 +1967,7 @@ impl TableReferences {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
+            scalar_subquery_affinities: Vec::new(),
         }
     }
 
@@ -1966,6 +1983,32 @@ impl TableReferences {
     /// Add a new [OuterQueryReference] to the query plan.
     pub fn add_outer_query_reference(&mut self, outer_query_reference: OuterQueryReference) {
         self.outer_query_refs.push(outer_query_reference);
+    }
+
+    /// Record the affinity of the column that a single-column scalar subquery selects.
+    pub(crate) fn add_scalar_subquery_affinity(
+        &mut self,
+        subquery_id: TableInternalId,
+        affinity: Affinity,
+    ) {
+        self.scalar_subquery_affinities
+            .push((subquery_id, affinity));
+    }
+
+    /// Take the recorded affinities of `other`, for when its WHERE terms move into this query.
+    pub(crate) fn take_scalar_subquery_affinities_from(&mut self, other: &mut TableReferences) {
+        self.scalar_subquery_affinities
+            .append(&mut other.scalar_subquery_affinities);
+    }
+
+    pub(crate) fn scalar_subquery_affinity(
+        &self,
+        subquery_id: TableInternalId,
+    ) -> Option<Affinity> {
+        self.scalar_subquery_affinities
+            .iter()
+            .find(|(id, _)| *id == subquery_id)
+            .map(|(_, affinity)| *affinity)
     }
 
     /// Returns an immutable reference to the [JoinedTable]s in the query plan.
@@ -2307,6 +2350,7 @@ impl TableReferences {
         let TableReferences {
             joined_tables,
             outer_query_refs,
+            scalar_subquery_affinities,
         } = other;
 
         // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
@@ -2315,6 +2359,10 @@ impl TableReferences {
         // and copying every element into a fresh buffer.
         take_or_append(&mut self.joined_tables, joined_tables);
         take_or_append(&mut self.outer_query_refs, outer_query_refs);
+        take_or_append(
+            &mut self.scalar_subquery_affinities,
+            scalar_subquery_affinities,
+        );
     }
 }
 
@@ -3070,11 +3118,12 @@ impl Operation {
     }
 }
 
+/// The columns a query gives an outer query, and the type of each.
 pub(super) fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
     resolver: &Resolver,
-) -> Result<alloc::Vec<Column>> {
+) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
         Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
         Plan::CompoundSelect {
@@ -3134,10 +3183,21 @@ pub(super) fn query_output_columns(
         })
         .try_collect::<alloc::Vec<_>>()?;
 
-    let env = TypeEnv::new(Some(table_references), resolver);
+    let context = ExprContext::new(Some(table_references), resolver);
+    let env = context.type_env();
+    let mut column_types = alloc::Vec::try_with_capacity_ext(columns.len())?;
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        let dimensions = type_of(result_expr, &env).array_dimensions();
+        // A compound's column has the common type of every SELECT, but the
+        // text collation of the leftmost SELECT only, as in SQLite. The
+        // compound itself removes duplicates with the collation of
+        // `compound_column_collation`, which looks at every SELECT.
+        let result_type = match &compound_arms {
+            Some(arms) => compound_column_type(arms.iter().copied(), column_index, resolver),
+            None => type_of(result_expr, &env),
+        };
+        let text_collation = expr_text_collation(result_expr, &context, context.catalog())?;
+        let dimensions = result_type.array_dimensions();
         if dimensions > ast::MAX_ARRAY_DIMENSIONS {
             crate::bail_parse_error!(
                 "result column {} is an array with {dimensions} dimensions, but arrays have at most {}",
@@ -3146,21 +3206,21 @@ pub(super) fn query_output_columns(
             );
         }
         column.set_array_dimensions(dimensions);
-        column.set_collation(Some(
-            ExprContext::new(Some(table_references), resolver).expr_collation(result_expr)?,
-        ));
+        column.set_collation(Some(text_collation));
+        column.set_type_ordering(type_ordering(&result_type, resolver.schema()));
+        column_types.try_push(result_type)?;
     }
-    Ok(columns)
+    Ok((columns, column_types))
 }
 
 fn subquery_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
     resolver: &Resolver,
-) -> Result<alloc::Vec<Column>> {
-    let mut columns = query_output_columns(plan, explicit_columns, resolver)?;
+) -> Result<(alloc::Vec<Column>, alloc::Vec<ExprType>)> {
+    let (mut columns, column_types) = query_output_columns(plan, explicit_columns, resolver)?;
     make_column_names_unique(&mut columns);
-    Ok(columns)
+    Ok((columns, column_types))
 }
 
 fn make_column_names_unique(columns: &mut [Column]) {
@@ -3218,12 +3278,13 @@ impl JoinedTable {
         resolver: &Resolver,
     ) -> Result<Self> {
         let plan = Plan::Select(Box::new(plan));
-        let columns = subquery_output_columns(&plan, None, resolver)?;
+        let (columns, column_types) = subquery_output_columns(&plan, None, resolver)?;
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
+            column_types,
             parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -3262,7 +3323,7 @@ impl JoinedTable {
         materialize_hint: bool,
         resolver: &Resolver,
     ) -> Result<Self> {
-        let columns = subquery_output_columns(&plan, explicit_columns, resolver)?;
+        let (columns, column_types) = subquery_output_columns(&plan, explicit_columns, resolver)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -3276,6 +3337,7 @@ impl JoinedTable {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
+            column_types,
             parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
@@ -3305,7 +3367,8 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         resolver: &Resolver,
     ) -> Result<Self> {
-        let mut columns = subquery_output_columns(query, explicit_columns, resolver)?;
+        let (mut columns, column_types) =
+            subquery_output_columns(query, explicit_columns, resolver)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the
@@ -3316,6 +3379,7 @@ impl JoinedTable {
         let table = Table::RecursiveCteInput(Arc::new(RecursiveCteInput {
             name: identifier.clone(),
             columns,
+            column_types,
         }));
         Ok(Self {
             op: Operation::default_scan_for(&table),

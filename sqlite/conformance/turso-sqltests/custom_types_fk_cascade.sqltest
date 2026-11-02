@@ -178,7 +178,7 @@ test cascade-text-based-type {
     INSERT INTO parent VALUES ('hello');
     INSERT INTO child VALUES (1, 'hello');
 
-    UPDATE parent SET id = 'world' WHERE id = 'hello';
+    UPDATE parent SET id = 'world' WHERE id = 'HELLO';
     SELECT parent_id FROM child;
 }
 expect {

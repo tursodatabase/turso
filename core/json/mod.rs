@@ -774,7 +774,9 @@ fn json_path_from_db_value<'a>(
                 return Ok(Some(JsonPath {
                     elements: vec![
                         PathElement::Root(),
-                        PathElement::ArrayLocator(Some(i as i32)),
+                        // SQLite reads integer N as the path `$[N]`, or `$[#N]`
+                        // when N is negative, which keeps only the low 32 bits.
+                        PathElement::array_locator(i.unsigned_abs() as u32, i < 0),
                     ],
                 }));
             }

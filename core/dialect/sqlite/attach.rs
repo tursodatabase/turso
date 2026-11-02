@@ -125,7 +125,7 @@ pub fn translate_attach(
         func: crate::function::FuncCtx {
             func: Func::Scalar(ScalarFunc::Attach),
             arg_count: 3,
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::BINARY,
         },
     });
 
@@ -188,7 +188,7 @@ pub fn translate_detach(
         func: crate::function::FuncCtx {
             func: Func::Scalar(ScalarFunc::Detach),
             arg_count: 1,
-            collation: CollationSeq::Binary,
+            collation: CollationSeq::BINARY,
         },
     });
 

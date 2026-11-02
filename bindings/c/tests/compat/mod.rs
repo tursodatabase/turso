@@ -655,9 +655,11 @@ mod tests {
             let name2_str = std::ffi::CStr::from_ptr(name2).to_str().unwrap();
             assert_eq!(name2_str, "value");
 
-            // will lead to panic
-            //let invalid = sqlite3_column_name(stmt, 5);
-            //assert!(invalid.is_null());
+            for invalid_idx in [-1, 2, 5, i32::MIN, i32::MAX] {
+                assert!(sqlite3_column_name(stmt, invalid_idx).is_null());
+                assert!(sqlite3_column_table_name(stmt, invalid_idx).is_null());
+                assert!(sqlite3_column_decltype(stmt, invalid_idx).is_null());
+            }
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             assert_eq!(sqlite3_close(db), SQLITE_OK);

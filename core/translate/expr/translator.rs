@@ -250,7 +250,7 @@ fn translate_expr_by_kind(
             translate_unary_expr(program, referenced_tables, expr, target_register, resolver)
         }
         ast::Expr::Variable(_) => translate_variable_expr(program, expr, target_register),
-        ast::Expr::Register(_) => translate_register_expr(program, expr, target_register),
+        ast::Expr::Register { .. } => translate_register_expr(program, expr, target_register),
         ast::Expr::Default => {
             crate::bail_parse_error!("DEFAULT is only valid in INSERT VALUES");
         }
@@ -562,15 +562,15 @@ fn translate_binary_expr(
         }
     }
 
-    if try_translate_custom_type_operator(
-        program,
-        referenced_tables,
-        e1,
-        op,
-        e2,
-        target_register,
-        resolver,
-    )? {
+    if let Some(result_reg) = emit_custom_type_operator(program, referenced_tables, expr, resolver)?
+    {
+        if result_reg != target_register {
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+        }
         return Ok(target_register);
     }
 
@@ -608,33 +608,6 @@ fn translate_truth_test_expr(
         invert: is_not == is_true_literal,
     });
     Ok(target_register)
-}
-
-/// Translates the binary expression with the operator of a custom type, if
-/// either operand has a custom type that defines one. Returns false otherwise.
-#[inline(never)]
-fn try_translate_custom_type_operator(
-    program: &mut ProgramBuilder,
-    referenced_tables: Option<&TableReferences>,
-    e1: &ast::Expr,
-    op: &ast::Operator,
-    e2: &ast::Expr,
-    target_register: usize,
-    resolver: &Resolver,
-) -> Result<bool> {
-    let Some(resolved) = find_custom_type_operator(e1, e2, op, referenced_tables, resolver) else {
-        return Ok(false);
-    };
-    let result_reg =
-        emit_custom_type_operator(program, referenced_tables, e1, e2, &resolved, resolver)?;
-    if result_reg != target_register {
-        program.emit_insn(Insn::Copy {
-            src_reg: result_reg,
-            dst_reg: target_register,
-            extra_amount: 0,
-        });
-    }
-    Ok(true)
 }
 
 #[inline(never)]
@@ -705,7 +678,6 @@ fn translate_case_expr(
                         .expect("base_reg is set only with a base expression"),
                     when_expr,
                     &ExprContext::new(referenced_tables, resolver),
-                    &resolver.catalog,
                 )?,
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
@@ -766,12 +738,17 @@ fn translate_cast_expr(
     let ast::Expr::Cast { expr, type_name } = expr else {
         unreachable!("translate_cast_expr expects Expr::Cast");
     };
+    // A CAST to a custom type gives the value a column of the type reads, after
+    // ENCODE and then DECODE, so that operators, functions and comparisons see
+    // both alike: `CAST(42 AS cents)` is 42, and `-CAST(1.5 AS numeric(10,2))`
+    // runs numeric's `-` on 1.50.
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
 
     let cast_type_name = type_name.as_ref().map(|tn| crate::util::dequote(&tn.name));
 
     if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
         if tn.array_dimensions > 0 {
+            resolver.schema().check_array_element_type(cast_type_name)?;
             let mut column = Column::new(
                 None,
                 cast_type_name.clone(),
@@ -785,7 +762,8 @@ fn translate_cast_expr(
             super::arrays::emit_array_encode(program, target_register, &column, resolver, "")?;
             return Ok(target_register);
         }
-        if let Some(resolved) = resolver.schema().resolve_type_unchecked(cast_type_name)? {
+        if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
+            let chain = resolved.chain;
             // Build ty_params from AST TypeSize so parametric types
             // (e.g. numeric(10,2)) get their parameters passed through.
             let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
@@ -796,39 +774,41 @@ fn translate_cast_expr(
                 None => Vec::new(),
             };
 
-            // Domains: store the value as a column of the domain does, which
-            // runs the ENCODE and COERCE of the types under it, then check
-            // the domain's constraints on the stored value.
-            if resolved.is_domain() {
-                emit_store_value(
-                    program,
-                    &resolved.chain,
-                    target_register,
-                    &ty_params,
-                    resolver,
-                )?;
-
-                // Validate domain constraints on the encoded value
-                emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
-                return Ok(target_register);
+            // A cast to a domain over boolean gives true for every nonzero
+            // integer in dialects whose integer-to-boolean cast does, before
+            // boolean's ENCODE sees the value.
+            let is_domain = chain[0].is_domain;
+            if is_domain
+                && chain
+                    .iter()
+                    .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
+            {
+                emit_integer_to_boolean_cast(program, target_register);
             }
-
-            // CAST gives the stored form: CAST(42 AS cents) → 4200. With type
-            // arguments it applies their limits too, as storing in a column
-            // of that type does: CAST('3.504' AS numeric(10,2)) is 3.50. A
-            // type that takes arguments, named without all of them, is
-            // SQLite's CAST: CAST(x AS NUMERIC) is a common SQLite idiom.
-            let user_param_count = resolved.leaf().user_params().count();
-            if user_param_count == 0 || ty_params.len() == user_param_count {
-                emit_store_value(
-                    program,
-                    &resolved.chain[..1],
-                    target_register,
-                    &ty_params,
-                    resolver,
-                )?;
-                return Ok(target_register);
+            // A domain whose types have no expression to convert the value holds
+            // it as its base SQL type, so the CAST converts it as a CAST to that
+            // type would: CAST('2' AS d) is the integer 2 for a domain d over
+            // integer.
+            let converts_by_expression = chain
+                .iter()
+                .any(|td| td.has_encode_or_coerce() || td.decode().is_some());
+            if is_domain
+                && !converts_by_expression
+                && !resolved.primitive.eq_ignore_ascii_case("any")
+            {
+                program.emit_insn(Insn::Cast {
+                    reg: target_register,
+                    affinity: Affinity::of_written_type(&resolved.primitive),
+                });
             }
+            emit_store_value(program, &chain, target_register, &ty_params, resolver)?;
+            emit_decode(program, &chain, target_register, resolver)?;
+            // The domain's CHECKs see the value after DECODE, as they do on a
+            // column of the domain.
+            if is_domain {
+                emit_domain_cast_constraints(program, &chain, tn, target_register, resolver)?;
+            }
+            return Ok(target_register);
         }
     }
 
@@ -841,6 +821,79 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// The custom types a CAST to `type_name` stores its value as, the way a
+/// column of the type stores it, or None when the CAST is SQLite's CAST. A
+/// domain stores through every type under it, then checks its constraints on
+/// the stored value. A CAST with type arguments applies their limits too:
+/// CAST('3.504' AS numeric(10,2)) is 3.50. Array types are not covered here.
+fn custom_type_cast_chain(
+    type_name: &ast::Type,
+    schema: &crate::schema::Schema,
+) -> Result<Option<crate::schema::ResolvedType>> {
+    if type_name.array_dimensions > 0 {
+        return Ok(None);
+    }
+    let Some(mut resolved) =
+        schema.resolve_type_unchecked(&crate::util::dequote(&type_name.name))?
+    else {
+        return Ok(None);
+    };
+    if resolved.is_domain() {
+        return Ok(Some(resolved));
+    }
+    if is_sqlite_cast_to(resolved.leaf(), type_name) {
+        return Ok(None);
+    }
+    resolved.chain.truncate(1);
+    Ok(Some(resolved))
+}
+
+/// Whether a CAST to `type_def`, written as `type_name`, is SQLite's CAST
+/// instead: the type takes arguments and `type_name` doesn't give all of them.
+/// CAST(x AS NUMERIC) is a common SQLite idiom.
+pub(crate) fn is_sqlite_cast_to(type_def: &TypeDef, type_name: &ast::Type) -> bool {
+    let type_arg_count = match &type_name.size {
+        Some(ast::TypeSize::MaxSize(_)) => 1,
+        Some(ast::TypeSize::TypeSize(..)) => 2,
+        None => 0,
+    };
+    let user_param_count = type_def.user_params().count();
+    !type_def.is_domain && user_param_count != 0 && type_arg_count != user_param_count
+}
+
+/// True when a cast to `type_def` turns every nonzero integer into true.
+fn casts_nonzero_integer_to_true(type_def: &TypeDef, resolver: &Resolver) -> bool {
+    type_def.is_builtin
+        && type_def.name == "boolean"
+        && resolver.catalog.dialect.casts_nonzero_integer_to_true()
+}
+
+/// Replaces an integer in `reg` with 1 when it is nonzero and 0 when it is
+/// zero. Other values are left for the boolean type's ENCODE.
+fn emit_integer_to_boolean_cast(program: &mut ProgramBuilder, reg: usize) {
+    let to_boolean = program.allocate_label();
+    let done = program.allocate_label();
+    // IsType also jumps for NULL, which must stay NULL.
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: done,
+    });
+    program.emit_insn(Insn::IsType {
+        reg,
+        target_pc: to_boolean,
+        value_type: crate::types::ValueType::Integer,
+    });
+    program.emit_insn(Insn::Goto { target_pc: done });
+    program.preassign_label_to_next_insn(to_boolean);
+    program.emit_insn(Insn::IsTrue {
+        reg,
+        dest: reg,
+        null_value: false,
+        invert: false,
+    });
+    program.preassign_label_to_next_insn(done);
 }
 
 #[inline(never)]
@@ -892,10 +945,9 @@ fn translate_function_call_expr(
         first_collation(
             args.iter()
                 .map(|arg| (arg.as_ref(), ExprContext::new(referenced_tables, resolver))),
-            &resolver.catalog,
         )?
     } else {
-        CollationSeq::Binary
+        CollationSeq::BINARY
     };
     let func_ctx = FuncCtx {
         func,
@@ -1908,12 +1960,6 @@ fn translate_function_call_expr(
                 }
                 ScalarFunc::TestUintEncode
                 | ScalarFunc::TestUintDecode
-                | ScalarFunc::TestUintAdd
-                | ScalarFunc::TestUintSub
-                | ScalarFunc::TestUintMul
-                | ScalarFunc::TestUintDiv
-                | ScalarFunc::TestUintLt
-                | ScalarFunc::TestUintEq
                 | ScalarFunc::StringReverse
                 | ScalarFunc::Gcd
                 | ScalarFunc::Lcm
@@ -1930,10 +1976,11 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericSub
                 | ScalarFunc::NumericMul
                 | ScalarFunc::NumericDiv
-                | ScalarFunc::NumericLt
-                | ScalarFunc::NumericEq
+                | ScalarFunc::NumericMod
+                | ScalarFunc::NumericNeg
                 | ScalarFunc::DatePlus
-                | ScalarFunc::DateMinus => translate_function(
+                | ScalarFunc::DateMinus
+                | ScalarFunc::DateDiff => translate_function(
                     program,
                     args,
                     referenced_tables,
@@ -2370,11 +2417,23 @@ fn translate_self_table_column_expr(
                     crate::bail_parse_error!("column index out of bounds");
                 }
                 let src_reg = dml_ctx.to_column_reg(*column);
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: target_register,
-                    extra_amount: 0,
-                });
+                let table_column = &table.columns()[*column];
+                if dml_ctx.holds_stored_value(*column) {
+                    emit_user_facing_column_value(
+                        program,
+                        src_reg,
+                        target_register,
+                        table_column,
+                        table.is_strict,
+                        resolver,
+                    )?;
+                } else {
+                    program.emit_insn(Insn::Copy {
+                        src_reg,
+                        dst_reg: target_register,
+                        extra_amount: 0,
+                    });
+                }
                 Ok(target_register)
             }
             None => {
@@ -3173,6 +3232,17 @@ fn translate_unary_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    if let Some(result_reg) = emit_custom_type_operator(program, referenced_tables, expr, resolver)?
+    {
+        if result_reg != target_register {
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: target_register,
+                extra_amount: 0,
+            });
+        }
+        return Ok(target_register);
+    }
     let ast::Expr::Unary(op, expr) = expr else {
         unreachable!("translate_unary_expr expects Expr::Unary");
     };
@@ -3286,7 +3356,10 @@ fn translate_register_expr(
     expr: &ast::Expr,
     target_register: usize,
 ) -> Result<usize> {
-    let ast::Expr::Register(src_reg) = expr else {
+    let ast::Expr::Register {
+        register: src_reg, ..
+    } = expr
+    else {
         unreachable!("translate_register_expr expects Expr::Register");
     };
     // For DBSP expression compilation: copy from source register to target

@@ -1222,6 +1222,12 @@ pub struct ProgramState {
     /// active write; abort() compares against it to tell whether the
     /// statement wrote anything before failing.
     pub(crate) write_baseline: WriteBaseline,
+    /// Whether the transaction was READ ONLY when this statement started
+    /// writing. The write opcodes reject database writes under it, the
+    /// backstop behind the compile-time and sequence read-only checks. A
+    /// statement already writing when the transaction turns read-only keeps
+    /// its mode, as in PostgreSQL, which checks when a command starts.
+    pub(crate) tx_read_only_at_start: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
@@ -1323,6 +1329,7 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            tx_read_only_at_start: false,
             write_baseline: WriteBaseline::None,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
@@ -1496,6 +1503,7 @@ impl ProgramState {
         }
         self.uses_subjournal = false;
         self.is_active_write = false;
+        self.tx_read_only_at_start = false;
         self.write_baseline = WriteBaseline::None;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
@@ -1668,14 +1676,14 @@ impl ProgramState {
             .expect("an instruction that reports IO leaves its completion in the state")
     }
 
-    /// Runs `f` on the metrics of this statement including its active and
-    /// cached subprograms, without copying them when there is no subprogram.
+    /// Runs `f` on the metrics of this statement including its active
+    /// subprogram, without copying them when there is no active subprogram.
     pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
-        let has_subprograms = matches!(
+        let has_active_subprogram = matches!(
             self.active_op_state.program_ref(),
             Some(OpProgramState::Step { .. })
-        ) || !self.subprogram_stmt_cache.is_empty();
-        if has_subprograms {
+        );
+        if has_active_subprogram {
             f(&self.metrics())
         } else {
             f(&self.metrics)
@@ -1687,18 +1695,12 @@ impl ProgramState {
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
-        for statement in self.subprogram_stmt_cache.values() {
-            metrics.merge(&statement.metrics());
-        }
         metrics
     }
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_metrics();
-        }
-        for statement in self.subprogram_stmt_cache.values_mut() {
             statement.reset_metrics();
         }
     }
@@ -1711,13 +1713,11 @@ impl ProgramState {
             crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
             crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
             crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
+            crate::statement::StatementStatusCounter::Run => self.metrics.runs = 0,
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
-            statement.reset_stmt_status(counter);
-        }
-        for statement in self.subprogram_stmt_cache.values_mut() {
             statement.reset_stmt_status(counter);
         }
     }

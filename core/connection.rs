@@ -25,7 +25,7 @@ use crate::{
     io::{MemoryIO, IO},
     progress::{ProgressHandler, ProgressHandlerCallback},
     translate,
-    translate::collate::CollationSeq,
+    translate::collate::TextCollation,
     util::IOExt,
     vdbe, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
     CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion,
@@ -210,6 +210,9 @@ pub struct ReparseSchemaInner {
     /// instead of re-reading each backing table. `None` for a normal reparse,
     /// which recovers descriptors from disk in the `PopulateSequences` phase.
     preserved_sequences: Option<rustc_hash::FxHashMap<String, Arc<crate::schema::Sequence>>>,
+    /// The `sqlite_schema` scan, which also collects the indexes and
+    /// materialized views that are built once the types are loaded.
+    parse: Box<crate::util::ParseSchemaRowsState>,
     phase: ReparsePhase,
 }
 
@@ -227,9 +230,7 @@ pub enum SubqueryUnnestingMode {
 
 enum ReparsePhase {
     /// Scanning `SELECT * FROM sqlite_schema` into `fresh`.
-    ParseSchema {
-        parse: Box<crate::util::ParseSchemaRowsState>,
-    },
+    ParseSchema,
     /// Loading the names of the namespaces from the namespaces table.
     LoadNamespaces {
         stmt: Box<Statement>,
@@ -262,6 +263,9 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         type_rows: Vec<String>,
     },
+    /// Loading the CREATE TYPE statements `type_sqls`, then building the
+    /// materialized views and indexes collected by the `sqlite_schema` scan.
+    BuildIndexes { type_sqls: Vec<String> },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -444,6 +448,11 @@ pub struct Connection {
     /// can skip the catalog locks while no such pager can exist.
     pub(super) has_non_main_pagers: AtomicBool,
     pub(super) query_only: AtomicBool,
+    /// True while a READ ONLY transaction is active. Cleared when the
+    /// transaction ends (COMMIT, ROLLBACK, or any implicit rollback).
+    /// Unlike query_only, this is per-transaction: it resets automatically
+    /// when the transaction ends, so it is safe to use for BEGIN READ ONLY.
+    pub(super) tx_read_only: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
@@ -477,6 +486,9 @@ pub struct Connection {
     /// a non-CYCLE nextval means inline backing-table compaction
     /// (or another contended write) was reintroduced.
     pub(crate) sequence_inner_retries: AtomicU64,
+    /// Next value returned by the test-only `test_nondet_counter()` function.
+    #[cfg(feature = "test_helper")]
+    pub(crate) test_nondet_counter: AtomicI64,
     pub(crate) mv_tx: RwLock<Option<(crate::mvcc::database::TxID, TransactionMode)>>,
     /// Per-attached-database MVCC transactions.
     /// Main DB uses `mv_tx` above for zero-cost hot path access.
@@ -529,6 +541,13 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
+    /// Whether non-TEMP triggers fire for statements prepared on this
+    /// connection. TEMP triggers always fire, matching SQLite's
+    /// `SQLITE_DBCONFIG_ENABLE_TRIGGER`. Not exposed as a PRAGMA: a SQL
+    /// client must not be able to turn off triggers a database relies on
+    /// for its own rules. Only a Rust API caller (the sync engine's row
+    /// replay) can set it.
+    pub(super) triggers_enabled: AtomicBool,
     /// Number of active top-level write statements on this connection.
     ///
     /// This is currently only 0 or 1. We return Busy instead of allowing a
@@ -801,7 +820,7 @@ impl Connection {
     }
 
     /// Returns true once the per-connection temp database has been created.
-    pub(crate) fn has_temp_database(&self) -> bool {
+    pub fn has_temp_database(&self) -> bool {
         self.temp.database.read().is_some()
     }
 
@@ -1481,9 +1500,8 @@ impl Connection {
             _guard: guard,
             fresh,
             preserved_sequences,
-            phase: ReparsePhase::ParseSchema {
-                parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
-            },
+            parse: Box::new(crate::util::ParseSchemaRowsState::new(stmt, mv_tx)),
+            phase: ReparsePhase::ParseSchema,
         })
     }
 
@@ -1499,7 +1517,7 @@ impl Connection {
                 unreachable!("drive_reparse_building requires Building state");
             };
             match &mut inner.phase {
-                ReparsePhase::ParseSchema { parse } => {
+                ReparsePhase::ParseSchema => {
                     // Resolver so attached-db qualifiers in temp triggers can be
                     // mapped to their actual index on this connection.
                     let attached_resolver = |name: &str| -> Option<usize> {
@@ -1507,7 +1525,7 @@ impl Connection {
                             .database_id(&crate::util::normalize_ident(name))
                     };
                     crate::return_if_io!(crate::util::parse_schema_rows(
-                        parse,
+                        &mut inner.parse,
                         &mut inner.fresh,
                         &self.syms.read(),
                         &attached_resolver,
@@ -1664,9 +1682,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::RefreshStats {
-                            stats: Default::default(),
-                        };
+                        inner.phase = ReparsePhase::BuildIndexes { type_sqls: vec![] };
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
@@ -1674,8 +1690,17 @@ impl Connection {
                         type_rows.push(row.get::<&str>(1)?.to_string());
                         Ok(())
                     }));
-                    let type_rows = std::mem::take(type_rows);
-                    inner.fresh.load_type_definitions(&type_rows)?;
+                    inner.phase = ReparsePhase::BuildIndexes {
+                        type_sqls: std::mem::take(type_rows),
+                    };
+                }
+                ReparsePhase::BuildIndexes { type_sqls } => {
+                    crate::util::populate_types_views_then_indices(
+                        &mut inner.parse,
+                        &mut inner.fresh,
+                        &self.syms.read(),
+                        type_sqls,
+                    )?;
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1941,6 +1966,19 @@ impl Connection {
         self.fk_pragma.load(Ordering::Acquire)
     }
 
+    /// Turns non-TEMP triggers on or off for statements prepared from now on.
+    /// TEMP triggers keep firing either way (SQLite's
+    /// `SQLITE_DBCONFIG_ENABLE_TRIGGER` rule). Already-prepared statements are
+    /// unaffected until they are reprepared.
+    pub fn set_triggers_enabled(&self, enable: bool) {
+        self.triggers_enabled.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn triggers_enabled(&self) -> bool {
+        self.triggers_enabled.load(Ordering::Acquire)
+    }
+
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
         self.check_constraints_pragma
             .store(ignore, Ordering::Release);
@@ -1988,30 +2026,6 @@ impl Connection {
             Ok(())
         })?;
         Ok(rows)
-    }
-
-    /// Query the CREATE TYPE SQL definitions stored in __turso_internal_types.
-    /// The connection's schema must already contain the table definitions so
-    /// that `prepare` can resolve the table name. Returns an empty Vec if the
-    /// types table does not exist.
-    pub(crate) fn query_stored_type_definitions(self: &Arc<Connection>) -> Result<Vec<String>> {
-        let has_types_table = {
-            let s = self.schema.read();
-            s.has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
-        };
-        if !has_types_table {
-            return Ok(Vec::new());
-        }
-        let mut type_stmt = self.prepare_internal(format!(
-            "SELECT name, sql FROM {}",
-            crate::schema::TURSO_TYPES_TABLE_NAME
-        ))?;
-        let mut type_rows = Vec::new();
-        type_stmt.run_with_row_callback(|row| {
-            type_rows.push(row.get::<&str>(1)?.to_string());
-            Ok(())
-        })?;
-        Ok(type_rows)
     }
 
     pub fn maybe_update_schema(&self) {
@@ -2262,9 +2276,12 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
         use crate::storage::sqlite3_ondisk::parse_wal_frame_header;
+        use crate::Buffer;
 
-        let c = self.pager.load().wal_get_frame(frame_no, frame)?;
+        let buffer = Arc::new(Buffer::new_temporary(frame.len()));
+        let c = self.pager.load().wal_get_frame(frame_no, buffer.clone())?;
         self.db.io.wait_for_completion(c)?;
+        frame.copy_from_slice(buffer.as_slice());
         let (header, _) = parse_wal_frame_header(frame);
         Ok(WalFrameInfo {
             page_no: header.page_number,
@@ -2950,8 +2967,10 @@ impl Connection {
                 }
             }
 
-            match schema.populate_materialized_views_then_indices(
+            // The schema already holds every stored type.
+            match schema.populate_types_views_then_indices(
                 &syms,
+                &[],
                 materialized_view_info,
                 dbsp_state_roots,
                 dbsp_state_index_roots,
@@ -3247,7 +3266,7 @@ impl Connection {
     }
 
     /// Get the database id for a schema name ("main", "temp", or an attached db alias).
-    pub(crate) fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
+    pub fn get_database_id_by_name(&self, name: &str) -> Result<usize> {
         self.current_qualifiers()
             .database_id(&crate::util::normalize_ident(name))
             .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}")))
@@ -3444,7 +3463,7 @@ impl Connection {
     /// Prepares CREATE SCHEMA or DROP SCHEMA. No dialect parses their text, so
     /// preparing the statement again, after another connection changes the
     /// schema, translates the statement itself.
-    fn prepare_namespace_stmt(
+    pub fn prepare_namespace_stmt(
         self: &Arc<Self>,
         statement: turso_parser::ast::Stmt,
     ) -> Result<Statement> {
@@ -3491,7 +3510,7 @@ impl Connection {
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning
-    pub(crate) fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
+    pub fn with_schema<T>(&self, database_id: usize, f: impl FnOnce(&Schema) -> T) -> T {
         match database_id {
             crate::MAIN_DB_ID => {
                 let schema = self.schema.read();
@@ -3578,6 +3597,16 @@ impl Connection {
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
         self.bump_prepare_context_generation();
+    }
+
+    pub fn is_tx_read_only(&self) -> bool {
+        self.tx_read_only.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tx_read_only(&self, value: bool) {
+        if self.tx_read_only.swap(value, Ordering::Relaxed) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn set_vdbe_trace(&self, value: bool) {
@@ -4097,6 +4126,11 @@ impl Connection {
     /// leaves MVCC AUTOINCREMENT able to re-emit a rowid already in use after a
     /// WAL→MVCC mode switch, so errors propagate to fail the open rather than
     /// continue into a state where the next INSERT NULL collides on disk.
+    /// A row whose `name` is not text names no table and is logged and skipped
+    /// (WAL mode can never look it up); the table that row once described is
+    /// left without an imported watermark. Unlike WAL mode, which falls back
+    /// to the table's largest rowid when a sequence row is absent, this sync
+    /// has no such floor — closing that gap is a separate fix.
     pub(crate) fn sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(
         self: &Arc<Connection>,
         state: &mut SyncAutoincrementState,
@@ -4104,6 +4138,7 @@ impl Connection {
         use crate::schema::{autoincrement_sequence_name, SQLITE_SEQUENCE_TABLE_NAME};
         use crate::translate::sequence::sequence_backing_table_name;
         use crate::types::IOResult;
+        use crate::vdbe::execute::extract_int_value;
 
         loop {
             match state {
@@ -4125,9 +4160,19 @@ impl Connection {
                 }
                 SyncAutoincrementState::ReadSeqRows { stmt, rows } => {
                     crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
-                        let name = row.get::<&str>(0)?.to_string();
-                        let seq = row.get::<i64>(1)?;
-                        rows.push((name, seq));
+                        // A row only matters for the table it names, so a
+                        // name that is not text names no table and the row is
+                        // skipped — WAL mode can never look it up either.
+                        // The seq value is coerced to an integer with the same
+                        // conversion the INSERT path uses.
+                        let Ok(name) = row.get::<&str>(0) else {
+                            tracing::warn!(
+                                "skipping sqlite_sequence row with non-text name during autoincrement sync"
+                            );
+                            return Ok(());
+                        };
+                        let seq = extract_int_value(row.get_value(1));
+                        rows.push((name.to_string(), seq));
                         Ok(())
                     }));
                     let rows = std::mem::take(rows);
@@ -4308,6 +4353,19 @@ impl Connection {
     /// Creates a HashSet of modules that have been loaded
     pub fn get_syms_vtab_mods(&self) -> HashSet<String> {
         self.syms.read().vtab_modules.keys().cloned().collect()
+    }
+
+    /// Names of the collations registered on this connection, sorted.
+    pub fn get_syms_collation_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .syms
+            .read()
+            .collations
+            .values()
+            .map(|c| c.name.clone())
+            .collect();
+        names.sort();
+        names
     }
 
     /// Returns external (extension) functions: (name, is_aggregate, argc, deterministic)
@@ -4935,6 +4993,7 @@ impl Connection {
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
+        self.set_tx_read_only(false);
         self.clear_tx_poison();
         // The entire transaction is being rolled back, so every materialized
         // view delta captured within it is void. Leaving them behind would
@@ -4968,6 +5027,7 @@ impl Connection {
             self.index_methods_on_transaction_rolled_back();
             self.set_tx_state(TransactionState::None);
             self.auto_commit.store(true, Ordering::SeqCst);
+            self.set_tx_read_only(false);
         }
 
         self.rollback_temp_schema();
@@ -5147,7 +5207,7 @@ impl SymbolTable {
             .filter(|func| func.func.matches_arg_count(arg_count))
     }
 
-    pub fn resolve_collation(&self, name: &str) -> Option<CollationSeq> {
+    pub fn resolve_collation(&self, name: &str) -> Option<TextCollation> {
         self.collations
             .get(&crate::util::normalize_ident(name))
             .map(|external| external.collation)

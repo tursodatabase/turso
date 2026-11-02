@@ -7,8 +7,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["simd"]
+simd = ["turso_core/simd"]
+
 [dependencies]
-turso_core = { workspace = true, features = ["conn_raw_api"] }
+turso_core = { path = "../../core", version = "0.9.0-pre.2", default-features = false, features = [
+    "baseline",
+    "conn_raw_api",
+] }
 turso_parser = { workspace = true }
 thiserror = "2.0.12"
 tracing = "0.1.41"

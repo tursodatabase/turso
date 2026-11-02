@@ -110,6 +110,7 @@ pub fn create_dbsp_state_index(
             // (see state_table_sql), and the index must compare the same way.
             collation: state_table.columns()[pos_in_table].collation(),
             pos_in_table,
+            explicit_collation: None,
             default: None,
             expr: None,
         })?;

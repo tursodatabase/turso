@@ -1,4 +1,4 @@
-use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
+use crate::{alloc, turso_assert, turso_assert_eq, types::AsValueRef, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
 use std::ops::Range;
@@ -12,7 +12,7 @@ use crate::{
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
-        plan::{ResultSetColumn, TableReferences},
+        plan::{ColumnMask, ResultSetColumn, TableReferences},
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -41,8 +41,9 @@ impl TableRefIdCounter {
 }
 
 use super::{
-    affinity::Affinity, explain::ExplainInfo, BranchOffset, CursorID, Insn, InsnReference,
-    PrepareContext, PreparedProgram, Program,
+    affinity::{apply_integer_affinity, Affinity},
+    explain::ExplainInfo,
+    BranchOffset, CursorID, Insn, InsnReference, PrepareContext, PreparedProgram, Program,
 };
 use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
@@ -117,10 +118,6 @@ pub enum SelfTableContext {
     ForDML {
         dml_ctx: DmlColumnContext,
         table: Arc<BTreeTable>,
-        /// False for generated column expressions: they use the standard operators on
-        /// custom-type columns, and indexes on virtual generated columns already store
-        /// keys computed that way.
-        uses_custom_type_operators: bool,
     },
 }
 
@@ -137,10 +134,39 @@ enum DmlColumnRegisters {
     },
 }
 
+/// Which form the registers of a row being written hold. A custom-type column
+/// holds either the value the user sees or the value ENCODE produced, and an
+/// expression that reads the column, such as a generated column `val * 2`,
+/// must see the user's value. Reading a stored value therefore runs DECODE.
+#[derive(Clone, Debug)]
+pub enum DmlRowForm {
+    /// Every column holds the user's value, as before ENCODE in INSERT.
+    UserFacing,
+    /// Every column holds the stored value, as after ENCODE or when read from
+    /// the table.
+    Stored,
+    /// UPDATE before ENCODE: the SET columns hold the user's values and the
+    /// other columns hold the stored values read from the table.
+    StoredExceptUpdated(ColumnMask),
+}
+
+impl DmlRowForm {
+    /// Whether column `col_idx` holds the value ENCODE stored rather than the
+    /// user's value.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        match self {
+            DmlRowForm::UserFacing => false,
+            DmlRowForm::Stored => true,
+            DmlRowForm::StoredExceptUpdated(updated) => !updated.get(col_idx),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DmlColumnContext {
     registers: DmlColumnRegisters,
     rowid_alias_col: Option<usize>,
+    form: DmlRowForm,
 }
 
 impl DmlColumnContext {
@@ -149,6 +175,7 @@ impl DmlColumnContext {
         base_reg: usize,
         rowid_reg: usize,
         layout: ColumnLayout,
+        form: DmlRowForm,
     ) -> Self {
         let rowid_alias_col = columns.iter().position(|c| c.is_rowid_alias());
 
@@ -159,10 +186,14 @@ impl DmlColumnContext {
                 layout,
             },
             rowid_alias_col,
+            form,
         }
     }
 
-    pub fn from_column_reg_mapping<'a>(pairs: impl Iterator<Item = (&'a Column, usize)>) -> Self {
+    pub fn from_column_reg_mapping<'a>(
+        pairs: impl Iterator<Item = (&'a Column, usize)>,
+        form: DmlRowForm,
+    ) -> Self {
         let mut rowid_alias_col = None;
         let mut column_regs = Vec::new();
         for (idx, (col, reg)) in pairs.enumerate() {
@@ -174,7 +205,24 @@ impl DmlColumnContext {
         Self {
             registers: DmlColumnRegisters::Indexed { column_regs },
             rowid_alias_col,
+            form,
         }
+    }
+
+    /// The same registers after a step such as ENCODE changed their form.
+    pub fn with_form(&self, form: DmlRowForm) -> Self {
+        Self {
+            form,
+            ..self.clone()
+        }
+    }
+
+    /// Whether the register of column `col_idx` holds the value ENCODE
+    /// stored rather than the user's value. A virtual generated column
+    /// follows the row's form like any other column: in a row of stored
+    /// values, its expression's value is ENCODEd too.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        self.rowid_alias_col != Some(col_idx) && self.form.holds_stored_value(col_idx)
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {
@@ -455,9 +503,9 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, translate_expr will skip custom type decode for Expr::Column.
-    /// This is used when building ORDER BY sort keys so the sorter compares
-    /// encoded (on-disk) values. Decode is presentation-only.
+    /// When set, a custom-type column is read in its stored form, without
+    /// DECODE. Set when an ORDER BY key is such a column, so the sorter
+    /// compares stored values.
     pub const fn suppress_custom_type_decode(self) -> bool {
         self.get(Self::SUPPRESS_CUSTOM_TYPE_DECODE)
     }
@@ -580,7 +628,7 @@ impl CursorType {
                         .columns()
                         .iter()
                         .map(|col| {
-                            if let Some(coll) = col.collation_opt() {
+                            if let Some(coll) = col.text_collation() {
                                 format!("{coll}")
                             } else {
                                 "B".to_string()
@@ -606,7 +654,7 @@ impl CursorType {
                                 SortOrder::Desc => "-",
                             };
                             match col.collation {
-                                CollationSeq::Binary => format!("{sign}B"),
+                                CollationSeq::BINARY => format!("{sign}B"),
                                 coll => format!("{sign}{coll}"),
                             }
                         })
@@ -936,12 +984,18 @@ impl ProgramBuilder {
     /// clause is applied through the program's resolve_type, except in a
     /// trigger: its program holds every trigger step, each with its own OR
     /// clause, so each Halt carries its step's resolve type, as in SQLite.
+    /// A trigger fired with an ABORT override (by an UPSERT's DO UPDATE, or
+    /// by an explicit OR ABORT) carries ABORT too, or under DO UPDATE the
+    /// error would take the outer statement's OR clause.
     pub fn constraint_halt_on_error(&self, effective: ResolveType) -> Option<ResolveType> {
         if self.flags.has_statement_conflict() && self.trigger.is_none() {
             return None;
         }
         match effective {
             ResolveType::Fail | ResolveType::Rollback => Some(effective),
+            ResolveType::Abort if self.trigger_conflict_override == Some(ResolveType::Abort) => {
+                Some(effective)
+            }
             _ => None,
         }
     }
@@ -2410,6 +2464,14 @@ impl ProgramBuilder {
                     }
                     either::Either::Right(val) => val,
                 };
+            }
+
+            if matches!(affinity, Affinity::Integer | Affinity::Numeric) {
+                if let Some(ValueRef::Numeric(integer)) =
+                    apply_integer_affinity(value.as_value_ref())
+                {
+                    value = Value::from(integer);
+                }
             }
 
             Some(value)

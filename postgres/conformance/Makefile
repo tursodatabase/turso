@@ -33,7 +33,7 @@ PG_TESTS := pg-sqltests
 # 2 * num_cpu (arbitrary multiplier)
 POSTGRES_JOBS ?= $(shell expr 2 \* $$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2))
 
-.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres test-pgdump fuzz-pgdump build-dump-fuzzer run-upstream clean
+.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres run-sqlstate-fuzzer test-pgdump fuzz-pgdump build-dump-fuzzer run-upstream clean
 
 # Build everything
 all: build
@@ -73,6 +73,13 @@ run-postgres: build-runner
 # make run-one-postgres FILE=pg-sqltests/select.sqltest
 run-one-postgres: build-runner
 	./with-postgres.sh sh -c '$(SQLTEST) run $(FILE) --jobs $(POSTGRES_JOBS) --backend postgres --postgres-dsn "$$PG_DSN"'
+
+# Differential SQLSTATE fuzzer: generates a random schema, data, and
+# statements and compares every outcome's error code against a real
+# PostgreSQL server. Prints its seed; rerun a failure with SEED=<n>, and
+# set GEN_CASES=<n> for more statements.
+run-sqlstate-fuzzer:
+	POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh cargo test -p turso_pg_server --test sqlstate_differential -- --nocapture
 
 build-dump-fuzzer:
 	cd $(ROOT_DIR) && cargo build $(FUZZER_CARGO_PROFILE) --package turso_pg_dump_fuzzer

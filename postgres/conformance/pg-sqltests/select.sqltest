@@ -5,6 +5,26 @@
 
 @database :memory:
 
+test order-by-using-builtin-operators {
+    CREATE TABLE order_using_values (x int);
+    INSERT INTO order_using_values VALUES (1), (NULL), (2);
+    SELECT coalesce(x::text, 'N') FROM order_using_values ORDER BY x USING >;
+    SELECT coalesce(x::text, 'N') FROM order_using_values ORDER BY x USING OPERATOR(pg_catalog.<);
+    SELECT coalesce(x::text, 'N') FROM order_using_values ORDER BY x USING > NULLS LAST;
+    DROP TABLE order_using_values;
+}
+expect {
+    N
+    2
+    1
+    1
+    2
+    N
+    2
+    1
+    N
+}
+
 test cast-text-to-integer-array {
     SELECT '{10,20,30}'::integer[];
     SELECT array_length('{10,20,30}'::integer[], 1);
@@ -264,6 +284,26 @@ test select-cast-to-domain-checks-constraint {
 @sqlstate 23514
 expect error {}
 
+test select-cast-integer-to-domain-over-boolean {
+    CREATE DOMAIN db AS boolean;
+    CREATE DOMAIN true_db AS db CHECK (VALUE);
+    SELECT CASE WHEN 5::db THEN 't' ELSE 'f' END,
+           CASE WHEN 0::db THEN 't' ELSE 'f' END,
+           CASE WHEN (-3)::db THEN 't' ELSE 'f' END,
+           CASE WHEN 7::true_db THEN 't' ELSE 'f' END,
+           CASE WHEN (NULL::integer)::db IS NULL THEN 'null' END,
+           CASE WHEN 'yes'::db THEN 't' ELSE 'f' END;
+}
+expect {
+    t|f|t|t|null|t
+}
+
+test select-cast-text-that-is-not-a-boolean-to-domain-over-boolean-errors {
+    CREATE DOMAIN db AS boolean;
+    SELECT '5'::db;
+}
+expect error {}
+
 test select-cast-text-to-date-and-time {
     SELECT '2024-01-15 10:30:00'::date, CAST('2024-01-15 10:30:00' AS time);
 }
@@ -361,6 +401,30 @@ test any-subquery {
 expect {
     1
     5
+}
+
+test exists-subquery-with-empty-select-list {
+    SELECT a FROM (VALUES (1), (2)) AS t1(a)
+    WHERE EXISTS (SELECT FROM (VALUES (2)) AS t2(b) WHERE t2.b > t1.a);
+}
+expect {
+    1
+}
+
+test exists-subquery-with-empty-select-list-rejects-order-by-position {
+    SELECT a FROM (VALUES (1)) AS t1(a)
+    WHERE EXISTS (SELECT FROM (VALUES (2)) AS t2(b) ORDER BY 1);
+}
+@sqlstate 42P10
+expect error {
+}
+
+test exists-subquery-with-empty-select-list-rejects-group-by-position {
+    SELECT a FROM (VALUES (1)) AS t1(a)
+    WHERE EXISTS (SELECT FROM (VALUES (2)) AS t2(b) GROUP BY 1);
+}
+@sqlstate 42P10
+expect error {
 }
 
 test select-current-data-and-time {
@@ -1079,6 +1143,117 @@ expect {
     0|1|0|1|1|1|1|1|1|1|1|0|1
 }
 
+test similar-to-escape-character {
+    SELECT CASE WHEN 'a%' SIMILAR TO 'a#%' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'ab' SIMILAR TO 'a#%' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a_' SIMILAR TO 'a!_' ESCAPE '!' THEN 1 ELSE 0 END, CASE WHEN 'ax' SIMILAR TO 'a!_' ESCAPE '!' THEN 1 ELSE 0 END, CASE WHEN 'a#' SIMILAR TO 'a##' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a5' SIMILAR TO 'a#d' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a%' NOT SIMILAR TO 'a#%' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a%' SIMILAR TO 'a\%' ESCAPE '\' THEN 1 ELSE 0 END;
+}
+expect {
+    1|0|1|0|1|1|0|1
+}
+
+test similar-to-escape-makes-backslash-a-literal {
+    SELECT CASE WHEN 'a\b' SIMILAR TO 'a\b' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a\b' SIMILAR TO 'a[\x]b' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'a%' SIMILAR TO 'a%' ESCAPE '' THEN 1 ELSE 0 END, CASE WHEN 'a\bc' SIMILAR TO 'a\%' ESCAPE '' THEN 1 ELSE 0 END, CASE WHEN 'a%' SIMILAR TO 'a\%' ESCAPE '' THEN 1 ELSE 0 END;
+}
+expect {
+    1|1|1|1|0
+}
+
+test similar-to-escape-double-quote-separators {
+    SELECT CASE WHEN 'xay' SIMILAR TO '%#"a#"%' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN 'xay' SIMILAR TO '%\"a\"%' THEN 1 ELSE 0 END, CASE WHEN 'xby' SIMILAR TO '%#"a#"%' ESCAPE '#' THEN 1 ELSE 0 END;
+}
+expect {
+    1|1|0
+}
+
+test similar-to-escape-null-gives-null {
+    SELECT CASE WHEN ('a' SIMILAR TO 'a' ESCAPE NULL) IS NULL THEN 1 ELSE 0 END, CASE WHEN (NULL SIMILAR TO 'a' ESCAPE '#') IS NULL THEN 1 ELSE 0 END;
+}
+expect {
+    1|1
+}
+
+test similar-to-escape-longer-than-one-character-errors {
+    SELECT 'a' SIMILAR TO 'a' ESCAPE '##';
+}
+@sqlstate 22025
+expect error {
+    invalid escape string
+}
+
+test similar-to-more-than-two-escape-double-quotes-errors {
+    SELECT 'a' SIMILAR TO '#"a#"#"' ESCAPE '#';
+}
+@sqlstate 2200C
+expect error {
+    SQL regular expression may not contain more than two escape-double-quote separators
+}
+
+test similar-to-non-literal-pattern-and-escape {
+    CREATE TABLE similar_patterns (id int, s text, pattern text, esc text);
+    INSERT INTO similar_patterns VALUES (1, 'a%', 'a#%', '#'), (2, 'ab', 'a#%', '#'), (3, 'abc', 'a(b|x)c', '\'), (4, 'a.c', 'a.c', ''), (5, 'abc', 'a.c', ''), (6, 'a', 'a', NULL);
+    SELECT id FROM similar_patterns WHERE s SIMILAR TO pattern ESCAPE esc ORDER BY id;
+    SELECT id FROM similar_patterns WHERE s SIMILAR TO pattern ORDER BY id;
+    SELECT id FROM similar_patterns WHERE s NOT SIMILAR TO pattern || '%' ESCAPE esc ORDER BY id;
+}
+expect {
+    1
+    3
+    4
+    3
+    4
+    6
+    2
+    5
+}
+
+test similar-to-non-literal-escape-longer-than-one-character-errors {
+    CREATE TABLE similar_escapes (esc text);
+    INSERT INTO similar_escapes VALUES ('##');
+    SELECT 'a' SIMILAR TO 'a' ESCAPE esc FROM similar_escapes;
+}
+@sqlstate 22025
+expect error {
+    invalid escape string
+}
+
+test similar-to-escape-function {
+    SELECT similar_to_escape('a#%#"b#"c', '#'), similar_to_escape('a%_');
+}
+expect {
+    ^(?:a\%){1,1}?(b){1,1}(?:c)$|^(?:a.*.)$
+}
+
+test similar-to-custom-escape-inside-brackets {
+    SELECT CASE WHEN ']x' SIMILAR TO '[#]]x' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN '5' SIMILAR TO '[#d]' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN '"' SIMILAR TO '[#"]' ESCAPE '#' THEN 1 ELSE 0 END, CASE WHEN ']x' SIMILAR TO p ESCAPE '#' THEN 1 ELSE 0 END FROM (SELECT '[#]]x' AS p) s;
+}
+expect {
+    1|1|1|1
+}
+
+test similar-to-escape-function-makes-groups-non-capturing {
+    SELECT similar_to_escape('a(b|c)'), similar_to_escape('[(]#(', '#');
+}
+expect {
+    ^(?:a(?:b|c))$|^(?:[(]\()$
+}
+
+@setup like_strings
+test similar-to-escape-in-partial-index {
+    CREATE INDEX t_similar_escape ON t (id) WHERE s SIMILAR TO 'a#_c' ESCAPE '#';
+    SELECT id FROM t WHERE s SIMILAR TO 'a#_c' ESCAPE '#' ORDER BY id;
+}
+expect {
+    3
+}
+
+@setup like_strings
+@skip-if postgres "Turso can only index SIMILAR TO with a string-literal pattern, which it turns into a regex"
+test similar-to-with-computed-pattern-in-index-errors {
+    CREATE INDEX t_similar_computed ON t (id) WHERE s SIMILAR TO 'a' || '%';
+}
+expect error {
+    CREATE INDEX supports SIMILAR TO only with a string-literal pattern and ESCAPE
+}
+
 test with-clause-on-set-operation-and-values {
     WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION SELECT 2 ORDER BY 1;
     WITH c AS (SELECT 3 AS x) VALUES ((SELECT x FROM c));
@@ -1390,4 +1565,20 @@ test limit-text-that-is-not-a-number-is-an-error {
 @sqlstate 22P02
 expect error {
     invalid input syntax for type bigint: "abc"
+}
+
+test where-on-indexed-time-and-date-columns-converts-the-literal {
+    CREATE TABLE seek_m(x time PRIMARY KEY);
+    INSERT INTO seek_m VALUES ('12:00');
+    CREATE TABLE seek_d(d date PRIMARY KEY);
+    INSERT INTO seek_d VALUES ('2026-10-08');
+    SELECT count(*) FROM seek_m WHERE x = '12:00';
+    SELECT count(*) FROM seek_d WHERE d = '2026-10-08T00:00';
+    DELETE FROM seek_m WHERE x = '12:00';
+    SELECT count(*) FROM seek_m;
+}
+expect {
+    1
+    1
+    0
 }

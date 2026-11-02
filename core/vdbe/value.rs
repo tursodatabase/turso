@@ -131,16 +131,16 @@ impl ComparisonOp {
         lhs: V1,
         rhs: V2,
         collation: CollationSeq,
-    ) -> bool {
-        let order = collation.compare(lhs.as_value_ref(), rhs.as_value_ref());
-        match self {
+    ) -> crate::Result<bool> {
+        let order = collation.compare_operands(lhs.as_value_ref(), rhs.as_value_ref())?;
+        Ok(match self {
             ComparisonOp::Eq => order.is_eq(),
             ComparisonOp::Ne => order.is_ne(),
             ComparisonOp::Lt => order.is_lt(),
             ComparisonOp::Le => order.is_le(),
             ComparisonOp::Gt => order.is_gt(),
             ComparisonOp::Ge => order.is_ge(),
-        }
+        })
     }
 }
 
@@ -1209,7 +1209,14 @@ impl Value {
     /// the result by 1 ulp relative to SQLite's ratio.
     #[allow(unused_unsafe)]
     pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
-        let Some(f) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
+        // SQLite's logFunc type-checks the base, but reads X of log(B, X) with
+        // sqlite3_value_double(), so log(10, '100abc') and log(10, x'313030') are 2.0.
+        let f = if base.is_some() {
+            Numeric::from_value(self)
+        } else {
+            Numeric::from_value_strict(self)
+        };
+        let Some(f) = f.map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
@@ -1564,12 +1571,12 @@ impl Value {
                     Value::Null => 0,
                 };
                 // Invalid codepoints (negative, surrogates, or > U+10FFFF)
-                // become U+FFFD, matching SQLite.
-                if codepoint >= 0 {
-                    char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}')
-                } else {
-                    '\u{FFFD}'
-                }
+                // become U+FFFD, matching SQLite. Range-check the i64 before
+                // narrowing, or 4294967296 would wrap to U+0000.
+                u32::try_from(codepoint)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or('\u{FFFD}')
             })
             .collect();
         Value::build_text(result)
@@ -1880,7 +1887,7 @@ mod tests {
     }
 
     fn binary(lhs: &Value, rhs: &Value) -> crate::Result<std::cmp::Ordering> {
-        Ok(crate::translate::collate::CollationSeq::Binary.compare(lhs.as_ref(), rhs.as_ref()))
+        Ok(crate::translate::collate::CollationSeq::BINARY.compare(lhs.as_ref(), rhs.as_ref()))
     }
 
     fn allocated(result: std::result::Result<Value, crate::alloc::TryReserveError>) -> Value {

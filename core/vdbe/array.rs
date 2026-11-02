@@ -32,9 +32,27 @@ pub fn array_values_from_any(arr: &Value) -> Option<Vec<Value>> {
 /// Parse a text array literal in PG format `{1, hello, NULL}` into a Vec<Value>.
 /// Handles integers, floats, strings (quoted and unquoted), and NULL.
 pub(crate) fn parse_text_array(text: &str) -> Option<Vec<Value>> {
+    parse_text_array_as(text, UnquotedElements::Numbers)
+}
+
+/// [parse_text_array] for an array whose elements are texts, such as a
+/// `text[]`: an unquoted `1.0` stays the text `1.0`.
+pub(crate) fn parse_text_array_of_texts(text: &str) -> Option<Vec<Value>> {
+    parse_text_array_as(text, UnquotedElements::Texts)
+}
+
+/// How an unquoted element other than NULL is read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnquotedElements {
+    /// As an integer, then a float, then a text.
+    Numbers,
+    Texts,
+}
+
+fn parse_text_array_as(text: &str, unquoted: UnquotedElements) -> Option<Vec<Value>> {
     let text = text.trim();
     if text.starts_with('{') && text.ends_with('}') {
-        return parse_pg_text_array(text);
+        return parse_pg_text_array(text, unquoted);
     }
     None
 }
@@ -42,8 +60,8 @@ pub(crate) fn parse_text_array(text: &str) -> Option<Vec<Value>> {
 /// Parse a PG-style text array like `{1, hello, NULL, 3.14}` into a Vec<Value>.
 /// Unquoted `NULL` (case-insensitive) → Value::Null.
 /// Quoted strings use `"..."` with `\"` and `\\` escapes.
-/// Unquoted tokens are parsed as integer, then float, then text.
-fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
+/// Unquoted tokens are read as `unquoted` says.
+fn parse_pg_text_array(text: &str, unquoted: UnquotedElements) -> Option<Vec<Value>> {
     let inner = text[1..text.len() - 1].trim();
     if inner.is_empty() {
         return Some(Vec::new());
@@ -106,6 +124,8 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
             let token = &inner[start..pos];
             if token.eq_ignore_ascii_case("null") {
                 elements.push(Value::Null);
+            } else if unquoted == UnquotedElements::Texts {
+                elements.push(Value::build_text(token.to_string()));
             } else if let Ok(i) = token.parse::<i64>() {
                 elements.push(Value::from_i64(i));
             } else if let Ok(f) = token.parse::<f64>() {
@@ -587,31 +607,6 @@ pub(crate) fn make_array_from_registers(
 ) -> Result<Value> {
     let record = ImmutableRecord::from_registers(&registers[start_reg..start_reg + count], count)?;
     Ok(Value::Blob(record.into_payload()))
-}
-
-/// Element-wise comparison of two record-format array blobs.
-/// Compares corresponding elements using ValueRef ordering.
-/// If all common elements are equal, the shorter array is less.
-/// Returns Err if either blob is not a valid record.
-pub(crate) fn compare_arrays(a: &[u8], b: &[u8]) -> Result<std::cmp::Ordering> {
-    let iter_a = ValueIterator::new(a)?;
-    let iter_b = ValueIterator::new(b)?;
-    let mut count_a = 0usize;
-    let mut count_b = 0usize;
-    for (va, vb) in iter_a.zip(iter_b) {
-        count_a += 1;
-        count_b += 1;
-        let (va, vb) = (va?, vb?);
-        let ord = va.cmp(&vb);
-        if !ord.is_eq() {
-            return Ok(ord);
-        }
-    }
-    // Count remaining elements in the longer array
-    //TODO don't start another iterator, because it will deserialize the whole record again.
-    let len_a = count_a + ValueIterator::new(a)?.skip(count_a).count();
-    let len_b = count_b + ValueIterator::new(b)?.skip(count_b).count();
-    Ok(len_a.cmp(&len_b))
 }
 
 #[cfg(test)]

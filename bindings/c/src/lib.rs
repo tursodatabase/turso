@@ -975,13 +975,34 @@ pub unsafe extern "C" fn sqlite3_busy_handler(
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_readonly(
     db: *mut sqlite3,
-    _db_name: *const ffi::c_char,
+    db_name: *const ffi::c_char,
 ) -> ffi::c_int {
     if db.is_null() {
         return -1;
     }
+    let name = if db_name.is_null() {
+        "main"
+    } else {
+        match CStr::from_ptr(db_name).to_str() {
+            Ok(name) => name,
+            Err(_) => return -1,
+        }
+    };
     let inner = (*db).inner.lock().unwrap();
-    inner._db.is_readonly() as ffi::c_int
+    database_readonly(&inner.conn, name)
+}
+
+/// Returns 1 if the named database is read-only, 0 if it is writable, and -1
+/// if the connection has no database with that name.
+fn database_readonly(conn: &turso_core::Connection, name: &str) -> ffi::c_int {
+    let Ok(database_id) = conn.get_database_id_by_name(name) else {
+        return -1;
+    };
+    // Like SQLite, temp is not a database until something creates it.
+    if database_id == turso_core::TEMP_DB_ID && !conn.has_temp_database() {
+        return -1;
+    }
+    conn.is_readonly(database_id) as ffi::c_int
 }
 
 #[no_mangle]
@@ -1588,10 +1609,10 @@ pub unsafe extern "C" fn sqlite3_stmt_status(
         SQLITE_STMTSTATUS_SORT => turso_core::StatementStatusCounter::Sort,
         SQLITE_STMTSTATUS_VM_STEP => turso_core::StatementStatusCounter::VmStep,
         SQLITE_STMTSTATUS_REPREPARE => turso_core::StatementStatusCounter::Reprepare,
+        SQLITE_STMTSTATUS_RUN => turso_core::StatementStatusCounter::Run,
         LIBSQL_STMTSTATUS_ROWS_READ => turso_core::StatementStatusCounter::RowsRead,
         LIBSQL_STMTSTATUS_ROWS_WRITTEN => turso_core::StatementStatusCounter::RowsWritten,
         SQLITE_STMTSTATUS_AUTOINDEX
-        | SQLITE_STMTSTATUS_RUN
         | SQLITE_STMTSTATUS_FILTER_MISS
         | SQLITE_STMTSTATUS_FILTER_HIT
         | SQLITE_STMTSTATUS_MEMUSED => return 0,
@@ -2363,8 +2384,11 @@ pub unsafe extern "C" fn sqlite3_column_decltype(
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
-    if let Some(val) = stmt.stmt.get_column_decltype(idx as usize) {
+    if let Some(val) = stmt.stmt.get_column_decltype(idx) {
         let c_string = CString::new(val).expect("CString::new failed");
         c_string.into_raw()
     } else {
@@ -2377,8 +2401,10 @@ pub unsafe extern "C" fn sqlite3_column_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     let binding = stmt.stmt.get_column_name(idx).into_owned();
     let val = binding.as_str();
@@ -2396,8 +2422,10 @@ pub unsafe extern "C" fn sqlite3_column_table_name(
     stmt: *mut sqlite3_stmt,
     idx: ffi::c_int,
 ) -> *const ffi::c_char {
-    let idx = idx.try_into().unwrap();
     let stmt = &mut *stmt;
+    let Some(idx) = result_column_index(stmt, idx) else {
+        return std::ptr::null();
+    };
 
     let binding = stmt
         .stmt
@@ -2412,6 +2440,14 @@ pub unsafe extern "C" fn sqlite3_column_table_name(
 
     let c_string = CString::new(val).expect("CString::new failed");
     c_string.into_raw()
+}
+
+/// Converts a C column index to `usize`, or returns None when it is outside
+/// the statement's result columns, as SQLite does for an out-of-range index.
+fn result_column_index(stmt: &sqlite3_stmt, idx: ffi::c_int) -> Option<usize> {
+    usize::try_from(idx)
+        .ok()
+        .filter(|&idx| idx < stmt.stmt.num_columns())
 }
 
 /// Returns the value at column `idx` of the current row, or None when there
@@ -2877,19 +2913,28 @@ pub unsafe extern "C" fn sqlite3_result_text(
     context: *mut ffi::c_void,
     text: *const ffi::c_char,
     len: ffi::c_int,
-    _destroy: *mut ffi::c_void,
+    destructor: Option<extern "C" fn(*mut ffi::c_void)>,
 ) {
-    if context.is_null() || text.is_null() {
+    if text.is_null() {
+        sqlite3_result_null(context);
         return;
     }
-    let ctx = &mut *(context as *mut SqliteContext);
-    let s = if len < 0 {
-        CStr::from_ptr(text).to_string_lossy().into_owned()
-    } else {
-        let bytes = std::slice::from_raw_parts(text.cast::<u8>(), len as usize);
-        String::from_utf8_lossy(bytes).into_owned()
-    };
-    ctx.result = ExtValue::from_text(s);
+    if !context.is_null() {
+        let ctx = &mut *(context as *mut SqliteContext);
+        let s = if len < 0 {
+            CStr::from_ptr(text).to_string_lossy().into_owned()
+        } else {
+            let bytes = std::slice::from_raw_parts(text.cast::<u8>(), len as usize);
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        ctx.result = ExtValue::from_text(s);
+    }
+    // Turso never keeps the caller's buffer, so release it now unless it is SQLITE_TRANSIENT (-1).
+    if let Some(destructor_fn) = destructor {
+        if destructor_fn as usize != usize::MAX {
+            destructor_fn(text as *mut _);
+        }
+    }
 }
 
 #[no_mangle]
@@ -2897,14 +2942,23 @@ pub unsafe extern "C" fn sqlite3_result_blob(
     context: *mut ffi::c_void,
     blob: *const ffi::c_void,
     len: ffi::c_int,
-    _destroy: *mut ffi::c_void,
+    destructor: Option<extern "C" fn(*mut ffi::c_void)>,
 ) {
-    if context.is_null() || blob.is_null() || len < 0 {
+    if blob.is_null() {
+        sqlite3_result_null(context);
         return;
     }
-    let ctx = &mut *(context as *mut SqliteContext);
-    let bytes = std::slice::from_raw_parts(blob.cast::<u8>(), len as usize).to_vec();
-    ctx.result = ExtValue::from_blob(bytes);
+    if !context.is_null() && len >= 0 {
+        let ctx = &mut *(context as *mut SqliteContext);
+        let bytes = std::slice::from_raw_parts(blob.cast::<u8>(), len as usize).to_vec();
+        ctx.result = ExtValue::from_blob(bytes);
+    }
+    // Turso never keeps the caller's buffer, so release it now unless it is SQLITE_TRANSIENT (-1).
+    if let Some(destructor_fn) = destructor {
+        if destructor_fn as usize != usize::MAX {
+            destructor_fn(blob as *mut _);
+        }
+    }
 }
 
 #[no_mangle]
@@ -3846,9 +3900,12 @@ fn limbo_err_code(err: &LimboError) -> i32 {
     match err {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
+        // A Raise is a constraint error that carries its own conflict
+        // resolution, and SQLite reports it as SQLITE_CONSTRAINT.
         LimboError::Constraint(_)
         | LimboError::ConstraintViolation(_)
-        | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
+        | LimboError::ForeignKeyConstraint(_)
+        | LimboError::Raise(..) => SQLITE_CONSTRAINT,
         LimboError::DatabaseFull | LimboError::SequenceExhausted { .. } => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,
@@ -3948,6 +4005,57 @@ mod tests {
             assert_eq!(msg, "UNIQUE constraint failed: u.a");
             sqlite3_finalize(stmt);
             sqlite3_close(db);
+        }
+    }
+
+    /// A constraint failure in an UPSERT's DO UPDATE arm, or in a trigger
+    /// fired under an explicit OR ABORT, carries its own conflict resolution.
+    /// It is still a constraint failure, so SQLite returns SQLITE_CONSTRAINT.
+    #[test]
+    fn test_constraint_failure_with_its_own_conflict_resolution_is_sqlite_constraint() {
+        // Each statement is stepped on its own: sqlite3_exec splits a
+        // CREATE TRIGGER body at its inner `;`.
+        let cases: [(&[&CStr], &CStr); 2] = [
+            (
+                &[
+                    c"CREATE TABLE t(id INTEGER PRIMARY KEY, u INT UNIQUE, c INT UNIQUE)",
+                    c"INSERT INTO t VALUES (1,1,10), (2,2,20)",
+                ],
+                c"INSERT OR FAIL INTO t VALUES (10,5,50), (11,1,60) \
+                  ON CONFLICT(u) DO UPDATE SET c = 20",
+            ),
+            (
+                &[
+                    c"CREATE TABLE p(a INTEGER PRIMARY KEY, b INT)",
+                    c"CREATE TABLE log(x INT UNIQUE)",
+                    c"INSERT INTO log VALUES (7)",
+                    c"CREATE TRIGGER tp AFTER UPDATE ON p BEGIN INSERT INTO log VALUES (NEW.b); END",
+                    c"INSERT INTO p VALUES (1,1)",
+                ],
+                c"UPDATE OR ABORT p SET b = 7",
+            ),
+        ];
+        for (setup, failing) in cases {
+            unsafe {
+                let mut db = ptr::null_mut();
+                assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+                for sql in setup.iter().chain([&failing]) {
+                    let mut stmt = ptr::null_mut();
+                    assert_eq!(
+                        sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                        SQLITE_OK,
+                        "{sql:?}"
+                    );
+                    let expected = if *sql == failing {
+                        SQLITE_CONSTRAINT
+                    } else {
+                        SQLITE_DONE
+                    };
+                    assert_eq!(sqlite3_step(stmt), expected, "{sql:?}");
+                    sqlite3_finalize(stmt);
+                }
+                sqlite3_close(db);
+            }
         }
     }
 
@@ -4138,7 +4246,7 @@ mod tests {
             );
             assert_eq!(
                 sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_RUN, 0),
-                0
+                1
             );
             assert_eq!(
                 sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_FILTER_HIT, 0),
@@ -4573,5 +4681,44 @@ mod tests {
 
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
+    }
+
+    #[test]
+    fn test_database_readonly_reports_each_attached_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let open = |name: &str| {
+            let path = dir.path().join(name);
+            let database = turso_core::Database::open_file_with_flags(
+                io.clone(),
+                path.to_str().unwrap(),
+                turso_core::OpenFlags::default(),
+                DatabaseOpts::new().with_attach(true),
+                None,
+                Arc::new(SqliteDialect),
+            )
+            .unwrap();
+            (path, database.connect(ConnectOpts::new()).unwrap())
+        };
+        let (ro_path, ro_conn) = open("ro.db");
+        ro_conn.execute("CREATE TABLE t(x)").unwrap();
+        ro_conn.close().unwrap();
+        drop(ro_conn);
+        let (_, conn) = open("main.db");
+
+        conn.execute(format!("ATTACH 'file:{}?mode=ro' AS ro", ro_path.display()))
+            .unwrap();
+        conn.execute(format!(
+            "ATTACH '{}' AS rw",
+            dir.path().join("rw.db").display()
+        ))
+        .unwrap();
+        assert_eq!(database_readonly(&conn, "ro"), 1);
+        assert_eq!(database_readonly(&conn, "RO"), 1);
+        assert_eq!(database_readonly(&conn, "rw"), 0);
+        assert_eq!(database_readonly(&conn, "main"), 0);
+
+        conn.execute("DETACH ro").unwrap();
+        assert_eq!(database_readonly(&conn, "ro"), -1);
     }
 }

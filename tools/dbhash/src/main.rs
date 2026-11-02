@@ -1,6 +1,7 @@
 //! turso-dbhash CLI - Compute SHA1 hash of SQLite database content.
 
 use clap::Parser;
+use turso_core::EncryptionOpts;
 use turso_dbhash::{hash_database, DbHashOptions};
 
 #[derive(Parser)]
@@ -26,6 +27,14 @@ struct Args {
     /// Trace hash inputs to stderr
     #[arg(long)]
     debug: bool,
+
+    /// Cipher of an encrypted database (e.g. aegis256, aes256gcm)
+    #[arg(long, value_name = "CIPHER", requires = "hexkey")]
+    cipher: Option<String>,
+
+    /// Encryption key of an encrypted database, as hex
+    #[arg(long, value_name = "KEY", requires = "cipher")]
+    hexkey: Option<String>,
 }
 
 fn main() {
@@ -41,6 +50,10 @@ fn main() {
         schema_only: args.schema_only,
         without_schema: args.without_schema,
         debug_trace: args.debug,
+        encryption: args
+            .cipher
+            .zip(args.hexkey)
+            .map(|(cipher, hexkey)| EncryptionOpts { cipher, hexkey }),
     };
 
     let mut exit_code = 0;
