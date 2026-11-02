@@ -27,8 +27,8 @@ pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 
 // Constants used across the sync module
 const DEFAULT_CLIENT_NAME: &str = "turso-sync-rust";
-const CHECKPOINT_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
-const CHECKPOINT_BUSY_MAX_ATTEMPTS: usize = 100;
+const SYNC_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+const SYNC_BUSY_MAX_ATTEMPTS: usize = 100;
 
 /// Future returned by an auth token provider. Resolves to a bearer token string
 /// (without the `Bearer ` prefix — that prefix is added when building the header).
@@ -443,7 +443,47 @@ impl Database {
 
     // Pull remote changes; returns true if any changes were applied.
     pub async fn pull(&self) -> Result<bool> {
-        let _operation = self.operation_lock.lock().await;
+        for attempt in 0..SYNC_BUSY_MAX_ATTEMPTS {
+            // Applying changes fails with Busy while a user connection is writing. The failed
+            // apply consumed the downloaded changes, so the retry downloads them again; the
+            // revision was not advanced, so the server answers at once.
+            let result = {
+                let _operation = self.operation_lock.lock().await;
+                self.pull_once().await
+            };
+            match result {
+                Err(error)
+                    if is_sync_busy_error(&error) && attempt + 1 < SYNC_BUSY_MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(SYNC_BUSY_RETRY_DELAY).await;
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the last attempt returns its result")
+    }
+
+    // Force WAL checkpoint for the main database.
+    pub async fn checkpoint(&self) -> Result<()> {
+        for attempt in 0..SYNC_BUSY_MAX_ATTEMPTS {
+            let result = {
+                let _operation = self.operation_lock.lock().await;
+                drive_operation(self.sync.checkpoint(), self.io.clone()).await
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_sync_busy_error(&error) && attempt + 1 < SYNC_BUSY_MAX_ATTEMPTS =>
+                {
+                    tokio::time::sleep(SYNC_BUSY_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn pull_once(&self) -> Result<bool> {
         // First, wait for changes...
         let op = self.sync.wait_changes();
         let result = drive_operation_result(op, self.io.clone()).await?;
@@ -464,26 +504,6 @@ impl Database {
         }
 
         Ok(has_changes)
-    }
-
-    // Force WAL checkpoint for the main database.
-    pub async fn checkpoint(&self) -> Result<()> {
-        for attempt in 0..CHECKPOINT_BUSY_MAX_ATTEMPTS {
-            let result = {
-                let _operation = self.operation_lock.lock().await;
-                drive_operation(self.sync.checkpoint(), self.io.clone()).await
-            };
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error)
-                    if is_sync_busy_error(&error) && attempt + 1 < CHECKPOINT_BUSY_MAX_ATTEMPTS =>
-                {
-                    tokio::time::sleep(CHECKPOINT_BUSY_RETRY_DELAY).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(())
     }
 
     // Retrieve sync statistics for the database.
@@ -2866,6 +2886,54 @@ mod tests {
             .map(|(error, count)| format!("{count} x {error}"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // A pull that starts while a user transaction is writing must wait for it, not fail
+    // with "database is busy".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    pub async fn test_sync_pull_waits_for_open_write_transaction() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        db.pull().await.unwrap();
+        let conn = db.connect().await.unwrap();
+        conn.execute("INSERT INTO t VALUES ('local')", ())
+            .await
+            .unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('remote')")
+            .await
+            .unwrap();
+
+        conn.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES ('in transaction')", ())
+            .await
+            .unwrap();
+        let pull = tokio::spawn({
+            let db = db.clone();
+            async move { db.pull().await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        conn.execute("COMMIT", ()).await.unwrap();
+
+        assert!(pull.await.unwrap().unwrap());
+        let rows = all_rows(conn.query("SELECT x FROM t ORDER BY x", ()).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Text("in transaction".into())],
+                vec![Value::Text("local".into())],
+                vec![Value::Text("remote".into())],
+            ]
+        );
     }
 
     // Each task does what a web request would: open a connection, write a row, push.
