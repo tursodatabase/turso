@@ -68,6 +68,12 @@ impl RoleId {
         assert!(rowid > 0, "role rowid must be positive, got {rowid}");
         RoleId(rowid)
     }
+
+    /// The role with a stored id: a built-in role or a rowid of the roles
+    /// table. Any other number is not a role.
+    pub fn from_stored(id: i64) -> Option<Self> {
+        (id >= -1).then_some(RoleId(id))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
