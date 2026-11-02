@@ -73,6 +73,24 @@ pub enum PyRemoteEncryptionCipher {
     Aegis256X4,
 }
 
+#[pymethods]
+impl PyRemoteEncryptionCipher {
+    #[getter]
+    fn cipher_name(&self) -> &'static str {
+        match self {
+            Self::Aes256Gcm => "aes256gcm",
+            Self::Aes128Gcm => "aes128gcm",
+            Self::ChaCha20Poly1305 => "chacha20poly1305",
+            Self::Aegis128L => "aegis128l",
+            Self::Aegis128X2 => "aegis128x2",
+            Self::Aegis128X4 => "aegis128x4",
+            Self::Aegis256 => "aegis256",
+            Self::Aegis256X2 => "aegis256x2",
+            Self::Aegis256X4 => "aegis256x4",
+        }
+    }
+}
+
 impl PyRemoteEncryptionCipher {
     /// Returns the total reserved bytes as required by the server
     pub fn reserved_bytes(&self) -> usize {
@@ -178,7 +196,12 @@ pub fn py_turso_sync_new(
         path: db_config.path.clone(),
         experimental_features: db_config.experimental_features.clone(),
         async_io: true, // we will drive IO externally which is especially important for partial sync
-        encryption: None,
+        encryption: db_config.encryption.as_ref().map(|config| {
+            turso_sdk_kit::rsapi::EncryptionOpts {
+                cipher: config.cipher.clone(),
+                hexkey: config.hexkey.clone(),
+            }
+        }),
         vfs: IoBackend::Default,
         io: None,
         db_file: None,
@@ -191,7 +214,9 @@ pub fn py_turso_sync_new(
         .map(|c| c.reserved_bytes())
         .or(sync_config.reserved_bytes);
     let sync_config = rsapi::TursoDatabaseSyncConfig {
-        cipher: None,
+        cipher: sync_config
+            .remote_encryption_cipher
+            .map(|cipher| cipher.cipher_name().to_string()),
         path: sync_config.path.clone(),
         remote_url: sync_config.remote_url.clone(),
         client_name: sync_config.client_name.clone(),
