@@ -368,6 +368,32 @@ expect error {
     CHECK constraint failed
 }
 
+# A minus sign in front of a number keeps it a literal of the type's input
+# type, so -5 compares with a custom-type column like 5 does.
+@requires strict "uses STRICT tables"
+test custom-type-negative-literals {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(
+        amount cents CHECK(amount > -5),
+        n numeric(10,2) CHECK(n BETWEEN -5.5 AND 5) CHECK(n IN (-1, -4.5))
+    ) STRICT;
+    INSERT INTO t VALUES(-4, -4.5);
+    SELECT amount, n FROM t;
+}
+expect {
+    -4|-4.50
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-negative-literal-check-violation {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(amount cents CHECK(amount > -5)) STRICT;
+    INSERT INTO t VALUES(-6);
+}
+expect error {
+    CHECK constraint failed
+}
+
 @requires strict "uses STRICT tables"
 test custom-type-cast-in-check-compares-like-select {
     -- CAST(50 AS cents) gives 50, the value a read gives, and the CHECK

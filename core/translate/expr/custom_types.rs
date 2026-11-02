@@ -31,10 +31,22 @@ pub(super) fn literal_compatible_with_value_type(
 }
 
 /// Whether `expr` is a literal of the type a custom type takes as input, such
-/// as `50` for a type based on integer. A comparison of the type's values
-/// with it is well typed, as it is for an operator of the type.
+/// as `50` or `-50` for a type based on integer. A comparison of the type's
+/// values with it is well typed, as it is for an operator of the type.
 pub(crate) fn is_literal_of_input_type(expr: &ast::Expr, type_def: &TypeDef) -> bool {
-    literal_type_name(expr_type::without_wrappers(expr)).is_some_and(|literal_type| {
+    // A minus sign in front of a number keeps the number's type.
+    let expr = match expr_type::without_wrappers(expr) {
+        ast::Expr::Unary(ast::UnaryOperator::Negative, number)
+            if matches!(
+                number.as_ref(),
+                ast::Expr::Literal(ast::Literal::Numeric(_))
+            ) =>
+        {
+            number.as_ref()
+        }
+        expr => expr,
+    };
+    literal_type_name(expr).is_some_and(|literal_type| {
         literal_compatible_with_value_type(literal_type, type_def.value_input_type())
     })
 }
