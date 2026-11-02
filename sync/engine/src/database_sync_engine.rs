@@ -225,6 +225,16 @@ fn replace_base_backup_path(main_db_path: &str, name: &str) -> String {
     format!("{main_db_path}-replace-base-apply-{name}.backup")
 }
 
+fn replace_base_file_specs(main_db_path: &str) -> [(String, &'static str); 5] {
+    [
+        (main_db_path.to_string(), "main-db"),
+        (create_main_db_wal_path(main_db_path), "main-wal"),
+        (create_main_db_log_path(main_db_path), "main-log"),
+        (create_revert_db_wal_path(main_db_path), "revert-wal"),
+        (create_meta_path(main_db_path), "metadata"),
+    ]
+}
+
 #[cfg(test)]
 thread_local! {
     static REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER: std::cell::Cell<usize> =
@@ -467,13 +477,7 @@ impl<IO: SyncEngineIo> ReplaceBaseApplyGuard<IO> {
             ));
         }
         let is_memory = is_memory(main_db_path);
-        let file_specs = [
-            (main_db_path.to_string(), "main-db"),
-            (create_main_db_wal_path(main_db_path), "main-wal"),
-            (create_main_db_log_path(main_db_path), "main-log"),
-            (create_revert_db_wal_path(main_db_path), "revert-wal"),
-            (create_meta_path(main_db_path), "metadata"),
-        ];
+        let file_specs = replace_base_file_specs(main_db_path);
         let mut files = Vec::with_capacity(file_specs.len());
         for (path, name) in file_specs {
             let backup_path = replace_base_backup_path(main_db_path, name);
@@ -1037,6 +1041,61 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         meta: Option<DatabaseMetadata>,
     ) -> Result<DatabaseMetadata> {
         tracing::info!("bootstrap_db(path={}): opts={:?}", main_db_path, opts);
+        let local_crypto = opts.local_encryption_context()?;
+        if local_crypto.is_some() && meta.is_none() {
+            if !opts.bootstrap_if_empty || opts.remote_encryption_key.is_none() {
+                return Err(Error::DatabaseSyncEngineError(
+                    "encrypted sync creation requires a cloud key and full bootstrap".into(),
+                ));
+            }
+            if opts.partial_sync_opts.is_some()
+                || opts.protocol_version_hint != DatabaseSyncEngineProtocolVersion::V1
+            {
+                return Err(Error::DatabaseSyncEngineError(
+                    "encrypted sync requires full V1 bootstrap".into(),
+                ));
+            }
+            // Recovery runs before bootstrap. Remaining artifacts must not be
+            // silently reused by fresh creation, even when they are empty.
+            // Keep this separate from sync_database_file_paths: the browser
+            // eagerly creates/registers every path in that public inventory.
+            let recovery_paths = std::iter::once(create_replace_base_marker_path(main_db_path))
+                .chain(
+                    replace_base_file_specs(main_db_path)
+                        .into_iter()
+                        .map(|(_, name)| replace_base_backup_path(main_db_path, name)),
+                );
+            for path in recovery_paths {
+                let exists = if is_memory(main_db_path) {
+                    io.try_open(&path)?.is_some()
+                } else {
+                    let completion = sync_engine_io.full_read(&path)?;
+                    let data = wait_all_results(coro, &completion, None).await?;
+                    match completion.status()? {
+                        // Host storage can differ from core IO (e.g. localStorage).
+                        Some(404) => false,
+                        Some(204) => true,
+                        _ if !data.is_empty() => true,
+                        // Legacy hosts conflate absent and empty files.
+                        _ => io.try_open(&path)?.is_some(),
+                    }
+                };
+                if exists {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "cannot bootstrap encrypted sync over existing recovery artifact without valid metadata: {path}"
+                    )));
+                }
+            }
+            for path in sync_database_file_paths(main_db_path) {
+                if let Some(file) = io.try_open(&path)? {
+                    if file.size()? != 0 {
+                        return Err(Error::DatabaseSyncEngineError(format!(
+                            "cannot bootstrap encrypted sync over existing replica file without valid metadata: {path}"
+                        )));
+                    }
+                }
+            }
+        }
         let meta_path = create_meta_path(main_db_path);
         let partial_sync_opts = opts.partial_sync_opts.clone();
         let partial = partial_sync_opts.is_some();
