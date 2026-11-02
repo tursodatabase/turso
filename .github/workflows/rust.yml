@@ -172,13 +172,20 @@ jobs:
           cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not binary(pending_byte_tests)' "${partition[@]}" --failure-output=final
         timeout-minutes: 30
       # On main, report-flaky-tests reads these reports. cargo llvm-cov builds
-      # in its own target directory, hence the glob.
+      # in its own target directory, hence the glob. job-name.txt lets the
+      # report name and link the job a flaky test ran in.
+      - name: Record job name for the flaky test report
+        if: ${{ !cancelled() && github.event_name == 'push' && matrix.suite == 'nextest' }}
+        shell: bash
+        run: echo "${{ github.job }} (${{ matrix.os }}, ${{ matrix.suite }})" > job-name.txt
       - name: Upload JUnit report
         if: ${{ !cancelled() && github.event_name == 'push' && matrix.suite == 'nextest' }}
         uses: actions/upload-artifact@v4
         with:
           name: junit-${{ runner.os }}
-          path: target/**/nextest/ci/junit.xml
+          path: |
+            job-name.txt
+            target/**/nextest/ci/junit.xml
           if-no-files-found: ignore
           retention-days: 14
       # Same suite against a --sync-dir server, so directory mode's per-database
@@ -217,6 +224,8 @@ jobs:
     permissions:
       contents: read
       issues: write
+      # To look up the URL of the job each flaky test ran in.
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
