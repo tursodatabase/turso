@@ -252,6 +252,62 @@ expect {
     7|1
 }
 
+@setup row_value_null_component_schema
+test row-value-null-first-component-under-not {
+    SELECT id FROM t WHERE NOT (a,b,c) IN (SELECT x,y,z FROM s) ORDER BY id;
+}
+expect {
+    4
+    7
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-update-where {
+    UPDATE t SET c = 99 WHERE (a,b,c) NOT IN (SELECT x,y,z FROM s);
+    SELECT id FROM t WHERE c = 99 ORDER BY id;
+}
+expect {
+    4
+    7
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-delete-where {
+    DELETE FROM t WHERE (a,b,c) NOT IN (SELECT x,y,z FROM s);
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    5
+    6
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-view {
+    CREATE VIEW v AS SELECT id FROM t WHERE (a,b,c) NOT IN (SELECT x,y,z FROM s);
+    SELECT id FROM v ORDER BY id;
+}
+expect {
+    4
+    7
+}
+
+@setup row_value_null_component_schema
+test row-value-null-first-component-trigger-when {
+    CREATE TABLE log(id INT);
+    CREATE TRIGGER tr AFTER INSERT ON t WHEN (new.a,new.b,new.c) NOT IN (SELECT x,y,z FROM s)
+    BEGIN
+        INSERT INTO log VALUES (new.id);
+    END;
+    INSERT INTO t VALUES (20,NULL,9,3),(21,NULL,2,3);
+    SELECT id FROM log ORDER BY id;
+}
+expect {
+    20
+}
+
 # Row 2 follows a row whose second component is 9. The 9 must not be compared in
 # place of the NULL read for row 2.
 test row-value-null-component-does-not-reuse-previous-row-value {
