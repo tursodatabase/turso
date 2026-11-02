@@ -59,7 +59,7 @@ class Database extends DatabasePromise {
     #remoteWriter: RemoteWriter | null = null;
     #db: any;
     constructor(opts: DatabaseOpts) {
-        if (opts.url == null) {
+        if (opts.url == null && opts.localEncryptionKey == null) {
             const db = new NativeDatabase(opts.path, { tracing: opts.tracing, experimental: opts.experimental }) as any;
             super(db);
             this.#db = db;
@@ -93,9 +93,10 @@ class Database extends DatabasePromise {
             protocolVersion: SyncEngineProtocolVersion.V1,
             longPollTimeoutMs: opts.longPollTimeoutMs,
             tracing: opts.tracing,
-            bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
+            bootstrapIfEmpty: opts.url != null && (typeof opts.url != "function" || opts.url() != null),
             experimental: opts.experimental,
             remoteEncryptionCipher: opts.remoteEncryption?.cipher,
+            localEncryptionKey: opts.localEncryptionKey,
             remoteEncryptionKey: opts.remoteEncryption?.key,
             partialSyncOpts: partialSyncOpts as any,
             pushOperationsThreshold: opts.pushOperationsThreshold,
@@ -108,7 +109,7 @@ class Database extends DatabasePromise {
             const authToken = opts.authToken;
             headers = async () => ({
                 ...(opts.authToken != null && { "Authorization": `Bearer ${await authToken()}` }),
-                ...(opts.remoteEncryption != null && {
+                ...(opts.remoteEncryption?.key != null && {
                     "x-turso-encryption-key": opts.remoteEncryption.key,
                     "x-turso-encryption-cipher": opts.remoteEncryption.cipher,
                 })
@@ -117,14 +118,14 @@ class Database extends DatabasePromise {
             const authToken = opts.authToken;
             headers = {
                 ...(opts.authToken != null && { "Authorization": `Bearer ${authToken}` }),
-                ...(opts.remoteEncryption != null && {
+                ...(opts.remoteEncryption?.key != null && {
                     "x-turso-encryption-key": opts.remoteEncryption.key,
                     "x-turso-encryption-cipher": opts.remoteEncryption.cipher,
                 })
             };
         }
         const runOpts = {
-            url: opts.url,
+            url: opts.url ?? (() => null),
             headers: headers,
             preemptionMs: 1,
             transform: opts.transform,
