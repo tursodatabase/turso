@@ -111,6 +111,9 @@ Postgres frontend sees `postgres` and `public`. No connection can run as
 
 Other roles are created with `CREATE ROLE` and stored in the
 `__turso_internal_roles` table, which is created together with the first role.
+A role's id is its rowid in that table. A dropped role's row stays in the
+table, marked dropped, so that its id is never given to another role while a
+connection may still run as the dropped role.
 Creating a role is DDL: it runs in the caller's transaction, is undone by a
 rollback, and bumps the schema cookie so that other connections and other
 processes reload the roles.
@@ -414,9 +417,8 @@ In the order the pieces depend on each other:
   program. Policies on a table are stored with the schema, like indexes and
   triggers.
 - **Role management.** `ALTER ROLE`, `DROP ROLE`, and role attributes such as
-  `SUPERUSER` and `CREATEROLE`. A dropped role's id must not be given to a
-  new role, because a connection may still run as the dropped role; today a
-  role's id is its rowid in the roles table.
+  `SUPERUSER` and `CREATEROLE`. `DROP ROLE` marks the role's row dropped
+  instead of deleting it, so that the id is not given to a new role.
 - **Privilege inquiry.** `has_table_privilege()` and the other access
   privilege inquiry functions, and the `relacl` columns of the catalogs.
 

@@ -5,7 +5,9 @@
 //! [RoleId::PUBLIC], which every role is a member of. Core gives them no
 //! names; a frontend names them as its users expect. Roles created with
 //! `CREATE ROLE` are stored in the `__turso_internal_roles` table, which is
-//! created together with the first such role.
+//! created together with the first such role. A dropped role's row stays in
+//! the table, marked dropped, so that its id is never given to another role:
+//! a connection may still run as the dropped role, and the id is the rowid.
 //!
 //! Each schema holds a [`RoleCatalog`], an in-memory copy of the stored roles. It is
 //! loaded together with the schema, and a statement that changes roles bumps
@@ -25,15 +27,18 @@ pub const ROLES_TABLE_NAME: &str = "__turso_internal_roles";
 pub const CREATE_ROLES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_roles (\
     id INTEGER PRIMARY KEY, \
     name TEXT NOT NULL, \
-    superuser INTEGER NOT NULL)";
+    superuser INTEGER NOT NULL, \
+    dropped INTEGER NOT NULL)";
 
 pub const ROLES_NAME_INDEX_NAME: &str = "__turso_internal_roles_name";
 
-/// Keeps role names unique in the stored table, whatever writes it.
-pub const CREATE_ROLES_NAME_INDEX_SQL: &str =
-    "CREATE UNIQUE INDEX __turso_internal_roles_name ON __turso_internal_roles (name)";
+/// Keeps the names of the roles that are not dropped unique in the stored
+/// table, whatever writes it.
+pub const CREATE_ROLES_NAME_INDEX_SQL: &str = "CREATE UNIQUE INDEX __turso_internal_roles_name \
+    ON __turso_internal_roles (name) WHERE dropped = 0";
 
-pub const SELECT_ROLES_SQL: &str = "SELECT id, name, superuser FROM __turso_internal_roles";
+pub const SELECT_ROLES_SQL: &str =
+    "SELECT id, name, superuser, dropped FROM __turso_internal_roles";
 
 /// The role a new connection runs as. The program that opens the connection
 /// chooses it; SQL cannot.
@@ -87,7 +92,9 @@ impl RoleCatalog {
     pub fn new(rows: &[Vec<Value>]) -> Result<Self> {
         let mut catalog = Self::default();
         for row in rows {
-            let role = role_from_row(row)?;
+            let Some(role) = role_from_row(row)? else {
+                continue;
+            };
             if catalog.roles.contains_key(&role.id) || catalog.ids_by_name.contains_key(&role.name)
             {
                 return Err(LimboError::Corrupt(format!(
@@ -139,20 +146,22 @@ impl RoleCatalog {
     }
 }
 
-fn role_from_row(row: &[Value]) -> Result<Role> {
-    let [id, name, superuser] = row else {
+/// Returns the role stored in `row`, or `None` for a dropped role.
+fn role_from_row(row: &[Value]) -> Result<Option<Role>> {
+    let [id, name, superuser, dropped] = row else {
         return Err(corrupt_row(row));
     };
-    match (id, name, superuser) {
+    match (id, name, superuser, dropped) {
         (
             Value::Numeric(Numeric::Integer(id)),
             Value::Text(name),
             Value::Numeric(Numeric::Integer(superuser @ (0 | 1))),
-        ) if *id > 0 => Ok(Role {
+            Value::Numeric(Numeric::Integer(dropped @ (0 | 1))),
+        ) if *id > 0 => Ok((*dropped == 0).then(|| Role {
             id: RoleId::from_rowid(*id),
             name: name.as_str().to_string(),
             superuser: *superuser == 1,
-        }),
+        })),
         _ => Err(corrupt_row(row)),
     }
 }
@@ -215,11 +224,24 @@ mod tests {
         assert!(!catalog.can_set_role(RoleId::SUPERUSER, RoleId::PUBLIC));
     }
 
+    #[test]
+    fn new_skips_dropped_roles_and_lets_a_role_take_a_dropped_role_name() {
+        let mut dropped_alice = role_row(1, "alice", 0);
+        dropped_alice[3] = Value::from_i64(1);
+
+        let catalog = RoleCatalog::new(&[dropped_alice, role_row(2, "alice", 0)]).unwrap();
+
+        let alice = catalog.get_by_name("alice").unwrap();
+        assert_eq!(alice.id.get(), 2);
+        assert_eq!(catalog.iter().count(), 1);
+    }
+
     fn role_row(id: i64, name: &str, superuser: i64) -> Vec<Value> {
         vec![
             Value::from_i64(id),
             Value::build_text(name.to_string()),
             Value::from_i64(superuser),
+            Value::from_i64(0),
         ]
     }
 }
