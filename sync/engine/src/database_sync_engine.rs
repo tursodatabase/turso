@@ -12,17 +12,18 @@ use turso_core::{
 };
 
 use crate::{
+    changes_file::ChangesFile,
     database_sync_engine_io::{DataCompletion, SyncEngineIo},
     database_sync_lazy_storage::LazyDatabaseStorage,
     database_sync_operations::{
-        acquire_slot,
-        apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats,
-        apply_transformation, bootstrap_db_file, connect_untracked, count_local_changes, has_table,
-        is_logically_replayable_table, list_user_tables, max_local_change_id, pull_updates_v1,
-        push_logical_changes, read_last_change_id, read_logical_replay_table_map, read_wal_salt,
-        reset_wal_file, should_replay_local_change, sync_file, update_last_change_id,
-        wait_all_results, wal_apply_from_file, wal_pull_to_file, PullUpdatesV1Result,
-        SyncEngineIoStats, SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
+        acquire_slot, apply_logical_transactions_staging_without_commit, apply_transformation,
+        bootstrap_db_file, connect_untracked, count_local_changes, has_table,
+        is_logically_replayable_table, list_user_tables, max_local_change_id,
+        pull_updates_to_staging, push_logical_changes, read_last_change_id,
+        read_logical_replay_table_map, read_wal_salt, reset_wal_file, should_replay_local_change,
+        sync_file, update_last_change_id, wait_all_results, wal_apply_from_file,
+        wal_apply_from_staging, wal_pull_to_staging, PullUpdatesV1Result, SyncEngineIoStats,
+        SyncOperationCtx, PAGE_SIZE, WAL_FRAME_HEADER, WAL_FRAME_SIZE,
     },
     database_tape::{
         replay_without_triggers, run_stmt_ignore_rows, try_wal_watermark_read_page,
@@ -175,7 +176,7 @@ pub struct DatabaseSyncEngine<IO: SyncEngineIo> {
     revert_db_wal_path: String,
     main_db_path: String,
     meta_path: String,
-    changes_file: Arc<Mutex<Option<Arc<dyn turso_core::File>>>>,
+    changes_file: Arc<Mutex<Option<ChangesFile>>>,
     opts: DatabaseSyncEngineOpts,
     meta: Mutex<DatabaseMetadata>,
     client_unique_id: String,
@@ -1413,7 +1414,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             main_db_wal_path: create_main_db_wal_path(&main_db_path),
             revert_db_wal_path: create_revert_db_wal_path(&main_db_path),
             meta_path: create_meta_path(&main_db_path),
-            changes_file: Arc::new(Mutex::new(Some(changes_file))),
+            changes_file: Arc::new(Mutex::new(Some(ChangesFile::new(
+                changes_file,
+                local_crypto.clone(),
+            )))),
             opts,
             meta: Mutex::new(meta.clone()),
             client_unique_id: meta.client_unique_id.clone(),
@@ -1877,7 +1881,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     ) -> Result<DbChangesStatus> {
         tracing::info!("wait_changes(path={})", self.main_db_path);
 
-        let file = acquire_slot(&self.changes_file)?;
+        let mut file = acquire_slot(&self.changes_file)?;
 
         let now = self.io.current_time_wall_clock();
         let revision = self.meta().synced_revision.clone();
@@ -1900,7 +1904,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         );
         let next_revision = match (remote_pull_protocol, &revision) {
             (RemotePullProtocol::MvccLogical, Some(DatabasePullRevision::V1 { revision })) => {
-                match pull_updates_v1(ctx, &file.value, revision, long_poll_timeout, true).await? {
+                match pull_updates_to_staging(
+                    ctx,
+                    file.value_mut(),
+                    revision,
+                    long_poll_timeout,
+                    true,
+                )
+                .await?
+                {
                     (next_revision, result @ PullUpdatesV1Result::Logical { txns, ops }, _) => {
                         tracing::info!(
                             "wait_changes(path={}): logical pull returned {} transactions / {} ops",
@@ -1923,7 +1935,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
             (RemotePullProtocol::MvccLogical, None) => {
                 let (next_revision, result, _) =
-                    pull_updates_v1(ctx, &file.value, "", long_poll_timeout, false).await?;
+                    pull_updates_to_staging(ctx, file.value_mut(), "", long_poll_timeout, false)
+                        .await?;
                 tracing::info!(
                     "wait_changes(path={}): initial logical MVCC sync returned page base",
                     self.main_db_path,
@@ -1963,7 +1976,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             // the response header tells us which protocol the remote speaks.
             (RemotePullProtocol::Unknown, None) => {
                 let (next_revision, result, detected) =
-                    pull_updates_v1(ctx, &file.value, "", long_poll_timeout, false).await?;
+                    pull_updates_to_staging(ctx, file.value_mut(), "", long_poll_timeout, false)
+                        .await?;
                 if detected == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         self.opts.partial_sync_opts.is_some(),
@@ -2011,9 +2025,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 next_revision
             }
             (RemotePullProtocol::Pages | RemotePullProtocol::Unknown, _) => {
-                wal_pull_to_file(
+                wal_pull_to_staging(
                     ctx,
-                    &file.value,
+                    file.value_mut(),
                     &revision,
                     self.opts.wal_pull_batch_size,
                     long_poll_timeout,
@@ -2022,7 +2036,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             }
         };
 
-        if file.value.size()? == 0 {
+        let empty = if matches!(stream_kind, DbChangesStreamKind::LegacyPages) {
+            file.value_mut().raw_file().size()? == 0
+        } else {
+            file.value_mut().validate_boundary(coro).await?
+        };
+        if empty {
             tracing::info!(
                 "wait_changes(path={}): no changes detected",
                 self.main_db_path
@@ -2061,7 +2080,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn apply_changes_from_remote<Ctx>(
         &self,
         coro: &Coro<Ctx>,
-        remote_changes: DbChangesStatus,
+        mut remote_changes: DbChangesStatus,
     ) -> Result<()> {
         let mut new_revision = remote_changes.revision.clone();
         if remote_changes.is_empty() {
@@ -2074,13 +2093,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         }
         let changes_file = remote_changes
             .file_slot
-            .as_ref()
+            .as_mut()
             .expect("non-empty remote changes must keep a file slot")
-            .value
-            .clone();
+            .value_mut();
+        if !matches!(remote_changes.stream_kind, DbChangesStreamKind::LegacyPages) {
+            changes_file.validate_boundary(coro).await?;
+        }
         if matches!(remote_changes.stream_kind, DbChangesStreamKind::Logical) {
             let logical_table_names_by_stable_id = self
-                .apply_logical_mvcc_changes_internal(coro, &changes_file)
+                .apply_logical_mvcc_changes_internal(coro, changes_file)
                 .await?;
             self.update_meta(coro, |m| {
                 m.revert_since_wal_salt = None;
@@ -2098,7 +2119,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let pull_result = self
             .apply_changes_internal(
                 coro,
-                &changes_file,
+                changes_file,
                 remote_changes.stream_kind,
                 &remote_changes.revision,
             )
@@ -2135,7 +2156,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     async fn apply_logical_mvcc_changes_internal<Ctx>(
         &self,
         coro: &Coro<Ctx>,
-        changes_file: &Arc<dyn turso_core::File>,
+        changes_file: &mut ChangesFile,
     ) -> Result<BTreeMap<u64, String>> {
         tracing::info!("apply_logical_mvcc_changes(path={})", self.main_db_path);
 
@@ -2177,7 +2198,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         );
         let apply_result = async {
             let remote_apply_stats =
-                apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                apply_logical_transactions_staging_without_commit(
                     coro,
                     &mut replay,
                     changes_file,
@@ -2349,7 +2370,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     async fn apply_changes_internal<Ctx>(
         &self,
         coro: &Coro<Ctx>,
-        changes_file: &Arc<dyn turso_core::File>,
+        changes_file: &mut ChangesFile,
         stream_kind: DbChangesStreamKind,
         remote_revision: &DatabasePullRevision,
     ) -> Result<(u64, BTreeMap<u64, String>, Option<DatabasePullRevision>)> {
@@ -2548,14 +2569,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                             self.main_db_path,
                         );
                     }
-                    let db_size = wal_apply_from_file(
-                        coro,
-                        changes_file,
-                        main_session
-                            .as_mut()
-                            .expect("main WAL session must be active"),
-                    )
-                    .await?;
+                    let session = main_session.as_mut().expect("main WAL session must be active");
+                    let db_size = if matches!(stream_kind, DbChangesStreamKind::LegacyPages) {
+                        wal_apply_from_file(coro, changes_file.raw_file(), session).await?
+                    } else {
+                        wal_apply_from_staging(coro, changes_file, session).await?
+                    };
                     tracing::info!(
                         "apply_changes(path={}): applied changes from remote: db_size={}",
                         self.main_db_path,
@@ -2696,8 +2715,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 &self.sync_engine_io,
                                 self.meta().remote_url(),
                                 self.opts.remote_encryption_key.as_ref(),
-                            );
-                            match pull_updates_v1(ctx, changes_file, revision, None, true).await? {
+                            ).with_encryption_config(self.opts.encryption.as_ref());
+                            match pull_updates_to_staging(ctx, changes_file, revision, None, true).await? {
                                 (next_revision, PullUpdatesV1Result::Logical { txns, ops }, _) => {
                                     tracing::info!(
                                         "apply_changes(path={}): replace-base follow-up logical pull returned {} transactions / {} ops",
@@ -2706,7 +2725,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                         ops,
                                     );
                                     followup_revision = Some(next_revision);
-                                    if txns != 0 || ops != 0 || changes_file.size()? != 0 {
+                                    let empty = changes_file.validate_boundary(coro).await?;
+                                    if txns != 0 || ops != 0 || !empty {
                                         let replay_conn = logical_replay_conn
                                             .as_ref()
                                             .expect("replace-base replay connection should exist");
@@ -2716,7 +2736,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                                 use_implicit_rowid: true,
                                             },
                                         );
-                                        apply_logical_transactions_file_without_commit_excluding_client_txns_with_table_map_and_stats(
+                                        apply_logical_transactions_staging_without_commit(
                                             coro,
                                             &mut replay,
                                             changes_file,
@@ -4467,6 +4487,15 @@ mod tests {
 
     #[test]
     fn apply_changes_from_remote_applies_logical_stream_without_local_replay() {
+        apply_logical_staging_without_local_replay(false);
+    }
+
+    #[test]
+    fn apply_changes_from_remote_decrypts_logical_staging() {
+        apply_logical_staging_without_local_replay(true);
+    }
+
+    fn apply_logical_staging_without_local_replay(encrypted: bool) {
         let db_temp = NamedTempFile::new().unwrap();
         let meta_temp = NamedTempFile::new().unwrap();
         let changes_temp = NamedTempFile::new().unwrap();
@@ -4580,13 +4609,17 @@ mod tests {
             meta: Mutex::new(meta),
             client_unique_id: "client-a".to_string(),
         };
-        let remote_changes = DbChangesStatus {
+        let mut remote_changes = DbChangesStatus {
             time: io.current_time_wall_clock(),
             revision: DatabasePullRevision::V1 {
                 revision: "g1:o2".to_string(),
             },
             file_slot: Some(crate::database_sync_operations::MutexSlot {
-                value: changes_file,
+                value: Some(crate::changes_file::ChangesFile::from_plaintext_test_file(
+                    changes_file,
+                    crate::sync_cipher::ChangeKind::Logical,
+                    txns.len(),
+                )),
                 slot,
             }),
             stream_kind: DbChangesStreamKind::Logical,
@@ -4596,6 +4629,29 @@ mod tests {
             let engine = engine;
             move |coro| async move {
                 let coro: Coro<()> = coro.into();
+                if encrypted {
+                    let slot = remote_changes.file_slot.as_mut().unwrap();
+                    let file = slot.value_mut().raw_file().clone();
+                    let crypto = turso_core::EncryptionContext::new(
+                        turso_core::CipherMode::Aes256Gcm,
+                        &turso_core::EncryptionKey::new_256([3; 32]),
+                        4096,
+                    )
+                    .unwrap();
+                    let mut staging = crate::changes_file::ChangesFile::new(file, Some(crypto));
+                    staging
+                        .reset(&coro, crate::sync_cipher::ChangeKind::Logical)
+                        .await
+                        .unwrap();
+                    for txn in &txns {
+                        staging
+                            .append_record(&coro, &txn.encode_length_delimited_to_vec())
+                            .await
+                            .unwrap();
+                    }
+                    staging.finish(&coro).await.unwrap();
+                    slot.value = Some(staging);
+                }
                 engine
                     .apply_changes_from_remote(&coro, remote_changes)
                     .await
@@ -4764,7 +4820,11 @@ mod tests {
                 revision: "g1:o2".to_string(),
             },
             file_slot: Some(crate::database_sync_operations::MutexSlot {
-                value: changes_file,
+                value: Some(crate::changes_file::ChangesFile::from_plaintext_test_file(
+                    changes_file,
+                    crate::sync_cipher::ChangeKind::Logical,
+                    txns.len(),
+                )),
                 slot: Arc::new(Mutex::new(None)),
             }),
             stream_kind: DbChangesStreamKind::Logical,
@@ -4930,9 +4990,16 @@ mod tests {
 
                 let changes_file =
                     write_replace_base_pages_file(&coro, &io, &remote_path, &changes_path).await?;
+                let records =
+                    changes_file.size()? as usize / crate::database_sync_operations::WAL_FRAME_SIZE;
+                let changes_file = crate::changes_file::ChangesFile::from_plaintext_test_file(
+                    changes_file,
+                    crate::sync_cipher::ChangeKind::Pages,
+                    records,
+                );
                 let slot = Arc::new(Mutex::new(Some(changes_file)));
                 let file_slot = MutexSlot {
-                    value: slot.lock().unwrap().take().unwrap(),
+                    value: slot.lock().unwrap().take(),
                     slot: slot.clone(),
                 };
 
