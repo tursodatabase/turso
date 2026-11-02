@@ -408,7 +408,7 @@ Upgrade is not supported.
 | Default permissions | ❌ Not supported | |
 | Direct TLS negotiation ("sslnegotiation") | ❌ Not supported | |
 | FIPS mode validation | ❌ Not supported | |
-| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | ❌ Not supported | GRANT/REVOKE not supported at all |
+| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | ❌ Not supported | GRANT/REVOKE of privileges are accepted but ignored: privileges are not checked |
 | GSSAPI client and server-side encryption | ❌ Not supported | |
 | GSSAPI support | ❌ Not supported | |
 | Kerberos credential delegation | ❌ Not supported | |
@@ -422,8 +422,8 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read rows but not write them, use sequences, or change the schema, and `GRANT` is not supported; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
-| Row-level security | ❌ Not supported | |
+| ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read rows but not write them, use sequences, or change the schema, and `GRANT` is ignored; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
+| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY`, and `CREATE/DROP POLICY` for permissive `FOR SELECT`/`FOR ALL` policies `TO PUBLIC` whose `USING` is `true`, `false` or `<column> = current_user`; roles cannot write to tables with row-level security yet; FULL JOIN with such tables is rejected; views are checked as the querying role; `pg_policy` is empty |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
 | security_barrier option on views | ❌ Not supported | |

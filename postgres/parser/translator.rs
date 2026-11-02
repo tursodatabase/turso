@@ -194,6 +194,7 @@ impl PostgreSQLTranslator {
                 ))
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
+            NodeRef::CreatePolicyStmt(policy) => self.translate_create_policy(policy)?,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{} is not supported",
@@ -948,6 +949,8 @@ impl PostgreSQLTranslator {
                     "ALTER TABLE ADD CONSTRAINT is not supported".into(),
                 ));
             }
+            AlterTableType::AtEnableRowSecurity => ast::AlterTableBody::RowSecurity(true),
+            AlterTableType::AtDisableRowSecurity => ast::AlterTableBody::RowSecurity(false),
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "ALTER TABLE {} is not supported",
@@ -957,6 +960,68 @@ impl PostgreSQLTranslator {
         };
 
         Ok(ast::Stmt::AlterTable(ast::AlterTable { name, body }))
+    }
+
+    fn translate_create_policy(
+        &self,
+        policy: &pg_query::protobuf::CreatePolicyStmt,
+    ) -> Result<ast::Stmt, ParseError> {
+        let table = policy
+            .table
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("CREATE POLICY missing table".into()))?;
+        let command = match policy.cmd_name.as_str() {
+            "all" => ast::PolicyCommand::All,
+            "select" => ast::PolicyCommand::Select,
+            "insert" => ast::PolicyCommand::Insert,
+            "update" => ast::PolicyCommand::Update,
+            "delete" => ast::PolicyCommand::Delete,
+            other => {
+                return Err(ParseError::ParseError(format!(
+                    "CREATE POLICY FOR {other} is not supported"
+                )))
+            }
+        };
+        let using_expr = policy
+            .qual
+            .as_ref()
+            .map(|expr| self.translate_policy_expr(expr).map(Box::new))
+            .transpose()?;
+        let check_expr = policy
+            .with_check
+            .as_ref()
+            .map(|expr| self.translate_policy_expr(expr).map(Box::new))
+            .transpose()?;
+        Ok(ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
+            policy_name: ast::Name::exact(policy.policy_name.clone()),
+            tbl_name: self.qualified_name_from_range_var(table)?,
+            restrictive: !policy.permissive,
+            command,
+            roles: policy_role_names(&policy.roles)?,
+            using_expr,
+            check_expr,
+        })))
+    }
+
+    /// A policy condition. `true` and `false` become the plain literals,
+    /// which core recognizes as policies that show every row or none,
+    /// instead of the boolean casts other expressions use.
+    fn translate_policy_expr(
+        &self,
+        node: &pg_query::protobuf::Node,
+    ) -> Result<ast::Expr, ParseError> {
+        use pg_query::protobuf::{a_const::Val, node::Node};
+
+        if let Some(Node::AConst(constant)) = &node.node {
+            if let Some(Val::Boolval(value)) = &constant.val {
+                return Ok(ast::Expr::Literal(if value.boolval {
+                    ast::Literal::True
+                } else {
+                    ast::Literal::False
+                }));
+            }
+        }
+        self.translate_expr(node)
     }
 
     fn translate_rename_stmt(
@@ -1200,6 +1265,9 @@ impl PostgreSQLTranslator {
 
         let remove_type = ObjectType::try_from(drop.remove_type)
             .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
+        if remove_type == ObjectType::ObjectPolicy {
+            return translate_drop_policy(drop);
+        }
 
         if drop.behavior == pg_query::protobuf::DropBehavior::DropCascade as i32 {
             return Err(not_supported(format!(
@@ -6021,6 +6089,65 @@ pub fn role_keyword(function_name: &str) -> Option<&'static str> {
         .map(|(_, keyword)| *keyword)
 }
 
+/// `DROP POLICY name ON table`. A policy has no schema of its own; its name
+/// list is the table's name followed by the policy's.
+fn translate_drop_policy(drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let [object] = drop.objects.as_slice() else {
+        return Err(not_supported("DROP POLICY of several policies"));
+    };
+    let Some(Node::List(list)) = &object.node else {
+        return Err(ParseError::ParseError("DROP POLICY: invalid name".into()));
+    };
+    let names = extract_key_columns(&list.items)?;
+    let (tbl_name, policy_name) = match names.as_slice() {
+        [table, policy] => (
+            ast::QualifiedName::single(exact_name(table.clone())),
+            policy,
+        ),
+        [schema, table, policy] => (
+            ast::QualifiedName::fullname(
+                exact_name(schema_qualifier(schema)?),
+                exact_name(table.clone()),
+            ),
+            policy,
+        ),
+        _ => return Err(ParseError::ParseError("DROP POLICY: invalid name".into())),
+    };
+    Ok(ast::Stmt::DropPolicy {
+        if_exists: drop.missing_ok,
+        policy_name: ast::Name::exact(policy_name.clone()),
+        tbl_name,
+    })
+}
+
+/// The roles of a policy's TO clause. `PUBLIC` covers every role, which the
+/// core statement represents with an empty list.
+fn policy_role_names(roles: &[pg_query::protobuf::Node]) -> Result<Vec<ast::Name>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::RoleSpecType;
+
+    let mut names = Vec::new();
+    for role in roles {
+        let Some(Node::RoleSpec(spec)) = &role.node else {
+            return Err(ParseError::ParseError("expected a role name".into()));
+        };
+        match RoleSpecType::try_from(spec.roletype) {
+            Ok(RoleSpecType::RolespecCstring) => {
+                names.push(ast::Name::exact(spec.rolename.clone()))
+            }
+            Ok(RoleSpecType::RolespecPublic) => return Ok(Vec::new()),
+            _ => {
+                return Err(not_supported(
+                    "CURRENT_ROLE, CURRENT_USER and SESSION_USER as policy roles",
+                ))
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with
 /// an ENCODE expression that validates values against the enum labels.
 fn translate_create_enum(
@@ -6915,6 +7042,14 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
+/// Returns true if the parse result is a GRANT or REVOKE statement.
+fn is_grant_or_revoke(parse_result: &ParseResult) -> bool {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    !nodes.is_empty() && matches!(&nodes[0].0, NodeRef::GrantStmt(_))
+}
+
 /// A COMMENT ON statement. Comments are accepted for PostgreSQL
 /// compatibility but are not stored.
 #[derive(Debug, Clone)]
@@ -7154,6 +7289,8 @@ pub enum FrontendStmt {
     DropSchema(PgDropSchemaStmt),
     RefreshMatview(PgRefreshMatviewStmt),
     CommentOn(PgCommentOnStmt),
+    /// GRANT or REVOKE of privileges on objects, which are not checked yet.
+    GrantOrRevoke,
     CopyFrom(PgCopyFromStmt),
     CopyTo(crate::copy::CopyToStdout),
 }
@@ -7190,6 +7327,9 @@ pub fn frontend_stmt(
     }
     if let Some(stmt) = try_extract_comment_on(parse_result) {
         return Ok(Some(FrontendStmt::CommentOn(stmt)));
+    }
+    if is_grant_or_revoke(parse_result) {
+        return Ok(Some(FrontendStmt::GrantOrRevoke));
     }
     if let Some(stmt) = try_extract_copy_from(parse_result)? {
         return Ok(Some(FrontendStmt::CopyFrom(stmt)));
@@ -7922,6 +8062,7 @@ mod tests {
                 FrontendStmt::DropSchema(_) => "drop schema",
                 FrontendStmt::RefreshMatview(_) => "refresh matview",
                 FrontendStmt::CommentOn(_) => "comment on",
+                FrontendStmt::GrantOrRevoke => "grant or revoke",
                 FrontendStmt::CopyFrom(_) => "copy from",
                 FrontendStmt::CopyTo(_) => "copy to",
             })
@@ -7940,6 +8081,8 @@ mod tests {
             ("DROP SCHEMA app CASCADE", "drop schema"),
             ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
             ("COMMENT ON TABLE t IS 'x'", "comment on"),
+            ("GRANT SELECT ON t TO PUBLIC", "grant or revoke"),
+            ("REVOKE SELECT ON t FROM PUBLIC", "grant or revoke"),
             ("COPY t FROM '/tmp/t.csv'", "copy from"),
             ("COPY t TO STDOUT", "copy to"),
         ] {
@@ -11838,5 +11981,37 @@ mod tests {
         assert!(
             !check_set_transaction(&crate::parse("SET search_path TO public").unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn translate_row_security_statements() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, expected) in [
+            (
+                "ALTER TABLE docs ENABLE ROW LEVEL SECURITY",
+                "ALTER TABLE docs ENABLE ROW LEVEL SECURITY",
+            ),
+            (
+                "ALTER TABLE docs DISABLE ROW LEVEL SECURITY",
+                "ALTER TABLE docs DISABLE ROW LEVEL SECURITY",
+            ),
+            (
+                "CREATE POLICY own ON docs FOR SELECT TO PUBLIC USING (owner = current_user)",
+                "CREATE POLICY own ON docs FOR SELECT USING (owner = current_user ())",
+            ),
+            (
+                "CREATE POLICY everything ON docs USING (true)",
+                "CREATE POLICY everything ON docs FOR ALL USING (TRUE)",
+            ),
+            (
+                "DROP POLICY IF EXISTS own ON docs",
+                "DROP POLICY IF EXISTS own ON docs",
+            ),
+            ("DROP POLICY own ON app.docs", "DROP POLICY own ON app.docs"),
+        ] {
+            let parse_result = crate::parse(sql).unwrap();
+            let stmt = translator.translate(&parse_result).unwrap();
+            assert_eq!(stmt.to_string(), expected, "{sql}");
+        }
     }
 }
