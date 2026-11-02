@@ -14,14 +14,13 @@ const READ_BUFFER_SIZE: usize = 64 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SealedChanges {
     identity: ChangeIdentity,
-    kind: ChangeKind,
     counts: ChangeCounts,
     size: u64,
 }
 
 impl SealedChanges {
     pub(crate) fn kind(&self) -> ChangeKind {
-        self.kind
+        self.identity.kind()
     }
     pub(crate) fn is_empty(&self) -> bool {
         self.counts.records == 0
@@ -32,7 +31,6 @@ enum State {
     Invalid,
     Writing {
         identity: ChangeIdentity,
-        kind: ChangeKind,
         counts: ChangeCounts,
         offset: u64,
     },
@@ -70,12 +68,12 @@ impl ChangesFile {
     }
 
     pub(crate) async fn validate_boundary<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<bool> {
-        let sealed = self.sealed()?;
-        let mut reader = self.open_reader(coro, &sealed).await?;
-        if sealed.is_empty() {
+        let mut reader = self.open_reader(coro, None).await?;
+        let empty = reader.is_empty();
+        if empty {
             assert!(reader.next_record(coro).await?.is_none());
         }
-        Ok(sealed.is_empty())
+        Ok(empty)
     }
 
     pub(crate) async fn prepare_legacy<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
@@ -96,7 +94,6 @@ impl ChangesFile {
         let size = file.size().expect("test file size");
         let sealed = SealedChanges {
             identity: ChangeIdentity::new(kind).expect("test identity"),
-            kind,
             counts: ChangeCounts {
                 records: records as u64,
                 bytes: plaintext_bytes as u64,
@@ -121,7 +118,6 @@ impl ChangesFile {
         let offset = 0;
         self.state = State::Writing {
             identity,
-            kind,
             counts: ChangeCounts::default(),
             offset,
         };
@@ -135,7 +131,6 @@ impl ChangesFile {
     ) -> Result<()> {
         let State::Writing {
             identity,
-            kind,
             mut counts,
             mut offset,
         } = std::mem::replace(&mut self.state, State::Invalid)
@@ -146,7 +141,7 @@ impl ChangesFile {
         identity.validate_record_length(length)?;
         let record_index = counts.records;
         counts.append(bytes.len() as u64)?;
-        let prefix_len = if kind == ChangeKind::Logical {
+        let prefix_len = if identity.kind() == ChangeKind::Logical {
             prost::length_delimiter_len(bytes.len())
         } else {
             0
@@ -160,18 +155,23 @@ impl ChangesFile {
             prefix_len
         };
         let mut buffer = Vec::with_capacity(capacity);
-        if kind == ChangeKind::Logical {
+        if identity.kind() == ChangeKind::Logical {
             prost::encode_length_delimiter(bytes.len(), &mut buffer)
                 .map_err(|e| invalid(&format!("cannot encode change length: {e}")))?;
         }
-        if let Some(crypto) = self.crypto.clone() {
+        if self.crypto.is_some() {
             if prefix_len > 0 {
                 self.write(coro, offset, buffer).await?;
                 offset = checked_add(offset, prefix_len)?;
             }
             for (index, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
-                let stored =
-                    identity.seal_chunk(&crypto, record_index, length, index as u64, chunk)?;
+                let stored = identity.seal_chunk(
+                    self.crypto.as_ref().expect("encrypted change file"),
+                    record_index,
+                    length,
+                    index as u64,
+                    chunk,
+                )?;
                 let length = stored.len();
                 self.write(coro, offset, stored).await?;
                 offset = checked_add(offset, length)?;
@@ -184,7 +184,6 @@ impl ChangesFile {
         }
         self.state = State::Writing {
             identity,
-            kind,
             counts,
             offset,
         };
@@ -197,11 +196,8 @@ impl ChangesFile {
         buffer: Arc<Buffer>,
     ) -> Result<()> {
         if !matches!(
-            self.state,
-            State::Writing {
-                kind: ChangeKind::Pages,
-                ..
-            }
+            &self.state,
+            State::Writing { identity, .. } if identity.kind() == ChangeKind::Pages
         ) {
             self.state = State::Invalid;
             return Err(invalid("change download is not writable for pages"));
@@ -211,7 +207,6 @@ impl ChangesFile {
         }
         let State::Writing {
             identity,
-            kind,
             mut counts,
             offset,
         } = std::mem::replace(&mut self.state, State::Invalid)
@@ -224,7 +219,6 @@ impl ChangesFile {
         self.write_buffer(coro, offset, buffer).await?;
         self.state = State::Writing {
             identity,
-            kind,
             counts,
             offset: end,
         };
@@ -236,7 +230,6 @@ impl ChangesFile {
     pub(crate) async fn finish<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<SealedChanges> {
         let State::Writing {
             identity,
-            kind,
             counts,
             offset,
         } = std::mem::replace(&mut self.state, State::Invalid)
@@ -246,12 +239,37 @@ impl ChangesFile {
         self.wait_pending(coro).await?;
         let sealed = SealedChanges {
             identity,
-            kind,
             counts,
             size: offset,
         };
         self.state = State::Sealed(sealed.clone());
         Ok(sealed)
+    }
+
+    pub(crate) async fn open_reader<'a, Ctx>(
+        &'a mut self,
+        coro: &Coro<Ctx>,
+        expected_kind: Option<ChangeKind>,
+    ) -> Result<ChangesReader<'a>> {
+        let sealed = self.sealed()?;
+        if expected_kind.is_some_and(|kind| kind != sealed.kind()) {
+            return Err(invalid("unexpected change record kind"));
+        }
+        self.state = State::Invalid;
+        if self.file.size()? != sealed.size {
+            return Err(invalid("change file length has changed"));
+        }
+        self.wait_pending(coro).await?;
+        self.state = State::Sealed(sealed.clone());
+        Ok(ChangesReader {
+            file: self,
+            sealed,
+            offset: 0,
+            counts: ChangeCounts::default(),
+            finished: false,
+            read_buffer: Vec::new(),
+            read_buffer_pos: 0,
+        })
     }
 
     async fn write<Ctx>(&mut self, coro: &Coro<Ctx>, offset: u64, bytes: Vec<u8>) -> Result<()> {
@@ -330,6 +348,165 @@ impl ChangesFile {
         self.pending = None;
         if let Some(error) = error {
             return Err(Error::IoError(error.to_string()));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct ChangesReader<'a> {
+    file: &'a mut ChangesFile,
+    sealed: SealedChanges,
+    offset: u64,
+    counts: ChangeCounts,
+    finished: bool,
+    read_buffer: Vec<u8>,
+    read_buffer_pos: usize,
+}
+
+impl ChangesReader<'_> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sealed.is_empty()
+    }
+
+    pub(crate) async fn next_record<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<Option<Vec<u8>>> {
+        if self.finished {
+            return Ok(None);
+        }
+        if !matches!(self.file.state, State::Sealed(_)) {
+            return Err(invalid(
+                "change reader failed; reset the download before reuse",
+            ));
+        }
+        self.file.state = State::Invalid;
+        let result = self.read_record(coro).await;
+        if result.is_ok() {
+            self.file.state = State::Sealed(self.sealed.clone());
+        }
+        result
+    }
+
+    async fn read_record<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<Option<Vec<u8>>> {
+        if self.counts.records == self.sealed.counts.records {
+            if self.offset != self.sealed.size
+                || self.counts != self.sealed.counts
+                || self.file.file.size()? != self.sealed.size
+            {
+                return Err(invalid("change file end does not match downloaded records"));
+            }
+            self.finished = true;
+            return Ok(None);
+        }
+        let length = match self.sealed.kind() {
+            ChangeKind::Pages => 4120,
+            ChangeKind::Logical => self.read_length(coro).await?,
+        };
+        self.sealed.identity.validate_record_length(length)?;
+        if length
+            > self
+                .sealed
+                .counts
+                .bytes
+                .checked_sub(self.counts.bytes)
+                .ok_or_else(|| invalid("change byte count overflow"))?
+        {
+            return Err(invalid("change records exceed downloaded byte count"));
+        }
+        let chunks = length.div_ceil(CHUNK_SIZE as u64);
+        let overhead = self
+            .file
+            .crypto
+            .as_ref()
+            .map_or(0, |c| c.tag_size() + c.nonce_size());
+        let stored_length = chunks
+            .checked_mul(overhead as u64)
+            .and_then(|n| n.checked_add(length))
+            .ok_or_else(|| invalid("change record length overflow"))?;
+        if self
+            .offset
+            .checked_add(stored_length)
+            .filter(|&end| end <= self.sealed.size)
+            .is_none()
+        {
+            return Err(invalid("change record exceeds file boundary"));
+        }
+        let length_usize =
+            usize::try_from(length).map_err(|_| invalid("change record length overflow"))?;
+        let mut bytes = Vec::new();
+        if self.file.crypto.is_some() {
+            for index in 0..chunks {
+                let size = self.sealed.identity.chunk_plaintext_size(length, index)? + overhead;
+                let mut stored = Vec::new();
+                self.read_buffered(coro, size, &mut stored).await?;
+                bytes.extend(self.sealed.identity.open_chunk(
+                    self.file.crypto.as_ref().expect("encrypted change file"),
+                    self.counts.records,
+                    length,
+                    index,
+                    &stored,
+                )?);
+            }
+        } else {
+            self.read_buffered(coro, length_usize, &mut bytes).await?;
+        }
+        self.counts.append(bytes.len() as u64)?;
+        if self.counts.bytes > self.sealed.counts.bytes {
+            return Err(invalid("change records exceed downloaded byte count"));
+        }
+        Ok(Some(bytes))
+    }
+
+    async fn read_length<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<u64> {
+        let mut length = 0u64;
+        for index in 0..10 {
+            let byte = self.read_byte(coro).await?;
+            if index == 9 && byte > 1 {
+                return Err(invalid("change protobuf length overflow"));
+            }
+            length |= u64::from(byte & 0x7f) << (index * 7);
+            if byte & 0x80 == 0 {
+                if length == 0 || (index > 0 && byte == 0) {
+                    return Err(invalid("noncanonical or zero change protobuf length"));
+                }
+                return Ok(length);
+            }
+        }
+        Err(invalid("unterminated change protobuf length"))
+    }
+
+    async fn read_byte<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<u8> {
+        self.refill(coro).await?;
+        let byte = self.read_buffer[self.read_buffer_pos];
+        self.read_buffer_pos += 1;
+        self.offset = checked_add(self.offset, 1)?;
+        Ok(byte)
+    }
+
+    async fn read_buffered<Ctx>(
+        &mut self,
+        coro: &Coro<Ctx>,
+        mut length: usize,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        while length > 0 {
+            self.refill(coro).await?;
+            let count = length.min(self.read_buffer.len() - self.read_buffer_pos);
+            let end = self.read_buffer_pos + count;
+            output.extend_from_slice(&self.read_buffer[self.read_buffer_pos..end]);
+            self.read_buffer_pos = end;
+            self.offset = checked_add(self.offset, count)?;
+            length -= count;
+        }
+        Ok(())
+    }
+
+    async fn refill<Ctx>(&mut self, coro: &Coro<Ctx>) -> Result<()> {
+        if self.read_buffer_pos == self.read_buffer.len() {
+            let wanted = (self.sealed.size - self.offset).min(READ_BUFFER_SIZE as u64) as usize;
+            if wanted == 0 {
+                return Err(invalid("unexpected EOF in change file"));
+            }
+            self.read_buffer = self.file.read_exact(coro, self.offset, wanted).await?;
+            self.read_buffer_pos = 0;
         }
         Ok(())
     }

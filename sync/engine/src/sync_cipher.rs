@@ -34,6 +34,10 @@ pub(crate) struct ChangeIdentity {
 }
 
 impl ChangeIdentity {
+    pub(crate) fn kind(&self) -> ChangeKind {
+        self.kind
+    }
+
     pub(crate) fn new(kind: ChangeKind) -> Result<Self> {
         let mut id = [0; 16];
         getrandom::fill(&mut id)
