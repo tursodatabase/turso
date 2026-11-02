@@ -955,45 +955,6 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
     }
 }
 
-async fn truncate_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) -> Result<()> {
-    let c = Completion::new_trunc(move |result| {
-        let Ok(rc) = result else {
-            return;
-        };
-        assert_eq!(rc, 0);
-    });
-    let c = file.truncate(0, c)?;
-    while !c.succeeded() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
-    }
-    Ok(())
-}
-
-async fn append_file_bytes<Ctx>(
-    coro: &Coro<Ctx>,
-    file: &Arc<dyn turso_core::File>,
-    offset: &mut u64,
-    data: &[u8],
-) -> Result<()> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    let buffer = Arc::new(Buffer::new(data.to_vec()));
-    let len = data.len();
-    let c = Completion::new_write(move |result| {
-        let Ok(size) = result else {
-            return;
-        };
-        assert_eq!(size as usize, len);
-    });
-    let c = file.pwrite(*offset, buffer, c)?;
-    while !c.succeeded() {
-        coro.yield_(SyncEngineIoResult::IO).await?;
-    }
-    *offset += len as u64;
-    Ok(())
-}
-
 fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32> {
     let bytes = buf.get(offset..offset + 4).ok_or_else(|| {
         Error::DatabaseSyncEngineError("truncated MVCC logical-log frame".to_string())
@@ -1638,8 +1599,7 @@ fn take_proto_message_from_bytes<T: prost::Message + Default>(
 
 async fn append_decoded_mvcc_frame_to_txns_file<Ctx>(
     coro: &Coro<Ctx>,
-    txns_file: &Arc<dyn turso_core::File>,
-    txns_offset: &mut u64,
+    txns_file: &mut ChangesFile,
     portable_payload: &[u8],
     recovery_payload: &[u8],
     op_count: u32,
@@ -1656,13 +1616,9 @@ async fn append_decoded_mvcc_frame_to_txns_file<Ctx>(
         }
         ops += txn.ops.len();
         txns += 1;
-        append_file_bytes(
-            coro,
-            txns_file,
-            txns_offset,
-            &txn.encode_length_delimited_to_vec(),
-        )
-        .await?;
+        txns_file
+            .append_record(coro, &txn.encode_length_delimited_to_vec())
+            .await?;
     }
     if !payload_bytes.is_empty() {
         return Err(Error::DatabaseSyncEngineError(
@@ -1678,9 +1634,20 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
     body: &[u8],
     header: &PullUpdatesRespProtoBody,
 ) -> Result<(usize, usize)> {
+    let mut staging = ChangesFile::new(txns_file.clone(), None);
+    decode_raw_mvcc_logical_log_to_staging(coro, &mut staging, body, header).await
+}
+
+pub(crate) async fn decode_raw_mvcc_logical_log_to_staging<Ctx>(
+    coro: &Coro<Ctx>,
+    txns_file: &mut ChangesFile,
+    body: &[u8],
+    header: &PullUpdatesRespProtoBody,
+) -> Result<(usize, usize)> {
+    txns_file.reset(coro, ChangeKind::Logical).await?;
     let Some(metadata) = header.mvcc_log.as_ref() else {
         if body.is_empty() {
-            truncate_file(coro, txns_file).await?;
+            txns_file.finish(coro).await?;
             return Ok((0, 0));
         }
         return Err(Error::DatabaseSyncEngineError(
@@ -1699,9 +1666,7 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
         ));
     }
 
-    truncate_file(coro, txns_file).await?;
     let mut body_offset = 0usize;
-    let mut txns_offset = 0u64;
     let mut txns = 0usize;
     let mut ops = 0usize;
     let mut running_crc: Option<u32> = None;
@@ -1875,7 +1840,6 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
             let (frame_txns, frame_ops) = append_decoded_mvcc_frame_to_txns_file(
                 coro,
                 txns_file,
-                &mut txns_offset,
                 &portable_payload,
                 recovery_payload,
                 op_count,
@@ -1893,7 +1857,7 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
             "raw MVCC logical-log body has trailing bytes after advertised ranges".to_string(),
         ));
     }
-    sync_file(coro, txns_file).await?;
+    txns_file.finish(coro).await?;
     Ok((txns, ops))
 }
 
@@ -2091,6 +2055,28 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
     PullUpdatesV1Result,
     RemotePullProtocol,
 )> {
+    let mut staging = ChangesFile::new(frames_file.clone(), None);
+    pull_updates_to_staging(
+        ctx,
+        &mut staging,
+        revision,
+        long_poll_timeout,
+        logical_updates,
+    )
+    .await
+}
+
+pub(crate) async fn pull_updates_to_staging<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    frames_file: &mut ChangesFile,
+    revision: &str,
+    long_poll_timeout: Option<std::time::Duration>,
+    logical_updates: bool,
+) -> Result<(
+    DatabasePullRevision,
+    PullUpdatesV1Result,
+    RemotePullProtocol,
+)> {
     tracing::info!(
         "pull_updates_v1: remote_url={:?} revision={} logical_updates={} long_poll_timeout_ms={}",
         ctx.remote_url,
@@ -2163,9 +2149,8 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
     match pull_updates_stream_kind(&header)? {
         PullUpdatesStreamKind::Pages => {
             let replace_base = matches!(apply_mode, PullUpdatesApplyMode::ReplaceBase);
-            truncate_file(ctx.coro, frames_file).await?;
+            frames_file.reset(ctx.coro, ChangeKind::Pages).await?;
 
-            let mut offset = 0;
             #[allow(clippy::arc_with_non_send_sync)]
             let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
 
@@ -2201,21 +2186,12 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
                 tracing::debug!("page_data_opt: {}", page_data_opt.is_some());
                 frame_info.put_to_frame_header(buffer.as_mut_slice());
 
-                let c = Completion::new_write(move |result| {
-                    let Ok(size) = result else {
-                        return;
-                    };
-                    assert!(size as usize == WAL_FRAME_SIZE);
-                });
-
-                let c = frames_file.pwrite(offset, buffer.clone(), c)?;
-                while !c.succeeded() {
-                    ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-                }
-                offset += WAL_FRAME_SIZE as u64;
+                frames_file
+                    .append_record(ctx.coro, buffer.as_slice())
+                    .await?;
             }
 
-            sync_file(ctx.coro, frames_file).await?;
+            frames_file.finish(ctx.coro).await?;
 
             tracing::info!(
                 "pull_updates_v1: completed page stream: remote_url={:?} next_revision={:?} replace_base={}",
@@ -2247,7 +2223,8 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
                 &wait_all_results(ctx.coro, &completion, Some(&ctx.io.network_stats)).await?,
             );
             let (txns, ops) =
-                decode_raw_mvcc_logical_log_to_file(ctx.coro, frames_file, &body, &header).await?;
+                decode_raw_mvcc_logical_log_to_staging(ctx.coro, frames_file, &body, &header)
+                    .await?;
             tracing::info!(
                 "pull_updates_v1: completed raw MVCC logical-log stream: remote_url={:?} next_revision={:?} txns={} ops={}",
                 ctx.remote_url,
@@ -2268,6 +2245,16 @@ pub async fn pull_updates_v1<IO: SyncEngineIo, Ctx>(
 pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     frames_file: &Arc<dyn turso_core::File>,
+    revision: &str,
+    long_poll_timeout: Option<std::time::Duration>,
+) -> Result<DatabasePullRevision> {
+    let mut staging = ChangesFile::new(frames_file.clone(), None);
+    wal_pull_to_staging_v1(ctx, &mut staging, revision, long_poll_timeout).await
+}
+
+pub(crate) async fn wal_pull_to_staging_v1<IO: SyncEngineIo, Ctx>(
+    ctx: &SyncOperationCtx<'_, IO, Ctx>,
+    frames_file: &mut ChangesFile,
     revision: &str,
     long_poll_timeout: Option<std::time::Duration>,
 ) -> Result<DatabasePullRevision> {
@@ -2311,7 +2298,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
     tracing::info!("wal_pull_to_file: got header={:?}", header);
     ensure_incremental_page_stream(&header, "wal_pull_to_file_v1")?;
 
-    let mut offset = 0;
+    frames_file.reset(ctx.coro, ChangeKind::Pages).await?;
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(WAL_FRAME_SIZE));
 
@@ -2346,22 +2333,12 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
         tracing::debug!("page_data_opt: {}", page_data_opt.is_some());
         frame_info.put_to_frame_header(buffer.as_mut_slice());
 
-        let c = Completion::new_write(move |result| {
-            // todo(sivukhin): we need to error out in case of partial read
-            let Ok(size) = result else {
-                return;
-            };
-            assert!(size as usize == WAL_FRAME_SIZE);
-        });
-
-        let c = frames_file.pwrite(offset, buffer.clone(), c)?;
-        while !c.succeeded() {
-            ctx.coro.yield_(SyncEngineIoResult::IO).await?;
-        }
-        offset += WAL_FRAME_SIZE as u64;
+        frames_file
+            .append_record(ctx.coro, buffer.as_slice())
+            .await?;
     }
 
-    sync_file(ctx.coro, frames_file).await?;
+    frames_file.finish(ctx.coro).await?;
 
     Ok(DatabasePullRevision::V1 {
         revision: header.server_revision,
@@ -4866,40 +4843,70 @@ mod tests {
         (frame, crc)
     }
 
+    fn staging_test_crypto() -> turso_core::EncryptionContext {
+        turso_core::EncryptionContext::new(
+            turso_core::CipherMode::Aes256Gcm,
+            &turso_core::EncryptionKey::new_256([3; 32]),
+            super::PAGE_SIZE,
+        )
+        .unwrap()
+    }
+
     fn decode_raw_mvcc_log_for_test(
         header: PullUpdatesRespProtoBody,
         body: Vec<u8>,
     ) -> Result<Vec<LogicalTxnData>> {
-        let temp = NamedTempFile::new().unwrap();
-        let path = temp.path().to_owned();
-        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let file = core_io
-            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
-            .unwrap();
-        let mut gen = genawaiter::sync::Gen::new({
-            let file = file.clone();
-            move |coro| async move {
+        let mut previous = None;
+        for crypto in [None, Some(staging_test_crypto())] {
+            let temp = NamedTempFile::new().unwrap();
+            let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+            let file = core_io
+                .open_file(
+                    temp.path().to_str().unwrap(),
+                    turso_core::OpenFlags::Create,
+                    false,
+                )
+                .unwrap();
+            let header =
+                PullUpdatesRespProtoBody::decode(header.encode_to_vec().as_slice()).unwrap();
+            let body = body.clone();
+            let mut gen = genawaiter::sync::Gen::new(move |coro| async move {
                 let coro: Coro<()> = coro.into();
-                super::decode_raw_mvcc_logical_log_to_file(&coro, &file, &body, &header).await?;
-                Result::Ok(())
-            }
-        });
-        loop {
-            match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => {}
-                genawaiter::GeneratorState::Complete(result) => {
-                    result?;
-                    break;
+                let mut staging = super::ChangesFile::new(file, crypto);
+                super::decode_raw_mvcc_logical_log_to_staging(&coro, &mut staging, &body, &header)
+                    .await?;
+                let sealed = staging.sealed()?;
+                let mut reader = staging.open_reader(&coro, &sealed).await?;
+                let mut txns = Vec::new();
+                while let Some(record) = reader.next_record(&coro).await? {
+                    let mut bytes = record.as_slice();
+                    txns.push(LogicalTxnData::decode_length_delimited(&mut bytes).unwrap());
+                    assert!(bytes.is_empty());
+                }
+                Result::Ok(txns)
+            });
+            let result = loop {
+                match gen.resume_with(Ok(())) {
+                    genawaiter::GeneratorState::Yielded(..) => core_io.step().unwrap(),
+                    genawaiter::GeneratorState::Complete(result) => break result,
+                }
+            };
+            if let Some(previous) = previous {
+                match (previous, result) {
+                    (Ok(expected), Ok(actual)) => {
+                        assert_eq!(expected, actual);
+                        return Ok(actual);
+                    }
+                    (Err(expected), Err(actual)) => {
+                        assert_eq!(format!("{expected}"), format!("{actual}"));
+                        return Err(actual);
+                    }
+                    other => panic!("plaintext/encrypted staging disagreed: {other:?}"),
                 }
             }
+            previous = Some(result);
         }
-
-        let mut bytes = BytesMut::from(std::fs::read(path).unwrap().as_slice());
-        let mut txns = Vec::new();
-        while let Some(txn) = super::take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
-            txns.push(txn);
-        }
-        Ok(txns)
+        unreachable!()
     }
 
     fn read_logical_txns_from_path(path: &std::path::Path) -> Result<Vec<LogicalTxnData>> {
@@ -5246,6 +5253,15 @@ mod tests {
 
     #[test]
     fn pull_updates_v1_accepts_page_stream_when_logical_pull_is_requested() {
+        page_stream_when_logical_pull_is_requested(false);
+    }
+
+    #[test]
+    fn encrypted_staging_accepts_page_stream_when_logical_pull_is_requested() {
+        page_stream_when_logical_pull_is_requested(true);
+    }
+
+    fn page_stream_when_logical_pull_is_requested(encrypted: bool) {
         let page = vec![7u8; super::PAGE_SIZE];
         let header = PullUpdatesRespProtoBody {
             encrypted_sync: false,
@@ -5291,8 +5307,11 @@ mod tests {
                     Some("https://example.com".to_string()),
                     None,
                 );
+                let mut staging =
+                    super::ChangesFile::new(file, encrypted.then(staging_test_crypto));
                 let (revision, result, _) =
-                    pull_updates_v1(&ctx, &file, "g1:o40", None, true).await?;
+                    super::pull_updates_to_staging(&ctx, &mut staging, "g1:o40", None, true)
+                        .await?;
                 let DatabasePullRevision::V1 { revision } = revision else {
                     panic!("expected V1 revision");
                 };
@@ -5303,20 +5322,29 @@ mod tests {
                         replace_base: false
                     }
                 );
-                Result::Ok(())
+                let sealed = staging.sealed()?;
+                let mut reader = staging.open_reader(&coro, &sealed).await?;
+                let bytes = reader.next_record(&coro).await?.unwrap();
+                assert!(reader.next_record(&coro).await?.is_none());
+                Result::Ok(bytes)
             }
         });
-        loop {
+        let bytes = loop {
             match gen.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(..) => {}
                 genawaiter::GeneratorState::Complete(result) => {
-                    result.unwrap();
-                    break;
+                    break result.unwrap();
                 }
             }
-        }
+        };
 
-        let bytes = std::fs::read(path).unwrap();
+        if encrypted {
+            let stored = std::fs::read(&path).unwrap();
+            assert!(stored.starts_with(b"TSYNCHNG"));
+            assert!(!stored.windows(page.len()).any(|window| window == page));
+        } else {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
         assert_eq!(bytes.len(), super::WAL_FRAME_SIZE);
         let info =
             turso_core::types::WalFrameInfo::from_frame_header(&bytes[..super::WAL_FRAME_HEADER]);
