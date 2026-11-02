@@ -151,7 +151,18 @@ pub fn emit_program_for_compound_select(
 
     let real_query_destination = right_most.query_destination.clone();
     let num_result_cols = right_most.result_columns.len();
-    let collations = compound_collations(left, right_most, resolver)?;
+    // Only ORDER BY and the operators that remove rows compare the rows of the
+    // SELECTs. A compound of UNION ALL alone needs no collation, so like SQLite
+    // it can read a column whose collation the connection has not registered.
+    let compares_rows = has_order_by
+        || left
+            .iter()
+            .any(|(_, operator)| !matches!(operator, CompoundOperator::UnionAll));
+    let collations = if compares_rows {
+        compound_collations(left, right_most, resolver)?
+    } else {
+        Vec::new()
+    };
 
     // When ORDER BY is present, redirect compound output to a collection index,
     // then sort and emit to the real destination afterwards.

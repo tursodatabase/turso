@@ -3,7 +3,7 @@ use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, hash::Hasher, str
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, UnaryOperator};
+use turso_parser::ast::{Expr, Literal, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
@@ -49,7 +49,20 @@ pub enum TextCollation {
     /// number in [CUSTOM_COLLATIONS]. Two registrations of the same name get
     /// different numbers.
     Custom(u32),
+    /// A collation that the schema names but that is neither built in nor a
+    /// locale, by its number in [UNKNOWN_COLLATIONS]. The schema is shared by
+    /// all connections, so it cannot know whether a connection registered the
+    /// name. A statement that needs the collation looks the name up on its
+    /// connection (see [CatalogContext::resolve_schema_collation]) and fails
+    /// with `no such collation sequence` when it is not registered, as in
+    /// SQLite. Nothing compares with this collation.
+    Unknown(u32),
 }
+
+/// The names of [TextCollation::Unknown] collations, by their number. Names are
+/// never removed, so a number stays valid for the life of the process.
+static UNKNOWN_COLLATIONS: LazyLock<RwLock<Vec<String>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Every registered custom collation, by its number in [CollationSeq::Custom].
 /// Comparing with a custom collation looks up its callback here, so the
@@ -91,7 +104,7 @@ impl CollationSeq {
     pub const NO_COLLATION_BITS: u16 = 0;
 
     /// A compact number for the collation, for storing it in column flags and
-    /// aggregate state. A custom collation has none and gets
+    /// aggregate state. A custom or unknown collation has none and gets
     /// [Self::NO_COLLATION_BITS].
     #[inline]
     pub const fn to_bits(self) -> u16 {
@@ -100,7 +113,9 @@ impl CollationSeq {
             Self::Text(TextCollation::NoCase) => 2,
             Self::Text(TextCollation::Rtrim) => 3,
             Self::Text(TextCollation::Locale(id)) => id.to_bits(),
-            Self::Text(TextCollation::Custom(_)) => Self::NO_COLLATION_BITS,
+            Self::Text(TextCollation::Custom(_) | TextCollation::Unknown(_)) => {
+                Self::NO_COLLATION_BITS
+            }
             Self::Type(ordering) => Self::FIRST_TYPE_ORDERING_BITS + ordering as u16,
         }
     }
@@ -143,6 +158,11 @@ impl CollationSeq {
     #[inline]
     pub const fn is_custom(self) -> bool {
         matches!(self, Self::Text(TextCollation::Custom(_)))
+    }
+
+    #[inline]
+    pub const fn is_unknown(self) -> bool {
+        matches!(self, Self::Text(TextCollation::Unknown(_)))
     }
 
     /// Whether values can be hashed so that values this collation calls equal
@@ -269,6 +289,33 @@ impl TextCollation {
             .map(Self::Locale)
     }
 
+    /// The collation that a column, index or constraint definition in the
+    /// schema names. A name that is neither built in nor a locale is
+    /// [Self::Unknown], so a database whose schema uses a collation this
+    /// connection has not registered still opens.
+    pub(crate) fn from_schema(collation: &str) -> Self {
+        Self::new(collation).unwrap_or_else(|_| Self::unknown(collation))
+    }
+
+    fn unknown(collation: &str) -> Self {
+        if let Some(number) = UNKNOWN_COLLATIONS
+            .read()
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(collation))
+        {
+            return Self::Unknown(number as u32);
+        }
+        let mut names = UNKNOWN_COLLATIONS.write();
+        if let Some(number) = names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(collation))
+        {
+            return Self::Unknown(number as u32);
+        }
+        names.push(collation.to_string());
+        Self::Unknown((names.len() - 1) as u32)
+    }
+
     pub fn name(self) -> String {
         match self {
             Self::Binary => "Binary".to_string(),
@@ -276,6 +323,7 @@ impl TextCollation {
             Self::Rtrim => "RTrim".to_string(),
             Self::Locale(id) => LocaleCollationRegistry::global().name(id),
             Self::Custom(number) => custom_collation(number).name.clone(),
+            Self::Unknown(number) => UNKNOWN_COLLATIONS.read()[number as usize].clone(),
         }
     }
 
@@ -297,6 +345,9 @@ impl TextCollation {
             Self::Custom(_) => {
                 unreachable!("hash tables reject collations that cannot hash (see can_hash)")
             }
+            Self::Unknown(_) => {
+                unreachable!("a statement resolves an unknown collation before it compares")
+            }
         }
     }
 
@@ -308,6 +359,9 @@ impl TextCollation {
             Self::Rtrim => rtrim_cmp(lhs, rhs),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
             Self::Custom(number) => custom_collation(number).compare(lhs, rhs),
+            Self::Unknown(_) => {
+                unreachable!("a statement resolves an unknown collation before it compares")
+            }
         }
     }
 }
@@ -513,18 +567,35 @@ pub fn comparison_collation_across_queries(
     }
     let catalog = lhs_context.catalog();
     let collation = if has_collate_operator(lhs) {
-        expr_collation_if_any(lhs, lhs_context, catalog)?
+        schema_collation_if_any(lhs, lhs_context, catalog)?
     } else if has_collate_operator(rhs) {
-        expr_collation_if_any(rhs, rhs_context, catalog)?
+        schema_collation_if_any(rhs, rhs_context, catalog)?
     } else {
-        match expr_collation_if_any(lhs, lhs_context, catalog)? {
+        match schema_collation_if_any(lhs, lhs_context, catalog)? {
             Some(collation) => Some(collation),
-            None => expr_collation_if_any(rhs, rhs_context, catalog)?,
+            None => schema_collation_if_any(rhs, rhs_context, catalog)?,
         }
     };
-    Ok(CollationSeq::Text(
-        collation.unwrap_or(TextCollation::Binary),
-    ))
+    let collation = match collation {
+        // A comparison with NULL gives NULL, or for IS a test for NULL,
+        // whatever the collation, so it does not need the connection to
+        // register one. SQLite only skips the lookup for `x IS NULL`, and
+        // rejects `x = NULL`.
+        Some(TextCollation::Unknown(_)) if is_null_literal(lhs) || is_null_literal(rhs) => {
+            TextCollation::Binary
+        }
+        Some(collation) => catalog.resolve_schema_collation(collation)?,
+        None => TextCollation::Binary,
+    };
+    Ok(CollationSeq::Text(collation))
+}
+
+fn is_null_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Literal::Null) => true,
+        Expr::Parenthesized(exprs) => exprs.len() == 1 && is_null_literal(&exprs[0]),
+        _ => false,
+    }
 }
 
 /// [comparison_collation_across_queries] for `x IN (SELECT ...)`, where the
@@ -938,6 +1009,18 @@ fn expr_collation_if_any(
     metadata: &impl ExprProperties,
     catalog: &CatalogContext<'_>,
 ) -> Result<Option<TextCollation>> {
+    schema_collation_if_any(expr, metadata, catalog)?
+        .map(|collation| catalog.resolve_schema_collation(collation))
+        .transpose()
+}
+
+/// [expr_collation_if_any] before an [TextCollation::Unknown] collation of a
+/// column is looked up on the connection.
+fn schema_collation_if_any(
+    expr: &Expr,
+    metadata: &impl ExprProperties,
+    catalog: &CatalogContext<'_>,
+) -> Result<Option<TextCollation>> {
     match expr {
         Expr::Column { table, column, .. } => metadata.column_collation(*table, *column),
         Expr::RowId { .. } => Ok(None),
@@ -951,14 +1034,14 @@ fn expr_collation_if_any(
             let first_column = columns
                 .first()
                 .expect("a merged column must have at least two source columns");
-            expr_collation_if_any(first_column, metadata, catalog)
+            schema_collation_if_any(first_column, metadata, catalog)
         }
         Expr::Cast { expr, .. } | Expr::Unary(UnaryOperator::Positive, expr) => {
-            expr_collation_if_any(expr, metadata, catalog)
+            schema_collation_if_any(expr, metadata, catalog)
         }
         Expr::Parenthesized(exprs) => {
             let first = exprs.first().expect("parentheses must hold an expression");
-            expr_collation_if_any(first, metadata, catalog)
+            schema_collation_if_any(first, metadata, catalog)
         }
         Expr::Collate(_, name) => Ok(Some(catalog.resolve_collation(name.as_str())?)),
         _ => {
@@ -969,7 +1052,7 @@ fn expr_collation_if_any(
                 }
             });
             match operand_with_collate {
-                Some(operand) => expr_collation_if_any(operand, metadata, catalog),
+                Some(operand) => schema_collation_if_any(operand, metadata, catalog),
                 None => Ok(None),
             }
         }
