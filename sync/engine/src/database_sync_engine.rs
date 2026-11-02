@@ -179,6 +179,7 @@ pub struct DatabaseSyncEngine<IO: SyncEngineIo> {
     opts: DatabaseSyncEngineOpts,
     meta: Mutex<DatabaseMetadata>,
     client_unique_id: String,
+    local_crypto: Option<turso_core::EncryptionContext>,
 }
 
 fn db_size_from_page(page: &[u8]) -> u32 {
@@ -1340,6 +1341,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
         let main_db_path = main_db.path.to_string();
+        let local_crypto = opts.local_encryption_context()?;
         tracing::info!("open_db(path={}): opts={:?}", main_db_path, opts);
         // A previous process may have crashed after writing the replace-base
         // marker but before completing local replay. Restore the backed-up
@@ -1354,7 +1356,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         if recovered {
             // Recovery restored files behind this already-open Database handle,
             // so rebuild its shared WAL/MVCC view before continuing.
-            main_db.reload_wal_after_external_restore()?;
+            main_db.reload_wal_after_external_restore_with_encryption_key(opts.local_key())?;
         }
 
         let meta_path = create_meta_path(&main_db_path);
@@ -1376,7 +1378,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         // DB wasn't synced with remote but will be encrypted on remote - so we must properly set reserved bytes field in advance
         if meta.synced_revision.is_none() && opts.reserved_bytes != 0 {
-            let conn = main_db.connect(ConnectOpts::new())?;
+            let conn = main_db.connect(opts.connect_options())?;
             conn.wal_auto_actions_disable();
             conn.set_reserved_bytes(opts.reserved_bytes as u8)?;
 
@@ -1393,7 +1395,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         tracing::info!("initialize database tape connection: path={}", main_db_path);
         let main_db_io = main_db.io.clone();
         let main_db_file = main_db.db_file.clone();
-        let main_tape = DatabaseTape::new_with_opts(main_db, tape_opts);
+        let main_tape =
+            DatabaseTape::new_with_opts(main_db, tape_opts).with_encryption_key(opts.local_key());
         // Initialize CDC pragma and cache CDC version so iterate_changes() can work
         main_tape.connect(coro).await?;
 
@@ -1413,6 +1416,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             opts,
             meta: Mutex::new(meta.clone()),
             client_unique_id: meta.client_unique_id.clone(),
+            local_crypto,
         };
 
         let synced_revision = meta.synced_revision.as_ref();
@@ -1443,6 +1447,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         main_db_path: &str,
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
+        let local_crypto = opts.local_encryption_context()?;
         ReplaceBaseApplyGuard::recover_pending(
             coro,
             io.clone(),
@@ -1479,7 +1484,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let main_db_options = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
             .storage(main_db_storage)
             .flags(OpenFlags::Create)
-            .db_opts(opts.db_opts);
+            .db_opts(opts.db_opts)
+            .encryption(opts.local_options());
         let mut open_state = turso_core::OpenDbAsyncState::new();
         let main_db = loop {
             match turso_core::Database::open_async(
@@ -1509,7 +1515,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 .storage(self.db_file.clone())
                 .wal_path(self.revert_db_wal_path.clone())
                 .flags(OpenFlags::Create)
-                .db_opts(self.opts.db_opts);
+                .db_opts(self.opts.db_opts)
+                .encryption(self.opts.local_options());
             let mut state = OpenDbAsyncState::new();
             loop {
                 match turso_core::Database::do_open_async(
@@ -1528,7 +1535,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 }
             }
         };
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(self.opts.connect_options())?;
         conn.wal_auto_actions_disable();
         Ok(conn)
     }
@@ -3942,6 +3949,171 @@ mod tests {
         assert!(printed.contains("client_name: \"test-client\""));
     }
 
+    #[test]
+    fn encrypted_offline_open_keys_internal_connections_and_metadata() {
+        let dir = tempfile::tempdir().expect("directory");
+        let path = dir.path().join("encrypted.db");
+        let path = path.to_str().expect("path").to_string();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().expect("IO"));
+        let mut opts = default_test_opts();
+        opts.db_opts = turso_core::DatabaseOpts::new().with_encryption(true);
+        opts.remote_url = Some("https://example.invalid/private-database".into());
+        opts.encryption = Some(
+            crate::sync_encryption::SyncEncryption::new(
+                turso_core::CipherMode::Aes256Gcm,
+                Some(turso_core::EncryptionKey::new_256([11; 32])),
+            )
+            .expect("config"),
+        );
+        let crypto = opts
+            .local_encryption_context()
+            .expect("crypto")
+            .expect("local");
+        {
+            let db = turso_core::Database::open_file_with_flags(
+                io.clone(),
+                &path,
+                turso_core::OpenFlags::Create,
+                opts.db_opts,
+                opts.local_options(),
+                Arc::new(SqliteDialect),
+            )
+            .expect("open encrypted database");
+            let conn = db
+                .connect(opts.connect_options())
+                .expect("keyed connection");
+            conn.execute("PRAGMA journal_mode = 'mvcc'").expect("MVCC");
+            conn.execute("CREATE TABLE private_table(value TEXT)")
+                .expect("schema");
+            conn.execute("INSERT INTO private_table VALUES ('private initial value')")
+                .expect("insert");
+        }
+        let meta = DatabaseMetadata::load(
+            &serde_json::to_vec(&serde_json::json!({
+                "version": "v1", "client_unique_id": "private-client",
+                "synced_revision": {"type": "v1", "revision": "g1:o56"},
+                "revert_since_wal_watermark": 0,
+                "last_pushed_pull_gen_hint": 0, "last_pushed_change_id_hint": 0,
+                "remote_pull_protocol": "mvcc_logical"
+            }))
+            .expect("metadata JSON"),
+        )
+        .expect("metadata");
+        let original = meta
+            .dump_with_encryption(Some(&crypto))
+            .expect("seal metadata");
+        std::fs::write(create_meta_path(&path), &original).expect("write fixture");
+        let stats = SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo));
+        let mut gen = genawaiter::sync::Gen::new(|co| async {
+            let coro: Coro<()> = co.into();
+            let engine = DatabaseSyncEngine::create_db(
+                &coro,
+                io.clone(),
+                stats.clone(),
+                &path,
+                opts.clone(),
+            )
+            .await?;
+            let conn = engine.connect_rw(&coro).await?;
+            assert!(conn.get_pager().is_encryption_ctx_set());
+            conn.execute("INSERT INTO private_table VALUES ('private new value')")?;
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            let untracked = engine.main_tape.connect_untracked()?;
+            assert!(untracked.get_pager().is_encryption_ctx_set());
+            assert_eq!(
+                untracked
+                    .prepare("SELECT count(*) FROM private_table")?
+                    .run_collect_rows()?,
+                vec![vec![turso_core::Value::from_i64(2)]]
+            );
+            drop(untracked);
+            let mut iterator = engine.main_tape.iterate_changes(Default::default())?;
+            assert!(iterator.next(&coro).await?.is_some());
+            drop(iterator);
+            drop(conn);
+            let revert = engine.open_revert_db_conn(&coro).await?;
+            assert!(revert.get_pager().is_encryption_ctx_set());
+            assert_eq!(
+                revert
+                    .prepare("SELECT count(*) FROM private_table")?
+                    .run_collect_rows()?,
+                vec![vec![turso_core::Value::from_i64(2)]]
+            );
+            drop(revert);
+            engine
+                .update_meta(&coro, |meta| meta.last_push_unix_time = Some(123))
+                .await?;
+            let updated = std::fs::read(create_meta_path(&path))?;
+            assert_ne!(updated, original);
+            for secret in ["private-client", "private-database", "private_table"] {
+                assert!(!updated
+                    .windows(secret.len())
+                    .any(|part| part == secret.as_bytes()));
+            }
+            let decoded = DatabaseMetadata::load_with_encryption(&updated, Some(&crypto))?;
+            assert_eq!(decoded.last_push_unix_time, Some(123));
+            assert_eq!(decoded.remote_url(), opts.remote_url);
+            assert!(DatabaseMetadata::load_with_encryption(&updated, None).is_err());
+            drop(engine);
+            let reopened = DatabaseSyncEngine::create_db(
+                &coro,
+                io.clone(),
+                stats.clone(),
+                &path,
+                opts.clone(),
+            )
+            .await?;
+            assert_eq!(reopened.meta().last_push_unix_time, Some(123));
+            Ok::<_, crate::errors::Error>(())
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(_) => {
+                    io.step().expect("drive IO");
+                }
+                genawaiter::GeneratorState::Complete(result) => {
+                    result.expect("encrypted offline roundtrip");
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encrypted_metadata_rejects_empty_file_and_missing_key() {
+        let dir = tempfile::tempdir().expect("directory");
+        let path = dir.path().join("db");
+        let path = path.to_str().expect("path");
+        std::fs::write(create_meta_path(path), []).expect("empty metadata");
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().expect("IO"));
+        let crypto = turso_core::EncryptionContext::new(
+            turso_core::CipherMode::Aes256Gcm,
+            &turso_core::EncryptionKey::new_256([1; 32]),
+            4096,
+        )
+        .expect("crypto");
+        let mut gen = genawaiter::sync::Gen::new(|co| async {
+            let coro: Coro<()> = co.into();
+            let result = DatabaseSyncEngine::read_db_meta_with_encryption(
+                &coro,
+                Some(io.clone()),
+                SyncEngineIoStats::new(Arc::new(NoopSyncEngineIo)),
+                path,
+                Some(&crypto),
+            )
+            .await;
+            assert!(result
+                .expect_err("empty metadata is not a fresh replica")
+                .to_string()
+                .contains("empty"));
+        });
+        assert!(matches!(
+            gen.resume_with(Ok(())),
+            genawaiter::GeneratorState::Complete(())
+        ));
+        assert!(DatabaseMetadata::load_with_encryption(b"TSYNMETA\x01\x00", None).is_err());
+    }
+
     fn replace_base_guard_test_paths(
         main_path: &str,
     ) -> Vec<(&'static str, String, Option<&'static [u8]>)> {
@@ -4387,6 +4559,7 @@ mod tests {
             }),
         };
         let engine = DatabaseSyncEngine {
+            local_crypto: None,
             io: db_io,
             sync_engine_io,
             db_file,
@@ -4564,6 +4737,7 @@ mod tests {
             }),
         };
         let engine = DatabaseSyncEngine {
+            local_crypto: None,
             io: db_io,
             sync_engine_io,
             db_file,
