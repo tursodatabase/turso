@@ -779,6 +779,23 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test op-abs-of-coalesce-of-numeric-in-check-error {
+    -- coalesce(n, 0) may be the stored numeric, so abs of it is refused like abs(n).
+    CREATE TABLE c(n numeric(10,2) CHECK(abs(coalesce(n, 0)) > 4)) STRICT;
+}
+expect error {
+    cannot use abs\(\) on a numeric value in a CHECK constraint
+}
+
+@requires strict "uses STRICT tables"
+test op-minus-of-coalesce-of-numeric-in-check-error {
+    CREATE TABLE c(n numeric(10,2) CHECK(-coalesce(n, 0) < 0)) STRICT;
+}
+expect error {
+    unary minus/plus requires a numeric type, got numeric
+}
+
+@requires strict "uses STRICT tables"
 test op-date-minus-derived-table-cte-and-view-columns {
     CREATE TABLE t(d date) STRICT;
     CREATE TABLE u(e date) STRICT;

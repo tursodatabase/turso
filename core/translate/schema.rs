@@ -507,11 +507,18 @@ fn reject_value_unlike_stored_columns(
 
 /// The type of a function that returns one of several values: the type they
 /// all share, REAL for a mix of integers and reals, and otherwise any type.
-/// NULL values don't count.
+/// NULL values don't count. If one value is of a custom type, the result is
+/// that type: a CHECK constraint sees it in its stored form, such as
+/// numeric's blob, so arithmetic on it must stay refused.
 fn common_check_type(types: impl Iterator<Item = Result<CheckExprType>>) -> Result<CheckExprType> {
     let mut common = CheckExprType::Null;
+    let mut custom_type = None;
     for ty in types {
-        common = match (common, ty?) {
+        let ty = ty?;
+        if custom_type.is_none() && matches!(ty, CheckExprType::CustomType(_)) {
+            custom_type = Some(ty.clone());
+        }
+        common = match (common, ty) {
             (common, CheckExprType::Null) => common,
             (CheckExprType::Null, ty) => ty,
             (common, ty) if common == ty => common,
@@ -519,10 +526,10 @@ fn common_check_type(types: impl Iterator<Item = Result<CheckExprType>>) -> Resu
                 CheckExprType::Integer | CheckExprType::Real,
                 CheckExprType::Integer | CheckExprType::Real,
             ) => CheckExprType::Real,
-            _ => return Ok(CheckExprType::Any),
+            _ => CheckExprType::Any,
         };
     }
-    Ok(common)
+    Ok(custom_type.unwrap_or(common))
 }
 
 /// Resolve a column's type from its definition.
