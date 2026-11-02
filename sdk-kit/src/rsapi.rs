@@ -1789,7 +1789,11 @@ impl TursoStatement {
         let _guard = guard.try_use()?;
         let mut handle = self.handle.lock().unwrap();
         if let Some(stmt) = handle.as_mut() {
-            while stmt.execution_state().is_running() {
+            // Finish a statement only after it has returned a row, so that an
+            // `INSERT ... RETURNING` whose rows were not all read still commits. A statement
+            // that stopped earlier, for example on Busy, must not run further: dropping it
+            // below rolls it back, as `sqlite3_finalize` would.
+            while stmt.has_returned_row() && stmt.execution_state().is_running() {
                 let status = step_inner(stmt, self.async_io, waker)?;
                 if status == TursoStatusCode::Io {
                     return Ok(status);
@@ -2977,5 +2981,81 @@ mod tests {
         assert_eq!(stmt.n_change(), 0);
         assert_eq!(stmt.column_count(), 0);
         assert_eq!(stmt.parameters_count(), 0);
+    }
+
+    /// Opens a file database with two connections. The second one gives up on locks after 1ms.
+    fn open_holder_and_writer() -> (
+        tempfile::NamedTempFile,
+        Arc<super::TursoConnection>,
+        Arc<super::TursoConnection>,
+    ) {
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let mut config = config_with_features(None);
+        config.path = temp_file.path().to_str().unwrap().to_string();
+        let db = TursoDatabase::new(config);
+        let _ = db.open().unwrap();
+        let holder = db.connect().unwrap();
+        let writer = db.connect().unwrap();
+        writer.set_busy_timeout(std::time::Duration::from_millis(1));
+        (temp_file, holder, writer)
+    }
+
+    fn execute_sql(conn: &Arc<super::TursoConnection>, sql: &str) {
+        let mut stmt = conn.prepare_single(sql).unwrap();
+        assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+    }
+
+    fn count_rows(conn: &Arc<super::TursoConnection>) -> Value {
+        let mut count = conn.prepare_single("SELECT count(*) FROM t").unwrap();
+        assert_eq!(count.step(None).unwrap(), TursoStatusCode::Row);
+        count.row_value(0).unwrap()
+    }
+
+    #[test]
+    fn finalize_does_not_resume_statements_that_failed_with_busy() {
+        let (_file, holder, writer) = open_holder_and_writer();
+        execute_sql(&holder, "CREATE TABLE t(x INTEGER)");
+        execute_sql(&holder, "BEGIN IMMEDIATE");
+
+        let mut failed = Vec::new();
+        for sql in ["INSERT INTO t VALUES (1)", "BEGIN IMMEDIATE"] {
+            let mut stmt = writer.prepare_single(sql).unwrap();
+            let result = stmt.execute(None);
+            assert!(
+                matches!(result, Err(TursoError::Busy(_))),
+                "{sql}: {result:?}"
+            );
+            failed.push(stmt);
+        }
+
+        execute_sql(&holder, "ROLLBACK");
+        for mut stmt in failed {
+            assert_eq!(stmt.finalize(None).unwrap(), TursoStatusCode::Done);
+        }
+
+        assert!(
+            writer.get_auto_commit(),
+            "finalize opened the transaction of a BEGIN IMMEDIATE that returned Busy"
+        );
+        assert_eq!(
+            count_rows(&holder),
+            Value::from_i64(0),
+            "finalize committed an INSERT whose execute returned Busy"
+        );
+    }
+
+    #[test]
+    fn finalize_commits_insert_returning_after_a_partial_read() {
+        let (_file, holder, writer) = open_holder_and_writer();
+        execute_sql(&holder, "CREATE TABLE t(x INTEGER)");
+
+        let mut insert = writer
+            .prepare_single("INSERT INTO t VALUES (1), (2), (3) RETURNING x")
+            .unwrap();
+        assert_eq!(insert.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(insert.finalize(None).unwrap(), TursoStatusCode::Done);
+
+        assert_eq!(count_rows(&holder), Value::from_i64(3));
+        assert!(writer.get_auto_commit());
     }
 }
