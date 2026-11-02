@@ -1557,19 +1557,25 @@ pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<
     schemas
 }
 
+/// The translator puts a catalog table's name in `main`, the database that
+/// holds the catalog, so a table of the same name in a user schema, such as
+/// `public.pg_class`, is an ordinary table.
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
-    let table_name = match stmt {
-        ast::Stmt::Insert { tbl_name, .. } => Some(tbl_name.name.as_str()),
-        ast::Stmt::Delete { tbl_name, .. } => Some(tbl_name.name.as_str()),
-        ast::Stmt::Update(update) => Some(update.tbl_name.name.as_str()),
+    let table = match stmt {
+        ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => Some(tbl_name),
+        ast::Stmt::Update(update) => Some(&update.tbl_name),
         _ => None,
     };
 
-    let Some(table_name) = table_name else {
+    let Some(table) = table else {
         return Ok(());
     };
-
-    if !catalog::is_catalog_table_name(table_name) {
+    let table_name = table.name.as_str();
+    let in_catalog = table
+        .namespace
+        .as_ref()
+        .is_none_or(|namespace| namespace.as_str() == "main");
+    if !in_catalog || !catalog::is_catalog_table_name(table_name) {
         return Ok(());
     }
 

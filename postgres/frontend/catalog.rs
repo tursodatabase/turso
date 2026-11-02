@@ -264,8 +264,12 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>)> 
         let mut namespace_tables: Vec<_> = schema
             .tables(namespace)
             .map(|table| (namespace, table.get_name(), table))
-            .filter(|(_, name, table)| {
-                !is_system_table_name(name) && matches!(table.as_ref(), Table::BTree(_))
+            // The catalog's own tables and the engine's internal tables are in
+            // the root namespace; a table in a user schema is the user's,
+            // whatever it is named.
+            .filter(|(namespace, name, table)| {
+                !(namespace.is_root() && is_system_table_name(name))
+                    && matches!(table.as_ref(), Table::BTree(_))
             })
             .collect();
         namespace_tables.sort_by_key(|(_, name, _)| *name);
