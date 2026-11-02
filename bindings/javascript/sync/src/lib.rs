@@ -359,6 +359,7 @@ impl SyncEngine {
     #[napi]
     pub fn connect(&mut self) -> napi::Result<GeneratorHolder> {
         let opts = DatabaseSyncEngineOpts {
+            encryption: None,
             client_name: self.opts.client_name.clone(),
             remote_url: self.opts.remote_url.clone(),
             wal_pull_batch_size: self.opts.wal_pull_batch_size as u64,
