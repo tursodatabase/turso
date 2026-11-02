@@ -183,6 +183,164 @@ fn encrypted_reopen_preserves_replica_and_orphaned_backups() {
 }
 
 #[test]
+fn encrypted_bootstrap_failures_around_sync_and_metadata_publication() {
+    for stage in 1..=4 {
+        let remote = Remote::new_encrypted(&[
+            "CREATE TABLE items(value TEXT)",
+            "INSERT INTO items VALUES ('encrypted bootstrap failure marker')",
+        ])
+        .unwrap();
+        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let server = InProcessServer::new(remote.clone());
+        if stage >= 3 {
+            server
+                .metadata_write_failure
+                .store(stage - 2, Ordering::SeqCst);
+        }
+        let io = Arc::new(BootstrapIo {
+            inner: Arc::new(PlatformIO::new().unwrap()),
+            failure: Arc::new(AtomicU8::new(if stage <= 2 { stage } else { 0 })),
+        });
+        let error = Replica::open_encrypted_with_io(&directory, server, Some([22; 32]), io)
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("injected"),
+            "stage {stage}: {error}"
+        );
+        let main = std::fs::read(directory.path().join("replica.db")).unwrap();
+        assert!(!main.is_empty());
+        let crypto = turso_core::EncryptionContext::new(
+            turso_core::CipherMode::Aes256Gcm,
+            &turso_core::EncryptionKey::new_256([22; 32]),
+            4096,
+        )
+        .unwrap();
+        for (index, page) in main.chunks_exact(4096).enumerate() {
+            crypto.decrypt_page(page, index + 1).unwrap();
+        }
+        let reopened = Replica::open_encrypted(
+            &directory,
+            InProcessServer::new(remote.clone()),
+            Some([22; 32]),
+        );
+        if stage == 4 {
+            assert_eq!(
+                reopened.unwrap().snapshot().unwrap(),
+                remote.snapshot().unwrap()
+            );
+        } else {
+            assert!(!directory.path().join("replica.db-info").exists());
+            assert!(reopened.is_err());
+            assert_eq!(
+                std::fs::read(directory.path().join("replica.db")).unwrap(),
+                main
+            );
+        }
+    }
+}
+
+#[test]
+fn encrypted_pull_metadata_failure_keeps_published_progress() {
+    let remote = Remote::new_encrypted(&["CREATE TABLE items(value TEXT)"]).unwrap();
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let server = InProcessServer::new(remote.clone());
+    let failure = server.metadata_write_failure.clone();
+    let replica = Replica::open_encrypted(&directory, server, Some([22; 32])).unwrap();
+    let before = std::fs::read(directory.path().join("replica.db-info")).unwrap();
+    remote
+        .execute_transaction(&["INSERT INTO items VALUES ('remote')"])
+        .unwrap();
+    failure.store(1, Ordering::SeqCst);
+    assert!(replica
+        .pull()
+        .unwrap_err()
+        .to_string()
+        .contains("metadata publication"));
+    assert_eq!(
+        std::fs::read(directory.path().join("replica.db-info")).unwrap(),
+        before
+    );
+    drop(replica);
+    let replica = Replica::open_encrypted(
+        &directory,
+        InProcessServer::new(remote.clone()),
+        Some([22; 32]),
+    )
+    .unwrap();
+    replica.pull().unwrap();
+    assert_eq!(replica.snapshot().unwrap(), remote.snapshot().unwrap());
+}
+
+#[test]
+fn encrypted_startup_restores_pending_replacement_and_can_write_again() {
+    let remote = Remote::new_encrypted(&[
+        "CREATE TABLE items(value TEXT)",
+        "INSERT INTO items VALUES ('original')",
+    ])
+    .unwrap();
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let replica = Replica::open_encrypted(
+        &directory,
+        InProcessServer::new(remote.clone()),
+        Some([22; 32]),
+    )
+    .unwrap();
+    let expected = replica.snapshot().unwrap();
+    drop(replica);
+    let main = directory
+        .path()
+        .join("replica.db")
+        .to_string_lossy()
+        .into_owned();
+    let mut files = Vec::new();
+    for (suffix, name) in [
+        ("", "main-db"),
+        ("-wal", "main-wal"),
+        ("-log", "main-log"),
+        ("-wal-revert", "revert-wal"),
+        ("-info", "metadata"),
+    ] {
+        let path = format!("{main}{suffix}");
+        let backup = format!("{main}-replace-base-apply-{name}.backup");
+        let present = std::fs::metadata(&path).is_ok_and(|meta| meta.len() != 0);
+        if present {
+            std::fs::copy(&path, &backup).unwrap();
+        }
+        files.push(serde_json::json!({"path":path,"backup_path":backup,"present":present}));
+    }
+    // Reproduce the on-disk state after the guard publishes its manifest and
+    // an interrupted replacement has damaged the main database and metadata.
+    std::fs::write(
+        format!("{main}-replace-base-apply"),
+        serde_json::to_vec(&serde_json::json!({
+            "version":1,"operation":"replace_base_apply","main_db_path":main,
+            "previous_synced_revision":null,"files":files,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&main, [0x91; 4096]).unwrap();
+    std::fs::write(format!("{main}-info"), [0x91; 20]).unwrap();
+    let replica = Replica::open_encrypted(
+        &directory,
+        InProcessServer::new(remote.clone()),
+        Some([22; 32]),
+    )
+    .unwrap();
+    assert_eq!(replica.snapshot().unwrap(), expected);
+    assert!(!std::path::Path::new(&format!("{main}-replace-base-apply")).exists());
+    replica
+        .execute("INSERT INTO items VALUES ('after recovery')")
+        .unwrap();
+    let expected = replica.snapshot().unwrap();
+    drop(replica);
+    let replica =
+        Replica::open_encrypted(&directory, InProcessServer::new(remote), Some([22; 32])).unwrap();
+    assert_eq!(replica.snapshot().unwrap(), expected);
+}
+
+#[test]
 fn encrypted_empty_bootstrap_pull_reopen_and_auth_failure() {
     let remote = Remote::new_encrypted(&[]).unwrap();
     let directory = Arc::new(tempfile::tempdir().unwrap());
@@ -355,4 +513,113 @@ fn encrypted_zero_page_generation_base_starts_in_mvcc_mode() {
     .unwrap();
     assert!(replica.is_mvcc());
     assert_eq!(replica.snapshot().unwrap(), remote.snapshot().unwrap());
+}
+
+#[test]
+fn encrypted_replacement_replay_failure_restores_database_and_progress() {
+    let remote = Remote::new_encrypted(&[
+        "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)",
+        "INSERT INTO items VALUES (1, 'duplicate')",
+    ])
+    .unwrap();
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let replica = Replica::open_encrypted(
+        &directory,
+        InProcessServer::new(remote.clone()),
+        Some([22; 32]),
+    )
+    .unwrap();
+    replica
+        .execute("CREATE UNIQUE INDEX local_unique ON items(value)")
+        .unwrap();
+    let before = replica.snapshot().unwrap();
+    drop(replica);
+    remote
+        .execute_transaction(&["INSERT INTO items VALUES (2, 'duplicate')"])
+        .unwrap();
+    let replica = Replica::open_encrypted(
+        &directory,
+        InProcessServer::with_replacement(remote.clone()),
+        Some([22; 32]),
+    )
+    .unwrap();
+    let progress = std::fs::read(directory.path().join("replica.db-info")).unwrap();
+    assert!(
+        replica.pull().is_err(),
+        "replaying the local unique index must fail"
+    );
+    assert_eq!(replica.snapshot().unwrap(), before);
+    assert_eq!(
+        std::fs::read(directory.path().join("replica.db-info")).unwrap(),
+        progress
+    );
+    replica
+        .execute("INSERT INTO items VALUES (3, 'after recovery')")
+        .unwrap();
+    replica.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let recovered = replica.snapshot().unwrap();
+    drop(replica);
+    let reopened =
+        Replica::open_encrypted(&directory, InProcessServer::new(remote), Some([22; 32])).unwrap();
+    assert_eq!(reopened.snapshot().unwrap(), recovered);
+}
+
+#[test]
+fn plaintext_empty_host_metadata_bootstraps_and_reopens() {
+    let remote = Remote::new(&[
+        "CREATE TABLE items(value TEXT)",
+        "INSERT INTO items VALUES ('from remote')",
+    ])
+    .unwrap();
+    for empty in [false, true] {
+        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let path = directory
+            .path()
+            .join("replica.db-info")
+            .to_string_lossy()
+            .into_owned();
+        let files = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        if empty {
+            files.lock().unwrap().insert(path.clone(), Vec::new());
+        }
+        let server = || {
+            let mut server = InProcessServer::new(remote.clone());
+            server.host_files = Some(files.clone());
+            server
+        };
+        let opts = super::harness::database_opts();
+        let replica = Replica::open(&directory, server(), opts).unwrap();
+        assert_eq!(replica.snapshot().unwrap(), remote.snapshot().unwrap());
+        drop(replica);
+        assert!(serde_json::from_slice::<serde_json::Value>(&files.lock().unwrap()[&path]).is_ok());
+        let reopened = Replica::open(&directory, server(), opts).unwrap();
+        assert_eq!(reopened.snapshot().unwrap(), remote.snapshot().unwrap());
+    }
+}
+
+#[test]
+fn encrypted_metadata_uses_host_existence_when_storage_differs_from_core() {
+    let remote = Remote::new_encrypted(&["CREATE TABLE items(value TEXT)"]).unwrap();
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let metadata_path = directory.path().join("replica.db-info");
+    // OPFS registration creates an empty file, while BrowserIO keeps metadata
+    // separately in localStorage. The empty OPFS file is not the metadata.
+    std::fs::write(&metadata_path, []).unwrap();
+    let files = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let server = || {
+        let mut server = InProcessServer::new(remote.clone());
+        server.host_files = Some(files.clone());
+        server
+    };
+    let replica = Replica::open_encrypted(&directory, server(), Some([22; 32])).unwrap();
+    assert_eq!(replica.snapshot().unwrap(), remote.snapshot().unwrap());
+    drop(replica);
+    let path = metadata_path.to_string_lossy().into_owned();
+    assert!(files.lock().unwrap()[&path].starts_with(b"TSYNMETA"));
+    assert_eq!(std::fs::metadata(&metadata_path).unwrap().len(), 0);
+    let replica = Replica::open_encrypted(&directory, server(), Some([22; 32])).unwrap();
+    assert_eq!(replica.snapshot().unwrap(), remote.snapshot().unwrap());
+    drop(replica);
+    files.lock().unwrap().insert(path, Vec::new());
+    assert!(Replica::open_encrypted(&directory, server(), Some([22; 32])).is_err());
 }
