@@ -15,8 +15,7 @@ use crate::namespace::{mangle_name, NamespaceId, NamespaceRef};
 use crate::numeric::decimal::{numeric_from_value, MAX_FRACTION_DIGITS};
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
-    SCHEMA_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
@@ -18103,7 +18102,7 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
-    let (old_column_name, is_strict) = conn.with_schema(*db, |schema| {
+    let (old_column_name, is_strict, new_column) = conn.with_schema(*db, |schema| {
         let table = schema
             .get_table(*namespace, &normalized_table_name)
             .expect("table being ALTERed should be in schema");
@@ -18114,12 +18113,13 @@ pub fn op_alter_column(
             .as_ref()
             .expect("column being ALTERed should be named")
             .clone();
-        (old_column_name, table.is_strict())
+        let new_column = table
+            .btree()
+            .expect("only btree tables can be altered")
+            .column_for_alter(*column_index, definition);
+        (old_column_name, table.is_strict(), new_column)
     });
-    let new_column = crate::schema::Column::from_definition(
-        definition,
-        FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
-    )?;
+    let new_column = new_column?;
     let new_name = definition.col_name.as_str().to_owned();
     let (domain_not_null, domain_checks) = if is_strict && !*rename {
         conn.with_schema(*db, |schema| schema.column_domain_constraints(&new_column))?
