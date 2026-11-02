@@ -1591,6 +1591,7 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
     txns_file: &Arc<dyn turso_core::File>,
     body: &[u8],
     header: &PullUpdatesRespProtoBody,
+    source_cipher: Option<turso_core::CipherMode>,
 ) -> Result<(usize, usize)> {
     let Some(metadata) = header.mvcc_log.as_ref() else {
         if body.is_empty() {
@@ -1622,25 +1623,36 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
     let mut previous_range_boundary: Option<(u64, u64)> = None;
 
     for range in &metadata.ranges {
-        if previous_range_boundary != Some((range.generation, range.start_offset)) {
+        if previous_range_boundary != Some((range.generation, range.start_offset))
+            || source_cipher.is_some()
+        {
             running_crc = None;
         }
-        let range_len = usize::try_from(
-            range
-                .end_offset
-                .checked_sub(range.start_offset)
-                .ok_or_else(|| {
-                    Error::DatabaseSyncEngineError(format!(
-                        "invalid MVCC logical-log range {}..{}",
-                        range.start_offset, range.end_offset
-                    ))
-                })?,
-        )
-        .map_err(|_| {
-            Error::DatabaseSyncEngineError(
-                "MVCC logical-log range length overflows usize".to_string(),
+        let range_len = if source_cipher.is_some() {
+            if range.end_offset < range.start_offset {
+                return Err(Error::DatabaseSyncEngineError(
+                    "invalid MVCC source range".into(),
+                ));
+            }
+            body.len() - body_offset
+        } else {
+            usize::try_from(
+                range
+                    .end_offset
+                    .checked_sub(range.start_offset)
+                    .ok_or_else(|| {
+                        Error::DatabaseSyncEngineError(format!(
+                            "invalid MVCC logical-log range {}..{}",
+                            range.start_offset, range.end_offset
+                        ))
+                    })?,
             )
-        })?;
+            .map_err(|_| {
+                Error::DatabaseSyncEngineError(
+                    "MVCC logical-log range length overflows usize".to_string(),
+                )
+            })?
+        };
         let range_end = body_offset.checked_add(range_len).ok_or_else(|| {
             Error::DatabaseSyncEngineError("MVCC logical-log range length overflow".to_string())
         })?;
@@ -1650,10 +1662,17 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
                 range.start_offset, range.end_offset
             ))
         })?;
-        body_offset = range_end;
-
+        let mut source_offset = range.start_offset;
         let mut pos = 0usize;
         if range.starts_with_header {
+            if source_cipher.is_some() {
+                source_offset = source_offset
+                    .checked_add(MVCC_LOG_HEADER_SIZE as u64)
+                    .filter(|&end| end <= range.end_offset)
+                    .ok_or_else(|| {
+                        Error::DatabaseSyncEngineError("invalid MVCC source range header".into())
+                    })?;
+            }
             running_crc = Some(validate_mvcc_log_header(range_body)?);
             pos = MVCC_LOG_HEADER_SIZE;
         } else if let Some(seed) = range.crc_seed.as_deref() {
@@ -1665,67 +1684,116 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
             )));
         }
 
-        while pos < range_body.len() {
+        while if source_cipher.is_some() {
+            source_offset < range.end_offset
+        } else {
+            pos < range_body.len()
+        } {
             let frame_start = pos;
-            if range_body.len() - pos < MVCC_TX_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
-                return Err(Error::DatabaseSyncEngineError(
-                    "truncated MVCC logical-log transaction frame".to_string(),
-                ));
-            }
-            let frame_magic = read_u32_le(range_body, pos)?;
-            let has_extension_header = frame_magic == MVCC_TX_EXT_FRAME_MAGIC;
-            if frame_magic != MVCC_TX_FRAME_MAGIC && !has_extension_header {
-                return Err(Error::DatabaseSyncEngineError(format!(
-                    "invalid MVCC logical-log transaction frame magic at range offset {frame_start}"
-                )));
-            }
-            let header_size = if has_extension_header {
-                if range_body.len() - pos < MVCC_TX_EXT_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
-                    return Err(Error::DatabaseSyncEngineError(
-                        "truncated MVCC logical-log transaction frame".to_string(),
-                    ));
-                }
-                MVCC_TX_EXT_HEADER_SIZE
-            } else {
-                MVCC_TX_HEADER_SIZE
-            };
-            let payload_size =
-                usize::try_from(read_u64_le(range_body, pos + 4)?).map_err(|_| {
-                    Error::DatabaseSyncEngineError(
-                        "MVCC logical-log recovery payload size overflows usize".to_string(),
-                    )
-                })?;
-            let op_count = read_u32_le(range_body, pos + 12)?;
-            let (extension_size, extension_record_count) = if has_extension_header {
-                let extension_size =
-                    usize::try_from(read_u64_le(range_body, pos + 24)?).map_err(|_| {
-                        Error::DatabaseSyncEngineError(
-                            "MVCC logical-log extension size overflows usize".to_string(),
+            let (header_size, payload_size, extension_size, extension_record_count) =
+                match source_cipher {
+                    Some(cipher) => {
+                        use turso_core::mvcc::persistent_storage::logical_log::frame_codec::inspect_frame_prefix_with_overhead;
+                        let layout = inspect_frame_prefix_with_overhead(
+                            &range_body[pos..],
+                            Some((cipher.tag_size(), cipher.nonce_size())),
+                        )?
+                        .ok_or_else(|| {
+                            Error::DatabaseSyncEngineError(
+                                "truncated MVCC source frame header".into(),
+                            )
+                        })?;
+                        source_offset = source_offset
+                            .checked_add(layout.stored_size() as u64)
+                            .filter(|&end| end <= range.end_offset)
+                            .ok_or_else(|| {
+                                Error::DatabaseSyncEngineError(
+                                    "MVCC source frame exceeds range boundary".into(),
+                                )
+                            })?;
+                        (
+                            layout.header_size(),
+                            layout.recovery_size(),
+                            layout.extension_size(),
+                            layout.extension_records(),
                         )
-                    })?;
-                let extension_record_count = read_u32_le(range_body, pos + 32)?;
-                let frame_flags = read_u32_le(range_body, pos + 36)?;
-                if frame_flags & !MVCC_TX_FLAG_HAS_EXTENSION_BLOCK != 0 {
-                    return Err(Error::DatabaseSyncEngineError(format!(
-                        "unsupported MVCC logical-log transaction flags {frame_flags:#x}"
-                    )));
-                }
-                if extension_size == 0 && extension_record_count != 0 {
-                    return Err(Error::DatabaseSyncEngineError(
-                        "MVCC logical-log frame has extension record count without extension block"
-                            .to_string(),
-                    ));
-                }
-                if extension_size > 0 && frame_flags & MVCC_TX_FLAG_HAS_EXTENSION_BLOCK == 0 {
-                    return Err(Error::DatabaseSyncEngineError(
-                        "MVCC logical-log frame has extension block without extension flag"
-                            .to_string(),
-                    ));
-                }
-                (extension_size, extension_record_count)
-            } else {
-                (0, 0)
-            };
+                    }
+                    None => {
+                        if range_body.len() - pos < MVCC_TX_HEADER_SIZE + MVCC_TX_TRAILER_SIZE {
+                            return Err(Error::DatabaseSyncEngineError(
+                                "truncated MVCC logical-log transaction frame".to_string(),
+                            ));
+                        }
+                        let frame_magic = read_u32_le(range_body, pos)?;
+                        let has_extension_header = frame_magic == MVCC_TX_EXT_FRAME_MAGIC;
+                        if frame_magic != MVCC_TX_FRAME_MAGIC && !has_extension_header {
+                            return Err(Error::DatabaseSyncEngineError(format!(
+                            "invalid MVCC logical-log transaction frame magic at range offset {frame_start}"
+                        )));
+                        }
+                        let header_size = if has_extension_header {
+                            if range_body.len() - pos
+                                < MVCC_TX_EXT_HEADER_SIZE + MVCC_TX_TRAILER_SIZE
+                            {
+                                return Err(Error::DatabaseSyncEngineError(
+                                    "truncated MVCC logical-log transaction frame".to_string(),
+                                ));
+                            }
+                            MVCC_TX_EXT_HEADER_SIZE
+                        } else {
+                            MVCC_TX_HEADER_SIZE
+                        };
+                        let payload_size = usize::try_from(read_u64_le(range_body, pos + 4)?)
+                            .map_err(|_| {
+                                Error::DatabaseSyncEngineError(
+                                    "MVCC logical-log recovery payload size overflows usize"
+                                        .to_string(),
+                                )
+                            })?;
+                        let (extension_size, extension_record_count) = if has_extension_header {
+                            let extension_size = usize::try_from(read_u64_le(
+                                range_body,
+                                pos + 24,
+                            )?)
+                            .map_err(|_| {
+                                Error::DatabaseSyncEngineError(
+                                    "MVCC logical-log extension size overflows usize".to_string(),
+                                )
+                            })?;
+                            let extension_record_count = read_u32_le(range_body, pos + 32)?;
+                            let frame_flags = read_u32_le(range_body, pos + 36)?;
+                            if frame_flags & !MVCC_TX_FLAG_HAS_EXTENSION_BLOCK != 0 {
+                                return Err(Error::DatabaseSyncEngineError(format!(
+                                "unsupported MVCC logical-log transaction flags {frame_flags:#x}"
+                            )));
+                            }
+                            if extension_size == 0 && extension_record_count != 0 {
+                                return Err(Error::DatabaseSyncEngineError(
+                                "MVCC logical-log frame has extension record count without extension block"
+                                    .to_string(),
+                            ));
+                            }
+                            if extension_size > 0
+                                && frame_flags & MVCC_TX_FLAG_HAS_EXTENSION_BLOCK == 0
+                            {
+                                return Err(Error::DatabaseSyncEngineError(
+                                "MVCC logical-log frame has extension block without extension flag"
+                                    .to_string(),
+                            ));
+                            }
+                            (extension_size, extension_record_count)
+                        } else {
+                            (0, 0)
+                        };
+                        (
+                            header_size,
+                            payload_size,
+                            extension_size,
+                            extension_record_count,
+                        )
+                    }
+                };
+            let op_count = read_u32_le(range_body, pos + 12)?;
 
             let extension_start = pos.checked_add(header_size).ok_or_else(|| {
                 Error::DatabaseSyncEngineError("MVCC logical-log frame offset overflow".to_string())
@@ -1793,6 +1861,9 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
             ops += frame_ops;
             pos = frame_end;
         }
+        body_offset = body_offset.checked_add(pos).ok_or_else(|| {
+            Error::DatabaseSyncEngineError("MVCC logical-log range length overflow".into())
+        })?;
         previous_range_boundary = Some((range.generation, range.end_offset));
     }
 
@@ -4603,40 +4674,376 @@ mod tests {
         (frame, crc)
     }
 
+    fn staging_test_crypto() -> turso_core::EncryptionContext {
+        turso_core::EncryptionContext::new(
+            turso_core::CipherMode::Aes256Gcm,
+            &turso_core::EncryptionKey::new_256([3; 32]),
+            super::PAGE_SIZE,
+        )
+        .unwrap()
+    }
+
     fn decode_raw_mvcc_log_for_test(
         header: PullUpdatesRespProtoBody,
         body: Vec<u8>,
     ) -> Result<Vec<LogicalTxnData>> {
-        let temp = NamedTempFile::new().unwrap();
-        let path = temp.path().to_owned();
-        let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let file = core_io
-            .open_file(path.to_str().unwrap(), turso_core::OpenFlags::Create, false)
-            .unwrap();
-        let mut gen = genawaiter::sync::Gen::new({
-            let file = file.clone();
-            move |coro| async move {
+        decode_raw_mvcc_log_with_source_for_test(header, body, None)
+    }
+
+    fn decode_raw_mvcc_log_with_source_for_test(
+        header: PullUpdatesRespProtoBody,
+        body: Vec<u8>,
+        source_cipher: Option<turso_core::CipherMode>,
+    ) -> Result<Vec<LogicalTxnData>> {
+        let mut previous = None;
+        for crypto in [None, Some(staging_test_crypto())] {
+            let temp = NamedTempFile::new().unwrap();
+            let core_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+            let file = core_io
+                .open_file(
+                    temp.path().to_str().unwrap(),
+                    turso_core::OpenFlags::Create,
+                    false,
+                )
+                .unwrap();
+            let header =
+                PullUpdatesRespProtoBody::decode(header.encode_to_vec().as_slice()).unwrap();
+            let body = body.clone();
+            let mut gen = genawaiter::sync::Gen::new(move |coro| async move {
                 let coro: Coro<()> = coro.into();
-                super::decode_raw_mvcc_logical_log_to_file(&coro, &file, &body, &header).await?;
-                Result::Ok(())
-            }
-        });
-        loop {
-            match gen.resume_with(Ok(())) {
-                genawaiter::GeneratorState::Yielded(..) => {}
-                genawaiter::GeneratorState::Complete(result) => {
-                    result?;
-                    break;
+                let mut staging = super::ChangesFile::new(file, crypto);
+                let result = super::decode_raw_mvcc_logical_log_to_staging(
+                    &coro,
+                    &mut staging,
+                    &body,
+                    &header,
+                    source_cipher,
+                )
+                .await;
+                if result.is_err() {
+                    assert!(
+                        staging.sealed().is_err(),
+                        "failed download must not be sealed"
+                    );
+                }
+                result?;
+                let mut reader = staging
+                    .open_reader(&coro, Some(super::ChangeKind::Logical))
+                    .await?;
+                let mut txns = Vec::new();
+                while let Some(record) = reader.next_record(&coro).await? {
+                    let mut bytes = record.as_slice();
+                    txns.push(LogicalTxnData::decode(&mut bytes).unwrap());
+                    assert!(bytes.is_empty());
+                }
+                Result::Ok(txns)
+            });
+            let result = loop {
+                match gen.resume_with(Ok(())) {
+                    genawaiter::GeneratorState::Yielded(..) => core_io.step().unwrap(),
+                    genawaiter::GeneratorState::Complete(result) => break result,
+                }
+            };
+            if let Some(previous) = previous {
+                match (previous, result) {
+                    (Ok(expected), Ok(actual)) => {
+                        assert_eq!(expected, actual);
+                        return Ok(actual);
+                    }
+                    (Err(expected), Err(actual)) => {
+                        assert_eq!(format!("{expected}"), format!("{actual}"));
+                        return Err(actual);
+                    }
+                    other => panic!("plaintext/encrypted staging disagreed: {other:?}"),
                 }
             }
+            previous = Some(result);
         }
+        unreachable!()
+    }
 
-        let mut bytes = BytesMut::from(std::fs::read(path).unwrap().as_slice());
-        let mut txns = Vec::new();
-        while let Some(txn) = super::take_proto_message_from_bytes::<LogicalTxnData>(&mut bytes)? {
-            txns.push(txn);
+    #[test]
+    fn plaintext_mvcc_accepts_empty_extension_flag_and_validates_frame() {
+        let seed = 1234u32;
+        let mut frame = vec![0u8; super::MVCC_TX_EXT_HEADER_SIZE];
+        frame[..4].copy_from_slice(&super::MVCC_TX_EXT_FRAME_MAGIC.to_le_bytes());
+        frame[16..24].copy_from_slice(&77u64.to_le_bytes());
+        frame[36..40].copy_from_slice(&super::MVCC_TX_FLAG_HAS_EXTENSION_BLOCK.to_le_bytes());
+        let crc = crc32c::crc32c_append(seed, &frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        frame.extend_from_slice(&super::MVCC_TX_END_MAGIC.to_le_bytes());
+        let start = super::MVCC_LOG_HEADER_SIZE as u64;
+        let end = start + frame.len() as u64;
+        let response = |end_offset| PullUpdatesRespProtoBody {
+            mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                format: "lml3".into(),
+                checkpoint_transition: false,
+                ranges: vec![server_proto::MvccLogicalLogRangeProto {
+                    generation: 1,
+                    start_offset: start,
+                    end_offset,
+                    starts_with_header: false,
+                    crc_seed: Some(seed.to_le_bytes().to_vec()),
+                }],
+            }),
+            ..Default::default()
+        };
+        assert!(decode_raw_mvcc_log_for_test(response(end), frame.clone())
+            .expect("plaintext decoder accepts an empty flagged extension")
+            .is_empty());
+
+        let mut bad_crc = frame.clone();
+        bad_crc[super::MVCC_TX_EXT_HEADER_SIZE] ^= 1;
+        let error = decode_raw_mvcc_log_for_test(response(end), bad_crc)
+            .expect_err("plaintext decoder must still validate the checksum");
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+        assert!(
+            decode_raw_mvcc_log_for_test(response(end), frame[..frame.len() - 1].to_vec()).is_err()
+        );
+        assert!(decode_raw_mvcc_log_for_test(response(start - 1), frame.clone()).is_err());
+
+        let error = decode_raw_mvcc_log_with_source_for_test(
+            response(end),
+            frame,
+            Some(turso_core::CipherMode::Aes256Gcm),
+        )
+        .expect_err("encrypted source must still use frame layout validation");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid logical log extension flags or count"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn source_layout_derives_multiple_wire_ranges_for_every_cipher() {
+        use turso_core::CipherMode::{
+            Aegis128L, Aegis128X2, Aegis128X4, Aegis256, Aegis256X2, Aegis256X4, Aes128Gcm,
+            Aes256Gcm,
+        };
+        for cipher in [
+            None,
+            Some(Aes128Gcm),
+            Some(Aes256Gcm),
+            Some(Aegis128L),
+            Some(Aegis128X2),
+            Some(Aegis128X4),
+            Some(Aegis256),
+            Some(Aegis256X2),
+            Some(Aegis256X4),
+        ] {
+            let mut ranges = Vec::new();
+            let mut body = Vec::new();
+            let mut source_end = 0;
+            for (i, sizes) in [vec![0usize, 32767], vec![32768, 32769], vec![0, 65536]]
+                .into_iter()
+                .enumerate()
+            {
+                let header = i != 1;
+                let start = if header { 0 } else { source_end };
+                source_end = start;
+                let mut crc = crc32c::crc32c(&(1234 + i as u64).to_le_bytes());
+                let seed = crc;
+                if header {
+                    body.extend(raw_mvcc_log_header(1234 + i as u64));
+                    source_end += 56;
+                }
+                for size in sizes {
+                    let frame = compact_wire_frame(size, crc);
+                    crc = u32::from_le_bytes(
+                        frame[frame.len() - 8..frame.len() - 4].try_into().unwrap(),
+                    );
+                    source_end += frame.len() as u64
+                        + (size.div_ceil(32768)
+                            * cipher.map_or(0, |c| c.tag_size() + c.nonce_size()))
+                            as u64;
+                    body.extend(frame);
+                }
+                ranges.push(server_proto::MvccLogicalLogRangeProto {
+                    generation: if i == 2 { 2 } else { 1 },
+                    start_offset: start,
+                    end_offset: source_end,
+                    starts_with_header: header,
+                    crc_seed: (!header).then(|| seed.to_le_bytes().to_vec()),
+                });
+            }
+            let response = |ranges| PullUpdatesRespProtoBody {
+                mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                    format: "lml3".into(),
+                    checkpoint_transition: true,
+                    ranges,
+                }),
+                ..Default::default()
+            };
+            assert!(decode_raw_mvcc_log_with_source_for_test(
+                response(ranges.clone()),
+                body.clone(),
+                cipher
+            )
+            .unwrap()
+            .is_empty());
+            for damaged in [
+                body[..body.len() - 1].to_vec(),
+                [body.as_slice(), &[0]].concat(),
+            ] {
+                assert!(decode_raw_mvcc_log_with_source_for_test(
+                    response(ranges.clone()),
+                    damaged,
+                    cipher
+                )
+                .is_err());
+            }
+            let mut overshoot = ranges.clone();
+            overshoot[0].end_offset -= 1;
+            assert!(decode_raw_mvcc_log_with_source_for_test(
+                response(overshoot),
+                body.clone(),
+                cipher
+            )
+            .is_err());
+            if cipher.is_some() {
+                ranges[1].crc_seed = None;
+                let error = decode_raw_mvcc_log_with_source_for_test(
+                    response(ranges),
+                    body.clone(),
+                    cipher,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("missing CRC seed"), "{error}");
+            }
         }
-        Ok(txns)
+    }
+
+    #[test]
+    fn encrypted_source_layout_rejects_overflow_and_truncated_headers() {
+        let cipher = turso_core::CipherMode::Aes256Gcm;
+        let mut frame = compact_wire_frame(1, 0);
+        let range = server_proto::MvccLogicalLogRangeProto {
+            generation: 1,
+            start_offset: 56,
+            end_offset: u64::MAX,
+            starts_with_header: false,
+            crc_seed: Some(vec![0; 4]),
+        };
+        frame[4..12].copy_from_slice(&u64::MAX.to_le_bytes());
+        let decode = |range, frame| {
+            let header = PullUpdatesRespProtoBody {
+                mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                    format: "lml3".into(),
+                    checkpoint_transition: false,
+                    ranges: vec![range],
+                }),
+                ..Default::default()
+            };
+            decode_raw_mvcc_log_with_source_for_test(header, frame, Some(cipher))
+        };
+        assert!(decode(range.clone(), frame.clone()).is_err());
+        assert!(decode(range.clone(), frame[..23].to_vec()).is_err());
+        let mut range = range;
+        range.start_offset = u64::MAX - 1;
+        assert!(decode(range, compact_wire_frame(0, 0)).is_err());
+    }
+
+    #[test]
+    fn encrypted_source_ranges_require_exact_boundaries_and_valid_frame_contents() {
+        let cipher = turso_core::CipherMode::Aes256Gcm;
+        let salt = 1234u64;
+        let seed = crc32c::crc32c(&salt.to_le_bytes());
+        let first = compact_wire_frame(1, seed);
+        let first_crc =
+            u32::from_le_bytes(first[first.len() - 8..first.len() - 4].try_into().unwrap());
+        let portable = super::PortableLogicalTxn {
+            end_offset: 104,
+            commit_ts: 77,
+            string_table: Vec::new(),
+            object_map: Vec::new(),
+            meta: Vec::new(),
+        }
+        .encode_length_delimited_to_vec();
+        let (second, _) = raw_mvcc_log_frame_with_crc(77, &portable, &[], 0, first_crc);
+        let header = raw_mvcc_log_header(salt);
+        let body = [header.as_slice(), &first, &second].concat();
+        let end = (body.len() + 2 * (cipher.tag_size() + cipher.nonce_size())) as u64;
+        let range = server_proto::MvccLogicalLogRangeProto {
+            generation: 1,
+            start_offset: 0,
+            end_offset: end,
+            starts_with_header: true,
+            crc_seed: None,
+        };
+        let decode = |range, body| {
+            let header = PullUpdatesRespProtoBody {
+                mvcc_log: Some(server_proto::MvccLogicalLogMetadataProto {
+                    format: "lml3".into(),
+                    checkpoint_transition: false,
+                    ranges: vec![range],
+                }),
+                ..Default::default()
+            };
+            decode_raw_mvcc_log_with_source_for_test(header, body, Some(cipher))
+        };
+        assert!(decode(range.clone(), body.clone()).unwrap().is_empty());
+        for cut in 0..body.len() {
+            assert!(
+                decode(range.clone(), body[..cut].to_vec()).is_err(),
+                "wire cut {cut}"
+            );
+        }
+        for boundary in 0..=end + 1 {
+            if boundary != end {
+                let mut damaged = range.clone();
+                damaged.end_offset = boundary;
+                assert!(
+                    decode(damaged, body.clone()).is_err(),
+                    "source end {boundary}"
+                );
+            }
+        }
+        let mut backwards = range.clone();
+        backwards.start_offset = end + 1;
+        assert!(decode(backwards, body.clone()).is_err());
+        assert!(decode(range.clone(), [body.as_slice(), &[0]].concat()).is_err());
+        for offset in [
+            super::MVCC_LOG_HEADER_CRC_START,
+            header.len() + super::MVCC_TX_HEADER_SIZE,
+            header.len() + first.len() - 1,
+            body.len() - super::MVCC_TX_TRAILER_SIZE,
+        ] {
+            let mut damaged = body.clone();
+            damaged[offset] ^= 1;
+            assert!(
+                decode(range.clone(), damaged).is_err(),
+                "corrupt byte {offset}"
+            );
+        }
+        for (offset, value) in [(24, 0u64), (24, u64::MAX), (32, 2u64), (36, 0u64)] {
+            let mut damaged = body.clone();
+            let start = header.len() + first.len() + offset;
+            let length = if offset == 24 { 8 } else { 4 };
+            damaged[start..start + length].copy_from_slice(&value.to_le_bytes()[..length]);
+            let trailer = damaged.len() - super::MVCC_TX_TRAILER_SIZE;
+            let crc =
+                crc32c::crc32c_append(first_crc, &damaged[header.len() + first.len()..trailer]);
+            damaged[trailer..trailer + 4].copy_from_slice(&crc.to_le_bytes());
+            assert!(
+                decode(range.clone(), damaged).is_err(),
+                "extension field {offset}"
+            );
+        }
+    }
+
+    fn compact_wire_frame(size: usize, seed: u32) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend(super::MVCC_TX_FRAME_MAGIC.to_le_bytes());
+        frame.extend((size as u64).to_le_bytes());
+        frame.extend(0u32.to_le_bytes());
+        frame.extend(0u64.to_le_bytes());
+        frame.extend(vec![42; size]);
+        let crc = crc32c::crc32c_append(seed, &frame);
+        frame.extend(crc.to_le_bytes());
+        frame.extend(super::MVCC_TX_END_MAGIC.to_le_bytes());
+        frame
     }
 
     fn read_logical_txns_from_path(path: &std::path::Path) -> Result<Vec<LogicalTxnData>> {
@@ -4834,6 +5241,20 @@ mod tests {
 
     #[test]
     fn pull_updates_v1_decodes_raw_mvcc_log_stream() {
+        check_pull_updates_v1_decodes_raw_mvcc_log_stream(false, false);
+    }
+
+    #[test]
+    fn pull_updates_v1_decodes_transformed_mvcc_log_stream_with_source_revision() {
+        check_pull_updates_v1_decodes_raw_mvcc_log_stream(true, false);
+    }
+
+    #[test]
+    fn pull_updates_v1_rejects_zero_wire_length_for_nonempty_source_range() {
+        check_pull_updates_v1_decodes_raw_mvcc_log_stream(true, true);
+    }
+
+    fn check_pull_updates_v1_decodes_raw_mvcc_log_stream(transformed: bool, invalid_length: bool) {
         let table_id = -42;
         let record = record(&[turso_core::Value::build_text("logical")]);
         let expected_txn = LogicalTxnData {
@@ -4871,7 +5292,10 @@ mod tests {
         let (raw_frame, _) =
             raw_mvcc_log_frame_with_crc(77, &portable_payload, &recovery_payload, 1, crc_seed);
         let range_start = super::MVCC_LOG_HEADER_SIZE as u64;
-        let range_end = range_start + raw_frame.len() as u64;
+        let range_end = range_start
+            + raw_frame.len() as u64
+            + if transformed { 28 } else { 0 }
+            + u64::from(invalid_length);
         let header = PullUpdatesRespProtoBody {
             protocol: 0,
             server_revision: format!("g1:o{range_end}"),
@@ -4915,12 +5339,17 @@ mod tests {
             move |coro| async move {
                 let coro: Coro<()> = coro.into();
                 let stats = SyncEngineIoStats::new(io.clone());
-                let ctx = SyncOperationCtx::new(
+                let mut ctx = SyncOperationCtx::new(
                     &coro,
                     &stats,
                     Some("https://example.com".to_string()),
                     None,
                 );
+                if transformed {
+                    ctx.encryption_cipher = Some(turso_core::CipherMode::Aes256Gcm);
+                    ctx.remote_encryption_key =
+                        Some(crate::types::Secret::new("cloud".to_string()));
+                }
                 let (revision, result, _) =
                     pull_updates_v1(&ctx, &file, "g1:o56", None, true).await?;
                 let DatabasePullRevision::V1 { revision } = revision else {
@@ -4935,6 +5364,10 @@ mod tests {
             match gen.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(..) => {}
                 genawaiter::GeneratorState::Complete(result) => {
+                    if invalid_length {
+                        assert!(result.is_err());
+                        return;
+                    }
                     result.unwrap();
                     break;
                 }
