@@ -89,7 +89,9 @@ keeps the role, and `DISCARD ALL` resets it.
 Ownership and `GRANT` are not supported yet. A role that is not a superuser
 therefore has no privileges on tables, views, or sequences, and cannot create
 or drop objects, create roles, or `COPY FROM` a file. It can still run
-statements that use no database objects, such as `SELECT 1`, and switch roles.
+statements that use no database objects, such as `SELECT 1`, read the
+`pg_catalog` tables, change settings with `SET` and show them with `SHOW`, and
+switch roles.
 
 **Examples:**
 
