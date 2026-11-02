@@ -15,6 +15,7 @@ pub mod server_proto;
 // Used by the engine integration in the next stacked PR.
 #[allow(dead_code)]
 mod sync_cipher;
+pub mod sync_encryption;
 pub mod types;
 pub mod wal_session;
 
