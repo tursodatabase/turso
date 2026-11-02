@@ -200,7 +200,7 @@ fn prepare_and_optimize_update_plan(
     update_plan.from_tables = read_scope_tables;
 
     let mut plan = Plan::Update(Box::new(update_plan));
-    optimize_plan(program, &mut plan, resolver)?;
+    optimize_plan(program, &mut plan, resolver, connection)?;
     Ok(plan)
 }
 

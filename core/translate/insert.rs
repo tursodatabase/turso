@@ -563,6 +563,7 @@ pub fn translate_insert(
         TriggerTime::Before,
         None,
         &btree_table,
+        connection,
     );
 
     // The inserted values are the user's values until ENCODE runs below.
@@ -1039,6 +1040,7 @@ pub fn translate_insert(
         TriggerTime::After,
         None,
         &btree_table,
+        connection,
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
@@ -2321,6 +2323,7 @@ fn init_source_emission<'a>(
         TriggerEvent::Insert,
         None,
         ctx.table.as_ref(),
+        connection,
     );
 
     let (num_values, cursor_id) = match body {
