@@ -406,6 +406,33 @@ impl ObjectAccess {
         }
     }
 
+    /// A built-in object, owned by the superuser, with `privileges` granted
+    /// to every role on top of the kind's defaults.
+    pub fn builtin_with_public(kind: ObjectKind, privileges: Privileges) -> ObjectAccess {
+        let mut access = ObjectAccess::default_for(kind, RoleId::SUPERUSER);
+        access.acl.grant(
+            RoleId::PUBLIC,
+            privileges,
+            Privileges::NONE,
+            RoleId::SUPERUSER,
+        );
+        access
+    }
+
+    /// A built-in object that every role may read, such as a catalog table.
+    pub fn readable_by_everyone(kind: ObjectKind) -> ObjectAccess {
+        ObjectAccess::builtin_with_public(kind, Privileges::of(Privilege::Select))
+    }
+
+    /// A built-in object that only the superuser may use, such as a function
+    /// that reads the process or the database file.
+    pub fn superuser_only() -> ObjectAccess {
+        ObjectAccess {
+            owner: RoleId::SUPERUSER,
+            acl: Acl::empty(),
+        }
+    }
+
     pub fn allows(&self, role: RoleId, privilege: Privilege) -> bool {
         self.acl.privileges_of(role).contains(privilege)
     }

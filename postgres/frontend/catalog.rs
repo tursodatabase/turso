@@ -8,6 +8,8 @@ use turso_core::{
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
+    security::acl_catalog::ObjectKey,
+    security::privilege::{ObjectAccess, ObjectKind, Privilege, Privileges},
     security::roles::{Role, RoleCatalog, RoleId},
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
     Result, Statement, Value, WalkControl,
@@ -170,7 +172,9 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
+        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)?;
+        register_catalog_privileges(schema);
+        Ok(())
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -825,6 +829,64 @@ pub(crate) fn postgres_roles(roles: &RoleCatalog) -> impl Iterator<Item = Role> 
         superuser: true,
     };
     std::iter::once(superuser).chain(roles.iter().cloned())
+}
+
+/// The catalog tables of `register_catalog_modules`. The other modules there
+/// are functions, which every role may execute by default.
+const CATALOG_TABLES: &[&str] = &[
+    "pg_class",
+    "pg_namespace",
+    "pg_attribute",
+    "pg_roles",
+    "pg_am",
+    "pg_proc",
+    "pg_database",
+    "pg_tables",
+    "pg_indexes",
+    "pg_information_schema_schemata",
+    "pg_index",
+    "pg_constraint",
+    "pg_type",
+    "pg_attrdef",
+    "pg_sequence",
+    "pg_sequences",
+    "pg_settings",
+    "pg_extension",
+    "pg_policy",
+    "pg_trigger",
+    "pg_statistic_ext",
+    "pg_inherits",
+    "pg_rewrite",
+    "pg_foreign_table",
+    "pg_partitioned_table",
+    "pg_collation",
+    "pg_description",
+    "pg_seclabels",
+    "pg_publication",
+    "pg_publication_namespace",
+    "pg_publication_rel",
+    "pg_depend",
+    "pg_tablespace",
+    "pg_init_privs",
+    "pg_cast",
+    "pg_transform",
+];
+
+/// Registers what every role may do with the catalog, as PostgreSQL does
+/// when it creates a database: read every catalog table, and use the
+/// `public` schema.
+fn register_catalog_privileges(schema: &mut Schema) {
+    let acls = Arc::make_mut(&mut schema.acls);
+    for table in CATALOG_TABLES {
+        acls.register_builtin(
+            ObjectKey::root(ObjectKind::Table, *table),
+            ObjectAccess::readable_by_everyone(ObjectKind::Table),
+        );
+    }
+    acls.register_builtin(
+        ObjectKey::root(ObjectKind::Schema, "public"),
+        ObjectAccess::builtin_with_public(ObjectKind::Schema, Privileges::of(Privilege::Usage)),
+    );
 }
 
 /// Virtual table implementation for pg_catalog.pg_roles.
@@ -4101,6 +4163,26 @@ mod tests {
             .unwrap();
         conn.set_search_path(Some(vec!["public".to_string()]));
         conn
+    }
+
+    #[test]
+    fn every_role_may_read_the_catalog_tables_and_use_the_public_schema() {
+        let schema = Schema::with_options(true, &PostgresDialect).unwrap();
+        let alice = RoleId::from_stored(7).unwrap();
+
+        for table in CATALOG_TABLES {
+            let access = schema
+                .acls
+                .get(&ObjectKey::root(ObjectKind::Table, *table))
+                .unwrap();
+            assert!(access.allows(alice, Privilege::Select), "{table}");
+        }
+        let public = schema
+            .acls
+            .get(&ObjectKey::root(ObjectKind::Schema, "public"))
+            .unwrap();
+        assert!(public.allows(alice, Privilege::Usage));
+        assert!(!public.allows(alice, Privilege::Create));
     }
 
     #[test]
