@@ -35,6 +35,7 @@ use crate::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
             TableReferences,
         },
+        row_security,
         trigger::create_trigger_to_sql,
     },
     util::{
@@ -1548,13 +1549,16 @@ pub fn translate_alter_table(
                 },
             )?
         }
-        ast::AlterTableBody::RowSecurity(_) => {
-            return Err(LimboError::ParseError(
-                "ALTER TABLE ... ROW LEVEL SECURITY is not supported".to_string(),
-            ));
+        ast::AlterTableBody::RowSecurity(enable) => {
+            row_security::translate_row_security_change(
+                namespace, table_name, enable, resolver, program,
+            )?;
         }
         ast::AlterTableBody::RenameTo(new_name) => {
             reject_dependent_materialized_views(resolver, namespace, table_name)?;
+            row_security::reject_rename_of_table_with_row_security(
+                table_name, namespace, resolver,
+            )?;
             let new_name = new_name.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);

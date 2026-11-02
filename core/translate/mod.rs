@@ -36,6 +36,7 @@ pub(crate) mod result_column_types;
 pub(crate) mod result_row;
 pub(crate) mod roles;
 pub(crate) mod rollback;
+pub(crate) mod row_security;
 pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod sequence;
@@ -150,6 +151,9 @@ pub fn translate(
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
+    if !is_engine_statement {
+        resolver.row_security_role = connection.row_security_role()?;
+    }
 
     walk_stmt_expressions(&stmt, &mut |expr| {
         if let ast::Expr::Variable(variable) = expr {

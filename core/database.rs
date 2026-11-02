@@ -6,6 +6,7 @@
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
 use crate::security::roles::ROLES_TABLE_NAME;
+use crate::security::row_security::ROW_SECURITY_TABLE_NAME;
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -353,6 +354,9 @@ pub enum OpenDbAsyncPhase {
     /// bootstrap, because before it an MVCC database has no table roots and
     /// has not replayed its logical log.
     LoadingRoles,
+    /// Reads the row-level security table into its catalog, after MVCC
+    /// bootstrap for the same reason as `LoadingRoles`.
+    LoadingRowSecurity,
     Done,
 }
 
@@ -579,6 +583,10 @@ pub struct OpenDbAsyncState {
     /// across yields.
     roles_stmt: Option<Box<Statement>>,
     role_rows: Vec<Vec<Value>>,
+    /// The row-level security table scan of `LoadingRowSecurity` and the rows
+    /// read so far, held across yields.
+    row_security_stmt: Option<Box<Statement>>,
+    row_security_rows: Vec<crate::security::row_security::RowSecurityRow>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -605,6 +613,8 @@ impl OpenDbAsyncState {
             mvcc_convert_stmt: None,
             roles_stmt: None,
             role_rows: Vec::new(),
+            row_security_stmt: None,
+            row_security_rows: Vec::new(),
         }
     }
 }
@@ -1850,6 +1860,49 @@ impl Database {
                             Arc::new(crate::security::roles::RoleCatalog::new(&state.role_rows)?);
                         db.with_schema_mut(|schema| {
                             schema.roles = roles;
+                            Ok(())
+                        })?;
+                    }
+
+                    state.phase = OpenDbAsyncPhase::LoadingRowSecurity;
+                }
+
+                OpenDbAsyncPhase::LoadingRowSecurity => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    if state.row_security_stmt.is_none() {
+                        let schema = db.schema.lock().clone();
+                        let has_row_security_table = db.dialect().supports_roles()
+                            && schema
+                                .get_btree_table(NamespaceId::ROOT, ROW_SECURITY_TABLE_NAME)
+                                .is_some();
+                        *conn.schema.write() = schema;
+                        if has_row_security_table {
+                            state.row_security_stmt =
+                                Some(Box::new(conn.prepare_row_security_read()?));
+                        }
+                    }
+                    if let Some(stmt) = state.row_security_stmt.as_mut() {
+                        let rows = &mut state.row_security_rows;
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            rows.push(crate::security::row_security::RowSecurityRow::from_row(
+                                row,
+                            )?);
+                            Ok(())
+                        }));
+                        state.row_security_stmt = None;
+                        let catalog =
+                            Arc::new(crate::security::row_security::RowSecurityCatalog::load(
+                                &state.row_security_rows,
+                            )?);
+                        db.with_schema_mut(|schema| {
+                            schema.row_security = catalog;
                             Ok(())
                         })?;
                     }

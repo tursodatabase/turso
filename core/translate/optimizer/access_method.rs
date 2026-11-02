@@ -1078,6 +1078,12 @@ fn find_best_access_method_for_btree(
             return Ok(Some(best_access_method));
         }
 
+        // Multi-index scans evaluate their branch conditions before the
+        // table's row-level security filter.
+        if table_references.is_row_security_filtered(rhs_table.internal_id) {
+            return Ok(Some(best_access_method));
+        }
+
         if let Some(multi_idx_method) = consider_multi_index_union(
             rhs_table,
             where_clause,

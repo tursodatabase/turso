@@ -5,6 +5,9 @@ use crate::error::io_error;
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
 use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
+use crate::security::row_security::{
+    RowSecurityCatalog, RowSecurityRow, ROW_SECURITY_TABLE_NAME, SELECT_ROW_SECURITY_SQL,
+};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -271,6 +274,12 @@ enum ReparsePhase {
     LoadRoles {
         stmt: Box<Statement>,
         rows: Vec<Vec<Value>>,
+    },
+    /// Loading the tables with row-level security. Unlike custom types this
+    /// is not best-effort: a missing row would show rows a role must not see.
+    LoadRowSecurity {
+        stmt: Box<Statement>,
+        rows: Vec<RowSecurityRow>,
     },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
@@ -1723,6 +1732,14 @@ impl Connection {
                         Ok(())
                     }));
                     inner.fresh.roles = Arc::new(RoleCatalog::new(rows)?);
+                    inner.phase = self.load_row_security_phase(&inner.fresh)?;
+                }
+                ReparsePhase::LoadRowSecurity { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        rows.push(RowSecurityRow::from_row(row)?);
+                        Ok(())
+                    }));
+                    inner.fresh.row_security = Arc::new(RowSecurityCatalog::load(rows)?);
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1752,7 +1769,7 @@ impl Connection {
     }
 
     /// Returns the phase that loads the roles table into `fresh`, or the
-    /// stats refresh phase if the dialect has no roles or the database has no
+    /// phase after it if the dialect has no roles or the database has no
     /// roles table. The fresh
     /// schema is installed first, because the current schema may not contain
     /// the roles table yet.
@@ -1760,9 +1777,7 @@ impl Connection {
         if !self.db.dialect().supports_roles()
             || !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
         {
-            return Ok(ReparsePhase::RefreshStats {
-                stats: Default::default(),
-            });
+            return self.load_row_security_phase(fresh);
         }
         self.with_schema_mut(|schema| {
             *schema = fresh.try_clone()?;
@@ -1782,6 +1797,36 @@ impl Connection {
     /// transaction when the schema is read outside a transaction.
     pub(crate) fn prepare_roles_read(self: &Arc<Connection>) -> Result<Statement> {
         self.prepare_with_origin(SELECT_ROLES_SQL, StatementOrigin::EngineMetadataRead)
+    }
+
+    /// Returns the phase that loads the row-level security table into
+    /// `fresh`, or the stats refresh phase if the dialect has no roles or the
+    /// database has no such table. The fresh schema is installed first, like
+    /// for the roles table.
+    fn load_row_security_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        if !self.db.dialect().supports_roles()
+            || !fresh.has_table(NamespaceId::ROOT, ROW_SECURITY_TABLE_NAME)
+        {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare_row_security_read()?;
+        Ok(ReparsePhase::LoadRowSecurity {
+            stmt: Box::new(stmt),
+            rows: Vec::new(),
+        })
+    }
+
+    /// Prepares the read of the row-level security table, for opening the
+    /// database and for reading the schema again, the same way as
+    /// [`Self::prepare_roles_read`].
+    pub(crate) fn prepare_row_security_read(self: &Arc<Connection>) -> Result<Statement> {
+        self.prepare_with_origin(SELECT_ROW_SECURITY_SQL, StatementOrigin::EngineMetadataRead)
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -3582,6 +3627,22 @@ impl Connection {
 
     pub fn current_role_is_superuser(&self) -> bool {
         self.role_catalog().is_superuser(self.current_role())
+    }
+
+    /// The name of the current role if row policies apply to it. They apply
+    /// to every role that is not a superuser.
+    pub(crate) fn row_security_role(&self) -> Result<Option<String>> {
+        let roles = self.role_catalog();
+        let current_role = self.current_role();
+        if roles.is_superuser(current_role) {
+            return Ok(None);
+        }
+        let Some(role) = roles.get(current_role) else {
+            return Err(LimboError::InvalidArgument(
+                "the current role no longer exists".to_string(),
+            ));
+        };
+        Ok(Some(role.name.clone()))
     }
 
     /// Statements prepared under the previous role are prepared again, because

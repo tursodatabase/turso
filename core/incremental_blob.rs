@@ -289,7 +289,13 @@ impl Connection {
             ));
         }
         let fk_enforced = self.foreign_keys_enabled();
+        let hides_rows = self.row_security_role()?.is_some();
         let (table_ref, record_column) = self.with_schema_mut(|schema| {
+            if hides_rows && schema.row_security.has_row_security(table) {
+                return Err(LimboError::ParseError(format!(
+                    "blob access to table \"{table}\" with row-level security is not supported for roles"
+                )));
+            }
             if schema.is_materialized_view(NamespaceId::ROOT, table)
                 || schema.get_view(NamespaceId::ROOT, table).is_some()
             {

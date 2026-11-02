@@ -343,6 +343,11 @@ fn prepare_one_select_plan(
                     &mut table_references,
                     connection,
                 )?;
+                crate::translate::row_security::add_select_row_security_filters(
+                    &mut table_references,
+                    &mut where_predicates,
+                    resolver,
+                )?;
             }
 
             // Preallocate space for the result columns

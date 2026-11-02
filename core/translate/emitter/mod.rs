@@ -181,6 +181,10 @@ pub struct Resolver<'a> {
     /// The statement is compiled for a role that is not a superuser, which may
     /// not use a sequence or a PRAGMA anywhere, including inside a view.
     pub(crate) role_is_not_superuser: bool,
+    /// The role whose rows row-level security shows to the statement being
+    /// compiled. `None` when row policies do not apply, as for the superuser
+    /// and for statements the engine runs on its own behalf.
+    pub(crate) row_security_role: Option<String>,
 }
 
 /// The column a register stands for in [Resolver::register_columns].
@@ -392,6 +396,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
             role_is_not_superuser: false,
+            row_security_role: None,
         }
     }
 
@@ -427,6 +432,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
+            row_security_role: self.row_security_role.clone(),
         }
     }
 
@@ -444,6 +450,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             role_is_not_superuser: self.role_is_not_superuser,
+            row_security_role: self.row_security_role.clone(),
         }
     }
 
