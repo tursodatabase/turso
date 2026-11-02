@@ -33,7 +33,7 @@ use crate::{
             SeekEndState, SeekToLastState,
         },
     },
-    translate::plan::IterationDirection,
+    translate::{collate::CollationSeq, plan::IterationDirection},
     turso_assert,
     types::{
         find_compare, get_tie_breaker_from_seek_op, IOCompletions, IndexInfo, RecordCompare,
@@ -1370,13 +1370,24 @@ impl BTreeCursor {
         table: &BTreeTable,
         num_columns: usize,
     ) -> Self {
-        let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
+        let primary_key_constraint_columns = table
+            .unique_sets
+            .iter()
+            .find(|unique_set| unique_set.is_primary_key)
+            .map_or(&[][..], |unique_set| unique_set.columns.as_slice());
+        let pk_columns = table.primary_key_columns.iter().enumerate();
+        let key_info = pk_columns.map(|(i, (col_name, order))| {
             let (_, column) = table
                 .get_column(col_name)
                 .expect("WITHOUT ROWID primary key column should exist");
+            // A COLLATE in PRIMARY KEY(...) overrides the column's own collation.
+            let collation = primary_key_constraint_columns
+                .get(i)
+                .and_then(|c| c.collation)
+                .map_or_else(|| column.collation(), CollationSeq::Text);
             crate::types::KeyInfo {
                 sort_order: *order,
-                collation: column.collation(),
+                collation,
                 nulls_order: None,
             }
         });
