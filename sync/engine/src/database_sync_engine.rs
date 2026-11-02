@@ -5513,7 +5513,9 @@ mod tests {
                     Arc::new(SqliteDialect),
                 )
                 .unwrap();
-                let remote_conn = remote_db.connect(ConnectOpts::new()).unwrap();
+                let remote_conn = remote_db
+                    .connect(ConnectOpts::new(SessionRole::Superuser))
+                    .unwrap();
                 remote_conn.wal_auto_actions_disable();
                 remote_conn
                     .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
