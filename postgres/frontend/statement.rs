@@ -124,7 +124,19 @@ struct RollbackExecution {
 /// transaction state.
 pub(crate) type PostRunFn = Arc<dyn Fn(Result<()>) -> Result<()> + Send + Sync>;
 
+/// The client-visible result of a PostgreSQL statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatementResultKind {
+    /// Command completion only; internal rows must still be drained.
+    Command,
+    /// An ordinary result set, including an empty result set.
+    Rows,
+    /// Typed rows for COPY TO STDOUT, encoded by the transport.
+    CopyOut,
+}
+
 pub struct Statement {
+    result_kind: StatementResultKind,
     pub(crate) inner: turso_core::Statement,
     deferred: Option<Box<DeferredExecution>>,
     rollback: Option<Box<RollbackExecution>>,
@@ -147,6 +159,7 @@ pub struct Statement {
 impl Statement {
     pub(crate) fn new(inner: turso_core::Statement) -> Self {
         Self {
+            result_kind: StatementResultKind::Command,
             inner,
             deferred: None,
             rollback: None,
@@ -155,6 +168,16 @@ impl Statement {
             post_run: None,
             marks_query_start: false,
         }
+    }
+
+    /// Result semantics independent of core columns and read/write policy.
+    pub fn result_kind(&self) -> StatementResultKind {
+        self.result_kind
+    }
+
+    pub(crate) fn with_result_kind(mut self, result_kind: StatementResultKind) -> Self {
+        self.result_kind = result_kind;
+        self
     }
 
     pub(crate) fn new_with_post_run(inner: turso_core::Statement, post_run: PostRunFn) -> Self {

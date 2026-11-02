@@ -30,7 +30,9 @@ remain empty fields. The server sends rows individually and reports `COPY n`
 when the export succeeds.
 
 With the embedded API, `conn.prepare("COPY users TO STDOUT")` returns a normal
-statement. Call `step()` and `row()` to read ordinary column values, without
+statement whose `result_kind()` is `StatementResultKind::CopyOut`. Both this
+path and `prepare_copy_to_stdout()` preserve the typed output columns, including
+for an empty table. Call `step()` and `row()` to read ordinary column values, without
 COPY escaping or wire-protocol messages. The caller handles I/O yields as with
 other statements. To produce COPY text, pass each row to `CopyTextEncoder`.
 The embedded `execute()` API executes the statement but discards the rows.
