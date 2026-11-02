@@ -95,10 +95,13 @@ fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) {
     }
 }
 
+/// Steps `writer`'s COMMIT until it finishes or yields when the transaction
+/// `selection_key` reaches `point`. A yielded COMMIT is kept unfinished.
 struct CommitWriterOnExclusiveAcquireInjector {
     point: YieldPoint,
     selection_key: u64,
     writer: Arc<Connection>,
+    writer_commit: Mutex<Option<crate::Statement>>,
     fired: AtomicBool,
 }
 
@@ -108,12 +111,17 @@ impl CommitWriterOnExclusiveAcquireInjector {
             point,
             selection_key,
             writer,
+            writer_commit: Mutex::new(None),
             fired: AtomicBool::new(false),
         })
     }
 
     fn fired(&self) -> bool {
         self.fired.load(Ordering::Acquire)
+    }
+
+    fn take_writer_commit(&self) -> Option<crate::Statement> {
+        self.writer_commit.lock().take()
     }
 }
 
@@ -135,7 +143,17 @@ impl YieldInjector for CommitWriterOnExclusiveAcquireInjector {
         {
             return false;
         }
-        self.writer.execute("COMMIT").unwrap();
+        let mut commit = self.writer.prepare("COMMIT").unwrap();
+        loop {
+            match commit.step().unwrap() {
+                StepResult::Done => break,
+                StepResult::Yield => {
+                    *self.writer_commit.lock() = Some(commit);
+                    break;
+                }
+                _ => {}
+            }
+        }
         true
     }
 }
@@ -23051,9 +23069,8 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
 
     // tx_a: CONCURRENT update. Pin its commit inside FinalizeCommit, after
     // CommitEnd has already marked the tx Committed but before the
-    // watermark / global_header writes. tx_a is no longer Preparing at the
-    // yield, so `acquire_exclusive_tx`'s `has_preparing_tx_other_than` check
-    // lets tx_b take the slot.
+    // watermark / global_header writes. tx_b begins after tx_a's commit
+    // timestamp, so `acquire_exclusive_tx` lets tx_b take the slot.
     conn_a.execute("BEGIN CONCURRENT").unwrap();
     conn_a
         .execute("UPDATE t SET v = 'a-mod' WHERE id = 1")
@@ -23093,8 +23110,8 @@ fn test_global_header_cookie_no_regression_on_out_of_order_finalize() {
         "tx_a should be Committed (set by CommitEnd) by the time we yield in FinalizeCommit"
     );
 
-    // tx_b: exclusive DDL. tx_a is Committed so `acquire_exclusive_tx`
-    // does not see a Preparing other-than. tx_b runs end-to-end and its
+    // tx_b: exclusive DDL. tx_a committed before tx_b began, so
+    // `acquire_exclusive_tx` succeeds. tx_b runs end-to-end and its
     // FinalizeCommit writes the bumped cookie into global_header.
     conn_b.execute("BEGIN").unwrap();
     conn_b.execute("CREATE TABLE foo(x INTEGER)").unwrap();
@@ -23268,6 +23285,161 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
     let integrity = get_rows(&observer, "PRAGMA integrity_check");
     assert_eq!(integrity.len(), 1);
     assert_eq!(integrity[0][0].to_string(), "ok");
+}
+
+/// Like the test above, but the writer pauses in `FinalizeCommit`, after it is
+/// `Committed` and before it raises `last_committed_tx_ts`. The check after the
+/// CAS must still see it.
+#[test]
+fn test_create_index_exclusive_acquire_rechecks_committed_tx_after_cas() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    let mvcc_store = db.get_mvcc_store();
+    let ddl_tx_id = ddl
+        .get_mv_tx_id()
+        .expect("DDL connection should have an active MVCC transaction");
+    let injector = CommitWriterOnExclusiveAcquireInjector::new(
+        ExclusiveTxYieldPoint::AfterTimestampCheckBeforeCas.point(),
+        ddl_tx_id,
+        writer.clone(),
+    );
+    ddl.set_yield_injector(Some(injector.clone()));
+
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    let mut writer_commit = injector
+        .take_writer_commit()
+        .expect("writer COMMIT should pause before publishing last_committed_tx_ts");
+    assert!(
+        matches!(result, Err(crate::LimboError::Busy)),
+        "DDL transaction older than an already-committed writer should return Busy: {result:?}"
+    );
+    assert!(!mvcc_store.is_exclusive_tx(&ddl_tx_id));
+    ddl.set_yield_injector(None);
+    ddl.execute("ROLLBACK").unwrap();
+
+    writer.set_yield_injector(None);
+    writer_commit.run_ignore_rows().unwrap();
+    drop(writer_commit);
+
+    let observer = db.connect();
+    observer.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    let rows = get_rows(&observer, "SELECT id FROM t INDEXED BY idx_v WHERE v = 200");
+    assert_eq!(rows.len(), 1);
+}
+
+/// A writer paused in `FinalizeCommit` is already `Committed` but has not yet
+/// raised `last_committed_tx_ts`. An older transaction must still get Busy when
+/// it tries to take the exclusive lock, or its CREATE INDEX misses the row.
+#[test]
+fn test_create_index_exclusive_acquire_rechecks_committed_tx_before_watermark_publish() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+
+    let mut writer_commit = writer.prepare("COMMIT").unwrap();
+    assert!(matches!(writer_commit.step().unwrap(), StepResult::Yield));
+
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    assert!(
+        matches!(result, Err(crate::LimboError::Busy)),
+        "DDL transaction older than an already-committed writer should return Busy: {result:?}"
+    );
+    ddl.execute("ROLLBACK").unwrap();
+
+    writer.set_yield_injector(None);
+    writer_commit.run_ignore_rows().unwrap();
+    drop(writer_commit);
+
+    let observer = db.connect();
+    observer.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    let rows = get_rows(&observer, "SELECT id FROM t INDEXED BY idx_v WHERE v = 200");
+    assert_eq!(rows.len(), 1);
+    let integrity = get_rows(&observer, "PRAGMA integrity_check");
+    assert_eq!(integrity[0][0].to_string(), "ok");
+}
+
+/// Same as above, but the writer's COMMIT statement is dropped while paused in
+/// `FinalizeCommit`. Dropping it finishes the commit and removes the
+/// transaction, so an older transaction must still get Busy afterwards.
+#[test]
+fn test_create_index_exclusive_acquire_after_dropped_commit_returns_busy() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+    setup.close().unwrap();
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    let mut read = ddl.prepare("SELECT COUNT(*) FROM t").unwrap();
+    read.run_ignore_rows().unwrap();
+    drop(read);
+
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeGlobalHeaderUpdate.point(),
+    ])));
+
+    let mut writer_commit = writer.prepare("COMMIT").unwrap();
+    assert!(matches!(writer_commit.step().unwrap(), StepResult::Yield));
+    drop(writer_commit);
+    assert!(writer.get_mv_tx_id().is_none());
+
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    assert!(
+        matches!(result, Err(crate::LimboError::Busy)),
+        "DDL transaction older than a committed writer should return Busy: {result:?}"
+    );
+    ddl.execute("ROLLBACK").unwrap();
+
+    let observer = db.connect();
+    let rows = get_rows(&observer, "SELECT id FROM t WHERE id = 2");
+    assert_eq!(rows.len(), 1);
 }
 
 /// Contract test for [`crate::StepResult::Yield`]: an explicit yield (here an

@@ -567,6 +567,10 @@ fn dropped_waiter_after_log_tx_still_commits() {
         step_until_yield_or_done(&mut commit_a),
         StepResult::Yield
     ));
+    // Begins after conn_a's commit timestamp and before conn_b's.
+    let ddl = db.connect();
+    ddl.execute("BEGIN DEFERRED").unwrap();
+    get_rows(&ddl, "SELECT COUNT(*) FROM t");
     assert!(matches!(
         step_until_yield_or_done(&mut commit_b),
         StepResult::Yield
@@ -606,6 +610,12 @@ fn dropped_waiter_after_log_tx_still_commits() {
         vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]],
         "waiter dropped after log_tx must still commit"
     );
+    let result = ddl.execute("CREATE INDEX idx_v ON t(v)");
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "transaction older than the dropped waiter's commit should get Busy: {result:?}"
+    );
+    ddl.execute("ROLLBACK").unwrap();
 
     db.restart();
     let reader = db.connect();
