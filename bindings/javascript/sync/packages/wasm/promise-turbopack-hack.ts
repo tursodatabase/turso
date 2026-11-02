@@ -3,20 +3,7 @@ import { DatabasePromise, Transaction, TransactionFunction, AsyncTransactionFunc
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner, RemoteWriter, RemoteWriteStatement } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, initThreadPool, MainWorker, Database as NativeDatabase } from "./index-turbopack-hack.js";
 
-let BrowserIO: ProtocolIo = {
-    async read(path: string): Promise<Buffer | Uint8Array | null> {
-        const result = localStorage.getItem(path);
-        if (result == null) {
-            return null;
-        }
-        return new TextEncoder().encode(result);
-    },
-    async write(path: string, data: Buffer | Uint8Array): Promise<void> {
-        const array = new Uint8Array(data);
-        const value = new TextDecoder('utf-8').decode(array);
-        localStorage.setItem(path, value);
-    }
-};
+import { BrowserIO, EncryptedBrowserIO } from "./browser-io.js";
 
 function memoryIO(): ProtocolIo {
     let values = new Map();
@@ -58,7 +45,7 @@ class Database extends DatabasePromise {
     #remoteWriter: RemoteWriter | null = null;
     #db: any;
     constructor(opts: DatabaseOpts) {
-        if (opts.url == null) {
+        if (opts.url == null && opts.localEncryptionKey == null) {
             const db = new NativeDatabase(opts.path, { tracing: opts.tracing, experimental: opts.experimental }) as any;
             super(
                 db,
@@ -95,9 +82,11 @@ class Database extends DatabasePromise {
             protocolVersion: SyncEngineProtocolVersion.V1,
             longPollTimeoutMs: opts.longPollTimeoutMs,
             tracing: opts.tracing,
-            bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
+            bootstrapIfEmpty: opts.url != null && (typeof opts.url != "function" || opts.url() != null),
             experimental: opts.experimental,
-            remoteEncryption: opts.remoteEncryption?.cipher,
+            remoteEncryptionCipher: opts.remoteEncryption?.cipher,
+            remoteEncryptionKey: opts.remoteEncryption?.key,
+            localEncryptionKey: opts.localEncryptionKey,
             partialSyncOpts: partialSyncOpts,
             pushOperationsThreshold: opts.pushOperationsThreshold,
             pullBytesThreshold: opts.pullBytesThreshold,
@@ -109,7 +98,7 @@ class Database extends DatabasePromise {
             const authToken = opts.authToken;
             headers = async () => ({
                 ...(opts.authToken != null && { "Authorization": `Bearer ${await authToken()}` }),
-                ...(opts.remoteEncryption != null && {
+                ...(opts.remoteEncryption?.key != null && {
                     "x-turso-encryption-key": opts.remoteEncryption.key,
                     "x-turso-encryption-cipher": opts.remoteEncryption.cipher,
                 })
@@ -118,14 +107,14 @@ class Database extends DatabasePromise {
             const authToken = opts.authToken;
             headers = {
                 ...(opts.authToken != null && { "Authorization": `Bearer ${authToken}` }),
-                ...(opts.remoteEncryption != null && {
+                ...(opts.remoteEncryption?.key != null && {
                     "x-turso-encryption-key": opts.remoteEncryption.key,
                     "x-turso-encryption-cipher": opts.remoteEncryption.cipher,
                 })
             };
         }
         const runOpts = {
-            url: opts.url,
+            url: opts.url ?? (() => null),
             headers: headers,
             preemptionMs: 1,
             transform: opts.transform,
@@ -133,7 +122,8 @@ class Database extends DatabasePromise {
         };
         const db = engine.db() as unknown as any;
         const memory = db.memory;
-        const io = memory ? memoryIO() : BrowserIO;
+        const hostIO = opts.localEncryptionKey == null ? BrowserIO : EncryptedBrowserIO;
+        const io = memory ? memoryIO() : hostIO;
         const run = runner(runOpts, io, engine);
         super(db, () => run.wait());
 
