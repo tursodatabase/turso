@@ -3470,11 +3470,91 @@ pub unsafe extern "C" fn sqlite3_complete(sql: *const ffi::c_char) -> ffi::c_int
     if sql.is_null() {
         return 0;
     }
-    let s = CStr::from_ptr(sql).to_bytes();
-    s.iter()
-        .rev()
-        .find(|&&b| !b.is_ascii_whitespace())
-        .map_or(0, |&b| (b == b';') as ffi::c_int)
+    is_complete_statement(CStr::from_ptr(sql).to_bytes()) as ffi::c_int
+}
+
+/// Returns true if `sql` ends with a semicolon that is outside any string,
+/// quoted identifier, comment, or unfinished `CREATE TRIGGER` body.
+///
+/// This is the token state machine of SQLite's `src/complete.c`. Comments count
+/// as whitespace, and strings and quoted identifiers count as one ordinary token.
+/// A trigger body only ends at `;END;`.
+fn is_complete_statement(sql: &[u8]) -> bool {
+    const SEMI: usize = 0;
+    const WS: usize = 1;
+    const OTHER: usize = 2;
+    const EXPLAIN: usize = 3;
+    const CREATE: usize = 4;
+    const TEMP: usize = 5;
+    const TRIGGER: usize = 6;
+    const END: usize = 7;
+    const START: usize = 1;
+    #[rustfmt::skip]
+    const TRANSITIONS: [[usize; 8]; 8] = [
+        /* Token:         SEMI  WS  OTHER  EXPLAIN  CREATE  TEMP  TRIGGER  END */
+        /* 0 INVALID: */ [   1,  0,     2,       3,      4,    2,       2,   2],
+        /* 1   START: */ [   1,  1,     2,       3,      4,    2,       2,   2],
+        /* 2  NORMAL: */ [   1,  2,     2,       2,      2,    2,       2,   2],
+        /* 3 EXPLAIN: */ [   1,  3,     3,       2,      4,    2,       2,   2],
+        /* 4  CREATE: */ [   1,  4,     2,       2,      2,    4,       5,   2],
+        /* 5 TRIGGER: */ [   6,  5,     5,       5,      5,    5,       5,   5],
+        /* 6    SEMI: */ [   6,  6,     5,       5,      5,    5,       5,   7],
+        /* 7     END: */ [   1,  7,     5,       5,      5,    5,       5,   5],
+    ];
+    // SQLite's IdChar(): letters, digits, '_', '$' and every non-ASCII byte.
+    let is_id_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80;
+
+    let mut state = 0;
+    // `i` is left on the last byte of each token.
+    let mut i = 0;
+    while i < sql.len() {
+        let token = match sql[i] {
+            b';' => SEMI,
+            b' ' | b'\r' | b'\t' | b'\n' | b'\x0c' => WS,
+            b'/' if sql.get(i + 1) == Some(&b'*') => {
+                let Some(pos) = sql[i + 2..].windows(2).position(|w| w == b"*/") else {
+                    return false;
+                };
+                i += 2 + pos + 1;
+                WS
+            }
+            b'-' if sql.get(i + 1) == Some(&b'-') => {
+                let Some(pos) = sql[i..].iter().position(|&b| b == b'\n') else {
+                    return state == START;
+                };
+                i += pos;
+                WS
+            }
+            quote @ (b'[' | b'`' | b'"' | b'\'') => {
+                let close = if quote == b'[' { b']' } else { quote };
+                let Some(pos) = sql[i + 1..].iter().position(|&b| b == close) else {
+                    return false;
+                };
+                i += 1 + pos;
+                OTHER
+            }
+            b if is_id_char(b) => {
+                let len = sql[i..]
+                    .iter()
+                    .position(|&b| !is_id_char(b))
+                    .unwrap_or(sql.len() - i);
+                let word = &sql[i..i + len];
+                i += len - 1;
+                match word.to_ascii_lowercase().as_slice() {
+                    b"create" => CREATE,
+                    b"trigger" => TRIGGER,
+                    b"temp" | b"temporary" => TEMP,
+                    b"end" => END,
+                    b"explain" => EXPLAIN,
+                    _ => OTHER,
+                }
+            }
+            _ => OTHER,
+        };
+        state = TRANSITIONS[state][token];
+        i += 1;
+    }
+    state == START
 }
 
 #[no_mangle]
@@ -3969,6 +4049,96 @@ mod tests {
     }
     use super::*;
     use std::ptr;
+
+    #[test]
+    fn is_complete_statement_matches_sqlite() {
+        let cases: &[(&str, bool)] = &[
+            ("SELECT 1", false),
+            ("SELECT 1;", true),
+            ("", false),
+            ("   ", false),
+            (";", true),
+            ("SELECT 4/2;", true),
+            ("SELECT 1; - 1", false),
+            // Comments after the semicolon count as whitespace.
+            ("SELECT 1; -- trailing comment", true),
+            ("SELECT 1; -- comment\n", true),
+            ("SELECT 1; -- comment\nSELECT 2", false),
+            ("SELECT 1 -- comment;", false),
+            ("-- only a comment", false),
+            ("SELECT 1; /* block */", true),
+            ("SELECT /* ; */ 1;", true),
+            ("SELECT 1 /* ; */", false),
+            ("SELECT 1; /* unterminated", false),
+            // Strings and quoted identifiers are ordinary tokens.
+            ("SELECT ';'", false),
+            ("SELECT 'it''s';", true),
+            ("SELECT \"a;b\";", true),
+            ("SELECT `a;b`;", true),
+            ("SELECT [a;b];", true),
+            ("SELECT 1; 'abc'", false),
+            ("SELECT 1; 'unterminated", false),
+            ("SELECT 1; [a", false),
+            // A trigger body only ends at `;END;`.
+            ("CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;", false),
+            (
+                "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;",
+                true,
+            ),
+            (
+                "create trigger t after insert on x begin select 1; end;",
+                true,
+            ),
+            (
+                "CREATE TEMP TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;",
+                false,
+            ),
+            (
+                "CREATE TEMPORARY TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;",
+                true,
+            ),
+            (
+                "EXPLAIN CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;",
+                false,
+            ),
+            (
+                "EXPLAIN CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;",
+                true,
+            ),
+            (
+                "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 'END;'; END;",
+                true,
+            ),
+            (
+                "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END_X;",
+                false,
+            ),
+            (
+                "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END$;",
+                false,
+            ),
+            (
+                "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END\u{e9};",
+                false,
+            ),
+            (
+                "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; /* c */ END -- c\n;",
+                true,
+            ),
+            ("CREATE TABLE trigger(a);", true),
+            (
+                "SELECT 1; CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;",
+                false,
+            ),
+        ];
+        for &(sql, expected) in cases {
+            assert_eq!(
+                is_complete_statement(sql.as_bytes()),
+                expected,
+                "is_complete_statement({sql:?})"
+            );
+        }
+    }
 
     /// sqlite3_errmsg must return the bare message SQLite produces — no
     /// "Runtime error:" prefix and no "(19)" suffix; those are sqlite3
