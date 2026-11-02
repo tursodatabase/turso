@@ -60,6 +60,8 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
         ["RemoteEncryptionCipher"] = "Remote Encryption Cipher",
         ["Remote Encryption Key"] = "Remote Encryption Key",
         ["RemoteEncryptionKey"] = "Remote Encryption Key",
+        ["Local Encryption Key"] = "Local Encryption Key",
+        ["LocalEncryptionKey"] = "Local Encryption Key",
         ["Push Operations Threshold"] = "Push Operations Threshold",
         ["PushOperationsThreshold"] = "Push Operations Threshold",
         ["Pull Bytes Threshold"] = "Pull Bytes Threshold",
@@ -248,6 +250,12 @@ public sealed class TursoConnectionStringBuilder : DbConnectionStringBuilder
     {
         get => GetString("Remote Encryption Cipher");
         set => SetString("Remote Encryption Cipher", value);
+    }
+
+    public string LocalEncryptionKey
+    {
+        get => GetString("Local Encryption Key");
+        set => SetString("Local Encryption Key", value);
     }
 
     public string RemoteEncryptionKey
