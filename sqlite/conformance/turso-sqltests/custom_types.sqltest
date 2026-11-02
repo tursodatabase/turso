@@ -197,6 +197,18 @@ expect error {
     violates check constraint
 }
 
+# A CAST to a domain over a plain SQL type converts the value to that type, as
+# a column of the domain holds it, before the domain's CHECKs run.
+@requires strict "uses STRICT tables"
+test cast-to-domain-converts-to-base-type {
+    CREATE DOMAIN dw AS integer CHECK (value = 2);
+    CREATE DOMAIN dt AS text;
+    SELECT CAST('2' AS dw), typeof(CAST('2' AS dw)), typeof(CAST(2 AS dt));
+}
+expect {
+    2|integer|text
+}
+
 @requires strict "uses STRICT tables"
 test cast-to-varchar {
     SELECT CAST('hello' AS varchar(3));

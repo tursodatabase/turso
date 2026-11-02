@@ -182,13 +182,16 @@ UPDATE items SET stock = -1 WHERE id = 1;
 
 ## CAST Support
 
-CAST applies the domain's validation constraints:
+CAST applies the domain's validation constraints. A CAST to a domain over a plain SQL type first converts the value as a CAST to that type does:
 
 ```sql
 CREATE DOMAIN positive_int AS integer CHECK (value > 0);
 
 SELECT CAST(42 AS positive_int);
 -- 42
+
+SELECT CAST('42' AS positive_int), typeof(CAST('42' AS positive_int));
+-- 42|integer
 
 SELECT CAST(-1 AS positive_int);
 -- Error: domain positive_int constraint violation

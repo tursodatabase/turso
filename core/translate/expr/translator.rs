@@ -762,7 +762,8 @@ fn translate_cast_expr(
             super::arrays::emit_array_encode(program, target_register, &column, resolver, "")?;
             return Ok(target_register);
         }
-        if let Some(chain) = custom_type_cast_chain(tn, resolver.schema())? {
+        if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
+            let chain = resolved.chain;
             // Build ty_params from AST TypeSize so parametric types
             // (e.g. numeric(10,2)) get their parameters passed through.
             let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
@@ -783,6 +784,22 @@ fn translate_cast_expr(
                     .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
             {
                 emit_integer_to_boolean_cast(program, target_register);
+            }
+            // A domain whose types have no expression to convert the value holds
+            // it as its base SQL type, so the CAST converts it as a CAST to that
+            // type would: CAST('2' AS d) is the integer 2 for a domain d over
+            // integer.
+            let converts_by_expression = chain
+                .iter()
+                .any(|td| td.has_encode_or_coerce() || td.decode().is_some());
+            if is_domain
+                && !converts_by_expression
+                && !resolved.primitive.eq_ignore_ascii_case("any")
+            {
+                program.emit_insn(Insn::Cast {
+                    reg: target_register,
+                    affinity: Affinity::of_written_type(&resolved.primitive),
+                });
             }
             emit_store_value(program, &chain, target_register, &ty_params, resolver)?;
             emit_decode(program, &chain, target_register, resolver)?;
@@ -814,7 +831,7 @@ fn translate_cast_expr(
 fn custom_type_cast_chain(
     type_name: &ast::Type,
     schema: &crate::schema::Schema,
-) -> Result<Option<crate::alloc::Vec<Arc<TypeDef>>>> {
+) -> Result<Option<crate::schema::ResolvedType>> {
     if type_name.array_dimensions > 0 {
         return Ok(None);
     }
@@ -824,13 +841,13 @@ fn custom_type_cast_chain(
         return Ok(None);
     };
     if resolved.is_domain() {
-        return Ok(Some(resolved.chain));
+        return Ok(Some(resolved));
     }
     if is_sqlite_cast_to(resolved.leaf(), type_name) {
         return Ok(None);
     }
     resolved.chain.truncate(1);
-    Ok(Some(resolved.chain))
+    Ok(Some(resolved))
 }
 
 /// Whether a CAST to `type_def`, written as `type_name`, is SQLite's CAST
