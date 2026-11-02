@@ -255,6 +255,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         // match the main database opened via TursoDatabase below.
         let db_opts = db_config.database_opts();
         let sync_engine_opts = turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts {
+            encryption: None,
             remote_url: sync_config.remote_url.clone(),
             client_name: sync_config.client_name.clone(),
             tables_ignore: vec![],
