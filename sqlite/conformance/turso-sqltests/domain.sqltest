@@ -982,7 +982,7 @@ test domain-over-custom-type-cast-pass {
     SELECT CAST(5 AS positive_cents);
 }
 expect {
-    500
+    5
 }
 
 @requires custom_types "uses CREATE DOMAIN"

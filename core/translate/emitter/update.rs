@@ -628,15 +628,14 @@ fn emit_notnull_constraint_check(
 /// a `trigger_conflict_override` pushed by an enclosing UPSERT `DO UPDATE`
 /// wins, otherwise the outer UPDATE's explicit `OR <conflict>` overrides the
 /// trigger's own conflict resolution. Without an OR clause the trigger's own
-/// resolution applies. `after` selects
-/// between the BEFORE and AFTER constructors.
+/// resolution applies. `new_form` says which NEW registers hold stored values.
 fn update_trigger_context(
     program: &ProgramBuilder,
     btree_table: &Arc<BTreeTable>,
     new_registers: Option<Vec<usize>>,
+    new_form: DmlRowForm,
     old_registers: Option<Vec<usize>>,
     or_conflict: ResolveType,
-    timing: TriggerTime,
 ) -> TriggerContext {
     let override_conflict = program.trigger_conflict_override.or_else(|| {
         program
@@ -645,24 +644,11 @@ fn update_trigger_context(
             .then_some(or_conflict)
     });
 
-    let after = matches!(timing, TriggerTime::After);
-    match (after, override_conflict) {
-        (true, Some(override_conflict)) => TriggerContext::new_after_with_override_conflict(
-            btree_table.clone(),
-            new_registers,
-            old_registers,
-            override_conflict,
-        ),
-        (true, None) => {
-            TriggerContext::new_after(btree_table.clone(), new_registers, old_registers)
-        }
-        (false, Some(override_conflict)) => TriggerContext::new_with_override_conflict(
-            btree_table.clone(),
-            new_registers,
-            old_registers,
-            override_conflict,
-        ),
-        (false, None) => TriggerContext::new(btree_table.clone(), new_registers, old_registers),
+    let trigger_ctx =
+        TriggerContext::new(btree_table.clone(), new_registers, new_form, old_registers);
+    match override_conflict {
+        Some(override_conflict) => trigger_ctx.with_override_conflict(override_conflict),
+        None => trigger_ctx,
     }
 }
 
@@ -1536,9 +1522,9 @@ fn emit_update_insns<'a>(
                     program,
                     &btree_table,
                     Some(new_registers),
+                    DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
                     Some(old_registers.clone()),
                     or_conflict,
-                    TriggerTime::Before,
                 );
 
                 for trigger in relevant_before_update_triggers {
@@ -1913,21 +1899,15 @@ fn emit_update_insns<'a>(
                 program,
                 &relevant_checks,
                 &mut t_ctx.resolver,
-                &btree_table.name,
+                &btree_table,
                 effective_rowid_reg,
-                btree_table
-                    .columns()
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, col)| {
-                        col.name.as_deref().map(|n| {
-                            if col.is_rowid_alias() {
-                                (n, effective_rowid_reg)
-                            } else {
-                                (n, layout.to_register(start, idx))
-                            }
-                        })
-                    }),
+                btree_table.columns().iter().enumerate().map(|(idx, col)| {
+                    if col.is_rowid_alias() {
+                        (col, effective_rowid_reg)
+                    } else {
+                        (col, layout.to_register(start, idx))
+                    }
+                }),
                 connection,
                 or_conflict,
                 check_halt_on_error,
@@ -2804,9 +2784,9 @@ fn emit_update_insns<'a>(
                         program,
                         &btree_table,
                         Some(new_registers_after),
+                        DmlRowForm::Stored,
                         old_registers_after,
                         or_conflict,
-                        TriggerTime::After,
                     );
 
                     // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,

@@ -20,7 +20,7 @@ use crate::translate::emitter::{
     OperationMode, Resolver,
 };
 use crate::translate::expr::expr_type::iif_values;
-use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
@@ -221,6 +221,18 @@ impl CheckExprType {
             Self::CustomType(name) => name.as_str(),
         }
     }
+
+    /// The name a custom type uses for this as its input type, such as
+    /// `integer`. None for a value that is not one of SQLite's storage types.
+    fn sql_type_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Integer => Some("integer"),
+            Self::Real => Some("real"),
+            Self::Text => Some("text"),
+            Self::Blob => Some("blob"),
+            Self::Any | Self::Null | Self::CustomType(_) => None,
+        }
+    }
 }
 
 /// Resolve the type of an expression node in a CHECK constraint.
@@ -358,7 +370,7 @@ fn resolve_check_expr_type(
                 | Operator::GreaterEquals => {
                     let lty = resolve_check_expr_type(lhs, columns, resolver)?;
                     let rty = resolve_check_expr_type(rhs, columns, resolver)?;
-                    if !lty.is_compatible_with(&rty) {
+                    if !can_compare(&lty, &rty, resolver) {
                         bail_parse_error!(
                             "type mismatch in CHECK constraint: cannot compare {} with {}",
                             lty.display_name(),
@@ -420,22 +432,16 @@ fn resolve_func_return_type(
     }
     let type_of = |arg: &ast::Expr| resolve_check_expr_type(arg, columns, resolver);
     // A call with the wrong number of arguments is reported when it is translated.
+    // A function that computes a new value from a custom-type value, such as
+    // abs or substr of a numeric, computes it from the value a read gives,
+    // after DECODE. Its type is not declared, so the result's type is unknown.
     let first_argument = || args.first().map(|arg| type_of(arg)).transpose();
-    // A function that computes a new value from its argument, such as abs or
-    // substr, computes it from what the CHECK constraint sees: a custom-type
-    // column in its stored form, such as numeric's blob.
-    let first_argument_as_stored = || {
-        first_argument()?
-            .map(|ty| stored_check_type(ty, resolver))
-            .transpose()
-    };
     match func.result_type() {
         ResultType::Declared(ReturnType::Integer) => Ok(CheckExprType::Integer),
         ResultType::Declared(ReturnType::Real) => Ok(CheckExprType::Real),
         ResultType::Declared(ReturnType::Text) => Ok(CheckExprType::Text),
         ResultType::Declared(ReturnType::Blob) => Ok(CheckExprType::Blob),
         ResultType::Declared(ReturnType::Custom(type_name)) => {
-            reject_value_unlike_stored_columns(name, type_name, resolver)?;
             resolve_type_name(type_name, resolver)
         }
         ResultType::Declared(ReturnType::Array) => Ok(CheckExprType::Any),
@@ -447,14 +453,13 @@ fn resolve_func_return_type(
         // ceil, floor and trunc give an integer for an integer and a real for
         // a real. A text or blob argument is first converted to a number,
         // which may be either.
-        ResultType::NumberOfTheFirstArgumentsType => Ok(match first_argument_as_stored()? {
+        ResultType::NumberOfTheFirstArgumentsType => Ok(match first_argument()? {
             Some(ty @ (CheckExprType::Integer | CheckExprType::Real | CheckExprType::Null)) => ty,
             _ => CheckExprType::Any,
         }),
         // abs gives a real for text or a blob, without converting it first.
-        // abs of a custom type keeps the type, so comparing it with a number or
-        // computing with it is refused: here abs would run on the stored value,
-        // such as numeric's blob, and give 0.0.
+        // abs of a custom type keeps the type, as in a query, so the type's
+        // operators still apply to `abs(n) + n`.
         ResultType::AbsOfTheFirstArgument => Ok(match first_argument()? {
             Some(
                 ty @ (CheckExprType::Integer
@@ -467,7 +472,7 @@ fn resolve_func_return_type(
         }),
         ResultType::RealForARealArgument => Ok(CheckExprType::Real),
         // substr returns a blob for a blob and text for a number or text.
-        ResultType::TextOrBlobLikeTheFirstArgument => Ok(match first_argument_as_stored()? {
+        ResultType::TextOrBlobLikeTheFirstArgument => Ok(match first_argument()? {
             Some(ty @ (CheckExprType::Blob | CheckExprType::Any | CheckExprType::Null)) => ty,
             Some(CheckExprType::Integer | CheckExprType::Real | CheckExprType::Text) => {
                 CheckExprType::Text
@@ -487,55 +492,13 @@ fn resolve_func_return_type(
     }
 }
 
-/// A function that returns a value of a custom type returns it as a column
-/// read gives it, after DECODE, but a CHECK constraint sees the columns as they
-/// are stored. For a type whose DECODE changes the value, such as `uuid`
-/// stored as a blob and read as text, comparing the function's value with a
-/// column would never find them equal, so the CHECK constraint is refused.
-fn reject_value_unlike_stored_columns(
-    name: &str,
-    type_name: &str,
-    resolver: &CatalogContext,
-) -> Result<()> {
-    if let Some(resolved) = resolver.schema().resolve_type_unchecked(type_name)? {
-        if !resolved.is_domain() && !resolved.reads_stored_values_unchanged() {
-            bail_parse_error!(
-                "cannot compare {}() in a CHECK constraint: it returns {} values in a \
-                 different form than they are stored",
-                name,
-                type_name
-            );
-        }
-    }
-    Ok(())
-}
-
-/// The type a CHECK constraint sees for a value of type `ty`: for a custom type
-/// whose DECODE changes the value, the type it is stored as, such as BLOB for
-/// numeric.
-fn stored_check_type(ty: CheckExprType, resolver: &CatalogContext) -> Result<CheckExprType> {
-    let CheckExprType::CustomType(type_name) = &ty else {
-        return Ok(ty);
-    };
-    match resolver.schema().resolve_type_unchecked(type_name)? {
-        Some(resolved) => resolve_type_name(&resolved.primitive, resolver),
-        None => bail_parse_error!("unknown type '{}' in CHECK constraint", type_name),
-    }
-}
-
 /// The type of a function that returns one of several values: the type they
 /// all share, REAL for a mix of integers and reals, and otherwise any type.
-/// NULL values don't count. If one value is of a custom type, the result is
-/// that type: a CHECK constraint sees it in its stored form, such as
-/// numeric's blob, so arithmetic on it must stay refused.
+/// NULL values don't count.
 fn common_check_type(types: impl Iterator<Item = Result<CheckExprType>>) -> Result<CheckExprType> {
     let mut common = CheckExprType::Null;
-    let mut custom_type = None;
     for ty in types {
         let ty = ty?;
-        if custom_type.is_none() && matches!(ty, CheckExprType::CustomType(_)) {
-            custom_type = Some(ty.clone());
-        }
         common = match (common, ty) {
             (common, CheckExprType::Null) => common,
             (CheckExprType::Null, ty) => ty,
@@ -547,7 +510,7 @@ fn common_check_type(types: impl Iterator<Item = Result<CheckExprType>>) -> Resu
             _ => CheckExprType::Any,
         };
     }
-    Ok(custom_type.unwrap_or(common))
+    Ok(common)
 }
 
 /// Resolve a column's type from its definition.
@@ -609,7 +572,7 @@ fn validate_check_types_in_expr(
                 | Operator::GreaterEquals => {
                     let lty = resolve_check_expr_type(lhs, columns, resolver)?;
                     let rty = resolve_check_expr_type(rhs, columns, resolver)?;
-                    if !lty.is_compatible_with(&rty) {
+                    if !can_compare(&lty, &rty, resolver) {
                         bail_parse_error!(
                             "type mismatch in CHECK constraint: cannot compare {} with {}",
                             lty.display_name(),
@@ -634,14 +597,14 @@ fn validate_check_types_in_expr(
             let lty = resolve_check_expr_type(lhs, columns, resolver)?;
             let sty = resolve_check_expr_type(start, columns, resolver)?;
             let ety = resolve_check_expr_type(end, columns, resolver)?;
-            if !lty.is_compatible_with(&sty) {
+            if !can_compare(&lty, &sty, resolver) {
                 bail_parse_error!(
                     "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
                     lty.display_name(),
                     sty.display_name()
                 );
             }
-            if !lty.is_compatible_with(&ety) {
+            if !can_compare(&lty, &ety, resolver) {
                 bail_parse_error!(
                     "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
                     lty.display_name(),
@@ -653,7 +616,7 @@ fn validate_check_types_in_expr(
             let lty = resolve_check_expr_type(lhs, columns, resolver)?;
             for item in rhs {
                 let ity = resolve_check_expr_type(item, columns, resolver)?;
-                if !lty.is_compatible_with(&ity) {
+                if !can_compare(&lty, &ity, resolver) {
                     bail_parse_error!(
                         "type mismatch in CHECK IN list: cannot compare {} with {}",
                         lty.display_name(),
@@ -695,6 +658,24 @@ fn validate_check_types_in_expr(
         _ => {}
     }
     Ok(())
+}
+
+/// Whether a CHECK constraint may compare two values of these types. A value
+/// of a custom type may also be compared with any value of the type it takes
+/// as input, as in `amount < 50` or `amount > -5 - 1`: the CHECK sees the
+/// value a read gives, as a SELECT does.
+fn can_compare(lty: &CheckExprType, rty: &CheckExprType, resolver: &CatalogContext) -> bool {
+    let is_input_for = |value: &CheckExprType, ty: &CheckExprType| {
+        let (CheckExprType::CustomType(type_name), Some(value_type)) = (ty, value.sql_type_name())
+        else {
+            return false;
+        };
+        resolver
+            .schema()
+            .get_type_def_unchecked(type_name)
+            .is_some_and(|type_def| takes_input_of_type(type_def, value_type))
+    };
+    lty.is_compatible_with(rty) || is_input_for(rty, lty) || is_input_for(lty, rty)
 }
 
 fn validate(

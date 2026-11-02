@@ -1,3 +1,4 @@
+use crate::alloc::TursoFromIterator;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::ColumnLayout;
 use crate::translate::collate::CollationSeq;
@@ -10,7 +11,7 @@ use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
         self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
-        EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
+        SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
     translate::{
@@ -33,8 +34,8 @@ use crate::{
             open_read_table, table_scan_match_any, ForeignKeyActions,
         },
         plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
+            ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination,
+            ResultSetColumn, TableReferences,
         },
         planner::{collect_subquery_table_refs_in_expr, plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
@@ -641,26 +642,18 @@ pub fn translate_insert(
         //    trigger statements (per SQLite semantics, the outer statement's
         //    conflict resolution overrides the trigger body's)
         // 3. Otherwise, don't override (use statement's own conflict resolution)
-        let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
-            TriggerContext::new_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers),
-                None, // No OLD for INSERT
-                override_conflict,
-            )
-        } else if let Some(statement_on_conflict) = ctx.statement_on_conflict {
-            TriggerContext::new_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers),
-                None, // No OLD for INSERT
-                statement_on_conflict,
-            )
-        } else {
-            TriggerContext::new(
-                btree_table.clone(),
-                Some(new_registers),
-                None, // No OLD for INSERT
-            )
+        let trigger_ctx = TriggerContext::new(
+            btree_table.clone(),
+            Some(new_registers),
+            DmlRowForm::UserFacing,
+            None, // No OLD for INSERT
+        );
+        let trigger_ctx = match program
+            .trigger_conflict_override
+            .or(ctx.statement_on_conflict)
+        {
+            Some(override_conflict) => trigger_ctx.with_override_conflict(override_conflict),
+            None => trigger_ctx,
         };
         for trigger in relevant_before_triggers {
             fire_trigger(
@@ -842,19 +835,17 @@ pub fn translate_insert(
         program,
         &ctx.table.check_constraints,
         resolver,
-        &ctx.table.name,
+        ctx.table,
         insertion.key_register(),
-        insertion.col_mappings.iter().filter_map(|m| {
-            m.column.name.as_deref().map(|n| {
-                // Rowid alias columns have NULL in their register (the real value
-                // lives in the key register), so point CHECK to the key register.
-                let reg = if m.column.is_rowid_alias() {
-                    insertion.key_register()
-                } else {
-                    m.register
-                };
-                (n, reg)
-            })
+        insertion.col_mappings.iter().map(|m| {
+            // Rowid alias columns have NULL in their register (the real value
+            // lives in the key register), so point CHECK to the key register.
+            let reg = if m.column.is_rowid_alias() {
+                insertion.key_register()
+            } else {
+                m.register
+            };
+            (m.column, reg)
         }),
         connection,
         ctx.on_conflict,
@@ -1062,22 +1053,18 @@ pub fn translate_insert(
             .chain(std::iter::once(key_reg))
             .collect();
         // Determine the conflict resolution to propagate to AFTER triggers (same logic as BEFORE)
-        let trigger_ctx_after = if let Some(override_conflict) = program.trigger_conflict_override {
-            TriggerContext::new_after_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers_after),
-                None,
-                override_conflict,
-            )
-        } else if let Some(statement_on_conflict) = ctx.statement_on_conflict {
-            TriggerContext::new_after_with_override_conflict(
-                btree_table.clone(),
-                Some(new_registers_after),
-                None,
-                statement_on_conflict,
-            )
-        } else {
-            TriggerContext::new_after(btree_table.clone(), Some(new_registers_after), None)
+        let trigger_ctx_after = TriggerContext::new(
+            btree_table.clone(),
+            Some(new_registers_after),
+            DmlRowForm::Stored,
+            None,
+        );
+        let trigger_ctx_after = match program
+            .trigger_conflict_override
+            .or(ctx.statement_on_conflict)
+        {
+            Some(override_conflict) => trigger_ctx_after.with_override_conflict(override_conflict),
+            None => trigger_ctx_after,
         };
         // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
         // not skip post-row work (FK counters, autoincrement, CDC, RETURNING).
@@ -1964,10 +1951,7 @@ fn emit_notnulls(
         // ENCODE produces a non-NULL value but DECODE returns NULL.
         let has_decode = resolver
             .schema()
-            .resolve_type(&column_mapping.column.ty_str, ctx.table.is_strict)
-            .ok()
-            .flatten()
-            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()));
+            .column_has_decode(column_mapping.column, ctx.table.is_strict);
         let check_reg = if has_decode {
             let decoded_reg = program.alloc_register();
             crate::translate::expr::emit_user_facing_column_value(
@@ -3290,7 +3274,7 @@ fn emit_unique_index_check(
         .columns
         .iter()
         .map(|ic| {
-            if ic.expr.is_some() {
+            if ic.expression().is_some() {
                 Affinity::Blob.aff_mask()
             } else {
                 ctx.table.columns()[ic.pos_in_table].affinity().aff_mask()
@@ -3614,8 +3598,8 @@ fn emit_index_column_value_for_insert(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
-        let expr = expr.as_ref().clone();
+    if let Some(expr) = idx_col.expression() {
+        let expr = expr.clone();
         let columns: Vec<Column> = insertion
             .col_mappings
             .iter()
@@ -3641,14 +3625,6 @@ fn emit_index_column_value_for_insert(
             table,
             dest_reg,
         )?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            let column = &table.columns()[idx_col.pos_in_table];
-            if column.is_virtual_generated() {
-                program.emit_column_affinity(dest_reg, column.affinity());
-            }
-        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(
@@ -4422,6 +4398,8 @@ pub fn emit_parent_side_fk_decrement_on_insert(
 /// Emit encode expressions for columns with custom types.
 /// For each column that has a custom type with an encode expression,
 /// evaluates the expression with `value` bound to the column register.
+/// Virtual columns are skipped: their registers are not computed yet, and
+/// `compute_virtual_columns` encodes them when it computes them.
 fn emit_custom_type_encode(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -4434,12 +4412,19 @@ fn emit_custom_type_encode(
         .map(|m| m.column.clone())
         .collect();
     let layout = ColumnLayout::from_columns(&columns)?;
+    let stored_columns = ColumnMask::try_from_iter(
+        columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.is_virtual_generated())
+            .map(|(i, _)| i),
+    )?;
     crate::translate::expr::emit_custom_type_encode_columns(
         program,
         resolver,
         &columns,
         insertion.first_col_register(),
-        None, // INSERT: encode all columns
+        Some(&stored_columns),
         table_name,
         &layout,
     )

@@ -642,18 +642,14 @@ fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     ExprType::array(scalar, type_name.array_dimensions)
 }
 
-/// A CAST to a custom type that needs arguments but has none, such as
-/// `CAST(x AS numeric)` for `numeric(precision, scale)`, is a plain SQLite CAST.
 fn custom_cast_target(name: &str, type_name: &ast::Type, schema: &Schema) -> Option<ExprType> {
     let type_def = schema.get_type_def_unchecked(name)?;
-    let params = written_type_params(type_name);
-    let needed_params = type_def.user_params().count();
-    if !type_def.is_domain && needed_params != 0 && params.len() != needed_params {
+    if super::is_sqlite_cast_to(type_def, type_name) {
         return None;
     }
     Some(ExprType::Custom {
         type_def: Arc::clone(type_def),
-        params,
+        params: written_type_params(type_name),
     })
 }
 

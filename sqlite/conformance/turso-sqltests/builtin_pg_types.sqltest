@@ -428,7 +428,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test numeric-cast-rounds-extra-digits {
-    SELECT numeric_decode(CAST(0.019 AS numeric(10,2))), numeric_decode(CAST('-2.345' AS numeric(10,2)));
+    SELECT CAST(0.019 AS numeric(10,2)), CAST('-2.345' AS numeric(10,2));
 }
 expect {
     0.02|-2.35

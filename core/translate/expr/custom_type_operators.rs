@@ -234,9 +234,9 @@ fn accepts_operand(
         OperatorArg::Value => is_this_type(operand.value_type.as_ref()),
         OperatorArg::EncodableLiteral => {
             operand.value_type.is_none()
-                && operand.literal_kind.is_some_and(|kind| {
-                    literal_compatible_with_value_type(kind, ty.type_def.value_input_type())
-                })
+                && operand
+                    .literal_kind
+                    .is_some_and(|kind| takes_input_of_type(&ty.type_def, kind))
         }
         OperatorArg::PlainValue => is_plain_value(signature, operand),
         OperatorArg::Integer => is_plain_value(signature, operand) && operand.may_be_integer,

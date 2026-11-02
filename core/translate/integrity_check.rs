@@ -3,10 +3,9 @@ use crate::namespace::NamespaceRef;
 use crate::schema::Column;
 use crate::translate::collate::CollationSeq;
 use crate::translate::expr::{emit_stored_column, emit_table_column};
-use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
-    schema::{BTreeTable, GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
+    schema::{BTreeTable, Index, Schema, Table},
     translate::{
         emitter::Resolver,
         expr::{
@@ -21,7 +20,7 @@ use crate::{
     },
     HashSet,
 };
-use turso_parser::ast;
+use turso_parser::ast::{self, TableInternalId};
 
 /// Maximum number of errors to report with integrity check. If we exceed this number we will
 /// short circuit the procedure and return early to not waste time. SQLite uses 100 as default.
@@ -29,9 +28,7 @@ pub const MAX_INTEGRITY_CHECK_ERRORS: usize = 100;
 
 enum BoundIndexColumn {
     Column(usize),
-    /// The affiniy is `Some` when the index column refers to a virtual generated column
-    /// (the affinity is the column's declared type).
-    Expr(Box<ast::Expr>, Option<Affinity>),
+    Expr(Box<ast::Expr>),
 }
 
 struct BoundIntegrityIndex {
@@ -322,17 +319,12 @@ fn translate_integrity_check_for_schema(
             let mut columns = Vec::with_capacity(index.columns.len());
             let mut unique_nullable = Vec::with_capacity(index.columns.len());
             for col in &index.columns {
-                if let Some(expr) = col.expr.as_deref() {
-                    let affinity = if col.pos_in_table != EXPR_INDEX_SENTINEL {
-                        Some(btree_table.columns()[col.pos_in_table].affinity())
-                    } else {
-                        // expression indexes don't apply affinity from the basae table
-                        None
-                    };
-                    columns.push(BoundIndexColumn::Expr(
-                        Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
-                        affinity,
-                    ));
+                if let Some(expr) = col.expression() {
+                    columns.push(BoundIndexColumn::Expr(Box::new(bind_expr_for_table(
+                        expr,
+                        &mut table_references,
+                        resolver,
+                    )?)));
                     unique_nullable.push(true);
                 } else {
                     columns.push(BoundIndexColumn::Column(col.pos_in_table));
@@ -384,26 +376,18 @@ fn translate_integrity_check_for_schema(
             .enumerate()
             .filter(|(_, c)| !c.is_rowid_alias()) // nothing to check on IPK cols
             .filter(|(_, c)| c.notnull() || btree_table.is_strict)
-            .map(|(idx, col)| {
-                let col_ref = match col.generated_type() {
-                    GeneratedType::Virtual { expr, .. } => BoundIndexColumn::Expr(
-                        Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
-                        Some(col.affinity()),
-                    ),
-                    GeneratedType::NotGenerated => BoundIndexColumn::Column(idx),
-                };
+            .map(|(idx, col)| (idx, col, &type_check_table.columns()[idx]))
+            .collect::<Vec<_>>();
 
-                Ok((col_ref, col, &type_check_table.columns()[idx]))
-            })
-            .collect::<crate::Result<Vec<_>>>()?;
-
-        for (col_ref, col, type_check_col) in &checked_columns {
-            let col_reg = emit_column(
+        for (idx, col, type_check_col) in &checked_columns {
+            let col_reg = emit_checked_column(
                 program,
                 resolver,
                 table_cursor_id,
+                table_ref_id,
                 &table_references,
-                col_ref,
+                col,
+                *idx,
             )?;
 
             let col_name = col.name.as_deref().unwrap_or("");
@@ -496,7 +480,7 @@ fn translate_integrity_check_for_schema(
                             resolver,
                         )?;
                     }
-                    BoundIndexColumn::Expr(expr, affinity) => {
+                    BoundIndexColumn::Expr(expr) => {
                         let self_table_context =
                             table_references.joined_tables().first().map(|jt| {
                                 SelfTableContext::ForSelect {
@@ -520,9 +504,6 @@ fn translate_integrity_check_for_schema(
                                 Ok(())
                             },
                         )?;
-                        if let Some(aff) = affinity {
-                            program.emit_column_affinity(target, *aff);
-                        }
                     }
                 }
             }
@@ -790,47 +771,37 @@ fn emit_notnull_check(
     program.preassign_label_to_next_insn(not_null_ok);
 }
 
-/// Returns the register containing the column
-fn emit_column(
+/// Reads a column as it is stored. A virtual column is computed and encoded,
+/// so it gets the same checks as a stored column.
+fn emit_checked_column(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     table_cursor_id: usize,
+    table_ref_id: TableInternalId,
     table_references: &TableReferences,
-    col_ref: &BoundIndexColumn,
+    column: &Column,
+    column_index: usize,
 ) -> crate::Result<usize> {
     let col_value_reg = program.alloc_register();
-    match col_ref {
-        BoundIndexColumn::Column(idx) => {
-            emit_stored_column(program, table_cursor_id, *idx, col_value_reg, resolver)?;
-        }
-        BoundIndexColumn::Expr(expr, affinity) => {
-            let self_table_context =
-                table_references
-                    .joined_tables()
-                    .first()
-                    .map(|jt| SelfTableContext::ForSelect {
-                        table_ref_id: jt.internal_id,
-                        referenced_tables: table_references.clone(),
-                    });
-            resolver.with_self_table_context(
-                program,
-                self_table_context.as_ref(),
-                |program, _| {
-                    translate_expr_no_constant_opt(
-                        program,
-                        Some(table_references),
-                        expr,
-                        col_value_reg,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                    if let Some(affinity) = affinity {
-                        program.emit_column_affinity(col_value_reg, *affinity);
-                    }
-                    Ok(())
-                },
-            )?;
-        }
+    if column.is_virtual_generated() {
+        emit_table_column(
+            program,
+            table_cursor_id,
+            table_ref_id,
+            table_references,
+            column,
+            column_index,
+            col_value_reg,
+            resolver,
+        )?;
+    } else {
+        emit_stored_column(
+            program,
+            table_cursor_id,
+            column_index,
+            col_value_reg,
+            resolver,
+        )?;
     }
     Ok(col_value_reg)
 }
