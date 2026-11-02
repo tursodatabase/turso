@@ -28,7 +28,9 @@ pub(super) fn translate_between_expr(
         unreachable!("translate_between_expr expects Expr::Between");
     };
 
-    let lhs_reg = program.alloc_register();
+    // A row value left side, `(x, y) BETWEEN (a, b) AND (c, d)`, needs one
+    // register per component.
+    let lhs_reg = program.alloc_registers(expr_vector_size(lhs)?);
     translate_expr(program, referenced_tables, &*lhs, lhs_reg, resolver)?;
 
     let mut between_resolver = resolver.fork_with_expr_cache();
