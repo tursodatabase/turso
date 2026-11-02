@@ -825,7 +825,7 @@ fn translate_cast_expr(
 pub(crate) fn custom_type_cast_chain(
     type_name: &ast::Type,
     schema: &crate::schema::Schema,
-) -> Result<Option<Vec<Arc<TypeDef>>>> {
+) -> Result<Option<crate::alloc::Vec<Arc<TypeDef>>>> {
     if type_name.array_dimensions > 0 {
         return Ok(None);
     }
