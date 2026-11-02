@@ -42,15 +42,6 @@ struct JsonRpcError {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct InitializeRequest {
-    #[serde(rename = "protocolVersion")]
-    protocol_version: String,
-    capabilities: Value,
-    #[serde(rename = "clientInfo")]
-    client_info: Value,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 struct CallToolRequest {
     name: String,
     arguments: Option<Value>,
