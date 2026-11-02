@@ -291,6 +291,8 @@ pub struct sqlite3_stmt {
     /// Cached ExtValue instances for sqlite3_column_value().
     /// Populated lazily per column; cleared on each step/reset.
     pub(crate) value_cache: Vec<Option<ExtValue>>,
+    pub(crate) run_count: u64,
+    pub(crate) run_started: bool,
     /// High-water mark of `search_count` already published to the global
     /// counter, so each step contributes only the delta.
     pub(crate) prev_search_count: i64,
@@ -319,6 +321,8 @@ impl sqlite3_stmt {
             next: std::ptr::null_mut(),
             text_cache: vec![vec![]; n_cols],
             value_cache: (0..n_cols).map(|_| None).collect(),
+            run_count: 0,
+            run_started: false,
             prev_search_count: 0,
         }
     }
@@ -1219,6 +1223,10 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
+    if !stmt.run_started {
+        stmt.run_count = stmt.run_count.saturating_add(1);
+        stmt.run_started = true;
+    }
     let db = &stmt.db;
     // Do not hold the handle lock across the step. A user-defined function
     // invoked mid-step may re-enter the C API on the same handle (SQLite
@@ -1549,7 +1557,9 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)
     // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)
     let result = stmt_run_to_completion(stmt);
-    if let Err(err) = stmt.stmt.reset() {
+    let reset_result = stmt.stmt.reset();
+    stmt.run_started = false;
+    if let Err(err) = reset_result {
         if result == SQLITE_OK {
             return handle_limbo_err(err, std::ptr::null_mut());
         }
@@ -1604,6 +1614,13 @@ pub unsafe extern "C" fn sqlite3_stmt_status(
     }
 
     let stmt = &mut *stmt;
+    if op == SQLITE_STMTSTATUS_RUN {
+        let value = stmt.run_count;
+        if reset_flg != 0 {
+            stmt.run_count = 0;
+        }
+        return value.min(ffi::c_int::MAX as u64) as ffi::c_int;
+    }
     let counter = match op {
         SQLITE_STMTSTATUS_FULLSCAN_STEP => turso_core::StatementStatusCounter::FullscanStep,
         SQLITE_STMTSTATUS_SORT => turso_core::StatementStatusCounter::Sort,
@@ -1612,7 +1629,6 @@ pub unsafe extern "C" fn sqlite3_stmt_status(
         LIBSQL_STMTSTATUS_ROWS_READ => turso_core::StatementStatusCounter::RowsRead,
         LIBSQL_STMTSTATUS_ROWS_WRITTEN => turso_core::StatementStatusCounter::RowsWritten,
         SQLITE_STMTSTATUS_AUTOINDEX
-        | SQLITE_STMTSTATUS_RUN
         | SQLITE_STMTSTATUS_FILTER_MISS
         | SQLITE_STMTSTATUS_FILTER_HIT
         | SQLITE_STMTSTATUS_MEMUSED => return 0,
@@ -4228,7 +4244,21 @@ mod tests {
             );
             assert_eq!(
                 sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_RUN, 0),
+                1
+            );
+            assert_eq!(
+                sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_RUN, 1),
+                1
+            );
+            assert_eq!(
+                sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_RUN, 0),
                 0
+            );
+            assert_eq!(sqlite3_reset(select_stmt), SQLITE_OK);
+            while sqlite3_step(select_stmt) == SQLITE_ROW {}
+            assert_eq!(
+                sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_RUN, 0),
+                1
             );
             assert_eq!(
                 sqlite3_stmt_status(select_stmt, SQLITE_STMTSTATUS_FILTER_HIT, 0),
