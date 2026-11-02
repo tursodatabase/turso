@@ -744,6 +744,73 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test add-column-default-rejected-by-coerce-fails-alter {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (1);
+    ALTER TABLE t1 ADD COLUMN x varchar(3) DEFAULT 'toolong';
+}
+expect error {
+    value too long for varchar
+}
+
+@requires strict "uses STRICT tables"
+test add-column-default-accepted-by-coerce {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (1);
+    ALTER TABLE t1 ADD COLUMN y varchar(3) DEFAULT 'ok';
+    SELECT * FROM t1;
+}
+expect {
+    1|ok
+}
+
+@requires strict "uses STRICT tables"
+test add-column-default-rejected-by-encode-fails-alter {
+    CREATE TYPE posint BASE integer ENCODE CASE WHEN value > 0 THEN value ELSE RAISE(ABORT, 'must be positive') END DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (1);
+    ALTER TABLE t1 ADD COLUMN x posint DEFAULT -5;
+}
+expect error {
+    must be positive
+}
+
+@requires strict "uses STRICT tables"
+test add-column-default-rejected-by-encode-under-domain-fails-alter {
+    CREATE TYPE posint BASE integer ENCODE CASE WHEN value > 0 THEN value ELSE RAISE(ABORT, 'must be positive') END DECODE value;
+    CREATE DOMAIN pd AS posint;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (1);
+    ALTER TABLE t1 ADD COLUMN x pd DEFAULT -5;
+}
+expect error {
+    must be positive
+}
+
+@requires strict "uses STRICT tables"
+test add-column-default-accepted-under-domain {
+    CREATE TYPE posint BASE integer ENCODE CASE WHEN value > 0 THEN value ELSE RAISE(ABORT, 'must be positive') END DECODE value;
+    CREATE DOMAIN pd AS posint;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t1 VALUES (1);
+    ALTER TABLE t1 ADD COLUMN y pd DEFAULT 5;
+    SELECT * FROM t1;
+}
+expect {
+    1|5
+}
+
+@requires strict "uses STRICT tables"
+test add-column-default-rejected-by-coerce-empty-table {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    ALTER TABLE t1 ADD COLUMN x varchar(3) DEFAULT 'toolong';
+    SELECT count(*) FROM t1;
+}
+expect {
+    0
+}
+
+@requires strict "uses STRICT tables"
 test add-column-numeric-default-preexisting {
     CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
     INSERT INTO t1 VALUES (1);
