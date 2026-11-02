@@ -2269,6 +2269,37 @@ mod tests {
     }
 
     #[test]
+    fn mvcc_table_scan_reads_through_a_btree_cursor_with_an_mvcc_reader() {
+        use crate::storage::btree::CursorTrait;
+
+        let conn = open_test_connection().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        let mut stmt = conn.prepare("SELECT v FROM t").unwrap();
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Row => break,
+                StepResult::IO | StepResult::Yield => stmt._io().step().unwrap(),
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        let cursor = stmt
+            .state
+            .cursors
+            .iter()
+            .flatten()
+            .next()
+            .expect("the scan must open a cursor");
+        let crate::types::Cursor::BTree(cursor, _) = cursor else {
+            panic!("an MVCC table scan must read through a B-tree cursor, got {cursor:?}");
+        };
+        assert!(cursor.is_mvcc());
+    }
+
+    #[test]
     fn test_metrics_include_subprogram_writes() {
         let conn = open_test_connection().unwrap();
         conn.execute("CREATE TABLE src(x)").unwrap();
