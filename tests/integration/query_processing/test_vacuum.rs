@@ -6418,6 +6418,118 @@ fn test_mvcc_plain_vacuum_requires_checkpointed_image() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Size of the MVCC logical log header (`LOG_HDR_SIZE`): a log of this size has
+/// no transaction frames.
+const MVCC_LOG_HEADER_SIZE: u64 = 56;
+
+#[test]
+fn test_mvcc_plain_vacuum_accepts_header_only_log() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_plain_vacuum_accepts_header_only_log.db");
+    let conn = tmp_db.connect_limbo();
+    assert_eq!(mvcc_log_file_size(&tmp_db), MVCC_LOG_HEADER_SIZE);
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+    drop(conn);
+    let path = tmp_db.path.clone();
+    drop(tmp_db);
+
+    let reopened = TempDatabase::new_with_existent(&path);
+    let conn = reopened.connect_limbo();
+    assert_eq!(mvcc_log_file_size(&reopened), MVCC_LOG_HEADER_SIZE);
+    conn.execute("VACUUM")?;
+    assert_eq!(run_integrity_check(&conn), "ok");
+
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_plain_vacuum_after_switching_to_mvcc_with_existing_rows() -> anyhow::Result<()> {
+    let tmp_db =
+        TempDatabase::new("test_mvcc_plain_vacuum_after_switching_to_mvcc_with_existing_rows.db");
+    let conn = tmp_db.connect_limbo();
+    let mut expected_rows = populate_mvcc_vacuum_workload(&conn)?;
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    assert_eq!(mvcc_log_file_size(&tmp_db), MVCC_LOG_HEADER_SIZE);
+    // Reading the rows loads their versions into the MVCC store, which VACUUM
+    // must drop before it rewrites the root pages.
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    let before_hash = compute_plain_vacuum_dbhash(&tmp_db);
+    conn.execute("VACUUM")?;
+    assert_plain_vacuum_integrity_and_hash(&tmp_db, &conn, &before_hash);
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    conn.execute("INSERT INTO t VALUES(1000, 'after-vacuum', 'z')")?;
+    expected_rows.push((1000, "after-vacuum".to_string()));
+    assert!(mvcc_log_file_size(&tmp_db) > MVCC_LOG_HEADER_SIZE);
+
+    // One committed frame in the log must still block VACUUM, otherwise
+    // recovery would replay it over the rewritten database file.
+    let err = conn.execute("VACUUM").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first",
+    );
+    drop(conn);
+    let path = tmp_db.path.clone();
+    drop(tmp_db);
+
+    // Recovery replays the frame written after VACUUM onto the vacuumed file.
+    let reopened = TempDatabase::new_with_existent(&path);
+    let conn = reopened.connect_limbo();
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_plain_vacuum_accepts_log_with_only_a_torn_frame() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new("test_mvcc_plain_vacuum_accepts_log_with_only_a_torn_frame.db");
+    let conn = tmp_db.connect_limbo();
+    let mut expected_rows = populate_mvcc_vacuum_workload(&conn)?;
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    conn.execute("INSERT INTO t VALUES(1000, 'torn', 'z')")?;
+    drop(conn);
+    let path = tmp_db.path.clone();
+    let log_path = tmp_db.path.with_extension("db-log");
+    drop(tmp_db);
+
+    // Cut the last byte off the only frame, as a crash during its commit
+    // would leave it. Recovery drops the frame but leaves its bytes in the file.
+    let log_size = std::fs::metadata(&log_path)?.len();
+    assert!(log_size > MVCC_LOG_HEADER_SIZE);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&log_path)?
+        .set_len(log_size - 1)?;
+
+    let reopened = TempDatabase::new_with_existent(&path);
+    let conn = reopened.connect_limbo();
+    assert_eq!(mvcc_log_file_size(&reopened), log_size - 1);
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+    let before_hash = compute_plain_vacuum_dbhash(&reopened);
+    conn.execute("VACUUM")?;
+    assert_plain_vacuum_integrity_and_hash(&reopened, &conn, &before_hash);
+    drop(conn);
+    drop(reopened);
+
+    // Recovery after VACUUM still drops the torn frame.
+    let reopened = TempDatabase::new_with_existent(&path);
+    let conn = reopened.connect_limbo();
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    // The next commit writes its frame over the torn bytes.
+    conn.execute("INSERT INTO t VALUES(1001, 'after-vacuum', 'z')")?;
+    expected_rows.push((1001, "after-vacuum".to_string()));
+    drop(conn);
+    drop(reopened);
+    let reopened = TempDatabase::new_with_existent(&path);
+    let conn = reopened.connect_limbo();
+    assert_mvcc_vacuum_workload(&conn, &expected_rows)?;
+
+    Ok(())
+}
+
 #[test]
 fn test_mvcc_plain_vacuum_after_checkpoint_preserves_mvcc_state() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_with_mvcc(
