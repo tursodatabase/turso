@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use turso_core::{
     mvcc::persistent_storage::logical_log::LogTxFrameInfo, Clock, Completion, ConnectOpts,
-    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, File, MonotonicInstant, OpenFlags,
-    OpenOptions, SqliteDialect, StepResult, WallClockInstant, IO,
+    Database, DatabaseOpts, EncryptionKey, EncryptionOpts, File, LimboError, MonotonicInstant,
+    OpenFlags, OpenOptions, SqliteDialect, StepResult, WallClockInstant, IO,
 };
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
@@ -412,24 +412,131 @@ fn test_mvcc_read_to_write_upgrade_does_not_block_checkpoint(
 }
 
 #[test]
-fn test_mvcc_blob_open_reports_unsupported() -> anyhow::Result<()> {
-    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_open_reports_unsupported.db");
+fn test_mvcc_blob_read_works_and_write_is_unsupported() -> anyhow::Result<()> {
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_blob_read_works_and_write_is_unsupported.db");
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB)")?;
-    conn.execute("INSERT INTO files VALUES (1, zeroblob(8))")?;
+    conn.execute("INSERT INTO files VALUES (1, x'00112233445566778899')")?;
 
-    for read_write in [false, true] {
-        let Err(err) = conn.blob_open("files", "data", 1, read_write) else {
-            panic!("blob_open must fail in MVCC mode");
-        };
-        assert_eq!(
-            err.to_string(),
-            "Internal error: incremental blob I/O is not supported in MVCC mode"
-        );
-    }
+    let mut blob = conn.blob_open("files", "data", 1, false)?;
+    assert_eq!(blob.bytes(), 10);
+    let mut whole = [0u8; 10];
+    blob.read(0, &mut whole)?;
+    assert_eq!(
+        whole,
+        [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99]
+    );
+    let mut mid = [0u8; 4];
+    blob.read(2, &mut mid)?;
+    assert_eq!(mid, [0x22, 0x33, 0x44, 0x55]);
+    let mut past_end = [0u8; 4];
+    assert!(blob.read(8, &mut past_end).is_err());
+    blob.close()?;
+
+    let Err(err) = conn.blob_open("files", "data", 1, true) else {
+        panic!("read-write blob_open must fail in MVCC mode");
+    };
+    assert_eq!(
+        err.to_string(),
+        "Internal error: incremental blob I/O writes are not supported in MVCC mode"
+    );
 
     let rows: Vec<(String,)> = conn.exec_rows("SELECT hex(data) FROM files WHERE id = 1");
-    assert_eq!(rows, vec![("0000000000000000".to_string(),)]);
+    assert_eq!(rows, vec![("00112233445566778899".to_string(),)]);
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_reads_a_large_value_by_range() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_reads_a_large_value_by_range.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, data BLOB)")?;
+    conn.execute("INSERT INTO files VALUES (1, randomblob(100000))")?;
+    let expected: Vec<(String,)> =
+        conn.exec_rows("SELECT hex(substr(data, 50001, 16)) FROM files WHERE id = 1");
+
+    let mut blob = conn.blob_open("files", "data", 1, false)?;
+    assert_eq!(blob.bytes(), 100000);
+    let mut buf = [0u8; 16];
+    blob.read(50000, &mut buf)?;
+    let hex: String = buf.iter().map(|b| format!("{b:02X}")).collect();
+    assert_eq!(hex, expected[0].0);
+    blob.close()?;
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_expires_when_its_row_changes() -> anyhow::Result<()> {
+    for (case, change) in [
+        ("other_column", "UPDATE t SET x = 1 WHERE id = 1"),
+        (
+            "blob_column",
+            "UPDATE t SET data = x'FFFFFFFF' WHERE id = 1",
+        ),
+        ("delete", "DELETE FROM t WHERE id = 1"),
+    ] {
+        let tmp_db = TempDatabase::new_with_mvcc(&format!("test_mvcc_blob_expires_{case}.db"));
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x, data BLOB)")?;
+        conn.execute("INSERT INTO t VALUES (1, 0, x'00112233')")?;
+
+        let mut blob = conn.blob_open("t", "data", 1, false)?;
+        let mut buf = [0u8; 4];
+        blob.read(0, &mut buf)?;
+        conn.execute(change)?;
+        for _ in 0..2 {
+            assert!(
+                matches!(blob.read(0, &mut buf), Err(LimboError::BlobHandleExpired)),
+                "{case}: the handle must expire, and stay expired"
+            );
+        }
+        blob.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_opened_after_its_row_changed_in_the_same_transaction() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_opened_after_its_row_changed.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x, data BLOB)")?;
+    conn.execute("INSERT INTO t VALUES (1, 0, x'00112233')")?;
+    conn.execute("BEGIN")?;
+    conn.execute("UPDATE t SET data = x'44556677' WHERE id = 1")?;
+
+    let mut blob = conn.blob_open("t", "data", 1, false)?;
+    let mut buf = [0u8; 4];
+    blob.read(0, &mut buf)?;
+    assert_eq!(buf, [0x44, 0x55, 0x66, 0x77]);
+    conn.execute("UPDATE t SET x = 1 WHERE id = 1")?;
+    assert!(matches!(
+        blob.read(0, &mut buf),
+        Err(LimboError::BlobHandleExpired)
+    ));
+    blob.close()?;
+    conn.execute("COMMIT")?;
+    Ok(())
+}
+
+#[test]
+fn test_mvcc_blob_on_a_checkpointed_row_expires_when_the_row_changes() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_blob_on_a_checkpointed_row.db");
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x, data BLOB)")?;
+    conn.execute("INSERT INTO t VALUES (1, 0, x'00112233')")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+    let mut blob = conn.blob_open("t", "data", 1, false)?;
+    let mut buf = [0u8; 4];
+    blob.read(0, &mut buf)?;
+    assert_eq!(buf, [0x00, 0x11, 0x22, 0x33]);
+    conn.execute("UPDATE t SET x = 1 WHERE id = 1")?;
+    assert!(matches!(
+        blob.read(0, &mut buf),
+        Err(LimboError::BlobHandleExpired)
+    ));
+    blob.close()?;
     Ok(())
 }
 
