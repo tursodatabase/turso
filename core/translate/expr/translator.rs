@@ -789,7 +789,7 @@ fn translate_cast_expr(
             // The domain's CHECKs see the value after DECODE, as they do on a
             // column of the domain.
             if is_domain {
-                emit_domain_cast_constraints(program, &chain, target_register, resolver)?;
+                emit_domain_cast_constraints(program, &chain, tn, target_register, resolver)?;
             }
             return Ok(target_register);
         }

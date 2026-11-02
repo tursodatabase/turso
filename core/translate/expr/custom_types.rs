@@ -159,6 +159,7 @@ pub(crate) fn emit_decode(
 pub(super) fn emit_domain_cast_constraints(
     program: &mut ProgramBuilder,
     chain: &[crate::sync::Arc<TypeDef>],
+    cast_type: &ast::Type,
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -186,22 +187,29 @@ pub(super) fn emit_domain_cast_constraints(
                 .clone()
                 .unwrap_or_else(|| format!("{}_{}", td.name, i));
 
-            // Bind `value` → reg, translate check expr, verify truthy
-            program
-                .id_register_overrides
-                .insert("value".to_string(), reg);
+            // `value` reads the CAST's result with the CAST's type, as a
+            // column of the domain does, so `value < 100` on a domain over
+            // numeric compares numbers, not numeric's decoded text.
+            let mut check = dc.check.as_ref().clone();
+            walk_expr_mut(&mut check, &mut |e| {
+                if matches!(e, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value")) {
+                    *e = ast::Expr::Register {
+                        register: reg,
+                        custom_type: Some(Box::new(cast_type.clone())),
+                    };
+                }
+                Ok(WalkControl::Continue)
+            })?;
 
             let expr_result_reg = program.alloc_register();
             translate_expr_no_constant_opt(
                 program,
                 None,
-                &dc.check,
+                &check,
                 expr_result_reg,
                 resolver,
                 NoConstantOptReason::RegisterReuse,
             )?;
-
-            program.id_register_overrides.remove("value");
 
             let passed_label = program.allocate_label();
 

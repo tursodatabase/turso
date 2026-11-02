@@ -232,7 +232,7 @@ Earlier versions gave the stored value from a CAST to a type with a DECODE. An i
 
 ## CHECK Constraints with Custom Types
 
-A CHECK constraint sees a custom-type column as a SELECT reads it, after DECODE. `CHECK (ceil(n) > 4)` on a `numeric` column computes from the number, and `CHECK (length(id) = 36)` on a `uuid` column measures the text form. In a STRICT table, a column of a custom type can be compared with a literal of the type it takes as input:
+A CHECK constraint sees a custom-type column as a SELECT reads it, after DECODE. `CHECK (ceil(n) > 4)` on a `numeric` column computes from the number, and `CHECK (length(id) = 36)` on a `uuid` column measures the text form. In a STRICT table, a column of a custom type can be compared with any value of the type it takes as input, such as `0`, `-5 - 1` or an `integer` column for `cents`:
 
 ```sql
 CREATE TYPE cents BASE integer
@@ -245,7 +245,7 @@ CREATE TABLE products (
 ) STRICT;
 ```
 
-`CHECK(price >= CAST(0 AS cents))` means the same, because a CAST gives the decoded value too. A domain's CHECK also sees `value` after DECODE, both on a column of the domain and in a CAST to it.
+`CHECK(price >= CAST(0 AS cents))` means the same, because a CAST gives the decoded value too. A domain's CHECK also sees `value` after DECODE, with the domain's type, both on a column of the domain and in a CAST to it.
 
 ## Inspecting Types
 
