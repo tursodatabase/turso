@@ -206,10 +206,11 @@ impl DmlColumnContext {
     }
 
     /// Whether the register of column `col_idx` holds the value ENCODE
-    /// stored rather than the user's value. A virtual generated column's
-    /// register holds the result of its expression, which is the user's value.
-    pub fn holds_stored_value(&self, col_idx: usize, column: &Column) -> bool {
-        if column.is_virtual_generated() || self.rowid_alias_col == Some(col_idx) {
+    /// stored rather than the user's value. A virtual generated column
+    /// follows the row's form like any other column: in a row of stored
+    /// values, its expression's value is ENCODEd too.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        if self.rowid_alias_col == Some(col_idx) {
             return false;
         }
         match &self.form {

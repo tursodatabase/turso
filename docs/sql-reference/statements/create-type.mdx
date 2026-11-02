@@ -228,7 +228,7 @@ SELECT -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1;
 
 A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the value as the column holds it.
 
-Earlier versions gave the stored value from a CAST to a type with a DECODE. An index made by an earlier version whose key or WHERE clause uses such a CAST holds those stored values, and `PRAGMA integrity_check` reports its rows as missing: run `REINDEX` on it. Triggers, views and CHECK constraints that use such a CAST now get the decoded value.
+Earlier versions gave the stored value from a CAST to a type with a DECODE. An index made by an earlier version whose key uses such a CAST holds those stored values, and `PRAGMA integrity_check` reports its rows as missing. A partial index whose WHERE clause uses such a CAST was filled with the earlier result of the WHERE clause; `PRAGMA integrity_check` does not report it, and queries that use it can return wrong rows. Run `REINDEX` on both kinds. Earlier versions also read a virtual generated column of a type with a DECODE without its ENCODE, so an index on such a column needs `REINDEX` too. Triggers, views and CHECK constraints that use such a CAST now get the decoded value.
 
 ## CHECK Constraints with Custom Types
 

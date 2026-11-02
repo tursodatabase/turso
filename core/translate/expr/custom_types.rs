@@ -405,13 +405,7 @@ pub(crate) fn emit_constraint_values_decode(
         let Some((_, column)) = table.get_column(name) else {
             continue;
         };
-        let decode_changes_value = resolver
-            .schema()
-            .resolve_type(&column.ty_str, table.is_strict)
-            .ok()
-            .flatten()
-            .is_some_and(|resolved| !resolved.reads_stored_values_unchanged());
-        if !column.is_array() && !decode_changes_value {
+        if !column.is_array() && !resolver.schema().column_has_decode(column, table.is_strict) {
             continue;
         }
         let decoded_reg = program.alloc_register();

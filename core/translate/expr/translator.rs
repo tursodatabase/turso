@@ -2401,7 +2401,7 @@ fn translate_self_table_column_expr(
                 }
                 let src_reg = dml_ctx.to_column_reg(*column);
                 let table_column = &table.columns()[*column];
-                if dml_ctx.holds_stored_value(*column, table_column) {
+                if dml_ctx.holds_stored_value(*column) {
                     emit_user_facing_column_value(
                         program,
                         src_reg,

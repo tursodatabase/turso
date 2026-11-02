@@ -1,8 +1,7 @@
-use crate::schema::{BTreeTable, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
-use crate::translate::expr::translate_expr;
+use crate::schema::{BTreeTable, Column, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
+use crate::translate::expr::{emit_custom_type_encode_columns, translate_expr};
 use crate::vdbe::builder::{DmlColumnContext, DmlRowForm, SelfTableContext};
 use crate::{Arc, Result};
-use turso_parser::ast;
 
 use super::{ProgramBuilder, Resolver};
 
@@ -26,25 +25,32 @@ pub fn compute_virtual_columns(
             };
             let target_reg = dml_ctx.to_column_reg(idx);
             translate_expr(program, None, expr, target_reg, resolver)?;
+            if dml_ctx.holds_stored_value(idx) {
+                emit_virtual_column_store(program, resolver, column, target_reg, table)?;
+            }
             program.emit_column_affinity(target_reg, column.affinity());
         }
         Ok(())
     })
 }
 
-/// Emit bytecode to compute a single virtual generated column expression.
+/// Emit bytecode to compute the stored value of a single virtual generated
+/// column from a row whose registers hold stored values.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_gencol_expr_from_registers(
     program: &mut ProgramBuilder,
-    expr: &ast::Expr,
+    column: &Column,
     target_reg: usize,
     registers_start: usize,
-    columns: &[crate::schema::Column],
+    columns: &[Column],
     resolver: &Resolver,
     rowid_reg: usize,
     layout: &ColumnLayout,
     table: &Arc<BTreeTable>,
 ) -> Result<()> {
+    let GeneratedType::Virtual { expr, .. } = column.generated_type() else {
+        unreachable!("emit_gencol_expr_from_registers expects a virtual generated column");
+    };
     let ctx = SelfTableContext::ForDML {
         dml_ctx: DmlColumnContext::layout(
             columns,
@@ -59,6 +65,35 @@ pub(crate) fn emit_gencol_expr_from_registers(
         translate_expr(program, None, expr, target_reg, resolver)?;
         Ok(())
     })?;
+    emit_virtual_column_store(program, resolver, column, target_reg, table)?;
 
     Ok(())
+}
+
+/// Turns the value of a virtual generated column's expression in `reg` into
+/// the value storing it in the column would store, by running the column
+/// type's ENCODE and COERCE. Every other column is read in that form and
+/// DECODE turns it into the value a query sees, so a virtual column is read
+/// the same way: `y cents AS (w)` with w = 300 reads 300. Only a STRICT
+/// table has custom types; elsewhere a type name such as NUMERIC is just an
+/// affinity.
+pub(crate) fn emit_virtual_column_store(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    column: &Column,
+    reg: usize,
+    table: &BTreeTable,
+) -> Result<()> {
+    if !table.is_strict {
+        return Ok(());
+    }
+    emit_custom_type_encode_columns(
+        program,
+        resolver,
+        std::slice::from_ref(column),
+        reg,
+        None,
+        &table.name,
+        &ColumnLayout::Identity { column_count: 1 },
+    )
 }

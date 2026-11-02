@@ -2006,3 +2006,51 @@ test check-error-does-not-run-failing-decode {
 expect error {
     CHECK constraint failed: n > 0
 }
+
+# A virtual generated column of a custom type reads what storing its
+# expression's value in a column of the type would read: 300, written as w
+# or as a CAST.
+@requires strict "uses STRICT tables"
+test virtual-custom-type-column-reads-its-expression-value {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(w integer, y cents AS (w), z cents AS (CAST(w AS cents))) STRICT;
+    INSERT INTO t(w) VALUES (300);
+    SELECT w, y, z FROM t;
+    SELECT count(*) FROM t WHERE y = 300 AND z = 300;
+}
+expect {
+    300|300|300
+    1
+}
+
+@requires strict "uses STRICT tables"
+test virtual-custom-type-column-in-an-index {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(w integer PRIMARY KEY, y cents AS (w)) STRICT;
+    CREATE INDEX t_y ON t(y);
+    INSERT INTO t(w) VALUES (300);
+    SELECT 'insert', w FROM t WHERE y = 300;
+    UPDATE t SET w = 400;
+    SELECT 'update', w FROM t WHERE y = 400;
+    INSERT INTO t(w) VALUES (400) ON CONFLICT (w) DO UPDATE SET w = 500;
+    SELECT 'upsert', w FROM t WHERE y = 500;
+    PRAGMA integrity_check;
+}
+expect {
+    insert|300
+    update|400
+    upsert|500
+    ok
+}
+
+# The column's type arguments apply to the expression's value, as when it is
+# stored: numeric(10,2) rounds 1/3 to 0.33.
+@requires strict "uses STRICT tables"
+test virtual-numeric-column-rounds-to-its-scale {
+    CREATE TABLE t(w real, n numeric(10,2) AS (w / 3)) STRICT;
+    INSERT INTO t(w) VALUES (1.0);
+    SELECT n FROM t;
+}
+expect {
+    0.33
+}

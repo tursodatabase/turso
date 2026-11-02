@@ -2214,10 +2214,10 @@ fn emit_index_column_value_new_image(
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
         match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref expr, .. } => {
+            GeneratedType::Virtual { .. } => {
                 gencol::emit_gencol_expr_from_registers(
                     program,
-                    expr,
+                    col_in_table,
                     dest_reg,
                     columns_start_reg,
                     columns,
