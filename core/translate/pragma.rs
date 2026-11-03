@@ -2038,7 +2038,11 @@ fn emit_columns_for_table_info(
         program.emit_string8(column.name.clone().unwrap_or_default(), base_reg + 1);
 
         // type
-        let mut declared_type = column.ty_str.clone();
+        let mut declared_type = if column.is_rowid_alias() {
+            "INTEGER".to_string()
+        } else {
+            column.ty_str.clone()
+        };
         let written_type = column.written_ty_str.as_deref().unwrap_or(&column.ty_str);
         if !column.ty_params.is_empty()
             && !matches!(
