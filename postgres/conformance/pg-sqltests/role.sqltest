@@ -334,6 +334,26 @@ expect error {
     must be owner of table sr_drop
 }
 
+test role-without-privileges-cannot-comment-on-table {
+    CREATE TABLE sr_commented (x int);
+    CREATE ROLE sr_commenter;
+    SET ROLE sr_commenter;
+    COMMENT ON TABLE sr_commented IS 'x';
+}
+expect error {
+    must be owner of table sr_commented
+}
+
+test role-without-privileges-cannot-comment-on-column {
+    CREATE TABLE sr_column_commented (x int);
+    CREATE ROLE sr_column_commenter;
+    SET ROLE sr_column_commenter;
+    COMMENT ON COLUMN sr_column_commented.x IS 'x';
+}
+expect error {
+    must be owner of relation sr_column_commented
+}
+
 test role-without-privileges-cannot-create-role {
     CREATE ROLE sr_role_creator;
     SET ROLE sr_role_creator;

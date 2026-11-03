@@ -236,6 +236,24 @@ fn role_without_privileges_cannot_drop_schema_or_copy_from_a_file(db: TempDataba
     assert_eq!(copy.to_string(), "permission denied to COPY from a file");
 }
 
+/// The PostgreSQL frontend runs in MVCC mode, which has no materialized
+/// views, so REFRESH does nothing for the superuser even without the view.
+#[test]
+fn role_without_privileges_cannot_refresh_materialized_view() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("REFRESH MATERIALIZED VIEW mv").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("REFRESH MATERIALIZED VIEW mv").unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "permission denied for materialized view mv"
+    );
+}
+
 #[test]
 fn set_role_finds_role_created_by_another_connection_after_prepare() {
     let db = TempDatabase::builder().build();

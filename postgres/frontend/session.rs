@@ -27,8 +27,8 @@ use turso_pg_parser::sqlstate::{
 use turso_pg_parser::translator::{
     execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
-    FrontendStmt, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo,
-    PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
+    PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 use turso_pg_parser::ParseError;
 
@@ -1039,6 +1039,7 @@ impl DeferredOperation {
                 })))
             }
             Self::Frontend(stmt) => {
+                check_frontend_privileges(conn, stmt)?;
                 let statements = match stmt {
                     FrontendStmt::ResetAll => {
                         reset_all_settings(conn)?;
@@ -1052,33 +1053,15 @@ impl DeferredOperation {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
-                        require_superuser(conn, || {
-                            PermissionDenied::privilege(
-                                Action::Create,
-                                Object::Database(catalog::db_name_from_path(conn.db_file_path())),
-                            )
-                        })?;
                         create_schema_commands(conn, stmt)?
                     }
                     FrontendStmt::DropSchema(stmt) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
-                        require_superuser(conn, || {
-                            PermissionDenied::owner(
-                                Action::Drop,
-                                Object::Schema(stmt.name.to_lowercase()),
-                            )
-                        })?;
                         drop_schema_commands(conn, stmt)?
                     }
                     FrontendStmt::CopyFrom(stmt) => {
-                        require_superuser(conn, || {
-                            PermissionDenied::privilege(
-                                Action::Read,
-                                Object::File(stmt.filename.clone()),
-                            )
-                        })?;
                         *active = Some(crate::Statement::new(prepare_copy_columns(
                             conn,
                             &stmt.table_name,
@@ -1092,7 +1075,7 @@ impl DeferredOperation {
                             index: 0,
                         })));
                     }
-                    FrontendStmt::RefreshMatview | FrontendStmt::CommentOn => {
+                    FrontendStmt::RefreshMatview(_) | FrontendStmt::CommentOn(_) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
@@ -1639,8 +1622,8 @@ fn try_prepare_special(
         | FrontendStmt::CreateSchema(_)
         | FrontendStmt::DropSchema(_)
         | FrontendStmt::CopyFrom(_)
-        | FrontendStmt::RefreshMatview
-        | FrontendStmt::CommentOn) => crate::Statement::with_deferred(
+        | FrontendStmt::RefreshMatview(_)
+        | FrontendStmt::CommentOn(_)) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
@@ -1690,14 +1673,46 @@ fn prepare_set_transaction(
     Ok(crate::Statement::new_with_post_run(inner, post_run))
 }
 
-/// Statements that the frontend runs itself, outside the privilege checks of
-/// core, are allowed only for a superuser.
-fn require_superuser(conn: &Connection, denial: impl FnOnce() -> PermissionDenied) -> Result<()> {
-    if conn.role_catalog().is_superuser(conn.current_role()) {
-        Ok(())
-    } else {
-        Err(LimboError::PermissionDenied(Box::new(denial())))
+/// Checks that the current role may run a statement that the frontend runs
+/// itself, outside the privilege checks of core. Only a superuser may change
+/// schemas or read files, and a superuser owns every object.
+fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<()> {
+    if conn.current_role_is_superuser() {
+        return Ok(());
     }
+    let denial = match stmt {
+        // Core checks the statements that these prepare.
+        FrontendStmt::Set(_)
+        | FrontendStmt::SetTransaction
+        | FrontendStmt::Show(_)
+        | FrontendStmt::ResetAll
+        | FrontendStmt::DiscardAll
+        | FrontendStmt::CopyTo(_) => return Ok(()),
+        FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
+            Action::Create,
+            Object::Database(catalog::db_name_from_path(conn.db_file_path())),
+        ),
+        FrontendStmt::DropSchema(stmt) => {
+            PermissionDenied::owner(Action::Drop, Object::Schema(stmt.name.to_lowercase()))
+        }
+        FrontendStmt::CopyFrom(stmt) => {
+            PermissionDenied::privilege(Action::Read, Object::File(stmt.filename.clone()))
+        }
+        FrontendStmt::RefreshMatview(stmt) => {
+            return Err(sqlstate_error(
+                SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                format!("permission denied for materialized view {}", stmt.name),
+            ));
+        }
+        FrontendStmt::CommentOn(stmt) => {
+            let message = match &stmt.target {
+                PgCommentTarget::Owned(object) => format!("must be owner of {object}"),
+                PgCommentTarget::Role | PgCommentTarget::Other => "permission denied".to_string(),
+            };
+            return Err(sqlstate_error(SQLSTATE_INSUFFICIENT_PRIVILEGE, message));
+        }
+    };
+    Err(LimboError::PermissionDenied(Box::new(denial)))
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
