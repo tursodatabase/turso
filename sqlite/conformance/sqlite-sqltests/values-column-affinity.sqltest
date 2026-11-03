@@ -287,11 +287,12 @@ expect {
 }
 
 # When a column is numeric and its first SELECT is a CAST, SQLite gives it the
-# FLEXNUM affinity: it is declared NUM, and the values keep their types.
+# FLEXNUM affinity: it is declared NUM, and the values keep their types. quote()
+# shows a REAL as 1.0 on every backend.
 test create-table-as-values-real-cast-then-integer {
     CREATE TABLE c AS VALUES (CAST(1 AS REAL)), (2);
     SELECT sql FROM sqlite_schema WHERE name = 'c';
-    SELECT column1, typeof(column1) FROM c;
+    SELECT quote(column1), typeof(column1) FROM c;
 }
 expect {
     CREATE TABLE c(column1 NUM)
@@ -304,9 +305,9 @@ test create-table-as-compound-real-cast-then-integer {
     CREATE TABLE e AS SELECT CAST(1 AS INTEGER) AS column1 UNION ALL SELECT 2.5;
     CREATE TABLE g AS SELECT 5 AS column1 UNION ALL SELECT CAST(2 AS REAL);
     SELECT name, sql FROM sqlite_schema ORDER BY name;
-    SELECT 'd', column1, typeof(column1) FROM d;
-    SELECT 'e', column1, typeof(column1) FROM e;
-    SELECT 'g', column1, typeof(column1) FROM g;
+    SELECT 'd', quote(column1), typeof(column1) FROM d;
+    SELECT 'e', quote(column1), typeof(column1) FROM e;
+    SELECT 'g', quote(column1), typeof(column1) FROM g;
 }
 expect {
     d|CREATE TABLE d(column1 NUM)
