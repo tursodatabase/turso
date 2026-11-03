@@ -309,6 +309,25 @@ pub fn expr_contains_function_that_changes_within_statement(
     })
 }
 
+/// Returns true if this expression still names a column (`a`, `t.a` or
+/// `db.t.a`) that binding has not resolved. A name inside a subquery belongs
+/// to that subquery and does not count.
+pub fn expr_contains_unresolved_column_name(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e| {
+        if matches!(
+            e,
+            ast::Expr::Id(_) | ast::Expr::Qualified(..) | ast::Expr::DoublyQualified(..)
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression with an infallible visitor cannot fail");
+    found
+}
+
 /// Returns true if this expression calls an aggregate or window function of
 /// its own query. A call inside a subquery belongs to that subquery and does
 /// not count.
