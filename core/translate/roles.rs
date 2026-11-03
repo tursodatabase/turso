@@ -13,6 +13,7 @@
 use crate::namespace::NamespaceId;
 use turso_parser::ast;
 
+use crate::schema::Table;
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::{
     CREATE_ROLES_NAME_INDEX_SQL, CREATE_ROLES_TABLE_SQL, ROLES_NAME_INDEX_NAME, ROLES_TABLE_NAME,
@@ -23,6 +24,7 @@ use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
 use crate::util::{visit_stmt, AstVisitor};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vtab::VirtualTableType;
 use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
@@ -42,7 +44,10 @@ pub fn check_statement_privileges(
     }
     let denial = match stmt {
         ast::Stmt::Select(_) => {
-            let mut finder = SequenceChangeFinder::default();
+            let mut finder = DeniedUseFinder {
+                resolver,
+                denial: None,
+            };
             visit_stmt(stmt, &mut finder)?;
             match finder.denial {
                 Some(denial) => denial,
@@ -153,13 +158,39 @@ fn write_denial(tbl_name: &ast::QualifiedName) -> PermissionDenied {
     )
 }
 
-/// Finds the first call that changes a sequence, `nextval()` or `setval()`.
-#[derive(Default)]
-struct SequenceChangeFinder {
+/// Finds the first thing in a query that a role that is not a superuser may
+/// not use: a call that changes a sequence, `nextval()` or `setval()`, or a
+/// table-valued PRAGMA function. Such a function runs its PRAGMA as a
+/// statement of the engine's own, which is not checked, so the PRAGMA is
+/// checked here, as if it was run directly.
+struct DeniedUseFinder<'a, 'b> {
+    resolver: &'a Resolver<'b>,
     denial: Option<PermissionDenied>,
 }
 
-impl AstVisitor for SequenceChangeFinder {
+impl DeniedUseFinder<'_, '_> {
+    /// Denies `name` if it is a table-valued PRAGMA function. It may be read
+    /// like a table, without arguments.
+    fn check_pragma_function(&mut self, name: &ast::QualifiedName) {
+        if self.denial.is_some() {
+            return;
+        }
+        let table = self
+            .resolver
+            .schema()
+            .get_table(NamespaceId::ROOT, name.name.as_str());
+        if let Some(Table::Virtual(table)) = table.as_deref() {
+            if let VirtualTableType::Pragma(pragma) = &table.vtab_type {
+                self.denial = Some(PermissionDenied::privilege(
+                    Action::Read,
+                    Object::Setting(pragma.pragma_name.clone()),
+                ));
+            }
+        }
+    }
+}
+
+impl AstVisitor for DeniedUseFinder<'_, '_> {
     fn expr(&mut self, expr: &ast::Expr) -> Result<WalkControl> {
         if self.denial.is_some() {
             return Ok(WalkControl::SkipChildren);
@@ -177,6 +208,16 @@ impl AstVisitor for SequenceChangeFinder {
             }
         }
         Ok(WalkControl::Continue)
+    }
+
+    fn table(&mut self, name: &ast::QualifiedName) -> Result<()> {
+        self.check_pragma_function(name);
+        Ok(())
+    }
+
+    fn table_function(&mut self, name: &ast::QualifiedName) -> Result<()> {
+        self.check_pragma_function(name);
+        Ok(())
     }
 }
 

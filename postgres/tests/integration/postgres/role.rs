@@ -216,6 +216,36 @@ fn schema_is_read_again_after_creating_a_role() {
     );
 }
 
+/// The table-valued PRAGMA functions run their PRAGMA as a statement of the
+/// engine's own, so the PRAGMA is checked where the function is called.
+#[test]
+fn role_without_privileges_cannot_call_pragma_functions() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SELECT file FROM pragma_database_list")
+        .unwrap();
+
+    conn.execute("SET ROLE alice").unwrap();
+
+    for (sql, pragma) in [
+        ("SELECT file FROM pragma_database_list", "database_list"),
+        ("SELECT name FROM pragma_table_info('t')", "table_info"),
+        (
+            "SELECT 1 WHERE EXISTS (SELECT 1 FROM pragma_database_list)",
+            "database_list",
+        ),
+    ] {
+        let error = conn.execute(sql).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("permission denied to examine \"{pragma}\""),
+            "{sql}"
+        );
+    }
+}
+
 #[test]
 fn role_without_privileges_cannot_create_schema() {
     let db = TempDatabase::builder().build();
