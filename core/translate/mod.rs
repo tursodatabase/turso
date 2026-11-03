@@ -34,6 +34,7 @@ pub(crate) mod pragma;
 pub(crate) mod recursive_cte;
 pub(crate) mod result_column_types;
 pub(crate) mod result_row;
+pub(crate) mod roles;
 pub(crate) mod rollback;
 pub(crate) mod schema;
 pub(crate) mod select;
@@ -114,13 +115,18 @@ pub fn translate(
     ));
 
     program.prologue();
-    // Engine-generated helper statements are always SQLite text and
-    // must resolve functions with SQLite semantics regardless of the
-    // database's dialect — the same invariant as unmarked schema rows.
-    // They look names up in every database, like SQLite does, whatever
-    // the connection's search path says.
-    let is_internal_helper = matches!(origin, crate::statement::StatementOrigin::InternalHelper);
-    let search_path = if is_internal_helper {
+    // Engine-generated statements, helpers and reads of the engine's own
+    // metadata, are always SQLite text and must resolve functions with
+    // SQLite semantics regardless of the database's dialect — the same
+    // invariant as unmarked schema rows. They look names up in every
+    // database, like SQLite does, whatever the connection's search path
+    // says.
+    let is_engine_statement = matches!(
+        origin,
+        crate::statement::StatementOrigin::InternalHelper
+            | crate::statement::StatementOrigin::EngineMetadataRead
+    );
+    let search_path = if is_engine_statement {
         None
     } else {
         connection.search_path()
@@ -135,7 +141,7 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        if is_internal_helper {
+        if is_engine_statement {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
@@ -151,6 +157,17 @@ pub fn translate(
         }
         Ok(WalkControl::Continue)
     })?;
+
+    let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
+    if check_privileges
+        && !resolver
+            .schema()
+            .roles
+            .is_superuser(connection.current_role())
+    {
+        resolver.role_is_not_superuser = true;
+        roles::check_statement_privileges(&stmt)?;
+    }
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -213,6 +230,7 @@ fn translate_statement(
             | ast::Stmt::CreateVirtualTable(..)
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
+            | ast::Stmt::CreateRole { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -404,6 +422,9 @@ fn translate_statement(
             if_exists,
             view_name,
         } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        ast::Stmt::CreateRole { role_name } => {
+            roles::translate_create_role(&role_name, resolver, program)?
+        }
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -609,6 +630,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateVirtualTable(_) => "create_virtual_table",
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",
+        ast::Stmt::CreateRole { .. } => "create_role",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
         ast::Stmt::DropIndex { .. } => "drop_index",

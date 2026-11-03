@@ -5,6 +5,7 @@
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
+use crate::security::roles::ROLES_TABLE_NAME;
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -55,6 +56,7 @@ use crate::{
     PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
     TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
+use crate::{Statement, Value};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::any::Any;
@@ -337,7 +339,7 @@ fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
 }
 
 /// Phase tracking for async database opening
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub enum OpenDbAsyncPhase {
     #[default]
     Init,
@@ -347,6 +349,10 @@ pub enum OpenDbAsyncPhase {
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
+    /// Reads the roles table into the role catalog. Runs after MVCC
+    /// bootstrap, because before it an MVCC database has no table roots and
+    /// has not replayed its logical log.
+    LoadingRoles,
     Done,
 }
 
@@ -569,6 +575,10 @@ pub struct OpenDbAsyncState {
     /// The `PRAGMA journal_mode = 'mvcc'` statement that converts the database
     /// when `DatabaseOpts::with_mvcc` is set, held across yields.
     mvcc_convert_stmt: Option<crate::Statement>,
+    /// The roles table scan of `LoadingRoles` and the rows read so far, held
+    /// across yields.
+    roles_stmt: Option<Box<Statement>>,
+    role_rows: Vec<Vec<Value>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -593,6 +603,8 @@ impl OpenDbAsyncState {
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
             mvcc_convert_stmt: None,
+            roles_stmt: None,
+            role_rows: Vec::new(),
         }
     }
 }
@@ -1804,6 +1816,44 @@ impl Database {
                         db.with_schema_mut(|schema| schema.load_namespace_names(&namespace_rows))?;
                     }
 
+                    state.phase = OpenDbAsyncPhase::LoadingRoles;
+                }
+
+                OpenDbAsyncPhase::LoadingRoles => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    if state.roles_stmt.is_none() {
+                        let schema = db.schema.lock().clone();
+                        let has_roles_table = db.dialect().supports_roles()
+                            && schema
+                                .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
+                                .is_some();
+                        *conn.schema.write() = schema;
+                        if has_roles_table {
+                            state.roles_stmt = Some(Box::new(conn.prepare_roles_read()?));
+                        }
+                    }
+                    if let Some(stmt) = state.roles_stmt.as_mut() {
+                        let rows = &mut state.role_rows;
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            rows.push(row.get_values().cloned().collect());
+                            Ok(())
+                        }));
+                        state.roles_stmt = None;
+                        let roles =
+                            Arc::new(crate::security::roles::RoleCatalog::new(&state.role_rows)?);
+                        db.with_schema_mut(|schema| {
+                            schema.roles = roles;
+                            Ok(())
+                        })?;
+                    }
+
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state
@@ -2755,6 +2805,8 @@ impl Database {
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
+            session_role: crate::security::roles::RoleId::SUPERUSER,
+            current_role: RwLock::new(crate::security::roles::RoleId::SUPERUSER),
             sequence_currvals: RwLock::new(HashMap::default()),
         });
         self.n_connections

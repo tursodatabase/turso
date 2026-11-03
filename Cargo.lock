@@ -7589,6 +7589,7 @@ dependencies = [
  "serde",
  "serde_json",
  "syntect",
+ "tempfile",
  "toml 0.8.22",
  "toml_edit 0.22.26",
  "tracing",

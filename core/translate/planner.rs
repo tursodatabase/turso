@@ -33,6 +33,7 @@ use crate::{
         Table,
     },
     util::{exprs_are_equivalent, normalize_ident},
+    vtab::VirtualTableType,
     Result,
 };
 use crate::{
@@ -2160,6 +2161,9 @@ fn parse_table(
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
+            if let VirtualTableType::Pragma(pragma) = &tbl.vtab_type {
+                crate::translate::roles::check_pragma_function(resolver, &pragma.pragma_name)?;
+            }
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {

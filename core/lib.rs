@@ -36,6 +36,7 @@ pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 pub mod schema;
+pub mod security;
 pub mod skiplist;
 pub mod state_machine;
 pub mod storage;
@@ -185,7 +186,7 @@ pub use turso_macros::{
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
-pub use vdbe::array::array_values_from_any;
+pub use vdbe::array::{array_values_from_any, text_array_literal};
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,

@@ -4,6 +4,7 @@ use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::namespace::{NamespaceId, NamespaceRef, Qualifier, Qualifiers};
+use crate::security::roles::{RoleCatalog, RoleId, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{checksum::CHECKSUM_REQUIRED_RESERVED_BYTES, pager::SavepointResult};
@@ -266,6 +267,11 @@ enum ReparsePhase {
     /// Loading the CREATE TYPE statements `type_sqls`, then building the
     /// materialized views and indexes collected by the `sqlite_schema` scan.
     BuildIndexes { type_sqls: Vec<String> },
+    /// Loading roles from the roles table into the role catalog.
+    LoadRoles {
+        stmt: Box<Statement>,
+        rows: Vec<Vec<Value>>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -598,6 +604,10 @@ pub struct Connection {
     /// Per-connection last-returned value for each sequence (for currval()),
     /// by the database and normalized name of the sequence.
     pub(crate) sequence_currvals: RwLock<HashMap<(usize, String), i64>>,
+    /// The role the session logged in as. `SET ROLE` checks against it.
+    pub(crate) session_role: RoleId,
+    /// The role whose privileges statements are checked against.
+    pub(crate) current_role: RwLock<RoleId>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -1701,6 +1711,18 @@ impl Connection {
                         &self.syms.read(),
                         type_sqls,
                     )?;
+                    inner.phase = self.load_roles_phase(&inner.fresh)?;
+                }
+                ReparsePhase::LoadRoles { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        turso_assert!(
+                            !matches!(self.get_tx_state(), TransactionState::None),
+                            "roles must be read in a transaction"
+                        );
+                        rows.push(row.get_values().cloned().collect());
+                        Ok(())
+                    }));
+                    inner.fresh.roles = Arc::new(RoleCatalog::new(rows)?);
                     inner.phase = ReparsePhase::RefreshStats {
                         stats: Default::default(),
                     };
@@ -1727,6 +1749,39 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Returns the phase that loads the roles table into `fresh`, or the
+    /// stats refresh phase if the dialect has no roles or the database has no
+    /// roles table. The fresh
+    /// schema is installed first, because the current schema may not contain
+    /// the roles table yet.
+    fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        if !self.db.dialect().supports_roles()
+            || !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
+        {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare_roles_read()?;
+        Ok(ReparsePhase::LoadRoles {
+            stmt: Box::new(stmt),
+            rows: Vec::new(),
+        })
+    }
+
+    /// Prepares the read of the roles table, for opening the database and
+    /// for reading the schema again. The table belongs to the engine, so its
+    /// name is looked up in every database, whatever the search path says.
+    /// The read is a top-level statement, so it runs in its own read
+    /// transaction when the schema is read outside a transaction.
+    pub(crate) fn prepare_roles_read(self: &Arc<Connection>) -> Result<Statement> {
+        self.prepare_with_origin(SELECT_ROLES_SQL, StatementOrigin::EngineMetadataRead)
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -3507,6 +3562,33 @@ impl Connection {
     pub fn search_order(&self) -> Vec<Qualifier> {
         self.current_qualifiers()
             .search_order(self.search_path.read().as_deref())
+    }
+
+    /// Returns the roles of the main database as seen by this connection.
+    /// Outside a transaction, this includes roles that other connections
+    /// committed.
+    pub fn role_catalog(&self) -> Arc<RoleCatalog> {
+        self.maybe_update_schema();
+        self.with_schema(MAIN_DB_ID, |schema| schema.roles.clone())
+    }
+
+    pub fn session_role(&self) -> RoleId {
+        self.session_role
+    }
+
+    pub fn current_role(&self) -> RoleId {
+        *self.current_role.read()
+    }
+
+    pub fn current_role_is_superuser(&self) -> bool {
+        self.role_catalog().is_superuser(self.current_role())
+    }
+
+    /// Statements prepared under the previous role are prepared again, because
+    /// privileges are checked when a statement is prepared.
+    pub fn set_current_role(&self, role: RoleId) {
+        *self.current_role.write() = role;
+        self.bump_prepare_context_generation();
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning

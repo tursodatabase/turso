@@ -187,6 +187,7 @@ impl PostgreSQLTranslator {
             NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas)?,
             NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt)?,
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
+            NodeRef::CreateRoleStmt(role) => translate_create_role(role)?,
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
                     "COPY is handled at the postgres frontend layer".to_string(),
@@ -3133,15 +3134,13 @@ impl PostgreSQLTranslator {
                         | SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
                     ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
-                    Ok(
-                        SqlValueFunctionOp::SvfopCurrentUser
-                        | SqlValueFunctionOp::SvfopSessionUser
-                        | SqlValueFunctionOp::SvfopUser
-                        | SqlValueFunctionOp::SvfopCurrentRole,
-                    ) => {
-                        // Return empty string stub for user functions
-                        Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
-                    }
+                    // Each role keyword is stored as a call to the function
+                    // of the same name, so that the catalogs can show the
+                    // keyword that was written.
+                    Ok(SqlValueFunctionOp::SvfopCurrentUser) => Ok(role_function("current_user")),
+                    Ok(SqlValueFunctionOp::SvfopCurrentRole) => Ok(role_function("current_role")),
+                    Ok(SqlValueFunctionOp::SvfopUser) => Ok(role_function("user")),
+                    Ok(SqlValueFunctionOp::SvfopSessionUser) => Ok(role_function("session_user")),
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.
                     Ok(SqlValueFunctionOp::SvfopCurrentSchema) => Ok(ast::Expr::FunctionCall {
@@ -5938,6 +5937,90 @@ struct PgForeignKey {
     on_update: Option<String>,
 }
 
+/// The name of the superuser that PostgreSQL creates with every database
+/// cluster. In turso it is the built-in superuser role, which every
+/// connection starts as.
+pub const BOOTSTRAP_SUPERUSER_NAME: &str = "postgres";
+
+fn translate_create_role(
+    stmt: &pg_query::protobuf::CreateRoleStmt,
+) -> Result<ast::Stmt, ParseError> {
+    use pg_query::protobuf::RoleStmtType;
+
+    match RoleStmtType::try_from(stmt.stmt_type) {
+        Ok(RoleStmtType::RolestmtRole) => {}
+        Ok(RoleStmtType::RolestmtUser) => {
+            return Err(ParseError::ParseError(
+                "CREATE USER is not supported".to_string(),
+            ))
+        }
+        Ok(RoleStmtType::RolestmtGroup) => {
+            return Err(ParseError::ParseError(
+                "CREATE GROUP is not supported".to_string(),
+            ))
+        }
+        _ => {
+            return Err(ParseError::ParseError(format!(
+                "unknown CREATE ROLE statement type: {}",
+                stmt.stmt_type
+            )))
+        }
+    }
+    if !stmt.options.is_empty() {
+        return Err(ParseError::ParseError(
+            "CREATE ROLE options are not supported".to_string(),
+        ));
+    }
+    if stmt.role.starts_with("pg_") {
+        return Err(ParseError::ParseError(format!(
+            "role name \"{}\" is reserved",
+            stmt.role
+        )));
+    }
+    if stmt.role == BOOTSTRAP_SUPERUSER_NAME {
+        return Err(ParseError::ParseError(format!(
+            "role \"{BOOTSTRAP_SUPERUSER_NAME}\" already exists"
+        )));
+    }
+    Ok(ast::Stmt::CreateRole {
+        role_name: stmt.role.clone(),
+    })
+}
+
+/// The functions that the role keywords `CURRENT_USER`, `CURRENT_ROLE`,
+/// `USER` and `SESSION_USER` are stored as, with their keywords.
+const ROLE_KEYWORD_FUNCTIONS: [(&str, &str); 4] = [
+    ("current_user", "CURRENT_USER"),
+    ("current_role", "CURRENT_ROLE"),
+    ("user", "USER"),
+    ("session_user", "SESSION_USER"),
+];
+
+fn role_function(name: &str) -> ast::Expr {
+    debug_assert!(ROLE_KEYWORD_FUNCTIONS
+        .iter()
+        .any(|(function, _)| *function == name));
+    ast::Expr::FunctionCall {
+        name: ast::Name::from_string(name),
+        distinctness: None,
+        args: vec![],
+        order_by: vec![],
+        within_group: vec![],
+        filter_over: ast::FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        },
+    }
+}
+
+/// The role keyword that a call to `function_name` was written as.
+pub fn role_keyword(function_name: &str) -> Option<&'static str> {
+    ROLE_KEYWORD_FUNCTIONS
+        .iter()
+        .find(|(function, _)| function.eq_ignore_ascii_case(function_name))
+        .map(|(_, keyword)| *keyword)
+}
+
 /// Translate `CREATE TYPE <name> AS ENUM (...)` to a Turso `CREATE TYPE` with
 /// an ENCODE expression that validates values against the enum labels.
 fn translate_create_enum(
@@ -6784,22 +6867,36 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
     })
 }
 
-/// Returns true if the parse result is a REFRESH MATERIALIZED VIEW statement.
-/// Turso materialized views are live (auto-updating), so REFRESH is a no-op.
-pub fn is_refresh_matview(parse_result: &ParseResult) -> Result<bool, ParseError> {
+/// A REFRESH MATERIALIZED VIEW statement. Turso materialized views are live
+/// (auto-updating), so REFRESH does nothing.
+#[derive(Debug, Clone)]
+pub struct PgRefreshMatviewStmt {
+    /// The name of the materialized view, as written.
+    pub name: String,
+}
+
+/// Extracts a REFRESH MATERIALIZED VIEW statement.
+pub fn try_extract_refresh_matview(
+    parse_result: &ParseResult,
+) -> Result<Option<PgRefreshMatviewStmt>, ParseError> {
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
     if nodes.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
     let NodeRef::RefreshMatViewStmt(refresh) = &nodes[0].0 else {
-        return Ok(false);
+        return Ok(None);
     };
     if refresh.skip_data {
         return Err(not_supported("REFRESH MATERIALIZED VIEW ... WITH NO DATA"));
     }
-    Ok(true)
+    let name = refresh
+        .relation
+        .as_ref()
+        .map(|relation| relation.relname.clone())
+        .unwrap_or_default();
+    Ok(Some(PgRefreshMatviewStmt { name }))
 }
 
 /// Returns true if the parse result is a DROP MATERIALIZED VIEW statement.
@@ -6818,16 +6915,87 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
-/// Returns true if the parse result is a COMMENT ON statement.
-/// Comments are accepted for PostgreSQL compatibility but are not persisted.
-pub fn is_comment_on(parse_result: &ParseResult) -> bool {
+/// A COMMENT ON statement. Comments are accepted for PostgreSQL
+/// compatibility but are not stored.
+#[derive(Debug, Clone)]
+pub struct PgCommentOnStmt {
+    pub target: PgCommentTarget,
+}
+
+/// What a COMMENT ON statement comments on, as far as deciding who may run
+/// it.
+#[derive(Debug, Clone)]
+pub enum PgCommentTarget {
+    /// An object that only its owner may comment on, named the way
+    /// PostgreSQL names it in errors, such as `table t`, or `relation t` for
+    /// a column or constraint of `t`.
+    Owned(String),
+    /// A role. Commenting on it needs the CREATEROLE attribute.
+    Role,
+    /// Any other kind of object.
+    Other,
+}
+
+/// Extracts a COMMENT ON statement.
+pub fn try_extract_comment_on(parse_result: &ParseResult) -> Option<PgCommentOnStmt> {
+    use pg_query::protobuf::ObjectType;
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
-    if nodes.is_empty() {
-        return false;
+    let NodeRef::CommentStmt(comment) = &nodes.first()?.0 else {
+        return None;
+    };
+    let names = comment
+        .object
+        .as_ref()
+        .and_then(|node| node.node.as_ref())
+        .map(comment_object_names)
+        .unwrap_or_default();
+    let last = || names.last().cloned().unwrap_or_default();
+    let owned = |kind: &str, name: String| PgCommentTarget::Owned(format!("{kind} {name}"));
+    let target = match ObjectType::try_from(comment.objtype) {
+        Ok(ObjectType::ObjectTable) => owned("table", last()),
+        Ok(ObjectType::ObjectView) => owned("view", last()),
+        Ok(ObjectType::ObjectMatview) => owned("materialized view", last()),
+        Ok(ObjectType::ObjectIndex) => owned("index", last()),
+        Ok(ObjectType::ObjectSequence) => owned("sequence", last()),
+        Ok(ObjectType::ObjectSchema) => owned("schema", last()),
+        Ok(ObjectType::ObjectType | ObjectType::ObjectDomain) => owned("type", last()),
+        Ok(ObjectType::ObjectFunction) => owned("function", last()),
+        Ok(ObjectType::ObjectDatabase) => owned("database", last()),
+        Ok(ObjectType::ObjectExtension) => owned("extension", last()),
+        // A column or constraint belongs to its table.
+        Ok(ObjectType::ObjectColumn | ObjectType::ObjectTabconstraint) => owned(
+            "relation",
+            names.iter().rev().nth(1).cloned().unwrap_or_default(),
+        ),
+        Ok(ObjectType::ObjectRole) => PgCommentTarget::Role,
+        _ => PgCommentTarget::Other,
+    };
+    Some(PgCommentOnStmt { target })
+}
+
+/// The names in the object of a COMMENT ON statement, such as
+/// `["s", "t", "a"]` for `COMMENT ON COLUMN s.t.a`.
+fn comment_object_names(node: &pg_query::NodeEnum) -> Vec<String> {
+    use pg_query::NodeEnum;
+
+    let strings = |items: &[pg_query::protobuf::Node]| {
+        items
+            .iter()
+            .filter_map(|item| match &item.node {
+                Some(NodeEnum::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    match node {
+        NodeEnum::String(s) => vec![s.sval.clone()],
+        NodeEnum::List(list) => strings(&list.items),
+        NodeEnum::TypeName(type_name) => strings(&type_name.names),
+        NodeEnum::ObjectWithArgs(function) => strings(&function.objname),
+        _ => Vec::new(),
     }
-    matches!(&nodes[0].0, NodeRef::CommentStmt(_))
 }
 
 /// Extracted COPY FROM statement info for use by the connection layer.
@@ -6984,8 +7152,8 @@ pub enum FrontendStmt {
     DiscardAll,
     CreateSchema(PgCreateSchemaStmt),
     DropSchema(PgDropSchemaStmt),
-    RefreshMatview,
-    CommentOn,
+    RefreshMatview(PgRefreshMatviewStmt),
+    CommentOn(PgCommentOnStmt),
     CopyFrom(PgCopyFromStmt),
     CopyTo(crate::copy::CopyToStdout),
 }
@@ -7017,11 +7185,11 @@ pub fn frontend_stmt(
     if let Some(stmt) = try_extract_drop_schema(parse_result) {
         return Ok(Some(FrontendStmt::DropSchema(stmt)));
     }
-    if is_refresh_matview(parse_result)? {
-        return Ok(Some(FrontendStmt::RefreshMatview));
+    if let Some(stmt) = try_extract_refresh_matview(parse_result)? {
+        return Ok(Some(FrontendStmt::RefreshMatview(stmt)));
     }
-    if is_comment_on(parse_result) {
-        return Ok(Some(FrontendStmt::CommentOn));
+    if let Some(stmt) = try_extract_comment_on(parse_result) {
+        return Ok(Some(FrontendStmt::CommentOn(stmt)));
     }
     if let Some(stmt) = try_extract_copy_from(parse_result)? {
         return Ok(Some(FrontendStmt::CopyFrom(stmt)));
@@ -7752,8 +7920,8 @@ mod tests {
                 FrontendStmt::DiscardAll => "discard all",
                 FrontendStmt::CreateSchema(_) => "create schema",
                 FrontendStmt::DropSchema(_) => "drop schema",
-                FrontendStmt::RefreshMatview => "refresh matview",
-                FrontendStmt::CommentOn => "comment on",
+                FrontendStmt::RefreshMatview(_) => "refresh matview",
+                FrontendStmt::CommentOn(_) => "comment on",
                 FrontendStmt::CopyFrom(_) => "copy from",
                 FrontendStmt::CopyTo(_) => "copy to",
             })
@@ -10364,16 +10532,50 @@ mod tests {
     #[test]
     fn fail_closed_refresh_with_no_data() {
         let parsed = crate::parse("REFRESH MATERIALIZED VIEW m WITH NO DATA").unwrap();
-        let err = is_refresh_matview(&parsed).unwrap_err().to_string();
+        let err = try_extract_refresh_matview(&parsed)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("WITH NO DATA"), "{err}");
         for sql in [
             "REFRESH MATERIALIZED VIEW m",
             "REFRESH MATERIALIZED VIEW CONCURRENTLY m WITH DATA",
         ] {
-            assert!(
-                is_refresh_matview(&crate::parse(sql).unwrap()).unwrap(),
-                "{sql}"
-            );
+            let stmt = try_extract_refresh_matview(&crate::parse(sql).unwrap()).unwrap();
+            assert_eq!(stmt.map(|stmt| stmt.name).as_deref(), Some("m"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn comment_on_names_the_object_whose_owner_may_run_it() {
+        let target = |sql: &str| match try_extract_comment_on(&crate::parse(sql).unwrap())
+            .unwrap()
+            .target
+        {
+            PgCommentTarget::Owned(object) => object,
+            PgCommentTarget::Role => "role".to_string(),
+            PgCommentTarget::Other => "other".to_string(),
+        };
+        for (sql, want) in [
+            ("COMMENT ON TABLE s.t IS 'x'", "table t"),
+            ("COMMENT ON COLUMN s.t.a IS 'x'", "relation t"),
+            ("COMMENT ON CONSTRAINT c ON t IS 'x'", "relation t"),
+            ("COMMENT ON VIEW v IS 'x'", "view v"),
+            (
+                "COMMENT ON MATERIALIZED VIEW mv IS 'x'",
+                "materialized view mv",
+            ),
+            ("COMMENT ON INDEX i IS 'x'", "index i"),
+            ("COMMENT ON SEQUENCE s IS 'x'", "sequence s"),
+            ("COMMENT ON SCHEMA sc IS 'x'", "schema sc"),
+            ("COMMENT ON TYPE ty IS 'x'", "type ty"),
+            ("COMMENT ON DOMAIN d IS 'x'", "type d"),
+            ("COMMENT ON FUNCTION f(int) IS 'x'", "function f"),
+            ("COMMENT ON DATABASE db IS 'x'", "database db"),
+            ("COMMENT ON EXTENSION plpgsql IS 'x'", "extension plpgsql"),
+            ("COMMENT ON ROLE r IS 'x'", "role"),
+            ("COMMENT ON LANGUAGE sql IS 'x'", "other"),
+        ] {
+            assert_eq!(target(sql), want, "{sql}");
         }
     }
 

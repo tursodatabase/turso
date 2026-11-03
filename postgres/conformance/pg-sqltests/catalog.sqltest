@@ -266,6 +266,8 @@ test pg-function-support-catalogs-are-empty {
 expect {}
 
 test pg-init-privs-is-read-only {
+    CREATE ROLE reader_of_init_privs_is_read_only_role;
+    SET ROLE reader_of_init_privs_is_read_only_role;
     DELETE FROM pg_init_privs;
 }
 @sqlstate 42501
@@ -274,6 +276,8 @@ expect error {permission denied for table pg_init_privs}
 expect @tursopg error {cannot delete from pg_catalog table "pg_init_privs"}
 
 test pg-cast-is-read-only {
+    CREATE ROLE reader_of_cast_is_read_only_role;
+    SET ROLE reader_of_cast_is_read_only_role;
     DELETE FROM pg_cast;
 }
 @sqlstate 42501
@@ -282,6 +286,8 @@ expect error {permission denied for table pg_cast}
 expect @tursopg error {cannot delete from pg_catalog table "pg_cast"}
 
 test pg-transform-is-read-only {
+    CREATE ROLE reader_of_transform_is_read_only_role;
+    SET ROLE reader_of_transform_is_read_only_role;
     DELETE FROM pg_transform;
 }
 @sqlstate 42501
@@ -411,6 +417,8 @@ test pg-object-unsupported-catalogs-are-empty {
 expect {}
 
 test pg-object-operator-is-read-only {
+    CREATE ROLE reader_of_object_operator_is_read_only_role;
+    SET ROLE reader_of_object_operator_is_read_only_role;
     DELETE FROM pg_operator;
 }
 @sqlstate 42501
@@ -419,6 +427,8 @@ expect error {permission denied for table pg_operator}
 expect @tursopg error {cannot delete from pg_catalog table "pg_operator"}
 
 test pg-object-opclass-is-read-only {
+    CREATE ROLE reader_of_object_opclass_is_read_only_role;
+    SET ROLE reader_of_object_opclass_is_read_only_role;
     DELETE FROM pg_opclass;
 }
 @sqlstate 42501
@@ -427,6 +437,8 @@ expect error {permission denied for table pg_opclass}
 expect @tursopg error {cannot delete from pg_catalog table "pg_opclass"}
 
 test pg-object-opfamily-is-read-only {
+    CREATE ROLE reader_of_object_opfamily_is_read_only_role;
+    SET ROLE reader_of_object_opfamily_is_read_only_role;
     DELETE FROM pg_opfamily;
 }
 @sqlstate 42501
@@ -435,6 +447,8 @@ expect error {permission denied for table pg_opfamily}
 expect @tursopg error {cannot delete from pg_catalog table "pg_opfamily"}
 
 test pg-object-ts-parser-is-read-only {
+    CREATE ROLE reader_of_object_ts_parser_is_read_only_role;
+    SET ROLE reader_of_object_ts_parser_is_read_only_role;
     DELETE FROM pg_ts_parser;
 }
 @sqlstate 42501
@@ -443,6 +457,8 @@ expect error {permission denied for table pg_ts_parser}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_parser"}
 
 test pg-object-ts-template-is-read-only {
+    CREATE ROLE reader_of_object_ts_template_is_read_only_role;
+    SET ROLE reader_of_object_ts_template_is_read_only_role;
     DELETE FROM pg_ts_template;
 }
 @sqlstate 42501
@@ -451,6 +467,8 @@ expect error {permission denied for table pg_ts_template}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_template"}
 
 test pg-object-ts-dict-is-read-only {
+    CREATE ROLE reader_of_object_ts_dict_is_read_only_role;
+    SET ROLE reader_of_object_ts_dict_is_read_only_role;
     DELETE FROM pg_ts_dict;
 }
 @sqlstate 42501
@@ -459,6 +477,8 @@ expect error {permission denied for table pg_ts_dict}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_dict"}
 
 test pg-object-ts-config-is-read-only {
+    CREATE ROLE reader_of_object_ts_config_is_read_only_role;
+    SET ROLE reader_of_object_ts_config_is_read_only_role;
     DELETE FROM pg_ts_config;
 }
 @sqlstate 42501
@@ -467,6 +487,8 @@ expect error {permission denied for table pg_ts_config}
 expect @tursopg error {cannot delete from pg_catalog table "pg_ts_config"}
 
 test pg-object-foreign-data-wrapper-is-read-only {
+    CREATE ROLE reader_of_object_foreign_data_wrapper_is_read_only_role;
+    SET ROLE reader_of_object_foreign_data_wrapper_is_read_only_role;
     DELETE FROM pg_foreign_data_wrapper;
 }
 @sqlstate 42501
@@ -475,6 +497,8 @@ expect error {permission denied for table pg_foreign_data_wrapper}
 expect @tursopg error {cannot delete from pg_catalog table "pg_foreign_data_wrapper"}
 
 test pg-object-foreign-server-is-read-only {
+    CREATE ROLE reader_of_object_foreign_server_is_read_only_role;
+    SET ROLE reader_of_object_foreign_server_is_read_only_role;
     DELETE FROM pg_foreign_server;
 }
 @sqlstate 42501
@@ -483,6 +507,8 @@ expect error {permission denied for table pg_foreign_server}
 expect @tursopg error {cannot delete from pg_catalog table "pg_foreign_server"}
 
 test pg-object-default-acl-is-read-only {
+    CREATE ROLE reader_of_object_default_acl_is_read_only_role;
+    SET ROLE reader_of_object_default_acl_is_read_only_role;
     DELETE FROM pg_default_acl;
 }
 @sqlstate 42501
@@ -491,6 +517,8 @@ expect error {permission denied for table pg_default_acl}
 expect @tursopg error {cannot delete from pg_catalog table "pg_default_acl"}
 
 test pg-object-conversion-is-read-only {
+    CREATE ROLE reader_of_object_conversion_is_read_only_role;
+    SET ROLE reader_of_object_conversion_is_read_only_role;
     DELETE FROM pg_conversion;
 }
 @sqlstate 42501
@@ -499,6 +527,8 @@ expect error {permission denied for table pg_conversion}
 expect @tursopg error {cannot delete from pg_catalog table "pg_conversion"}
 
 test pg-object-range-is-read-only {
+    CREATE ROLE reader_of_object_range_is_read_only_role;
+    SET ROLE reader_of_object_range_is_read_only_role;
     DELETE FROM pg_range;
 }
 @sqlstate 42501
@@ -507,6 +537,8 @@ expect error {permission denied for table pg_range}
 expect @tursopg error {cannot delete from pg_catalog table "pg_range"}
 
 test pg-object-event-trigger-is-read-only {
+    CREATE ROLE reader_of_object_event_trigger_is_read_only_role;
+    SET ROLE reader_of_object_event_trigger_is_read_only_role;
     DELETE FROM pg_event_trigger;
 }
 @sqlstate 42501
@@ -515,6 +547,8 @@ expect error {permission denied for table pg_event_trigger}
 expect @tursopg error {cannot delete from pg_catalog table "pg_event_trigger"}
 
 test pg-object-subscription-is-read-only {
+    CREATE ROLE reader_of_object_subscription_is_read_only_role;
+    SET ROLE reader_of_object_subscription_is_read_only_role;
     DELETE FROM pg_subscription;
 }
 @sqlstate 42501
@@ -523,6 +557,8 @@ expect error {permission denied for table pg_subscription}
 expect @tursopg error {cannot delete from pg_catalog table "pg_subscription"}
 
 test pg-object-largeobject-metadata-is-read-only {
+    CREATE ROLE reader_of_object_largeobject_metadata_is_read_only_role;
+    SET ROLE reader_of_object_largeobject_metadata_is_read_only_role;
     DELETE FROM pg_largeobject_metadata;
 }
 @sqlstate 42501
@@ -531,6 +567,8 @@ expect error {permission denied for table pg_largeobject_metadata}
 expect @tursopg error {cannot delete from pg_catalog table "pg_largeobject_metadata"}
 
 test pg-object-amop-is-read-only {
+    CREATE ROLE reader_of_object_amop_is_read_only_role;
+    SET ROLE reader_of_object_amop_is_read_only_role;
     DELETE FROM pg_amop;
 }
 @sqlstate 42501
@@ -539,6 +577,8 @@ expect error {permission denied for table pg_amop}
 expect @tursopg error {cannot delete from pg_catalog table "pg_amop"}
 
 test pg-object-amproc-is-read-only {
+    CREATE ROLE reader_of_object_amproc_is_read_only_role;
+    SET ROLE reader_of_object_amproc_is_read_only_role;
     DELETE FROM pg_amproc;
 }
 @sqlstate 42501

@@ -191,6 +191,20 @@ pub(crate) fn serialize_array_from_blob(blob: &[u8]) -> Result<String> {
     Ok(result)
 }
 
+/// Formats texts as an array literal in the same format, such as
+/// `{a,"b c"}`.
+pub fn text_array_literal<'a>(elements: impl IntoIterator<Item = &'a str>) -> String {
+    let mut result = String::from("{");
+    for (i, element) in elements.into_iter().enumerate() {
+        if i > 0 {
+            result.push(',');
+        }
+        write_pg_text_element(&mut result, element);
+    }
+    result.push('}');
+    result
+}
+
 fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
     match val {
         crate::ValueRef::Null => result.push_str("NULL"),

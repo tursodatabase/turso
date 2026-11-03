@@ -4,6 +4,7 @@ use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
+use turso_core::security::roles::{RoleCatalog, RoleId};
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
@@ -42,9 +43,9 @@ macro_rules! scalar_functions {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |connection, args| {
-        "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(args)?,
-        "pg_get_userbyid"(FunctionArity::Exact(1), true) => {
-            oid_arg(args, 0)?.map(exec_pg_get_user_by_id)
+        "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
+        "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
+            oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
         },
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible"(
             FunctionArity::Exact(1), true
@@ -98,6 +99,12 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         },
         "current_schemas"(FunctionArity::Exact(1), false) => {
             exec_current_schemas(connection, args[0].get_value())?
+        },
+        "current_user" | "current_role" | "user"(FunctionArity::Exact(0), false) => {
+            role_name(connection, connection.current_role())?
+        },
+        "session_user"(FunctionArity::Exact(0), false) => {
+            role_name(connection, connection.session_role())?
         },
         "pg_backend_pid"(FunctionArity::Exact(0), true) => std::process::id() as i64,
         // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -257,7 +264,7 @@ fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<St
     Ok(Some(result))
 }
 
-fn exec_acl_default(args: &[Register]) -> Result<Option<String>> {
+fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<String>> {
     if matches!(args[0].get_value(), Value::Null) || matches!(args[1].get_value(), Value::Null) {
         return Ok(None);
     }
@@ -287,15 +294,7 @@ fn exec_acl_default(args: &[Register]) -> Result<Option<String>> {
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
-    // TODO: This hardcoded role mapping is temporary pg_dump compatibility.
-    // Replace it with a real role OID-to-name lookup later. Keep the numeric fallback for unknown OIDs.
-    let role = if owner == 10 {
-        "turso".to_string()
-    } else if owner == PG_DATABASE_OWNER_OID {
-        "pg_database_owner".to_string()
-    } else {
-        owner.to_string()
-    };
+    let role = acl_role_name(&role_name_by_oid(conn, owner).unwrap_or_else(|| owner.to_string()));
     let mut entries = Vec::with_capacity(2);
     if !public_privileges.is_empty() {
         entries.push(format!("={public_privileges}/{role}"));
@@ -304,7 +303,16 @@ fn exec_acl_default(args: &[Register]) -> Result<Option<String>> {
         let grantee = if owner == 0 { "" } else { &role };
         entries.push(format!("{grantee}={owner_privileges}/{role}"));
     }
-    Ok(Some(format!("{{{}}}", entries.join(","))))
+    Ok(Some(turso_core::text_array_literal(
+        entries.iter().map(String::as_str),
+    )))
+}
+
+fn acl_role_name(name: &str) -> String {
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return name.to_string();
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[derive(strum::EnumString)]
@@ -628,12 +636,33 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
-fn exec_pg_get_user_by_id(oid: i64) -> &'static str {
-    if oid == PG_DATABASE_OWNER_OID {
-        "pg_database_owner"
-    } else {
-        "turso"
+fn role_name(conn: &Connection, role: RoleId) -> Result<String> {
+    role_name_in(&conn.role_catalog(), role)
+}
+
+/// The role of a connection is normally in the catalog, but it may have been
+/// dropped by another connection since the connection was opened.
+fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> {
+    match crate::catalog::postgres_roles(roles).find(|found| found.id == role) {
+        Some(role) => Ok(role.name),
+        None => Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_OBJECT,
+            format!("invalid role OID: {}", crate::catalog::role_oid(role)),
+        )),
     }
+}
+
+fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
+    role_name_by_oid(conn, oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
+}
+
+fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
+    if oid == PG_DATABASE_OWNER_OID {
+        return Some("pg_database_owner".to_string());
+    }
+    crate::catalog::postgres_roles(&conn.role_catalog())
+        .find(|role| crate::catalog::role_oid(role.id) == oid)
+        .map(|role| role.name)
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Boolean {
@@ -1541,4 +1570,29 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_name_of_a_role_that_is_not_in_the_catalog_is_an_error() {
+        let with_alice = RoleCatalog::new(&[vec![
+            Value::from_i64(1),
+            Value::build_text("alice"),
+            Value::from_i64(0),
+        ]])
+        .unwrap();
+        let without_alice = RoleCatalog::new(&[]).unwrap();
+        let alice = with_alice.get_by_name("alice").unwrap().id;
+        assert_eq!(role_name_in(&with_alice, alice).unwrap(), "alice");
+
+        let error = role_name_in(&without_alice, alice).unwrap_err();
+        assert_eq!(error.to_string(), "invalid role OID: 16385");
+        assert_eq!(
+            role_name_in(&without_alice, RoleId::SUPERUSER).unwrap(),
+            "postgres"
+        );
+    }
 }

@@ -17,6 +17,7 @@ use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
 };
+use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
@@ -10801,6 +10802,15 @@ pub fn op_function(
                 if !program.connection.can_load_extensions() {
                     crate::bail_parse_error!("runtime extension loading is disabled");
                 }
+                if !program.connection.current_role_is_superuser() {
+                    return Err(LimboError::PermissionDenied(Box::new(
+                        PermissionDenied::privilege(
+                            Action::Execute,
+                            Object::Function("load_extension".to_string()),
+                        ),
+                    ))
+                    .into());
+                }
                 let extension = &state.registers[*start_reg];
                 let ext = resolve_ext_path(&extension.get_value().to_string())?;
                 program.connection.load_extension(ext)?;
@@ -15127,6 +15137,39 @@ pub fn op_add_type(
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))??;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_add_role(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        AddRole {
+            db,
+            id_reg,
+            name,
+            superuser,
+        },
+        insn
+    );
+    let Value::Numeric(Numeric::Integer(rowid)) = state.registers[*id_reg].get_value() else {
+        return Err(LimboError::InternalError(format!(
+            "AddRole: role rowid register r[{id_reg}] does not hold an integer"
+        ))
+        .into());
+    };
+    let role = crate::security::roles::Role {
+        id: crate::security::roles::RoleId::from_rowid(*rowid),
+        name: name.clone(),
+        superuser: *superuser,
+    };
+    program
+        .connection
+        .with_database_schema_mut(*db, |schema| Arc::make_mut(&mut schema.roles).add(role))?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

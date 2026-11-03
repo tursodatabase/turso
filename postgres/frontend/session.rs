@@ -8,10 +8,12 @@ use std::task::Waker;
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
 use crate::settings::{
-    find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SettingScope,
+    find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
+    SettingScope,
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::schema::Table;
+use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
@@ -21,13 +23,14 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
     execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
     set_transaction_access_mode, unnamed_index_name, unqualified_create_table_name_location,
-    FrontendStmt, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetTo,
-    PgSetValue, PgShowStmt, PostgreSQLTranslator,
+    FrontendStmt, PgCommentTarget, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt,
+    PgSetTo, PgSetValue, PgShowStmt, PostgreSQLTranslator,
 };
 use turso_pg_parser::ParseError;
 
@@ -1038,6 +1041,7 @@ impl DeferredOperation {
                 })))
             }
             Self::Frontend(stmt) => {
+                check_frontend_privileges(conn, stmt)?;
                 let statements = match stmt {
                     FrontendStmt::ResetAll => {
                         reset_all_settings(conn)?;
@@ -1073,7 +1077,7 @@ impl DeferredOperation {
                             index: 0,
                         })));
                     }
-                    FrontendStmt::RefreshMatview | FrontendStmt::CommentOn => {
+                    FrontendStmt::RefreshMatview(_) | FrontendStmt::CommentOn(_) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
@@ -1620,8 +1624,8 @@ fn try_prepare_special(
         | FrontendStmt::CreateSchema(_)
         | FrontendStmt::DropSchema(_)
         | FrontendStmt::CopyFrom(_)
-        | FrontendStmt::RefreshMatview
-        | FrontendStmt::CommentOn) => crate::Statement::with_deferred(
+        | FrontendStmt::RefreshMatview(_)
+        | FrontendStmt::CommentOn(_)) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
@@ -1669,6 +1673,48 @@ fn prepare_set_transaction(
         Ok(())
     });
     Ok(crate::Statement::new_with_post_run(inner, post_run))
+}
+
+/// Checks that the current role may run a statement that the frontend runs
+/// itself, outside the privilege checks of core. Only a superuser may change
+/// schemas or read files, and a superuser owns every object.
+fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<()> {
+    if conn.current_role_is_superuser() {
+        return Ok(());
+    }
+    let denial = match stmt {
+        // Core checks the statements that these prepare.
+        FrontendStmt::Set(_)
+        | FrontendStmt::SetTransaction
+        | FrontendStmt::Show(_)
+        | FrontendStmt::ResetAll
+        | FrontendStmt::DiscardAll
+        | FrontendStmt::CopyTo(_) => return Ok(()),
+        FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
+            Action::Create,
+            Object::Database(catalog::db_name_from_path(conn.db_file_path())),
+        ),
+        FrontendStmt::DropSchema(stmt) => {
+            PermissionDenied::owner(Action::Drop, Object::Schema(stmt.name.to_lowercase()))
+        }
+        FrontendStmt::CopyFrom(stmt) => {
+            PermissionDenied::privilege(Action::Read, Object::File(stmt.filename.clone()))
+        }
+        FrontendStmt::RefreshMatview(stmt) => {
+            return Err(sqlstate_error(
+                SQLSTATE_INSUFFICIENT_PRIVILEGE,
+                format!("permission denied for materialized view {}", stmt.name),
+            ));
+        }
+        FrontendStmt::CommentOn(stmt) => {
+            let message = match &stmt.target {
+                PgCommentTarget::Owned(object) => format!("must be owner of {object}"),
+                PgCommentTarget::Role | PgCommentTarget::Other => "permission denied".to_string(),
+            };
+            return Err(sqlstate_error(SQLSTATE_INSUFFICIENT_PRIVILEGE, message));
+        }
+    };
+    Err(LimboError::PermissionDenied(Box::new(denial)))
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
@@ -1774,9 +1820,10 @@ fn reset_all_settings(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Resets the session as DISCARD ALL does. tursopg has no temporary
-/// tables, SQL-level prepared statements or cached plans to drop. A server
-/// client's protocol-level prepared statements are not dropped.
+/// Resets the session as DISCARD ALL does, including the current role.
+/// tursopg has no temporary tables, SQL-level prepared statements or cached
+/// plans to drop. A server client's protocol-level prepared statements are
+/// not dropped.
 fn discard_all(conn: &Connection) -> Result<()> {
     if !conn.get_auto_commit() {
         return Err(sqlstate_error(
@@ -1786,6 +1833,7 @@ fn discard_all(conn: &Connection) -> Result<()> {
     }
     reset_all_settings(conn)?;
     conn.clear_sequence_currvals();
+    set_role(conn, None, SettingScope::Session)?;
     Ok(())
 }
 
@@ -1810,6 +1858,42 @@ pub(crate) fn set_search_path(
 /// search_path that lists them finds nothing there, as in PostgreSQL.
 fn is_core_database_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("temp")
+}
+
+/// Makes `value` the current role, as SET ROLE does. `none`, or no value,
+/// makes the session's login role current again.
+pub(crate) fn set_role(
+    conn: &Connection,
+    value: Option<&str>,
+    scope: SettingScope,
+) -> Result<String> {
+    let role = match value.filter(|name| *name != "none") {
+        None => None,
+        Some(name) => {
+            let roles = conn.role_catalog();
+            let Some(role) = catalog::postgres_roles(&roles).find(|role| role.name == name) else {
+                return Err(sqlstate_error(
+                    SQLSTATE_UNDEFINED_OBJECT,
+                    format!("role \"{name}\" does not exist"),
+                ));
+            };
+            if !roles.can_set_role(conn.session_role(), role.id) {
+                return Err(LimboError::PermissionDenied(Box::new(
+                    PermissionDenied::privilege(Action::SetRole, Object::Role(name.to_owned())),
+                )));
+            }
+            Some(SetRole {
+                id: role.id,
+                name: name.to_owned(),
+            })
+        }
+    };
+    let role_id = role
+        .as_ref()
+        .map_or_else(|| conn.session_role(), |role| role.id);
+    session_state(conn)?.mutate(conn, |settings| settings.set_role(role, scope));
+    conn.set_current_role(role_id);
+    Ok(value.unwrap_or("none").to_owned())
 }
 
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {

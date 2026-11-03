@@ -8,13 +8,15 @@ use turso_core::{
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
-    Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
-    Value,
+    security::roles::{Role, RoleCatalog, RoleId},
+    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
+    Result, Statement, Value, WalkControl,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::{RefAct, SortOrder};
+use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 
+use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
 
 /// PostgreSQL uses OID zero when no object is referenced.
@@ -200,6 +202,10 @@ impl Dialect for PostgresDialect {
     }
 
     fn supports_namespaces(&self) -> bool {
+        true
+    }
+
+    fn supports_roles(&self) -> bool {
         true
     }
 
@@ -790,9 +796,34 @@ impl SnapshotRows for PgAttributeTable {
     }
 }
 
-/// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns the "turso" superuser and the built-in database owner role.
-/// TODO: replace with real role data when authentication is implemented.
+const SUPERUSER_OID: i64 = 10;
+const USER_ROLE_OID_START: i64 = 16384;
+
+/// Returns the PostgreSQL OID of a role. The built-in superuser has the OID
+/// of the PostgreSQL bootstrap superuser, and `public` has OID 0, as in
+/// PostgreSQL's access control lists.
+pub(crate) fn role_oid(id: RoleId) -> i64 {
+    match id {
+        RoleId::SUPERUSER => SUPERUSER_OID,
+        RoleId::PUBLIC => 0,
+        _ => USER_ROLE_OID_START + id.get(),
+    }
+}
+
+/// The roles that PostgreSQL has: its bootstrap superuser, which is the
+/// built-in [RoleId::SUPERUSER], and the roles in the core role catalog.
+/// `public` is not a role in PostgreSQL, only a name for [RoleId::PUBLIC] in
+/// access control lists.
+pub(crate) fn postgres_roles(roles: &RoleCatalog) -> impl Iterator<Item = Role> + '_ {
+    let superuser = Role {
+        id: RoleId::SUPERUSER,
+        name: BOOTSTRAP_SUPERUSER_NAME.to_string(),
+        superuser: true,
+    };
+    std::iter::once(superuser).chain(roles.iter().cloned())
+}
+
+/// Virtual table implementation for pg_catalog.pg_roles.
 #[derive(Debug)]
 struct PgRolesTable;
 
@@ -816,40 +847,51 @@ impl SnapshotRows for PgRolesTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 2;
 
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![
-            vec![
-                Value::from_i64(10),        // oid
-                Value::build_text("turso"), // rolname
-                Value::from_i64(1),         // rolsuper
-                Value::from_i64(1),         // rolinherit
-                Value::from_i64(1),         // rolcreaterole
-                Value::from_i64(1),         // rolcreatedb
-                Value::from_i64(1),         // rolcanlogin
-                Value::from_i64(1),         // rolreplication
-                Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-                Value::Null,                // rolpassword (never exposed)
-                Value::Null,                // rolvaliduntil
-                Value::from_i64(1),         // rolbypassrls
-                Value::Null,                // rolconfig
-            ],
-            vec![
-                Value::from_i64(PG_DATABASE_OWNER_OID),
-                Value::build_text("pg_database_owner"),
-                Value::from_i64(0),
-                Value::from_i64(1),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(0),
-                Value::from_i64(-1),
-                Value::Null,
-                Value::Null,
-                Value::from_i64(0),
-                Value::Null,
-            ],
-        ]
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        let mut rows: Vec<_> = postgres_roles(&conn.role_catalog())
+            .map(|role| role_row(&role))
+            .collect();
+        // The owner of the public schema, which PostgreSQL makes for every
+        // database.
+        rows.push(vec![
+            Value::from_i64(PG_DATABASE_OWNER_OID),
+            Value::build_text("pg_database_owner"),
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(-1),
+            Value::Null,
+            Value::Null,
+            Value::from_i64(0),
+            Value::Null,
+        ]);
+        rows
     }
+}
+
+/// `CREATE ROLE` creates roles that cannot log in, so only the built-in
+/// superuser can.
+fn role_row(role: &Role) -> Vec<Value> {
+    let superuser = Value::from_i64(role.superuser as i64);
+    let can_login = role.id == RoleId::SUPERUSER;
+    vec![
+        Value::from_i64(role_oid(role.id)),   // oid
+        Value::build_text(role.name.clone()), // rolname
+        superuser.clone(),                    // rolsuper
+        Value::from_i64(1),                   // rolinherit
+        superuser.clone(),                    // rolcreaterole
+        superuser.clone(),                    // rolcreatedb
+        Value::from_i64(can_login as i64),    // rolcanlogin
+        superuser.clone(),                    // rolreplication
+        Value::from_i64(-1),                  // rolconnlimit (-1 = no limit)
+        Value::Null,                          // rolpassword (never exposed)
+        Value::Null,                          // rolvaliduntil
+        superuser,                            // rolbypassrls
+        Value::Null,                          // rolconfig
+    ]
 }
 
 /// Virtual table implementation for pg_catalog.pg_proc
@@ -1189,7 +1231,7 @@ impl SnapshotRows for PgTablesTable {
             rows.push(vec![
                 Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
                 Value::Text(btree.declared_name.clone().into()),                   // tablename
-                Value::Text("turso".into()),                                       // tableowner
+                Value::build_text(BOOTSTRAP_SUPERUSER_NAME),                       // tableowner
                 Value::Null,                                                       // tablespace
                 Value::from_i64(0),                                                // hasindexes
                 Value::from_i64(0),                                                // hasrules
@@ -2089,7 +2131,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(chk.expr.to_string()), // conbin
+                    Value::build_text(render_expr(&chk.expr)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2139,10 +2181,10 @@ impl SnapshotRows for PgAttrdefTable {
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
                     rows.push(vec![
-                        Value::from_i64(attrdef_oid),                // oid
-                        Value::from_i64(table_oid),                  // adrelid
-                        Value::from_i64(col_idx as i64 + 1),         // adnum (1-based)
-                        Value::build_text(default_expr.to_string()), // adbin
+                        Value::from_i64(attrdef_oid),                 // oid
+                        Value::from_i64(table_oid),                   // adrelid
+                        Value::from_i64(col_idx as i64 + 1),          // adnum (1-based)
+                        Value::build_text(render_expr(default_expr)), // adbin
                     ]);
                     attrdef_oid += 1;
                 }
@@ -2258,16 +2300,16 @@ impl SnapshotRows for PgSequencesTable {
                     .unwrap_or(seq.start_value);
                 rows.push(vec![
                     Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
-                    Value::build_text(seq_name),           // sequencename
-                    Value::build_text("turso"),            // sequenceowner
-                    Value::build_text("bigint"),           // data_type
-                    Value::from_i64(seq.start_value),      // start_value
-                    Value::from_i64(seq.min_value),        // min_value
-                    Value::from_i64(seq.max_value),        // max_value
-                    Value::from_i64(seq.increment_by),     // increment_by
+                    Value::build_text(seq_name), // sequencename
+                    Value::build_text(BOOTSTRAP_SUPERUSER_NAME), // sequenceowner
+                    Value::build_text("bigint"), // data_type
+                    Value::from_i64(seq.start_value), // start_value
+                    Value::from_i64(seq.min_value), // min_value
+                    Value::from_i64(seq.max_value), // max_value
+                    Value::from_i64(seq.increment_by), // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
-                    Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val), // last_value
+                    Value::from_i64(1),          // cache_size (PG default; Turso doesn't cache)
+                    Value::from_i64(last_val),   // last_value
                 ]);
             }
         }
@@ -3787,7 +3829,7 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // CHECK constraints
         for chk in &btree.check_constraints {
             if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", chk.expr));
+                return Some(format!("CHECK ({})", render_expr(&chk.expr)));
             }
             constraint_oid += 1;
         }
@@ -3811,6 +3853,22 @@ fn constraint_column_list<'a>(
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn render_expr(expr: &ast::Expr) -> String {
+    let mut expr = expr.clone();
+    walk_expr_mut(&mut expr, &mut |expr| {
+        if let ast::Expr::FunctionCall { name, args, .. } = expr {
+            if args.is_empty() {
+                if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
+                    *expr = ast::Expr::Id(ast::Name::from_string(keyword));
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("rewriting role functions does not fail");
+    expr.to_string()
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
