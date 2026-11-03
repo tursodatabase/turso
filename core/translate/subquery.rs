@@ -1228,6 +1228,7 @@ fn update_column_used_masks(
                 outer_query_ref
                     .col_used_mask
                     .union_with(&child_outer_query_ref.col_used_mask)?;
+                outer_query_ref.rowid_referenced |= child_outer_query_ref.rowid_referenced;
             }
         }
 
@@ -2416,6 +2417,53 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
             rc.contains_aggregates = true;
         }
     }
+
+    let columns_read_by_group_subqueries = columns_read_by_group_subqueries(plan);
+    if let Some(group_by) = plan.group_by.as_mut() {
+        group_by.columns_read_by_group_subqueries = columns_read_by_group_subqueries;
+    }
+}
+
+/// The columns of `plan`'s own tables that are read by its subqueries that run
+/// once per group.
+fn columns_read_by_group_subqueries(plan: &SelectPlan) -> Vec<ast::Expr> {
+    let mut columns = Vec::new();
+    for subquery in &plan.non_from_clause_subqueries {
+        let SubqueryState::Unevaluated {
+            plan: Some(subquery_plan),
+        } = &subquery.state
+        else {
+            continue;
+        };
+        if subquery.eval_phase != SubqueryEvalPhase::GroupedOutput {
+            continue;
+        }
+        for outer_ref in subquery_plan.used_outer_query_refs() {
+            let table = outer_ref.internal_id;
+            if plan
+                .table_references
+                .find_joined_table_by_internal_id(table)
+                .is_none()
+            {
+                continue;
+            }
+            for column in outer_ref.col_used_mask.iter() {
+                columns.push(ast::Expr::Column {
+                    database: None,
+                    table,
+                    column,
+                    is_rowid_alias: outer_ref.columns()[column].is_rowid_alias(),
+                });
+            }
+            if outer_ref.rowid_referenced {
+                columns.push(ast::Expr::RowId {
+                    database: None,
+                    table,
+                });
+            }
+        }
+    }
+    columns
 }
 
 /// True when `expr` reads one of the given subqueries.
