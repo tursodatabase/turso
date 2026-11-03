@@ -309,6 +309,38 @@ pub fn expr_contains_function_that_changes_within_statement(
     })
 }
 
+/// Returns true if this expression calls an aggregate or window function of
+/// its own query. A call inside a subquery belongs to that subquery and does
+/// not count.
+pub fn expr_contains_aggregate_or_window_function(
+    expr: &ast::Expr,
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
+    let mut found = false;
+    walk_expr(expr, &mut |e| {
+        let func = match e {
+            ast::Expr::FunctionCall { name, args, .. } => {
+                resolver.resolve_function(name.as_str(), args.len())?
+            }
+            ast::Expr::FunctionCallStar { name, .. } => {
+                resolver.resolve_function(name.as_str(), 0)?
+            }
+            _ => None,
+        };
+        let is_aggregate_or_window = match func {
+            Some(Func::Agg(_) | Func::Window(_)) => true,
+            Some(Func::External(external)) => external.func.is_aggregate(),
+            _ => false,
+        };
+        if is_aggregate_or_window {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(found)
+}
+
 fn is_nondeterministic_scalar_like_function(func: &Func) -> bool {
     match func {
         // Aggregate and window function calls themselves are not flagged
