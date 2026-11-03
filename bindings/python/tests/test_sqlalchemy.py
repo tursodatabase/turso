@@ -937,7 +937,7 @@ class TestDBAPI2ModuleAttributes:
         assert turso.apilevel == "2.0"
         assert turso.paramstyle == "qmark"
         assert turso.threadsafety == 1
-        assert turso.Binary(b"\x00\xff") == b"\x00\xff"
+        assert turso.Binary is memoryview
 
     def test_turso_sync_module_attributes(self):
         """turso.sync module has all DB-API 2.0 attributes."""
@@ -946,7 +946,7 @@ class TestDBAPI2ModuleAttributes:
         assert turso.sync.apilevel == "2.0"
         assert turso.sync.paramstyle == "qmark"
         assert turso.sync.threadsafety == 1
-        assert turso.sync.Binary(b"\x00\xff") == b"\x00\xff"
+        assert turso.sync.Binary is memoryview
 
     def test_turso_sync_exception_hierarchy(self):
         """Exception classes are properly re-exported in turso.sync."""

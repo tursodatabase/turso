@@ -147,7 +147,7 @@ async def test_local_async_core_crud():
 
 @pytest.mark.asyncio
 async def test_local_async_large_binary_round_trip():
-    """LargeBinary values are bound through turso's Binary, not sqlite3's memoryview."""
+    """LargeBinary values are bound through the DB-API Binary constructor."""
     table = Table("blobs", MetaData(), Column("id", Integer, primary_key=True), Column("data", LargeBinary))
     engine = create_async_engine("sqlite+aioturso:///:memory:")
 

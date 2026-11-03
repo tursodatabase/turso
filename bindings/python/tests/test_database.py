@@ -1099,11 +1099,45 @@ def test_binary_constructor(provider):
     cursor.execute("CREATE TABLE test (id INTEGER, data BLOB)")
 
     blob_data = b"\x00\x01\x02\x03\x04"
-    cursor.execute("INSERT INTO test VALUES (?, ?)", (1, module.Binary(blob_data)))
+    binary = module.Binary(blob_data)
+    assert isinstance(binary, memoryview)
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (1, binary))
 
     cursor.execute("SELECT data FROM test")
     row = cursor.fetchone()
     assert row[0] == blob_data
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_bytearray_and_memoryview_blob_parameters(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, data BLOB)")
+
+    blob_data = b"\x00\x01\x02\x03\x04"
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (1, bytearray(blob_data)))
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (2, memoryview(blob_data)))
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (3, memoryview(blob_data)[1:4]))
+
+    cursor.execute("SELECT data, typeof(data) FROM test ORDER BY id")
+    assert cursor.fetchall() == [
+        (blob_data, "blob"),
+        (blob_data, "blob"),
+        (b"\x01\x02\x03", "blob"),
+    ]
+
+    conn.close()
+
+
+def test_non_contiguous_memoryview_parameter_is_rejected():
+    conn = turso.connect(":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (data BLOB)")
+
+    with pytest.raises(turso.DatabaseError, match="C-contiguous"):
+        cursor.execute("INSERT INTO test VALUES (?)", (memoryview(b"\x00\x01\x02\x03")[::2],))
 
     conn.close()
 
