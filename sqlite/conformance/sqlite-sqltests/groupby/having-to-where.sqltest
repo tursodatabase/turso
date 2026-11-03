@@ -108,6 +108,15 @@ expect error {
     integer overflow
 }
 
+# `0_0` is an integer literal SQLite's parser does not fold, so `g = 2` still
+# moves to WHERE and the overflowing group is never aggregated.
+@setup overflow
+test having-digit-separator-zero-still-moves-the-group-by-term {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g = 2 AND 0_0;
+}
+expect {
+}
+
 @setup overflow
 test having-subquery-still-aggregates {
     SELECT g, sum(a) FROM t GROUP BY g HAVING g = (SELECT 2);

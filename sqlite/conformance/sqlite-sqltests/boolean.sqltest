@@ -428,6 +428,23 @@ expect error {
     malformed JSON
 }
 
+# An integer literal with a digit separator is not folded either: SQLite only
+# reads the value of a plain digit string when it builds the literal.
+
+test and-with-a-digit-separator-operand-runs-the-other-operand {
+    SELECT 0_0 AND json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
+test or-with-a-digit-separator-operand-runs-the-other-operand {
+    SELECT 1_0 OR json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
 # An aggregate in the operand that `x AND 0` or `x OR 1` drops still makes the
 # query an aggregate query, so it gives one row.
 
