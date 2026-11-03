@@ -14,8 +14,10 @@ use prost::Message;
 use roaring::RoaringBitmap;
 use tracing::{debug, error, info};
 
+use turso_core::mvcc::persistent_storage::logical_log::frame_codec;
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, SessionRole, Value as CoreValue,
+    CipherMode, ConnectOpts, Connection, Database, DatabaseOpts, EncryptionContext, EncryptionKey,
+    EncryptionOpts, OpenFlags, SessionRole, Value as CoreValue,
 };
 use turso_sqlite::SqliteDialect;
 use turso_sync_engine::server_proto::{
@@ -51,6 +53,13 @@ pub struct OpenConfig {
     pub flags: OpenFlags,
     pub db_opts: DatabaseOpts,
     pub max_open: usize,
+    pub encryption: Option<ServerEncryption>,
+}
+
+#[derive(Clone)]
+pub struct ServerEncryption {
+    cipher: CipherMode,
+    pub key: EncryptionKey,
 }
 
 struct DbHandle {
@@ -75,7 +84,7 @@ enum DbSource {
     Single(Arc<DbHandle>),
     Dir {
         base: PathBuf,
-        config: OpenConfig,
+        config: Box<OpenConfig>,
         open_handles: OpenHandles,
     },
 }
@@ -85,6 +94,7 @@ pub struct TursoSyncServer {
     source: DbSource,
     interrupt_count: Arc<AtomicUsize>,
     workers: usize,
+    encryption: Option<ServerEncryption>,
 }
 
 struct ConnectionQueue {
@@ -106,8 +116,14 @@ impl TursoSyncServer {
         conn: Arc<Connection>,
         interrupt_count: Arc<AtomicUsize>,
         workers: usize,
+        encryption: Option<ServerEncryption>,
     ) -> Result<Self> {
+        anyhow::ensure!(conn.get_encryption_cipher_mode() == encryption.as_ref().map(|e| e.cipher),
+            "encrypted sync requires matching --sync-encryption-cipher and --sync-encryption-key-file");
         conn.wal_auto_actions_disable();
+        if encryption.is_some() {
+            conn.set_portable_logical_changes_enabled(true);
+        }
 
         Ok(Self {
             address,
@@ -117,6 +133,7 @@ impl TursoSyncServer {
             })),
             interrupt_count,
             workers,
+            encryption,
         })
     }
 
@@ -136,9 +153,10 @@ impl TursoSyncServer {
         let open_handles = OpenHandles::new(config.max_open);
         Ok(Self {
             address,
+            encryption: config.encryption.clone(),
             source: DbSource::Dir {
                 base: base.canonicalize()?,
-                config,
+                config: Box::new(config),
                 open_handles,
             },
             interrupt_count,
@@ -1069,6 +1087,33 @@ struct HttpResponse {
     body: Vec<u8>,
 }
 
+impl ServerEncryption {
+    pub fn from_key_file(cipher: &str, path: &Path) -> Result<Self> {
+        let config = Self {
+            cipher: CipherMode::try_from(cipher)?,
+            key: EncryptionKey::from_hex_string(&std::fs::read_to_string(path)?)?,
+        };
+        config.context()?;
+        Ok(config)
+    }
+
+    pub fn open_options(&self) -> EncryptionOpts {
+        EncryptionOpts {
+            cipher: self.cipher.to_string(),
+            hexkey: self
+                .key
+                .as_slice()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        }
+    }
+
+    fn context(&self) -> Result<EncryptionContext> {
+        Ok(EncryptionContext::new(self.cipher, &self.key, PAGE_SIZE)?)
+    }
+}
+
 struct MvccLogSnapshot {
     end_offset: u64,
     crc_by_offset: Vec<(u64, u32)>,
@@ -1605,11 +1650,23 @@ fn open_db_handle(path: &Path, config: &OpenConfig) -> Result<Arc<DbHandle>> {
         &path_str,
         config.vfs.as_deref(),
         config.flags,
-        config.db_opts,
-        None,
+        config
+            .db_opts
+            .with_encryption(config.encryption.is_some() || config.db_opts.enable_encryption),
+        config.encryption.as_ref().map(|e| e.open_options()),
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
+    let conn = db.connect(
+        ConnectOpts::new(SessionRole::Superuser)
+            .with_encryption_key(config.encryption.as_ref().map(|e| e.key.clone())),
+    )?;
+    anyhow::ensure!(
+        conn.get_encryption_cipher_mode() == config.encryption.as_ref().map(|e| e.cipher),
+        "database cipher does not match the sync server configuration"
+    );
+    if config.encryption.is_some() {
+        conn.set_portable_logical_changes_enabled(true);
+    }
     conn.wal_auto_actions_disable();
     Ok(Arc::new(DbHandle {
         conn: Mutex::new(conn),
@@ -1769,6 +1826,7 @@ mod tests {
                 flags: OpenFlags::default(),
                 db_opts: DatabaseOpts::new(),
                 max_open: TEST_MAX_OPEN,
+                encryption: None,
             },
             TEST_WORKERS,
         )
