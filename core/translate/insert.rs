@@ -3563,8 +3563,13 @@ fn translate_virtual_table_insert(
     Ok(())
 }
 
-/// Build the UNIQUE constraint error description to match sqlite: `t.c1, t.c2`
+/// Build the UNIQUE constraint error description to match sqlite
+/// column index:     `t.c1, t.c2`
+/// expression index: `index 'idx'`
 pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
+    if index.columns.iter().any(|c| c.expression().is_some()) {
+        return format!("index '{}'", index.name);
+    }
     index
         .columns
         .iter()

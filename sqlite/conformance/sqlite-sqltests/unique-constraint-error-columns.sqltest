@@ -1,7 +1,8 @@
 @database :memory:
 
 # A UNIQUE failure on several columns lists each one as `table.column`, the
-# format ORMs parse to find the conflicting columns.
+# format ORMs parse to find the conflicting columns. An index on an expression
+# is reported by its name instead.
 
 test composite-primary-key-violation-lists-each-column {
     CREATE TABLE t (a, b, PRIMARY KEY (a, b));
@@ -48,4 +49,33 @@ test upsert-do-update-violating-another-composite-unique {
 }
 expect error {
     ^UNIQUE constraint failed: t\.a, t\.b$
+}
+
+test expression-index-violation-on-insert-names-the-index {
+    CREATE TABLE t (a, b);
+    CREATE UNIQUE INDEX i ON t (a, lower(b));
+    INSERT INTO t VALUES (1, 'x');
+    INSERT INTO t VALUES (1, 'X');
+}
+expect error {
+    ^UNIQUE constraint failed: index 'i'$
+}
+
+test expression-index-violation-on-update-names-the-index {
+    CREATE TABLE t (a, b);
+    CREATE UNIQUE INDEX i ON t (lower(b));
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    UPDATE t SET b = 'X' WHERE a = 2;
+}
+expect error {
+    ^UNIQUE constraint failed: index 'i'$
+}
+
+test create-expression-index-over-duplicate-rows-names-the-index {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 'x'), (2, 'X');
+    CREATE UNIQUE INDEX i ON t (lower(b));
+}
+expect error {
+    ^UNIQUE constraint failed: index 'i'$
 }
