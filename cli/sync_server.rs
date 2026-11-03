@@ -1135,6 +1135,74 @@ fn validate_encryption_headers(
     Ok(())
 }
 
+struct NormalizedMvccLog {
+    snapshot: MvccLogSnapshot,
+    body: Vec<u8>,
+    wire_offsets: HashMap<u64, usize>,
+}
+
+fn normalize_encrypted_log(log: &[u8], crypto: &EncryptionContext) -> Result<NormalizedMvccLog> {
+    if log.is_empty() {
+        return Ok(NormalizedMvccLog {
+            snapshot: scan_mvcc_log(log)?,
+            body: Vec::new(),
+            wire_offsets: HashMap::from([(0, 0)]),
+        });
+    }
+    anyhow::ensure!(
+        log.len() >= MVCC_LOG_HEADER_SIZE,
+        "truncated MVCC log header"
+    );
+    let header = frame_codec::validate_log_header(&log[..MVCC_LOG_HEADER_SIZE])?;
+    // Only a valid older header may trigger replacement; corruption must fail.
+    anyhow::ensure!(
+        header.version() == MVCC_LOG_VERSION,
+        "unsupported MVCC logical log version {}",
+        header.version()
+    );
+    let mut source_crc = header.initial_crc();
+    let mut wire_crc = source_crc;
+    let mut offset = MVCC_LOG_HEADER_SIZE;
+    let mut body = header.bytes().to_vec();
+    let mut wire_offsets = HashMap::from([(0, 0), (offset as u64, offset)]);
+    let mut crc_by_offset = vec![(offset as u64, wire_crc)];
+    let mut plaintext = Vec::new();
+    while offset < log.len() {
+        let layout = frame_codec::inspect_frame_prefix(&log[offset..], Some(crypto))?
+            .ok_or_else(|| anyhow!("truncated MVCC frame header"))?;
+        let end = offset
+            .checked_add(layout.stored_size())
+            .filter(|end| *end <= log.len())
+            .ok_or_else(|| anyhow!("truncated MVCC frame"))?;
+        let frame = frame_codec::validate_frame_into(
+            &header,
+            offset as u64,
+            &log[offset..end],
+            source_crc,
+            Some(crypto),
+            &mut plaintext,
+        )?;
+        source_crc = frame.source_crc();
+        let wire = frame_codec::plaintext_wire_parts(&frame, wire_crc);
+        body.extend_from_slice(wire.header);
+        body.extend_from_slice(wire.body);
+        body.extend_from_slice(&wire.trailer);
+        wire_crc = wire.next_crc;
+        offset = end;
+        wire_offsets.insert(offset as u64, body.len());
+        crc_by_offset.push((offset as u64, wire_crc));
+    }
+    Ok(NormalizedMvccLog {
+        snapshot: MvccLogSnapshot {
+            end_offset: offset as u64,
+            crc_by_offset,
+        },
+        body,
+        wire_offsets,
+    })
+}
+
+#[derive(Clone)]
 struct MvccLogSnapshot {
     end_offset: u64,
     crc_by_offset: Vec<(u64, u32)>,
@@ -1756,6 +1824,101 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    #[test]
+    fn encrypted_log_normalization_preserves_source_boundaries_and_authenticates() {
+        for cipher in [
+            CipherMode::Aes128Gcm,
+            CipherMode::Aes256Gcm,
+            CipherMode::Aegis128L,
+            CipherMode::Aegis128X2,
+            CipherMode::Aegis128X4,
+            CipherMode::Aegis256,
+            CipherMode::Aegis256X2,
+            CipherMode::Aegis256X4,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let encryption = ServerEncryption {
+                cipher,
+                key: if cipher.required_key_size() == 16 {
+                    EncryptionKey::new_128([11; 16])
+                } else {
+                    EncryptionKey::new_256([11; 32])
+                },
+            };
+            let path = dir.path().join("data");
+            let handle = open_db_handle(
+                &path,
+                &OpenConfig {
+                    vfs: None,
+                    flags: OpenFlags::Create,
+                    db_opts: DatabaseOpts::new(),
+                    max_open: 1,
+                    encryption: Some(encryption.clone()),
+                },
+            )
+            .unwrap();
+            let conn = handle.conn.lock().unwrap();
+            conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+            conn.execute("CREATE TABLE secrets(value TEXT)").unwrap();
+            conn.execute(format!(
+                "INSERT INTO secrets VALUES ('{}')",
+                "private payload ".repeat(8000)
+            ))
+            .unwrap();
+            let log = std::fs::read(logical_log_path(path.to_str().unwrap()).unwrap()).unwrap();
+            let normalized = normalize_encrypted_log(&log, &encryption.context().unwrap()).unwrap();
+            assert_eq!(normalized.snapshot.end_offset, log.len() as u64);
+            assert!(normalized.body.len() < log.len());
+            let wire_snapshot = scan_mvcc_log(&normalized.body).unwrap();
+            assert_eq!(wire_snapshot.end_offset, normalized.body.len() as u64);
+            for (source_offset, crc) in &normalized.snapshot.crc_by_offset {
+                let wire_offset = normalized.wire_offsets[source_offset];
+                assert_eq!(wire_snapshot.crc_seed_at(wire_offset as u64).unwrap(), *crc);
+            }
+            assert!(normalized.body.windows(15).any(|w| w == b"private payload"));
+            assert!(!log.windows(15).any(|w| w == b"private payload"));
+            assert!(
+                normalize_encrypted_log(&log[..log.len() - 1], &encryption.context().unwrap())
+                    .is_err()
+            );
+            let wrong_key = EncryptionContext::new(
+                cipher,
+                &if cipher.required_key_size() == 16 {
+                    EncryptionKey::new_128([12; 16])
+                } else {
+                    EncryptionKey::new_256([12; 32])
+                },
+                PAGE_SIZE,
+            )
+            .unwrap();
+            assert!(normalize_encrypted_log(&log, &wrong_key).is_err());
+            let mut corrupt = log.clone();
+            corrupt[MVCC_LOG_HEADER_SIZE + MVCC_TX_EXT_HEADER_SIZE + 5] ^= 1;
+            assert!(normalize_encrypted_log(&corrupt, &encryption.context().unwrap()).is_err());
+            // Recomputing the unkeyed frame CRC must not bypass AEAD authentication.
+            let header = frame_codec::validate_log_header(&log[..MVCC_LOG_HEADER_SIZE]).unwrap();
+            let layout = frame_codec::inspect_frame_prefix(
+                &log[MVCC_LOG_HEADER_SIZE..],
+                Some(&encryption.context().unwrap()),
+            )
+            .unwrap()
+            .unwrap();
+            let trailer = MVCC_LOG_HEADER_SIZE + layout.stored_size() - MVCC_TX_TRAILER_SIZE;
+            let crc = crc32c::crc32c_append(
+                header.initial_crc(),
+                &corrupt[MVCC_LOG_HEADER_SIZE..trailer],
+            );
+            corrupt[trailer..trailer + 4].copy_from_slice(&crc.to_le_bytes());
+            assert!(
+                normalize_encrypted_log(&corrupt, &encryption.context().unwrap())
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("authentication failed")
+            );
+        }
     }
 
     #[test]
