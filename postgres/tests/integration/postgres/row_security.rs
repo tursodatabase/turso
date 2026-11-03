@@ -326,7 +326,10 @@ fn unsupported_policies_are_rejected() {
             "CREATE POLICY p ON docs FOR INSERT WITH CHECK (true)",
             "FOR SELECT",
         ),
-        ("CREATE POLICY p ON docs TO alice USING (true)", "TO PUBLIC"),
+        (
+            "CREATE POLICY p ON docs TO nobody USING (true)",
+            "role \"nobody\" does not exist",
+        ),
         (
             "CREATE POLICY p ON docs USING (true) WITH CHECK (true)",
             "WITH CHECK",
@@ -406,6 +409,101 @@ fn policy_condition_is_kept_exactly_after_reopening_the_database() {
     let conn = db.connect_postgres();
     conn.execute("SET ROLE alice").unwrap();
     assert_eq!(integers(&conn, "SELECT id FROM docs"), [1]);
+}
+
+#[test]
+fn policy_applies_only_to_its_roles() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    create_docs_with_row_security(&conn);
+    for sql in [
+        "CREATE ROLE bob",
+        "CREATE ROLE carol",
+        "CREATE POLICY readers ON docs FOR SELECT TO alice, carol USING (true)",
+        "CREATE POLICY everyone ON docs TO PUBLIC USING (id = 2)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+
+    for (role, expected) in [
+        ("alice", vec![1, 2, 3]),
+        ("bob", vec![2]),
+        ("carol", vec![1, 2, 3]),
+    ] {
+        conn.execute(format!("SET ROLE {role}")).unwrap();
+        assert_eq!(
+            integers(&conn, "SELECT id FROM docs ORDER BY id"),
+            expected,
+            "{role}"
+        );
+    }
+}
+
+#[test]
+fn statement_prepared_by_one_role_uses_the_policies_of_the_next() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    create_docs_with_row_security(&conn);
+    conn.execute("CREATE ROLE bob").unwrap();
+    conn.execute("CREATE POLICY readers ON docs TO alice USING (true)")
+        .unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    let mut stmt = conn.prepare("SELECT count(*) FROM docs").unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap(), [[Value::from_i64(3)]]);
+
+    conn.execute("SET ROLE bob").unwrap();
+
+    stmt.reset().unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap(), [[Value::from_i64(0)]]);
+}
+
+/// The policies a Supabase project writes: the user comes from the request's
+/// JWT claims, read by auth.uid(), and the request runs as the
+/// `authenticated` or `anon` role.
+#[test]
+fn supabase_policy_shows_each_user_their_rows() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    for sql in [
+        "CREATE TABLE todos (id int PRIMARY KEY, user_id uuid, title text)",
+        "INSERT INTO todos VALUES \
+            (1, '11111111-1111-1111-1111-111111111111', 'a'), \
+            (2, '22222222-2222-2222-2222-222222222222', 'b'), \
+            (3, '11111111-1111-1111-1111-111111111111', 'c')",
+        "CREATE ROLE anon",
+        "CREATE ROLE authenticated",
+        "ALTER TABLE todos ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY own ON todos FOR SELECT TO authenticated USING ((SELECT auth.uid()) = user_id)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SET LOCAL ROLE authenticated").unwrap();
+    let mut stmt = conn.prepare("SELECT id FROM todos ORDER BY id").unwrap();
+
+    for (user, expected) in [
+        ("11111111-1111-1111-1111-111111111111", vec![1, 3]),
+        ("22222222-2222-2222-2222-222222222222", vec![2]),
+        ("33333333-3333-3333-3333-333333333333", vec![]),
+    ] {
+        conn.execute(format!(
+            "SELECT set_config('request.jwt.claims', '{{\"sub\": \"{user}\", \"role\": \"authenticated\"}}', true)"
+        ))
+        .unwrap();
+        stmt.reset().unwrap();
+        let ids: Vec<_> = stmt
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect();
+        let expected: Vec<_> = expected.into_iter().map(Value::from_i64).collect();
+        assert_eq!(ids, expected, "{user}");
+    }
+    conn.execute("COMMIT").unwrap();
+
+    conn.execute("SET ROLE anon").unwrap();
+    assert_eq!(integers(&conn, "SELECT count(*) FROM todos"), [0]);
 }
 
 #[test]

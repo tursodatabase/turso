@@ -65,20 +65,23 @@ SELECT count(*) FROM documents;
 CREATE POLICY name ON table_name
     [ AS PERMISSIVE ]
     [ FOR { ALL | SELECT } ]
-    [ TO PUBLIC ]
+    [ TO { role_name | PUBLIC } [, ...] ]
     USING ( condition )
 ```
 
 **Description:**
 
 `CREATE POLICY` adds a policy to a table with row-level security. A role that
-is not a superuser sees the rows that any of the table's policies show.
+is not a superuser sees the rows that any of the table's policies for that
+role show.
 Policies have no effect while the table's row-level security is disabled.
 
 **Parameters:**
 
 - `name`: The name of the policy, unique among the table's policies.
 - `table_name`: The name of the table, optionally schema-qualified.
+- `role_name`: A role the policy applies to. `PUBLIC`, the default, means
+  every role.
 - `condition`: Which rows the policy shows: the rows for which the condition
   is true. It can use the columns of the table, written as `column` or
   `table_name.column`, and call functions such as `current_user` or
@@ -97,8 +100,12 @@ The condition is checked before the query's own conditions, so the query never
 evaluates its expressions on a row the role cannot see. An index on a column
 the condition compares can be used to find the rows.
 
-`AS RESTRICTIVE`, `FOR INSERT`, `FOR UPDATE`, `FOR DELETE`, `TO` a role and
-`WITH CHECK` are not supported. The columns a policy uses cannot be renamed,
+A role named in `TO` must have been created with `CREATE ROLE`. A policy
+applies only to the roles it names, not to other roles that are members of
+them.
+
+`AS RESTRICTIVE`, `FOR INSERT`, `FOR UPDATE`, `FOR DELETE` and `WITH CHECK`
+are not supported. The columns a policy uses cannot be renamed,
 dropped or altered. Policies are not listed in the `pg_policy` catalog.
 
 **Examples:**
@@ -118,6 +125,23 @@ SELECT id, title FROM documents;
 ----+-------
   1 | Plan
 (1 row)
+```
+
+Show each Supabase user their own rows. The user comes from the request's JWT
+claims:
+
+```sql
+CREATE ROLE authenticated;
+CREATE TABLE todos (id int PRIMARY KEY, user_id uuid, title text);
+ALTER TABLE todos ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_todos ON todos
+    FOR SELECT TO authenticated
+    USING ((SELECT auth.uid()) = user_id);
+BEGIN;
+SET LOCAL ROLE authenticated;
+SELECT set_config('request.jwt.claims', '{"sub": "11111111-1111-1111-1111-111111111111"}', true);
+SELECT id, title FROM todos;
+COMMIT;
 ```
 
 ### `CREATE ROLE` — create a role

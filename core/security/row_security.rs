@@ -230,6 +230,10 @@ impl Policy {
         })
     }
 
+    pub fn applies_to_role(&self, role: &str) -> bool {
+        self.roles.is_empty() || self.roles.iter().any(|name| name == role)
+    }
+
     /// Whether the policy decides which rows a SELECT shows.
     pub fn applies_to_reads(&self) -> bool {
         matches!(

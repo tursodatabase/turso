@@ -11983,6 +11983,14 @@ mod tests {
                 "CREATE POLICY everything ON docs FOR ALL USING (CAST (1 AS boolean))",
             ),
             (
+                "CREATE POLICY own ON todos TO anon, PUBLIC, authenticated USING (true)",
+                "CREATE POLICY own ON todos FOR ALL USING (CAST (1 AS boolean))",
+            ),
+            (
+                "CREATE POLICY own ON todos TO anon, authenticated USING (user_id = (SELECT auth.uid()))",
+                "CREATE POLICY own ON todos FOR ALL TO anon, authenticated USING (user_id = (SELECT \"auth.uid\" () uid))",
+            ),
+            (
                 "DROP POLICY IF EXISTS own ON docs",
                 "DROP POLICY IF EXISTS own ON docs",
             ),

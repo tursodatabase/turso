@@ -59,8 +59,7 @@ pub fn translate_row_security_change(
 }
 
 /// CREATE POLICY for the forms supported so far: a permissive SELECT (or
-/// ALL) policy for every role, whose USING condition refers only to columns
-/// of the table.
+/// ALL) policy whose USING condition refers only to columns of the table.
 pub fn translate_create_policy(
     policy: &ast::CreatePolicy,
     resolver: &Resolver,
@@ -88,8 +87,10 @@ pub fn translate_create_policy(
     ) {
         bail_parse_error!("only FOR SELECT and FOR ALL policies are supported");
     }
-    if !policy.roles.is_empty() {
-        bail_parse_error!("only policies TO PUBLIC are supported");
+    for role in &policy.roles {
+        if resolver.schema().roles.get_by_name(role.as_str()).is_none() {
+            bail_parse_error!("role \"{}\" does not exist", role.as_str());
+        }
     }
     if policy.check_expr.is_some() {
         bail_parse_error!("WITH CHECK is not supported");
@@ -208,9 +209,9 @@ pub fn reject_change_of_policy_column(
 }
 
 /// A role sees only the rows of a table with row-level security that one of
-/// the table's policies shows: every such table in the FROM clause gets a
-/// filter that combines the USING conditions of the policies with OR, and
-/// that is always false without policies. For the right side of an outer
+/// the table's policies for that role shows: every such table in the FROM
+/// clause gets a filter that combines the USING conditions of the policies
+/// with OR, and that is always false without policies. For the right side of an outer
 /// join the filter is part of the join condition, so the hidden rows produce
 /// NULLs like rows that do not exist. The filters go before the query's own
 /// conditions, so no expression of the query sees a hidden row. The tables
@@ -241,10 +242,17 @@ pub fn add_select_row_security_filters(
                 btree.declared_name
             );
         }
+        let role = resolver
+            .row_security_role
+            .as_deref()
+            .expect("row security applies to roles");
         let catalog = catalog(resolver);
         let policies = catalog.policies(&stored_table_name(table.namespace, &btree.declared_name));
         let mut visible = None;
-        for policy in policies.iter().filter(|policy| policy.applies_to_reads()) {
+        for policy in policies
+            .iter()
+            .filter(|policy| policy.applies_to_reads() && policy.applies_to_role(role))
+        {
             let Some(using_expr) = &policy.using_expr else {
                 continue;
             };
