@@ -67,7 +67,7 @@ pub fn emit_select_plan(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    optimize_plan(program, &mut plan, resolver)?;
+    optimize_plan(program, &mut plan, resolver, connection)?;
     let num_result_cols;
     let opts = match &plan {
         Plan::Select(select) => {
@@ -630,6 +630,7 @@ fn prepare_one_select_plan(
                             exprs,
                             sort_elided: false,
                             having,
+                            columns_read_by_group_subqueries: Vec::new(),
                         });
                     } else {
                         // HAVING without GROUP BY: treat as ungrouped aggregation with filter
@@ -639,6 +640,7 @@ fn prepare_one_select_plan(
                             sort_elided: false,
                             exprs: vec![],
                             having: having_predicates,
+                            columns_read_by_group_subqueries: Vec::new(),
                         });
                     }
                 }

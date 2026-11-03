@@ -2,10 +2,9 @@ use super::*;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
-use crate::translate::expr::{comparison_affinity, maybe_apply_affinity};
+use crate::translate::expr::{comparison_affinity, emit_table_column, maybe_apply_affinity};
 use crate::translate::expr_context::{ExprContext, TableMetadata};
 use crate::translate::plan::ColumnUsedMask;
-use crate::vdbe::builder::SelfTableContext;
 
 #[derive(Debug, Clone)]
 /// Payload layout metadata recorded during hash-build planning or reuse.
@@ -369,31 +368,19 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
                     .get(col_idx)
                     .map(|c| c.generated_type())
                 {
-                    Some(GeneratedType::Virtual { expr, .. })
+                    Some(GeneratedType::Virtual { .. })
                         if !config.uses_materialized_keys_and_payload =>
                     {
-                        planner.t_ctx.resolver.with_self_table_context(
+                        emit_table_column(
                             planner.program,
-                            Some(&SelfTableContext::ForSelect {
-                                table_ref_id: build_table.internal_id,
-                                referenced_tables: planner.table_references.clone(),
-                            }),
-                            |program, _| -> Result<()> {
-                                translate_expr(
-                                    program,
-                                    Some(planner.table_references),
-                                    expr,
-                                    payload_reg + i,
-                                    &planner.t_ctx.resolver,
-                                )?;
-                                Ok(())
-                            },
-                        )?;
-
-                        planner.program.emit_column_affinity(
+                            payload_source_cursor_id,
+                            build_table.internal_id,
+                            planner.table_references,
+                            &build_table.columns()[col_idx],
+                            col_idx,
                             payload_reg + i,
-                            build_table.columns()[col_idx].affinity(),
-                        );
+                            &planner.t_ctx.resolver,
+                        )?;
                     }
                     Some(_) if !config.uses_materialized_keys_and_payload => {
                         emit_stored_column(

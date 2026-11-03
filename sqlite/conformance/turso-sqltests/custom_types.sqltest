@@ -103,7 +103,7 @@ test cast-to-custom-type {
     SELECT CAST('hello' AS test_reverse);
 }
 expect {
-    olleh
+    hello
 }
 
 @requires strict "uses STRICT tables"
@@ -111,16 +111,102 @@ test cast-to-parametric-type {
     SELECT typeof(CAST(42 AS numeric(10,2)));
 }
 expect {
-    blob
+    text
+}
+
+# A CAST gives the value a column of the type reads back after ENCODE and
+# DECODE, so it compares equal to the column it was stored in.
+@requires strict "uses STRICT tables"
+test cast-to-custom-type-reads-like-a-column {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(p cents) STRICT;
+    INSERT INTO t VALUES (42);
+    SELECT CAST(42 AS cents), p = CAST(42 AS cents), p = CAST(43 AS cents) FROM t;
+}
+expect {
+    42|1|0
+}
+
+# A CHECK constraint sees a column and a CAST to its type in the same form, so
+# the CHECK allows 100 and rejects 101.
+@requires strict "uses STRICT tables"
+test cast-to-custom-type-in-check-compares-with-column {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(p cents CHECK (p <= CAST(100 AS cents))) STRICT;
+    INSERT INTO t VALUES (100);
+    SELECT p FROM t;
+}
+expect {
+    100
 }
 
 @requires strict "uses STRICT tables"
-test cast-to-custom-type-encode-only {
+test cast-to-custom-type-in-check-compares-with-column-error {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    SELECT CAST(42 AS cents);
+    CREATE TABLE t(p cents CHECK (p <= CAST(100 AS cents))) STRICT;
+    INSERT INTO t VALUES (101);
+}
+expect error {
+    CHECK constraint failed
+}
+
+# A domain's CHECK sees the value after DECODE, on a CAST to the domain as on
+# an INSERT into a column of it, and CAST(100 AS cents) in it is 100.
+@requires strict "uses STRICT tables"
+test cast-to-domain-check-sees-decoded-value {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN dc AS cents CHECK (value <= CAST(100 AS cents));
+    CREATE TABLE t(p dc) STRICT;
+    INSERT INTO t VALUES (50);
+    SELECT CAST(50 AS dc), p FROM t;
 }
 expect {
-    4200
+    50|50
+}
+
+@requires strict "uses STRICT tables"
+test cast-to-domain-check-sees-decoded-value-error {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN dc AS cents CHECK (value <= CAST(100 AS cents));
+    SELECT CAST(101 AS dc);
+}
+expect error {
+    violates check constraint
+}
+
+# In a CAST to a domain, the domain's CHECK reads `value` with the domain's
+# type, as on a column of the domain, so `value < 100` over numeric compares
+# numbers and not numeric's text form (where '5' > '100').
+@requires strict "uses STRICT tables"
+test cast-to-domain-over-numeric-checks-numbers {
+    CREATE DOMAIN dn AS numeric CHECK (value < 100);
+    CREATE TABLE t(x dn) STRICT;
+    INSERT INTO t VALUES (5);
+    SELECT CAST(5 AS dn), x FROM t;
+}
+expect {
+    5|5
+}
+
+@requires strict "uses STRICT tables"
+test cast-to-domain-over-numeric-check-violation {
+    CREATE DOMAIN dm AS numeric CHECK (value > 1);
+    SELECT CAST(0.5 AS dm);
+}
+expect error {
+    violates check constraint
+}
+
+# A CAST to a domain over a plain SQL type converts the value to that type, as
+# a column of the domain holds it, before the domain's CHECKs run.
+@requires strict "uses STRICT tables"
+test cast-to-domain-converts-to-base-type {
+    CREATE DOMAIN dw AS integer CHECK (value = 2);
+    CREATE DOMAIN dt AS text;
+    SELECT CAST('2' AS dw), typeof(CAST('2' AS dw)), typeof(CAST(2 AS dt));
+}
+expect {
+    2|integer|text
 }
 
 @requires strict "uses STRICT tables"
@@ -926,6 +1012,31 @@ expect {
     cherry
 }
 
+# A CAST gives the decoded value, so ORDER BY on it sorts by the decoded value,
+# the same as an index on the CAST holds it. ORDER BY on the column itself
+# sorts by the stored value.
+@requires strict "uses STRICT tables"
+test order-by-cast-to-custom-type-sorts-decoded-with-and-without-index {
+    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
+    CREATE TABLE t1(val test_reverse, plain text) STRICT;
+    INSERT INTO t1 VALUES ('apple', 'apple');
+    INSERT INTO t1 VALUES ('banana', 'banana');
+    INSERT INTO t1 VALUES ('cherry', 'cherry');
+    SELECT group_concat(val) FROM (SELECT val FROM t1 ORDER BY val);
+    SELECT group_concat(plain) FROM (SELECT plain FROM t1 ORDER BY CAST(plain AS test_reverse));
+    SELECT group_concat(c) FROM (SELECT CAST(plain AS test_reverse) AS c FROM t1 ORDER BY CAST(plain AS test_reverse));
+    SELECT group_concat(c) FROM (SELECT CAST(val AS test_reverse) AS c FROM t1 ORDER BY CAST(val AS test_reverse));
+    CREATE INDEX t1_cast ON t1(CAST(plain AS test_reverse));
+    SELECT group_concat(plain) FROM (SELECT plain FROM t1 ORDER BY CAST(plain AS test_reverse));
+}
+expect {
+    banana,apple,cherry
+    apple,banana,cherry
+    apple,banana,cherry
+    apple,banana,cherry
+    apple,banana,cherry
+}
+
 @requires strict "uses STRICT tables"
 test order-by-numeric-type-with-lt {
     CREATE TABLE t1(val numeric(10,2)) STRICT;
@@ -1703,6 +1814,58 @@ expect {
     500.25|750.50
 }
 
+# In a BEFORE UPDATE trigger, NEW of a column the SET clause does not name
+# holds the value read from the table. The trigger sees it decoded, as it sees
+# a SET column's value and as an AFTER trigger sees the row.
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test trigger-before-update-new-decoded-for-columns-not-set {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(w integer, y cents AS (w), c cents, n numeric(10,2)) STRICT;
+    CREATE TABLE log(t text, y integer, c integer, n text) STRICT;
+    CREATE TRIGGER b BEFORE UPDATE ON t
+    BEGIN INSERT INTO log VALUES ('before', NEW.y, NEW.c, CAST(NEW.n AS TEXT)); END;
+    CREATE TRIGGER a AFTER UPDATE ON t
+    BEGIN INSERT INTO log VALUES ('after', NEW.y, NEW.c, CAST(NEW.n AS TEXT)); END;
+    INSERT INTO t VALUES (3, 5, 1.5);
+    UPDATE t SET w = 7;
+    SELECT * FROM log;
+}
+expect {
+    before|7|5|1.50
+    after|7|5|1.50
+}
+
+# ALTER TABLE ADD COLUMN checks existing rows against the DEFAULT as a SELECT
+# reads it: a row stored before the column existed reads DEFAULT 5 as 5, for
+# the new column and for one added by an earlier ALTER.
+@requires strict "uses STRICT tables"
+test alter-add-column-check-sees-custom-type-default-as-read {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id integer primary key, w integer) STRICT;
+    INSERT INTO t VALUES (1, 3);
+    ALTER TABLE t ADD COLUMN a cents DEFAULT 5 CHECK (a > 4);
+    ALTER TABLE t ADD COLUMN n numeric(10,2) DEFAULT 1.5 CHECK (n > 1);
+    ALTER TABLE t ADD COLUMN c integer DEFAULT 9 CHECK (c > a);
+    SELECT * FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|3|5|1.50|9
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test alter-add-column-check-violation-on-custom-type-default {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id integer primary key, w integer) STRICT;
+    INSERT INTO t VALUES (1, 3);
+    ALTER TABLE t ADD COLUMN b cents DEFAULT 5 CHECK (b < 4);
+}
+expect error {
+    CHECK constraint failed: b < 4
+}
+
 # AFTER DELETE trigger should see decoded OLD values
 @requires strict "uses STRICT tables"
 @requires trigger "uses triggers"
@@ -1929,4 +2092,121 @@ test check-error-does-not-run-failing-decode {
 }
 expect error {
     CHECK constraint failed: n > 0
+}
+
+# A virtual generated column of a custom type reads what storing its
+# expression's value in a column of the type would read: 300, written as w
+# or as a CAST.
+@requires strict "uses STRICT tables"
+test virtual-custom-type-column-reads-its-expression-value {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(w integer, y cents AS (w), z cents AS (CAST(w AS cents))) STRICT;
+    INSERT INTO t(w) VALUES (300);
+    SELECT w, y, z FROM t;
+    SELECT count(*) FROM t WHERE y = 300 AND z = 300;
+}
+expect {
+    300|300|300
+    1
+}
+
+@requires strict "uses STRICT tables"
+test virtual-custom-type-column-in-an-index {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(w integer PRIMARY KEY, y cents AS (w)) STRICT;
+    CREATE INDEX t_y ON t(y);
+    INSERT INTO t(w) VALUES (300);
+    SELECT 'insert', w FROM t WHERE y = 300;
+    UPDATE t SET w = 400;
+    SELECT 'update', w FROM t WHERE y = 400;
+    INSERT INTO t(w) VALUES (400) ON CONFLICT (w) DO UPDATE SET w = 500;
+    SELECT 'upsert', w FROM t WHERE y = 500;
+    PRAGMA integrity_check;
+}
+expect {
+    insert|300
+    update|400
+    upsert|500
+    ok
+}
+
+# The column's type arguments apply to the expression's value, as when it is
+# stored: numeric(10,2) rounds 1/3 to 0.33.
+@requires strict "uses STRICT tables"
+test virtual-numeric-column-rounds-to-its-scale {
+    CREATE TABLE t(w real, n numeric(10,2) AS (w / 3)) STRICT;
+    INSERT INTO t(w) VALUES (1.0);
+    SELECT n FROM t;
+}
+expect {
+    0.33
+}
+
+# A join searches the inner table through an automatic index on y. Its keys
+# hold y in stored form, and the search key from a.s or a.y is stored the
+# same way.
+@requires strict "uses STRICT tables"
+test virtual-custom-type-column-in-an-automatic-index {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(w integer, y cents AS (w), s cents) STRICT;
+    INSERT INTO t(w, s) VALUES (3, 3), (1, 1);
+    SELECT 'join', count(*) FROM t a JOIN t b ON a.s = b.y;
+    SELECT 'self', count(*) FROM t a JOIN t b ON a.y = b.y;
+    SELECT 'left', count(b.w) FROM t a LEFT JOIN t b ON a.s = b.y;
+    SELECT 'exists', count(*) FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.y = a.s);
+}
+expect {
+    join|2
+    self|2
+    left|2
+    exists|2
+}
+
+# CREATE INDEX on existing rows, and every later write, store the same keys
+# for y as an index on a stored column of the type.
+@requires strict "uses STRICT tables"
+test virtual-custom-type-column-index-built-after-rows {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id integer PRIMARY KEY, w integer UNIQUE, y cents AS (w)) STRICT;
+    INSERT INTO t(id, w) VALUES (1, 3), (2, 1);
+    CREATE INDEX t_y ON t(y);
+    SELECT 'create', sum(w) FROM t WHERE y IN (1, 3);
+    PRAGMA integrity_check;
+    UPDATE t SET w = 13 WHERE id = 1;
+    INSERT INTO t(id, w) VALUES (3, 1) ON CONFLICT (w) DO UPDATE SET w = 20;
+    INSERT OR REPLACE INTO t(id, w) VALUES (1, 7);
+    DELETE FROM t WHERE id = 2;
+    SELECT 'writes', w, y FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    create|4
+    ok
+    writes|7|7
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test virtual-numeric-column-multi-row-insert {
+    CREATE TABLE t(w real, n numeric(10,2) AS (w)) STRICT;
+    INSERT INTO t(w) VALUES (3.5), (1.25);
+    SELECT n FROM t ORDER BY w;
+}
+expect {
+    1.25
+    3.50
+}
+
+# A hash join carries y from the build table to the result.
+@requires strict "uses STRICT tables"
+test virtual-custom-type-column-through-a-hash-join {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(w integer, y cents AS (w)) STRICT;
+    CREATE TABLE u(k integer) STRICT;
+    INSERT INTO t(w) VALUES (3);
+    INSERT INTO u VALUES (3);
+    SELECT t.y FROM t JOIN u ON t.w = u.k;
+}
+expect {
+    3
 }

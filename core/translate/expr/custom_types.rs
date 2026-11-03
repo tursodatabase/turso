@@ -20,14 +20,13 @@ pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
     }
 }
 
-/// Check if a literal type is compatible with a custom type's value input type.
-/// "any" matches everything; otherwise exact match (case-insensitive).
-pub(super) fn literal_compatible_with_value_type(
-    literal_type: &str,
-    value_input_type: &str,
-) -> bool {
-    value_input_type.eq_ignore_ascii_case("any")
-        || literal_type.eq_ignore_ascii_case(value_input_type)
+/// Whether a custom type takes values of the SQL type `type_name` as input,
+/// such as `integer` for a type based on integer. A type whose input type is
+/// `any` takes every value. A comparison of the type's values with such a
+/// value is well typed, as it is for an operator of the type.
+pub(crate) fn takes_input_of_type(type_def: &TypeDef, type_name: &str) -> bool {
+    let value_input_type = type_def.value_input_type();
+    value_input_type.eq_ignore_ascii_case("any") || type_name.eq_ignore_ascii_case(value_input_type)
 }
 
 /// Whether a custom type's function runs the operator expression `expr`, such
@@ -112,24 +111,37 @@ pub(crate) fn emit_user_facing_column_value(
         return Ok(());
     }
     if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
-        if resolved.chain.iter().all(|td| td.decode().is_none()) {
-            return Ok(());
-        }
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg: dest_reg,
-            target_pc: skip_label,
-        });
-
-        // Apply decode in reverse order (parent/ancestor first, then child)
-        for td in resolved.chain.iter().rev() {
-            if let Some(decode_expr) = td.decode() {
-                emit_type_expr(program, decode_expr, dest_reg, dest_reg, resolver)?;
-            }
-        }
-
-        program.preassign_label_to_next_insn(skip_label);
+        emit_decode(program, &resolved.chain, dest_reg, resolver)?;
     }
+    Ok(())
+}
+
+/// Emits the DECODE of each of `chain`'s types on the stored value in `reg`,
+/// which turns it into the value a column of the type reads back. NULL is
+/// left as it is.
+pub(crate) fn emit_decode(
+    program: &mut ProgramBuilder,
+    chain: &[crate::sync::Arc<TypeDef>],
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if chain.iter().all(|td| td.decode().is_none()) {
+        return Ok(());
+    }
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
+
+    // Apply decode in reverse order (parent/ancestor first, then child)
+    for td in chain.iter().rev() {
+        if let Some(decode_expr) = td.decode() {
+            emit_type_expr(program, decode_expr, reg, reg, resolver)?;
+        }
+    }
+
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -138,6 +150,7 @@ pub(crate) fn emit_user_facing_column_value(
 pub(super) fn emit_domain_cast_constraints(
     program: &mut ProgramBuilder,
     chain: &[crate::sync::Arc<TypeDef>],
+    cast_type: &ast::Type,
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -165,15 +178,29 @@ pub(super) fn emit_domain_cast_constraints(
                 .clone()
                 .unwrap_or_else(|| format!("{}_{}", td.name, i));
 
-            // Bind `value` → reg, translate check expr, verify truthy
-            program
-                .id_register_overrides
-                .insert("value".to_string(), reg);
+            // `value` reads the CAST's result with the CAST's type, as a
+            // column of the domain does, so `value < 100` on a domain over
+            // numeric compares numbers, not numeric's decoded text.
+            let mut check = dc.check.as_ref().clone();
+            walk_expr_mut(&mut check, &mut |e| {
+                if matches!(e, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value")) {
+                    *e = ast::Expr::Register {
+                        register: reg,
+                        custom_type: Some(Box::new(cast_type.clone())),
+                    };
+                }
+                Ok(WalkControl::Continue)
+            })?;
 
             let expr_result_reg = program.alloc_register();
-            translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
-
-            program.id_register_overrides.remove("value");
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                &check,
+                expr_result_reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
 
             let passed_label = program.allocate_label();
 
@@ -316,16 +343,18 @@ fn emit_expr_with_bindings(
     result
 }
 
-/// Decode custom type columns for AFTER trigger NEW registers.
+/// Decode the custom type columns of a trigger's NEW or OLD row.
 ///
-/// For each column with a custom type decode expression, copies the encoded register
-/// to a new register and emits the decode expression. NULL values are skipped.
-/// Returns a Vec of registers: one per column (decoded or original) plus the rowid at the end.
+/// For each column that `holds_stored_value` and has a custom type decode
+/// expression, copies the encoded register to a new register and emits the
+/// decode expression. NULL values are skipped. Returns a Vec of registers: one
+/// per column (decoded or original) plus the rowid at the end.
 pub(crate) fn emit_trigger_decode_registers(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     columns: &[Column],
     source_regs: &dyn Fn(usize) -> usize,
+    holds_stored_value: &dyn Fn(usize) -> bool,
     rowid_reg: usize,
     is_strict: bool,
 ) -> Result<Vec<usize>> {
@@ -333,21 +362,19 @@ pub(crate) fn emit_trigger_decode_registers(
         .iter()
         .enumerate()
         .map(|(i, col)| -> Result<usize> {
-            if let Ok(Some(resolved)) = resolver.schema().resolve_type(&col.ty_str, is_strict) {
-                if resolved.chain.iter().any(|td| td.decode().is_some()) {
-                    let decoded_reg = program.alloc_register();
-                    emit_user_facing_column_value(
-                        program,
-                        source_regs(i),
-                        decoded_reg,
-                        col,
-                        is_strict,
-                        resolver,
-                    )?;
-                    return Ok(decoded_reg);
-                }
+            if !holds_stored_value(i) || !resolver.schema().column_has_decode(col, is_strict) {
+                return Ok(source_regs(i));
             }
-            Ok(source_regs(i))
+            let decoded_reg = program.alloc_register();
+            emit_user_facing_column_value(
+                program,
+                source_regs(i),
+                decoded_reg,
+                col,
+                is_strict,
+                resolver,
+            )?;
+            Ok(decoded_reg)
         })
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
@@ -376,13 +403,7 @@ pub(crate) fn emit_constraint_values_decode(
         let Some((_, column)) = table.get_column(name) else {
             continue;
         };
-        let decode_changes_value = resolver
-            .schema()
-            .resolve_type(&column.ty_str, table.is_strict)
-            .ok()
-            .flatten()
-            .is_some_and(|resolved| !resolved.reads_stored_values_unchanged());
-        if !column.is_array() && !decode_changes_value {
+        if !column.is_array() && !resolver.schema().column_has_decode(column, table.is_strict) {
             continue;
         }
         let decoded_reg = program.alloc_register();

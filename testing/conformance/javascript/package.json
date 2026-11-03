@@ -20,5 +20,8 @@
     "better-sqlite3": "12.9.0",
     "libsql": "^0.6.0-pre.41",
     "@libsql/client": "^0.15.15"
+  },
+  "overrides": {
+    "minimatch": "^11.0.4"
   }
 }

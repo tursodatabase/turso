@@ -193,6 +193,10 @@ pub struct GroupBy {
     pub sort_elided: bool,
     /// having clause split into a vec at 'AND' boundaries.
     pub having: Option<Vec<ast::Expr>>,
+    /// Columns of this query's tables that are read by subqueries running once
+    /// per group. The table scan has moved on by then, so each group saves
+    /// these values, like the columns of its result row.
+    pub columns_read_by_group_subqueries: Vec<ast::Expr>,
 }
 
 /// The JOIN that supplied a term and whether that JOIN keeps unmatched rows.
@@ -585,10 +589,21 @@ impl Plan {
     /// SELECTs. DELETE and UPDATE plans have no outer-query references and
     /// always return an empty vector.
     pub fn used_outer_query_ref_ids(&self) -> Vec<TableInternalId> {
-        fn collect_from_select(plan: &SelectPlan, out: &mut Vec<TableInternalId>) {
+        self.used_outer_query_refs()
+            .iter()
+            .map(|outer_ref| outer_ref.internal_id)
+            .collect()
+    }
+
+    /// Returns every outer-query reference that this plan actually uses. For a
+    /// compound SELECT, the result spans all of its component SELECTs. DELETE
+    /// and UPDATE plans have no outer-query references and always return an
+    /// empty vector.
+    pub fn used_outer_query_refs(&self) -> Vec<&OuterQueryReference> {
+        fn collect_from_select<'a>(plan: &'a SelectPlan, out: &mut Vec<&'a OuterQueryReference>) {
             for outer_ref in plan.table_references.outer_query_refs().iter() {
                 if outer_ref.is_used() {
-                    out.push(outer_ref.internal_id);
+                    out.push(outer_ref);
                 }
             }
         }
@@ -604,8 +619,8 @@ impl Plan {
                 collect_from_select(right_most, &mut ids);
             }
             Plan::RecursiveCte(plan) => {
-                ids.extend(plan.initial_query.used_outer_query_ref_ids());
-                ids.extend(plan.recursive_query.used_outer_query_ref_ids());
+                ids.extend(plan.initial_query.used_outer_query_refs());
+                ids.extend(plan.recursive_query.used_outer_query_refs());
             }
             Plan::Delete(_) | Plan::Update(_) => {}
         }

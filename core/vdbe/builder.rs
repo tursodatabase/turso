@@ -138,7 +138,7 @@ enum DmlColumnRegisters {
 /// holds either the value the user sees or the value ENCODE produced, and an
 /// expression that reads the column, such as a generated column `val * 2`,
 /// must see the user's value. Reading a stored value therefore runs DECODE.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum DmlRowForm {
     /// Every column holds the user's value, as before ENCODE in INSERT.
     UserFacing,
@@ -148,6 +148,18 @@ pub enum DmlRowForm {
     /// UPDATE before ENCODE: the SET columns hold the user's values and the
     /// other columns hold the stored values read from the table.
     StoredExceptUpdated(ColumnMask),
+}
+
+impl DmlRowForm {
+    /// Whether column `col_idx` holds the value ENCODE stored rather than the
+    /// user's value.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        match self {
+            DmlRowForm::UserFacing => false,
+            DmlRowForm::Stored => true,
+            DmlRowForm::StoredExceptUpdated(updated) => !updated.get(col_idx),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -206,17 +218,11 @@ impl DmlColumnContext {
     }
 
     /// Whether the register of column `col_idx` holds the value ENCODE
-    /// stored rather than the user's value. A virtual generated column's
-    /// register holds the result of its expression, which is the user's value.
-    pub fn holds_stored_value(&self, col_idx: usize, column: &Column) -> bool {
-        if column.is_virtual_generated() || self.rowid_alias_col == Some(col_idx) {
-            return false;
-        }
-        match &self.form {
-            DmlRowForm::UserFacing => false,
-            DmlRowForm::Stored => true,
-            DmlRowForm::StoredExceptUpdated(updated) => !updated.get(col_idx),
-        }
+    /// stored rather than the user's value. A virtual generated column
+    /// follows the row's form like any other column: in a row of stored
+    /// values, its expression's value is ENCODEd too.
+    pub fn holds_stored_value(&self, col_idx: usize) -> bool {
+        self.rowid_alias_col != Some(col_idx) && self.form.holds_stored_value(col_idx)
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {
@@ -497,9 +503,9 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    /// When set, translate_expr will skip custom type decode for Expr::Column.
-    /// This is used when building ORDER BY sort keys so the sorter compares
-    /// encoded (on-disk) values. Decode is presentation-only.
+    /// When set, a custom-type column is read in its stored form, without
+    /// DECODE. Set when an ORDER BY key is such a column, so the sorter
+    /// compares stored values.
     pub const fn suppress_custom_type_decode(self) -> bool {
         self.get(Self::SUPPRESS_CUSTOM_TYPE_DECODE)
     }

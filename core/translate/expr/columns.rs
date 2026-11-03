@@ -1,4 +1,5 @@
 use super::*;
+use crate::translate::emitter::gencol::emit_virtual_column_store;
 
 /// Read a single column from a BTreeTable cursor, transparently computing
 /// virtual generated columns inline instead of hitting `emit_column`.
@@ -98,6 +99,17 @@ pub(super) fn do_emit_table_column(
                 }
                 Ok(())
             })?;
+            let table = match self_table_context {
+                SelfTableContext::ForSelect {
+                    table_ref_id,
+                    referenced_tables,
+                } => referenced_tables
+                    .find_table_by_internal_id(*table_ref_id)
+                    .and_then(|(_, table)| table.btree())
+                    .expect("a virtual column read in a query belongs to a btree table in it"),
+                SelfTableContext::ForDML { table, .. } => Arc::clone(table),
+            };
+            emit_virtual_column_store(program, resolver, column, target_register, &table)?;
             program.emit_column_affinity(target_register, column.affinity());
             if let Some(end) = end_column_emission {
                 program.preassign_label_to_next_insn(end);
