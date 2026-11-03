@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use bytes::Bytes;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -272,10 +273,32 @@ impl TursoSyncServer {
             break;
         }
 
-        let (method, path, body) = parse_http_request(&request_data)?;
-        info!("Request: {} {}", method, path);
+        let response = self.handle_request(&request_data);
+        let http_response = match response {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("Request error: {}", e);
+                text_response(500, &format!("Internal Server Error: {e}"))
+            }
+        };
+        stream.write_all(&format_http_response(&http_response))?;
+        stream.flush()?;
+        Ok(())
+    }
 
-        let response = match parse_route(&method, &path) {
+    fn handle_request(&self, request_data: &[u8]) -> Result<HttpResponse> {
+        let (method, path, body) = parse_http_request(request_data)?;
+        info!("Request: {} {}", method, path);
+        let route = parse_route(&method, &path);
+        if matches!(route, Route::Pipeline { .. } | Route::PullUpdates { .. }) {
+            if validate_encryption_headers(request_data, self.encryption.as_ref()).is_err() {
+                return Ok(text_response(
+                    400,
+                    "Invalid or missing sync encryption credentials",
+                ));
+            }
+        }
+        match route {
             Route::Options => Ok(text_response(204, "")),
             Route::Pipeline { db } => match self.resolve_db(db) {
                 Ok(handle) => {
@@ -295,25 +318,7 @@ impl TursoSyncServer {
                 info!("Unknown endpoint: {} {}", method, path);
                 Ok(text_response(404, "Not Found"))
             }
-        };
-
-        let http_response = match response {
-            Ok(resp) => resp,
-            Err(e) => {
-                error!("Request error: {}", e);
-                HttpResponse {
-                    status: 500,
-                    content_type: "text/plain".to_string(),
-                    body: format!("Internal Server Error: {e}").into_bytes(),
-                }
-            }
-        };
-
-        let response_bytes = format_http_response(&http_response);
-        stream.write_all(&response_bytes)?;
-        stream.flush()?;
-
-        Ok(())
+        }
     }
 
     fn handle_pipeline(&self, db: &DbHandle, body: &[u8]) -> Result<HttpResponse> {
@@ -1042,6 +1047,59 @@ impl ServerEncryption {
     }
 }
 
+fn validate_encryption_headers(
+    request: &[u8],
+    encryption: Option<&ServerEncryption>,
+) -> Result<()> {
+    let end = find_header_end(request, 0).ok_or_else(|| anyhow!("missing HTTP headers"))?;
+    let headers = std::str::from_utf8(&request[..end])?;
+    let mut key = None;
+    let mut cipher = None;
+    for line in headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let slot = if name.eq_ignore_ascii_case("x-turso-encryption-key") {
+            &mut key
+        } else if name.eq_ignore_ascii_case("x-turso-encryption-cipher") {
+            &mut cipher
+        } else {
+            continue;
+        };
+        anyhow::ensure!(
+            slot.replace(value.trim()).is_none(),
+            "duplicate encryption header"
+        );
+    }
+    let Some(encryption) = encryption else {
+        anyhow::ensure!(
+            key.is_none() && cipher.is_none(),
+            "database is not encrypted"
+        );
+        return Ok(());
+    };
+    anyhow::ensure!(
+        cipher.map(CipherMode::try_from).transpose()? == Some(encryption.cipher),
+        "cipher mismatch"
+    );
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(key.ok_or_else(|| anyhow!("missing encryption key"))?)?;
+    let key = match bytes.len() {
+        16 => EncryptionKey::new_128(bytes.try_into().unwrap()),
+        32 => EncryptionKey::new_256(bytes.try_into().unwrap()),
+        _ => return Err(anyhow!("invalid encryption key length")),
+    };
+    // Use the cipher's authentication check instead of a timing-sensitive key comparison.
+    let aad = b"turso sample sync server key validation";
+    let (ciphertext, nonce) = encryption.context()?.encrypt_chunk(b"", aad)?;
+    EncryptionContext::new(encryption.cipher, &key, PAGE_SIZE)?.decrypt_chunk(
+        &ciphertext,
+        &nonce,
+        aad,
+    )?;
+    Ok(())
+}
+
 struct MvccLogSnapshot {
     end_offset: u64,
     crc_by_offset: Vec<(u64, u32)>,
@@ -1539,6 +1597,66 @@ fn convert_core_to_value(value: CoreValue) -> Value {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn encrypted_requests_validate_credentials_before_opening_or_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut server = dir_server(dir.path());
+        let encryption = ServerEncryption {
+            cipher: CipherMode::Aes256Gcm,
+            key: EncryptionKey::new_256([11; 32]),
+        };
+        server.encryption = Some(encryption.clone());
+        if let DbSource::Dir { config, .. } = &mut server.source {
+            config.encryption = Some(encryption);
+        }
+        let key = base64::engine::general_purpose::STANDARD.encode([11; 32]);
+        let valid =
+            format!("X-Turso-Encryption-Key: {key}\r\nx-turso-encryption-cipher: aes256gcm\r\n");
+        for endpoint in ["pull-updates", "v2/pipeline"] {
+            for headers in [
+                String::new(),
+                valid.replace(
+                    &key,
+                    &base64::engine::general_purpose::STANDARD.encode([12; 32]),
+                ),
+                valid.replace("aes256gcm", "aegis256"),
+                format!("{valid}x-turso-encryption-key: {key}\r\n"),
+                valid.replace(&key, "invalid"),
+            ] {
+                let request = format!(
+                    "POST /db/rejected/{endpoint} HTTP/1.1\r\n{headers}Content-Length: 0\r\n\r\n"
+                );
+                assert_eq!(
+                    server.handle_request(request.as_bytes()).unwrap().status,
+                    400
+                );
+                assert!(!dir.path().join("rejected").exists());
+            }
+        }
+        let body =
+            r#"{"requests":[{"type":"execute","stmt":{"sql":"CREATE TABLE secret(value TEXT)"}}]}"#;
+        let request = format!(
+            "POST /db/accepted/v2/pipeline HTTP/1.1\r\n{valid}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(
+            server.handle_request(request.as_bytes()).unwrap().status,
+            200
+        );
+        assert!(dir.path().join("accepted/data").exists());
+        // Validation also runs when the database is already cached.
+        let request = request.replace(&valid, "");
+        assert_eq!(
+            server.handle_request(request.as_bytes()).unwrap().status,
+            400
+        );
+        assert!(validate_encryption_headers(
+            format!("POST / HTTP/1.1\r\n{valid}\r\n").as_bytes(),
+            None
+        )
+        .is_err());
+    }
 
     #[test]
     fn validates_database_names() {
