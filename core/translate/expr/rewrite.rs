@@ -94,6 +94,12 @@ fn replace_and_or_with_deciding_operand(
     if dropped_has_aggregate {
         return Ok(false);
     }
+    // A name that binding left for later, as a trigger WHEN clause or an
+    // UPSERT DO UPDATE does, is still checked when it is resolved, so the
+    // operand that holds it stays until then.
+    if expr_contains_unresolved_column_name(dropped) {
+        return Ok(false);
+    }
     let kept_is_and_or = matches!(
         unwrap_parens(kept).unwrap_or(kept),
         Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _)
