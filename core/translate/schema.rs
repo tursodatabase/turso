@@ -22,7 +22,7 @@ use crate::translate::emitter::{
 use crate::translate::expr::expr_type::iif_values;
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
+use crate::translate::plan::{compound_column_affinities, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::sequence::bind_sequence_names;
@@ -952,12 +952,15 @@ fn derive_ctas_schema(
     let mut sql_parts = Vec::with_capacity(result_columns.len());
     let mut col_defs = Vec::with_capacity(result_columns.len());
     let mut stores_values_unchanged = Vec::with_capacity(result_columns.len());
+    let mut compound_affinities = compound_arms
+        .as_ref()
+        .map(|arms| compound_column_affinities(arms, resolver).into_iter());
 
-    for (column_index, (col, name)) in result_columns.iter().zip(names).enumerate() {
+    for (col, name) in result_columns.iter().zip(names) {
         // Names come from the leftmost arm, but compound affinity can weaken its type.
-        let compound_affinity = compound_arms
-            .as_ref()
-            .map(|arms| compound_column_affinity(arms, column_index, resolver));
+        let compound_affinity = compound_affinities
+            .as_mut()
+            .and_then(|affinities| affinities.next());
         stores_values_unchanged.push(
             compound_affinity
                 .as_ref()
