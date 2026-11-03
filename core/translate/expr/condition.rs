@@ -278,9 +278,11 @@ pub fn translate_condition_expr(
     }
     match expr {
         // `x AND 0` and `x OR 1` are decided without running `x`; see
-        // translate_binary_expr for the expressions that reach this unbound.
+        // translate_binary_expr for the expressions that reach this unbound
+        // and for why one with an aggregate takes the normal path.
         ast::Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _)
-            if and_or_truth_value(expr).is_some() =>
+            if and_or_truth_value(expr).is_some()
+                && !expr_contains_aggregate_or_window_function(expr, resolver)? =>
         {
             let reg = program.alloc_register();
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
