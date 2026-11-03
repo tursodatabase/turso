@@ -137,6 +137,17 @@ expect error {
     integer overflow
 }
 
+# LIKE, GLOB and the JSON `->` operator are function calls to SQLite's parser
+# too, so these chains are not folded either and their term still moves.
+@setup overflow
+test having-like-term-next-to-integer-zero-still-moves {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g LIKE '2' AND 0;
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g GLOB '2' AND 0;
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g NOT LIKE '1' AND 0;
+}
+expect {
+}
+
 @setup overflow
 test having-subquery-still-aggregates {
     SELECT g, sum(a) FROM t GROUP BY g HAVING g = (SELECT 2);
