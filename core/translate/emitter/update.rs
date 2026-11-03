@@ -38,6 +38,7 @@ use crate::{
             fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
             ParentKeyNewProbeMode,
         },
+        insert::format_unique_violation_desc,
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             EvalAt, IterationDirection, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
@@ -2158,18 +2159,7 @@ fn emit_update_insns<'a>(
                 }
                 _ => {
                     // ABORT/FAIL/ROLLBACK behavior
-                    let column_names = index.columns.iter().enumerate().fold(
-                        String::with_capacity(50),
-                        |mut accum, (idx, col)| {
-                            if idx > 0 {
-                                accum.push_str(", ");
-                            }
-                            accum.push_str(table_name);
-                            accum.push('.');
-                            accum.push_str(&col.name);
-                            accum
-                        },
-                    );
+                    let column_names = format_unique_violation_desc(table_name, index);
                     let mut constraint_info = ConstraintInfo::unique_index(
                         table_name,
                         index,
