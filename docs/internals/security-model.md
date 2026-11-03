@@ -100,15 +100,15 @@ server does not do this yet: every client gets a superuser connection.
 
 ## Roles
 
-A role is an identity with a name and two flags: whether it is a superuser,
-and whether row policies apply to it. A superuser passes every privilege check.
+A role is an identity with a name and a flag that says whether it is a
+superuser. A superuser passes every privilege check.
 Roles belong to the database file, not to the process, so every connection to
 the same file sees the same roles.
 
-Every database has two built-in roles that are not stored: the superuser, and
-`public`, which every role is a member of. The dialect names them, so the
-Postgres frontend sees `postgres` and `public`. No connection can run as
-`public`, and no stored role can have the name of a built-in role.
+Two role ids are built in and not stored: the superuser, which every
+connection starts as, and `public`, which every role is a member of. Core
+gives them no names; a frontend names them as its users expect. No connection
+can run as `public`.
 
 Other roles are created with `CREATE ROLE` and stored in the
 `__turso_internal_roles` table, which is created together with the first role.
@@ -117,29 +117,29 @@ table, marked dropped, so that its id is never given to another role while a
 connection may still run as the dropped role.
 Creating a role is DDL: it runs in the caller's transaction, is undone by a
 rollback, and bumps the schema cookie so that other connections and other
-processes reload the roles.
+processes reload the roles. Under MVCC that change of the cookie does not
+abort concurrent transactions, as a change of the schema does: their
+statements keep the privileges they were checked against.
 
-Each schema holds a role catalog, an in-memory copy of all roles. It is loaded
+Each schema holds a role catalog, an in-memory copy of the stored roles. It is loaded
 when the database is opened, after MVCC bootstrap, and again whenever the
 schema is reloaded, for example after `VACUUM` or after another process changed
 the schema. Looking up a role never reads the database. A roles table that
-cannot be read fails the open or the reload; a connection never continues with
-only the built-in roles.
+cannot be read fails the open or the reload; a connection never continues
+without its roles.
 
 A connection has a session role and a current role. The host program chooses
-the session role when it opens the connection: the superuser, or a role by
-name. The name of the built-in superuser gives the superuser. A name that does
-not exist fails the connection, and so does the name of `public`. The current role
+the session role when it opens the connection: the superuser, or a stored role
+by name. A name that does not exist fails the connection. The current role
 starts out as the session role, and privilege checks run against the current
 role.
 
-`SET ROLE` changes the current role and `RESET ROLE` sets it back to the
-session role. A superuser session may switch to any role. Any other session may
-only switch to its own session role, because role membership does not exist
-yet. The switch happens when the statement completes, so an interrupted `SET
-ROLE` changes nothing. `SET ROLE` is refused inside a transaction block,
-because rolling back would not restore the previous role. Changing the role
-makes prepared statements prepare again. A query that is already returning rows
+A frontend changes the current role, for example with `SET ROLE`. A superuser
+session may switch to any role. Any other session may only switch to its own
+session role, because role membership does not exist yet. A prepared statement
+records the role it was checked against and is prepared again when it runs as
+another role, so switching to another role and back prepares nothing again.
+A query that is already returning rows
 is not checked again, as in PostgreSQL. The checks that run while a statement
 runs, such as those of `currval()`, use the role that is current at that time,
 and `current_user` returns it.
@@ -178,24 +178,21 @@ object would be created in. The PostgreSQL frontend qualifies the name of a
 catalog table with the catalog before Core resolves it, so the search path
 does not apply to catalog names.
 
-Schemas have no owner and no privileges yet. `CREATE SCHEMA` and `DROP
-SCHEMA` are allowed only for a superuser, creating an object in any schema
-needs a privilege that cannot be granted yet, and every role may resolve names
-in every schema, where PostgreSQL requires the `USAGE` privilege on the
-schema.
+`CREATE SCHEMA` needs `CREATE` on the database and `DROP SCHEMA` the owner of
+the schema. Creating an object in a schema needs `CREATE` on it. Every role
+may resolve names in every schema, where PostgreSQL requires the `USAGE`
+privilege on the schema.
 
 ## Privilege checks
 
 Privileges are checked when a statement is prepared, against the current role
 at that time. A superuser passes every check. Because changing the role makes
 prepared statements prepare again, a statement is always checked against the
-role that is current when it starts. Statements that the engine prepares for
-itself, for example to reload the schema, are checked the same way as
-statements from the client, except the ones that read metadata that only the
-engine sees: sequence descriptors and watermarks, and the table statistics in
-`sqlite_stat1`. They are prepared with the privileges of a superuser and are
-never handed to the client. The change records that change data capture writes
-are the engine's own too, so writing them is not checked.
+role that is current when it starts. Only statements from the client are
+checked. Statements that the engine prepares for itself run SQL that the engine
+wrote, such as the reads of sequence state and table statistics that load the
+schema. The one such statement whose rows reach the client, the PRAGMA that a
+PRAGMA table function runs, is checked when the function is compiled.
 
 A denial is data, not a message: the action that was denied, the object it was
 denied on, and whether the role lacked a privilege or was not the owner. Each
@@ -275,8 +272,6 @@ Roles:
 
 | Statement     | Rule                                                                                        |
 |---------------|---------------------------------------------------------------------------------------------|
-| `SET ROLE`    | Allowed, then checked when it runs: the session role must be a superuser or the role itself |
-| `RESET ROLE`  | Allowed                                                                                     |
 | `CREATE ROLE` | Superuser only                                                                              |
 | `GRANT`       | Allowed, then checked when it is translated: the grantor must own the object or hold the grant option |
 | `REVOKE`      | Allowed, then checked like `GRANT`                                                          |
@@ -379,7 +374,7 @@ separately:
 ## Frontends
 
 Core defines the model but adds no SQL syntax for it: the SQLite parser
-never produces `CREATE ROLE` or `SET ROLE`. Each frontend decides what to
+never produces `CREATE ROLE` or `GRANT`. Each frontend decides what to
 expose, how to name the built-in roles, and how to word a denial.
 
 The SQLite frontend exposes nothing. Every connection it opens runs as the
@@ -388,15 +383,18 @@ deny anything. SQLite databases behave as they did before roles existed.
 
 The Postgres frontend exposes roles the way PostgreSQL does:
 
-- The built-in roles are named `postgres` and `public`. `pg_roles` lists the
-  superuser with OID 10, the OID of the PostgreSQL bootstrap superuser, and
-  stored roles with OIDs from 16385 up. `public` has OID 0, as in PostgreSQL's
-  access control lists, and is not listed. Only the superuser can log in.
+- The built-in superuser is named `postgres`, like the PostgreSQL bootstrap
+  superuser. `pg_roles` lists it with OID 10 and stored roles with OIDs from
+  16385 up. `public` is not a role, only a name for everyone in access control
+  lists, where it has OID 0. Only the superuser can log in.
 - `CREATE ROLE name` is translated to the core statement. Role options,
-  `CREATE USER` and `CREATE GROUP` are rejected as not supported, and names
-  starting with `pg_` are reserved.
-- `SET ROLE name`, `SET ROLE NONE` and `RESET ROLE` are translated to the core
-  statement. `SET LOCAL ROLE` is rejected.
+  `CREATE USER` and `CREATE GROUP` are rejected as not supported, names
+  starting with `pg_` and the name `public` are reserved, and `CREATE ROLE
+  postgres` fails because the superuser exists.
+- `SET ROLE name`, `SET ROLE NONE` and `RESET ROLE` change the `role` setting,
+  which follows transactions and savepoints like every setting: it is undone
+  by a rollback, `SET LOCAL ROLE` lasts until the end of the transaction, and
+  `SHOW role`, `current_setting('role')` and `set_config('role', ...)` work.
 - `current_user`, `current_role` and `user` return the name of the current
   role, and `session_user` the name of the session role. `pg_get_userbyid()`
   and `acldefault()` look roles up by OID.
