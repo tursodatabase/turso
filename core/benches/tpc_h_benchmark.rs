@@ -39,7 +39,9 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, TPC_H_PATH, Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
+    let limbo_conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     let queries = [
         tpc_query!(1),

@@ -12,6 +12,9 @@ pub mod attach;
 use crate::namespace::NamespaceId;
 use crate::pragma::PragmaVirtualTable;
 use crate::schema::{BTreeTable, Schema, Table};
+use crate::security::acl_catalog::{ObjectKey, ACL_TABLE_NAME};
+use crate::security::privilege::{ObjectAccess, ObjectKind};
+use crate::security::roles::ROLES_TABLE_NAME;
 use crate::sync::Arc;
 use crate::vtab::{VirtualTable, VirtualTableType};
 use turso_ext::VTabKind;
@@ -184,7 +187,36 @@ pub fn register_builtin_catalog(
     if enable_custom_types {
         schema.register_internal_vtab(crate::turso_types_vtab::TursoTypesTable::new())?;
     }
+    register_builtin_privileges(schema);
     Ok(())
+}
+
+/// Registers what every role may do with the engine's own objects, which no
+/// `CREATE` statement made and so have no owner's list: the catalog tables
+/// hold the schema and the roles, which every role may read, and a few
+/// functions reach the process or the database file, which only the
+/// superuser may do. Every other built-in function may be executed by every
+/// role, as a function is by default.
+fn register_builtin_privileges(schema: &mut Schema) {
+    let acls = Arc::make_mut(&mut schema.acls);
+    for table in [
+        crate::schema::SCHEMA_TABLE_NAME,
+        crate::schema::TURSO_NAMESPACES_TABLE_NAME,
+        crate::schema::TURSO_TYPES_TABLE_NAME,
+        ROLES_TABLE_NAME,
+        ACL_TABLE_NAME,
+    ] {
+        acls.register_builtin(
+            ObjectKey::root(ObjectKind::Table, table),
+            ObjectAccess::readable_by_everyone(ObjectKind::Table),
+        );
+    }
+    for function in ["load_extension", "sqlite_dbpage", "btree_dump"] {
+        acls.register_builtin(
+            ObjectKey::root(ObjectKind::Function, function),
+            ObjectAccess::superuser_only(),
+        );
+    }
 }
 
 /// Build a `VirtualTable` for each PRAGMA table-valued function.
@@ -603,5 +635,42 @@ pub(crate) fn resolve_builtin_function_name(
         "currval" => Ok(Some(Func::Scalar(ScalarFunc::CurrVal))),
         "setval" => Ok(Some(Func::Scalar(ScalarFunc::SetVal))),
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod builtin_privilege_tests {
+    use super::*;
+    use crate::security::privilege::Privilege;
+    use crate::security::roles::RoleId;
+
+    #[test]
+    fn every_role_may_read_the_catalog_tables_and_only_the_superuser_may_dump_pages() {
+        let schema = Schema::new();
+        let alice = RoleId::from_stored(7).unwrap();
+
+        for table in [
+            crate::schema::SCHEMA_TABLE_NAME,
+            ROLES_TABLE_NAME,
+            ACL_TABLE_NAME,
+        ] {
+            let access = schema
+                .acls
+                .get(&ObjectKey::root(ObjectKind::Table, table))
+                .unwrap();
+            assert!(access.allows(alice, Privilege::Select), "{table}");
+            assert!(!access.allows(alice, Privilege::Insert), "{table}");
+        }
+        for function in ["load_extension", "btree_dump"] {
+            let access = schema
+                .acls
+                .get(&ObjectKey::root(ObjectKind::Function, function))
+                .unwrap();
+            assert!(!access.allows(alice, Privilege::Execute), "{function}");
+        }
+        assert!(schema
+            .acls
+            .get(&ObjectKey::root(ObjectKind::Function, "json_each"))
+            .is_none());
     }
 }

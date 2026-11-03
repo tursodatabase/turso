@@ -609,7 +609,9 @@ fn simulation_integrity_check(env: &SimulatorEnv) -> anyhow::Result<()> {
             .db
             .as_ref()
             .expect("simulation database exists")
-            .connect(turso_core::ConnectOpts::new())?;
+            .connect(turso_core::ConnectOpts::new(
+                turso_core::SessionRole::Superuser,
+            ))?;
         let mut statement = connection.prepare("PRAGMA integrity_check")?;
         statement.run_with_row_callback(|row| {
             result.push(row.get::<String>(0)?);
@@ -653,7 +655,9 @@ mod integrity_tests {
             .db
             .as_ref()
             .unwrap()
-            .connect(turso_core::ConnectOpts::new())?;
+            .connect(turso_core::ConnectOpts::new(
+                turso_core::SessionRole::Superuser,
+            ))?;
         connection.execute("CREATE TABLE checked(id INTEGER PRIMARY KEY)")?;
         connection.execute("INSERT INTO checked VALUES (42)")?;
         env.io.persist_files()?;
@@ -679,7 +683,9 @@ mod integrity_tests {
             .db
             .as_ref()
             .unwrap()
-            .connect(turso_core::ConnectOpts::new())?;
+            .connect(turso_core::ConnectOpts::new(
+                turso_core::SessionRole::Superuser,
+            ))?;
         connection.execute("CREATE TABLE checked(id INTEGER PRIMARY KEY)")?;
         connection.execute("INSERT INTO checked VALUES (42)")?;
         connection.execute("CREATE SEQUENCE checked_seq START 10")?;
@@ -695,7 +701,9 @@ mod integrity_tests {
             path.to_str().unwrap(),
             Arc::new(turso_core::SqliteDialect),
         )?
-        .connect(turso_core::ConnectOpts::new())?;
+        .connect(turso_core::ConnectOpts::new(
+            turso_core::SessionRole::Superuser,
+        ))?;
         let rows = reopened
             .prepare("SELECT id FROM checked")?
             .run_collect_rows()?;

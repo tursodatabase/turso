@@ -21,7 +21,7 @@ fn open_conn(io: Arc<MemorySimIO>, path: &str) -> Result<Arc<Connection>> {
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn = db.connect(ConnectOpts::new())?;
+    let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     Ok(conn)
 }
 
@@ -34,8 +34,8 @@ fn open_two_conns(io: Arc<MemorySimIO>, path: &str) -> Result<(Arc<Connection>, 
         None,
         Arc::new(SqliteDialect),
     )?;
-    let conn1 = db.connect(ConnectOpts::new())?;
-    let conn2 = db.connect(ConnectOpts::new())?;
+    let conn1 = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
+    let conn2 = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
     Ok((conn1, conn2))
 }
 

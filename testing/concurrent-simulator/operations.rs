@@ -491,7 +491,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let connection = database.connect(ConnectOpts::new()).unwrap();
+        let connection = database
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         connection
             .execute("CREATE TABLE fts_docs (id INTEGER PRIMARY KEY, body TEXT)")
             .unwrap();

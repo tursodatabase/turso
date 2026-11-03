@@ -529,6 +529,11 @@ impl ConstraintInfo {
     }
 }
 
+/// The P5 of a [Insn::SetCookie] that changes the schema cookie only to
+/// publish changes to roles and privileges. Under MVCC such a change does
+/// not conflict with concurrent transactions.
+pub const SET_COOKIE_FOR_ROLES: u16 = 1;
+
 // The opcodes the dispatch loop matches directly come first.
 #[repr(u8)]
 #[derive(Description, Debug, Clone, EnumDiscriminants)]
@@ -1916,6 +1921,15 @@ pub enum Insn {
         name: String,
         superuser: bool,
     },
+    /// Replace an object's owner and access control list in the in-memory
+    /// ACL catalog after its row was written
+    SetAcl {
+        db: usize,
+        /// Register holding the rowid of the object's row in the ACL table
+        id_reg: usize,
+        key: crate::security::acl_catalog::ObjectKey,
+        access: crate::security::privilege::ObjectAccess,
+    },
 
     /// Close a cursor.
     Close {
@@ -2042,7 +2056,9 @@ pub enum Insn {
         cookie: Cookie,
     },
     /// Write the value in register P3 into cookie number P2 of database P1.
-    /// If P2 is the SCHEMA_VERSION cookie (cookie number 1) then the internal schema version is set to P3-P5
+    /// If P2 is the SCHEMA_VERSION cookie (cookie number 1) then the internal schema version is set to P3-P5.
+    /// P5 holds [SET_COOKIE_FOR_ROLES] when the schema cookie changes only to
+    /// publish changes to roles and privileges.
     SetCookie {
         db: usize,
         cookie: Cookie,
@@ -2571,6 +2587,7 @@ impl InsnVariants {
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::AddRole => execute::op_add_role,
+            InsnVariants::SetAcl => execute::op_set_acl,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2718,6 +2735,7 @@ impl Insn {
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
             | Self::AddRole { .. }
+            | Self::SetAcl { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

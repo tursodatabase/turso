@@ -173,7 +173,9 @@ fn open_turso() -> TursoDatabase {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     execute_turso(&db, &conn, "PRAGMA fts_merge_threshold = 0");
     execute_turso(
         &db,

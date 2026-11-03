@@ -2190,6 +2190,9 @@ pub struct PrepareContext {
     /// attach/detach, extension registration, etc.) without rebuilding the full
     /// context on every step.
     generation: u64,
+    /// The role whose privileges the statement was checked against. A
+    /// statement runs only as that role, and is prepared again for another.
+    role: crate::security::roles::RoleId,
 }
 
 impl PrepareContext {
@@ -2197,6 +2200,7 @@ impl PrepareContext {
         Self {
             database_ptr: connection.database_ptr(),
             generation: connection.prepare_context_generation(),
+            role: connection.current_role(),
         }
     }
 
@@ -2204,6 +2208,7 @@ impl PrepareContext {
     pub fn matches_connection(&self, connection: &Connection) -> bool {
         self.database_ptr == connection.database_ptr()
             && self.generation == connection.prepare_context_generation()
+            && self.role == connection.current_role()
     }
 }
 
@@ -4521,7 +4526,9 @@ mod tests {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
                 crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
-            let conn = db.connect(ConnectOpts::new()).unwrap();
+            let conn = db
+                .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+                .unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Init);

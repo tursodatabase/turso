@@ -1492,3 +1492,34 @@ test pg-dump-descending-index-keys {
 expect {
     CREATE INDEX idx ON public.indexed USING btree (first DESC, second, third DESC)
 }
+
+test user-table-named-like-a-catalog-table-is-an-ordinary-table {
+    CREATE TABLE public.pg_class (x int);
+    INSERT INTO public.pg_class VALUES (1);
+    UPDATE public.pg_class SET x = 2;
+    SELECT x FROM public.pg_class;
+    SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename = 'pg_class';
+    SELECT count(*) FROM pg_class
+    WHERE relname = 'pg_class'
+      AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public');
+    DELETE FROM public.pg_class;
+    SELECT count(*) FROM public.pg_class;
+}
+expect {
+    2
+    1
+    1
+    0
+}
+
+test user-table-with-a-system-prefix-is-listed-in-the-catalog {
+    CREATE TABLE json_documents (x int);
+    CREATE TABLE pg_backup_log (x int);
+    SELECT tablename FROM pg_tables
+    WHERE tablename IN ('json_documents', 'pg_backup_log')
+    ORDER BY tablename;
+}
+expect {
+    json_documents
+    pg_backup_log
+}

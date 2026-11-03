@@ -60,7 +60,9 @@ fn seed_db(mode: Mode) -> Fixture {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     if matches!(mode, Mode::Mvcc) {
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();

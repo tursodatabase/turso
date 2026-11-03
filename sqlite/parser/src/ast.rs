@@ -207,6 +207,8 @@ pub enum Stmt {
         /// role name
         role_name: String,
     },
+    /// `GRANT` or `REVOKE`
+    Grant(GrantStmt),
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`
@@ -1403,6 +1405,52 @@ impl Name {
     pub const fn quoted(&self) -> bool {
         self.quote.is_some()
     }
+}
+
+/// `GRANT` and `REVOKE`
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GrantStmt {
+    /// `GRANT`, or `REVOKE` when false
+    pub is_grant: bool,
+    /// privilege names, or `ALL` when empty
+    pub privileges: Vec<String>,
+    /// the objects the privileges are on
+    pub objects: Vec<GrantObject>,
+    /// the roles that receive or lose the privileges
+    pub grantees: Vec<Grantee>,
+    /// `WITH GRANT OPTION` on `GRANT`, `GRANT OPTION FOR` on `REVOKE`
+    pub grant_option: bool,
+}
+
+/// An object named in `GRANT` or `REVOKE`
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum GrantObject {
+    /// `ON TABLE`, also a view
+    Table(QualifiedName),
+    /// `ON SEQUENCE`
+    Sequence(QualifiedName),
+    /// `ON FUNCTION`
+    Function(Name),
+    /// `ON SCHEMA`
+    Schema(Name),
+    /// `ON DATABASE`
+    Database,
+    /// `ON TYPE`
+    Type(Name),
+    /// `ON PARAMETER`
+    Setting(Name),
+}
+
+/// A role in `GRANT ... TO` or `REVOKE ... FROM`
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Grantee {
+    /// a role by name
+    Role(String),
+    /// `PUBLIC`, every role
+    Public,
 }
 
 /// Qualified name

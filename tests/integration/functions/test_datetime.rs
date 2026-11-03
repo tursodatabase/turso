@@ -65,7 +65,9 @@ fn current_time_comes_from_the_io_clock() {
         secs_added_per_read: 0,
     });
     let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     let rows: Vec<(String, String, String, String, f64, String)> = conn.exec_rows(
         "SELECT date('now'), time(), datetime('now'), strftime('%s', 'now'), \
@@ -118,7 +120,9 @@ fn current_time_does_not_change_within_one_step() {
         secs_added_per_read: 1,
     });
     let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     let rows: Vec<(i64, i64, String, String)> = conn.exec_rows(
         "SELECT unixepoch(), unixepoch('now'), datetime(), \

@@ -751,7 +751,9 @@ mod tests {
             .unwrap();
         assert_eq!(name, "external_metadata");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let mut stmt = conn
             .prepare("SELECT key, value FROM external_metadata")
             .unwrap();
@@ -795,7 +797,9 @@ mod tests {
             .unwrap();
         assert_eq!(name, "External_ΔΥΣ");
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let mut stmt = conn.prepare("SELECT key, value FROM external_ΔΥΣ").unwrap();
         let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows.len(), 2);

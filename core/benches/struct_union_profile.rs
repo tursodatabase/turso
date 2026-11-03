@@ -23,7 +23,9 @@ fn setup_db() -> (Arc<Database>, Arc<turso_core::Connection>) {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     (db, conn)
 }
 

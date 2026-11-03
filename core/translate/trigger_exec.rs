@@ -584,9 +584,11 @@ fn execute_trigger_commands(
     // `resolver` as a parameter rather than capturing the outer binding -
     // see `Resolver::with_database_scope_mut`.
     subprogram_builder.prologue();
+    let mut write_privileges = Vec::new();
     resolver.with_trigger_scope(trigger_namespace, trigger.name.clone(), |resolver| {
         for command in trigger.commands.iter() {
             let stmt = trigger_cmd_to_stmt_for_subprogram(command, &subprogram_ctx)?;
+            write_privileges.push(crate::translate::roles::write_privilege(&stmt));
             translate_inner(
                 stmt,
                 resolver,
@@ -606,6 +608,15 @@ fn execute_trigger_commands(
         Ok(())
     })?;
     subprogram_builder.epilogue(resolver.schema());
+    // The trigger's commands share one subprogram, so a table the
+    // subprogram writes needs the privilege of every writing command.
+    for write_privilege in write_privileges {
+        program.record_subprogram_denial(crate::translate::roles::storage_denial(
+            &subprogram_builder,
+            resolver,
+            write_privilege,
+        ));
+    }
     let built_subprogram =
         subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
     let subprogram_prepared = built_subprogram.prepared();

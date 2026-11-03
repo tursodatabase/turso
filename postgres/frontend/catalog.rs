@@ -8,6 +8,8 @@ use turso_core::{
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
+    security::acl_catalog::ObjectKey,
+    security::privilege::{ObjectAccess, ObjectKind, Privilege, Privileges},
     security::roles::{Role, RoleCatalog, RoleId},
     walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
     Result, Statement, Value, WalkControl,
@@ -170,7 +172,9 @@ impl Dialect for PostgresDialect {
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
+        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)?;
+        register_catalog_privileges(schema);
+        Ok(())
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -264,8 +268,12 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(NamespaceId, &str, &Arc<Table>)> 
         let mut namespace_tables: Vec<_> = schema
             .tables(namespace)
             .map(|table| (namespace, table.get_name(), table))
-            .filter(|(_, name, table)| {
-                !is_system_table_name(name) && matches!(table.as_ref(), Table::BTree(_))
+            // The catalog's own tables and the engine's internal tables are in
+            // the root namespace; a table in a user schema is the user's,
+            // whatever it is named.
+            .filter(|(namespace, name, table)| {
+                !(namespace.is_root() && is_system_table_name(name))
+                    && matches!(table.as_ref(), Table::BTree(_))
             })
             .collect();
         namespace_tables.sort_by_key(|(_, name, _)| *name);
@@ -446,6 +454,10 @@ impl SnapshotRows for PgClassTable {
             let relnatts = btree.columns().len() as i64;
             let relhasindex = i64::from(indexes.iter().any(|index| index.table_oid == table_oid));
             let relchecks = btree.check_constraints.len() as i64;
+            let owner = owner_of(
+                &schema,
+                &ObjectKey::new(ObjectKind::Table, *namespace, table.get_name()),
+            );
 
             rows.push(vec![
                 Value::from_i64(table_oid),                          // oid
@@ -453,7 +465,7 @@ impl SnapshotRows for PgClassTable {
                 Value::from_i64(namespace_oid(&schema, *namespace)), // relnamespace
                 Value::from_i64(0),                                  // reltype
                 Value::from_i64(0),                                  // reloftype
-                Value::from_i64(10),                                 // relowner
+                Value::from_i64(role_oid(owner)),                    // relowner
                 Value::from_i64(2),                                  // relam (heap)
                 Value::from_i64(0),                                  // relfilenode
                 Value::from_i64(0),                                  // reltablespace
@@ -821,6 +833,85 @@ pub(crate) fn postgres_roles(roles: &RoleCatalog) -> impl Iterator<Item = Role> 
         superuser: true,
     };
     std::iter::once(superuser).chain(roles.iter().cloned())
+}
+
+/// The role that owns the object `key`: the owner in its access control
+/// list, or the superuser for an object without one.
+fn owner_of(schema: &Schema, key: &ObjectKey) -> RoleId {
+    schema
+        .acls
+        .get(key)
+        .map_or(RoleId::SUPERUSER, |access| access.owner)
+}
+
+/// The name of the role that owns the object `key`. A role that is gone
+/// from the catalog is shown by its OID, as `pg_get_userbyid()` would.
+fn owner_name(conn: &Connection, schema: &Schema, key: &ObjectKey) -> String {
+    let owner = owner_of(schema, key);
+    postgres_roles(&conn.role_catalog())
+        .find(|role| role.id == owner)
+        .map_or_else(
+            || format!("unknown (OID={})", role_oid(owner)),
+            |role| role.name,
+        )
+}
+
+/// The catalog tables of `register_catalog_modules`. The other modules there
+/// are functions, which every role may execute by default.
+const CATALOG_TABLES: &[&str] = &[
+    "pg_class",
+    "pg_namespace",
+    "pg_attribute",
+    "pg_roles",
+    "pg_am",
+    "pg_proc",
+    "pg_database",
+    "pg_tables",
+    "pg_indexes",
+    "pg_information_schema_schemata",
+    "pg_index",
+    "pg_constraint",
+    "pg_type",
+    "pg_attrdef",
+    "pg_sequence",
+    "pg_sequences",
+    "pg_settings",
+    "pg_extension",
+    "pg_policy",
+    "pg_trigger",
+    "pg_statistic_ext",
+    "pg_inherits",
+    "pg_rewrite",
+    "pg_foreign_table",
+    "pg_partitioned_table",
+    "pg_collation",
+    "pg_description",
+    "pg_seclabels",
+    "pg_publication",
+    "pg_publication_namespace",
+    "pg_publication_rel",
+    "pg_depend",
+    "pg_tablespace",
+    "pg_init_privs",
+    "pg_cast",
+    "pg_transform",
+];
+
+/// Registers what every role may do with the catalog, as PostgreSQL does
+/// when it creates a database: read every catalog table, and use the
+/// `public` schema.
+fn register_catalog_privileges(schema: &mut Schema) {
+    let acls = Arc::make_mut(&mut schema.acls);
+    for table in CATALOG_TABLES {
+        acls.register_builtin(
+            ObjectKey::root(ObjectKind::Table, *table),
+            ObjectAccess::readable_by_everyone(ObjectKind::Table),
+        );
+    }
+    acls.register_builtin(
+        ObjectKey::root(ObjectKind::Schema, "public"),
+        ObjectAccess::builtin_with_public(ObjectKind::Schema, Privileges::of(Privilege::Usage)),
+    );
 }
 
 /// Virtual table implementation for pg_catalog.pg_roles.
@@ -1228,10 +1319,15 @@ impl SnapshotRows for PgTablesTable {
 
         for (namespace, _, table) in tables {
             let btree = table.btree().expect("user tables are B-trees");
+            let owner = owner_name(
+                conn,
+                &schema,
+                &ObjectKey::new(ObjectKind::Table, namespace, table.get_name()),
+            );
             rows.push(vec![
                 Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
                 Value::Text(btree.declared_name.clone().into()),                   // tablename
-                Value::build_text(BOOTSTRAP_SUPERUSER_NAME),                       // tableowner
+                Value::Text(owner.into()),                                         // tableowner
                 Value::Null,                                                       // tablespace
                 Value::from_i64(0),                                                // hasindexes
                 Value::from_i64(0),                                                // hasrules
@@ -2292,24 +2388,38 @@ impl SnapshotRows for PgSequencesTable {
                 let seq_name = seq.name.clone();
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
-                let last_val = conn
-                    .get_sequence_currval(
-                        turso_core::MAIN_DB_ID,
-                        &mangle_name(namespace, &seq_name),
+                let may_read = conn.current_role_may(
+                    turso_core::MAIN_DB_ID,
+                    &ObjectKey::new(ObjectKind::Sequence, namespace, seq_name.as_str()),
+                    Privileges::from_iter([Privilege::Usage, Privilege::Select]),
+                );
+                let last_value = if may_read {
+                    Value::from_i64(
+                        conn.get_sequence_currval(
+                            turso_core::MAIN_DB_ID,
+                            &mangle_name(namespace, &seq_name),
+                        )
+                        .unwrap_or(seq.start_value),
                     )
-                    .unwrap_or(seq.start_value);
+                } else {
+                    Value::Null
+                };
                 rows.push(vec![
                     Value::build_text(schema_name_of(&schema, namespace).to_string()), // schemaname
-                    Value::build_text(seq_name), // sequencename
-                    Value::build_text(BOOTSTRAP_SUPERUSER_NAME), // sequenceowner
-                    Value::build_text("bigint"), // data_type
-                    Value::from_i64(seq.start_value), // start_value
-                    Value::from_i64(seq.min_value), // min_value
-                    Value::from_i64(seq.max_value), // max_value
-                    Value::from_i64(seq.increment_by), // increment_by
+                    Value::build_text(seq_name.clone()), // sequencename
+                    Value::build_text(owner_name(
+                        conn,
+                        &schema,
+                        &ObjectKey::new(ObjectKind::Sequence, namespace, seq_name.as_str()),
+                    )), // sequenceowner
+                    Value::build_text("bigint"),         // data_type
+                    Value::from_i64(seq.start_value),    // start_value
+                    Value::from_i64(seq.min_value),      // min_value
+                    Value::from_i64(seq.max_value),      // max_value
+                    Value::from_i64(seq.increment_by),   // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
-                    Value::from_i64(1),          // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val),   // last_value
+                    Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
+                    last_value,         // last_value
                 ]);
             }
         }
@@ -4071,9 +4181,31 @@ mod tests {
     /// Connects like the frontend does: with the `public` schema in place
     /// and on the search path.
     fn connect_with_public(db: &Arc<Database>) -> Arc<Connection> {
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
         conn.set_search_path(Some(vec!["public".to_string()]));
         conn
+    }
+
+    #[test]
+    fn every_role_may_read_the_catalog_tables_and_use_the_public_schema() {
+        let schema = Schema::with_options(true, &PostgresDialect).unwrap();
+        let alice = RoleId::from_stored(7).unwrap();
+
+        for table in CATALOG_TABLES {
+            let access = schema
+                .acls
+                .get(&ObjectKey::root(ObjectKind::Table, *table))
+                .unwrap();
+            assert!(access.allows(alice, Privilege::Select), "{table}");
+        }
+        let public = schema
+            .acls
+            .get(&ObjectKey::root(ObjectKind::Schema, "public"))
+            .unwrap();
+        assert!(public.allows(alice, Privilege::Usage));
+        assert!(!public.allows(alice, Privilege::Create));
     }
 
     #[test]
@@ -4708,7 +4840,9 @@ mod tests {
             Arc::new(turso_core::SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+            .unwrap();
 
         // Try to query pg_class - should fail
         let result = conn.prepare("SELECT * FROM pg_class");

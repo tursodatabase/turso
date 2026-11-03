@@ -64,7 +64,7 @@ RESET ROLE
 
 **Description:**
 
-`SET ROLE` makes `role_name` the current role of the session. Statements are
+`SET ROLE` makes `role_name` the current role of the session. Privileges are
 then checked against that role. `current_user` and `current_role` return it,
 and `session_user` keeps returning the role that the session logged in as.
 
@@ -86,10 +86,13 @@ keeps the role, and `DISCARD ALL` resets it.
 
 **Notes:**
 
-Ownership, `GRANT` and table privileges are not supported yet. A role that is
-not a superuser may read the rows of every table, but it cannot insert,
-update, delete or truncate rows, call `nextval` or `setval`, create, alter or
-drop objects, create roles, or `COPY FROM` a file.
+A role that is not a superuser holds only the privileges granted to it or to
+`PUBLIC` with `GRANT`. By default it can run statements that use no database
+objects, such as `SELECT 1`, read the `pg_catalog` tables, execute functions,
+change settings with `SET` and show them with `SHOW`, and switch roles. A role
+owns the objects it creates and may read, change, alter, drop and grant them;
+creating an object needs `CREATE` on its schema.
+
 
 **Examples:**
 
@@ -110,11 +113,11 @@ SELECT current_user, session_user;
 ```
 
 ```sql
-DROP TABLE accounts;
+SELECT * FROM accounts;
 ```
 
 ```
-ERROR:  must be owner of table accounts
+ERROR:  permission denied for table accounts
 ```
 
 ```sql
@@ -127,4 +130,66 @@ SELECT current_user;
 --------------
  postgres
 (1 row)
+```
+
+### `GRANT` — give privileges on an object
+
+**Synopsis:**
+
+```sql
+GRANT { privilege [, ...] | ALL [ PRIVILEGES ] }
+    ON { [ TABLE ] name [, ...] | SEQUENCE name [, ...] | FUNCTION name [, ...]
+         | SCHEMA name [, ...] | DATABASE name | TYPE name [, ...] | PARAMETER name [, ...] }
+    TO { role_name | PUBLIC } [, ...] [ WITH GRANT OPTION ]
+
+REVOKE [ GRANT OPTION FOR ] { privilege [, ...] | ALL [ PRIVILEGES ] }
+    ON { same as GRANT }
+    FROM { role_name | PUBLIC } [, ...]
+```
+
+**Description:**
+
+`GRANT` gives privileges on an object to roles, and `REVOKE` takes them back.
+The grantor is the current role, which must own the object or hold the grant
+option for every privilege named. A superuser grants as the object's owner.
+`PUBLIC` stands for every role.
+
+The privileges an object can have depend on its kind: `SELECT`, `INSERT`,
+`UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES` and `TRIGGER` on a table or
+view; `USAGE`, `SELECT` and `UPDATE` on a sequence; `EXECUTE` on a function;
+`USAGE` and `CREATE` on a schema; `CREATE` and `TEMPORARY` on the database;
+`USAGE` on a type; `SET` on a parameter.
+
+**Notes:**
+
+Column privileges, `ALL TABLES IN SCHEMA`, `GRANTED BY` and default
+privileges are not supported. `GRANT` of a role to another role is not
+supported.
+
+Every role may execute every function and read every `pg_catalog` table by
+default. `REVOKE EXECUTE ON FUNCTION name FROM PUBLIC` and `REVOKE SELECT ON
+pg_class FROM PUBLIC` take that away.
+
+**Examples:**
+
+```sql
+CREATE TABLE accounts (id int);
+CREATE ROLE jonathan;
+GRANT SELECT ON accounts TO jonathan;
+SET ROLE jonathan;
+SELECT * FROM accounts;
+```
+
+```
+ id
+----
+(0 rows)
+```
+
+```sql
+INSERT INTO accounts VALUES (1);
+```
+
+```
+ERROR:  permission denied for table accounts
 ```

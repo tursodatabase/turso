@@ -13,7 +13,9 @@ use crate::settings::{
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::schema::Table;
+use turso_core::security::acl_catalog::ObjectKey;
 use turso_core::security::permission::{Action, Object, PermissionDenied};
+use turso_core::security::privilege::{ObjectKind, Privilege, Privileges};
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
@@ -122,14 +124,19 @@ fn refuse_a_file_with_tables_in_no_schema(
     if db.mvcc_enabled() {
         return Ok(());
     }
-    let conn = db.connect(turso_core::ConnectOpts::new())?;
+    let conn = db.connect(turso_core::ConnectOpts::new(
+        turso_core::SessionRole::Superuser,
+    ))?;
     refuse_tables_in_no_schema(&conn)?;
     Ok(())
 }
 
 impl PgConnection {
     pub fn connect(db: &Arc<turso_core::Database>) -> crate::Result<Self> {
-        Self::connect_with(db, turso_core::ConnectOpts::new())
+        Self::connect_with(
+            db,
+            turso_core::ConnectOpts::new(turso_core::SessionRole::Superuser),
+        )
     }
 
     /// Opens a session on `db`, connecting with `opts`, such as the
@@ -1552,19 +1559,25 @@ pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<
     schemas
 }
 
+/// The translator puts a catalog table's name in `main`, the database that
+/// holds the catalog, so a table of the same name in a user schema, such as
+/// `public.pg_class`, is an ordinary table.
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
-    let table_name = match stmt {
-        ast::Stmt::Insert { tbl_name, .. } => Some(tbl_name.name.as_str()),
-        ast::Stmt::Delete { tbl_name, .. } => Some(tbl_name.name.as_str()),
-        ast::Stmt::Update(update) => Some(update.tbl_name.name.as_str()),
+    let table = match stmt {
+        ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => Some(tbl_name),
+        ast::Stmt::Update(update) => Some(&update.tbl_name),
         _ => None,
     };
 
-    let Some(table_name) = table_name else {
+    let Some(table) = table else {
         return Ok(());
     };
-
-    if !catalog::is_catalog_table_name(table_name) {
+    let table_name = table.name.as_str();
+    let in_catalog = table
+        .namespace
+        .as_ref()
+        .is_none_or(|namespace| namespace.as_str() == "main");
+    if !in_catalog || !catalog::is_catalog_table_name(table_name) {
         return Ok(());
     }
 
@@ -1690,12 +1703,27 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         | FrontendStmt::ResetAll
         | FrontendStmt::DiscardAll
         | FrontendStmt::CopyTo(_) => return Ok(()),
-        FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
-            Action::Create,
-            Object::Database(catalog::db_name_from_path(conn.db_file_path())),
-        ),
+        FrontendStmt::CreateSchema(_) => {
+            let database = ObjectKey::root(ObjectKind::Database, "main");
+            if conn.current_role_may(
+                turso_core::MAIN_DB_ID,
+                &database,
+                Privileges::of(Privilege::Create),
+            ) {
+                return Ok(());
+            }
+            PermissionDenied::privilege(
+                Action::Create,
+                Object::Database(catalog::db_name_from_path(conn.db_file_path())),
+            )
+        }
         FrontendStmt::DropSchema(stmt) => {
-            PermissionDenied::owner(Action::Drop, Object::Schema(stmt.name.to_lowercase()))
+            let schema_name = stmt.name.to_lowercase();
+            let schema = ObjectKey::root(ObjectKind::Schema, schema_name.as_str());
+            if conn.current_role_owns(turso_core::MAIN_DB_ID, &schema) {
+                return Ok(());
+            }
+            PermissionDenied::owner(Action::Drop, Object::Schema(schema_name))
         }
         FrontendStmt::CopyFrom(stmt) => {
             PermissionDenied::privilege(Action::Read, Object::File(stmt.filename.clone()))
@@ -2415,10 +2443,12 @@ mod tests {
             OpenOptions::new(Arc::new(PostgresDialect)),
         )
         .unwrap();
-        db.connect(turso_core::ConnectOpts::new())
-            .unwrap()
-            .execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
-            .unwrap();
+        db.connect(turso_core::ConnectOpts::new(
+            turso_core::SessionRole::Superuser,
+        ))
+        .unwrap()
+        .execute("CREATE TABLE users (id INTEGER PRIMARY KEY)")
+        .unwrap();
         let error = match PgConnection::connect(&db) {
             Ok(_) => panic!("expected the database to be refused"),
             Err(error) => error.to_string(),

@@ -985,6 +985,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     header: RwLock<DatabaseHeader>,
     /// True when the transaction mutated its local database header snapshot.
     header_dirty: AtomicBool,
+    /// True when the transaction changed its header for anything but
+    /// publishing changes to roles and privileges.
+    header_changed_beyond_roles: AtomicBool,
     /// Stack of savepoints for statement-level rollback.
     /// Each savepoint tracks versions created/deleted during that statement.
     savepoint_stack: RwLock<Vec<Savepoint>>,
@@ -1045,6 +1048,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             write_set: Mutex::new(WriteSet::new()),
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
+            header_changed_beyond_roles: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
             pager_commit_lock_held: AtomicBool::new(false),
             log_appended: AtomicBool::new(false),
@@ -3161,7 +3165,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                     let header_dirty = tx.header_dirty.load(Ordering::Acquire);
                     turso_assert!(!header_dirty || mvcc_store.is_exclusive_tx(&tx.tx_id), "header_dirty=true implies that tx is exclusive");
-                    if our_cookie != global_cookie && !header_dirty {
+                    if our_cookie != global_cookie
+                        && !header_dirty
+                        && !mvcc_store.cookie_changed_only_for_roles(our_cookie, global_cookie)
+                    {
                         tracing::debug!("cookie mismatch in CommitState::Initial tx({our_cookie}) != global(!{global_cookie})");
                         schema_conflict = true;
                     }
@@ -3618,8 +3625,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 let prev_hdr_ts = mvcc_store
                     .last_global_header_ts
                     .fetch_max(*end_ts, Ordering::AcqRel);
-                if prev_hdr_ts <= *end_ts {
-                    self.header.write().replace(tx_header);
+                // A transaction that did not change its header holds the
+                // header it began with, which may be older than the global
+                // one, so it publishes nothing.
+                let header_dirty = tx_unlocked.header_dirty.load(Ordering::Acquire);
+                if prev_hdr_ts <= *end_ts && header_dirty {
+                    let mut global_header = self.header.write();
+                    mvcc_store.record_role_cookie_change(&global_header, &tx_header, tx_unlocked);
+                    global_header.replace(tx_header);
                 }
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
@@ -3686,11 +3699,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     let last_committed_ts = mvcc_store
                         .last_committed_tx_ts
                         .fetch_max(*end_ts, Ordering::AcqRel);
-                    if last_committed_ts <= *end_ts {
+                    let header_dirty = tx_unlocked.header_dirty.load(Ordering::Acquire);
+                    if last_committed_ts <= *end_ts && header_dirty {
+                        mvcc_store.record_role_cookie_change(
+                            &global_header,
+                            &tx_header,
+                            tx_unlocked,
+                        );
                         global_header.replace(tx_header);
                     }
                 }
-                if self.did_commit_schema_change {
+                let changed_only_roles = tx_unlocked.header_dirty.load(Ordering::Acquire)
+                    && !tx_unlocked
+                        .header_changed_beyond_roles
+                        .load(Ordering::Acquire);
+                if self.did_commit_schema_change && !changed_only_roles {
                     mvcc_store
                         .last_committed_schema_change_ts
                         .fetch_max(*end_ts, Ordering::AcqRel);
@@ -4483,6 +4506,11 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// The timestamp of the last committed schema change.
     /// Schema changes always cause a [SchemaUpdated] error.
     last_committed_schema_change_ts: AtomicU64,
+    /// The schema cookies that committed transactions set only to publish
+    /// changes to roles and privileges, each with the cookie it replaced.
+    /// Such a change does not conflict with concurrent transactions, whose
+    /// statements were checked against the roles when they were prepared.
+    role_cookie_changes: Mutex<HashMap<u32, u32>>,
     /// The timestamp of the last committed transaction.
     /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
@@ -4674,6 +4702,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             checkpoint_full_scan_min_snapshot_ts: AtomicU64::new(0),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
+            role_cookie_changes: Mutex::new(HashMap::default()),
             last_committed_tx_ts: AtomicU64::new(0),
             last_global_header_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
@@ -7067,6 +7096,61 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    /// Like [Self::with_header_mut] in transaction `tx_id`, for a change of
+    /// the schema cookie that only publishes changes to roles and privileges.
+    pub fn with_header_mut_for_roles<T, F>(&self, f: F, tx_id: &TxID) -> Result<T>
+    where
+        F: Fn(&mut DatabaseHeader) -> T,
+    {
+        let tx = self
+            .txs
+            .get(tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let out = f(&mut tx.value().header.write());
+        tx.value().header_dirty.store(true, Ordering::Release);
+        Ok(out)
+    }
+
+    /// Records the schema cookie of `tx_header`, which is about to replace
+    /// `global_header`, if `tx` changed the cookie only to publish changes to
+    /// roles and privileges.
+    fn record_role_cookie_change(
+        &self,
+        global_header: &Option<DatabaseHeader>,
+        tx_header: &DatabaseHeader,
+        tx: &Transaction<A>,
+    ) {
+        let Some(previous_cookie) = global_header
+            .as_ref()
+            .map(|header| header.schema_cookie.get())
+        else {
+            return;
+        };
+        let cookie = tx_header.schema_cookie.get();
+        if cookie != previous_cookie && !tx.header_changed_beyond_roles.load(Ordering::Acquire) {
+            self.role_cookie_changes
+                .lock()
+                .insert(cookie, previous_cookie);
+        }
+    }
+
+    /// Whether every change of the schema cookie from `ours` to `current` was
+    /// made only to publish changes to roles and privileges.
+    fn cookie_changed_only_for_roles(&self, ours: u32, current: u32) -> bool {
+        let changes = self.role_cookie_changes.lock();
+        let mut cookie = current;
+        for _ in 0..=changes.len() {
+            if cookie == ours {
+                return true;
+            }
+            match changes.get(&cookie) {
+                Some(previous) => cookie = *previous,
+                None => return false,
+            }
+        }
+        false
+    }
+
     pub fn with_header_mut<T, F>(&self, f: F, tx_id: Option<&TxID>) -> Result<T>
     where
         F: Fn(&mut DatabaseHeader) -> T,
@@ -7083,6 +7167,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // Commit path consults this flag to decide whether a header-only logical-log record
             // is required even when write_set stays empty.
             tx.value().header_dirty.store(true, Ordering::Release);
+            tx.value()
+                .header_changed_beyond_roles
+                .store(true, Ordering::Release);
             Ok(out)
         } else {
             let mut header = self.global_header.write();

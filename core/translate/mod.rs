@@ -159,15 +159,13 @@ pub fn translate(
     })?;
 
     let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
-    if check_privileges
-        && !resolver
-            .schema()
-            .roles
-            .is_superuser(connection.current_role())
-    {
-        resolver.role_is_not_superuser = true;
-        roles::check_statement_privileges(&stmt)?;
+    let role = connection.current_role();
+    if check_privileges && !resolver.schema().roles.is_superuser(role) {
+        resolver.checked_role = Some(role);
+        roles::check_statement_privileges(&stmt, &resolver)?;
     }
+    let write_privilege = roles::write_privilege(&stmt);
+    let ownership = roles::ownership_of_created_object(&stmt, &resolver)?;
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -181,10 +179,15 @@ pub fn translate(
                 &mut program,
             )?;
         }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        stmt => {
+            translate_inner(stmt, &mut resolver, &mut program, &connection, input)?;
+            roles::emit_ownership(&resolver, &mut program, ownership)?;
+        }
     };
 
     program.epilogue(schema);
+
+    roles::check_storage_access(&program, &resolver, write_privilege)?;
 
     program.build(connection, change_cnt_on, input)
 }
@@ -231,6 +234,7 @@ fn translate_statement(
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
             | ast::Stmt::CreateRole { .. }
+            | ast::Stmt::Grant(_)
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -425,6 +429,7 @@ fn translate_statement(
         ast::Stmt::CreateRole { role_name } => {
             roles::translate_create_role(&role_name, resolver, program)?
         }
+        ast::Stmt::Grant(grant) => roles::translate_grant(&grant, resolver, program, connection)?,
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -631,6 +636,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",
         ast::Stmt::CreateRole { .. } => "create_role",
+        ast::Stmt::Grant(grant) if grant.is_grant => "grant",
+        ast::Stmt::Grant(_) => "revoke",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
         ast::Stmt::DropIndex { .. } => "drop_index",
@@ -674,26 +681,42 @@ mod tests {
             ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 0, 0));
         program.push_cte_being_defined("caller".into());
 
-        let result = program.with_view_expansion(0, "v", |program| {
-            assert!(!program.is_cte_being_defined("caller"));
-            program.push_cte_being_defined("outer_view".into());
+        let result = program.with_view_expansion(
+            crate::namespace::NamespaceRef::root_of(0),
+            "v",
+            |program| {
+                assert!(!program.is_cte_being_defined("caller"));
+                program.push_cte_being_defined("outer_view".into());
 
-            // The same view name in another schema is not a circular reference.
-            program.with_view_expansion(1, "v", |program| {
-                assert!(!program.is_cte_being_defined("outer_view"));
-                Ok(())
-            })?;
-            assert!(program.is_cte_being_defined("outer_view"));
+                // The same view name in another schema is not a circular reference.
+                program.with_view_expansion(
+                    crate::namespace::NamespaceRef::root_of(1),
+                    "v",
+                    |program| {
+                        assert!(!program.is_cte_being_defined("outer_view"));
+                        Ok(())
+                    },
+                )?;
+                assert!(program.is_cte_being_defined("outer_view"));
 
-            // An indirect circular reference must unwind both expansion scopes.
-            program.with_view_expansion(0, "nested", |program| {
-                program.with_view_expansion(0, "v", |_| -> crate::Result<()> {
-                    panic!("a circular view must not be expanded")
-                })?;
+                // An indirect circular reference must unwind both expansion scopes.
+                program.with_view_expansion(
+                    crate::namespace::NamespaceRef::root_of(0),
+                    "nested",
+                    |program| {
+                        program.with_view_expansion(
+                            crate::namespace::NamespaceRef::root_of(0),
+                            "v",
+                            |_| -> crate::Result<()> {
+                                panic!("a circular view must not be expanded")
+                            },
+                        )?;
+                        Ok(())
+                    },
+                )?;
                 Ok(())
-            })?;
-            Ok(())
-        });
+            },
+        );
         assert!(
             matches!(result, Err(crate::LimboError::ParseError(ref message))
             if message == "view v is circularly defined")
@@ -703,8 +726,12 @@ mod tests {
 
         // Both names can be expanded again after the failed expansion.
         program
-            .with_view_expansion(0, "v", |program| {
-                program.with_view_expansion(0, "nested", |_| Ok(()))
+            .with_view_expansion(crate::namespace::NamespaceRef::root_of(0), "v", |program| {
+                program.with_view_expansion(
+                    crate::namespace::NamespaceRef::root_of(0),
+                    "nested",
+                    |_| Ok(()),
+                )
             })
             .unwrap();
         assert!(program.is_cte_being_defined("caller"));
@@ -715,7 +742,9 @@ mod tests {
     fn test_regexp_no_function_registered() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let schema = db.schema.lock().clone();
         let pager = conn.pager.load().clone();
 
@@ -749,7 +778,9 @@ mod tests {
     fn nth_value_reads_from_saved_rows_without_an_accumulator() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE items(value)").unwrap();
 
         let statement = conn
@@ -784,7 +815,9 @@ mod tests {
     fn delete_without_where_clears_table_and_index_btrees() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
             .unwrap();
         conn.execute("CREATE UNIQUE INDEX items_name ON items(name)")
@@ -866,7 +899,9 @@ mod tests {
     fn delete_keeps_row_loop_when_rows_need_individual_processing() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
 
@@ -921,7 +956,9 @@ mod tests {
     fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
@@ -975,7 +1012,9 @@ mod tests {
     fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
 
@@ -1018,7 +1057,9 @@ mod tests {
     fn test_trigger_compile_error_does_not_poison_future_insert_compilation() {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("CREATE TABLE ref(x);").unwrap();
         conn.execute("CREATE TABLE t(a INTEGER);").unwrap();

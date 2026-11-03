@@ -37,10 +37,14 @@ fn bench_graph_queries(criterion: &mut Criterion) {
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io.clone(), DB_PATH, Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn = db.connect(ConnectOpts::new()).unwrap();
+    let limbo_conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     let db_analyzed = Database::open_file(io, DB_PATH_ANALYZED, Arc::new(SqliteDialect)).unwrap();
-    let limbo_conn_analyzed = db_analyzed.connect(ConnectOpts::new()).unwrap();
+    let limbo_conn_analyzed = db_analyzed
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
 
     let queries = [
         gq_query!("a_cooccurrence"),

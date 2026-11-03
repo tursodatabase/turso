@@ -1195,7 +1195,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE aggregate_base(x)").unwrap();
         conn.execute(
             "CREATE MATERIALIZED VIEW aggregate_view AS SELECT SUM(x) AS total FROM aggregate_base",
@@ -1239,7 +1241,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE overflow_base(id INTEGER PRIMARY KEY, payload BLOB)")
             .unwrap();
         for id in 1..260 {

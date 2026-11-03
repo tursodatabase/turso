@@ -178,9 +178,10 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
-    /// The statement is compiled for a role that is not a superuser, which may
-    /// not use a sequence or a PRAGMA anywhere, including inside a view.
-    pub(crate) role_is_not_superuser: bool,
+    /// The role whose privileges the statement is checked against, or `None`
+    /// when it is not checked: the role is a superuser, or the engine
+    /// prepared the statement.
+    pub(crate) checked_role: Option<crate::security::roles::RoleId>,
 }
 
 /// The column a register stands for in [Resolver::register_columns].
@@ -391,7 +392,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
-            role_is_not_superuser: false,
+            checked_role: None,
         }
     }
 
@@ -426,7 +427,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
-            role_is_not_superuser: self.role_is_not_superuser,
+            checked_role: self.checked_role,
         }
     }
 
@@ -443,7 +444,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
-            role_is_not_superuser: self.role_is_not_superuser,
+            checked_role: self.checked_role,
         }
     }
 

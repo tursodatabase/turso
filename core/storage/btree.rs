@@ -11237,7 +11237,9 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
             Database::open_file(io, "freelist-stale-overflow.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("PRAGMA journal_mode = WAL").unwrap();
         conn.execute(
@@ -11360,7 +11362,9 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
             Database::open_file(io, "resume-overflow-yield.db", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute("PRAGMA journal_mode = WAL").unwrap();
         conn.execute(
@@ -11499,7 +11503,9 @@ mod tests {
     #[test]
     fn test_insert_cell() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let page = get_page(2);
 
         let header_size = 8;
@@ -11523,7 +11529,9 @@ mod tests {
     #[test]
     fn test_drop_1() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -11734,7 +11742,9 @@ mod tests {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let pager = conn.pager.load().clone();
 
         // FIXME: handle page cache is full
@@ -11889,7 +11899,9 @@ mod tests {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let pager = conn.pager.load().clone();
 
         let mut cursor = BTreeCursor::new(pager, 1, 5);
@@ -12686,7 +12698,9 @@ mod tests {
     #[test]
     pub fn test_drop_odd() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -12731,7 +12745,9 @@ mod tests {
     #[test]
     fn leaf_delete_balancing_prediction_matches_underflow_after_drop() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let usable_space = 4096;
         let mut rng = ChaCha8Rng::seed_from_u64(1700);
         let mut predicted_no_balancing = 0;
@@ -13790,7 +13806,9 @@ mod tests {
     #[test]
     pub fn test_defragment() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -13831,7 +13849,9 @@ mod tests {
     #[test]
     pub fn test_drop_odd_with_defragment() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -13878,7 +13898,9 @@ mod tests {
     #[test]
     pub fn test_fuzz_drop_defragment_insert() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -13962,7 +13984,9 @@ mod tests {
         // This test is used to demonstrate that issue at https://github.com/tursodatabase/turso/issues/1085
         // is FIXED.
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -14042,7 +14066,9 @@ mod tests {
     #[test]
     pub fn test_drop_page_in_balancing_issue_1203() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let queries = vec![
 "CREATE TABLE lustrous_petit (awesome_nomous TEXT,ambitious_amargi TEXT,fantastic_daniels BLOB,stupendous_highleyman TEXT,relaxed_crane TEXT,elegant_bromma INTEGER,proficient_castro BLOB,ambitious_liman TEXT,responsible_lusbert BLOB);",
@@ -14081,7 +14107,9 @@ mod tests {
     #[test]
     pub fn test_drop_page_in_balancing_issue_1203_2() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let queries = vec![
 "CREATE TABLE super_becky (engrossing_berger BLOB,plucky_chai BLOB,mirthful_asbo REAL,bountiful_jon REAL,competitive_petit REAL,engrossing_rexroth REAL);",
@@ -14135,7 +14163,9 @@ mod tests {
     #[test]
     pub fn test_free_space() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         let page = get_page(2);
 
         let page_contents = page.get_contents();
@@ -14194,7 +14224,9 @@ mod tests {
     #[test]
     pub fn test_defragment_1() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -14216,7 +14248,9 @@ mod tests {
     #[test]
     pub fn test_insert_drop_insert() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -14247,7 +14281,9 @@ mod tests {
     #[test]
     pub fn test_insert_drop_insert_multiple() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -14280,7 +14316,9 @@ mod tests {
     #[test]
     pub fn test_drop_a_few_insert() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -14306,7 +14344,9 @@ mod tests {
     #[test]
     pub fn test_fuzz_victim_1() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
 
@@ -14338,7 +14378,9 @@ mod tests {
     #[test]
     pub fn test_fuzz_victim_2() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
         let usable_space = 4096;
@@ -14379,7 +14421,9 @@ mod tests {
     #[test]
     pub fn test_fuzz_victim_3() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
         let usable_space = 4096;
@@ -14476,7 +14520,9 @@ mod tests {
     #[test]
     pub fn test_big_payload_compute_free() {
         let (db, _temp_dir) = get_database();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let page = get_page(2);
         let usable_space = 4096;

@@ -2160,6 +2160,7 @@ fn parse_table(
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
+        program.record_table_reference(internal_id);
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             if let VirtualTableType::Pragma(pragma) = &tbl.vtab_type {
                 crate::translate::roles::check_pragma_function(resolver, &pragma.pragma_name)?;
@@ -2198,6 +2199,15 @@ fn parse_table(
         schema.get_view(namespace.id, table_name.as_str())
     });
     if let Some(view) = regular_view {
+        program
+            .referenced_views
+            .push(crate::vdbe::builder::ViewRead {
+                view: crate::vdbe::builder::ViewRef {
+                    namespace,
+                    name: view.name.clone(),
+                },
+                through: program.view_being_expanded(),
+            });
         // Views are essentially query aliases, so just Expand the view as a subquery.
         let has_alias = maybe_alias.is_some();
         let view_alias = maybe_alias
@@ -2212,7 +2222,7 @@ fn parse_table(
         // fixed to the database it was created in, not resolved TEMP-first
         // like an ordinary top-level query.
         let view_plan = resolver.with_view_scope(namespace, view.name.clone(), || {
-            program.with_view_expansion(database_id, &view.name, |program| {
+            program.with_view_expansion(namespace, &view.name, |program| {
                 prepare_select_plan(
                     view.select_stmt.clone(),
                     resolver,
@@ -2533,6 +2543,9 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
         if !ctes_read[cte_definition_index] {
             continue;
         }
+        // Planning the CTE here only names it for nested FROM clauses; the
+        // views it reads are recorded when a query reads the CTE.
+        let views_read_before_planning = program.referenced_views.len();
         let joined_table = plan_cte(
             cte_definition_index,
             cte_definitions,
@@ -2542,6 +2555,9 @@ fn add_ctes_read_by_subqueries_as_outer_refs(
             connection,
             false,
         )?;
+        program
+            .referenced_views
+            .truncate(views_read_before_planning);
         table_references.add_outer_query_reference(OuterQueryReference {
             identifier: cte_definition.name.clone(),
             has_alias: false,

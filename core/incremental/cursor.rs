@@ -290,7 +290,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         )?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(crate::SessionRole::Superuser))?;
 
         // Create a test table
         conn.execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, value INTEGER)")?;

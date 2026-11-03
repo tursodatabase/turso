@@ -188,7 +188,10 @@ fn one_checkpoint_ns(n: usize) -> u64 {
 
 fn one_delta_checkpoint_ns(n: usize, delta: usize) -> u64 {
     let loaded = load_n_rows(n);
-    let reader = loaded.db.connect(ConnectOpts::new()).unwrap();
+    let reader = loaded
+        .db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     exec(&reader, &loaded.db, "BEGIN CONCURRENT");
     let seen = count_rows(&reader, &loaded.db);
     assert_eq!(seen, n as i64, "reader snapshot must see the N rows");
@@ -215,7 +218,9 @@ fn load_n_rows(n: usize) -> Loaded {
         Arc::new(SqliteDialect),
     )
     .unwrap();
-    let conn = db.connect(ConnectOpts::new()).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        .unwrap();
     exec(&conn, &db, "PRAGMA journal_mode = 'mvcc'");
     exec(&conn, &db, "PRAGMA mvcc_checkpoint_threshold = -1");
     exec(&conn, &db, "PRAGMA synchronous = OFF");

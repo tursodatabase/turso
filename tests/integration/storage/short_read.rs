@@ -117,7 +117,10 @@ fn test_truncated_wal_returns_short_read_error() {
         let existing_db = TempDatabase::new_with_existent(&db_path);
 
         // Error occurs during connect() when reading WAL frames
-        match existing_db.db.connect(ConnectOpts::new()) {
+        match existing_db
+            .db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        {
             Ok(_) => panic!("Connection to database with truncated WAL must fail"),
             Err(err) => {
                 let err_string = err.to_string();
@@ -163,7 +166,10 @@ fn test_truncated_header_returns_short_read_error() {
     // Opening the database should fail with a short read error
     {
         let existing_db = TempDatabase::new_with_existent(&db_path);
-        match existing_db.db.connect(ConnectOpts::new()) {
+        match existing_db
+            .db
+            .connect(ConnectOpts::new(turso_core::SessionRole::Superuser))
+        {
             Ok(_) => panic!("Connection to database with truncated header must fail"),
             Err(err) => {
                 let err_string = err.to_string();

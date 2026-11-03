@@ -1,5 +1,47 @@
 use crate::common::TempDatabase;
+use turso_core::security::roles::{RoleId, SessionRole};
+use turso_core::ConnectOpts;
+use turso_core::StepResult;
 use turso_pg::PgConnection;
+
+#[test]
+fn connection_runs_as_the_role_it_was_opened_as() {
+    let db = TempDatabase::builder().build();
+    let superuser_conn = db.connect_postgres();
+    superuser_conn.execute("CREATE ROLE alice").unwrap();
+    let alice = superuser_conn
+        .inner()
+        .role_catalog()
+        .get_by_name("alice")
+        .unwrap()
+        .id;
+
+    let conn = db
+        .db
+        .connect(ConnectOpts::new(SessionRole::Named("alice".to_string())))
+        .unwrap();
+
+    assert_eq!(superuser_conn.inner().session_role(), RoleId::SUPERUSER);
+    assert_eq!(conn.session_role(), alice);
+    assert_eq!(conn.current_role(), alice);
+    assert!(!conn.current_role_is_superuser());
+}
+
+#[test]
+fn connecting_as_a_role_that_does_not_exist_fails() {
+    let db = TempDatabase::builder().build();
+
+    for name in ["alice", "public"] {
+        let Err(error) = db
+            .db
+            .connect(ConnectOpts::new(SessionRole::Named(name.to_string())))
+        else {
+            panic!("connecting as {name}, which does not exist, succeeded");
+        };
+
+        assert_eq!(error.to_string(), format!("role \"{name}\" does not exist"));
+    }
+}
 
 #[test]
 fn created_role_is_visible_to_another_connection() {
@@ -170,6 +212,27 @@ fn statement_prepared_before_set_role_is_checked_against_the_new_role() {
 
     let error = create.run_collect_rows().unwrap_err();
     assert_eq!(error.to_string(), "permission denied for schema public");
+}
+
+#[test]
+fn query_started_before_set_role_returns_its_remaining_rows_but_fails_when_run_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    let mut select = conn.prepare("SELECT x FROM t ORDER BY x").unwrap();
+    assert!(matches!(select.step().unwrap(), StepResult::Row));
+    assert_eq!(select.row().unwrap().get_value(0).to_string(), "1");
+
+    conn.execute("SET ROLE alice").unwrap();
+
+    assert!(matches!(select.step().unwrap(), StepResult::Row));
+    assert_eq!(select.row().unwrap().get_value(0).to_string(), "2");
+    assert!(matches!(select.step().unwrap(), StepResult::Done));
+    select.reset().unwrap();
+    let error = select.run_collect_rows().unwrap_err();
+    assert_eq!(error.to_string(), "permission denied for table t");
 }
 
 #[test]
@@ -447,4 +510,178 @@ fn role_names(conn: &PgConnection) -> Vec<String> {
         .into_iter()
         .map(|row| row[0].to_string())
         .collect()
+}
+
+#[test]
+fn role_without_privileges_can_read_the_catalog() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let mut stmt = conn
+        .inner()
+        .prepare("SELECT count(*) FROM sqlite_schema WHERE type = 'table'")
+        .unwrap();
+
+    assert_ne!(stmt.run_collect_rows().unwrap()[0][0].to_string(), "0");
+}
+
+#[test]
+fn role_without_privileges_can_read_the_schema_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    conn.inner().force_reparse_schema().unwrap();
+
+    assert!(conn.inner().role_catalog().get_by_name("alice").is_some());
+}
+
+#[test]
+fn open_pragma_cursor_does_not_skip_privilege_checks() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    let mut pragma = conn
+        .inner()
+        .prepare("SELECT * FROM pragma_table_info('t')")
+        .unwrap();
+    assert!(matches!(
+        pragma.step().unwrap(),
+        turso_core::StepResult::Row
+    ));
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("SELECT * FROM t").unwrap_err();
+
+    assert_eq!(error.to_string(), "permission denied for table t");
+}
+
+#[test]
+fn granted_privileges_are_kept_after_reopening_the_database() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("GRANT SELECT ON t TO alice").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    let conn = db.connect_postgres();
+    conn.execute("SET ROLE alice").unwrap();
+    let mut stmt = conn.query("SELECT x FROM t").unwrap().unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap().len(), 1);
+    let error = conn.execute("INSERT INTO t VALUES (2)").unwrap_err();
+    assert_eq!(error.to_string(), "permission denied for table t");
+}
+
+#[test]
+fn a_grant_is_visible_to_another_connection() {
+    let db = TempDatabase::builder().build();
+    let admin = db.connect_postgres();
+    let other = db.connect_postgres();
+    admin.execute("CREATE TABLE t (x int)").unwrap();
+    admin.execute("CREATE ROLE alice").unwrap();
+    other.execute("SET ROLE alice").unwrap();
+    assert!(other.execute("SELECT x FROM t").is_err());
+
+    admin.execute("GRANT SELECT ON t TO alice").unwrap();
+
+    other.execute("SELECT x FROM t").unwrap();
+}
+
+#[test]
+fn a_role_without_the_grant_option_cannot_grant() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (x int)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE ROLE bob").unwrap();
+    conn.execute("GRANT SELECT ON t TO alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("GRANT SELECT ON t TO bob").unwrap_err();
+
+    assert_eq!(error.to_string(), "permission denied for table t");
+}
+
+#[test]
+fn revoke_select_on_a_catalog_table_from_public_hides_it() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("REVOKE SELECT ON pg_class FROM PUBLIC")
+        .unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    let error = conn.execute("SELECT relname FROM pg_class").unwrap_err();
+
+    assert_eq!(error.to_string(), "permission denied for table pg_class");
+    conn.execute("SELECT nspname FROM pg_namespace").unwrap();
+}
+
+#[test]
+fn changing_to_another_role_and_back_does_not_prepare_statements_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE ROLE bob").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    let mut select = conn.inner().prepare("SELECT 1").unwrap();
+    select.run_collect_rows().unwrap();
+    select.reset().unwrap();
+
+    conn.execute("SET ROLE alice").unwrap();
+    select.run_collect_rows().unwrap();
+    select.reset().unwrap();
+    conn.execute("SET ROLE bob").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    select.run_collect_rows().unwrap();
+
+    assert_eq!(
+        select.stmt_status(turso_core::StatementStatusCounter::Reprepare),
+        0
+    );
+}
+#[test]
+fn creating_a_role_does_not_abort_a_concurrent_transaction() {
+    let db = TempDatabase::builder().build();
+    let writer = db.connect_postgres();
+    let admin = db.connect_postgres();
+    writer.execute("CREATE TABLE t (x int)").unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    admin.execute("CREATE ROLE alice").unwrap();
+    admin.execute("GRANT SELECT ON t TO alice").unwrap();
+
+    writer.execute("COMMIT").unwrap();
+    let mut stmt = writer.query("SELECT x FROM t").unwrap().unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap().len(), 1);
+}
+
+#[test]
+fn creating_a_table_still_aborts_a_concurrent_transaction() {
+    let db = TempDatabase::builder().build();
+    let writer = db.connect_postgres();
+    let admin = db.connect_postgres();
+    writer.execute("CREATE TABLE t (x int)").unwrap();
+    admin.execute("CREATE ROLE alice").unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    admin.execute("CREATE ROLE bob").unwrap();
+    admin.execute("CREATE TABLE u (x int)").unwrap();
+
+    let error = writer.execute("COMMIT").unwrap_err();
+    assert_eq!(error.to_string(), "Database schema conflict");
 }

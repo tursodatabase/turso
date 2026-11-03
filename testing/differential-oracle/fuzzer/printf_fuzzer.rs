@@ -279,7 +279,7 @@ impl FuzzerState {
             out_dir.join("printf-test.db").to_str().unwrap(),
             Arc::new(SqliteDialect),
         )?;
-        let turso_conn = turso_db.connect(ConnectOpts::new())?;
+        let turso_conn = turso_db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
         let sqlite_conn =
             rusqlite::Connection::open_in_memory().context("Failed to open SQLite database")?;

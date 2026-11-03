@@ -26,7 +26,7 @@ impl Remote {
             &db_path.to_string_lossy(),
             OpenOptions::new(Arc::new(SqliteDialect)).db_opts(database_opts()),
         )?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
         conn.execute("PRAGMA journal_mode = 'mvcc'")?;
         conn.set_portable_logical_changes_enabled(true);
         for sql in setup {

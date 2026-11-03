@@ -17,7 +17,9 @@ use crate::numeric::Numeric;
 use crate::schema::{
     render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
 };
+use crate::security::acl_catalog::ObjectKey;
 use crate::security::permission::{Action, Object, PermissionDenied};
+use crate::security::privilege::{ObjectKind, Privilege, Privileges};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorStep, CursorTrait, IntegrityCheckError, IntegrityCheckState, KeptRead,
@@ -50,7 +52,7 @@ use crate::vdbe::affinity::{
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
-use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags};
+use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags, SET_COOKIE_FOR_ROLES};
 use crate::vdbe::metrics::{HashJoinMetrics, StatementMetrics};
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
@@ -10456,6 +10458,19 @@ pub fn op_function(
                 // on a dropped sequence reports "does not exist" rather
                 // than silently returning the stale per-session value.
                 let (namespace, sequence) = program.connection.find_sequence(&seq_name)?;
+                if !program.connection.current_role_may(
+                    namespace.database_id,
+                    &ObjectKey::new(ObjectKind::Sequence, namespace.id, sequence.name.as_str()),
+                    Privileges::from_iter([Privilege::Usage, Privilege::Select]),
+                ) {
+                    return Err(crate::LimboError::PermissionDenied(Box::new(
+                        PermissionDenied::privilege(
+                            Action::Use,
+                            Object::Sequence(sequence.name.clone()),
+                        ),
+                    ))
+                    .into());
+                }
                 match program.connection.get_sequence_currval(
                     namespace.database_id,
                     &mangle_name(namespace.id, &sequence.name),
@@ -10802,7 +10817,11 @@ pub fn op_function(
                 if !program.connection.can_load_extensions() {
                     crate::bail_parse_error!("runtime extension loading is disabled");
                 }
-                if !program.connection.current_role_is_superuser() {
+                if !program.connection.current_role_may(
+                    crate::MAIN_DB_ID,
+                    &ObjectKey::root(ObjectKind::Function, "load_extension"),
+                    Privileges::of(Privilege::Execute),
+                ) {
                     return Err(LimboError::PermissionDenied(Box::new(
                         PermissionDenied::privilege(
                             Action::Execute,
@@ -11117,6 +11136,19 @@ pub fn op_function(
                     }
                 };
                 let (namespace, sequence) = program.connection.find_sequence(sequence_name)?;
+                if !program.connection.current_role_may(
+                    namespace.database_id,
+                    &ObjectKey::new(ObjectKind::Sequence, namespace.id, sequence.name.as_str()),
+                    Privileges::from_iter([Privilege::Usage, Privilege::Select]),
+                ) {
+                    return Err(LimboError::PermissionDenied(Box::new(
+                        PermissionDenied::privilege(
+                            Action::Use,
+                            Object::Sequence(sequence.name.clone()),
+                        ),
+                    ))
+                    .into());
+                }
                 let watermark = program
                     .connection
                     .mv_store_for_db(namespace.database_id)
@@ -15174,6 +15206,35 @@ pub fn op_add_role(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_set_acl(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        SetAcl {
+            db,
+            id_reg,
+            key,
+            access,
+        },
+        insn
+    );
+    let Value::Numeric(Numeric::Integer(rowid)) = state.registers[*id_reg].get_value() else {
+        return Err(LimboError::InternalError(format!(
+            "SetAcl: rowid register r[{id_reg}] does not hold an integer"
+        ))
+        .into());
+    };
+    let rowid = *rowid;
+    program.connection.with_database_schema_mut(*db, |schema| {
+        Arc::make_mut(&mut schema.acls).set_stored(key.clone(), rowid, access.clone())
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Compute the next value of a sequence from a watermark row that has
 /// already been loaded into registers by the surrounding bytecode. Pure
 /// arithmetic — no I/O. The translator emits a cursor seek + Column reads
@@ -16517,7 +16578,7 @@ pub fn op_set_cookie(
             db,
             cookie,
             value,
-            p5: _,
+            p5,
         },
         insn
     );
@@ -16536,7 +16597,7 @@ pub fn op_set_cookie(
         upgrade_mv_tx_to_exclusive(program, &pager, mv_store, *db, tx_id)?;
     }
 
-    match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
+    let apply = |header: &mut DatabaseHeader| {
         match cookie {
             Cookie::ApplicationId => header.application_id = (*value).into(),
             Cookie::DatabaseFormat => header.schema_format = (*value as u32).into(),
@@ -16601,7 +16662,18 @@ pub fn op_set_cookie(
             Cookie::FreePageCount => unreachable!("freelist page count is not set via SetCookie"),
         };
         Ok(())
-    })? {
+    };
+    let applied = match mv_store.as_ref() {
+        Some(mv_store) if *p5 & SET_COOKIE_FOR_ROLES != 0 => {
+            let tx_id = program
+                .connection
+                .get_mv_tx_id_for_db(*db)
+                .expect("an MVCC header update has a transaction");
+            IOResult::Done(mv_store.with_header_mut_for_roles(apply, &tx_id)?)
+        }
+        _ => with_header_mut(&pager, mv_store.as_ref(), program, *db, apply)?,
+    };
+    match applied {
         IOResult::Done(result) => result?,
         IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
     }
@@ -20539,8 +20611,10 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     )?,
                 };
                 let output_conn = match page_codec {
-                    Some(codec) => output_db.connect(ConnectOpts::new().with_page_codec(codec))?,
-                    None => output_db.connect(ConnectOpts::new())?,
+                    Some(codec) => output_db.connect(
+                        ConnectOpts::new(crate::SessionRole::Superuser).with_page_codec(codec),
+                    )?,
+                    None => output_db.connect(ConnectOpts::new(crate::SessionRole::Superuser))?,
                 };
                 output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
                 // set reserved_space on output to match source
@@ -20823,7 +20897,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.prepare("SELECT 1;").unwrap()
     }
 
@@ -20884,7 +20960,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();
         conn.execute("INSERT INTO t VALUES (1)").unwrap();
 
@@ -20949,7 +21027,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         conn.execute(format!(
             "ATTACH DATABASE '{}' AS att",
@@ -21011,7 +21091,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
         conn.execute("CREATE TABLE aux.t(x)").unwrap();
 
@@ -21036,7 +21118,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..128 {
@@ -21081,7 +21165,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT)")
             .unwrap();
         for i in 0..32 {
@@ -21752,7 +21838,9 @@ mod tests {
             Arc::new(SqliteDialect),
         )
         .unwrap();
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
+            .unwrap();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             conn.execute("SELECT -X'18530E218A8D2D8D8F7456733370E68357745AFE13FC1B94751B77FCB00D0CAD971017936278BFF49BB4C8BD47F874ECA5226D3A433B7DFCD18661673598CED1FDB30A795F6F25'[2]")

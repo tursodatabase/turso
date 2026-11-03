@@ -84,7 +84,9 @@ pub fn hash_database_with_database_opts(
         .as_ref()
         .map(|encryption| EncryptionKey::from_hex_string(&encryption.hexkey))
         .transpose()?;
-    let conn = db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?;
+    let conn = db.connect(
+        ConnectOpts::new(turso_core::SessionRole::Superuser).with_encryption_key(encryption_key),
+    )?;
 
     let mut hasher = Sha1::new();
     let mut tables_hashed = 0;

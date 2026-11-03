@@ -271,7 +271,7 @@ fn do_fuzz(expr: Expr) -> Result<Corpus, Box<dyn Error>> {
             ":memory:",
             Arc::new(turso_core::SqliteDialect),
         )?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(turso_core::SessionRole::Superuser))?;
 
         let mut stmt = conn.prepare(sql)?;
         for (idx, value) in expr.parameters.iter().enumerate() {

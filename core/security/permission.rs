@@ -61,6 +61,9 @@ pub enum Action {
     CreateTrigger,
     Alter,
     Drop,
+    Use,
+    /// Granting or revoking privileges on the object
+    Grant,
     SetRole,
     Analyze,
     Vacuum,
@@ -81,6 +84,8 @@ impl fmt::Display for Action {
             Action::CreateTrigger => "create trigger",
             Action::Alter => "alter",
             Action::Drop => "drop",
+            Action::Use => "use",
+            Action::Grant => "grant",
             Action::SetRole => "set role",
             Action::Analyze => "analyze",
             Action::Vacuum => "vacuum",
@@ -105,6 +110,8 @@ pub enum Object {
     Table(String),
     /// A view, by name.
     View(String),
+    /// A materialized view, by name.
+    MaterializedView(String),
     /// An index, by name.
     Index(String),
     /// A trigger, by name.
@@ -121,6 +128,8 @@ pub enum Object {
     Setting(String),
     /// A file on the host, by path, such as the file of `COPY ... FROM`.
     File(String),
+    /// Storage that does not belong to a known object.
+    Storage,
 }
 
 impl fmt::Display for Object {
@@ -130,6 +139,7 @@ impl fmt::Display for Object {
             Object::Schema(name) => write!(f, "schema {name}"),
             Object::Table(name) => write!(f, "table {name}"),
             Object::View(name) => write!(f, "view {name}"),
+            Object::MaterializedView(name) => write!(f, "materialized view {name}"),
             Object::Index(name) => write!(f, "index {name}"),
             Object::Trigger(name) => write!(f, "trigger {name}"),
             Object::Sequence(name) => write!(f, "sequence {name}"),
@@ -138,6 +148,7 @@ impl fmt::Display for Object {
             Object::Role(name) => write!(f, "role {name}"),
             Object::Setting(name) => write!(f, "setting {name}"),
             Object::File(name) => write!(f, "file {name}"),
+            Object::Storage => f.write_str("database storage"),
         }
     }
 }
