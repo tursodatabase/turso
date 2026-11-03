@@ -1,5 +1,6 @@
 use crate::translate::collate::CollationSeq;
 use crate::vdbe::{
+    affinity::CastTypeTag,
     builder::CursorType,
     insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
@@ -2554,14 +2555,24 @@ pub fn insn_to_row(
                 0,
                 format!("r[{}] = data", *dest),
             ),
-            Insn::Cast { reg, affinity } => (
+            Insn::Cast {
+                reg,
+                affinity,
+                written_type,
+            } => (
                 "Cast",
                 *reg as i64,
                 0,
                 0,
                 Value::build_text(""),
                 0,
-                format!("affinity(r[{}]={:?})", *reg, affinity),
+                match written_type {
+                    CastTypeTag::Other => format!("affinity(r[{}]={:?})", *reg, affinity),
+                    _ => format!(
+                        "affinity(r[{}]={:?}, type={:?})",
+                        *reg, affinity, written_type
+                    ),
+                },
             ),
             Insn::RenameTable {
                 db: _,

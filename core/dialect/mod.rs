@@ -14,6 +14,11 @@ pub mod sqlite;
 
 pub use sqlite::SqliteDialect;
 
+use crate::{
+    vdbe::affinity::{Affinity, CastTypeTag},
+    Value,
+};
+
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
 pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
@@ -233,6 +238,21 @@ pub trait Dialect: Send + Sync + 'static {
     /// PostgreSQL raises SQLSTATE 22012. SQLite returns NULL.
     fn errors_on_zero_divisor(&self) -> bool {
         false
+    }
+
+    /// The tag for a CAST to the type named `type_name`.
+    fn cast_type_tag(&self, _type_name: &str) -> CastTypeTag {
+        CastTypeTag::Other
+    }
+
+    /// Converts `value` for a CAST to `written_type`, whose affinity is `target`.
+    fn cast_value(
+        &self,
+        value: &Value,
+        target: Affinity,
+        _written_type: CastTypeTag,
+    ) -> crate::Result<Value> {
+        Ok(value.cast_to_affinity(target)?)
     }
 
     /// Whether `mod` of two integers returns an integer.

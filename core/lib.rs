@@ -186,6 +186,7 @@ pub use turso_macros::{
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
+pub use vdbe::affinity::{Affinity, CastTypeTag};
 pub use vdbe::array::{array_values_from_any, text_array_literal};
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,

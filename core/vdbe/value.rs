@@ -990,6 +990,19 @@ impl Value {
         }
     }
 
+    pub fn cast_to_affinity(
+        &self,
+        affinity: Affinity,
+    ) -> std::result::Result<Value, crate::alloc::TryReserveError> {
+        match affinity {
+            Affinity::Blob | Affinity::None => self.exec_cast("BLOB"),
+            Affinity::Text => self.exec_cast("TEXT"),
+            Affinity::Numeric => self.exec_cast("NUMERIC"),
+            Affinity::Integer => self.exec_cast("INTEGER"),
+            Affinity::Real => self.exec_cast("REAL"),
+        }
+    }
+
     pub fn exec_cast(
         &self,
         datatype: &str,

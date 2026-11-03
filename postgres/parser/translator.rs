@@ -6147,11 +6147,15 @@ fn pg_type_name_to_ast_type(
     let pg_type = object_name(&type_name.names, is_default_schema, "type")?;
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
-        | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
-            "REAL"
-        }
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" => "INTEGER",
+        // Qualified so that CAST does not resolve to turso's built-in smallint,
+        // bigint and numeric types, which follow column rules instead.
+        "SMALLINT" | "INT2" => "pg_catalog.int2",
+        "BIGINT" | "INT8" => "pg_catalog.int8",
+        "REAL" | "FLOAT4" => "REAL",
+        "DOUBLE PRECISION" | "FLOAT8" => "DOUBLE PRECISION",
+        "NUMERIC" | "DECIMAL" => "pg_catalog.numeric",
+        "MONEY" => "REAL",
         // For CAST expressions, map all text-like PG types to TEXT and
         // boolean to INTEGER for SQLite VDBE compatibility
         "BOOLEAN" | "BOOL" => "INTEGER",

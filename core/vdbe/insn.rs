@@ -18,7 +18,7 @@ use crate::{
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::TransactionMode, plan::BitSet},
     types::KeyInfo,
-    vdbe::affinity::Affinity,
+    vdbe::affinity::{Affinity, CastTypeTag},
     PreparedProgram, Value,
 };
 use strum::EnumCount;
@@ -1523,6 +1523,7 @@ pub enum Insn {
     Cast {
         reg: usize,
         affinity: Affinity,
+        written_type: CastTypeTag,
     },
 
     InitCoroutine {

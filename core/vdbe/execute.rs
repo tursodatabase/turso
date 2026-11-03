@@ -17555,21 +17555,25 @@ pub fn op_integrity_check(
     Ok(InsnFunctionStepResult::Step)
 }
 pub fn op_cast(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(Cast { reg, affinity }, insn);
+    load_insn!(
+        Cast {
+            reg,
+            affinity,
+            written_type
+        },
+        insn
+    );
 
     let value = state.registers[*reg].get_value().clone();
-    let result = match affinity {
-        Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
-        Affinity::Text => value.exec_cast("TEXT"),
-        Affinity::Numeric => value.exec_cast("NUMERIC"),
-        Affinity::Integer => value.exec_cast("INTEGER"),
-        Affinity::Real => value.exec_cast("REAL"),
-    }?;
+    let result = program
+        .connection
+        .dialect()
+        .cast_value(&value, *affinity, *written_type)?;
 
     state.registers[*reg].set_value(result);
     state.pc += 1;
