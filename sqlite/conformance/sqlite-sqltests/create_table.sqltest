@@ -330,6 +330,24 @@ expect {
     C
 }
 
+# The key compares with BINARY, but WHERE compares with the column's NOCASE,
+# so a lookup on the key must still find both spellings.
+@skip-if mvcc "WITHOUT ROWID tables are not supported in MVCC mode"
+@cross-check-integrity
+test create_table_without_rowid_primary_key_collate_differs_from_column {
+    CREATE TABLE t_wpkx(a COLLATE NOCASE, b, PRIMARY KEY(a COLLATE BINARY DESC)) WITHOUT ROWID;
+    INSERT INTO t_wpkx VALUES ('x', 1), ('X', 2), ('m', 3);
+    SELECT a, b FROM t_wpkx WHERE a = 'X' ORDER BY b;
+    SELECT a FROM t_wpkx;
+}
+expect {
+    x|1
+    X|2
+    x
+    m
+    X
+}
+
 @cross-check-integrity
 test create_table_unique_collate_nocase_uniqueness {
     CREATE TABLE t_uqc(a, UNIQUE(a COLLATE NOCASE));

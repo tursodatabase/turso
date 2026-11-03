@@ -241,6 +241,12 @@ fn test_without_rowid_primary_key_repeating_column_with_other_collation_is_refus
         limbo_exec_rows(&conn, "SELECT x FROM other"),
         vec![vec![rusqlite::types::Value::Integer(1)]]
     );
+    assert_eq!(
+        limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![rusqlite::types::Value::Text(
+            "table t: not checked, Turso does not support a WITHOUT ROWID PRIMARY KEY that lists a column more than once with different collations".to_string()
+        )]]
+    );
     drop(conn);
     drop(db);
 
@@ -251,6 +257,16 @@ fn test_without_rowid_primary_key_repeating_column_with_other_collation_is_refus
             rusqlite::types::Value::Text("b".to_string()),
             rusqlite::types::Value::Integer(1)
         ]]
+    );
+    drop(sqlite);
+
+    // DROP TABLE does not open a cursor on the table, so the table can still be removed.
+    let db = TempDatabase::new_with_existent(&db_path);
+    let conn = db.connect_limbo();
+    limbo_exec_rows(&conn, "DROP TABLE t");
+    assert_eq!(
+        limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![rusqlite::types::Value::Text("ok".to_string())]]
     );
     Ok(())
 }

@@ -1370,14 +1370,7 @@ impl BTreeCursor {
         table: &BTreeTable,
         num_columns: usize,
     ) -> Result<Self> {
-        // SQLite stores such a column once per PRIMARY KEY entry and Turso
-        // stores it once, so Turso can neither read nor write SQLite's rows.
-        if table.primary_key_repeats_column_with_other_collation() {
-            return Err(LimboError::ParseError(format!(
-                "table {}: a WITHOUT ROWID PRIMARY KEY that lists a column more than once with different collations is not supported",
-                table.name
-            )));
-        }
+        table.check_without_rowid_key_is_supported()?;
         let pk_columns = table.primary_key_columns.iter().enumerate();
         let key_info = pk_columns.map(|(i, (col_name, order))| {
             let (_, column) = table

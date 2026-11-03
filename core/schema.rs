@@ -5725,13 +5725,29 @@ impl BTreeTable {
             })
     }
 
+    /// Fails for a WITHOUT ROWID table whose key Turso cannot store the way
+    /// SQLite does. See `primary_key_repeats_column_with_other_collation`.
+    pub fn check_without_rowid_key_is_supported(&self) -> Result<()> {
+        if self.primary_key_repeats_column_with_other_collation() {
+            return Err(LimboError::ParseError(format!(
+                "table {}: a WITHOUT ROWID PRIMARY KEY that lists a column more than once with different collations is not supported",
+                self.name
+            )));
+        }
+        Ok(())
+    }
+
     /// True when PRIMARY KEY(...) lists a column more than once with
     /// different collations, e.g. PRIMARY KEY(a COLLATE NOCASE, a).
+    /// SQLite stores such a column once per PRIMARY KEY entry in a WITHOUT
+    /// ROWID key and Turso stores it once.
     pub fn primary_key_repeats_column_with_other_collation(&self) -> bool {
         let collation_of = |i: usize| {
             let (name, _) = &self.primary_key_columns[i];
-            self.get_column(name)
-                .map(|(_, column)| self.primary_key_collation(i, column))
+            let (_, column) = self
+                .get_column(name)
+                .expect("primary key column should exist");
+            self.primary_key_collation(i, column)
         };
         let names = &self.primary_key_columns;
         (0..names.len()).any(|i| {
@@ -5750,11 +5766,12 @@ impl BTreeTable {
 
     /// The COLLATE written for the `i`-th entry of PRIMARY KEY(...), if any.
     pub fn primary_key_explicit_collation(&self, i: usize) -> Option<TextCollation> {
-        self.unique_sets
+        let unique_set = self
+            .unique_sets
             .iter()
-            .find(|unique_set| unique_set.is_primary_key)
-            .and_then(|unique_set| unique_set.columns.get(i))
-            .and_then(|column| column.collation)
+            .find(|unique_set| unique_set.is_primary_key)?;
+        assert_eq!(unique_set.columns.len(), self.primary_key_columns.len());
+        unique_set.columns[i].collation
     }
 
     fn primary_key_implies_not_null(&self, column: &Column) -> bool {
@@ -8184,14 +8201,16 @@ impl Index {
                 )));
             };
             let (_, column) = table.get_column(col_name).unwrap();
+            let explicit_collation = constraint_columns.get(i).and_then(|c| c.collation);
             primary_keys
                 .push_within_capacity(IndexColumn {
                     name: normalize_ident(col_name),
                     order: *order,
                     nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
-                    collation: table.primary_key_collation(i, column),
-                    explicit_collation: table.primary_key_explicit_collation(i),
+                    collation: explicit_collation
+                        .map_or_else(|| column.collation(), CollationSeq::Text),
+                    explicit_collation,
                     default: column.default.clone(),
                     expr: None,
                 })
