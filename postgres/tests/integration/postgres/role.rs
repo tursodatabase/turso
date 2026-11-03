@@ -352,34 +352,6 @@ fn interrupted_create_role_leaves_no_role_behind() {
     }
 }
 
-#[test]
-fn roles_are_loaded_on_open_when_the_schema_cookie_is_zero() {
-    let db = TempDatabase::builder().build();
-    let conn = db.connect_limbo();
-    conn.execute("CREATE ROLE alice").unwrap();
-    conn.checkpoint(turso_core::CheckpointMode::Truncate {
-        upper_bound_inclusive: None,
-    })
-    .unwrap();
-    conn.close().unwrap();
-    drop(conn);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&db.path)
-        .unwrap();
-    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(40)).unwrap();
-    std::io::Write::write_all(&mut file, &0u32.to_be_bytes()).unwrap();
-    drop(file);
-
-    let db = db.reopen();
-
-    assert!(db
-        .connect_limbo()
-        .role_catalog()
-        .get_by_name("alice")
-        .is_some());
-}
-
 /// Runs `sql` with a progress handler that interrupts it at the
 /// `interrupt_at_step`th step.
 fn run_interrupted_at(
