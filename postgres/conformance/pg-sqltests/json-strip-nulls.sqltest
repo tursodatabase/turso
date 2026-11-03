@@ -101,6 +101,21 @@ expect {
     {"a":1e400}
 }
 
+test json-strip-nulls-keeps-input-nested-1000-levels {
+    SELECT length(json_strip_nulls((repeat('[', 1000) || repeat(']', 1000))::json)::text);
+}
+expect {
+    2000
+}
+
+test json-strip-nulls-of-deeply-nested-input-errors {
+    SELECT json_strip_nulls((repeat('[', 50000) || repeat(']', 50000))::json);
+}
+@sqlstate 54001
+expect error {
+    stack depth limit exceeded
+}
+
 test json-strip-nulls-of-null-is-null {
     SELECT json_strip_nulls(NULL);
 }
