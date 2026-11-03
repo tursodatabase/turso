@@ -3291,11 +3291,29 @@ fn and_chain_folds_to_zero(expr: &Expr) -> bool {
     }
 }
 
-/// True if the expression calls a function outside of its subqueries.
+/// True if the expression calls a function outside of its subqueries. LIKE,
+/// GLOB, REGEXP and MATCH, the JSON `->` and `->>` operators and
+/// CURRENT_DATE, CURRENT_TIME and CURRENT_TIMESTAMP are function calls to
+/// SQLite's parser too.
 fn expr_calls_function(expr: &Expr) -> bool {
     let mut found = false;
     walk_expr(expr, &mut |e| {
-        if matches!(e, Expr::FunctionCall { .. } | Expr::FunctionCallStar { .. }) {
+        if matches!(
+            e,
+            Expr::FunctionCall { .. }
+                | Expr::FunctionCallStar { .. }
+                | Expr::Like { .. }
+                | Expr::Binary(
+                    _,
+                    ast::Operator::ArrowRight | ast::Operator::ArrowRightShift,
+                    _
+                )
+                | Expr::Literal(
+                    ast::Literal::CurrentDate
+                        | ast::Literal::CurrentTime
+                        | ast::Literal::CurrentTimestamp
+                )
+        ) {
             found = true;
             return Ok(WalkControl::SkipChildren);
         }
