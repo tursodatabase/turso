@@ -691,6 +691,14 @@ impl TursoSyncServer {
     fn handle_pull_updates(&self, db: &DbHandle, body: &[u8]) -> Result<HttpResponse> {
         let req = <PullUpdatesReqProtoBody as Message>::decode(body)
             .map_err(|e| anyhow!("Failed to decode PullUpdatesRequest: {}", e))?;
+        if self.encryption.is_some()
+            && (!req.server_pages_selector.is_empty() || !req.server_query_selector.is_empty())
+        {
+            return Ok(text_response(
+                400,
+                "Encrypted sync requires an unfiltered bootstrap",
+            ));
+        }
 
         debug!(
             "Pull updates request: server_revision={}, client_revision={}",
@@ -722,6 +730,24 @@ impl TursoSyncServer {
         let conn = db.conn.lock().expect("database connection lock poisoned");
 
         let wal_state = conn.wal_state()?;
+        if conn.get_encryption_cipher_mode().is_some() && req.client_revision.is_empty() {
+            anyhow::ensure!(
+                req.server_pages_selector.is_empty(),
+                "encrypted bootstrap requires a full snapshot"
+            );
+            let protocol = if conn.mvcc_enabled() {
+                PullUpdatesProtocol::MvccLogical
+            } else {
+                PullUpdatesProtocol::Pages
+            };
+            let revision = if conn.mvcc_enabled() {
+                "g1:o0".to_string()
+            } else {
+                wal_state.max_frame.to_string()
+            };
+            drop(conn);
+            return self.handle_snapshot_pages(db, revision, apply_mode, protocol);
+        }
         debug!("WAL state: max_frame={}", wal_state.max_frame);
 
         let server_revision: u64 = if req.server_revision.is_empty() {
@@ -790,6 +816,7 @@ impl TursoSyncServer {
                     page_no, frame_no, type_byte, frame_info.db_size
                 );
 
+                // Core's raw-frame API already authenticates and decodes the page.
                 let page_data = frame_buffer[WAL_FRAME_HEADER_SIZE..].to_vec();
                 pages_to_send.push((page_id, page_data));
             }
@@ -802,7 +829,7 @@ impl TursoSyncServer {
         );
         pages_to_send.reverse();
 
-        let db_size = current_db_size_pages(&conn, wal_state.max_frame)?;
+        let db_size = current_sync_db_size_pages(&conn, wal_state.max_frame)?;
 
         let header = PullUpdatesRespProtoBody {
             server_revision: server_revision.to_string(),
@@ -858,7 +885,7 @@ impl TursoSyncServer {
             let conn = db.conn.lock().expect("database connection lock poisoned");
             let wal_state = conn.wal_state()?;
             (
-                current_db_size_pages(&conn, wal_state.max_frame)?,
+                current_sync_db_size_pages(&conn, wal_state.max_frame)?,
                 format!("page:{}", wal_state.max_frame),
                 wal_state.max_frame.to_string(),
             )
@@ -1025,6 +1052,21 @@ impl TursoSyncServer {
         db: &DbHandle,
         server_revision: String,
     ) -> Result<HttpResponse> {
+        self.handle_snapshot_pages(
+            db,
+            server_revision,
+            PullUpdatesApplyMode::ReplaceBase,
+            PullUpdatesProtocol::MvccLogical,
+        )
+    }
+
+    fn handle_snapshot_pages(
+        &self,
+        db: &DbHandle,
+        server_revision: String,
+        apply_mode: PullUpdatesApplyMode,
+        protocol: PullUpdatesProtocol,
+    ) -> Result<HttpResponse> {
         let (db_size, pages) = self.read_replace_base_pages(db)?;
 
         let header = PullUpdatesRespProtoBody {
@@ -1033,10 +1075,9 @@ impl TursoSyncServer {
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
             stream_kind: PullUpdatesStreamKind::Pages as i32,
-            apply_mode: PullUpdatesApplyMode::ReplaceBase as i32,
+            apply_mode: apply_mode as i32,
             mvcc_log: None,
-            // Replace-base is only served from the MVCC logical flow here.
-            protocol: PullUpdatesProtocol::MvccLogical as i32,
+            protocol: protocol as i32,
         };
 
         let mut response_body = Vec::new();
@@ -1405,6 +1446,14 @@ fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64> {
         .get(offset..offset + 8)
         .ok_or_else(|| anyhow!("buffer too short for u64 at offset {offset}"))?;
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn current_sync_db_size_pages(conn: &Connection, max_frame: u64) -> Result<u64> {
+    if conn.get_encryption_cipher_mode().is_some() {
+        current_snapshot_db_size_pages(conn, max_frame)
+    } else {
+        current_db_size_pages(conn, max_frame)
+    }
 }
 
 fn current_db_size_pages(conn: &Connection, max_frame: u64) -> Result<u64> {
@@ -1889,6 +1938,48 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    #[test]
+    fn encrypted_snapshot_pages_advertise_sync_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.db");
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_encryption(true),
+            Some(turso_core::EncryptionOpts {
+                cipher: "aes256gcm".into(),
+                hexkey: "0b".repeat(32),
+            }),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db
+            .connect(
+                ConnectOpts::new(SessionRole::Superuser)
+                    .with_encryption_key(Some(turso_core::EncryptionKey::new_256([11; 32]))),
+            )
+            .unwrap();
+        conn.execute("CREATE TABLE secrets(value TEXT)").unwrap();
+        conn.execute("INSERT INTO secrets VALUES ('sample private value')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        let handle = DbHandle {
+            conn: Mutex::new(conn),
+            path: path.to_string_lossy().into_owned(),
+        };
+        let server = dir_server(dir.path());
+        let response = server
+            .handle_replace_base_pages(&handle, "g1:o0".into())
+            .unwrap();
+        let mut bytes = response.body.as_slice();
+        let header = PullUpdatesRespProtoBody::decode_length_delimited(&mut bytes).unwrap();
+        assert!(header.db_size > 0);
+        let first = PageData::decode_length_delimited(&mut bytes).unwrap();
+        assert!(first.encoded_page.starts_with(b"SQLite format 3\0"));
     }
 
     #[test]
