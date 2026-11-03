@@ -126,9 +126,11 @@ fn expr_calls_function(expr: &Expr) -> bool {
 /// `CASE WHEN (SELECT abs(-9223372036854775807 - 1)) AND 0 ...` does not run
 /// the subquery. In [BINDING_REWRITES] it runs after binding, so names in the
 /// dropped operand are still checked, and before subquery planning, so the
-/// subquery is never planned or emitted. An expression that is translated
-/// without binding, like a column DEFAULT, gets the same fold when its
-/// bytecode is emitted (see [and_or_truth_value]).
+/// subquery is never planned or emitted. A HAVING clause applies it after
+/// its terms have moved to WHERE or not, because SQLite decides that before
+/// this fold. An expression that is translated without binding, like a
+/// column DEFAULT, gets the same fold when its bytecode is emitted (see
+/// [and_or_truth_value]).
 pub(crate) struct AndOrConstantOperand;
 
 impl StaticRewrite for AndOrConstantOperand {
