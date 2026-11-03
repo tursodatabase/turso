@@ -10,18 +10,15 @@
 //! has no privileges on any database object. It may still run statements that
 //! touch no database object, such as `SELECT 1`, and switch roles.
 
-use std::sync::Arc;
-
 use crate::namespace::NamespaceId;
 use turso_parser::ast;
 
-use crate::schema::BTreeTable;
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::{CREATE_ROLES_TABLE_SQL, ROLES_TABLE_NAME};
 use crate::translate::emitter::Resolver;
-use crate::translate::schema::emit_create_internal_table;
+use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u32, Cookie, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
@@ -178,14 +175,20 @@ pub fn translate_create_role(
     }
     let superuser = false;
 
-    program.emit_insn(Insn::SetCookie {
-        db: MAIN_DB_ID,
-        cookie: Cookie::SchemaVersion,
-        value: (resolver.schema().schema_version + 1) as i32,
-        p5: 0,
-    });
-
-    let (roles_table, roles_root_page) = emit_roles_table_if_missing(resolver, program)?;
+    let existing = resolver
+        .schema()
+        .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME);
+    let (roles_table, roles_root_page) = match existing {
+        Some(table) => {
+            emit_schema_cookie(resolver, program);
+            let root_page = RegisterOrLiteral::Literal(table.root_page);
+            (table, root_page)
+        }
+        // Creating the table bumps the schema cookie too.
+        None => {
+            emit_create_internal_table(program, resolver, ROLES_TABLE_NAME, CREATE_ROLES_TABLE_SQL)?
+        }
+    };
     let roles_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(roles_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: roles_cursor_id,
@@ -235,24 +238,6 @@ pub fn translate_create_role(
         superuser,
     });
     Ok(())
-}
-
-/// Returns the roles table and its root page. If the table does not exist
-/// yet, emits bytecode that creates it and returns the register that will
-/// hold its root page.
-fn emit_roles_table_if_missing(
-    resolver: &Resolver,
-    program: &mut ProgramBuilder,
-) -> Result<(Arc<BTreeTable>, RegisterOrLiteral<i64>)> {
-    if let Some(table) = resolver
-        .schema()
-        .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
-    {
-        let root_page = RegisterOrLiteral::Literal(table.root_page);
-        return Ok((table, root_page));
-    }
-
-    emit_create_internal_table(program, resolver, ROLES_TABLE_NAME, CREATE_ROLES_TABLE_SQL)
 }
 
 #[cfg(test)]

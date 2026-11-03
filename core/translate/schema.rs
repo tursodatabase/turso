@@ -2992,8 +2992,6 @@ fn persist_type_definition(
     Ok(())
 }
 
-/// Marks the transaction as having changed the schema, so that a rollback restores the connection
-/// schema, and bumps the schema cookie of the main database.
 /// Creates one of the engine's own tables in the main database the first
 /// time it is used: a new B-tree, its row in `sqlite_schema`, and the table
 /// in the in-memory schema. Returns the table and the root page that the
@@ -3047,7 +3045,9 @@ pub(crate) fn emit_create_internal_table(
     Ok((table, RegisterOrLiteral::Register(root_reg)))
 }
 
-fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuilder) {
+/// Marks the transaction as having changed the schema, so that a rollback restores the connection
+/// schema, and bumps the schema cookie of the main database.
+pub(crate) fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuilder) {
     program.emit_insn(Insn::SetCookie {
         db: MAIN_DB_ID,
         cookie: Cookie::SchemaVersion,
