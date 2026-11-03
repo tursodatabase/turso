@@ -27,6 +27,12 @@ pub const CREATE_ROLES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_roles (\
     name TEXT NOT NULL, \
     superuser INTEGER NOT NULL)";
 
+pub const ROLES_NAME_INDEX_NAME: &str = "__turso_internal_roles_name";
+
+/// Keeps role names unique in the stored table, whatever writes it.
+pub const CREATE_ROLES_NAME_INDEX_SQL: &str =
+    "CREATE UNIQUE INDEX __turso_internal_roles_name ON __turso_internal_roles (name)";
+
 pub const SELECT_ROLES_SQL: &str = "SELECT id, name, superuser FROM __turso_internal_roles";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

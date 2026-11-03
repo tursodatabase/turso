@@ -14,11 +14,13 @@ use crate::namespace::NamespaceId;
 use turso_parser::ast;
 
 use crate::security::permission::{Action, Object, PermissionDenied};
-use crate::security::roles::{CREATE_ROLES_TABLE_SQL, ROLES_TABLE_NAME};
+use crate::security::roles::{
+    CREATE_ROLES_NAME_INDEX_SQL, CREATE_ROLES_TABLE_SQL, ROLES_NAME_INDEX_NAME, ROLES_TABLE_NAME,
+};
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u32, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
@@ -167,21 +169,44 @@ pub fn translate_create_role(
     let existing = resolver
         .schema()
         .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME);
-    let (roles_table, roles_root_page) = match existing {
+    let (roles_table, roles_root_page, (name_index, name_index_root_page)) = match existing {
         Some(table) => {
+            let name_index = resolver
+                .schema()
+                .get_indices(NamespaceId::ROOT, ROLES_TABLE_NAME)
+                .find(|index| index.name == ROLES_NAME_INDEX_NAME)
+                .cloned()
+                .ok_or_else(|| {
+                    LimboError::Corrupt(format!("{ROLES_TABLE_NAME} has no name index"))
+                })?;
             emit_schema_cookie(resolver, program);
             let root_page = RegisterOrLiteral::Literal(table.root_page);
-            (table, root_page)
+            let name_index_root_page = RegisterOrLiteral::Literal(name_index.root_page);
+            (table, root_page, (name_index, name_index_root_page))
         }
         // Creating the table bumps the schema cookie too.
         None => {
-            emit_create_internal_table(program, resolver, ROLES_TABLE_NAME, CREATE_ROLES_TABLE_SQL)?
+            let mut created = emit_create_internal_table(
+                program,
+                resolver,
+                ROLES_TABLE_NAME,
+                CREATE_ROLES_TABLE_SQL,
+                &[CREATE_ROLES_NAME_INDEX_SQL],
+            )?;
+            let name_index = created.indexes.pop().expect("one index was created");
+            (created.table, created.root_page, name_index)
         }
     };
     let roles_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(roles_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: roles_cursor_id,
         root_page: roles_root_page,
+        db: MAIN_DB_ID,
+    });
+    let name_index_cursor_id = program.alloc_cursor_index(None, &name_index)?;
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: name_index_cursor_id,
+        root_page: name_index_root_page,
         db: MAIN_DB_ID,
     });
 
@@ -219,6 +244,13 @@ pub fn translate_create_role(
         flag: InsertFlags::new().skip_last_rowid(),
         table_name: ROLES_TABLE_NAME.to_string(),
     });
+    emit_role_name_index_entry(
+        program,
+        name_index_cursor_id,
+        &name_index.name,
+        role_name,
+        id_reg,
+    );
 
     program.emit_insn(Insn::AddRole {
         db: MAIN_DB_ID,
@@ -227,6 +259,58 @@ pub fn translate_create_role(
         superuser,
     });
     Ok(())
+}
+
+/// Adds the role's name to the name index, failing if another role has the
+/// name. The in-memory catalog has already rejected a name it knows, so this
+/// only fails if the stored table has a role the catalog does not.
+fn emit_role_name_index_entry(
+    program: &mut ProgramBuilder,
+    cursor_id: usize,
+    index_name: &str,
+    role_name: &str,
+    id_reg: usize,
+) {
+    let key_reg = program.alloc_registers(2);
+    program.emit_insn(Insn::String8 {
+        value: role_name.to_string(),
+        dest: key_reg,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: id_reg,
+        dst_reg: key_reg + 1,
+        extra_amount: 0,
+    });
+    let no_conflict = program.allocate_label();
+    program.emit_insn(Insn::NoConflict {
+        cursor_id,
+        target_pc: no_conflict,
+        record_reg: key_reg,
+        num_regs: 1,
+    });
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: crate::error::SQLITE_CONSTRAINT_UNIQUE,
+        description: format!("role \"{role_name}\" already exists"),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(no_conflict);
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(key_reg),
+        count: to_u32(2),
+        dest_reg: to_u32(record_reg),
+        index_name: Some(index_name.to_string()),
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id,
+        record_reg,
+        unpacked_start: Some(key_reg),
+        unpacked_count: Some(2),
+        flags: IdxInsertFlags::new(),
+    });
 }
 
 #[cfg(test)]

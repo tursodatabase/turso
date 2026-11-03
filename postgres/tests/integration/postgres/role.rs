@@ -68,6 +68,35 @@ fn roles_are_kept_after_reopening_the_database() {
     );
 }
 
+/// The in-memory catalog rejects a name it knows, but only the stored table
+/// can keep a role name unique against every writer of the file.
+#[test]
+fn stored_roles_table_keeps_role_names_unique() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    let conn = db.connect_limbo();
+    let has_unique_name_index = conn.with_schema(turso_core::MAIN_DB_ID, |schema| {
+        schema
+            .get_indices(turso_core::NamespaceId::ROOT, "__turso_internal_roles")
+            .any(|index| {
+                index.unique
+                    && index
+                        .columns
+                        .iter()
+                        .map(|column| column.name.as_str())
+                        .eq(["name"])
+            })
+    });
+    assert!(has_unique_name_index);
+    db.connect_postgres().execute("CREATE ROLE bob").unwrap();
+}
+
 #[test]
 fn roles_are_kept_after_reopening_an_mvcc_database() {
     let db = TempDatabase::builder().with_mvcc(true).build();
