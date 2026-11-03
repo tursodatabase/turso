@@ -201,6 +201,28 @@ expect {
     3|0|1
 }
 
+test array-cast-null-to-custom-type-array-is-null {
+    CREATE TYPE lower_text_cast BASE text ENCODE value DECODE lower(value);
+    SELECT CAST(NULL AS lower_text_cast[]) IS NULL;
+}
+expect {
+    1
+}
+
+test array-cast-null-in-expression-index-on-custom-type-array {
+    CREATE TYPE lower_text_ix BASE text ENCODE value DECODE lower(value);
+    CREATE TABLE ct(id INTEGER PRIMARY KEY, c lower_text_ix[]) STRICT;
+    INSERT INTO ct VALUES (1, NULL);
+    CREATE INDEX ct_ix ON ct(CAST(c AS lower_text_ix[]));
+    INSERT INTO ct VALUES (2, NULL), (3, '{A,b}');
+    SELECT id, c FROM ct ORDER BY id;
+}
+expect {
+    1|
+    2|
+    3|{a,b}
+}
+
 test array-generated-column-concat-joins-arrays {
     CREATE TABLE g(id INTEGER PRIMARY KEY, a integer[], b integer[], c integer[] GENERATED ALWAYS AS (a || b)) STRICT;
     INSERT INTO g(id, a, b) VALUES (1, '{1,2}', '{3}'), (2, '{5}', '{5}');

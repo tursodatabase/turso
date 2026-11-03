@@ -525,19 +525,11 @@ pub(crate) fn emit_array_decode_for_results(
                 None
             };
             let reg = start_reg + i;
-            let skip = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: skip,
-            });
-
             if let Some(col) = array_col {
                 emit_array_decode(program, reg, col, resolver)?;
             } else if !program.flags.keep_array_results_as_blobs() {
                 program.emit_insn(Insn::ArrayDecode { reg });
             }
-
-            program.preassign_label_to_next_insn(skip);
         }
     }
     Ok(())

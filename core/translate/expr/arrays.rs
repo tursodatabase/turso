@@ -9,11 +9,18 @@ const MAX_ARRAY_LOOP_ELEMENTS: usize = 1024;
 /// Extracts each element, applies `transform_element` to the register holding
 /// it, stores results into contiguous registers, then rebuilds the blob with
 /// MakeArrayDynamic. O(N) instead of O(N²) ArraySetElement per iteration.
+/// A NULL array stays NULL.
 pub(super) fn emit_array_element_loop(
     program: &mut ProgramBuilder,
     reg: usize,
     transform_element: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
 ) -> Result<()> {
+    let null_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: null_label,
+    });
+
     let reg_len = program.alloc_register();
     let reg_idx = program.alloc_register();
     let reg_elem = program.alloc_register();
@@ -108,6 +115,7 @@ pub(super) fn emit_array_element_loop(
         dest: reg,
     });
 
+    program.preassign_label_to_next_insn(null_label);
     Ok(())
 }
 
@@ -229,13 +237,7 @@ pub(crate) fn emit_custom_type_encode_columns(
 
         // Handle array columns: encode input (text or blob) -> record blob for storage
         if col.is_array() {
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: skip_label,
-            });
             emit_array_encode(program, reg, col, resolver, table_name)?;
-            program.preassign_label_to_next_insn(skip_label);
             continue;
         }
 
@@ -295,13 +297,7 @@ pub(crate) fn emit_custom_type_decode_columns(
 
         // Handle array columns: decode record blob -> JSON text for display
         if col.is_array() {
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: skip_label,
-            });
             emit_array_decode(program, reg, col, resolver)?;
-            program.preassign_label_to_next_insn(skip_label);
             continue;
         }
 
