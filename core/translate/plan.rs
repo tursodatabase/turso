@@ -12,7 +12,7 @@ use crate::{
         emitter::{Resolver, UpdateRowSource},
         expr::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
-            lookup_unqualified_column, StorageClassMask,
+            lookup_unqualified_column, unwrap_parens, StorageClassMask,
         },
         expr_context::{ExprContext, ExprProperties, TableMetadata},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
@@ -69,12 +69,18 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
 /// keeps that affinity unless a later arm yields a conflicting datatype class
 /// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
 /// case it is downgraded to BLOB (none) so the column is compared by storage
-/// class.
+/// class. A numeric affinity becomes NUMERIC when the first arm's expression is
+/// a CAST, where SQLite uses its FLEXNUM affinity (see
+/// [CompoundColumnAffinity::stores_values_unchanged]).
 pub(super) fn compound_column_affinity(
     arms: &[&SelectPlan],
     i: usize,
     resolver: &Resolver,
-) -> Affinity {
+) -> CompoundColumnAffinity {
+    let plain = |affinity| CompoundColumnAffinity {
+        affinity,
+        stores_values_unchanged: false,
+    };
     let column_types = |expr: Option<&ast::Expr>, metadata: &TableMetadata| match expr {
         Some(expr) => (
             get_expr_affinity(expr, metadata),
@@ -98,8 +104,14 @@ pub(super) fn compound_column_affinity(
         }
     }
     let Some(&(mut affinity, _)) = parts.first() else {
-        return Affinity::None;
+        return plain(Affinity::None);
     };
+    let first_expr_is_cast = match arms.first() {
+        Some(arm) if arm.values.is_empty() => arm.result_columns.get(i).map(|rc| &rc.expr),
+        Some(arm) => arm.values.first().and_then(|row| row.get(i)),
+        None => None,
+    }
+    .is_some_and(|expr| matches!(unwrap_parens(expr), Ok(ast::Expr::Cast { .. })));
 
     let mut data_types = StorageClassMask::from_null();
     let mut idx = 0;
@@ -110,17 +122,32 @@ pub(super) fn compound_column_affinity(
         affinity = parts[idx].0;
     }
     if affinity == Affinity::None {
-        return Affinity::None;
+        return plain(Affinity::None);
     }
     // This arm has a real affinity; accumulate the remaining arms' classes.
     for &(_, data_type) in &parts[idx + 1..] {
         data_types |= data_type;
     }
     match affinity {
-        Affinity::Text if data_types.has_numeric() => Affinity::Blob,
-        a if a.is_numeric() && data_types.has_text() => Affinity::Blob,
-        _ => affinity,
+        Affinity::Text if data_types.has_numeric() => plain(Affinity::Blob),
+        a if a.is_numeric() && data_types.has_text() => plain(Affinity::Blob),
+        a if a.is_numeric() && parts.len() > 1 && first_expr_is_cast => CompoundColumnAffinity {
+            affinity: Affinity::Numeric,
+            stores_values_unchanged: true,
+        },
+        _ => plain(affinity),
     }
+}
+
+/// The affinity of a column of a compound SELECT or a VALUES list.
+pub(super) struct CompoundColumnAffinity {
+    pub affinity: Affinity,
+    /// Whether SQLite gives the column its FLEXNUM affinity: it is declared
+    /// NUM, but a value stored from it keeps its type, so a REAL from the first
+    /// SELECT does not turn the integers of the others into reals. No SELECT
+    /// gives text here, so storing the values without any conversion is the
+    /// same.
+    pub stores_values_unchanged: bool,
 }
 
 /// One of the SELECTs that SQLite builds for a VALUES list.
@@ -3261,9 +3288,9 @@ pub(super) fn query_output_columns(
                 .and_then(|names| names.get(column_index).cloned())
                 .or_else(|| result_column.name(table_references).map(String::from));
             let affinity = match (&compound_arms, plan) {
-                (Some(arms), _) => compound_column_affinity(arms, column_index, resolver),
+                (Some(arms), _) => compound_column_affinity(arms, column_index, resolver).affinity,
                 (None, Plan::Select(select)) if !select.values.is_empty() => {
-                    compound_column_affinity(&[&**select], column_index, resolver)
+                    compound_column_affinity(&[&**select], column_index, resolver).affinity
                 }
                 _ => infer_type_from_expr(&result_column.expr, Some(table_references)),
             };
