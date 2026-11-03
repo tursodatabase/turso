@@ -303,8 +303,9 @@ fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<Strin
         let grantee = if owner == 0 { "" } else { &role };
         entries.push(format!("{grantee}={owner_privileges}/{role}"));
     }
-    let elements: Vec<String> = entries.iter().map(|entry| array_element(entry)).collect();
-    Ok(Some(format!("{{{}}}", elements.join(","))))
+    Ok(Some(turso_core::text_array_literal(
+        entries.iter().map(String::as_str),
+    )))
 }
 
 fn acl_role_name(name: &str) -> String {
@@ -312,22 +313,6 @@ fn acl_role_name(name: &str) -> String {
         return name.to_string();
     }
     format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-fn array_element(element: &str) -> String {
-    let needs_quotes = element.is_empty()
-        || element.eq_ignore_ascii_case("NULL")
-        || element.chars().any(|c| {
-            matches!(
-                c,
-                '"' | '\\' | '{' | '}' | ',' | ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'
-            )
-        });
-    if !needs_quotes {
-        return element.to_string();
-    }
-    let escaped = element.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
 }
 
 #[derive(strum::EnumString)]
