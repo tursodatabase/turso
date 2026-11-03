@@ -87,9 +87,9 @@ keeps the role, and `DISCARD ALL` resets it.
 **Notes:**
 
 Ownership, `GRANT` and table privileges are not supported yet. A role that is
-not a superuser may read and write the rows of every table and use every
-sequence, but it cannot create, alter or drop objects, create roles, or
-`COPY FROM` a file.
+not a superuser may read the rows of every table, but it cannot insert,
+update, delete or truncate rows, call `nextval` or `setval`, create, alter or
+drop objects, create roles, or `COPY FROM` a file.
 
 **Examples:**
 

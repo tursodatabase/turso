@@ -429,6 +429,70 @@ expect error {
     permission denied for schema public
 }
 
+test role-without-privileges-cannot-insert-rows {
+    CREATE TABLE rw_insert (x int);
+    INSERT INTO rw_insert VALUES (1);
+    CREATE ROLE rw_inserter;
+    SET ROLE rw_inserter;
+    INSERT INTO rw_insert VALUES (1);
+}
+expect error {
+    permission denied for table rw_insert
+}
+
+test role-without-privileges-cannot-update-rows {
+    CREATE TABLE rw_update (x int);
+    INSERT INTO rw_update VALUES (1);
+    CREATE ROLE rw_updateer;
+    SET ROLE rw_updateer;
+    UPDATE rw_update SET x = 2;
+}
+expect error {
+    permission denied for table rw_update
+}
+
+test role-without-privileges-cannot-delete-rows {
+    CREATE TABLE rw_delete (x int);
+    INSERT INTO rw_delete VALUES (1);
+    CREATE ROLE rw_deleteer;
+    SET ROLE rw_deleteer;
+    DELETE FROM rw_delete;
+}
+expect error {
+    permission denied for table rw_delete
+}
+
+test role-without-privileges-cannot-truncate-rows {
+    CREATE TABLE rw_truncate (x int);
+    INSERT INTO rw_truncate VALUES (1);
+    CREATE ROLE rw_truncateer;
+    SET ROLE rw_truncateer;
+    TRUNCATE rw_truncate;
+}
+expect error {
+    permission denied for table rw_truncate
+}
+
+test role-without-privileges-cannot-call-nextval {
+    CREATE SEQUENCE rw_nextval_seq;
+    CREATE ROLE rw_nextval_caller;
+    SET ROLE rw_nextval_caller;
+    SELECT nextval('rw_nextval_seq');
+}
+expect error {
+    permission denied for sequence rw_nextval_seq
+}
+
+test role-without-privileges-cannot-call-setval {
+    CREATE SEQUENCE rw_setval_seq;
+    CREATE ROLE rw_setval_caller;
+    SET ROLE rw_setval_caller;
+    SELECT setval('rw_setval_seq', 5);
+}
+expect error {
+    permission denied for sequence rw_setval_seq
+}
+
 test role-without-privileges-cannot-drop-table {
     CREATE TABLE sr_drop (x int);
     CREATE ROLE sr_dropper;
