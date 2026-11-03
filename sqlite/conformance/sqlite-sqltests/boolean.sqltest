@@ -427,3 +427,58 @@ test and-or-with-a-null-operand-runs-the-other-operand {
 expect error {
     malformed JSON
 }
+
+# An aggregate in the operand that `x AND 0` or `x OR 1` drops still makes the
+# query an aggregate query, so it gives one row.
+
+test and-or-with-a-constant-operand-keeps-an-aggregate-query {
+    CREATE TABLE agg(a, g);
+    INSERT INTO agg VALUES (1, 1), (3, 1), (5, 2);
+    CREATE TABLE agg_empty(a);
+    SELECT count(*) OR 1 FROM agg;
+    SELECT sum(a) AND 0 FROM agg;
+    SELECT sum(a) AND 0 FROM agg_empty;
+    SELECT CASE WHEN count(*) OR 1 THEN 'y' END FROM agg;
+    SELECT (SELECT count(*) AND 0 FROM agg_empty);
+    SELECT g, sum(a) AND 0 FROM agg GROUP BY g ORDER BY g;
+    INSERT INTO agg_empty SELECT sum(a) OR 1 FROM agg;
+    SELECT count(*) FROM agg_empty;
+}
+expect {
+    1
+    0
+    0
+    y
+    0
+    1|0
+    2|0
+    1
+}
+
+# In a chain such as `5 AND 0 AND x`, the inner `5 AND 0` is folded to 0
+# first, so `x` never runs either, in the result columns and in WHERE and
+# HAVING, which keep the whole chain as one term.
+
+test and-chain-with-a-constant-false-operand-never-runs-the-other-operands {
+    CREATE TABLE chain(a, g);
+    INSERT INTO chain VALUES (1, 1), (3, 2);
+    SELECT 5 AND 0 AND (SELECT abs(-9223372036854775807 - 1)), (SELECT abs(-9223372036854775807 - 1)) AND (0 AND 5);
+    SELECT a FROM chain WHERE a AND 0 AND (SELECT abs(-9223372036854775807 - 1));
+    SELECT a FROM chain WHERE g = 1 AND (a AND 0) AND (SELECT abs(-9223372036854775807 - 1));
+    SELECT g FROM chain GROUP BY g HAVING g AND 0 AND (SELECT abs(-9223372036854775807 - 1));
+    SELECT count(*) FROM chain;
+}
+expect {
+    0|0
+    2
+}
+
+# The folded value is the 0 or 1 the AND or OR would have given, not the
+# literal operand that decided it.
+
+test and-or-with-a-constant-operand-gives-0-or-1 {
+    SELECT 0 OR 5, 5 OR 0, (3) AND 0, 0 AND (3), 5 AND 0 AND 7, 0 OR 5 OR 7, typeof(0 OR 5), typeof(5 AND 0);
+}
+expect {
+    1|1|0|0|0|1|integer|integer
+}

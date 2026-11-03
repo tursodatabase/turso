@@ -3260,20 +3260,29 @@ pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     // left as-is by unwrap_parens.
     let predicate = unwrap_parens(predicate).unwrap_or(predicate);
     match predicate {
-        // A conjunction with the integer literal 0 stays one term, so binding
-        // folds it to 0 instead of planning the other operand. SQLite's parser
-        // folds exactly that shape; `g = 2 AND false` still splits, and the
-        // `g = 2` term can move from HAVING to WHERE.
-        Expr::Binary(left, ast::Operator::And, right)
-            if integer_literal_truth_value(left) != Some(false)
-                && integer_literal_truth_value(right) != Some(false) =>
-        {
+        // A conjunction with the integer literal 0 among its terms stays one
+        // term, so binding folds it to 0 instead of planning the other terms.
+        // SQLite's parser folds exactly that shape; `g = 2 AND false` still
+        // splits, and the `g = 2` term can move from HAVING to WHERE.
+        Expr::Binary(left, ast::Operator::And, right) if !and_chain_has_integer_zero(predicate) => {
             break_predicate_at_and_boundaries(left, out_predicates);
             break_predicate_at_and_boundaries(right, out_predicates);
         }
         _ => {
             out_predicates.push(predicate.clone().into());
         }
+    }
+}
+
+/// True for the integer literal 0, or an AND chain with 0 as one of its terms,
+/// such as `a AND 0 AND b`: SQLite's parser folds every such chain to 0.
+fn and_chain_has_integer_zero(expr: &Expr) -> bool {
+    let expr = unwrap_parens(expr).unwrap_or(expr);
+    match expr {
+        Expr::Binary(left, ast::Operator::And, right) => {
+            and_chain_has_integer_zero(left) || and_chain_has_integer_zero(right)
+        }
+        _ => integer_literal_truth_value(expr) == Some(false),
     }
 }
 
