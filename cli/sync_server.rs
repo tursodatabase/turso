@@ -841,7 +841,40 @@ impl TursoSyncServer {
             }
             Err(err) => return Err(err.into()),
         };
-        let snapshot = match scan_mvcc_log(&log) {
+        if self.encryption.is_some() && log.len() == MVCC_LOG_HEADER_SIZE {
+            frame_codec::validate_log_header(&log)?;
+            let start = parse_mvcc_revision_offset(&req.client_revision, log.len() as u64)?;
+            anyhow::ensure!(
+                start == 0 || start == log.len() as u64,
+                "MVCC logical pull offset is not a transaction boundary"
+            );
+            // An empty database initially has an LML2 header. Its first portable
+            // transaction upgrades the header in place, preserving salt and offsets.
+            return self.handle_empty_logical_pull(format!("g1:o{}", log.len()), db_size);
+        }
+        let normalized = match self
+            .encryption
+            .as_ref()
+            .map(|e| normalize_encrypted_log(&log, &e.context()?))
+            .transpose()
+        {
+            Ok(normalized) => normalized,
+            Err(err) if is_nonportable_mvcc_log_error(&err) => {
+                return self.handle_logical_fallback(
+                    db,
+                    req,
+                    fallback_revision,
+                    &legacy_current_revision,
+                    db_size,
+                );
+            }
+            Err(err) => return Err(err),
+        };
+        let snapshot = match normalized
+            .as_ref()
+            .map(|n| Ok(n.snapshot.clone()))
+            .unwrap_or_else(|| scan_mvcc_log(&log))
+        {
             Ok(snapshot) => snapshot,
             Err(err) if is_nonportable_mvcc_log_error(&err) => {
                 info!(
@@ -865,10 +898,19 @@ impl TursoSyncServer {
                 snapshot.end_offset
             ));
         }
-        let start = usize::try_from(start_offset)
+        let source_start = usize::try_from(start_offset)
             .map_err(|_| anyhow!("MVCC logical pull start offset overflows usize"))?;
-        let end = usize::try_from(snapshot.end_offset)
+        let source_end = usize::try_from(snapshot.end_offset)
             .map_err(|_| anyhow!("MVCC logical pull end offset overflows usize"))?;
+        let (log, start, end) = if let Some(normalized) = &normalized {
+            let start = *normalized
+                .wire_offsets
+                .get(&start_offset)
+                .ok_or_else(|| anyhow!("MVCC offset is not a transaction boundary"))?;
+            (normalized.body.as_slice(), start, normalized.body.len())
+        } else {
+            (log.as_slice(), source_start, source_end)
+        };
 
         let mut response_body = Vec::new();
         let (mvcc_log, body) = if start == end {
@@ -1829,6 +1871,60 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    #[test]
+    fn encrypted_pull_rejects_corrupt_header_instead_of_replacing_base() {
+        for cipher in [CipherMode::Aes256Gcm, CipherMode::Aegis256] {
+            let dir = tempfile::tempdir().unwrap();
+            let encryption = ServerEncryption {
+                cipher,
+                key: EncryptionKey::new_256([11; 32]),
+            };
+            let path = dir.path().join("data");
+            let handle = open_db_handle(
+                &path,
+                &OpenConfig {
+                    vfs: None,
+                    flags: OpenFlags::Create,
+                    db_opts: DatabaseOpts::new(),
+                    max_open: 1,
+                    encryption: Some(encryption.clone()),
+                },
+            )
+            .unwrap();
+            {
+                let conn = handle.conn.lock().unwrap();
+                conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+                conn.execute("CREATE TABLE secrets(value TEXT)").unwrap();
+                conn.execute("INSERT INTO secrets VALUES ('committed secret')")
+                    .unwrap();
+            }
+            let mut server = dir_server(dir.path());
+            server.encryption = Some(encryption);
+            let request = PullUpdatesReqProtoBody {
+                stream_kind: PullUpdatesStreamKind::MvccLogicalLog as i32,
+                client_revision: "g1:o0".into(),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let log_path = logical_log_path(path.to_str().unwrap()).unwrap();
+            let original = std::fs::read(&log_path).unwrap();
+            assert_eq!(original[4], MVCC_LOG_VERSION);
+            assert!(original.len() > MVCC_LOG_HEADER_SIZE);
+            for version in [2, 4] {
+                let mut corrupt = original.clone();
+                corrupt[4] = version;
+                std::fs::write(&log_path, &corrupt).unwrap();
+                let result = server.handle_pull_updates(&handle, &request);
+                assert!(
+                    result.is_err(),
+                    "corrupt version {version} must not return replacement pages"
+                );
+                assert!(!is_nonportable_mvcc_log_error(&result.err().unwrap()));
+            }
+            std::fs::write(log_path, original).unwrap();
+        }
     }
 
     #[test]
