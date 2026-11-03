@@ -1,0 +1,51 @@
+@database :memory:
+
+# A UNIQUE failure on several columns lists each one as `table.column`, the
+# format ORMs parse to find the conflicting columns.
+
+test composite-primary-key-violation-lists-each-column {
+    CREATE TABLE t (a, b, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 1);
+}
+expect error {
+    ^UNIQUE constraint failed: t\.a, t\.b$
+}
+
+test composite-unique-violation-keeps-constraint-column-order {
+    CREATE TABLE t (a, b, c, UNIQUE (c, a, b));
+    INSERT INTO t VALUES (1, 1, 1);
+    INSERT INTO t VALUES (1, 1, 1);
+}
+expect error {
+    ^UNIQUE constraint failed: t\.c, t\.a, t\.b$
+}
+
+test composite-unique-index-violation-from-insert-select {
+    CREATE TABLE t (a, b);
+    CREATE UNIQUE INDEX i ON t (a, b);
+    CREATE TABLE s (a, b);
+    INSERT INTO s VALUES (1, 1), (1, 1);
+    INSERT INTO t SELECT * FROM s;
+}
+expect error {
+    ^UNIQUE constraint failed: t\.a, t\.b$
+}
+
+test create-composite-unique-index-over-duplicate-rows {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 1), (1, 1);
+    CREATE UNIQUE INDEX i ON t (a, b);
+}
+expect error {
+    ^UNIQUE constraint failed: t\.a, t\.b$
+}
+
+test upsert-do-update-violating-another-composite-unique {
+    CREATE TABLE t (a, b, c, UNIQUE (a, b), UNIQUE (c));
+    INSERT INTO t VALUES (1, 1, 1), (2, 2, 2);
+    INSERT INTO t VALUES (3, 3, 1) ON CONFLICT (c) DO UPDATE SET a = 2, b = 2;
+}
+expect error {
+    ^UNIQUE constraint failed: t\.a, t\.b$
+}
