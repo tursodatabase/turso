@@ -913,7 +913,8 @@ fn derive_ctas_schema(
         }
         _ => bail_parse_error!("unexpected plan type for CTAS"),
     };
-    // SQLite derives a compound output affinity from all arms, not only the leftmost arm.
+    // SQLite derives a compound output affinity from all arms, not only the leftmost arm,
+    // and a VALUES list's affinity from its rows.
     let compound_arms = match &plan {
         Plan::CompoundSelect {
             left, right_most, ..
@@ -923,6 +924,7 @@ fn derive_ctas_schema(
             arms.push(right_most);
             Some(arms)
         }
+        Plan::Select(select) if !select.values.is_empty() => Some(vec![&**select]),
         _ => None,
     };
 
@@ -949,7 +951,7 @@ fn derive_ctas_schema(
         // Names come from the leftmost arm, but compound affinity can weaken its type.
         let ty = compound_arms
             .as_ref()
-            .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
+            .map(|arms| compound_column_affinity(arms, column_index, resolver).short_type_name())
             .unwrap_or_else(|| col.declared_type(table_refs));
 
         let quoted = quote_identifier(&name);

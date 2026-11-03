@@ -869,10 +869,12 @@ fn get_subquery_parser<'a>(
                 let columns: Vec<_> = plan
                     .result_columns
                     .iter()
-                    .map(|result_col| RowValueSubqueryColumn {
-                        affinity: get_expr_affinity(
-                            &result_col.expr,
+                    .enumerate()
+                    .map(|(i, result_col)| RowValueSubqueryColumn {
+                        affinity: plan.subquery_column_affinity(
+                            i,
                             &ExprContext::new(Some(&plan.table_references), resolver),
+                            resolver,
                         ),
                         expr_type: type_of(&result_col.expr, &env),
                     })
@@ -1044,13 +1046,18 @@ fn get_subquery_parser<'a>(
                         lhs_expr,
                         &ExprContext::new(Some(referenced_tables), resolver),
                     );
+                    let rhs_context = ExprContext::new(Some(table_references), resolver);
+                    let rhs_affinity = match &plan {
+                        Plan::Select(select) => {
+                            select.subquery_column_affinity(i, &rhs_context, resolver)
+                        }
+                        Plan::CompoundSelect { right_most, .. } => {
+                            right_most.subquery_column_affinity(i, &rhs_context, resolver)
+                        }
+                        _ => get_expr_affinity(&result_columns[i].expr, &rhs_context),
+                    };
                     affinity_chars.push(
-                        comparison_affinity(
-                            &result_columns[i].expr,
-                            lhs_affinity,
-                            &ExprContext::new(Some(table_references), resolver),
-                        )
-                        .aff_mask(),
+                        comparison_affinity(rhs_affinity, lhs_affinity, &rhs_context).aff_mask(),
                     );
                     lhs_exprs.push(lhs_expr);
                 }

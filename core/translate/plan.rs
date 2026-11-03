@@ -14,9 +14,12 @@ use crate::{
             as_binary_components, expr_data_type, find_unqualified_column, get_expr_affinity,
             lookup_unqualified_column, StorageClassMask,
         },
-        expr_context::{ExprContext, TableMetadata},
+        expr_context::{ExprContext, ExprProperties, TableMetadata},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
-        optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
+        optimizer::{
+            constraints::{BinaryExprSide, SeekRangeConstraint},
+            Optimizable,
+        },
         planner::determine_where_to_eval_term,
     },
     types::SeekOp,
@@ -56,7 +59,9 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
 }
 
 /// Computes the affinity of column `i` of a compound (UNION/INTERSECT/EXCEPT)
-/// subquery, matching SQLite's `sqlite3SubqueryColumnTypes` (select.c).
+/// subquery, matching SQLite's `sqlite3SubqueryColumnTypes` (select.c). An arm
+/// that is a VALUES list counts as the SELECTs SQLite builds for it (see
+/// [values_parts]), so a lone VALUES list can be passed as the only arm.
 ///
 /// Scanning the arms left-to-right, the affinity is the first arm's affinity,
 /// skipping leading arms that have no affinity (adopting the next arm's). If
@@ -65,44 +70,101 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
 /// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
 /// case it is downgraded to BLOB (none) so the column is compared by storage
 /// class.
-pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
-    if arms.is_empty() {
-        return Affinity::None;
-    }
-    let col_affinities = |arm: &SelectPlan| {
-        arm.result_columns
-            .get(i)
-            .map(|rc| get_expr_affinity(&rc.expr, &TableMetadata::new(Some(&arm.table_references))))
-            .unwrap_or(Affinity::None)
+pub(super) fn compound_column_affinity(
+    arms: &[&SelectPlan],
+    i: usize,
+    resolver: &Resolver,
+) -> Affinity {
+    let column_types = |expr: Option<&ast::Expr>, metadata: &TableMetadata| match expr {
+        Some(expr) => (
+            get_expr_affinity(expr, metadata),
+            expr_data_type(expr, metadata),
+        ),
+        None => (Affinity::None, StorageClassMask::from_null()),
     };
-    let col_data_type = |arm: &SelectPlan| {
-        arm.result_columns
-            .get(i)
-            .map(|rc| expr_data_type(&rc.expr, &TableMetadata::new(Some(&arm.table_references))))
-            .unwrap_or(StorageClassMask::from_null())
+    let mut parts = Vec::new();
+    for arm in arms {
+        let metadata = TableMetadata::new(Some(&arm.table_references));
+        if arm.values.is_empty() {
+            let expr = arm.result_columns.get(i).map(|rc| &rc.expr);
+            parts.push(column_types(expr, &metadata));
+            continue;
+        }
+        for part in values_parts(&arm.values, &metadata, resolver) {
+            parts.push(match part {
+                ValuesPart::Row(row) => column_types(row.get(i), &metadata),
+                ValuesPart::CoRoutine => (Affinity::None, StorageClassMask::all()),
+            });
+        }
+    }
+    let Some(&(mut affinity, _)) = parts.first() else {
+        return Affinity::None;
     };
 
-    let mut affinity = col_affinities(arms[0]);
     let mut data_types = StorageClassMask::from_null();
     let mut idx = 0;
     // Skip leading arms with no affinity, adopting the next arm's affinity.
-    while affinity == Affinity::None && idx + 1 < arms.len() {
-        data_types |= col_data_type(arms[idx]);
+    while affinity == Affinity::None && idx + 1 < parts.len() {
+        data_types |= parts[idx].1;
         idx += 1;
-        affinity = col_affinities(arms[idx]);
+        affinity = parts[idx].0;
     }
     if affinity == Affinity::None {
         return Affinity::None;
     }
     // This arm has a real affinity; accumulate the remaining arms' classes.
-    for &arm in &arms[idx + 1..] {
-        data_types |= col_data_type(arm);
+    for &(_, data_type) in &parts[idx + 1..] {
+        data_types |= data_type;
     }
     match affinity {
         Affinity::Text if data_types.has_numeric() => Affinity::Blob,
         a if a.is_numeric() && data_types.has_text() => Affinity::Blob,
         _ => affinity,
     }
+}
+
+/// One of the SELECTs that SQLite builds for a VALUES list.
+enum ValuesPart<'a> {
+    /// A single row.
+    Row(&'a [ast::Expr]),
+    /// Constant rows read through a co-routine. Its columns have no affinity
+    /// and can hold values of any type.
+    CoRoutine,
+}
+
+/// The SELECTs that SQLite combines with UNION ALL for a VALUES list, as
+/// `sqlite3MultiValues` (insert.c) builds them. A row is a SELECT of its own
+/// when it is not constant, or when the SELECT before it is a single row that
+/// is not constant or has an affinity. Other rows go into a co-routine.
+///
+/// SQLite also gives every row its own SELECT when the statement has a WITH
+/// clause or belongs to the schema, such as a view. Turso does not do that, so
+/// there a constant row after a first row without affinity does not count.
+fn values_parts<'a>(
+    values: &'a [Vec<ast::Expr>],
+    metadata: &impl ExprProperties,
+    resolver: &Resolver,
+) -> Vec<ValuesPart<'a>> {
+    let is_constant = |row: &[ast::Expr]| row.iter().all(|expr| expr.is_constant(resolver));
+    let has_affinity = |row: &[ast::Expr]| {
+        row.iter()
+            .any(|expr| get_expr_affinity(expr, metadata) != Affinity::None)
+    };
+    let mut parts = Vec::new();
+    for row in values {
+        let joins_co_routine = match parts.last() {
+            None => false,
+            Some(ValuesPart::Row(previous)) => {
+                is_constant(row) && is_constant(previous) && !has_affinity(previous)
+            }
+            Some(ValuesPart::CoRoutine) => is_constant(row),
+        };
+        match parts.last_mut() {
+            Some(last) if joins_co_routine => *last = ValuesPart::CoRoutine,
+            _ => parts.push(ValuesPart::Row(row)),
+        }
+    }
+    parts
 }
 
 #[derive(Debug, Clone)]
@@ -900,6 +962,27 @@ pub struct SelectPlan {
 impl SelectPlan {
     pub fn joined_tables(&self) -> &[JoinedTable] {
         self.table_references.joined_tables()
+    }
+
+    /// The affinity of result column `i` when a scalar or IN subquery reads
+    /// this SELECT. SQLite takes it from the last SELECT it builds, so for a
+    /// VALUES list that is the last row, or no affinity when the last rows are
+    /// read through a co-routine (see [values_parts]).
+    pub(crate) fn subquery_column_affinity(
+        &self,
+        i: usize,
+        metadata: &impl ExprProperties,
+        resolver: &Resolver,
+    ) -> Affinity {
+        let expr = if self.values.is_empty() {
+            self.result_columns.get(i).map(|rc| &rc.expr)
+        } else {
+            match values_parts(&self.values, metadata, resolver).last() {
+                Some(ValuesPart::Row(row)) => row.get(i),
+                _ => None,
+            }
+        };
+        expr.map_or(Affinity::None, |expr| get_expr_affinity(expr, metadata))
     }
 
     pub fn agg_args_count(&self) -> usize {
@@ -3177,12 +3260,13 @@ pub(super) fn query_output_columns(
             let name = explicit_columns
                 .and_then(|names| names.get(column_index).cloned())
                 .or_else(|| result_column.name(table_references).map(String::from));
-            let affinity = compound_arms
-                .as_ref()
-                .map(|arms| compound_column_affinity(arms, column_index))
-                .unwrap_or_else(|| {
-                    infer_type_from_expr(&result_column.expr, Some(table_references))
-                });
+            let affinity = match (&compound_arms, plan) {
+                (Some(arms), _) => compound_column_affinity(arms, column_index, resolver),
+                (None, Plan::Select(select)) if !select.values.is_empty() => {
+                    compound_column_affinity(&[&**select], column_index, resolver)
+                }
+                _ => infer_type_from_expr(&result_column.expr, Some(table_references)),
+            };
             let column_type = affinity.to_type();
             let mut column = Column::new(
                 name,
