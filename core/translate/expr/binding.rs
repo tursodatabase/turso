@@ -116,8 +116,29 @@ enum QualifiedNameMatch {
 
 /// Rewrite ast::Expr in place, binding Column references/rewriting Expr::Id -> Expr::Column
 /// using the provided TableReferences, and replacing anonymous parameters with internal named
-/// ones
+/// ones, then applies the [BINDING_REWRITES].
+#[turso_macros::trace_stack]
 pub fn bind_and_rewrite_expr<'a>(
+    top_level_expr: &mut ast::Expr,
+    referenced_tables: Option<&'a mut TableReferences>,
+    result_columns: Option<&'a [ResultSetColumn]>,
+    resolver: &Resolver<'_>,
+    binding_behavior: BindingBehavior,
+) -> Result<()> {
+    bind_expr(
+        top_level_expr,
+        referenced_tables,
+        result_columns,
+        resolver,
+        binding_behavior,
+    )?;
+    apply_static_rewrites(top_level_expr, BINDING_REWRITES, Some(resolver))
+}
+
+/// [bind_and_rewrite_expr] without the [BINDING_REWRITES]. A HAVING clause
+/// binds its terms with this and applies the rewrites once it knows which
+/// terms move to WHERE (see select::process_having_clause).
+pub fn bind_expr<'a>(
     top_level_expr: &mut ast::Expr,
     referenced_tables: Option<&'a mut TableReferences>,
     result_columns: Option<&'a [ResultSetColumn]>,
@@ -134,7 +155,7 @@ pub fn bind_and_rewrite_expr<'a>(
     )
 }
 
-/// Like [bind_and_rewrite_expr], but no name is ever a column of the tables in `excluded`.
+/// Like [bind_expr], but no name is ever a column of the tables in `excluded`.
 #[turso_macros::trace_stack]
 pub fn bind_and_rewrite_expr_except<'a>(
     top_level_expr: &mut ast::Expr,
@@ -629,8 +650,7 @@ pub fn bind_and_rewrite_expr_except<'a>(
             Ok(WalkControl::Continue)
         },
     )?;
-    check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)?;
-    apply_static_rewrites(top_level_expr, BINDING_REWRITES, Some(resolver))
+    check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
 }
 
 /// Fails when `expr` uses an operator that no function of its operands' types

@@ -166,6 +166,32 @@ expect error {
     integer overflow
 }
 
+# `a = 1 OR TRUE` is folded by SQLite's code generator, after havingToWhere()
+# has seen a term that reads `a`, so the term stays in HAVING.
+@setup overflow
+test having-or-true-under-not-keeps-aggregating {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING NOT (a = 1 OR TRUE);
+}
+expect error {
+    integer overflow
+}
+
+@setup overflow
+test having-or-true-compared-to-zero-keeps-aggregating {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING (a = 1 OR TRUE) = 0;
+}
+expect error {
+    integer overflow
+}
+
+# The same shape over a GROUP BY term still moves to WHERE.
+@setup overflow
+test having-or-true-under-not-over-group-by-term-still-moves {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING NOT (g = 2 OR TRUE);
+}
+expect {
+}
+
 @setup overflow
 test having-subquery-still-aggregates {
     SELECT g, sum(a) FROM t GROUP BY g HAVING g = (SELECT 2);
