@@ -238,6 +238,10 @@ impl Dialect for PostgresDialect {
     fn casts_nonzero_integer_to_true(&self) -> bool {
         true
     }
+
+    fn create_table_as_keeps_column_types(&self) -> bool {
+        true
+    }
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {

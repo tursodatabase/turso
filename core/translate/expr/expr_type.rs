@@ -510,7 +510,7 @@ pub(crate) fn compound_column_type<'p>(
     column: usize,
     resolver: &Resolver,
 ) -> ExprType {
-    common_of_types(
+    common_type_of(
         arms.into_iter()
             .map(|select| select_column_type(select, column, resolver)),
         resolver.schema(),
@@ -959,10 +959,12 @@ fn declared_return_type(
 /// type without parameters. A custom type mixed with any other type counts as
 /// the type it is stored as. Any other mix is `Any`.
 fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) -> ExprType {
-    common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
+    common_type_of(exprs.map(|expr| type_of(expr, env)), env.schema())
 }
 
-fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
+/// [`common_type`] for types that are already worked out, such as the types of
+/// one result column in each SELECT of a compound SELECT.
+pub(crate) fn common_type_of(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
     let mut common: Option<ExprType> = None;
     for ty in types {
         common = Some(match (common, ty) {
