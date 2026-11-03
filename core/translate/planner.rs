@@ -2620,6 +2620,7 @@ pub fn parse_where(
                 resolver,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
+            reject_aggregate_in_predicate(&expr.expr, resolver)?;
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
         // considered independently by constraint extraction and range planning.
@@ -3060,6 +3061,7 @@ fn parse_join(
                         resolver,
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
+                    reject_aggregate_in_predicate(&predicate.expr, resolver)?;
                 }
             }
             ast::JoinConstraint::Using(distinct_names) => {
@@ -3277,6 +3279,50 @@ fn split_predicate_at_and_boundaries<T: From<Expr>>(predicate: &Expr, out_predic
             out_predicates.push(predicate.clone().into());
         }
     }
+}
+
+/// SQLite's resolver rejects an aggregate or window function in a WHERE or
+/// ON clause before anything is planned (NC_AllowAgg is not set there).
+/// Binding is that point here: a term after a constant false term is never
+/// emitted, so `WHERE 0 AND sum(a)` has to fail now, not when `sum(a)` is
+/// emitted. A function inside a subquery belongs to that subquery.
+fn reject_aggregate_in_predicate(expr: &Expr, resolver: &Resolver) -> Result<()> {
+    walk_expr(expr, &mut |e| {
+        let (name, arg_count, call, has_over) = match e {
+            Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => (
+                name,
+                args.len(),
+                format!("{}()", name.as_str()),
+                filter_over.over_clause.is_some(),
+            ),
+            Expr::FunctionCallStar { name, filter_over } => (
+                name,
+                0,
+                format!("{}(*)", name.as_str()),
+                filter_over.over_clause.is_some(),
+            ),
+            _ => return Ok(WalkControl::Continue),
+        };
+        let is_aggregate = match resolver.resolve_function(name.as_str(), arg_count)? {
+            Some(Func::Window(_)) => {
+                crate::bail_parse_error!("misuse of window function {call}")
+            }
+            Some(Func::Agg(_)) => true,
+            Some(Func::External(external)) => external.func.is_aggregate(),
+            _ => false,
+        };
+        if is_aggregate {
+            let kind = if has_over { "window" } else { "aggregate" };
+            crate::bail_parse_error!("misuse of {kind} function {call}");
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 pub fn parse_row_id<F>(

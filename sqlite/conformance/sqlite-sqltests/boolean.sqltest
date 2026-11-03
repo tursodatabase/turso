@@ -457,6 +457,34 @@ expect error {
     misuse of aggregate
 }
 
+# A constant false term does not hide a misused aggregate in the terms after
+# it: SQLite rejects the query before it plans anything.
+
+test and-chain-with-a-constant-false-operand-still-rejects-a-misused-aggregate {
+    CREATE TABLE misuse_after(a);
+    SELECT a FROM misuse_after WHERE 0 AND sum(a);
+}
+expect error {
+    misuse of aggregate function sum()
+}
+
+test and-chain-with-a-constant-false-operand-still-rejects-a-misused-window-function {
+    CREATE TABLE misuse_after_window(a);
+    SELECT a FROM misuse_after_window WHERE 0 AND row_number() OVER ();
+}
+expect error {
+    misuse of window function row_number()
+}
+
+test and-chain-with-a-constant-false-operand-still-rejects-a-misused-aggregate-in-on {
+    CREATE TABLE misuse_after_on(a);
+    CREATE TABLE misuse_after_on_other(b);
+    SELECT a, b FROM misuse_after_on JOIN misuse_after_on_other ON 0 AND count(*);
+}
+expect error {
+    misuse of aggregate function count
+}
+
 # A column name that is only resolved when the statement runs, as in a
 # trigger WHEN clause or an UPSERT DO UPDATE, is still checked.
 
