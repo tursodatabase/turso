@@ -485,6 +485,20 @@ expect error {
     misuse of aggregate function count
 }
 
+# `x AND 0` is decided before names are resolved, as in SQLite's parser.
+
+test and-with-integer-zero-drops-an-unknown-column-name-like-the-parser {
+    CREATE TABLE unknown_name(a);
+    INSERT INTO unknown_name VALUES (1);
+    SELECT 0 AND nosuchcol, a FROM unknown_name;
+    UPDATE unknown_name SET a = 2 WHERE 0 AND nosuchcol;
+    SELECT a FROM unknown_name;
+}
+expect {
+    0|1
+    1
+}
+
 # A column name that is only resolved when the statement runs, as in a
 # trigger WHEN clause or an UPSERT DO UPDATE, is still checked.
 

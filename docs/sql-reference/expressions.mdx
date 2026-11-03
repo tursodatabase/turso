@@ -98,7 +98,7 @@ All comparison operators return `1` (true), `0` (false), or `NULL` (if either op
 | `OR` | Logical OR | `x = 1 OR x = 2` |
 | `NOT` | Logical NOT | `NOT x = 5` |
 
-As in SQLite 3.51 and later, `x AND 0` is `0` and `x OR 1` is `1` without evaluating `x` when the constant operand is an integer literal (written without a digit separator such as `1_000`) or `TRUE`/`FALSE`, so `SELECT 1 OR json_extract('bare', '$.a')` returns `1` instead of a "malformed JSON" error. This also applies to a column `DEFAULT`, a generated column and a `CHECK` constraint.
+As in SQLite 3.51 and later, `x AND 0` is `0` and `x OR 1` is `1` without evaluating `x` when the constant operand is an integer literal (written without a digit separator such as `1_000`) or `TRUE`/`FALSE`, so `SELECT 1 OR json_extract('bare', '$.a')` returns `1` instead of a "malformed JSON" error. This also applies to a column `DEFAULT`, a generated column and a `CHECK` constraint. As in SQLite, `x AND 0` is decided before column names are checked, so `SELECT 0 AND nosuchcol` returns `0`, while `SELECT 1 OR nosuchcol` is still a "no such column" error.
 
 ### Bitwise Operators
 

@@ -42,14 +42,15 @@ pub(crate) fn apply_static_rewrites(
 
 /// SQLite's parser replaces `x AND 0` by 0 as it reads the statement
 /// (sqlite3ExprAnd): the 0 is a plain integer literal, parentheses do not
-/// matter, and neither operand calls a function. That happens before a
-/// WHERE, HAVING or ON clause is split into terms and before a HAVING term
-/// can move to WHERE, so break_predicate_at_and_boundaries applies this
-/// rule to the whole predicate first: `TRUE AND (a AND 0)` becomes 0,
-/// which stays in HAVING, while `g = 2 AND 0 AND abs(1)` becomes
-/// `0 AND abs(1)`, whose `abs(1)` term may move. The folds SQLite's code
-/// generator does later, on TRUE, FALSE and `x OR 1`, are
-/// [AndOrConstantOperand].
+/// matter, and neither operand calls a function. That happens before any
+/// name is resolved, so `0 AND nosuchcol` is 0, before a WHERE, HAVING or
+/// ON clause is split into terms, and before a HAVING term can move to
+/// WHERE. So bind_expr applies this rule before it resolves names, and
+/// break_predicate_at_and_boundaries applies it to the whole predicate
+/// before splitting it: `TRUE AND (a AND 0)` becomes 0, which stays in
+/// HAVING, while `g = 2 AND 0 AND abs(1)` becomes `0 AND abs(1)`, whose
+/// `abs(1)` term may move. The folds SQLite's code generator does later,
+/// on TRUE, FALSE and `x OR 1`, are [AndOrConstantOperand].
 pub(crate) struct AndWithIntegerZero;
 
 impl StaticRewrite for AndWithIntegerZero {
