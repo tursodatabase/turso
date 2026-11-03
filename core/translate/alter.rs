@@ -375,51 +375,6 @@ fn emit_rename_sqlite_sequence_entry(
     });
 }
 
-fn emit_delete_sqlite_sequence_entry(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    database_id: usize,
-    table_name_norm: &str,
-) {
-    let Some(sqlite_sequence) = resolver.with_schema(database_id, |s| {
-        s.get_btree_table(NamespaceId::ROOT, crate::schema::SQLITE_SEQUENCE_TABLE_NAME)
-    }) else {
-        return;
-    };
-
-    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_sequence.clone()));
-    let sequence_name_reg = program.alloc_register();
-    let row_name_to_delete_reg = program.emit_string8_new_reg(table_name_norm.to_string());
-    program.mark_last_insn_constant();
-
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: seq_cursor_id,
-        root_page: RegisterOrLiteral::Literal(sqlite_sequence.root_page),
-        db: database_id,
-    });
-
-    program.cursor_loop(seq_cursor_id, |program, _rowid| {
-        program.emit_column_or_rowid(seq_cursor_id, 0, sequence_name_reg);
-
-        let continue_loop_label = program.allocate_label();
-        program.emit_insn(Insn::Ne {
-            lhs: sequence_name_reg,
-            rhs: row_name_to_delete_reg,
-            target_pc: continue_loop_label,
-            flags: CmpInsFlags::default().jump_if_null(),
-            collation: CollationSeq::for_internal_values(),
-        });
-
-        program.emit_insn(Insn::Delete {
-            cursor_id: seq_cursor_id,
-            table_name: crate::schema::SQLITE_SEQUENCE_TABLE_NAME.to_string(),
-            is_part_of_update: false,
-        });
-
-        program.preassign_label_to_next_insn(continue_loop_label);
-    });
-}
-
 pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
@@ -572,12 +527,10 @@ fn emit_add_column_default_type_validation(
 }
 
 /// Validate NOT NULL and CHECK constraints for a new or altered column by
-/// scanning each existing row of `original_table` as if it had the columns of
-/// `table`, computing virtual generated columns as needed.
+/// scanning each existing row, computing virtual generated columns as needed.
 #[allow(clippy::too_many_arguments)]
 fn emit_column_constraints_validation(
     program: &mut ProgramBuilder,
-    original_table: &BTreeTable,
     table: &BTreeTable,
     column: &Column,
     constraints: &[ast::NamedColumnConstraint],
@@ -660,17 +613,6 @@ fn emit_column_constraints_validation(
         if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
             continue;
         }
-        // A rowid alias is stored as NULL in the record, also when the new
-        // definition makes the column an ordinary one.
-        if original_table.columns()[idx].is_rowid_alias() {
-            program.emit_insn(Insn::Copy {
-                src_reg: rowid_reg,
-                dst_reg: layout.to_register(base_dest_reg, idx),
-                extra_amount: 0,
-            });
-            continue;
-        }
-
         emit_stored_column(
             program,
             cursor_id,
@@ -1523,7 +1465,6 @@ pub fn translate_alter_table(
             emit_column_constraints_validation(
                 program,
                 &btree,
-                &btree,
                 &column,
                 &constraints,
                 resolver,
@@ -1885,15 +1826,12 @@ pub fn translate_alter_table(
                 ));
             }
 
-            // The new definition replaces the old one in the stored CREATE TABLE, so a
-            // PRIMARY KEY or UNIQUE written in the old column would disappear while its
-            // automatic index stays. A rowid alias has no automatic index.
+            // The new definition replaces the old one in the stored CREATE TABLE and
+            // cannot have a PRIMARY KEY or UNIQUE, so one written in the old column,
+            // including an INTEGER PRIMARY KEY, would be lost.
             if !rename {
                 let old_column = &btree.columns()[column_index];
-                if old_column.primary_key()
-                    && btree.primary_key_is_inline
-                    && !old_column.is_rowid_alias()
-                {
+                if old_column.primary_key() && btree.primary_key_is_inline {
                     return Err(LimboError::ParseError(
                         "PRIMARY KEY constraint cannot be altered".to_string(),
                     ));
@@ -1922,10 +1860,13 @@ pub fn translate_alter_table(
                                 "PRIMARY KEY constraint cannot be altered".to_string(),
                             ));
                         }
-                        // A rowid alias is stored as NULL in the record, so existing rows
-                        // must be rewritten to hold the value once the column is ordinary.
-                        let stops_being_rowid_alias =
-                            old_column.is_rowid_alias() && !replacement_column.is_rowid_alias();
+                        // The column cannot start or stop being the rowid: the new definition
+                        // has no PRIMARY KEY, a column with an inline one was rejected above,
+                        // and a table-level one was checked just now.
+                        turso_assert_eq!(
+                            old_column.is_rowid_alias(),
+                            replacement_column.is_rowid_alias()
+                        );
                         let becomes_generated =
                             !old_column.is_generated() && replacement_column.is_generated();
                         // Toggling the virtual-generated bit changes whether the column
@@ -1954,7 +1895,6 @@ pub fn translate_alter_table(
                                 resolver.schema(),
                             );
                         let rewrites_physical_layout = becomes_generated
-                            || stops_being_rowid_alias
                             || virtuality_changed
                             || affinity_changed
                             || strict_type_changed;
@@ -1966,13 +1906,6 @@ pub fn translate_alter_table(
                         )
                     }
                 };
-            let clears_autoincrement_sequence = !rename
-                && btree.has_autoincrement
-                && btree.columns()[column_index].is_rowid_alias()
-                && replacement_column
-                    .as_ref()
-                    .is_some_and(|column| !column.is_rowid_alias());
-
             let is_making_column_generated = definition
                 .constraints
                 .iter()
@@ -2366,7 +2299,6 @@ pub fn translate_alter_table(
                 let altered_table = Arc::new(altered_table);
                 emit_column_constraints_validation(
                     program,
-                    &original_btree,
                     &altered_table,
                     &altered_table.columns()[column_index],
                     &definition.constraints,
@@ -2424,15 +2356,6 @@ pub fn translate_alter_table(
                     &altered_table,
                     &indexes_to_rewrite,
                 )?;
-            }
-
-            if clears_autoincrement_sequence {
-                emit_delete_sqlite_sequence_entry(
-                    program,
-                    resolver,
-                    database_id,
-                    &mangled_table_name,
-                );
             }
 
             program.emit_insn(Insn::SetCookie {
