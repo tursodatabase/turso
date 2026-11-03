@@ -12,7 +12,8 @@ use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, expr_vector_size, integer_literal_truth_value, walk_expr, walk_expr_mut,
+    BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -1864,8 +1865,9 @@ fn move_group_by_only_having_terms_to_where(
     Ok(remaining)
 }
 
-/// Matches the terms SQLite keeps in HAVING as always false (`EP_IsFalse`): integer
-/// literal zero (decimal or hex, without `_` separators), `FALSE` and `x IN ()`.
+/// Matches the terms SQLite keeps in HAVING as always false (`EP_IsFalse`): the
+/// integer literal zero that `integer_literal_truth_value` accepts (decimal or hex,
+/// without `_` separators), `FALSE` and `x IN ()`.
 /// `Expr::is_always_false()` is not used because it also matches other constant false
 /// expressions such as `0.0`, `'0'` and `NOT 1`, which SQLite moves into WHERE.
 /// SQLite's parser also folds `X AND 0` into `0` when X has no function call, so it
@@ -1873,12 +1875,7 @@ fn move_group_by_only_having_terms_to_where(
 /// binding folds to `0`, so it stays in HAVING too.
 fn is_literal_false(expr: &ast::Expr) -> bool {
     match expr {
-        Expr::Literal(ast::Literal::Numeric(n)) => {
-            match n.strip_prefix("0x").or_else(|| n.strip_prefix("0X")) {
-                Some(hex_digits) => u64::from_str_radix(hex_digits, 16) == Ok(0),
-                None => n.parse::<i64>() == Ok(0),
-            }
-        }
+        Expr::Literal(ast::Literal::Numeric(_)) => integer_literal_truth_value(expr) == Some(false),
         Expr::Literal(ast::Literal::False) => true,
         Expr::InList {
             rhs, not: false, ..
