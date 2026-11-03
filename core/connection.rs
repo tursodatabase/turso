@@ -3730,11 +3730,11 @@ impl Connection {
             .unwrap_or_else(|| ObjectAccess::default_for(key.kind, RoleId::SUPERUSER))
     }
 
-    /// Statements prepared under the previous role are prepared again, because
-    /// privileges are checked when a statement is prepared.
+    /// A statement records the role it was prepared for and is prepared again
+    /// when it runs as another role, because privileges are checked when a
+    /// statement is prepared.
     pub fn set_current_role(&self, role: RoleId) {
         *self.current_role.write() = role;
-        self.bump_prepare_context_generation();
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning

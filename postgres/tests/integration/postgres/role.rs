@@ -628,3 +628,27 @@ fn revoke_select_on_a_catalog_table_from_public_hides_it() {
     assert_eq!(error.to_string(), "permission denied for table pg_class");
     conn.execute("SELECT nspname FROM pg_namespace").unwrap();
 }
+
+#[test]
+fn changing_to_another_role_and_back_does_not_prepare_statements_again() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE ROLE bob").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    let mut select = conn.inner().prepare("SELECT 1").unwrap();
+    select.run_collect_rows().unwrap();
+    select.reset().unwrap();
+
+    conn.execute("SET ROLE alice").unwrap();
+    select.run_collect_rows().unwrap();
+    select.reset().unwrap();
+    conn.execute("SET ROLE bob").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    select.run_collect_rows().unwrap();
+
+    assert_eq!(
+        select.stmt_status(turso_core::StatementStatusCounter::Reprepare),
+        0
+    );
+}
