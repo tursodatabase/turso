@@ -2608,6 +2608,9 @@ pub fn parse_where(
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
+            // Rewrite BETWEEN before binding names. Binding counts how often each column is
+            // used, and covering-index checks compare those counts with the uses an index can
+            // supply. Splitting a bound BETWEEN would copy its left side without counting it.
             rewrite_between_exprs(
                 &mut expr.expr,
                 Some(resolver),
@@ -2689,6 +2692,9 @@ pub fn rewrite_between_exprs(
                     Ok(WalkControl::Continue)
                 })?;
                 if lhs_has_alias {
+                    // Bind a copy to see which expression each name stands for. A column of the
+                    // same name wins over an alias, and the first matching alias wins over later
+                    // ones. The copy keeps the real column use counts untouched.
                     let mut expr = lhs.clone();
                     let mut tables = tables.clone();
                     bind_and_rewrite_expr(
@@ -2710,11 +2716,7 @@ pub fn rewrite_between_exprs(
             };
             // Keep the left side evaluated once. Conditions skip the second comparison
             // when the first decides; scalar, IN and EXISTS subqueries in bounds run first.
-            // Keep the no-resolver partial-index path unchanged.
-            let bounds_have_subquery = expr_contains_subquery(start) || expr_contains_subquery(end);
-            if (expr_contains_subquery(lhs_to_check) || lhs_is_nondeterministic)
-                && (resolver.is_some() || !bounds_have_subquery)
-            {
+            if expr_contains_subquery(lhs_to_check) || lhs_is_nondeterministic {
                 return Ok(WalkControl::Continue);
             }
 
