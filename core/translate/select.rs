@@ -12,8 +12,9 @@ use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_vector_size, integer_literal_truth_value, walk_expr, walk_expr_mut,
-    BindingBehavior, WalkControl,
+    apply_static_rewrites, bind_and_rewrite_expr, bind_expr, expr_vector_size,
+    integer_literal_truth_value, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    BINDING_REWRITES,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -659,12 +660,21 @@ fn prepare_one_select_plan(
                         });
                     } else {
                         // HAVING without GROUP BY: treat as ungrouped aggregation with filter
+                        let having = match having_predicates {
+                            Some(mut terms) => {
+                                for term in terms.iter_mut() {
+                                    apply_static_rewrites(term, BINDING_REWRITES, Some(resolver))?;
+                                }
+                                Some(terms)
+                            }
+                            None => None,
+                        };
                         plan.group_by = Some(GroupBy {
                             sort_order: Vec::new(),
                             nulls_order: Vec::new(),
                             sort_elided: false,
                             exprs: vec![],
-                            having: having_predicates,
+                            having,
                             columns_read_by_group_subqueries: Vec::new(),
                         });
                     }
@@ -1776,8 +1786,12 @@ fn process_having_clause(
         check_aliased_aggregate_misuse(expr, result_columns)?;
     }
 
+    // The BINDING_REWRITES wait until move_group_by_only_having_terms_to_where
+    // has decided which terms move: SQLite's havingToWhere() sees the terms
+    // before its code generator folds `x OR 1`, so `NOT (a = 1 OR TRUE)`
+    // stays in HAVING and every group is still aggregated.
     for expr in predicates.iter_mut() {
-        bind_and_rewrite_expr(
+        bind_expr(
             expr,
             Some(table_references),
             Some(result_columns),
@@ -1847,16 +1861,17 @@ fn move_group_by_only_having_terms_to_where(
     where_clause: &mut Vec<WhereTerm>,
 ) -> Result<Vec<ast::Expr>> {
     let mut remaining = Vec::new();
-    for term in having {
-        if !is_literal_false(&term)
+    for mut term in having {
+        let moves = !is_literal_false(&term)
             && is_constant_or_group_by(
                 &term,
                 group_by_exprs,
                 aggregates,
                 table_references,
                 resolver,
-            )?
-        {
+            )?;
+        apply_static_rewrites(&mut term, BINDING_REWRITES, Some(resolver))?;
+        if moves {
             where_clause.push(term.into());
         } else {
             remaining.push(term);

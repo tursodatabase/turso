@@ -80,7 +80,6 @@ use expr_type::*;
 use functions::*;
 #[allow(unused_imports)]
 use metadata::*;
-use rewrite::*;
 #[allow(unused_imports)]
 use translator::*;
 #[allow(unused_imports)]
@@ -100,7 +99,7 @@ pub(crate) use arrays::{
 };
 pub(crate) use binary::{row_value_component_expr, row_value_len};
 pub(crate) use binding::check_custom_types;
-pub use binding::{bind_and_rewrite_expr, BindingBehavior};
+pub use binding::{bind_and_rewrite_expr, bind_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub(crate) use columns::emit_encoded_default;
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
@@ -123,7 +122,9 @@ pub(crate) use emission::{
     seed_returning_row_image_in_cache,
 };
 pub use metadata::ConditionMetadata;
-pub(crate) use rewrite::{apply_static_rewrites, AndWithIntegerZero, BetweenToComparisons};
+pub(crate) use rewrite::{
+    apply_static_rewrites, AndWithIntegerZero, BetweenToComparisons, BINDING_REWRITES,
+};
 pub(crate) use translator::is_sqlite_cast_to;
 pub use translator::{
     resolve_expr, translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
