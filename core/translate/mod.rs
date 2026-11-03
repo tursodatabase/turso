@@ -159,8 +159,14 @@ pub fn translate(
     })?;
 
     let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
-    if check_privileges {
-        roles::check_statement_privileges(&stmt, &resolver, &connection)?;
+    if check_privileges
+        && !resolver
+            .schema()
+            .roles
+            .is_superuser(connection.current_role())
+    {
+        resolver.role_is_not_superuser = true;
+        roles::check_statement_privileges(&stmt)?;
     }
 
     match stmt {

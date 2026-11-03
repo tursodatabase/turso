@@ -13,47 +13,25 @@
 use crate::namespace::NamespaceId;
 use turso_parser::ast;
 
-use crate::schema::Table;
 use crate::security::permission::{Action, Object, PermissionDenied};
 use crate::security::roles::{
     CREATE_ROLES_NAME_INDEX_SQL, CREATE_ROLES_TABLE_SQL, ROLES_NAME_INDEX_NAME, ROLES_TABLE_NAME,
 };
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::WalkControl;
 use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
-use crate::util::{visit_stmt, AstVisitor};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
-use crate::vtab::VirtualTableType;
-use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
-/// Fails if the current role may not run `stmt` at all.
-pub fn check_statement_privileges(
-    stmt: &ast::Stmt,
-    resolver: &Resolver,
-    connection: &Connection,
-) -> Result<()> {
-    if resolver
-        .schema()
-        .roles
-        .is_superuser(connection.current_role())
-    {
-        return Ok(());
-    }
+/// Fails if a role that is not a superuser may not run `stmt` at all. Uses of
+/// sequences and PRAGMAs inside the statement are checked when they are
+/// compiled, by [check_sequence_change] and [check_pragma_function], so that
+/// the views a query reads are checked too.
+pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
     let denial = match stmt {
-        ast::Stmt::Select(_) => {
-            let mut finder = DeniedUseFinder {
-                resolver,
-                denial: None,
-            };
-            visit_stmt(stmt, &mut finder)?;
-            match finder.denial {
-                Some(denial) => denial,
-                None => return Ok(()),
-            }
-        }
+        ast::Stmt::Select(_) => return Ok(()),
         ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => {
             write_denial(tbl_name)
         }
@@ -158,67 +136,30 @@ fn write_denial(tbl_name: &ast::QualifiedName) -> PermissionDenied {
     )
 }
 
-/// Finds the first thing in a query that a role that is not a superuser may
-/// not use: a call that changes a sequence, `nextval()` or `setval()`, or a
-/// table-valued PRAGMA function. Such a function runs its PRAGMA as a
-/// statement of the engine's own, which is not checked, so the PRAGMA is
-/// checked here, as if it was run directly.
-struct DeniedUseFinder<'a, 'b> {
-    resolver: &'a Resolver<'b>,
-    denial: Option<PermissionDenied>,
+/// Fails if the statement is compiled for a role that is not a superuser,
+/// which may not change `sequence` with `nextval()` or `setval()`.
+pub(crate) fn check_sequence_change(resolver: &Resolver, sequence: &str) -> Result<()> {
+    if !resolver.role_is_not_superuser {
+        return Ok(());
+    }
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Write,
+        Object::Sequence(sequence.to_string()),
+    )))
 }
 
-impl DeniedUseFinder<'_, '_> {
-    /// Denies `name` if it is a table-valued PRAGMA function. It may be read
-    /// like a table, without arguments.
-    fn check_pragma_function(&mut self, name: &ast::QualifiedName) {
-        if self.denial.is_some() {
-            return;
-        }
-        let table = self
-            .resolver
-            .schema()
-            .get_table(NamespaceId::ROOT, name.name.as_str());
-        if let Some(Table::Virtual(table)) = table.as_deref() {
-            if let VirtualTableType::Pragma(pragma) = &table.vtab_type {
-                self.denial = Some(PermissionDenied::privilege(
-                    Action::Read,
-                    Object::Setting(pragma.pragma_name.clone()),
-                ));
-            }
-        }
+/// Fails if the statement is compiled for a role that is not a superuser,
+/// which may not read a table-valued PRAGMA function. The function runs
+/// `pragma_name` as a statement of the engine's own, which is not checked, so
+/// the PRAGMA is checked here as if it was run directly.
+pub(crate) fn check_pragma_function(resolver: &Resolver, pragma_name: &str) -> Result<()> {
+    if !resolver.role_is_not_superuser {
+        return Ok(());
     }
-}
-
-impl AstVisitor for DeniedUseFinder<'_, '_> {
-    fn expr(&mut self, expr: &ast::Expr) -> Result<WalkControl> {
-        if self.denial.is_some() {
-            return Ok(WalkControl::SkipChildren);
-        }
-        if let ast::Expr::FunctionCall { name, args, .. } = expr {
-            let name = name.as_str();
-            if name.eq_ignore_ascii_case("nextval") || name.eq_ignore_ascii_case("setval") {
-                let object = match args.first().map(AsRef::as_ref) {
-                    Some(ast::Expr::Literal(ast::Literal::String(sequence))) => {
-                        Object::Sequence(sequence.trim_matches('\'').to_string())
-                    }
-                    _ => Object::Function(name.to_ascii_lowercase()),
-                };
-                self.denial = Some(PermissionDenied::privilege(Action::Write, object));
-            }
-        }
-        Ok(WalkControl::Continue)
-    }
-
-    fn table(&mut self, name: &ast::QualifiedName) -> Result<()> {
-        self.check_pragma_function(name);
-        Ok(())
-    }
-
-    fn table_function(&mut self, name: &ast::QualifiedName) -> Result<()> {
-        self.check_pragma_function(name);
-        Ok(())
-    }
+    Err(permission_denied(PermissionDenied::privilege(
+        Action::Read,
+        Object::Setting(pragma_name.to_string()),
+    )))
 }
 
 fn create_in_schema_denial(name: &ast::QualifiedName) -> PermissionDenied {

@@ -226,6 +226,12 @@ fn role_without_privileges_cannot_call_pragma_functions() {
     conn.execute("CREATE ROLE alice").unwrap();
     conn.execute("SELECT file FROM pragma_database_list")
         .unwrap();
+    conn.execute("CREATE VIEW columns_of_t AS SELECT name FROM pragma_table_info('t')")
+        .unwrap();
+    conn.execute("CREATE VIEW databases AS SELECT file FROM pragma_database_list")
+        .unwrap();
+    conn.execute("CREATE VIEW view_of_databases AS SELECT file FROM databases")
+        .unwrap();
 
     conn.execute("SET ROLE alice").unwrap();
 
@@ -236,6 +242,8 @@ fn role_without_privileges_cannot_call_pragma_functions() {
             "SELECT 1 WHERE EXISTS (SELECT 1 FROM pragma_database_list)",
             "database_list",
         ),
+        ("SELECT name FROM columns_of_t", "table_info"),
+        ("SELECT file FROM view_of_databases", "database_list"),
     ] {
         let error = conn.execute(sql).unwrap_err();
         assert_eq!(
@@ -244,6 +252,37 @@ fn role_without_privileges_cannot_call_pragma_functions() {
             "{sql}"
         );
     }
+}
+
+/// Reading a view is allowed until GRANT exists, so the sequences the view
+/// changes are what is denied. PostgreSQL denies reading the view itself
+/// unless SELECT on it was granted.
+#[test]
+fn role_without_privileges_cannot_change_a_sequence_through_a_view() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    conn.execute("CREATE SEQUENCE s").unwrap();
+    conn.execute("CREATE VIEW next_s AS SELECT nextval('s') AS n")
+        .unwrap();
+    conn.execute("CREATE VIEW set_s AS SELECT setval('s', 5) AS n")
+        .unwrap();
+    conn.execute("CREATE VIEW view_of_set_s AS SELECT n FROM set_s")
+        .unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+
+    for sql in ["SELECT n FROM next_s", "SELECT n FROM view_of_set_s"] {
+        let error = conn.execute(sql).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "permission denied for sequence s",
+            "{sql}"
+        );
+    }
+
+    conn.execute("RESET ROLE").unwrap();
+    let mut stmt = conn.query("SELECT nextval('s')").unwrap().unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap()[0][0].to_string(), "1");
 }
 
 #[test]
