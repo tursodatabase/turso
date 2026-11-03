@@ -1360,17 +1360,18 @@ fn query_pragma(
                                 || fk.parent_columns.len() == fk.child_columns.len()
                         );
                         for (idx, child_column) in fk.child_columns.iter().enumerate() {
-                            let parent_column = fk
-                                .parent_columns
-                                .get(idx)
-                                .map(String::as_str)
-                                .unwrap_or_default();
-
                             program.emit_int(id as i64, base_reg);
                             program.emit_int(idx as i64, base_reg + 1);
                             program.emit_string8(fk.parent_table.clone(), base_reg + 2);
                             program.emit_string8(child_column.clone(), base_reg + 3);
-                            program.emit_string8(parent_column.to_string(), base_reg + 4);
+                            // A constraint that names no parent column refers to the
+                            // parent's primary key; SQLite reports `to` as NULL for it.
+                            match fk.parent_columns.get(idx) {
+                                Some(parent_column) => {
+                                    program.emit_string8(parent_column.clone(), base_reg + 4)
+                                }
+                                None => program.emit_null(base_reg + 4, None),
+                            }
                             program.emit_string8(
                                 foreign_key_action_name(fk.on_update).to_string(),
                                 base_reg + 5,

@@ -97,6 +97,50 @@ expect {
     0|0|parent|temp_ref|id|NO ACTION|CASCADE|NONE
 }
 
+# https://github.com/tursodatabase/turso/issues/11273
+# A foreign key that names no parent column refers to the parent's primary key.
+# SQLite reports `to` as NULL for it, not as an empty string, and schema
+# introspection code (Django, SQLAlchemy) checks for that NULL.
+@cross-check-integrity
+test pragma-foreign-key-list-implicit-parent-key-is-null {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(parent_id REFERENCES parent);
+    SELECT "from", quote("to"), typeof("to") FROM pragma_foreign_key_list('child');
+}
+expect {
+    parent_id|NULL|null
+}
+
+@cross-check-integrity
+test pragma-foreign-key-list-implicit-composite-parent-key-is-null {
+    CREATE TABLE parent(a INTEGER, b INTEGER, code TEXT UNIQUE, PRIMARY KEY(a, b));
+    CREATE TABLE child(
+        x INTEGER,
+        y INTEGER,
+        code_ref TEXT REFERENCES parent(code),
+        CONSTRAINT fk_xy FOREIGN KEY(x, y) REFERENCES parent ON DELETE CASCADE
+    );
+    SELECT id, seq, "from", quote("to"), on_delete
+      FROM pragma_foreign_key_list('child')
+     ORDER BY id, seq;
+}
+expect {
+    0|0|x|NULL|CASCADE
+    0|1|y|NULL|CASCADE
+    1|0|code_ref|'code'|NO ACTION
+}
+
+@cross-check-integrity
+test pragma-foreign-key-list-implicit-parent-key-after-add-column {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, other_id REFERENCES parent(id));
+    ALTER TABLE child ADD COLUMN parent_id REFERENCES parent;
+    SELECT "from" FROM pragma_foreign_key_list('child') WHERE "to" IS NULL;
+}
+expect {
+    parent_id
+}
+
 @skip-if mvcc "attach is not supported for mvcc"
 @cross-check-integrity
 test pragma-foreign-key-list-attached-database {
