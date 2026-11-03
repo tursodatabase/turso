@@ -40,8 +40,88 @@ pub(crate) fn apply_static_rewrites(
     Ok(())
 }
 
-/// SQLite replaces `x AND 0` with 0 and `x OR 1` with 1 when one operand is
-/// an integer literal or TRUE/FALSE, so the other operand never runs:
+/// SQLite's parser replaces `x AND 0` by 0 as it reads the statement
+/// (sqlite3ExprAnd): the 0 is a plain integer literal, parentheses do not
+/// matter, and neither operand calls a function. That happens before a
+/// WHERE, HAVING or ON clause is split into terms and before a HAVING term
+/// can move to WHERE, so break_predicate_at_and_boundaries applies this
+/// rule to the whole predicate first: `TRUE AND (a AND 0)` becomes 0,
+/// which stays in HAVING, while `g = 2 AND 0 AND abs(1)` becomes
+/// `0 AND abs(1)`, whose `abs(1)` term may move. The folds SQLite's code
+/// generator does later, on TRUE, FALSE and `x OR 1`, are
+/// [AndOrConstantOperand].
+pub(crate) struct AndWithIntegerZero;
+
+impl StaticRewrite for AndWithIntegerZero {
+    fn rewrite(
+        &self,
+        expr: &mut ast::Expr,
+        _resolver: Option<&Resolver<'_>>,
+    ) -> Result<WalkControl> {
+        let is_and = matches!(
+            unwrap_parens(expr).unwrap_or(expr),
+            Expr::Binary(_, ast::Operator::And, _)
+        );
+        if is_and && and_chain_folds_to_zero(expr) {
+            *expr = Expr::Literal(ast::Literal::Numeric("0".to_string()));
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    }
+}
+
+/// True when SQLite's parser replaces this AND chain by 0 (sqlite3ExprAnd):
+/// the integer literal 0 is one of its terms, as in `a AND 0 AND b`, and no
+/// term calls a function. A function call keeps the chain as it is there, so
+/// `f(x) AND 0` still runs `f(x)` in WHERE, and `abs(g) = 2 AND 0` still lets
+/// `abs(g) = 2` move from HAVING to WHERE.
+fn and_chain_folds_to_zero(expr: &Expr) -> bool {
+    let expr = unwrap_parens(expr).unwrap_or(expr);
+    match expr {
+        Expr::Binary(left, ast::Operator::And, right) => {
+            (and_chain_folds_to_zero(left) || and_chain_folds_to_zero(right))
+                && !expr_calls_function(left)
+                && !expr_calls_function(right)
+        }
+        _ => integer_literal_truth_value(expr) == Some(false),
+    }
+}
+
+/// True if the expression calls a function outside of its subqueries. LIKE,
+/// GLOB, REGEXP and MATCH, the JSON `->` and `->>` operators and
+/// CURRENT_DATE, CURRENT_TIME and CURRENT_TIMESTAMP are function calls to
+/// SQLite's parser too.
+fn expr_calls_function(expr: &Expr) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e| {
+        if matches!(
+            e,
+            Expr::FunctionCall { .. }
+                | Expr::FunctionCallStar { .. }
+                | Expr::Like { .. }
+                | Expr::Binary(
+                    _,
+                    ast::Operator::ArrowRight | ast::Operator::ArrowRightShift,
+                    _
+                )
+                | Expr::Literal(
+                    ast::Literal::CurrentDate
+                        | ast::Literal::CurrentTime
+                        | ast::Literal::CurrentTimestamp
+                )
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression with an infallible visitor cannot fail");
+    found
+}
+
+/// SQLite's code generator replaces `x AND 0` with 0 and `x OR 1` with 1
+/// when one operand is an integer literal or TRUE/FALSE
+/// (sqlite3ExprSimplifiedAndOr), so the other operand never runs:
 /// `SELECT 1 OR json_extract('bare', '$.a')` is 1 and
 /// `CASE WHEN (SELECT abs(-9223372036854775807 - 1)) AND 0 ...` does not run
 /// the subquery. In [BINDING_REWRITES] it runs after binding, so names in the
