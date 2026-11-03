@@ -319,22 +319,25 @@ fn unsupported_policies_are_rejected() {
 
     for (sql, expected) in [
         (
-            "CREATE POLICY p ON docs AS RESTRICTIVE USING (true)",
-            "RESTRICTIVE",
+            "CREATE POLICY p ON docs FOR SELECT USING (true) WITH CHECK (true)",
+            "WITH CHECK cannot be applied to SELECT or DELETE",
         ),
         (
-            "CREATE POLICY p ON docs FOR INSERT WITH CHECK (true)",
-            "FOR SELECT",
+            "CREATE POLICY p ON docs FOR DELETE WITH CHECK (true)",
+            "WITH CHECK cannot be applied to SELECT or DELETE",
+        ),
+        (
+            "CREATE POLICY p ON docs FOR INSERT USING (true)",
+            "only WITH CHECK expression allowed for INSERT",
+        ),
+        (
+            "CREATE POLICY p ON docs FOR INSERT WITH CHECK (missing = 1)",
+            "missing",
         ),
         (
             "CREATE POLICY p ON docs TO nobody USING (true)",
             "role \"nobody\" does not exist",
         ),
-        (
-            "CREATE POLICY p ON docs USING (true) WITH CHECK (true)",
-            "WITH CHECK",
-        ),
-        ("CREATE POLICY p ON docs", "USING"),
         (
             "CREATE POLICY p ON docs USING (owner IN (SELECT current_user))",
             "subqueries in policies are not supported",
@@ -504,6 +507,91 @@ fn supabase_policy_shows_each_user_their_rows() {
 
     conn.execute("SET ROLE anon").unwrap();
     assert_eq!(integers(&conn, "SELECT count(*) FROM todos"), [0]);
+}
+
+#[test]
+fn restrictive_policies_narrow_the_permissive_ones() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    create_docs_with_owner_policy(&conn);
+    conn.execute("CREATE POLICY first_two ON docs AS RESTRICTIVE USING (id < 3)")
+        .unwrap();
+    conn.execute("CREATE POLICY not_bob ON docs AS RESTRICTIVE FOR SELECT TO bob USING (false)")
+        .unwrap();
+
+    conn.execute("SET ROLE alice").unwrap();
+    assert_eq!(integers(&conn, "SELECT id FROM docs ORDER BY id"), [1]);
+    conn.execute("SET ROLE bob").unwrap();
+    assert_eq!(integers(&conn, "SELECT count(*) FROM docs"), [0]);
+
+    conn.execute("RESET ROLE").unwrap();
+    conn.execute("DROP POLICY own ON docs").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    assert_eq!(integers(&conn, "SELECT count(*) FROM docs"), [0]);
+}
+
+/// Policies for writes are kept so that scripts written for PostgreSQL run,
+/// but roles cannot write to tables with row-level security yet, so they
+/// change nothing. They do not show rows to SELECT.
+#[test]
+fn write_policies_are_kept_but_show_no_rows() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    create_docs_with_row_security(&conn);
+    for sql in [
+        "CREATE POLICY ins ON docs FOR INSERT WITH CHECK (owner = current_user)",
+        "CREATE POLICY upd ON docs FOR UPDATE USING (true) WITH CHECK (owner = current_user)",
+        "CREATE POLICY del ON docs FOR DELETE USING (true)",
+        "CREATE POLICY nothing ON docs",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    assert_error_contains(
+        &conn,
+        "ALTER TABLE docs RENAME COLUMN owner TO author",
+        "row-level security",
+    );
+
+    conn.execute("SET ROLE alice").unwrap();
+
+    assert_eq!(integers(&conn, "SELECT count(*) FROM docs"), [0]);
+    for sql in [
+        "INSERT INTO docs VALUES (4, 'alice')",
+        "UPDATE docs SET owner = 'alice'",
+        "DELETE FROM docs",
+    ] {
+        assert!(conn.execute(sql).is_err(), "{sql}");
+    }
+    conn.execute("RESET ROLE").unwrap();
+    assert_eq!(integers(&conn, "SELECT count(*) FROM docs"), [3]);
+}
+
+#[test]
+fn policy_definition_is_kept_after_reopening_the_database() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    create_docs_with_row_security(&conn);
+    for sql in [
+        "CREATE ROLE bob",
+        "CREATE POLICY readers ON docs FOR SELECT TO alice, bob USING (true)",
+        "CREATE POLICY first_two ON docs AS RESTRICTIVE TO alice USING (id < 3)",
+        "CREATE POLICY ins ON docs FOR INSERT TO alice WITH CHECK (true)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    let conn = db.connect_postgres();
+    conn.execute("SET ROLE alice").unwrap();
+    assert_eq!(integers(&conn, "SELECT id FROM docs ORDER BY id"), [1, 2]);
+    conn.execute("SET ROLE bob").unwrap();
+    assert_eq!(
+        integers(&conn, "SELECT id FROM docs ORDER BY id"),
+        [1, 2, 3]
+    );
 }
 
 #[test]

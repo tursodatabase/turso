@@ -58,8 +58,10 @@ pub fn translate_row_security_change(
     Ok(())
 }
 
-/// CREATE POLICY for the forms supported so far: a permissive SELECT (or
-/// ALL) policy whose USING condition refers only to columns of the table.
+/// CREATE POLICY. The policy's conditions may refer only to columns of the
+/// table. Policies for INSERT, UPDATE and DELETE and WITH CHECK conditions
+/// are stored but have no effect yet, because roles cannot write to tables
+/// with row-level security.
 pub fn translate_create_policy(
     policy: &ast::CreatePolicy,
     resolver: &Resolver,
@@ -78,25 +80,21 @@ pub fn translate_create_policy(
             table.declared_name
         );
     }
-    if policy.restrictive {
-        bail_parse_error!("RESTRICTIVE policies are not supported");
+    if policy.check_expr.is_some()
+        && matches!(
+            policy.command,
+            ast::PolicyCommand::Select | ast::PolicyCommand::Delete
+        )
+    {
+        bail_parse_error!("WITH CHECK cannot be applied to SELECT or DELETE");
     }
-    if !matches!(
-        policy.command,
-        ast::PolicyCommand::All | ast::PolicyCommand::Select
-    ) {
-        bail_parse_error!("only FOR SELECT and FOR ALL policies are supported");
+    if policy.using_expr.is_some() && policy.command == ast::PolicyCommand::Insert {
+        bail_parse_error!("only WITH CHECK expression allowed for INSERT");
     }
     for role in &policy.roles {
         if resolver.schema().roles.get_by_name(role.as_str()).is_none() {
             bail_parse_error!("role \"{}\" does not exist", role.as_str());
         }
-    }
-    if policy.check_expr.is_some() {
-        bail_parse_error!("WITH CHECK is not supported");
-    }
-    if policy.using_expr.is_none() {
-        bail_parse_error!("a policy needs a USING condition");
     }
 
     let row = RowSecurityRow::for_policy(&stored_name, policy);
@@ -208,12 +206,14 @@ pub fn reject_change_of_policy_column(
     Ok(())
 }
 
-/// A role sees only the rows of a table with row-level security that one of
-/// the table's policies for that role shows: every such table in the FROM
-/// clause gets a filter that combines the USING conditions of the policies
-/// with OR, and that is always false without policies. For the right side of an outer
-/// join the filter is part of the join condition, so the hidden rows produce
-/// NULLs like rows that do not exist. The filters go before the query's own
+/// A role sees only the rows of a table with row-level security that the
+/// table's policies for that role show. Every such table in the FROM clause
+/// gets a filter that combines the USING conditions of the permissive
+/// policies with OR and those of the restrictive policies with AND, as
+/// PostgreSQL does: a row must pass at least one permissive policy and every
+/// restrictive one. Without a permissive policy no row passes. For the right
+/// side of an outer join the filter is part of the join condition, so the
+/// hidden rows produce NULLs like rows that do not exist. The filters go before the query's own
 /// conditions, so no expression of the query sees a hidden row. The tables
 /// are recorded so the optimizer does not choose access methods that
 /// evaluate the query's expressions on a row before its filter.
@@ -248,7 +248,8 @@ pub fn add_select_row_security_filters(
             .expect("row security applies to roles");
         let catalog = catalog(resolver);
         let policies = catalog.policies(&stored_table_name(table.namespace, &btree.declared_name));
-        let mut visible = None;
+        let mut permissive = None;
+        let mut restrictive = None;
         for policy in policies
             .iter()
             .filter(|policy| policy.applies_to_reads() && policy.applies_to_role(role))
@@ -258,21 +259,26 @@ pub fn add_select_row_security_filters(
             };
             let shown = bind_policy_expr(using_expr, table, btree, resolver)?;
             collect_used_columns(&shown, table.internal_id, &mut used_columns)?;
-            visible = Some(match visible {
-                None => shown,
-                Some(previous) => {
-                    ast::Expr::Binary(Box::new(previous), ast::Operator::Or, Box::new(shown))
-                }
-            });
+            if policy.permissive {
+                permissive = Some(combine(permissive, ast::Operator::Or, shown));
+            } else {
+                restrictive = Some(combine(restrictive, ast::Operator::And, shown));
+            }
         }
+        let visible = match (permissive, restrictive) {
+            (None, _) => ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+            (Some(permissive), None) => permissive,
+            (Some(permissive), Some(restrictive)) => {
+                combine(Some(permissive), ast::Operator::And, restrictive)
+            }
+        };
         filtered_tables.push(table.internal_id);
         let is_outer = table
             .join_info
             .as_ref()
             .is_some_and(|join_info| join_info.is_outer());
         filters.push(WhereTerm {
-            expr: visible
-                .unwrap_or_else(|| ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))),
+            expr: visible,
             origin: if is_outer {
                 WhereTermOrigin::Join(JoinOrigin::Outer(table.internal_id))
             } else {
@@ -289,6 +295,13 @@ pub fn add_select_row_security_filters(
     }
     where_clause.splice(0..0, filters);
     Ok(())
+}
+
+fn combine(left: Option<ast::Expr>, operator: ast::Operator, right: ast::Expr) -> ast::Expr {
+    match left {
+        None => right,
+        Some(left) => ast::Expr::Binary(Box::new(left), operator, Box::new(right)),
+    }
 }
 
 /// Binds a policy condition to the table it protects. The condition sees

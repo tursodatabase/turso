@@ -63,17 +63,21 @@ SELECT count(*) FROM documents;
 
 ```sql
 CREATE POLICY name ON table_name
-    [ AS PERMISSIVE ]
-    [ FOR { ALL | SELECT } ]
+    [ AS { PERMISSIVE | RESTRICTIVE } ]
+    [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
     [ TO { role_name | PUBLIC } [, ...] ]
-    USING ( condition )
+    [ USING ( condition ) ]
+    [ WITH CHECK ( check_condition ) ]
 ```
 
 **Description:**
 
 `CREATE POLICY` adds a policy to a table with row-level security. A role that
-is not a superuser sees the rows that any of the table's policies for that
-role show.
+is not a superuser sees a row when the `USING` condition of at least one
+permissive policy for that role is true for it, and the `USING` conditions
+of all restrictive policies for that role are true too. Policies are
+permissive unless created `AS RESTRICTIVE`. Only `FOR ALL` and `FOR SELECT`
+policies decide which rows a role sees.
 Policies have no effect while the table's row-level security is disabled.
 
 **Parameters:**
@@ -85,13 +89,15 @@ Policies have no effect while the table's row-level security is disabled.
 - `condition`: Which rows the policy shows: the rows for which the condition
   is true. It can use the columns of the table, written as `column` or
   `table_name.column`, and call functions such as `current_user` or
-  `auth.uid()`.
+  `auth.uid()`. A policy without `USING` shows no rows.
+- `check_condition`: Which rows the policy lets a role write. It follows the
+  same rules as `condition`.
 
 **Notes:**
 
 Only a superuser can create policies.
 
-The condition cannot contain subqueries, except `(SELECT expression)`
+The conditions cannot contain subqueries, except `(SELECT expression)`
 without `FROM`, which is the same as `(expression)`. Supabase recommends that
 form, as in `(SELECT auth.uid())`. It cannot use generated columns that are
 not stored.
@@ -104,8 +110,12 @@ A role named in `TO` must have been created with `CREATE ROLE`. A policy
 applies only to the roles it names, not to other roles that are members of
 them.
 
-`AS RESTRICTIVE`, `FOR INSERT`, `FOR UPDATE`, `FOR DELETE` and `WITH CHECK`
-are not supported. The columns a policy uses cannot be renamed,
+`WITH CHECK` cannot be used with `FOR SELECT` or `FOR DELETE`, and
+`FOR INSERT` policies can only have `WITH CHECK`, as in PostgreSQL.
+
+Roles cannot write to tables with row-level security yet. `FOR INSERT`,
+`FOR UPDATE` and `FOR DELETE` policies and `WITH CHECK` conditions are kept,
+so scripts written for PostgreSQL run, but they have no effect. The columns a policy uses cannot be renamed,
 dropped or altered. Policies are not listed in the `pg_policy` catalog.
 
 **Examples:**
