@@ -370,7 +370,7 @@ fn resolve_check_expr_type(
                 | Operator::GreaterEquals => {
                     let lty = resolve_check_expr_type(lhs, columns, resolver)?;
                     let rty = resolve_check_expr_type(rhs, columns, resolver)?;
-                    if !can_compare(&lty, &rty, resolver) {
+                    if !can_compare_operands(lhs, &lty, rhs, &rty, resolver) {
                         bail_parse_error!(
                             "type mismatch in CHECK constraint: cannot compare {} with {}",
                             lty.display_name(),
@@ -572,7 +572,7 @@ fn validate_check_types_in_expr(
                 | Operator::GreaterEquals => {
                     let lty = resolve_check_expr_type(lhs, columns, resolver)?;
                     let rty = resolve_check_expr_type(rhs, columns, resolver)?;
-                    if !can_compare(&lty, &rty, resolver) {
+                    if !can_compare_operands(lhs, &lty, rhs, &rty, resolver) {
                         bail_parse_error!(
                             "type mismatch in CHECK constraint: cannot compare {} with {}",
                             lty.display_name(),
@@ -597,14 +597,14 @@ fn validate_check_types_in_expr(
             let lty = resolve_check_expr_type(lhs, columns, resolver)?;
             let sty = resolve_check_expr_type(start, columns, resolver)?;
             let ety = resolve_check_expr_type(end, columns, resolver)?;
-            if !can_compare(&lty, &sty, resolver) {
+            if !can_compare_operands(lhs, &lty, start, &sty, resolver) {
                 bail_parse_error!(
                     "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
                     lty.display_name(),
                     sty.display_name()
                 );
             }
-            if !can_compare(&lty, &ety, resolver) {
+            if !can_compare_operands(lhs, &lty, end, &ety, resolver) {
                 bail_parse_error!(
                     "type mismatch in CHECK BETWEEN: cannot compare {} with {}",
                     lty.display_name(),
@@ -616,7 +616,7 @@ fn validate_check_types_in_expr(
             let lty = resolve_check_expr_type(lhs, columns, resolver)?;
             for item in rhs {
                 let ity = resolve_check_expr_type(item, columns, resolver)?;
-                if !can_compare(&lty, &ity, resolver) {
+                if !can_compare_operands(lhs, &lty, item, &ity, resolver) {
                     bail_parse_error!(
                         "type mismatch in CHECK IN list: cannot compare {} with {}",
                         lty.display_name(),
@@ -658,6 +658,37 @@ fn validate_check_types_in_expr(
         _ => {}
     }
     Ok(())
+}
+
+/// Whether a CHECK constraint may compare these two operands: their types
+/// allow it, or the dialect reads a quoted number compared with a number as
+/// a number.
+fn can_compare_operands(
+    lhs: &ast::Expr,
+    lty: &CheckExprType,
+    rhs: &ast::Expr,
+    rty: &CheckExprType,
+    resolver: &CatalogContext,
+) -> bool {
+    can_compare(lty, rty, resolver)
+        || (resolver.dialect.check_constraints_accept_quoted_numbers()
+            && (is_quoted_number_of_type(rhs, lty) || is_quoted_number_of_type(lhs, rty)))
+}
+
+/// Whether `expr` is a quoted string that holds a valid value of the number
+/// type `ty`. `'0'` is an integer and `'0.5'` is a real, but `'0.5'` is not
+/// an integer.
+fn is_quoted_number_of_type(expr: &ast::Expr, ty: &CheckExprType) -> bool {
+    let ast::Expr::Literal(ast::Literal::String(s)) = expr else {
+        return false;
+    };
+    let text = crate::translate::expr::sanitize_string(s);
+    let text = text.trim();
+    match ty {
+        CheckExprType::Integer => text.parse::<i64>().is_ok(),
+        CheckExprType::Real => text.parse::<f64>().is_ok(),
+        _ => false,
+    }
 }
 
 /// Whether a CHECK constraint may compare two values of these types. A value

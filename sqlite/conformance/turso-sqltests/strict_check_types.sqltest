@@ -17,6 +17,15 @@ expect error {
     type mismatch
 }
 
+# Unlike in the PostgreSQL dialect, a quoted number is text.
+@requires strict "uses STRICT tables"
+test integer-vs-quoted-number-error {
+    CREATE TABLE t(a INTEGER CHECK(a > '0')) STRICT;
+}
+expect error {
+    type mismatch
+}
+
 @requires strict "uses STRICT tables"
 test integer-vs-blob-error {
     CREATE TABLE t(a INTEGER CHECK(a < x'FF')) STRICT;

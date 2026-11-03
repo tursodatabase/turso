@@ -233,6 +233,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn check_constraints_accept_quoted_numbers(&self) -> bool {
+        true
+    }
+
     fn add_column_computes_default_for_existing_rows(&self) -> bool {
         true
     }

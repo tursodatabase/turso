@@ -251,6 +251,16 @@ pub trait Dialect: Send + Sync + 'static {
         false
     }
 
+    /// Whether a CHECK constraint in a STRICT table may compare a number with
+    /// a quoted string that holds a number of the same kind, as in
+    /// `CHECK (x > '0')` on an integer column.
+    ///
+    /// PostgreSQL reads the string as a number. Turso's STRICT tables reject
+    /// any comparison of a number with text.
+    fn check_constraints_accept_quoted_numbers(&self) -> bool {
+        false
+    }
+
     /// Whether `ALTER TABLE ADD COLUMN` with a non-constant default works on
     /// a table that has rows.
     ///
