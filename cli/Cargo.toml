@@ -20,6 +20,7 @@ path = "main.rs"
 [dependencies]
 turso_sqlite = { workspace = true }
 anyhow.workspace = true
+base64 = "0.22.1"
 cfg-if = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { version = "=4.5.47", features = ["unstable-dynamic"] }
