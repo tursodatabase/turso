@@ -547,6 +547,18 @@ fn translate_binary_expr(
     let ast::Expr::Binary(e1, op, e2) = expr else {
         unreachable!("translate_binary_expr expects Expr::Binary");
     };
+    // A column DEFAULT, a generated column or a CHECK constraint is translated
+    // straight from the schema, without the binding that folds `x AND 0` and
+    // `x OR 1`, so the operand that fold would have dropped must not run here
+    // either. A bound expression only gets here with the operand it kept for
+    // its aggregate, whose value the literal already decides.
+    if let Some(value) = and_or_truth_value(expr) {
+        program.emit_insn(Insn::Integer {
+            value: i64::from(value),
+            dest: target_register,
+        });
+        return Ok(target_register);
+    }
     // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE specially.
     // These use truth semantics (only non-zero numbers are truthy) rather than equality.
     if matches!(op, ast::Operator::Is | ast::Operator::IsNot) {

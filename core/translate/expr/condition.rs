@@ -277,6 +277,16 @@ pub fn translate_condition_expr(
         program.release_registers(index_value_reg, 1);
     }
     match expr {
+        // `x AND 0` and `x OR 1` are decided without running `x`; see
+        // translate_binary_expr for the expressions that reach this unbound.
+        ast::Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _)
+            if and_or_truth_value(expr).is_some() =>
+        {
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
+            Ok(())
+        }
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because
             // the second condition MUST also be true. Instead we instruct the child expression to jump to a local
