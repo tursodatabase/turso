@@ -131,6 +131,37 @@ Start a sync server for database replication, listening at the given address.
 tursodb --sync-server 0.0.0.0:8080 mydata.db
 ```
 
+### `--sync-encryption-cipher <CIPHER>` and `--sync-encryption-key-file <PATH>`
+
+Serve encrypted databases with the sample sync server. Both options are required
+together and require `--sync-server`. The key file contains the hex-encoded cloud
+database key. Encryption is enabled automatically; use a database path rather
+than a `file:` URI.
+
+```bash
+tursodb --sync-server 127.0.0.1:8080 \
+  --sync-encryption-cipher aes256gcm \
+  --sync-encryption-key-file ./cloud-key.hex mydata.db
+```
+
+Core's AES-GCM and AEGIS ciphers are supported. Clients supply the same cipher and
+the base64 encoding of the cloud key through their remote encryption settings.
+Their local encryption key can differ. Both SQL pipeline and pull requests must
+include valid `x-turso-encryption-key` and `x-turso-encryption-cipher` headers;
+missing, incorrect, or duplicate credentials return HTTP 400 before opening a
+database or executing SQL. A plaintext server rejects these headers.
+
+This also works with `--sync-dir`: every database uses the configured cipher and
+cloud key, including databases created on demand. Encrypted sync supports full
+page bootstrap, WAL page updates, and portable MVCC logical updates. Filtered
+bootstrap is rejected. The sample server retains its single-generation MVCC
+limitation; it does not provide the production server's retained-generation
+storage or checkpoint transitions.
+
+The sample server speaks HTTP. Use loopback for local tests, or terminate HTTPS
+in front of it when sending encryption credentials over a network. Database
+encryption does not encrypt HTTP requests or responses.
+
 ### `--sync-dir <PATH>`
 
 Serve every database file under `PATH` over the sync server, instead of a single database. `PATH` must already exist as a directory. Requires `--sync-server`, and cannot be combined with a positional `DATABASE` argument.

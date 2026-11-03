@@ -20,6 +20,34 @@ recovery marker or known replacement backup, including empty files. The error
 identifies the conflicting path and leaves the artifacts untouched. Reopening an
 initialized replica still permits orphaned backups left by interrupted cleanup.
 
+## Local sample server
+
+The CLI sample server supports encrypted sync in single-database and directory
+mode. Put the cloud key's hex encoding in a key file, then run:
+
+```sh
+tursodb --sync-server 127.0.0.1:8080 \
+  --sync-encryption-cipher aes256gcm \
+  --sync-encryption-key-file ./cloud-key.hex ./source.db
+```
+
+Use `--sync-dir ./databases` instead of `./source.db` to serve databases under
+`http://127.0.0.1:8080/db/{name}` with the same configured key and cipher.
+Configure clients with the base64 encoding of that cloud key and an independent
+local hex key. The sample server validates encryption credentials for both
+pull and SQL push requests. It serves authenticated, decrypted pages and MVCC
+frames over HTTP; keep it on loopback or use an HTTPS proxy for network access.
+It supports one MVCC generation, without production retained-generation storage.
+Corrupt MVCC headers fail the pull before any replacement fallback; the client's
+existing data and sync revision remain unchanged.
+
+Run the actual HTTP client/server regression suite with:
+
+```sh
+cargo build -p turso_cli -p turso --bin tursodb --example sync_encryption_e2e --features turso/sync
+python3 testing/cli_tests/sync_encryption.py
+```
+
 ## Rust
 
 Enable the `sync` crate feature:
