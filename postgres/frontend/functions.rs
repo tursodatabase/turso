@@ -11,7 +11,7 @@ use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
 };
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
+    SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_PARAMETER_VALUE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
@@ -119,6 +119,9 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             0i64
         },
         "pg_limit_value"(FunctionArity::Exact(2), true) => exec_pg_limit_value(args)?,
+        "pg_generate_series_argument"(FunctionArity::Exact(2), true) => {
+            exec_pg_generate_series_argument(args)?
+        },
         // A double precision number in [0, 1), unlike SQLite's random integer.
         "random"(FunctionArity::Exact(0), false) => {
             exec_random(connection.get_pager().io.generate_random_number())
@@ -635,6 +638,30 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
         ));
     }
     Ok(Some(value))
+}
+
+/// Returns a generate_series argument unchanged, or raises the error PostgreSQL
+/// raises for an infinite bound or step, or a step of zero.
+fn exec_pg_generate_series_argument(args: &[Register]) -> Result<Value> {
+    let value = args[0].get_value();
+    let name = text_arg(args, 1);
+    let message = match value {
+        Value::Numeric(Numeric::Float(number)) if f64::from(*number).is_infinite() => {
+            if name == "step" {
+                "step size cannot be infinity".to_string()
+            } else {
+                format!("{name} value cannot be infinity")
+            }
+        }
+        Value::Numeric(Numeric::Integer(0)) if name == "step" => {
+            "step size cannot equal zero".to_string()
+        }
+        Value::Numeric(Numeric::Float(number)) if name == "step" && f64::from(*number) == 0.0 => {
+            "step size cannot equal zero".to_string()
+        }
+        _ => return Ok(value.clone()),
+    };
+    Err(sqlstate_error(SQLSTATE_INVALID_PARAMETER_VALUE, message))
 }
 
 fn role_name(conn: &Connection, role: RoleId) -> Result<String> {

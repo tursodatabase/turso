@@ -2479,6 +2479,7 @@ impl PostgreSQLTranslator {
             // Evaluate the arguments in their own VALUES row so that names like `value` or
             // `start` resolve to columns on the left, not to generate_series's own columns.
             // VALUES, unlike a SELECT, still rejects aggregate and window functions.
+            let args = checked_generate_series_arguments(args);
             let (arguments, args) = function_arguments_subquery(args);
             return Ok(ast::SelectTable::Select {
                 select: single_column_function_select(
@@ -5166,6 +5167,24 @@ fn single_column_function_select(
         order_by: vec![],
         limit: None,
     }
+}
+
+#[allow(clippy::vec_box)]
+fn checked_generate_series_arguments(args: Vec<Box<ast::Expr>>) -> Vec<Box<ast::Expr>> {
+    const NAMES: [&str; 3] = ["start", "stop", "step"];
+    args.into_iter()
+        .enumerate()
+        .map(|(index, arg)| match NAMES.get(index) {
+            Some(name) => Box::new(function_call(
+                "pg_generate_series_argument",
+                vec![
+                    *arg,
+                    ast::Expr::Literal(ast::Literal::String(format!("'{name}'"))),
+                ],
+            )),
+            None => arg,
+        })
+        .collect()
 }
 
 #[allow(clippy::vec_box)]
@@ -8023,15 +8042,15 @@ mod tests {
             ),
             (
                 "SELECT g.n FROM generate_series(1, 3) AS g(n)",
-                "SELECT g.n FROM LATERAL (SELECT value n FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) g",
+                "SELECT g.n FROM LATERAL (SELECT value n FROM (VALUES (pg_generate_series_argument (1, 'start'), pg_generate_series_argument (3, 'stop'))) arg, main.generate_series (arg.column1, arg.column2)) g",
             ),
             (
                 "SELECT g FROM generate_series(1, 3) g",
-                "SELECT g FROM LATERAL (SELECT value g FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) g",
+                "SELECT g FROM LATERAL (SELECT value g FROM (VALUES (pg_generate_series_argument (1, 'start'), pg_generate_series_argument (3, 'stop'))) arg, main.generate_series (arg.column1, arg.column2)) g",
             ),
             (
                 "SELECT * FROM generate_series(1, 3)",
-                "SELECT * FROM LATERAL (SELECT value generate_series FROM (VALUES (1, 3)) arg, main.generate_series (arg.column1, arg.column2)) generate_series",
+                "SELECT * FROM LATERAL (SELECT value generate_series FROM (VALUES (pg_generate_series_argument (1, 'start'), pg_generate_series_argument (3, 'stop'))) arg, main.generate_series (arg.column1, arg.column2)) generate_series",
             ),
         ] {
             assert_eq!(translate(sql).unwrap(), expected, "{sql}");
