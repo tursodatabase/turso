@@ -152,11 +152,8 @@ mod tests {
         {
             let db = TempDatabase::new_with_existent_with_opts(&path, opts);
             let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<'",
-            )
-            .unwrap();
+            conn.execute("CREATE TYPE rev BASE text ENCODE string_reverse(value) OPERATOR '<'")
+                .unwrap();
             conn.execute(
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
             )
@@ -173,13 +170,13 @@ mod tests {
         let conn = db.connect_limbo();
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
-        // A new row goes to its place in the stored (reversed) text order:
-        // ananab < elppa < tocirpa < yrrehc.
+        // The type has no DECODE, so words read back as they are stored
+        // (reversed). A new row goes to its place in that order.
         conn.execute("INSERT INTO t VALUES (4,'apricot',0)")
             .unwrap();
         let rows: Vec<(String,)> =
             conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
-        let words = ["banana", "apple", "apricot", "cherry"];
+        let words = ["ananab", "elppa", "tocirpa", "yrrehc"];
         assert_eq!(rows, words.map(|w| (w.to_string(),)));
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
@@ -229,11 +226,8 @@ mod tests {
         {
             let db = open();
             let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<'",
-            )
-            .unwrap();
+            conn.execute("CREATE TYPE rev BASE text ENCODE string_reverse(value) OPERATOR '<'")
+                .unwrap();
             conn.execute(
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
             )
@@ -250,14 +244,14 @@ mod tests {
         let conn = db.connect_limbo();
         conn.execute("INSERT INTO t VALUES (3,'banana',100)")
             .unwrap();
-        // Stored (reversed) text order: ananab < elppa < yrrehc.
-        check(&conn, &["banana", "apple", "cherry"], &[2, 3]);
+        // Words read back as stored (reversed): ananab < elppa < yrrehc.
+        check(&conn, &["ananab", "elppa", "yrrehc"], &[2, 3]);
 
         // A passive checkpoint builds its own schema to write the index rows.
         conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
         conn.execute("INSERT INTO t VALUES (4,'apricot',50)")
             .unwrap();
-        check(&conn, &["banana", "apple", "apricot", "cherry"], &[2, 3, 4]);
+        check(&conn, &["ananab", "elppa", "tocirpa", "yrrehc"], &[2, 3, 4]);
     }
 
     /// Under MVCC, reopening replays the logical log; a domain's DEFAULT and

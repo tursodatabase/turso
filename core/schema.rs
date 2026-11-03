@@ -1866,6 +1866,43 @@ impl Schema {
             .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()))
     }
 
+    /// Fails when `column` is lossy, so it cannot be an index, UNIQUE, PRIMARY KEY
+    /// or FOREIGN KEY column. See [Self::column_is_lossy].
+    pub fn check_column_can_be_key(&self, column: &Column, is_strict: bool) -> crate::Result<()> {
+        if !self.column_is_lossy(column, is_strict) {
+            return Ok(());
+        }
+        let brackets = "[]".repeat(column.array_dimensions() as usize);
+        let name = column.name.as_deref().unwrap_or_default();
+        // A type that cannot be resolved counts as lossy and has no primitive,
+        // so the hint falls back to the type's name.
+        let primitive = match self.resolve_type_unchecked(&column.ty_str) {
+            Ok(Some(resolved)) => resolved.primitive,
+            _ => column.ty_str.clone(),
+        };
+        crate::bail_parse_error!(
+            "column '{name}' of type '{}{brackets}' cannot be a key: different stored values can decode to the same value. Index CAST({name} AS {primitive}{brackets}) instead",
+            column.ty_str
+        );
+    }
+
+    /// Whether different stored values of the column can read back as the same
+    /// value, so a key on the column would tell apart values that queries
+    /// treat as equal. The column's type decides: built-in types, types
+    /// without a DECODE and types whose DECODE is `value` are not lossy, and a
+    /// domain or array follows the type it is based on. Everything else is
+    /// lossy, including a type that cannot be resolved.
+    pub fn column_is_lossy(&self, column: &Column, is_strict: bool) -> bool {
+        match self.resolve_type(&column.ty_str, is_strict) {
+            Ok(None) => false,
+            Ok(Some(resolved)) => !resolved
+                .chain
+                .iter()
+                .all(|td| td.is_builtin || td.decode_returns_value_unchanged()),
+            Err(_) => true,
+        }
+    }
+
     /// Look up a custom type definition by name without a strictness check.
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).
@@ -5309,6 +5346,60 @@ impl BTreeTable {
             }
         }
         Ok(())
+    }
+
+    /// Fails when a column of a UNIQUE, PRIMARY KEY or FOREIGN KEY of the
+    /// table is lossy. See [Schema::check_column_can_be_key].
+    pub(crate) fn check_keys_are_not_lossy(&self, schema: &Schema) -> Result<()> {
+        for column in &self.columns {
+            if self.is_key_column(column) {
+                schema.check_column_can_be_key(column, self.is_strict)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `column` is part of a UNIQUE, PRIMARY KEY or FOREIGN KEY of the
+    /// table.
+    pub(crate) fn is_key_column(&self, column: &Column) -> bool {
+        let Some(name) = column.name.as_deref() else {
+            return false;
+        };
+        let unique_columns = self
+            .unique_sets
+            .iter()
+            .flat_map(|set| set.columns.iter().map(|key| key.name.as_str()));
+        let foreign_columns = self
+            .foreign_keys
+            .iter()
+            .flat_map(|fk| fk.child_columns.iter().map(String::as_str));
+        unique_columns
+            .chain(foreign_columns)
+            .any(|key| key.eq_ignore_ascii_case(name))
+    }
+
+    /// Renames a column inside the UNIQUE, PRIMARY KEY and FOREIGN KEY lists.
+    /// Does not touch the column itself.
+    pub(crate) fn rename_column_in_keys(&mut self, old_name: &str, new_name: &str) {
+        for key in self.unique_sets.iter_mut().flat_map(|set| &mut set.columns) {
+            if key.name.eq_ignore_ascii_case(old_name) {
+                key.name = new_name.to_string();
+            }
+        }
+        for foreign_key in &mut self.foreign_keys {
+            if foreign_key
+                .child_columns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(old_name))
+            {
+                let foreign_key = Arc::make_mut(foreign_key);
+                for name in foreign_key.child_columns.iter_mut() {
+                    if name.eq_ignore_ascii_case(old_name) {
+                        *name = new_name.to_string();
+                    }
+                }
+            }
+        }
     }
 
     /// Fill in what custom type columns get from their type:

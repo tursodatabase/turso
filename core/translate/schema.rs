@@ -825,11 +825,10 @@ fn validate(
             }
         }
 
+        let mut table = create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
         // Rules for new tables only: VACUUM creates the tables the database
         // already has as nested statements, and those may break these rules.
         if !is_nested {
-            let mut table =
-                create_table(table_name, body, 0, resolver.dialect.supports_namespaces())?;
             if !table.has_rowid {
                 if table.has_autoincrement {
                     bail_parse_error!("AUTOINCREMENT is not allowed on WITHOUT ROWID tables");
@@ -863,6 +862,7 @@ fn validate(
             table.resolve_custom_types(resolver.schema());
             table.check_collates_are_allowed()?;
         }
+        table.check_keys_are_not_lossy(resolver.schema())?;
     }
     Ok(())
 }

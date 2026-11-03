@@ -330,6 +330,9 @@ pub(super) fn automatic_index_terms(
         let column = &columns[term
             .table_col_pos
             .expect("a term that can drive an index seek has a column")];
+        if schema.column_is_lossy(column, table.table.is_strict()) {
+            return false;
+        }
         !column.index_order_differs_from_value_order(schema, table.table.is_strict())
             || term.operator == ast::Operator::Equals.into()
     };

@@ -1049,19 +1049,19 @@ expect {
 
 @requires custom_types "uses CREATE DOMAIN"
 test domain-over-custom-type-index-lookup {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TYPE cents BASE integer ENCODE value * 100;
     CREATE DOMAIN pc AS cents;
     CREATE TABLE t(id INTEGER PRIMARY KEY, x pc) STRICT;
     CREATE INDEX i ON t(x);
     INSERT INTO t VALUES (1, 5), (2, 6);
-    SELECT id FROM t WHERE x = 5;
-    UPDATE t SET x = 9 WHERE x = 6;
+    SELECT id FROM t WHERE x = 500;
+    UPDATE t SET x = 9 WHERE x = 600;
     SELECT id, x FROM t ORDER BY id;
 }
 expect {
     1
-    1|5
-    2|9
+    1|500
+    2|900
 }
 
 @requires custom_types "uses CREATE DOMAIN"

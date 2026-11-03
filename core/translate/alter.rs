@@ -1337,6 +1337,15 @@ pub fn translate_alter_table(
                     }
                 }
             }
+            let new_column = btree
+                .columns()
+                .last()
+                .expect("ADD COLUMN appended a column");
+            if btree.is_key_column(new_column) {
+                resolver
+                    .schema()
+                    .check_column_can_be_key(new_column, btree.is_strict)?;
+            }
 
             // Propagate domain CHECK and NOT NULL constraints to the newly
             // added column. Without this, columns typed with a domain would
@@ -1950,6 +1959,12 @@ pub fn translate_alter_table(
 
             let altered_table = if let Some(replacement_column) = &replacement_column {
                 let mut table = btree.clone();
+                if let (Some(old_name), Some(new_name)) = (
+                    btree.columns()[column_index].name.as_deref(),
+                    replacement_column.name.as_deref(),
+                ) {
+                    table.rename_column_in_keys(old_name, new_name);
+                }
                 table.columns_mut()[column_index] = replacement_column.clone();
                 table.resolve_custom_types(resolver.schema());
                 let column = &table.columns()[column_index];
@@ -1971,6 +1986,20 @@ pub fn translate_alter_table(
             };
 
             if let Some(altered_table) = &altered_table {
+                let column = &altered_table.columns()[column_index];
+                let is_index_column =
+                    table_indexes
+                        .iter()
+                        .flat_map(|index| &index.columns)
+                        .any(|index_column| {
+                            index_column.expression().is_none()
+                                && index_column.pos_in_table == column_index
+                        });
+                if is_index_column || altered_table.is_key_column(column) {
+                    resolver
+                        .schema()
+                        .check_column_can_be_key(column, altered_table.is_strict)?;
+                }
                 reject_change_of_indexed_column_order(
                     &original_btree,
                     altered_table,

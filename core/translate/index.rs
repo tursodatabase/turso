@@ -223,7 +223,8 @@ pub fn translate_create_index(
         )
     })?;
 
-    // Block CREATE INDEX on STRUCT/UNION columns and on types that can't be sorted
+    // Block CREATE INDEX on STRUCT/UNION columns, on types that can't be sorted
+    // and on lossy types
     for col in &columns {
         if col.expr.is_none() {
             // Simple column reference (not expression index)
@@ -246,6 +247,9 @@ pub fn translate_create_index(
                         );
                     }
                 }
+                resolver
+                    .schema()
+                    .check_column_can_be_key(column, tbl.is_strict)?;
             }
         }
     }

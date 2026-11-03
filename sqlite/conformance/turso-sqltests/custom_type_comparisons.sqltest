@@ -885,15 +885,16 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test cmp-index-seek-key-is-encoded {
-    -- The index holds encoded values (500, 700), so a seek key is encoded
-    -- before it is compared. The results match the same queries on a scan.
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
-    CREATE TABLE t(id INTEGER PRIMARY KEY, c cents) STRICT;
+    -- The index holds encoded values (500, 700) and DECODE returns them as is,
+    -- so the seek key must be compared as stored. The results match the same
+    -- queries on a scan.
+    CREATE TYPE scaled BASE integer ENCODE value * 100 DECODE value OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c scaled) STRICT;
     INSERT INTO t VALUES (1, 5), (2, 7);
     CREATE INDEX t_c ON t(c);
-    SELECT id FROM t WHERE c = 5;
-    SELECT id FROM t WHERE c > 6;
-    SELECT id FROM t WHERE c IN (7, 8);
+    SELECT id FROM t WHERE c = 500;
+    SELECT id FROM t WHERE c > 600;
+    SELECT id FROM t WHERE c IN (700, 800);
 }
 expect {
     1

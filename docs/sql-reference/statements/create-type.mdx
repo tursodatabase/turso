@@ -545,6 +545,7 @@ If a non-STRICT table was created with a type name that did not exist at the tim
 </Note>
 - **No subqueries in expressions**: The ENCODE, DECODE, and DEFAULT expressions cannot contain subqueries, aggregate functions, or window functions.
 - **No indexes on STRUCT/UNION columns**: CREATE INDEX on a STRUCT or UNION column is not supported.
+- **No keys on types whose DECODE loses information**: A column of a type whose DECODE can give the same value for different stored values cannot be a key: not in `CREATE INDEX`, `UNIQUE`, `PRIMARY KEY`, or either side of a `FOREIGN KEY`. Only types with no DECODE, or a DECODE that is just `value`, can be keys. A domain follows its base type and an array follows its element type. For example, with `CREATE TYPE ci BASE text ENCODE value DECODE lower(value) OPERATOR '<'`, `CREATE INDEX i ON t(c)` fails with `column 'c' of type 'ci' cannot be a key: different stored values can decode to the same value. Index CAST(c AS text) instead`. An index on `CAST(c AS text)` or another expression is allowed.
 
 ## Examples
 
