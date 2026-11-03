@@ -1772,7 +1772,7 @@ pub(super) fn partial_index_predicate_terms(
     bind_partial_index_columns(&mut bound, table_reference);
     apply_static_rewrites(&mut bound, &[&BetweenToComparisons], None).ok()?;
     let mut index_conjuncts: Vec<ast::Expr> = Vec::new();
-    break_predicate_at_and_boundaries(&bound, &mut index_conjuncts);
+    break_predicate_at_and_boundaries(&bound, &mut index_conjuncts).ok()?;
     let mut matched_terms = SmallVec::<[usize; 4]>::new();
     for index_conjunct in index_conjuncts.iter() {
         let (term_idx, term) = query_where_clause.iter().enumerate().find(|(_, term)| {

@@ -19,9 +19,8 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         apply_static_rewrites, expr_contains_function_that_changes_within_statement,
-        expr_contains_nondeterministic_scalar_function, expr_vector_size,
-        integer_literal_truth_value, unwrap_parens, BetweenToComparisons, BindingBehavior,
-        WalkControl,
+        expr_contains_nondeterministic_scalar_function, expr_vector_size, unwrap_parens,
+        AndWithIntegerZero, BetweenToComparisons, BindingBehavior, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -2611,7 +2610,7 @@ pub fn parse_where(
 ) -> Result<()> {
     if let Some(where_expr) = where_clause {
         let start_idx = out_where_clause.len();
-        break_predicate_at_and_boundaries(where_expr, out_where_clause);
+        break_predicate_at_and_boundaries(where_expr, out_where_clause)?;
         for expr in out_where_clause[start_idx..].iter_mut() {
             apply_static_rewrites(&mut expr.expr, &[&BetweenToComparisons], Some(resolver))?;
             bind_and_rewrite_expr(
@@ -2634,7 +2633,7 @@ pub fn parse_where(
             ) {
                 let term = out_where_clause.remove(i);
                 let mut new_terms: Vec<WhereTerm> = Vec::new();
-                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+                break_predicate_at_and_boundaries(&term.expr, &mut new_terms)?;
                 // Preserve the source from the original term.
                 for new_term in new_terms.iter_mut() {
                     new_term.origin = term.origin;
@@ -3051,7 +3050,7 @@ fn parse_join(
         match constraint {
             ast::JoinConstraint::On(ref expr) => {
                 let start_idx = out_where_clause.len();
-                break_predicate_at_and_boundaries(expr, out_where_clause);
+                break_predicate_at_and_boundaries(expr, out_where_clause)?;
                 for predicate in out_where_clause[start_idx..].iter_mut() {
                     predicate.origin = WhereTermOrigin::Join(join_origin);
                     bind_and_rewrite_expr(
@@ -3250,77 +3249,34 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<TableInternalId> {
         _ => None,
     }
 }
+/// Splits a WHERE, HAVING or ON predicate into its AND terms. SQLite's
+/// parser has already replaced `x AND 0` by 0 when it splits a predicate
+/// (see [AndWithIntegerZero]), so that fold comes first here too.
 pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     predicate: &Expr,
     out_predicates: &mut Vec<T>,
-) {
+) -> Result<()> {
+    let mut predicate = predicate.clone();
+    apply_static_rewrites(&mut predicate, &[&AndWithIntegerZero], None)?;
+    split_predicate_at_and_boundaries(&predicate, out_predicates);
+    Ok(())
+}
+
+fn split_predicate_at_and_boundaries<T: From<Expr>>(predicate: &Expr, out_predicates: &mut Vec<T>) {
     // Unwrap single-element parenthesized expressions recursively: ((expr)) -> expr.
     // This is semantically equivalent since single-element Parenthesized is purely
     // syntactic grouping. Multi-element Parenthesized (row values like (x, y)) are
     // left as-is by unwrap_parens.
     let predicate = unwrap_parens(predicate).unwrap_or(predicate);
     match predicate {
-        // A conjunction SQLite's parser would fold to 0 stays one term, so
-        // binding folds it to 0 instead of planning the other terms.
-        // `g = 2 AND false` still splits, and the `g = 2` term can move from
-        // HAVING to WHERE.
-        Expr::Binary(left, ast::Operator::And, right) if !and_chain_folds_to_zero(predicate) => {
-            break_predicate_at_and_boundaries(left, out_predicates);
-            break_predicate_at_and_boundaries(right, out_predicates);
+        Expr::Binary(left, ast::Operator::And, right) => {
+            split_predicate_at_and_boundaries(left, out_predicates);
+            split_predicate_at_and_boundaries(right, out_predicates);
         }
         _ => {
             out_predicates.push(predicate.clone().into());
         }
     }
-}
-
-/// True when SQLite's parser replaces this AND chain by 0 (sqlite3ExprAnd):
-/// the integer literal 0 is one of its terms, as in `a AND 0 AND b`, and no
-/// term calls a function. A function call keeps the chain as it is there, so
-/// `f(x) AND 0` still runs `f(x)` in WHERE, and `abs(g) = 2 AND 0` still lets
-/// `abs(g) = 2` move from HAVING to WHERE.
-fn and_chain_folds_to_zero(expr: &Expr) -> bool {
-    let expr = unwrap_parens(expr).unwrap_or(expr);
-    match expr {
-        Expr::Binary(left, ast::Operator::And, right) => {
-            (and_chain_folds_to_zero(left) || and_chain_folds_to_zero(right))
-                && !expr_calls_function(left)
-                && !expr_calls_function(right)
-        }
-        _ => integer_literal_truth_value(expr) == Some(false),
-    }
-}
-
-/// True if the expression calls a function outside of its subqueries. LIKE,
-/// GLOB, REGEXP and MATCH, the JSON `->` and `->>` operators and
-/// CURRENT_DATE, CURRENT_TIME and CURRENT_TIMESTAMP are function calls to
-/// SQLite's parser too.
-fn expr_calls_function(expr: &Expr) -> bool {
-    let mut found = false;
-    walk_expr(expr, &mut |e| {
-        if matches!(
-            e,
-            Expr::FunctionCall { .. }
-                | Expr::FunctionCallStar { .. }
-                | Expr::Like { .. }
-                | Expr::Binary(
-                    _,
-                    ast::Operator::ArrowRight | ast::Operator::ArrowRightShift,
-                    _
-                )
-                | Expr::Literal(
-                    ast::Literal::CurrentDate
-                        | ast::Literal::CurrentTime
-                        | ast::Literal::CurrentTimestamp
-                )
-        ) {
-            found = true;
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    })
-    .expect("walking an expression with an infallible visitor cannot fail");
-    found
 }
 
 pub fn parse_row_id<F>(

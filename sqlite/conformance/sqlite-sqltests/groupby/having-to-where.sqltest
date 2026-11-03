@@ -148,6 +148,24 @@ test having-like-term-next-to-integer-zero-still-moves {
 expect {
 }
 
+# Parentheses are not there for SQLite's parser: `TRUE AND (a AND 0)` is
+# `TRUE AND 0`, which it folds to 0, so the whole term stays in HAVING.
+@setup overflow
+test having-and-zero-inside-parentheses-keeps-aggregating {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING TRUE AND (a AND 0);
+}
+expect error {
+    integer overflow
+}
+
+@setup overflow
+test having-and-zero-inside-parentheses-before-a-literal-keeps-aggregating {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING (a AND 0) AND 1;
+}
+expect error {
+    integer overflow
+}
+
 @setup overflow
 test having-subquery-still-aggregates {
     SELECT g, sum(a) FROM t GROUP BY g HAVING g = (SELECT 2);
