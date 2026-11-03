@@ -9,7 +9,7 @@ import pytest
 # Skip all tests if SQLAlchemy is not installed
 sqlalchemy = pytest.importorskip("sqlalchemy")
 
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import Column, Integer, LargeBinary, MetaData, Table, select, text  # noqa: E402
 from sqlalchemy.engine import URL  # noqa: E402
 from sqlalchemy.exc import DatabaseError as SADatabaseError  # noqa: E402
 from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: E402
@@ -141,6 +141,23 @@ async def test_local_async_core_crud():
     async with engine.connect() as conn:
         result = await conn.execute(text("SELECT name FROM items"))
         assert result.scalar() == "alice"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_local_async_large_binary_round_trip():
+    """LargeBinary values are bound through turso's Binary, not sqlite3's memoryview."""
+    table = Table("blobs", MetaData(), Column("id", Integer, primary_key=True), Column("data", LargeBinary))
+    engine = create_async_engine("sqlite+aioturso:///:memory:")
+
+    async with engine.begin() as conn:
+        await conn.run_sync(table.create)
+        await conn.execute(table.insert(), {"id": 1, "data": b"\x00\x01\xff"})
+
+    async with engine.connect() as conn:
+        result = await conn.execute(select(table.c.data))
+        assert result.scalar() == b"\x00\x01\xff"
 
     await engine.dispose()
 

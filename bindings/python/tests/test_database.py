@@ -1092,6 +1092,23 @@ def test_blob_data(provider):
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_binary_constructor(provider):
+    module = turso if provider == "turso" else sqlite3
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, data BLOB)")
+
+    blob_data = b"\x00\x01\x02\x03\x04"
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (1, module.Binary(blob_data)))
+
+    cursor.execute("SELECT data FROM test")
+    row = cursor.fetchone()
+    assert row[0] == blob_data
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_limit_offset(provider):
     conn = connect(provider, ":memory:")
     cursor = conn.cursor()

@@ -9,7 +9,7 @@ import pytest
 # Skip all tests if SQLAlchemy is not installed
 sqlalchemy = pytest.importorskip("sqlalchemy")
 
-from sqlalchemy import Column, Integer, String, create_engine, text  # noqa: E402
+from sqlalchemy import Column, Integer, LargeBinary, MetaData, String, Table, create_engine, select, text  # noqa: E402
 from sqlalchemy.engine import URL  # noqa: E402
 from sqlalchemy.orm import Session, declarative_base  # noqa: E402
 from turso.sqlalchemy import TursoDialect, TursoSyncDialect, get_sync_connection  # noqa: E402
@@ -352,6 +352,18 @@ class TestBasicDialectIntegration:
             rows = result.fetchall()
 
             assert rows == [(1, "alice")]
+
+    def test_large_binary_round_trip(self):
+        """LargeBinary values are bound through the DB-API Binary constructor."""
+        table = Table("blobs", MetaData(), Column("id", Integer, primary_key=True), Column("data", LargeBinary))
+        engine = create_engine("sqlite+turso:///:memory:")
+
+        with engine.begin() as conn:
+            table.create(conn)
+            conn.execute(table.insert(), {"id": 1, "data": b"\x00\x01\xff"})
+
+        with engine.connect() as conn:
+            assert conn.execute(select(table.c.data)).scalar() == b"\x00\x01\xff"
 
     def test_orm_usage(self):
         """Test ORM usage with basic dialect."""
@@ -925,6 +937,7 @@ class TestDBAPI2ModuleAttributes:
         assert turso.apilevel == "2.0"
         assert turso.paramstyle == "qmark"
         assert turso.threadsafety == 1
+        assert turso.Binary(b"\x00\xff") == b"\x00\xff"
 
     def test_turso_sync_module_attributes(self):
         """turso.sync module has all DB-API 2.0 attributes."""
@@ -933,6 +946,7 @@ class TestDBAPI2ModuleAttributes:
         assert turso.sync.apilevel == "2.0"
         assert turso.sync.paramstyle == "qmark"
         assert turso.sync.threadsafety == 1
+        assert turso.sync.Binary(b"\x00\xff") == b"\x00\xff"
 
     def test_turso_sync_exception_hierarchy(self):
         """Exception classes are properly re-exported in turso.sync."""
