@@ -86,7 +86,6 @@ pub fn translate(
     query_mode: QueryMode,
     input: &str,
     origin: crate::statement::StatementOrigin,
-    prepare_options: &crate::connection::PrepareOptions,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -122,8 +121,11 @@ pub fn translate(
     // invariant as unmarked schema rows. They look names up in every
     // database, like SQLite does, whatever the connection's search path
     // says.
-    let is_engine_statement = prepare_options.reads_engine_metadata
-        || matches!(origin, crate::statement::StatementOrigin::InternalHelper);
+    let is_engine_statement = matches!(
+        origin,
+        crate::statement::StatementOrigin::InternalHelper
+            | crate::statement::StatementOrigin::EngineMetadataRead
+    );
     let search_path = if is_engine_statement {
         None
     } else {
@@ -731,7 +733,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -953,7 +954,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -997,7 +997,6 @@ mod tests {
             QueryMode::Normal,
             "",
             crate::statement::StatementOrigin::Root,
-            &crate::connection::PrepareOptions::default(),
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {

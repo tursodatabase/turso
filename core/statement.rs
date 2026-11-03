@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use crate::connection::PrepareOptions;
 use tracing::{instrument, Level};
 use turso_parser::ast::{fmt::ToTokens, Cmd};
 
@@ -54,11 +53,18 @@ type StepResult = vdbe::StepResult;
 /// already compiled into a parent statement and entered through `OP_Program`,
 /// such as trigger or foreign-key actions. This is not separately prepared SQL;
 /// it is embedded child bytecode execution inside the parent statement.
+///
+/// Use [`StatementOrigin::EngineMetadataRead`] when the engine reads its own
+/// tables, such as the roles table or `sqlite_stat1`, to load the schema.
+/// Such a statement is a top-level statement like a root statement, so it
+/// runs in its own read transaction, but its names are looked up like in a
+/// helper statement: in every database, whatever the search path says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatementOrigin {
     Root,
     InternalHelper,
     Subprogram,
+    EngineMetadataRead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +81,12 @@ pub enum StatementStatusCounter {
 impl StatementOrigin {
     pub(crate) const fn needs_nested_guard(self) -> bool {
         matches!(self, Self::InternalHelper)
+    }
+
+    /// Whether the statement counts toward
+    /// `Connection::n_active_root_statements`.
+    pub(crate) const fn is_top_level(self) -> bool {
+        matches!(self, Self::Root | Self::EngineMetadataRead)
     }
 }
 
@@ -211,7 +223,6 @@ pub struct Statement {
     /// The command the statement was prepared from, when its SQL text cannot
     /// be parsed again, so that preparing it again translates the command.
     reprepare_cmd: Option<Cmd>,
-    reads_engine_metadata: bool,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -294,13 +305,7 @@ impl Statement {
             nested_guard_active,
             analyze_refresh: None,
             reprepare_cmd: None,
-            reads_engine_metadata: false,
         }
-    }
-
-    pub(crate) fn with_reads_engine_metadata(mut self, reads_engine_metadata: bool) -> Self {
-        self.reads_engine_metadata = reads_engine_metadata;
-        self
     }
 
     /// Mark this statement as the parked backing statement of an incremental
@@ -540,7 +545,7 @@ impl Statement {
     /// hand back to the caller when the statement must not run yet.
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
-        if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
+        if !self.counted_as_active_root && self.origin.is_top_level() {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
             // After the root count, so the checkpoint guard's subtraction
@@ -1009,9 +1014,6 @@ impl Statement {
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
             let schema = conn.schema.read().clone();
-            let prepare_options = PrepareOptions {
-                reads_engine_metadata: self.reads_engine_metadata,
-            };
             translate::translate(
                 &schema,
                 stmt,
@@ -1021,7 +1023,6 @@ impl Statement {
                 mode,
                 &self.program.sql,
                 self.origin,
-                &prepare_options,
             )?
         };
 
