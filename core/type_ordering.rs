@@ -30,7 +30,9 @@ pub enum TypeOrdering {
 impl TypeOrdering {
     pub const ALL: [Self; 3] = [Self::Numeric, Self::Array, Self::TextArray];
 
-    /// The name EXPLAIN shows for the order.
+    /// The name EXPLAIN shows for the order, also saved in `sqlite_schema` as
+    /// part of the key type of materialized view hidden tables. Existing
+    /// databases depend on these names, so they must not change.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Numeric => "numeric",
