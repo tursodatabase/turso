@@ -117,6 +117,26 @@ test having-digit-separator-zero-still-moves-the-group-by-term {
 expect {
 }
 
+# SQLite's parser does not fold `x AND 0` when a term calls a function, so
+# `abs(g) = 2` still moves to WHERE and the overflowing group is never
+# aggregated.
+@setup overflow
+test having-function-term-next-to-integer-zero-still-moves {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING abs(g) = 2 AND 0;
+}
+expect {
+}
+
+# `g = 2 AND 0` is folded first; the `0 AND abs(1)` that is left keeps every
+# group aggregated, while `abs(1)` alone may move.
+@setup overflow
+test having-integer-zero-folded-before-a-function-term-keeps-aggregating {
+    SELECT g, sum(a) FROM t GROUP BY g HAVING g = 2 AND 0 AND abs(1);
+}
+expect error {
+    integer overflow
+}
+
 @setup overflow
 test having-subquery-still-aggregates {
     SELECT g, sum(a) FROM t GROUP BY g HAVING g = (SELECT 2);

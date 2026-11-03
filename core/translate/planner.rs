@@ -3260,11 +3260,11 @@ pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     // left as-is by unwrap_parens.
     let predicate = unwrap_parens(predicate).unwrap_or(predicate);
     match predicate {
-        // A conjunction with the integer literal 0 among its terms stays one
-        // term, so binding folds it to 0 instead of planning the other terms.
-        // SQLite's parser folds exactly that shape; `g = 2 AND false` still
-        // splits, and the `g = 2` term can move from HAVING to WHERE.
-        Expr::Binary(left, ast::Operator::And, right) if !and_chain_has_integer_zero(predicate) => {
+        // A conjunction SQLite's parser would fold to 0 stays one term, so
+        // binding folds it to 0 instead of planning the other terms.
+        // `g = 2 AND false` still splits, and the `g = 2` term can move from
+        // HAVING to WHERE.
+        Expr::Binary(left, ast::Operator::And, right) if !and_chain_folds_to_zero(predicate) => {
             break_predicate_at_and_boundaries(left, out_predicates);
             break_predicate_at_and_boundaries(right, out_predicates);
         }
@@ -3274,16 +3274,35 @@ pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     }
 }
 
-/// True for the integer literal 0, or an AND chain with 0 as one of its terms,
-/// such as `a AND 0 AND b`: SQLite's parser folds every such chain to 0.
-fn and_chain_has_integer_zero(expr: &Expr) -> bool {
+/// True when SQLite's parser replaces this AND chain by 0 (sqlite3ExprAnd):
+/// the integer literal 0 is one of its terms, as in `a AND 0 AND b`, and no
+/// term calls a function. A function call keeps the chain as it is there, so
+/// `f(x) AND 0` still runs `f(x)` in WHERE, and `abs(g) = 2 AND 0` still lets
+/// `abs(g) = 2` move from HAVING to WHERE.
+fn and_chain_folds_to_zero(expr: &Expr) -> bool {
     let expr = unwrap_parens(expr).unwrap_or(expr);
     match expr {
         Expr::Binary(left, ast::Operator::And, right) => {
-            and_chain_has_integer_zero(left) || and_chain_has_integer_zero(right)
+            (and_chain_folds_to_zero(left) || and_chain_folds_to_zero(right))
+                && !expr_calls_function(left)
+                && !expr_calls_function(right)
         }
         _ => integer_literal_truth_value(expr) == Some(false),
     }
+}
+
+/// True if the expression calls a function outside of its subqueries.
+fn expr_calls_function(expr: &Expr) -> bool {
+    let mut found = false;
+    walk_expr(expr, &mut |e| {
+        if matches!(e, Expr::FunctionCall { .. } | Expr::FunctionCallStar { .. }) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression with an infallible visitor cannot fail");
+    found
 }
 
 pub fn parse_row_id<F>(
