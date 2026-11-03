@@ -985,12 +985,12 @@ impl PostgreSQLTranslator {
         let using_expr = policy
             .qual
             .as_ref()
-            .map(|expr| self.translate_policy_expr(expr).map(Box::new))
+            .map(|expr| self.translate_expr(expr).map(Box::new))
             .transpose()?;
         let check_expr = policy
             .with_check
             .as_ref()
-            .map(|expr| self.translate_policy_expr(expr).map(Box::new))
+            .map(|expr| self.translate_expr(expr).map(Box::new))
             .transpose()?;
         Ok(ast::Stmt::CreatePolicy(Box::new(ast::CreatePolicy {
             policy_name: ast::Name::exact(policy.policy_name.clone()),
@@ -1001,27 +1001,6 @@ impl PostgreSQLTranslator {
             using_expr,
             check_expr,
         })))
-    }
-
-    /// A policy condition. `true` and `false` become the plain literals,
-    /// which core recognizes as policies that show every row or none,
-    /// instead of the boolean casts other expressions use.
-    fn translate_policy_expr(
-        &self,
-        node: &pg_query::protobuf::Node,
-    ) -> Result<ast::Expr, ParseError> {
-        use pg_query::protobuf::{a_const::Val, node::Node};
-
-        if let Some(Node::AConst(constant)) = &node.node {
-            if let Some(Val::Boolval(value)) = &constant.val {
-                return Ok(ast::Expr::Literal(if value.boolval {
-                    ast::Literal::True
-                } else {
-                    ast::Literal::False
-                }));
-            }
-        }
-        self.translate_expr(node)
     }
 
     fn translate_rename_stmt(
@@ -12001,7 +11980,7 @@ mod tests {
             ),
             (
                 "CREATE POLICY everything ON docs USING (true)",
-                "CREATE POLICY everything ON docs FOR ALL USING (TRUE)",
+                "CREATE POLICY everything ON docs FOR ALL USING (CAST (1 AS boolean))",
             ),
             (
                 "DROP POLICY IF EXISTS own ON docs",

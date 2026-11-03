@@ -333,20 +333,20 @@ fn unsupported_policies_are_rejected() {
         ),
         ("CREATE POLICY p ON docs", "USING"),
         (
-            "CREATE POLICY p ON docs USING (owner = 'alice')",
-            "unsupported policy condition",
-        ),
-        (
-            "CREATE POLICY p ON docs USING (owner = current_user AND id > 1)",
-            "unsupported policy condition",
-        ),
-        (
             "CREATE POLICY p ON docs USING (owner IN (SELECT current_user))",
-            "unsupported policy condition",
+            "subqueries in policies are not supported",
+        ),
+        (
+            "CREATE POLICY p ON docs USING (EXISTS (SELECT 1 FROM ids WHERE ids.id = docs.id))",
+            "subqueries in policies are not supported",
         ),
         (
             "CREATE POLICY p ON docs USING (missing = current_user)",
             "missing",
+        ),
+        (
+            "CREATE POLICY p ON docs USING (ids.id = 1)",
+            "can only refer to the columns of that table",
         ),
         ("CREATE POLICY p ON nope USING (true)", "nope"),
     ] {
@@ -359,6 +359,53 @@ fn unsupported_policies_are_rejected() {
         "CREATE POLICY p ON docs USING (true)",
         "already exists",
     );
+}
+
+#[test]
+fn policy_condition_can_be_any_expression_on_the_table() {
+    for (using, expected) in [
+        ("owner = 'bob'", vec![2]),
+        ("owner = current_user AND id > 1", vec![3]),
+        ("id IN (1, 2)", vec![1, 2]),
+        ("upper(owner) = upper(current_user)", vec![1, 3]),
+        ("docs.id % 2 = 1", vec![1, 3]),
+        ("true", vec![1, 2, 3]),
+        ("false", vec![]),
+        ("NULL", vec![]),
+    ] {
+        let db = TempDatabase::builder().build();
+        let conn = db.connect_postgres();
+        create_docs_with_row_security(&conn);
+        conn.execute(format!("CREATE POLICY p ON docs USING ({using})"))
+            .unwrap();
+
+        conn.execute("SET ROLE alice").unwrap();
+
+        assert_eq!(
+            integers(&conn, "SELECT d.id FROM docs AS d ORDER BY d.id"),
+            expected,
+            "{using}"
+        );
+    }
+}
+
+#[test]
+fn policy_condition_is_kept_exactly_after_reopening_the_database() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    create_docs_with_row_security(&conn);
+    conn.execute(
+        "CREATE POLICY p ON docs USING (owner = (SELECT current_user) AND owner <> 'it''s' AND id < 3)",
+    )
+    .unwrap();
+    conn.close().unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+
+    let conn = db.connect_postgres();
+    conn.execute("SET ROLE alice").unwrap();
+    assert_eq!(integers(&conn, "SELECT id FROM docs"), [1]);
 }
 
 #[test]
@@ -420,14 +467,21 @@ fn policies_are_kept_after_reopening_the_database() {
 }
 
 #[test]
-fn policy_owner_column_cannot_change() {
+fn columns_used_by_policies_cannot_change() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();
     create_docs_with_owner_policy(&conn);
 
+    conn.execute("ALTER TABLE docs ADD COLUMN team int")
+        .unwrap();
+    conn.execute("CREATE POLICY team ON docs USING (docs.team > 0 OR id = 1)")
+        .unwrap();
+
     for sql in [
         "ALTER TABLE docs RENAME COLUMN owner TO author",
         "ALTER TABLE docs DROP COLUMN owner",
+        "ALTER TABLE docs DROP COLUMN team",
+        "ALTER TABLE docs RENAME COLUMN id TO key",
         "ALTER TABLE docs RENAME TO papers",
     ] {
         assert_error_contains(&conn, sql, "row-level security");

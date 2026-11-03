@@ -7,14 +7,15 @@ use crate::{
     namespace::{mangle_name, NamespaceId, NamespaceRef},
     schema::{BTreeTable, Table},
     security::row_security::{
-        Policy, PolicyCondition, RowSecurityCatalog, RowSecurityChange,
+        Policy, RowSecurityCatalog, RowSecurityChange, RowSecurityRow,
         CREATE_ROW_SECURITY_TABLE_SQL, ROW_SECURITY_TABLE_NAME,
     },
     storage::pager::CreateBTreeFlags,
     translate::{
         collate::CollationSeq,
         emitter::Resolver,
-        plan::{JoinOrigin, TableReferences, WhereTerm, WhereTermOrigin},
+        expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl},
+        plan::{JoinOrigin, JoinedTable, TableReferences, WhereTerm, WhereTermOrigin},
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
     util::normalize_ident,
@@ -42,7 +43,7 @@ pub fn translate_row_security_change(
     }
     let rows = RowSecurityRows::open(resolver, program)?;
     if enable {
-        rows.emit_insert(program, &["row_security", "", &table, "", ""]);
+        rows.emit_insert(program, &RowSecurityRow::for_row_security(&table));
     } else {
         rows.emit_delete(program, &[("row_security", 0), (&table, 2)]);
     }
@@ -58,8 +59,8 @@ pub fn translate_row_security_change(
 }
 
 /// CREATE POLICY for the forms supported so far: a permissive SELECT (or
-/// ALL) policy for every role, whose USING condition shows every row, no
-/// row, or the rows whose owner column equals the current role.
+/// ALL) policy for every role, whose USING condition refers only to columns
+/// of the table.
 pub fn translate_create_policy(
     policy: &ast::CreatePolicy,
     resolver: &Resolver,
@@ -93,25 +94,24 @@ pub fn translate_create_policy(
     if policy.check_expr.is_some() {
         bail_parse_error!("WITH CHECK is not supported");
     }
-    let Some(using_expr) = &policy.using_expr else {
+    if policy.using_expr.is_none() {
         bail_parse_error!("a policy needs a USING condition");
-    };
-    let condition = policy_condition(using_expr, &table)?;
+    }
 
-    let (condition_value, column_name) = condition.to_row_values();
+    let row = RowSecurityRow::for_policy(&stored_name, policy);
+    let change = RowSecurityChange::from_row(&row)?;
+    let RowSecurityChange::CreatePolicy { policy, .. } = &change else {
+        unreachable!("a policy row is a policy");
+    };
+    for expr in [&policy.using_expr, &policy.check_expr]
+        .into_iter()
+        .flatten()
+    {
+        check_policy_expr(expr, &table)?;
+    }
     let rows = RowSecurityRows::open(resolver, program)?;
-    rows.emit_insert(
-        program,
-        &["policy", &name, &stored_name, condition_value, column_name],
-    );
-    emit_catalog_update(
-        program,
-        resolver,
-        RowSecurityChange::CreatePolicy {
-            table: stored_name,
-            policy: Policy { name, condition },
-        },
-    );
+    rows.emit_insert(program, &row);
+    emit_catalog_update(program, resolver, change);
     Ok(())
 }
 
@@ -182,8 +182,8 @@ pub fn reject_rename_of_table_with_row_security(
     Ok(())
 }
 
-/// Policies refer to their owner column by name, so it cannot be renamed,
-/// dropped or redefined.
+/// Policies refer to columns by name, so a column that a policy uses cannot
+/// be renamed, dropped or redefined.
 pub fn reject_change_of_policy_column(
     table_name: &str,
     namespace: NamespaceRef,
@@ -195,9 +195,10 @@ pub fn reject_change_of_policy_column(
     }
     let column_name = normalize_ident(column_name);
     let stored_name = stored_table_name(namespace, table_name);
-    let used_by_policy = catalog(resolver).policies(&stored_name).iter().any(|policy| {
-        matches!(&policy.condition, PolicyCondition::OwnedByRole(column) if *column == column_name)
-    });
+    let used_by_policy = catalog(resolver)
+        .policies(&stored_name)
+        .iter()
+        .any(|policy| policy_uses_column(policy, &column_name));
     if used_by_policy {
         bail_parse_error!(
             "cannot change column \"{column_name}\" of table \"{table_name}\": a row-level security policy uses it"
@@ -208,13 +209,13 @@ pub fn reject_change_of_policy_column(
 
 /// A role sees only the rows of a table with row-level security that one of
 /// the table's policies shows: every such table in the FROM clause gets a
-/// filter that combines the policies with OR, and that is always false
-/// without policies. For the right side of an outer join the filter is part
-/// of the join condition, so the hidden rows produce NULLs like rows that do
-/// not exist. The filters go before the
-/// query's own conditions, so no expression of the query sees a hidden row.
-/// The tables are recorded so the optimizer does not choose access methods
-/// that evaluate the query's expressions on a row before its filter.
+/// filter that combines the USING conditions of the policies with OR, and
+/// that is always false without policies. For the right side of an outer
+/// join the filter is part of the join condition, so the hidden rows produce
+/// NULLs like rows that do not exist. The filters go before the query's own
+/// conditions, so no expression of the query sees a hidden row. The tables
+/// are recorded so the optimizer does not choose access methods that
+/// evaluate the query's expressions on a row before its filter.
 pub fn add_select_row_security_filters(
     table_references: &mut TableReferences,
     where_clause: &mut Vec<WhereTerm>,
@@ -240,32 +241,19 @@ pub fn add_select_row_security_filters(
                 btree.declared_name
             );
         }
-        let role = resolver
-            .row_security_role
-            .as_deref()
-            .expect("row security applies to roles");
         let catalog = catalog(resolver);
         let policies = catalog.policies(&stored_table_name(table.namespace, &btree.declared_name));
-        if policies
-            .iter()
-            .any(|policy| policy.condition == PolicyCondition::AllRows)
-        {
-            continue;
-        }
         let mut visible = None;
-        for policy in policies {
-            let PolicyCondition::OwnedByRole(column) = &policy.condition else {
+        for policy in policies.iter().filter(|policy| policy.applies_to_reads()) {
+            let Some(using_expr) = &policy.using_expr else {
                 continue;
             };
-            let (index, column) = btree
-                .get_column(column)
-                .expect("policy columns cannot be dropped");
-            used_columns.push((table.internal_id, index));
-            let owned = owned_by_role(table.internal_id, index, column.is_rowid_alias(), role);
+            let shown = bind_policy_expr(using_expr, table, btree, resolver)?;
+            collect_used_columns(&shown, table.internal_id, &mut used_columns)?;
             visible = Some(match visible {
-                None => owned,
+                None => shown,
                 Some(previous) => {
-                    ast::Expr::Binary(Box::new(previous), ast::Operator::Or, Box::new(owned))
+                    ast::Expr::Binary(Box::new(previous), ast::Operator::Or, Box::new(shown))
                 }
             });
         }
@@ -295,30 +283,44 @@ pub fn add_select_row_security_filters(
     Ok(())
 }
 
-/// `column = '<role>' COLLATE BINARY`: the column's own collation must not
-/// make a different role's name match.
-fn owned_by_role(
-    table: ast::TableInternalId,
-    column: usize,
-    is_rowid_alias: bool,
-    role: &str,
-) -> ast::Expr {
-    ast::Expr::Binary(
-        Box::new(ast::Expr::Column {
-            database: None,
-            table,
-            column,
-            is_rowid_alias,
-        }),
-        ast::Operator::Equals,
-        Box::new(ast::Expr::Collate(
-            Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                "'{}'",
-                role.replace('\'', "''")
-            )))),
-            ast::Name::exact("BINARY".to_string()),
-        )),
-    )
+/// Binds a policy condition to the table it protects. The condition sees
+/// only that table, under its own name, whatever alias the query gives it.
+fn bind_policy_expr(
+    expr: &ast::Expr,
+    table: &JoinedTable,
+    btree: &BTreeTable,
+    resolver: &Resolver,
+) -> Result<ast::Expr> {
+    let mut policy_table = table.clone();
+    policy_table.identifier = normalize_ident(&btree.declared_name);
+    policy_table.has_alias = false;
+    policy_table.join_info = None;
+    let mut table_references = TableReferences::new(vec![policy_table], Vec::new());
+    let mut expr = expr.clone();
+    bind_and_rewrite_expr(
+        &mut expr,
+        Some(&mut table_references),
+        None,
+        resolver,
+        BindingBehavior::ResultColumnsNotAllowed,
+    )?;
+    Ok(expr)
+}
+
+fn collect_used_columns(
+    expr: &ast::Expr,
+    internal_id: ast::TableInternalId,
+    used_columns: &mut Vec<(ast::TableInternalId, usize)>,
+) -> Result<()> {
+    walk_expr(expr, &mut |expr| {
+        if let ast::Expr::Column { table, column, .. } = expr {
+            if *table == internal_id {
+                used_columns.push((*table, *column));
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 /// A role cannot write to a table with row-level security yet.
@@ -390,118 +392,63 @@ fn stored_table_name(namespace: NamespaceRef, table_name: &str) -> String {
     mangle_name(namespace.id, &normalize_ident(table_name))
 }
 
-/// The condition of a supported USING expression: `true`, `false`, or
-/// `<column> = current_user` in either order, where `current_user` may also
-/// be written as `current_user()` or `(SELECT current_user)`.
-fn policy_condition(expr: &ast::Expr, table: &BTreeTable) -> Result<PolicyCondition> {
-    let expr = unwrap_parens(expr);
-    match expr {
-        ast::Expr::Literal(ast::Literal::True) => return Ok(PolicyCondition::AllRows),
-        ast::Expr::Literal(ast::Literal::False) => return Ok(PolicyCondition::NoRows),
-        ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1" => {
-            return Ok(PolicyCondition::AllRows)
-        }
-        ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0" => {
-            return Ok(PolicyCondition::NoRows)
-        }
-        ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
-            let (lhs, rhs) = (unwrap_parens(lhs), unwrap_parens(rhs));
-            for (column, role) in [(lhs, rhs), (rhs, lhs)] {
-                if is_current_user(role, table) {
-                    if let Some(column) = column_of(column, table)? {
-                        return Ok(PolicyCondition::OwnedByRole(column));
-                    }
+/// A policy condition may refer to the columns of its table, written as
+/// `column` or `table.column`, and call functions. Subqueries are not
+/// supported, except `(SELECT <expr>)` without FROM, which the catalog has
+/// already replaced by its expression. Virtual generated columns are not
+/// supported either.
+fn check_policy_expr(expr: &ast::Expr, table: &BTreeTable) -> Result<()> {
+    walk_expr(expr, &mut |expr| {
+        let column_name = match expr {
+            ast::Expr::Id(name) => name,
+            ast::Expr::Qualified(qualifier, name) => {
+                if normalize_ident(qualifier.as_str()) != normalize_ident(&table.declared_name) {
+                    bail_parse_error!(
+                        "a policy of table \"{}\" can only refer to the columns of that table",
+                        table.declared_name
+                    );
                 }
+                name
             }
+            ast::Expr::DoublyQualified(..) => bail_parse_error!(
+                "a policy of table \"{}\" can only refer to the columns of that table",
+                table.declared_name
+            ),
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+                bail_parse_error!("subqueries in policies are not supported")
+            }
+            ast::Expr::Variable(_) => bail_parse_error!("parameters in policies are not supported"),
+            _ => return Ok(WalkControl::Continue),
+        };
+        let Some((_, column)) = table.get_column(column_name.as_str()) else {
+            bail_parse_error!("no such column: {}", column_name.as_str());
+        };
+        if column.is_virtual_generated() {
+            bail_parse_error!(
+                "policies cannot use generated column \"{}\"",
+                column_name.as_str()
+            );
         }
-        _ => {}
-    }
-    bail_parse_error!(
-        "unsupported policy condition {expr}: only true, false and <column> = current_user are supported"
-    )
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
-fn unwrap_parens(expr: &ast::Expr) -> &ast::Expr {
-    match expr {
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => unwrap_parens(&exprs[0]),
-        _ => expr,
-    }
-}
-
-fn is_current_user(expr: &ast::Expr, table: &BTreeTable) -> bool {
-    match expr {
-        ast::Expr::FunctionCall {
-            name,
-            distinctness: None,
-            args,
-            order_by,
-            within_group,
-            filter_over,
-        } => {
-            name.as_str().eq_ignore_ascii_case("current_user")
-                && args.is_empty()
-                && order_by.is_empty()
-                && within_group.is_empty()
-                && filter_over.filter_clause.is_none()
-                && filter_over.over_clause.is_none()
-        }
-        ast::Expr::Id(name) => {
-            name.as_str().eq_ignore_ascii_case("current_user")
-                && table.get_column(name.as_str()).is_none()
-        }
-        ast::Expr::Subquery(select) => single_value_of(select)
-            .is_some_and(|value| is_current_user(unwrap_parens(value), table)),
-        _ => false,
-    }
-}
-
-/// The expression of `SELECT <expr>` without FROM or any other clause.
-fn single_value_of(select: &ast::Select) -> Option<&ast::Expr> {
-    if select.with.is_some()
-        || !select.body.compounds.is_empty()
-        || !select.order_by.is_empty()
-        || select.limit.is_some()
+fn policy_uses_column(policy: &Policy, column_name: &str) -> bool {
+    let mut uses_column = false;
+    for expr in [&policy.using_expr, &policy.check_expr]
+        .into_iter()
+        .flatten()
     {
-        return None;
+        walk_expr(expr, &mut |expr| {
+            if let ast::Expr::Id(name) | ast::Expr::Qualified(_, name) = expr {
+                uses_column |= normalize_ident(name.as_str()) == column_name;
+            }
+            Ok(WalkControl::Continue)
+        })
+        .expect("the walk never fails");
     }
-    match &select.body.select {
-        ast::OneSelect::Select {
-            distinctness: None,
-            columns,
-            from: None,
-            where_clause: None,
-            group_by: None,
-            window_clause,
-        } if window_clause.is_empty() => match columns.as_slice() {
-            [ast::ResultColumn::Expr(expr, _)] => Some(expr),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// The name of the column `expr` refers to, written as `column` or
-/// `table.column`. Virtual generated columns are rejected.
-fn column_of(expr: &ast::Expr, table: &BTreeTable) -> Result<Option<String>> {
-    let name = match expr {
-        ast::Expr::Id(name) => name,
-        ast::Expr::Qualified(qualifier, name)
-            if normalize_ident(qualifier.as_str()) == normalize_ident(&table.declared_name) =>
-        {
-            name
-        }
-        _ => return Ok(None),
-    };
-    let Some((_, column)) = table.get_column(name.as_str()) else {
-        bail_parse_error!("no such column: {}", name.as_str());
-    };
-    if column.is_virtual_generated() {
-        bail_parse_error!(
-            "generated column \"{}\" cannot be a policy owner column",
-            name.as_str()
-        );
-    }
-    Ok(Some(normalize_ident(name.as_str())))
+    uses_column
 }
 
 /// Whether the table has row-level security or policies.
@@ -622,24 +569,40 @@ impl RowSecurityRows {
         Ok((table, RegisterOrLiteral::Register(root_reg)))
     }
 
-    fn emit_insert(&self, program: &mut ProgramBuilder, values: &[&str]) {
+    fn emit_insert(&self, program: &mut ProgramBuilder, row: &RowSecurityRow) {
         let rowid_reg = program.alloc_register();
         program.emit_insn(Insn::NewRowid {
             cursor: self.cursor_id,
             rowid_reg,
             prev_largest_reg: 0,
         });
-        let first_reg = program.alloc_registers(values.len());
-        for (i, value) in values.iter().enumerate() {
+        // Column positions as in CREATE_ROW_SECURITY_TABLE_SQL.
+        const COLUMN_COUNT: usize = 8;
+        const PERMISSIVE_COLUMN: usize = 3;
+        let texts = [
+            (0, &row.kind),
+            (1, &row.name),
+            (2, &row.tbl_name),
+            (4, &row.command),
+            (5, &row.roles),
+            (6, &row.using_expr),
+            (7, &row.check_expr),
+        ];
+        let first_reg = program.alloc_registers(COLUMN_COUNT);
+        for (column, text) in texts {
             program.emit_insn(Insn::String8 {
-                dest: first_reg + i,
-                value: value.to_string(),
+                dest: first_reg + column,
+                value: text.clone(),
             });
         }
+        program.emit_insn(Insn::Integer {
+            value: i64::from(row.permissive),
+            dest: first_reg + PERMISSIVE_COLUMN,
+        });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(first_reg),
-            count: to_u32(values.len()),
+            count: to_u32(COLUMN_COUNT),
             dest_reg: to_u32(record_reg),
             index_name: None,
             affinity_str: None,

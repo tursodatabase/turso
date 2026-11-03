@@ -79,25 +79,27 @@ Policies have no effect while the table's row-level security is disabled.
 
 - `name`: The name of the policy, unique among the table's policies.
 - `table_name`: The name of the table, optionally schema-qualified.
-- `condition`: Which rows the policy shows. One of:
-  - `true`: every row.
-  - `false`: no rows.
-  - `column = current_user`, in either order: the rows whose `column` equals
-    the name of the current role. `current_user` may also be written as
-    `current_user()` or `(SELECT current_user)`.
+- `condition`: Which rows the policy shows: the rows for which the condition
+  is true. It can use the columns of the table, written as `column` or
+  `table_name.column`, and call functions such as `current_user` or
+  `auth.uid()`.
 
 **Notes:**
 
 Only a superuser can create policies.
 
-The role name is compared with the column byte for byte, whatever the
-column's collation. An index on the column can be used to find the role's
-rows.
+The condition cannot contain subqueries, except `(SELECT expression)`
+without `FROM`, which is the same as `(expression)`. Supabase recommends that
+form, as in `(SELECT auth.uid())`. It cannot use generated columns that are
+not stored.
 
-`AS RESTRICTIVE`, `FOR INSERT`, `FOR UPDATE`, `FOR DELETE`, `TO` a role,
-`WITH CHECK`, and other conditions are not supported. The column a policy
-uses cannot be renamed, dropped or altered. Policies are not listed in the
-`pg_policy` catalog.
+The condition is checked before the query's own conditions, so the query never
+evaluates its expressions on a row the role cannot see. An index on a column
+the condition compares can be used to find the rows.
+
+`AS RESTRICTIVE`, `FOR INSERT`, `FOR UPDATE`, `FOR DELETE`, `TO` a role and
+`WITH CHECK` are not supported. The columns a policy uses cannot be renamed,
+dropped or altered. Policies are not listed in the `pg_policy` catalog.
 
 **Examples:**
 
