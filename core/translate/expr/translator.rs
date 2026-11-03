@@ -552,9 +552,13 @@ fn translate_binary_expr(
     // `x OR 1`, so the operand that fold would have dropped must not run here
     // either. An expression with an aggregate takes the normal path: binding
     // kept its operands on purpose, and an aggregate where none is allowed,
-    // as in an ON clause, must still fail as a misuse.
+    // as in an ON clause, must still fail as a misuse. So does one with a
+    // column name this statement has no register for, as an unknown column
+    // in a trigger WHEN clause, which must still fail as no such column.
     if let Some(value) = and_or_truth_value(expr) {
-        if !expr_contains_aggregate_or_window_function(expr, resolver)? {
+        if !expr_contains_aggregate_or_window_function(expr, resolver)?
+            && every_column_name_has_a_register(expr, resolver)
+        {
             program.emit_insn(Insn::Integer {
                 value: i64::from(value),
                 dest: target_register,
@@ -601,6 +605,27 @@ fn translate_binary_expr(
         BinaryEmitMode::Value,
     )?;
     Ok(target_register)
+}
+
+/// True when every column name still in `expr` has a register this statement
+/// gave it, as the columns of a CHECK constraint have. A name without one,
+/// like an unknown column in a trigger WHEN clause, must reach
+/// translate_id_expr and fail there.
+pub(super) fn every_column_name_has_a_register(expr: &ast::Expr, resolver: &Resolver) -> bool {
+    let mut every_name_has_one = true;
+    walk_expr(expr, &mut |e| {
+        if matches!(
+            e,
+            ast::Expr::Id(_) | ast::Expr::Qualified(..) | ast::Expr::DoublyQualified(..)
+        ) && resolver.resolve_cached_expr_reg(e).is_none()
+        {
+            every_name_has_one = false;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression with an infallible visitor cannot fail");
+    every_name_has_one
 }
 
 #[inline(never)]
