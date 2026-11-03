@@ -11780,7 +11780,7 @@ pub fn op_function(
                         crate::util::renamed_automatic_index_name(&name, &rename_from, &rename_to)
                     {
                         index_name
-                    } else if name == rename_from {
+                    } else if entry_type.as_str() == "table" && name == rename_from {
                         rename_to.clone()
                     } else {
                         name
