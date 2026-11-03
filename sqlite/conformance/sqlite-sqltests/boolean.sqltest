@@ -445,6 +445,18 @@ expect error {
     malformed JSON
 }
 
+# An aggregate where none is allowed is still a misuse, even next to the
+# constant that would decide the AND or OR.
+
+test and-or-with-a-constant-operand-still-rejects-a-misused-aggregate {
+    CREATE TABLE misuse(a);
+    CREATE TABLE misuse_other(b);
+    SELECT a, b FROM misuse LEFT JOIN misuse_other ON sum(a) AND 0;
+}
+expect error {
+    misuse of aggregate
+}
+
 # An aggregate in the operand that `x AND 0` or `x OR 1` drops still makes the
 # query an aggregate query, so it gives one row.
 
