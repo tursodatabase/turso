@@ -52,7 +52,7 @@ use crate::vdbe::affinity::{
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
-use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags};
+use crate::vdbe::insn::{AlterColumnData, ConstraintInfo, InsertFlags, SET_COOKIE_FOR_ROLES};
 use crate::vdbe::metrics::{HashJoinMetrics, StatementMetrics};
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
@@ -16578,7 +16578,7 @@ pub fn op_set_cookie(
             db,
             cookie,
             value,
-            p5: _,
+            p5,
         },
         insn
     );
@@ -16597,7 +16597,7 @@ pub fn op_set_cookie(
         upgrade_mv_tx_to_exclusive(program, &pager, mv_store, *db, tx_id)?;
     }
 
-    match with_header_mut(&pager, mv_store.as_ref(), program, *db, |header| {
+    let apply = |header: &mut DatabaseHeader| {
         match cookie {
             Cookie::ApplicationId => header.application_id = (*value).into(),
             Cookie::DatabaseFormat => header.schema_format = (*value as u32).into(),
@@ -16662,7 +16662,18 @@ pub fn op_set_cookie(
             Cookie::FreePageCount => unreachable!("freelist page count is not set via SetCookie"),
         };
         Ok(())
-    })? {
+    };
+    let applied = match mv_store.as_ref() {
+        Some(mv_store) if *p5 & SET_COOKIE_FOR_ROLES != 0 => {
+            let tx_id = program
+                .connection
+                .get_mv_tx_id_for_db(*db)
+                .expect("an MVCC header update has a transaction");
+            IOResult::Done(mv_store.with_header_mut_for_roles(apply, &tx_id)?)
+        }
+        _ => with_header_mut(&pager, mv_store.as_ref(), program, *db, apply)?,
+    };
+    match applied {
         IOResult::Done(result) => result?,
         IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
     }

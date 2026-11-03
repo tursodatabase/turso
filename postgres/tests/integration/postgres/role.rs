@@ -652,3 +652,36 @@ fn changing_to_another_role_and_back_does_not_prepare_statements_again() {
         0
     );
 }
+#[test]
+fn creating_a_role_does_not_abort_a_concurrent_transaction() {
+    let db = TempDatabase::builder().build();
+    let writer = db.connect_postgres();
+    let admin = db.connect_postgres();
+    writer.execute("CREATE TABLE t (x int)").unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    admin.execute("CREATE ROLE alice").unwrap();
+    admin.execute("GRANT SELECT ON t TO alice").unwrap();
+
+    writer.execute("COMMIT").unwrap();
+    let mut stmt = writer.query("SELECT x FROM t").unwrap().unwrap();
+    assert_eq!(stmt.run_collect_rows().unwrap().len(), 1);
+}
+
+#[test]
+fn creating_a_table_still_aborts_a_concurrent_transaction() {
+    let db = TempDatabase::builder().build();
+    let writer = db.connect_postgres();
+    let admin = db.connect_postgres();
+    writer.execute("CREATE TABLE t (x int)").unwrap();
+    admin.execute("CREATE ROLE alice").unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    admin.execute("CREATE ROLE bob").unwrap();
+    admin.execute("CREATE TABLE u (x int)").unwrap();
+
+    let error = writer.execute("COMMIT").unwrap_err();
+    assert_eq!(error.to_string(), "Database schema conflict");
+}

@@ -2151,3 +2151,25 @@ fn test_mvcc_open_tolerates_null_sqlite_sequence_name() -> anyhow::Result<()> {
     assert_eq!(rows, vec![(6,)]);
     Ok(())
 }
+
+/// A transaction that began before another one changed the database header
+/// must not put back the header it began with when it commits.
+#[turso_macros::test]
+fn test_commit_keeps_a_header_change_made_after_the_transaction_began(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let writer = tmp_db.connect_limbo();
+    writer.pragma_update("journal_mode", "'mvcc'")?;
+    let other = tmp_db.connect_limbo();
+    writer.execute("CREATE TABLE t (x)")?;
+    writer.execute("BEGIN CONCURRENT")?;
+    writer.execute("INSERT INTO t VALUES (1)")?;
+
+    other.execute("PRAGMA user_version = 5")?;
+    writer.execute("COMMIT")?;
+
+    let mut stmt = other.prepare("PRAGMA user_version")?;
+    let rows = stmt.run_collect_rows()?;
+    assert_eq!(rows, vec![vec![turso_core::Value::from_i64(5)]]);
+    Ok(())
+}

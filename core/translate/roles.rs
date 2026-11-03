@@ -34,7 +34,9 @@ use crate::security::roles::{
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_create_internal_table, emit_schema_cookie};
 use crate::vdbe::builder::{CursorType, ProgramBuilder, ViewRef};
-use crate::vdbe::insn::{to_u32, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{
+    to_u32, Cookie, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral, SET_COOKIE_FOR_ROLES,
+};
 use crate::vtab::{VirtualTable, VirtualTableType};
 use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
 use turso_parser::ast::TableInternalId;
@@ -796,7 +798,23 @@ pub fn translate_create_role(
         name: role_name.to_string(),
         superuser,
     });
+    mark_cookie_changes_for_roles(program);
     Ok(())
+}
+
+/// Marks every change of the schema cookie in `program`, which is a role
+/// statement, as one that only publishes changes to roles and privileges.
+fn mark_cookie_changes_for_roles(program: &mut ProgramBuilder) {
+    for (insn, _) in program.insns.iter_mut() {
+        if let Insn::SetCookie {
+            cookie: Cookie::SchemaVersion,
+            p5,
+            ..
+        } = insn
+        {
+            *p5 |= SET_COOKIE_FOR_ROLES;
+        }
+    }
 }
 
 /// Adds the role's name to the name index, failing if another role has the
@@ -926,7 +944,9 @@ pub fn translate_grant(
         changes.push((key, access, rowid));
     }
 
-    emit_acl_rows(resolver, program, changes)
+    emit_acl_rows(resolver, program, changes)?;
+    mark_cookie_changes_for_roles(program);
+    Ok(())
 }
 
 /// Writes one row of the access control table per change: the owner and
