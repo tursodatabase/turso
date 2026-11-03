@@ -1,5 +1,21 @@
 # Custom type comparison: design (part A)
 
+> # ⚠️ FAIL CLOSED ⚠️
+>
+> **When the rules don't say exactly what a comparison, sort, hash or
+> conversion means, it is an error. Never a default.**
+>
+> - No "unknown, so use SQLite rules". No "the values look alike, so
+>   compare them". No trait read off another trait (text kind ≠
+>   collatable).
+> - No implicit conversion except the ones written down here (constants,
+>   section 4).
+> - An error tells the user what to write instead, usually a CAST.
+> - Loosening a rule later is easy. Taking back a wrong answer users
+>   depend on is not.
+>
+> Every design step and every review checks for new fallbacks.
+
 Requirements: `requirements.md`. Map of the code before the redesign:
 `code-map.md`. Progress: `README.md`.
 
@@ -87,13 +103,15 @@ can change stored bytes.
 
 ## 2. What a type compares like
 
-Each type has a **value kind** (integer, real, number, text, blob,
-unknown), a **comparison** and a **capability** (`None`, `Equality`,
+Each type has a **value kind** (integer, real, number, text or
+blob), a **comparison** and a **capability** (`None`, `Equality`,
 `Order`).
 
-1. **Registered traits.** Whoever defines a type may register its traits
-   through one function (`register_type_traits`), so PostgreSQL types are
-   registered from `postgres/` (R12). Part A registrations:
+1. **Registered traits.** Whoever defines a type registers its traits
+   through one function (`register_type_traits`), next to the definition
+   in effect: core for the types core defines, `postgres/` for the ones
+   tursopg defines itself (postgres/frontend/catalog.rs) (R12). Part A
+   registrations:
 
    | type | value kind | comparison | capability |
    |---|---|---|---|
@@ -114,21 +132,60 @@ unknown), a **comparison** and a **capability** (`None`, `Equality`,
 4. **DECODE**: from `type_of(DECODE expr)`, with `value` bound to the
    base type. A custom result type U gives U's traits. A plain SQLite
    type gives that kind, SQLite rules with the expression's collation,
-   Order. `Any` (extension functions, CASE mixing kinds) gives kind
-   unknown: SQLite rules across storage classes, hashing and affinity as
-   for an untyped column, Order.
+   Order.
+5. **No unknown kind.** When `type_of(DECODE expr)` is `Any`, CREATE
+   TYPE fails: `cannot tell what kind of value DECODE of type t returns;
+   wrap it in CAST(... AS <type>)`. The CAST converts every value, so the
+   kind it names is always true. `Any` must mean the result really
+   varies (`unixepoch(x, 'subsec')`, a CASE or coalesce mixing kinds, a
+   C extension function, which has no way to declare a type), never "not
+   tracked":
+   - Built-in functions already declare their result type through an
+     exhaustive match (`ScalarFunc::result_type`).
+   - Functions core registers through the extension API (time_*,
+     regexp, uuid_*) declare their result type at registration. A test
+     fails for any core-registered function without one.
+   - A result type that differs by dialect, such as `round(integer)`
+     (real in SQLite, exact in PostgreSQL), comes from the dialect, not
+     `Any`.
+   
+   A type whose DECODE is `Any` when the schema loads (a native
+   extension function that declared a type at CREATE TYPE but is not
+   loaded now) gets capability None, so every comparison errors with the
+   same hint. It is never compared by a guessed rule.
+6. **`EQUALITY ONLY`** on CREATE TYPE lowers a type to Equality. Nothing
+   raises a type above what rules 1-4 give. tursopg's enums use it:
+   PostgreSQL orders them by declaration, not by label text, so they get
+   no Order until part B.
 
 - **Arrays** compare element by element with the element type's
   comparison, then the shorter first; NULL elements equal each other and
   sort after non-NULL (PostgreSQL), so `ARRAY[1,NULL] = ARRAY[1,NULL]`.
   `Type(Array)`/`Type(TextArray)` (core/type_ordering.rs) are checked
-  against this. Arrays of custom types are rejected.
+  against this. A custom type may be an array element only when this
+  follows from its definition: its value form is its stored form (no
+  DECODE in its chain), its comparison is the plain SQLite comparison of
+  its kind, and its capability is at least Equality. `boolean[]`,
+  `smallint[]`, `date[]`, `uuid[]` and `varchar[]` pass; `numeric[]`
+  (comparison `Type(Numeric)`) and any type with DECODE are errors.
 - **Affinity.** Custom-type values have no affinity: none on index
   entries of custom-type columns, none in comparisons involving one
   (`satisfies_index_affinity`, FK affinity strings,
   `emit_pk_uniqueness_check`).
-- **COLLATE** applies when the value kind is text or unknown; otherwise
-  it's an error.
+- **COLLATE** and **window RANGE offsets** are traits of their own, not
+  read off the value kind. A text kind doesn't make a type collatable,
+  and an integer kind doesn't give it RANGE offsets.
+  - Registered types declare both. Part A: only varchar is collatable,
+    as in PostgreSQL (`uuid_col COLLATE nocase` and `ORDER BY ts COLLATE
+    x` are errors). RANGE offsets are declared per (type, offset type)
+    pair, as PostgreSQL's `in_range` functions are: smallint and bigint
+    with integer offsets, numeric with integer or numeric offsets (using
+    numeric's exact `+` and `-`). Part A has no interval type, so
+    `RANGE 1 PRECEDING` over a date, time or timestamp is an error, as in
+    PostgreSQL; so is any offset over boolean.
+  - A user type is collatable if its DECODE result is text. It takes
+    RANGE offsets only for an offset type it declares `+` and `-` for.
+  - Anything else is an error naming the type.
 
 ## 3. Comparisons
 
@@ -159,23 +216,32 @@ struct Comparison {
   with no hash gets no hash join.
 - FK lookups and child scans use the FK's `Comparison`. Row values: one
   comparison per component. IN lists: one per element.
-- Window RANGE with an offset over a custom type: allowed when the value
-  kind is integer or real, otherwise an error.
+- Window RANGE with an offset over a custom type: allowed when the type
+  takes RANGE offsets (section 2), otherwise an error.
 
 ### Which pairs compare (`Dialect::common_type`)
 **SQLite default.** A custom type T against a non-constant side compares
-values directly when:
-- the other side is T (any parameters) or in T's chain,
-- both have the same comparison,
+values directly only when:
+- the other side is T (any parameters), or the two are linked only
+  through domains (a domain and its base, directly or through other
+  domains),
 - T's comparison is `Type(Numeric)` and the other side is integer or
-  real (real: numeric converts to real first, as PostgreSQL does),
-- T's comparison is a plain SQLite one and the other side is a plain
-  value of the same kind, or either kind is unknown.
+  real (real: numeric converts to real first, as PostgreSQL does).
 
 Anything else errors at prepare: `cannot compare type X with type Y; use
-CAST`. Numeric against an unknown kind is an error, because
-`Type(Numeric)` rejects non-number text in a comparison jump but sorts it
-after numbers in a sorter.
+CAST`. In particular:
+- Two different types never compare because their values look alike. A
+  `celsius` and a `fahrenheit` type over REAL, or uuid and a user type
+  over text, need a CAST.
+- A type with its own ENCODE or DECODE never compares directly with a
+  plain value, its base type included. A constant goes through ENCODE
+  (section 4) and a column would not, so `email = 'A@x.com'` and
+  `email = text_col` holding `'A@x.com'` would give different answers.
+  `CAST(text_col AS email)` converts the column the same way.
+- A side whose type is `Any`, such as a column declared without a type.
+
+Constants, parameters included, convert to T (section 4), so `WHERE id =
+?` works.
 
 **PostgreSQL** (`PostgresDialect::common_type`, part A): direct
 comparison only where it gives PostgreSQL's answer: same type, domain and
@@ -220,9 +286,9 @@ decode-for-sort and decode-for-CHECK/trigger/FK copies, `type_of`'s
 ## 7. Performance
 
 - Plain SQLite: `comparison_for` runs at translate time; the runtime
-  `CollationSeq` is unchanged. The `comparison_for` step asserts in debug
-  builds, over the whole test corpus, that it agrees with the old
-  functions for comparisons without custom types.
+  `CollationSeq` is unchanged. A diff of the compiled programs against
+  main, over the whole test corpus, shows that comparisons without custom
+  types compile the same (step2-comparison-for.md section 1).
 - Custom types: covering scans skip DECODE; constants convert once per
   execution.
 - Not met in part A: numeric parses its text in each comparison; tursopg
@@ -233,21 +299,29 @@ decode-for-sort and decode-for-CHECK/trigger/FK copies, `type_of`'s
 Each merges alone with cargo test and both conformance suites green,
 with sqltest expectations rewritten in the same commit.
 1. NULL checks and determinism (sections 1, 5).
-2. `comparison_for`, `Need`, `Conversion`, `ComparatorHandle`,
-   `Dialect::common_type` with today's rules; debug agreement check.
+2. `comparison_for` and `ComparatorHandle` with today's rules, no
+   behavior change, proven by a program dump diff against main
+   (step2-comparison-for.md).
 3. Traits per section 2 through `register_type_traits`; `type_of` with a
-   `value` binding; capability errors; array rules; delete `OPERATOR
-   '<'` and `is_sortable`; rewrite `custom_type_ordering.sqltest`.
-4. Values in sorters, hash payloads, CHECK, trigger and FK copies.
+   `value` binding; result types for core-registered functions and the
+   CREATE TYPE error for an `Any` DECODE; `Need` and capability errors;
+   comparators from column declarations (`key_collation`,
+   `Column::collation()`) through the same rules; array rules; delete `OPERATOR '<'` and
+   `is_sortable`; `EQUALITY ONLY`; ORDER BY sort keys become values
+   (deleting `OPERATOR '<'` while sorting stored values would give wrong
+   orders); rewrite `custom_type_ordering.sqltest`.
+4. Values in hash payloads, CHECK, trigger and FK copies.
 5. The index funnel for writes, probes and reads, still storing the
    stored form; `integrity_check` after every statement in the
    custom-type sqltests.
 6. VACUUM copies records byte for byte.
 7. Index entries become values; constants convert in every comparison
-   (seek keys and filters); no affinity on custom-type entries; CAST gains
-   `affinity_base`.
-8. Pair rules and result types (section 3), persisted-expression rules,
-   schema changes.
+   (seek keys and filters), carried as `Conversion`s on `Comparison`;
+   `Comparison.affinity`, with no affinity on custom-type entries; CAST
+   gains `affinity_base`.
+8. Pair rules and result types (section 3) through
+   `Dialect::common_type` and its PostgresDialect override,
+   persisted-expression rules, schema changes.
 
 ## 9. Part B
 

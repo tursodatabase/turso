@@ -15,6 +15,12 @@ indexes can disagree on order. This folder holds the plan to fix that.
 
 ## Rules for working on it
 
+> # ⚠️ FAIL CLOSED ⚠️
+>
+> **If the rules don't say exactly what something means, it is an
+> error, never a default or a guess.** See the top of `design.md`.
+> Reviewers list every fallback or implicit behavior they find.
+
 - Correctness is the only criterion. Custom types are experimental: no
   backward compatibility with databases made by earlier versions, and
   "main does X" is not a reason for anything. Where part A can't give
@@ -32,8 +38,8 @@ Branch: `custom-types-compare-redesign`.
 
 | Step | What | Status |
 |---|---|---|
-| 1 | NULL checks and determinism | in progress |
-| 2 | `comparison_for` and friends | not started |
+| 1 | NULL checks and determinism | done (6566745d55) |
+| 2 | `comparison_for` and friends | designed and reviewed (`step2-comparison-for.md`) |
 | 3 | Type traits and capability errors | not started |
 | 4 | Values in sorters, hash payloads, CHECK, trigger and FK copies | not started |
 | 5 | One funnel for index writes, probes and reads | not started |
