@@ -188,23 +188,6 @@ fn schema_is_read_again_after_creating_a_role() {
 }
 
 #[test]
-fn set_role_inside_transaction_block_fails() {
-    let db = TempDatabase::builder().build();
-    let conn = db.connect_postgres();
-    conn.execute("CREATE ROLE alice").unwrap();
-    conn.execute("BEGIN").unwrap();
-
-    let error = conn.execute("SET ROLE alice").unwrap_err();
-
-    assert_eq!(
-        error.to_string(),
-        "SET ROLE inside a transaction block is not supported"
-    );
-    conn.execute("ROLLBACK").unwrap();
-    assert_eq!(current_user(&conn), "postgres");
-}
-
-#[test]
 fn role_without_privileges_cannot_create_schema() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();
@@ -294,30 +277,10 @@ fn create_role_keeps_the_last_inserted_rowid() {
 }
 
 #[test]
-fn failed_set_role_inside_a_transaction_keeps_the_transaction() {
-    let db = TempDatabase::builder().build();
-    let conn = db.connect_limbo();
-    conn.execute("CREATE ROLE alice").unwrap();
-    conn.execute("CREATE TABLE t (x int)").unwrap();
-    conn.execute("BEGIN").unwrap();
-    conn.execute("INSERT INTO t VALUES (1)").unwrap();
-
-    conn.execute("SET ROLE alice").unwrap_err();
-
-    assert!(!conn.get_auto_commit());
-    conn.execute("COMMIT").unwrap();
-    let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
-    assert_eq!(
-        stmt.run_collect_rows().unwrap(),
-        vec![vec![turso_core::Value::from_i64(1)]]
-    );
-}
-
-#[test]
 fn interrupted_set_role_keeps_the_current_role() {
     for interrupt_at_step in 1.. {
         let db = TempDatabase::builder().build();
-        let conn = db.connect_limbo();
+        let conn = db.connect_postgres();
         conn.execute("CREATE ROLE alice").unwrap();
         let result = run_interrupted_at(&conn, "SET ROLE alice", interrupt_at_step);
         if result.is_ok() {
@@ -326,8 +289,8 @@ fn interrupted_set_role_keeps_the_current_role() {
         }
 
         assert_eq!(
-            conn.current_role(),
-            conn.session_role(),
+            current_user(&conn),
+            "postgres",
             "interrupted at step {interrupt_at_step}, the role changed"
         );
     }
@@ -337,7 +300,7 @@ fn interrupted_set_role_keeps_the_current_role() {
 fn interrupted_create_role_leaves_no_role_behind() {
     for interrupt_at_step in 1.. {
         let db = TempDatabase::builder().build();
-        let conn = db.connect_limbo();
+        let conn = db.connect_postgres();
         let result = run_interrupted_at(&conn, "CREATE ROLE alice", interrupt_at_step);
         if result.is_ok() {
             assert!(interrupt_at_step > 1, "the statement was never interrupted");
@@ -345,7 +308,7 @@ fn interrupted_create_role_leaves_no_role_behind() {
         }
 
         assert!(
-            conn.role_catalog().get_by_name("alice").is_none(),
+            conn.inner().role_catalog().get_by_name("alice").is_none(),
             "interrupted at step {interrupt_at_step}, the role is still in the catalog"
         );
         conn.execute("CREATE ROLE alice").unwrap();
@@ -355,19 +318,19 @@ fn interrupted_create_role_leaves_no_role_behind() {
 /// Runs `sql` with a progress handler that interrupts it at the
 /// `interrupt_at_step`th step.
 fn run_interrupted_at(
-    conn: &std::sync::Arc<turso_core::Connection>,
+    conn: &PgConnection,
     sql: &str,
     interrupt_at_step: u64,
-) -> turso_core::Result<()> {
+) -> turso_pg::Result<()> {
     let steps = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    conn.set_progress_handler(
+    conn.inner().set_progress_handler(
         1,
         Some(Box::new(move || {
             steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == interrupt_at_step
         })),
     );
     let result = conn.execute(sql);
-    conn.set_progress_handler(0, None);
+    conn.inner().set_progress_handler(0, None);
     result
 }
 

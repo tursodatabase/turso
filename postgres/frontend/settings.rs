@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use turso_core::security::roles::RoleId;
 use turso_core::{Connection, ConnectionHooks, SavepointMemo};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +28,18 @@ impl PgSessionState {
 
     pub(crate) fn has_setting(&self, name: &str) -> bool {
         self.settings.lock().unwrap().contains(name)
+    }
+
+    /// The name of the role set with SET ROLE, or `None` if the session's
+    /// login role is current.
+    pub(crate) fn role_name(&self) -> Option<String> {
+        let settings = self.settings.lock().unwrap();
+        settings
+            .current
+            .role
+            .current()
+            .as_ref()
+            .map(|role| role.name.clone())
     }
 
     pub(crate) fn name_as_defined(&self, name: &str) -> Option<String> {
@@ -99,10 +112,20 @@ pub(crate) struct ConnectionSettings {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SettingValues {
     search_path: Setting<Option<Vec<String>>>,
+    /// The role set with SET ROLE, or `None` for the session's login role.
+    role: Setting<Option<SetRole>>,
     /// Custom parameters, by ascii-lowercase name. Also contains the `search_path` as the user entered it.
     named: HashMap<String, Setting<Option<String>>>,
     /// whether this struct contains any LOCAL values
     has_transaction_values: bool,
+}
+
+/// A role that SET ROLE made current.
+#[derive(Clone, Debug)]
+pub(crate) struct SetRole {
+    pub(crate) id: RoleId,
+    /// The name as it was set, which SHOW role returns.
+    pub(crate) name: String,
 }
 
 /// The values of the settings that core keeps a copy of, so core must be
@@ -110,11 +133,13 @@ pub(crate) struct SettingValues {
 #[derive(Clone, PartialEq)]
 struct CoreValues {
     search_path: Option<Vec<String>>,
+    role: Option<RoleId>,
 }
 
 impl CoreValues {
     fn apply(self, conn: &Connection) {
         conn.set_search_path(self.search_path);
+        conn.set_current_role(self.role.unwrap_or_else(|| conn.session_role()));
     }
 }
 
@@ -162,6 +187,11 @@ impl ConnectionSettings {
         scope: SettingScope,
     ) {
         self.current.search_path.set(search_path, scope);
+        self.current.has_transaction_values |= scope == SettingScope::Transaction;
+    }
+
+    pub(crate) fn set_role(&mut self, role: Option<SetRole>, scope: SettingScope) {
+        self.current.role.set(role, scope);
         self.current.has_transaction_values |= scope == SettingScope::Transaction;
     }
 
@@ -236,11 +266,13 @@ impl SettingValues {
     fn core_values(&self) -> CoreValues {
         CoreValues {
             search_path: self.search_path.current().clone(),
+            role: self.role.current().as_ref().map(|role| role.id),
         }
     }
 
     fn restore(&mut self, mut saved: SettingValues) {
         self.search_path = saved.search_path;
+        self.role = saved.role;
         self.has_transaction_values = saved.has_transaction_values;
         for (name, setting) in &mut self.named {
             *setting = saved.named.remove(name).unwrap_or_default();
@@ -249,6 +281,7 @@ impl SettingValues {
 
     fn end_transaction(&mut self) {
         self.search_path.end_transaction();
+        self.role.end_transaction();
         for setting in self.named.values_mut() {
             setting.end_transaction();
         }
@@ -280,6 +313,7 @@ impl<T> Setting<T> {
 
 pub(crate) enum ConfigParameter {
     SearchPath,
+    Role,
     ApplicationName,
     Fixed(&'static FixedParameter),
 }
@@ -292,6 +326,8 @@ pub(crate) enum Parameter<'a> {
 pub(crate) fn find_parameter(name: &str) -> Option<Parameter<'_>> {
     let parameter = if name.eq_ignore_ascii_case("search_path") {
         ConfigParameter::SearchPath
+    } else if name.eq_ignore_ascii_case("role") {
+        ConfigParameter::Role
     } else if name.eq_ignore_ascii_case("application_name") {
         ConfigParameter::ApplicationName
     } else if let Some(parameter) = FIXED_PARAMETERS
@@ -314,6 +350,7 @@ impl ConfigParameter {
     ) -> turso_core::Result<String> {
         match self {
             Self::SearchPath => crate::session::set_search_path(conn, value, scope),
+            Self::Role => crate::session::set_role(conn, value, scope),
             Self::ApplicationName => {
                 crate::session::session_state(conn)?.mutate(conn, |settings| {
                     settings.set(self.name(), value.map(str::to_owned), scope);
@@ -333,6 +370,10 @@ impl ConfigParameter {
         match self {
             Self::SearchPath => crate::session::search_path_setting(conn)
                 .unwrap_or_else(|| crate::session::DEFAULT_SEARCH_PATH.to_owned()),
+            Self::Role => conn
+                .context::<PgSessionState>()
+                .and_then(PgSessionState::role_name)
+                .unwrap_or_else(|| "none".to_owned()),
             Self::ApplicationName => conn
                 .context::<PgSessionState>()
                 .and_then(|state| state.setting(self.name()))
@@ -344,6 +385,7 @@ impl ConfigParameter {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::SearchPath => "search_path",
+            Self::Role => "role",
             Self::ApplicationName => "application_name",
             Self::Fixed(parameter) => parameter.name,
         }

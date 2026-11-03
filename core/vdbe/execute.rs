@@ -4218,7 +4218,7 @@ pub fn op_halt(
     } else {
         description.to_string()
     };
-    let result = halt(
+    halt(
         program,
         state,
         pager,
@@ -4226,13 +4226,7 @@ pub fn op_halt(
         &desc,
         *on_error,
         constraint_info.as_deref(),
-    );
-    if matches!(result, Ok(InsnFunctionStepResult::Done)) {
-        if let Some(role) = state.role_to_set.take() {
-            program.connection.set_current_role(role);
-        }
-    }
-    result
+    )
 }
 
 pub fn op_halt_if_null(
@@ -15176,46 +15170,6 @@ pub fn op_add_role(
     program
         .connection
         .with_database_schema_mut(*db, |schema| Arc::make_mut(&mut schema.roles).add(role))?;
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-pub fn op_set_role(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    _pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(SetRole { role_name }, insn);
-    let conn = &program.connection;
-    if !conn.get_auto_commit() {
-        return Err(LimboError::TxError(
-            "SET ROLE inside a transaction block is not supported".to_string(),
-        )
-        .into());
-    }
-    let roles = conn.role_catalog();
-    let role = match role_name {
-        Some(role_name) => {
-            let Some(role) = roles.get_by_name(role_name) else {
-                return Err(
-                    LimboError::SqlError(format!("role \"{role_name}\" does not exist")).into(),
-                );
-            };
-            if !roles.can_set_role(conn.session_role(), role.id) {
-                return Err(
-                    LimboError::PermissionDenied(Box::new(PermissionDenied::privilege(
-                        Action::SetRole,
-                        Object::Role(role_name.clone()),
-                    )))
-                    .into(),
-                );
-            }
-            role.id
-        }
-        None => conn.session_role(),
-    };
-    state.role_to_set = Some(role);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

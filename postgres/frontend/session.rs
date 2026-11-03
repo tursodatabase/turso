@@ -8,7 +8,8 @@ use std::task::Waker;
 use crate::catalog::{self, PostgresDialect};
 use crate::error::{in_failed_sql_transaction_error, sqlstate_error};
 use crate::settings::{
-    find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SettingScope,
+    find_parameter, ConfigParameter, ConnectionSettings, Parameter, PgSessionState, SetRole,
+    SettingScope,
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::schema::Table;
@@ -22,7 +23,8 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_ACTIVE_SQL_TRANSACTION, SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INSUFFICIENT_PRIVILEGE, SQLSTATE_INVALID_NAME,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_SCHEMA_NAME,
-    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_WRONG_OBJECT_TYPE,
+    SQLSTATE_OBJECT_NOT_IN_PREREQUISITE_STATE, SQLSTATE_RESERVED_NAME, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_WRONG_OBJECT_TYPE,
 };
 use turso_pg_parser::translator::{
     execution_takes_snapshot, frontend_stmt, is_drop_matview, is_tx_exit_stmt,
@@ -1831,7 +1833,7 @@ fn discard_all(conn: &Connection) -> Result<()> {
     }
     reset_all_settings(conn)?;
     conn.clear_sequence_currvals();
-    conn.reset_current_role();
+    set_role(conn, None, SettingScope::Session)?;
     Ok(())
 }
 
@@ -1856,6 +1858,42 @@ pub(crate) fn set_search_path(
 /// search_path that lists them finds nothing there, as in PostgreSQL.
 fn is_core_database_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("main") || name.eq_ignore_ascii_case("temp")
+}
+
+/// Makes `value` the current role, as SET ROLE does. `none`, or no value,
+/// makes the session's login role current again.
+pub(crate) fn set_role(
+    conn: &Connection,
+    value: Option<&str>,
+    scope: SettingScope,
+) -> Result<String> {
+    let role = match value.filter(|name| *name != "none") {
+        None => None,
+        Some(name) => {
+            let roles = conn.role_catalog();
+            let Some(role) = catalog::postgres_roles(&roles).find(|role| role.name == name) else {
+                return Err(sqlstate_error(
+                    SQLSTATE_UNDEFINED_OBJECT,
+                    format!("role \"{name}\" does not exist"),
+                ));
+            };
+            if !roles.can_set_role(conn.session_role(), role.id) {
+                return Err(LimboError::PermissionDenied(Box::new(
+                    PermissionDenied::privilege(Action::SetRole, Object::Role(name.to_owned())),
+                )));
+            }
+            Some(SetRole {
+                id: role.id,
+                name: name.to_owned(),
+            })
+        }
+    };
+    let role_id = role
+        .as_ref()
+        .map_or_else(|| conn.session_role(), |role| role.id);
+    session_state(conn)?.mutate(conn, |settings| settings.set_role(role, scope));
+    conn.set_current_role(role_id);
+    Ok(value.unwrap_or("none").to_owned())
 }
 
 pub(crate) fn search_path_setting(conn: &Connection) -> Option<String> {

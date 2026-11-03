@@ -45,8 +45,7 @@ pub fn check_statement_privileges(
         | ast::Stmt::Commit { .. }
         | ast::Stmt::Rollback { .. }
         | ast::Stmt::Savepoint { .. }
-        | ast::Stmt::Release { .. }
-        | ast::Stmt::SetRole { .. } => return Ok(()),
+        | ast::Stmt::Release { .. } => return Ok(()),
         ast::Stmt::CreateTable {
             temporary: true, ..
         }
@@ -149,16 +148,6 @@ fn database_denial(action: Action) -> PermissionDenied {
 
 fn permission_denied(denial: PermissionDenied) -> LimboError {
     LimboError::PermissionDenied(Box::new(denial))
-}
-
-/// Switches the connection to `role_name`, or back to the session role when
-/// `role_name` is `None`. The role is looked up when the statement runs. The
-/// read transaction makes the statement prepare again if another connection
-/// changed the roles since it was prepared.
-pub fn translate_set_role(role_name: Option<String>, program: &mut ProgramBuilder) -> Result<()> {
-    program.begin_read_operation()?;
-    program.emit_insn(Insn::SetRole { role_name });
-    Ok(())
 }
 
 /// Creates a role that is not a superuser and cannot log in.

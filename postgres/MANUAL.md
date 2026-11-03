@@ -57,8 +57,8 @@ SELECT rolname FROM pg_roles;
 **Synopsis:**
 
 ```sql
-SET ROLE role_name
-SET ROLE NONE
+SET [ SESSION | LOCAL ] ROLE role_name
+SET [ SESSION | LOCAL ] ROLE NONE
 RESET ROLE
 ```
 
@@ -70,6 +70,13 @@ and `session_user` keeps returning the role that the session logged in as.
 
 `SET ROLE NONE` and `RESET ROLE` make the session's login role the current
 role again.
+
+The current role is the `role` setting, so it follows the same rules as other
+settings. `SET LOCAL ROLE` lasts until the end of the transaction. A role set
+in a transaction that rolls back, or after a savepoint that is rolled back to,
+is undone. `SHOW role` and `current_setting('role')` return the role, or
+`none` when no role was set, and `set_config('role', ...)` sets it. `RESET ALL`
+keeps the role, and `DISCARD ALL` resets it.
 
 **Parameters:**
 
@@ -83,9 +90,6 @@ Ownership, `GRANT` and table privileges are not supported yet. A role that is
 not a superuser may read and write the rows of every table and use every
 sequence, but it cannot create, alter or drop objects, create roles, or
 `COPY FROM` a file.
-
-`SET ROLE` is not supported inside a transaction block, and `SET LOCAL ROLE`
-is not supported.
 
 **Examples:**
 

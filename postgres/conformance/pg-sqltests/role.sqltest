@@ -292,6 +292,111 @@ expect {
     session user
 }
 
+test set-role-in-rolled-back-transaction-is-undone {
+    CREATE ROLE sr_rolled_back;
+    BEGIN;
+    SET ROLE sr_rolled_back;
+    SELECT current_user;
+    ROLLBACK;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    sr_rolled_back
+    session user
+}
+
+test set-role-in-committed-transaction-is-kept {
+    CREATE ROLE sr_committed;
+    BEGIN;
+    SET ROLE sr_committed;
+    COMMIT;
+    SELECT current_user;
+}
+expect {
+    sr_committed
+}
+
+test set-role-to-role-created-in-rolled-back-transaction-is-undone {
+    BEGIN;
+    CREATE ROLE sr_created_and_rolled_back;
+    SET ROLE sr_created_and_rolled_back;
+    ROLLBACK;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-local-role-ends-at-commit {
+    CREATE ROLE sr_local;
+    BEGIN;
+    SET LOCAL ROLE sr_local;
+    SELECT current_user;
+    COMMIT;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    sr_local
+    session user
+}
+
+test set-local-role-outside-a-transaction-ends-with-its-statement {
+    CREATE ROLE sr_local_outside;
+    SET LOCAL ROLE sr_local_outside;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test rollback-to-savepoint-restores-the-role {
+    CREATE ROLE sr_savepoint;
+    BEGIN;
+    SAVEPOINT s;
+    SET ROLE sr_savepoint;
+    SELECT current_user;
+    ROLLBACK TO SAVEPOINT s;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+    COMMIT;
+}
+expect {
+    sr_savepoint
+    session user
+}
+
+test show-role-names-the-role-set-with-set-role {
+    CREATE ROLE sr_show;
+    SHOW role;
+    SET ROLE sr_show;
+    SHOW role;
+    SELECT current_setting('role');
+}
+expect {
+    none
+    sr_show
+    sr_show
+}
+
+test set-config-sets-the-role {
+    CREATE ROLE sr_set_config;
+    SELECT set_config('role', 'sr_set_config', false);
+    SELECT current_user;
+}
+expect {
+    sr_set_config
+    sr_set_config
+}
+
+test reset-all-keeps-the-role {
+    CREATE ROLE sr_reset_all;
+    SET ROLE sr_reset_all;
+    RESET ALL;
+    SELECT current_user;
+}
+expect {
+    sr_reset_all
+}
+
 test set-role-to-missing-role-fails {
     SET ROLE sr_missing;
 }
