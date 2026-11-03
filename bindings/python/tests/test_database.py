@@ -1,3 +1,4 @@
+import array
 import logging
 import os
 import sqlite3
@@ -1131,6 +1132,21 @@ def test_bytearray_and_memoryview_blob_parameters(provider):
     conn.close()
 
 
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_array_blob_parameter(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (data BLOB)")
+
+    values = array.array("i", [1, 2, 3])
+    cursor.execute("INSERT INTO test VALUES (?)", (values,))
+
+    cursor.execute("SELECT data, typeof(data) FROM test")
+    assert cursor.fetchall() == [(values.tobytes(), "blob")]
+
+    conn.close()
+
+
 def test_non_contiguous_memoryview_parameter_is_rejected():
     conn = turso.connect(":memory:")
     cursor = conn.cursor()
@@ -1138,6 +1154,17 @@ def test_non_contiguous_memoryview_parameter_is_rejected():
 
     with pytest.raises(turso.DatabaseError, match="C-contiguous"):
         cursor.execute("INSERT INTO test VALUES (?)", (memoryview(b"\x00\x01\x02\x03")[::2],))
+
+    conn.close()
+
+
+def test_unsupported_parameter_type_is_rejected():
+    conn = turso.connect(":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (data BLOB)")
+
+    with pytest.raises(turso.DatabaseError, match="bytes-like objects"):
+        cursor.execute("INSERT INTO test VALUES (?)", (object(),))
 
     conn.close()
 

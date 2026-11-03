@@ -10,7 +10,7 @@
 //!  (e.g. the itertools library), since Python tends to be slow.
 use pyo3::{
     prelude::*,
-    types::{PyByteArray, PyBytes, PyFloat, PyInt, PyMemoryView, PyTuple},
+    types::{PyBytes, PyFloat, PyInt, PyMemoryView, PyTuple},
 };
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value};
@@ -437,20 +437,19 @@ fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
         Ok(Value::Text(string.into()))
     } else if let Ok(bytes) = obj.cast::<PyBytes>() {
         Ok(Value::Blob(bytes.as_bytes().to_vec()))
-    } else if let Ok(bytearray) = obj.cast::<PyByteArray>() {
-        Ok(Value::Blob(bytearray.to_vec()))
-    } else if obj.is_instance_of::<PyMemoryView>() {
-        // PyBuffer needs Python 3.11+ under abi3, so copy the bytes through Python.
-        // Like sqlite3, refuse a view that is not C-contiguous.
-        if obj.getattr("c_contiguous")?.is_truthy()? {
-            let bytes = obj.call_method0("tobytes")?.cast_into::<PyBytes>()?;
+    } else if let Ok(view) = PyMemoryView::from(&obj) {
+        // Like sqlite3, bind any buffer object (bytearray, memoryview, array.array, ...)
+        // as a blob. PyBuffer needs Python 3.11+ under abi3, so copy the bytes through
+        // a memoryview. Like sqlite3, refuse a buffer that is not C-contiguous.
+        if view.getattr("c_contiguous")?.is_truthy()? {
+            let bytes = view.call_method0("tobytes")?.cast_into::<PyBytes>()?;
             Ok(Value::Blob(bytes.as_bytes().to_vec()))
         } else {
-            Err(Error::new_err("memoryview parameter must be C-contiguous"))
+            Err(Error::new_err("buffer parameter must be C-contiguous"))
         }
     } else {
         Err(Error::new_err(
-            "unexpected parameter value, only None, numbers, strings and bytes are supported"
+            "unexpected parameter value, only None, numbers, strings and bytes-like objects are supported"
                 .to_string(),
         ))
     }
