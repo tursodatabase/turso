@@ -492,6 +492,182 @@ fn resolve_func_return_type(
     }
 }
 
+/// Resolve the return type of a scalar function.
+fn resolve_scalar_func_return_type(
+    func: &ScalarFunc,
+    args: &[Box<ast::Expr>],
+    columns: &[&ast::ColumnDefinition],
+    resolver: &CatalogContext,
+) -> Result<CheckExprType> {
+    match func {
+        // Functions that always return INTEGER
+        ScalarFunc::Length
+        | ScalarFunc::OctetLength
+        | ScalarFunc::Instr
+        | ScalarFunc::Unicode
+        | ScalarFunc::Sign
+        | ScalarFunc::Random
+        | ScalarFunc::Changes
+        | ScalarFunc::TotalChanges
+        | ScalarFunc::LastInsertRowid
+        | ScalarFunc::Glob
+        | ScalarFunc::Like
+        | ScalarFunc::Likely
+        | ScalarFunc::Unlikely
+        | ScalarFunc::Likelihood
+        | ScalarFunc::BooleanToInt
+        | ScalarFunc::IntToBoolean
+        | ScalarFunc::IsAutocommit
+        | ScalarFunc::ConnTxnId
+        | ScalarFunc::TestUintLt
+        | ScalarFunc::TestUintEq
+        | ScalarFunc::NumericLt
+        | ScalarFunc::NumericEq
+        | ScalarFunc::ValidateIpAddr
+        | ScalarFunc::GetByte
+        | ScalarFunc::UnixEpoch => Ok(CheckExprType::Integer),
+
+        // Functions that always return TEXT
+        ScalarFunc::Upper
+        | ScalarFunc::Lower
+        | ScalarFunc::Trim
+        | ScalarFunc::LTrim
+        | ScalarFunc::RTrim
+        | ScalarFunc::Hex
+        | ScalarFunc::Soundex
+        | ScalarFunc::Quote
+        | ScalarFunc::Replace
+        | ScalarFunc::Substr
+        | ScalarFunc::Substring
+        | ScalarFunc::Char
+        | ScalarFunc::Concat
+        | ScalarFunc::ConcatWs
+        | ScalarFunc::Typeof
+        | ScalarFunc::SqliteVersion
+        | ScalarFunc::TursoVersion
+        | ScalarFunc::SqliteSourceId
+        | ScalarFunc::Date
+        | ScalarFunc::Time
+        | ScalarFunc::DateTime
+        | ScalarFunc::StrfTime
+        | ScalarFunc::TimeDiff
+        | ScalarFunc::Printf
+        | ScalarFunc::StringReverse => Ok(CheckExprType::Text),
+
+        // Functions that always return REAL
+        ScalarFunc::Round | ScalarFunc::JulianDay => Ok(CheckExprType::Real),
+
+        // Functions that always return BLOB
+        ScalarFunc::RandomBlob | ScalarFunc::ZeroBlob | ScalarFunc::Unhex | ScalarFunc::SetByte => {
+            Ok(CheckExprType::Blob)
+        }
+
+        // Functions whose return type depends on arguments
+        ScalarFunc::Abs | ScalarFunc::Nullif => {
+            if let Some(arg) = args.first() {
+                resolve_check_expr_type(arg, columns, resolver)
+            } else {
+                Ok(CheckExprType::Any)
+            }
+        }
+
+        ScalarFunc::Coalesce | ScalarFunc::IfNull => {
+            for arg in args {
+                let ty = resolve_check_expr_type(arg, columns, resolver)?;
+                if ty != CheckExprType::Null {
+                    return Ok(ty);
+                }
+            }
+            Ok(CheckExprType::Null)
+        }
+
+        ScalarFunc::Min | ScalarFunc::Max | ScalarFunc::Greatest | ScalarFunc::Least => {
+            if let Some(first) = args.first() {
+                resolve_check_expr_type(first, columns, resolver)
+            } else {
+                Ok(CheckExprType::Any)
+            }
+        }
+
+        ScalarFunc::Iif => {
+            // iif(cond, then_val, else_val) — return type of then_val
+            if args.len() >= 2 {
+                resolve_check_expr_type(&args[1], columns, resolver)
+            } else {
+                Ok(CheckExprType::Any)
+            }
+        }
+
+        // Internal/custom type functions
+        ScalarFunc::TestUintEncode
+        | ScalarFunc::TestUintDecode
+        | ScalarFunc::TestUintAdd
+        | ScalarFunc::TestUintSub
+        | ScalarFunc::TestUintMul
+        | ScalarFunc::TestUintDiv
+        | ScalarFunc::NumericEncode
+        | ScalarFunc::NumericFit
+        | ScalarFunc::NumericDecode
+        | ScalarFunc::NumericAdd
+        | ScalarFunc::NumericSub
+        | ScalarFunc::NumericMul
+        | ScalarFunc::NumericDiv => Ok(CheckExprType::Blob),
+
+        // Remaining functions — treat as ANY
+        _ => Ok(CheckExprType::Any),
+    }
+}
+
+/// Resolve the return type of a math function.
+fn resolve_math_func_return_type(func: &MathFunc) -> Result<CheckExprType> {
+    match func {
+        // Floor/ceil/trunc return INTEGER for integer inputs, but always produce numeric results
+        MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc => {
+            Ok(CheckExprType::Integer)
+        }
+        // All other math functions return REAL
+        _ => Ok(CheckExprType::Real),
+    }
+}
+
+/// Resolve the return type of a JSON function.
+#[cfg(feature = "json")]
+fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<CheckExprType> {
+    use crate::function::JsonFunc;
+    match func {
+        // Functions that return TEXT (JSON text)
+        JsonFunc::Json
+        | JsonFunc::JsonArray
+        | JsonFunc::JsonObject
+        | JsonFunc::JsonPatch
+        | JsonFunc::JsonRemove
+        | JsonFunc::JsonReplace
+        | JsonFunc::JsonInsert
+        | JsonFunc::JsonSet
+        | JsonFunc::JsonPretty
+        | JsonFunc::JsonQuote
+        | JsonFunc::JsonType => Ok(CheckExprType::Text),
+
+        // Functions that return BLOB (JSONB binary)
+        JsonFunc::Jsonb
+        | JsonFunc::JsonbArray
+        | JsonFunc::JsonbObject
+        | JsonFunc::JsonbPatch
+        | JsonFunc::JsonbRemove
+        | JsonFunc::JsonbReplace
+        | JsonFunc::JsonbInsert
+        | JsonFunc::JsonbSet => Ok(CheckExprType::Blob),
+
+        // Functions that return INTEGER
+        JsonFunc::JsonArrayLength | JsonFunc::JsonErrorPosition | JsonFunc::JsonValid => {
+            Ok(CheckExprType::Integer)
+        }
+
+        // Extract functions can return any type
+        JsonFunc::JsonExtract
+        | JsonFunc::JsonbExtract
+        | JsonFunc::JsonArrowExtract
+        | JsonFunc::JsonArrowShiftExtract => Ok(CheckExprType::Any),
 /// The type of a function that returns one of several values: the type they
 /// all share, REAL for a mix of integers and reals, and otherwise any type.
 /// NULL values don't count.

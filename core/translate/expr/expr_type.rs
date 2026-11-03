@@ -827,6 +827,28 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
             1,
         ),
+        Func::Scalar(
+            ScalarFunc::Coalesce
+            | ScalarFunc::IfNull
+            | ScalarFunc::Max
+            | ScalarFunc::Min
+            | ScalarFunc::Greatest
+            | ScalarFunc::Least,
+        )
+        | Func::Agg(AggFunc::Max | AggFunc::Min) => {
+            common_type(args.iter().map(|arg| arg.as_ref()), env)
+        }
+        Func::Scalar(ScalarFunc::Iif) => common_type(args.iter().skip(1).map(|a| a.as_ref()), env),
+        // A call with the wrong number of arguments is reported when it is translated.
+        Func::Scalar(ScalarFunc::Nullif | ScalarFunc::Abs | ScalarFunc::ArrayElement)
+            if args.is_empty() =>
+        {
+            ExprType::Builtin(BuiltinType::Any)
+        }
+        Func::Scalar(ScalarFunc::Nullif) => type_of(&args[0], env),
+        Func::Scalar(ScalarFunc::Abs) => arithmetic_type(
+            &ExprType::Builtin(BuiltinType::Integer),
+            &sqlite_operand_type(type_of(&args[0], env), None, env.schema()),
         // A value of another row: its own argument's type, or for lag and
         // lead the common type of the argument and the default (the third
         // argument).
