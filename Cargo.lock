@@ -7155,6 +7155,7 @@ name = "turso_cli"
 version = "0.9.0-pre.6"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "cfg-if",
  "clap",
