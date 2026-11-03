@@ -64,3 +64,31 @@ expect {
     0|0|1
     1|0
 }
+
+# A column DEFAULT, a generated column and a CHECK constraint are translated
+# straight from the schema, without the binding that folds the expressions
+# above, so the fold is applied again when their bytecode is emitted.
+
+test and-or-with-a-constant-operand-folds-in-default-generated-and-check {
+    CREATE TABLE col(a, b DEFAULT (1 OR abs(-9223372036854775807 - 1)), c AS (json_extract('bare', '$.a') AND 0), d CHECK (d OR 1 OR abs(-9223372036854775807 - 1)), n NOT NULL DEFAULT (0 AND json_extract('bare', '$.a')));
+    INSERT INTO col(a, d) VALUES (1, 0);
+    INSERT INTO col DEFAULT VALUES;
+    INSERT OR REPLACE INTO col(a, d, n) VALUES (3, 0, NULL);
+    UPDATE col SET a = 2 WHERE a = 1;
+    SELECT a, b, c, d, n FROM col ORDER BY a;
+    SELECT count(*) FROM col WHERE c = 0;
+}
+expect {
+    |1|0||0
+    2|1|0|0|0
+    3|1|0|0|0
+    3
+}
+
+test and-chain-with-a-constant-false-operand-in-check-rejects-the-row {
+    CREATE TABLE ck(a CHECK (a AND 0 AND abs(-9223372036854775807 - 1)));
+    INSERT INTO ck VALUES (1);
+}
+expect error {
+    CHECK constraint failed
+}
