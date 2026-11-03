@@ -69,9 +69,8 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
 /// keeps that affinity unless a later arm yields a conflicting datatype class
 /// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
 /// case it is downgraded to BLOB (none) so the column is compared by storage
-/// class. A numeric affinity becomes NUMERIC when the first arm's expression is
-/// a CAST, where SQLite uses its FLEXNUM affinity (see
-/// [CompoundColumnAffinity::stores_values_unchanged]).
+/// class. A numeric column whose first arm's expression is a CAST is also
+/// marked as SQLite's FLEXNUM (see [CompoundColumnAffinity::flexible_numeric]).
 pub(super) fn compound_column_affinity(
     arms: &[&SelectPlan],
     i: usize,
@@ -79,7 +78,7 @@ pub(super) fn compound_column_affinity(
 ) -> CompoundColumnAffinity {
     let plain = |affinity| CompoundColumnAffinity {
         affinity,
-        stores_values_unchanged: false,
+        flexible_numeric: false,
     };
     let column_types = |expr: Option<&ast::Expr>, metadata: &TableMetadata| match expr {
         Some(expr) => (
@@ -132,8 +131,8 @@ pub(super) fn compound_column_affinity(
         Affinity::Text if data_types.has_numeric() => plain(Affinity::Blob),
         a if a.is_numeric() && data_types.has_text() => plain(Affinity::Blob),
         a if a.is_numeric() && parts.len() > 1 && first_expr_is_cast => CompoundColumnAffinity {
-            affinity: Affinity::Numeric,
-            stores_values_unchanged: true,
+            affinity: a,
+            flexible_numeric: true,
         },
         _ => plain(affinity),
     }
@@ -142,12 +141,13 @@ pub(super) fn compound_column_affinity(
 /// The affinity of a column of a compound SELECT or a VALUES list.
 pub(super) struct CompoundColumnAffinity {
     pub affinity: Affinity,
-    /// Whether SQLite gives the column its FLEXNUM affinity: it is declared
-    /// NUM, but a value stored from it keeps its type, so a REAL from the first
-    /// SELECT does not turn the integers of the others into reals. No SELECT
-    /// gives text here, so storing the values without any conversion is the
-    /// same.
-    pub stores_values_unchanged: bool,
+    /// Whether SQLite gives the column its FLEXNUM affinity instead. CREATE
+    /// TABLE AS then declares the column NUM and stores each value with its
+    /// own type, so a REAL from the first SELECT does not turn the integers of
+    /// the others into reals. No SELECT gives text here, so storing the values
+    /// without any conversion is the same. Comparisons treat FLEXNUM like any
+    /// numeric affinity.
+    pub flexible_numeric: bool,
 }
 
 /// One of the SELECTs that SQLite builds for a VALUES list.
@@ -3290,7 +3290,17 @@ pub(super) fn query_output_columns(
             let affinity = match (&compound_arms, plan) {
                 (Some(arms), _) => compound_column_affinity(arms, column_index, resolver).affinity,
                 (None, Plan::Select(select)) if !select.values.is_empty() => {
-                    compound_column_affinity(&[&**select], column_index, resolver).affinity
+                    // Turso has no FLEXNUM affinity, which compares like a
+                    // numeric one but stores values unchanged. A VALUES column
+                    // that SQLite gives FLEXNUM keeps no affinity, so a join's
+                    // automatic index still stores 2 as an integer.
+                    let column_affinity =
+                        compound_column_affinity(&[&**select], column_index, resolver);
+                    if column_affinity.flexible_numeric {
+                        Affinity::None
+                    } else {
+                        column_affinity.affinity
+                    }
                 }
                 _ => infer_type_from_expr(&result_column.expr, Some(table_references)),
             };

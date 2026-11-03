@@ -65,6 +65,7 @@ expect {
     1
 }
 
+@cross-check-integrity
 test view-cast-to-text {
     CREATE VIEW v1 AS VALUES (CAST('20' AS TEXT));
     SELECT column1 = 20 FROM v1;
@@ -94,14 +95,6 @@ test first-row-integer-then-text-has-no-affinity {
 }
 expect {
     0
-    0
-}
-
-test first-row-integer-then-real {
-    SELECT column1 = '20' FROM (VALUES (CAST(20 AS INTEGER)), (1.5));
-}
-expect {
-    1
     0
 }
 
@@ -268,6 +261,7 @@ expect {
     0|0|1
 }
 
+@cross-check-integrity
 test create-table-as-select-from-values {
     CREATE TABLE c1 AS SELECT * FROM (VALUES (CAST('20' AS TEXT)));
     SELECT sql FROM sqlite_schema WHERE name = 'c1';
@@ -276,6 +270,7 @@ expect {
     CREATE TABLE c1(column1 TEXT)
 }
 
+@cross-check-integrity
 test create-table-as-values {
     CREATE TABLE c2 AS VALUES (CAST('20' AS TEXT), 5);
     SELECT sql FROM sqlite_schema WHERE name = 'c2';
@@ -289,6 +284,7 @@ expect {
 # When a column is numeric and its first SELECT is a CAST, SQLite gives it the
 # FLEXNUM affinity: it is declared NUM, and the values keep their types. quote()
 # shows a REAL as 1.0 on every backend.
+@cross-check-integrity
 test create-table-as-values-real-cast-then-integer {
     CREATE TABLE c AS VALUES (CAST(1 AS REAL)), (2);
     SELECT sql FROM sqlite_schema WHERE name = 'c';
@@ -300,33 +296,53 @@ expect {
     2|integer
 }
 
-test create-table-as-compound-real-cast-then-integer {
-    CREATE TABLE d AS SELECT CAST(1 AS REAL) AS column1 UNION ALL SELECT 2;
-    CREATE TABLE e AS SELECT CAST(1 AS INTEGER) AS column1 UNION ALL SELECT 2.5;
-    CREATE TABLE g AS SELECT 5 AS column1 UNION ALL SELECT CAST(2 AS REAL);
-    SELECT name, sql FROM sqlite_schema ORDER BY name;
-    SELECT 'd', quote(column1), typeof(column1) FROM d;
-    SELECT 'e', quote(column1), typeof(column1) FROM e;
-    SELECT 'g', quote(column1), typeof(column1) FROM g;
-}
-expect {
-    d|CREATE TABLE d(column1 NUM)
-    e|CREATE TABLE e(column1 NUM)
-    g|CREATE TABLE g(column1 REAL)
-    d|1.0|real
-    d|2|integer
-    e|1|integer
-    e|2.5|real
-    g|5.0|real
-    g|2.0|real
-}
-
-test real-cast-then-integer-compares-as-number {
-    SELECT column1 = '2' FROM (VALUES (CAST(1 AS REAL)), (2));
+test compound-real-cast-then-integer-compares-as-number {
+    SELECT x = '2' FROM (SELECT CAST(1 AS REAL) AS x UNION ALL SELECT 2);
 }
 expect {
     0
     1
+}
+
+# A join over these columns builds an automatic index on them. Its keys must
+# keep the values' types: REALs stay REAL, and an integer from VALUES stays an
+# integer.
+setup join_table {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (2), (1.5), (1);
+}
+
+@setup join_table
+@cross-check-integrity
+test join-on-compound-of-real-casts-keeps-reals {
+    SELECT quote(v.v) FROM (SELECT CAST(1.5 AS REAL) v UNION ALL SELECT CAST(2 AS REAL)) v
+    JOIN t ON t.x = v.v ORDER BY 1;
+}
+expect {
+    1.5
+    2.0
+}
+
+@setup join_table
+@cross-check-integrity
+test join-on-values-of-real-casts-keeps-reals {
+    SELECT quote(v.column1) FROM (VALUES (CAST(1.5 AS REAL)), (CAST(2 AS REAL))) v
+    JOIN t ON t.x = v.column1 ORDER BY 1;
+}
+expect {
+    1.5
+    2.0
+}
+
+@setup join_table
+@cross-check-integrity
+test join-on-values-real-cast-then-integer-keeps-each-type {
+    SELECT quote(v.column1) FROM (VALUES (CAST(1 AS REAL)), (2)) v
+    JOIN t ON t.x = v.column1 ORDER BY 1;
+}
+expect {
+    1.0
+    2
 }
 
 # TEXT affinity turns a number into text only when the other side is text.

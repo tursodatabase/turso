@@ -887,7 +887,7 @@ struct CtasInfo {
     schema_sql: String,
     /// For each column, whether its values are stored without converting
     /// them to the column's affinity (see
-    /// [crate::translate::plan::CompoundColumnAffinity]).
+    /// [crate::translate::plan::CompoundColumnAffinity::flexible_numeric]).
     stores_values_unchanged: Vec<bool>,
 }
 
@@ -961,10 +961,16 @@ fn derive_ctas_schema(
         stores_values_unchanged.push(
             compound_affinity
                 .as_ref()
-                .is_some_and(|affinity| affinity.stores_values_unchanged),
+                .is_some_and(|affinity| affinity.flexible_numeric),
         );
         let ty = compound_affinity
-            .map(|affinity| affinity.affinity.short_type_name())
+            .map(|affinity| {
+                if affinity.flexible_numeric {
+                    Affinity::Numeric.short_type_name()
+                } else {
+                    affinity.affinity.short_type_name()
+                }
+            })
             .unwrap_or_else(|| col.declared_type(table_refs));
 
         let quoted = quote_identifier(&name);
@@ -1070,9 +1076,12 @@ fn emit_ctas_insert(
         .columns()
         .iter()
         .zip(stores_values_unchanged)
-        .map(|(column, &unchanged)| match unchanged {
-            true => Affinity::Blob.aff_mask(),
-            false => column.affinity().aff_mask(),
+        .map(|(column, &unchanged)| {
+            if unchanged {
+                Affinity::Blob.aff_mask()
+            } else {
+                column.affinity().aff_mask()
+            }
         })
         .collect();
     let new_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctas_btree));

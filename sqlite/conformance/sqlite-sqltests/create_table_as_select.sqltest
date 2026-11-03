@@ -647,3 +647,27 @@ expect {
     2.5|real
     '3.5'|text
 }
+
+# A numeric column whose first SELECT is a CAST gets SQLite's FLEXNUM affinity:
+# it is declared NUM, and each value keeps its own type.
+@cross-check-integrity
+test ctas_compound_select_numeric_cast_declares_num {
+    CREATE TABLE real_first AS SELECT CAST(1 AS REAL) AS x UNION ALL SELECT 2;
+    CREATE TABLE integer_first AS SELECT CAST(1 AS INTEGER) AS x UNION ALL SELECT 2.5;
+    CREATE TABLE no_cast_first AS SELECT 5 AS x UNION ALL SELECT CAST(2 AS REAL);
+    SELECT name, sql FROM sqlite_schema WHERE type = 'table' ORDER BY name;
+    SELECT 'real_first', quote(x), typeof(x) FROM real_first;
+    SELECT 'integer_first', quote(x), typeof(x) FROM integer_first;
+    SELECT 'no_cast_first', quote(x), typeof(x) FROM no_cast_first;
+}
+expect {
+    integer_first|CREATE TABLE integer_first(x NUM)
+    no_cast_first|CREATE TABLE no_cast_first(x REAL)
+    real_first|CREATE TABLE real_first(x NUM)
+    real_first|1.0|real
+    real_first|2|integer
+    integer_first|1|integer
+    integer_first|2.5|real
+    no_cast_first|5.0|real
+    no_cast_first|2.0|real
+}
