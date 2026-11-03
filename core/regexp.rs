@@ -1,9 +1,9 @@
-use crate::ext::register_scalar_function;
+use crate::ext::register_deterministic_scalar_function;
 use turso_ext::{scalar, ExtensionApi, Value};
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
     unsafe {
-        register_scalar_function(ext_api.ctx, c"regexp".as_ptr(), regexp);
+        register_deterministic_scalar_function(ext_api.ctx, c"regexp".as_ptr(), regexp);
     }
 }
 

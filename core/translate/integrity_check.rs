@@ -1,4 +1,5 @@
 use crate::alloc::Arc;
+use crate::function::PureContext;
 use crate::namespace::NamespaceRef;
 use crate::schema::Column;
 use crate::translate::collate::CollationSeq;
@@ -9,8 +10,9 @@ use crate::{
     translate::{
         emitter::Resolver,
         expr::{
-            bind_and_rewrite_expr, translate_condition_expr, translate_expr_no_constant_opt,
-            BindingBehavior, ConditionMetadata, NoConstantOptReason,
+            bind_and_rewrite_expr, translate_check_condition, translate_condition_expr,
+            translate_expr_no_constant_opt, BindingBehavior, ConditionMetadata,
+            NoConstantOptReason,
         },
         plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
     },
@@ -408,24 +410,18 @@ fn translate_integrity_check_for_schema(
 
         for check_expr in &bound_checks {
             let check_ok = program.allocate_label();
-            // Evaluate the CHECK expression into a register, then branch.
             // A CHECK constraint passes when the result is TRUE *or* NULL
-            // (only explicit FALSE/0 is a violation), so we use
-            // jump_if_null: true to treat NULL as passing.
-            let check_reg = program.alloc_register();
-            translate_expr_no_constant_opt(
-                program,
-                Some(&table_references),
-                check_expr,
-                check_reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            program.emit_insn(Insn::If {
-                reg: check_reg,
-                target_pc: check_ok,
-                jump_if_null: true,
-            });
+            // (only explicit FALSE/0 is a violation). It is a conditional
+            // jump, so AND, OR and CASE skip what they do not need.
+            program.with_pure_context(PureContext::Check, |program| {
+                translate_check_condition(
+                    program,
+                    &table_references,
+                    check_expr,
+                    check_ok,
+                    resolver,
+                )
+            })?;
             program.emit_string8(
                 format!("CHECK constraint failed in {}", btree_table.name),
                 registers.message,
@@ -440,20 +436,22 @@ fn translate_integrity_check_for_schema(
             if let Some(where_expr) = bound_index.where_expr.as_ref() {
                 let where_failed = skip_current_index;
                 let where_true_fallthrough = program.allocate_label();
-                translate_condition_expr(
-                    program,
-                    &table_references,
-                    where_expr,
-                    ConditionMetadata {
-                        // For partial indexes, rows that evaluate predicate to FALSE/NULL
-                        // are not part of the index and must be skipped.
-                        jump_if_condition_is_true: false,
-                        jump_target_when_true: where_true_fallthrough,
-                        jump_target_when_false: where_failed,
-                        jump_target_when_null: where_failed,
-                    },
-                    resolver,
-                )?;
+                program.with_pure_context(PureContext::Index, |program| {
+                    translate_condition_expr(
+                        program,
+                        &table_references,
+                        where_expr,
+                        ConditionMetadata {
+                            // For partial indexes, rows that evaluate predicate to FALSE/NULL
+                            // are not part of the index and must be skipped.
+                            jump_if_condition_is_true: false,
+                            jump_target_when_true: where_true_fallthrough,
+                            jump_target_when_false: where_failed,
+                            jump_target_when_null: where_failed,
+                        },
+                        resolver,
+                    )
+                })?;
                 program.preassign_label_to_next_insn(where_true_fallthrough);
             }
 
@@ -493,14 +491,16 @@ fn translate_integrity_check_for_schema(
                             program,
                             self_table_context.as_ref(),
                             |program, _| {
-                                translate_expr_no_constant_opt(
-                                    program,
-                                    Some(&table_references),
-                                    expr,
-                                    target,
-                                    resolver,
-                                    NoConstantOptReason::RegisterReuse,
-                                )?;
+                                program.with_pure_context(PureContext::Index, |program| {
+                                    translate_expr_no_constant_opt(
+                                        program,
+                                        Some(&table_references),
+                                        expr,
+                                        target,
+                                        resolver,
+                                        NoConstantOptReason::RegisterReuse,
+                                    )
+                                })?;
                                 Ok(())
                             },
                         )?;

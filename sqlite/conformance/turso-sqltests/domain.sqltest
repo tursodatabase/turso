@@ -1094,14 +1094,14 @@ expect {
 }
 
 @requires custom_types "uses CREATE DOMAIN"
-test domain-over-custom-type-not-null-checks-decoded-value {
+test domain-over-custom-type-decode-returning-null-is-an-error {
     CREATE TYPE g BASE integer ENCODE value DECODE nullif(value, 0);
     CREATE DOMAIN gd AS g;
     CREATE TABLE t(x gd NOT NULL) STRICT;
     INSERT INTO t VALUES (0);
 }
 expect error {
-    NOT NULL constraint failed
+    DECODE of type g returned NULL
 }
 
 @requires custom_types "uses CREATE DOMAIN"
@@ -1737,4 +1737,18 @@ expect {
     1|8
     2|8
     3|8
+}
+
+# An array of a domain over a custom type stores its elements the same way an
+# array of the custom type itself does.
+@requires custom_types "uses CREATE DOMAIN"
+test domain-array-elements-use-the-parent-type-encode-and-decode {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN dc AS cents;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a dc[], b cents[]) STRICT;
+    INSERT INTO t VALUES (1, '{5,7}', '{5,7}');
+    SELECT a, b, hex(a) = hex(b) FROM t;
+}
+expect {
+    {5,7}|{5,7}|1
 }

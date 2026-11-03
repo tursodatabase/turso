@@ -1,4 +1,4 @@
-use crate::ext::register_scalar_function;
+use crate::ext::{register_deterministic_scalar_function, register_scalar_function};
 use turso_ext::{scalar, ExtensionApi, ResultCode, Value, ValueType};
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
@@ -9,9 +9,15 @@ pub fn register_extension(ext_api: &mut ExtensionApi) {
         register_scalar_function(ext_api.ctx, c"uuid4".as_ptr(), uuid4_blob);
         register_scalar_function(ext_api.ctx, c"uuid7_str".as_ptr(), uuid7_str);
         register_scalar_function(ext_api.ctx, c"uuid7".as_ptr(), uuid7);
-        register_scalar_function(ext_api.ctx, c"uuid7_timestamp_ms".as_ptr(), uuid7_ts);
-        register_scalar_function(ext_api.ctx, c"uuid_str".as_ptr(), uuid_str);
-        register_scalar_function(ext_api.ctx, c"uuid_blob".as_ptr(), uuid_blob);
+        // These only convert their argument. The generators above read the
+        // clock or a random source.
+        register_deterministic_scalar_function(
+            ext_api.ctx,
+            c"uuid7_timestamp_ms".as_ptr(),
+            uuid7_ts,
+        );
+        register_deterministic_scalar_function(ext_api.ctx, c"uuid_str".as_ptr(), uuid_str);
+        register_deterministic_scalar_function(ext_api.ctx, c"uuid_blob".as_ptr(), uuid_blob);
     }
 }
 

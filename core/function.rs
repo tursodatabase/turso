@@ -1327,6 +1327,9 @@ impl ScalarFunc {
                 | Self::UnixEpoch
                 | Self::StrfTime
                 | Self::TimeDiff
+                | Self::DatePlus
+                | Self::DateMinus
+                | Self::DateDiff
         )
     }
 }
@@ -1828,6 +1831,35 @@ pub struct FuncCtx {
     /// The collation the function compares its arguments with when
     /// [Func::needs_collation] is true. BINARY for the other functions.
     pub collation: CollationSeq,
+    /// Set when the call is part of an expression that must be deterministic.
+    /// Date and time functions then fail instead of reading the clock or the
+    /// time zone.
+    pub pure_context: Option<PureContext>,
+}
+
+/// Where an expression that must be deterministic is used. A date or time
+/// function raises an error when it would read the clock or the time zone here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PureContext {
+    Check,
+    GeneratedColumn,
+    Index,
+    /// The DECODE of the custom type with this name.
+    CustomTypeDecode(Arc<str>),
+}
+
+impl Display for PureContext {
+    /// The words that end the "non-deterministic use of f() in ..." error.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PureContext::Check => write!(f, "a CHECK constraint"),
+            PureContext::GeneratedColumn => write!(f, "a generated column"),
+            PureContext::Index => write!(f, "an index"),
+            PureContext::CustomTypeDecode(type_name) => {
+                write!(f, "the DECODE of type {type_name}")
+            }
+        }
+    }
 }
 
 impl Deterministic for Func {

@@ -53,3 +53,392 @@ test reject-nondeterministic-last-insert-rowid {
 expect error {
     non-deterministic functions prohibited in ENCODE expressions: last_insert_rowid
 }
+
+# Extension functions must be registered as deterministic, in ENCODE, COERCE
+# and DECODE alike. time_now() is not. uuid_blob() and uuid_str() are.
+
+@requires strict "uses STRICT tables"
+test reject-nondeterministic-extension-function-in-encode {
+    CREATE TYPE bad BASE integer
+        ENCODE value + time_to_unix(time_now())
+        DECODE value;
+}
+expect error {
+    time_now\(\) cannot be used in ENCODE expressions because the extension did not register it as deterministic. If it always gives the same result for the same arguments, register it with register_deterministic_scalar_function
+}
+
+@requires strict "uses STRICT tables"
+test reject-nondeterministic-extension-function-in-decode {
+    CREATE TYPE bad BASE integer
+        ENCODE value
+        DECODE value + time_to_unix(time_now());
+}
+expect error {
+    time_now\(\) cannot be used in DECODE expressions because the extension did not register it as deterministic. If it always gives the same result for the same arguments, register it with register_deterministic_scalar_function
+}
+
+@requires strict "uses STRICT tables"
+test reject-nondeterministic-extension-function-in-coerce {
+    CREATE TYPE bad BASE integer
+        ENCODE value
+        COERCE value + time_to_unix(time_now())
+        DECODE value;
+}
+expect error {
+    time_now\(\) cannot be used in COERCE expressions because the extension did not register it as deterministic. If it always gives the same result for the same arguments, register it with register_deterministic_scalar_function
+}
+
+@requires strict "uses STRICT tables"
+test reject-uuid-generator {
+    CREATE TYPE bad BASE blob
+        ENCODE value
+        DECODE uuid4();
+}
+expect error {
+    uuid4\(\) cannot be used in DECODE expressions because the extension did not register it as deterministic
+}
+
+@requires strict "uses STRICT tables"
+test accept-uuid-conversions {
+    CREATE TYPE good(value any) BASE blob
+        ENCODE uuid_blob(value)
+        DECODE uuid_str(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val good) STRICT;
+    INSERT INTO t1 VALUES (1, '019509a2-0000-7000-8000-000000000000');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|019509a2-0000-7000-8000-000000000000
+}
+
+# ENCODE and COERCE convert an input once, so they may read the clock or the
+# time zone: 'now' is a valid date input.
+
+@requires strict "uses STRICT tables"
+test accept-clock-in-encode {
+    CREATE TYPE good BASE text
+        ENCODE CASE WHEN value = 'now' THEN date('now') ELSE value END
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val good) STRICT;
+    INSERT INTO t1 VALUES (1, 'now');
+    SELECT id, val = date('now') FROM t1;
+}
+expect {
+    1|1
+}
+
+@requires strict "uses STRICT tables"
+test accept-time-zone-and-current-timestamp-in-encode {
+    CREATE TYPE good BASE text
+        ENCODE datetime(value, 'localtime') || current_timestamp
+        DECODE value;
+}
+expect {
+}
+
+@requires strict "uses STRICT tables"
+test accept-clock-in-coerce {
+    CREATE TYPE good BASE text
+        ENCODE value
+        COERCE CASE WHEN value = 'now' THEN strftime('%Y', 'now') ELSE value END
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val good) STRICT;
+    INSERT INTO t1 VALUES (1, 'now');
+    SELECT id, val = strftime('%Y', 'now') FROM t1;
+}
+expect {
+    1|1
+}
+
+# DECODE is run again to rebuild index entries, so a date or time function in
+# it must not read the clock or the time zone. SQLite refuses these in an
+# index on an expression for the same reason. A literal argument is refused
+# by CREATE TYPE.
+
+@requires strict "uses STRICT tables"
+test reject-date-now-in-decode {
+    CREATE TYPE bad BASE text
+        ENCODE value
+        DECODE date('now');
+}
+expect error {
+    non-deterministic functions prohibited in DECODE expressions: date
+}
+
+@requires strict "uses STRICT tables"
+test reject-datetime-now-uppercase-in-decode {
+    CREATE TYPE bad BASE text
+        ENCODE value
+        DECODE datetime('NOW');
+}
+expect error {
+    non-deterministic functions prohibited in DECODE expressions: datetime
+}
+
+@requires strict "uses STRICT tables"
+test reject-date-with-no-arguments-in-decode {
+    CREATE TYPE bad BASE text
+        ENCODE value
+        DECODE date();
+}
+expect error {
+    non-deterministic functions prohibited in DECODE expressions: date
+}
+
+@requires strict "uses STRICT tables"
+test reject-localtime-modifier-in-decode {
+    CREATE TYPE bad BASE text
+        ENCODE value
+        DECODE datetime(value, 'localtime');
+}
+expect error {
+    non-deterministic functions prohibited in DECODE expressions: datetime
+}
+
+@requires strict "uses STRICT tables"
+test reject-utc-modifier-in-decode {
+    CREATE TYPE bad BASE text
+        ENCODE value
+        DECODE datetime(value, 'UTC');
+}
+expect error {
+    non-deterministic functions prohibited in DECODE expressions: datetime
+}
+
+@requires strict "uses STRICT tables"
+test reject-strftime-now-in-decode {
+    CREATE TYPE bad BASE text
+        ENCODE value
+        DECODE strftime('%s', 'now');
+}
+expect error {
+    non-deterministic functions prohibited in DECODE expressions: strftime
+}
+
+@requires strict "uses STRICT tables"
+test reject-current-timestamp-in-decode {
+    CREATE TYPE bad BASE text
+        ENCODE value
+        DECODE value || current_timestamp;
+}
+expect error {
+    non-deterministic functions prohibited in DECODE expressions: current_timestamp
+}
+
+@requires strict "uses STRICT tables"
+test reject-current-date-in-decode {
+    CREATE TYPE bad BASE text
+        ENCODE value
+        DECODE value || current_date;
+}
+expect error {
+    non-deterministic functions prohibited in DECODE expressions: current_date
+}
+
+@requires strict "uses STRICT tables"
+test accept-date-functions-of-the-value-in-decode {
+    CREATE TYPE good BASE text
+        ENCODE value
+        DECODE date(datetime(value, '+1 day', 'start of month'));
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val good) STRICT;
+    INSERT INTO t1 VALUES (1, '2020-03-15 10:00:00');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|2020-03-01
+}
+
+# A date or time function argument that is not a literal is checked when
+# DECODE runs: a stored text that is a clock or time zone request is an error.
+
+@requires strict "uses STRICT tables"
+test decode-time-value-that-reads-the-clock-is-an-error {
+    CREATE TYPE t BASE text
+        ENCODE value
+        DECODE date(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val t) STRICT;
+    INSERT INTO t1 VALUES (1, 'now');
+    SELECT id, val FROM t1;
+}
+expect error {
+    non-deterministic use of date\(\) in the DECODE of type t
+}
+
+@requires strict "uses STRICT tables"
+test decode-modifier-that-reads-the-time-zone-is-an-error {
+    CREATE TYPE t BASE text
+        ENCODE value
+        DECODE datetime('2020-01-01 00:00:00', value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val t) STRICT;
+    INSERT INTO t1 VALUES (1, 'LocalTime');
+    SELECT id, val FROM t1;
+}
+expect error {
+    non-deterministic use of datetime\(\) in the DECODE of type t
+}
+
+@requires strict "uses STRICT tables"
+test decode-time-value-and-modifier-that-are-fine-still-work {
+    CREATE TYPE t BASE text
+        ENCODE value
+        DECODE datetime('2020-01-01 00:00:00', value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val t) STRICT;
+    INSERT INTO t1 VALUES (1, '+1 day');
+    INSERT INTO t1 VALUES (2, NULL);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|2020-01-02 00:00:00
+    2|
+}
+
+# Extension functions that only compute from their arguments are
+# deterministic. time_now() reads the clock and is not.
+
+@requires strict "uses STRICT tables"
+test accept-pure-time-function-in-decode {
+    CREATE TYPE good BASE integer
+        ENCODE value
+        DECODE value + time_to_unix(time_date(2020, 1, 1, 0, 0, 0, 0));
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val good) STRICT;
+    INSERT INTO t1 VALUES (1, 1);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|1577836801
+}
+
+@requires strict "uses STRICT tables"
+test reject-time-now-next-to-a-pure-time-function {
+    CREATE TYPE bad BASE integer
+        ENCODE value + time_to_unix(time_date(2020, 1, 1, 0, 0, 0, 0)) + time_to_unix(time_now())
+        DECODE value;
+}
+expect error {
+    time_now\(\) cannot be used in ENCODE expressions because the extension did not register it as deterministic. If it always gives the same result for the same arguments, register it with register_deterministic_scalar_function
+}
+
+@requires strict "uses STRICT tables"
+test accept-regexp-in-decode {
+    CREATE TYPE good BASE text
+        ENCODE value
+        DECODE CASE WHEN regexp('^a', value) THEN upper(value) ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val good) STRICT;
+    INSERT INTO t1 VALUES (1, 'ab');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|AB
+}
+
+# ENCODE and COERCE may read the clock, but a CHECK or an index that runs
+# them repeats the call later, so it fails like any other date function
+# there.
+
+@requires strict "uses STRICT tables"
+test encode-that-reads-the-clock-is-an-error-in-a-check {
+    CREATE TYPE ts BASE text
+        ENCODE datetime(value)
+        DECODE value;
+    CREATE TABLE t1(x TEXT, CHECK (CAST(x AS ts) IS NOT NULL)) STRICT;
+    INSERT INTO t1 VALUES ('2020-01-01');
+    INSERT INTO t1 VALUES ('now');
+}
+expect error {
+    non-deterministic use of datetime\(\) in a CHECK constraint
+}
+
+@requires strict "uses STRICT tables"
+test encode-that-reads-the-clock-is-an-error-in-an-index {
+    CREATE TYPE ts BASE text
+        ENCODE datetime(value)
+        DECODE value;
+    CREATE TABLE t1(x TEXT) STRICT;
+    CREATE INDEX t1_x ON t1(CAST(x AS ts));
+    INSERT INTO t1 VALUES ('2020-01-01');
+    INSERT INTO t1 VALUES ('now');
+}
+expect error {
+    non-deterministic use of datetime\(\) in an index
+}
+
+@requires strict "uses STRICT tables"
+test encode-that-reads-the-clock-is-fine-when-storing-a-value {
+    CREATE TYPE ts BASE text
+        ENCODE datetime(value)
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val ts) STRICT;
+    INSERT INTO t1 VALUES (1, 'now');
+    SELECT id FROM t1 WHERE val IS NOT NULL;
+}
+expect {
+    1
+}
+
+# A domain CHECK runs inside the table's CHECK, so it follows SQLite's rules for
+# a CHECK: current_date, current_time and current_timestamp are allowed, and
+# date('now') is accepted when the domain is created and fails when it runs.
+# A domain DEFAULT is computed when a row is inserted, so it may read the clock.
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-with-current-date-is-allowed {
+    CREATE DOMAIN past_day AS text CHECK (value < current_date);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d past_day) STRICT;
+    INSERT INTO t1 VALUES (1, '2000-01-01');
+    SELECT id FROM t1;
+}
+expect {
+    1
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-with-date-now-is-created {
+    CREATE DOMAIN past_day AS text CHECK (value < date('now'));
+    SELECT count(*) FROM __turso_internal_types WHERE name = 'past_day';
+}
+expect {
+    1
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-with-date-now-fails-when-it-runs {
+    CREATE DOMAIN past_day AS text CHECK (value < date('now'));
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d past_day) STRICT;
+    INSERT INTO t1 VALUES (1, '2000-01-01');
+}
+expect error {
+    non-deterministic use of date\(\) in a CHECK constraint
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-check-with-date-now-is-skipped-by-or-short-circuit {
+    CREATE DOMAIN past_day AS text CHECK (value IS NULL OR value < date('now'));
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d past_day) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+    SELECT id FROM t1;
+}
+expect {
+    1
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-with-current-timestamp-is-allowed {
+    CREATE DOMAIN stamp AS text DEFAULT current_timestamp;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d stamp) STRICT;
+    INSERT INTO t1(id) VALUES (1);
+    SELECT d IS NOT NULL FROM t1;
+}
+expect {
+    1
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-default-with-date-now-is-allowed {
+    CREATE DOMAIN stamp AS text DEFAULT date('now');
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d stamp) STRICT;
+    INSERT INTO t1(id) VALUES (1);
+    SELECT d IS NOT NULL FROM t1;
+}
+expect {
+    1
+}

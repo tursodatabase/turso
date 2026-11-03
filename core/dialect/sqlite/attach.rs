@@ -126,6 +126,7 @@ pub fn translate_attach(
             func: Func::Scalar(ScalarFunc::Attach),
             arg_count: 3,
             collation: CollationSeq::BINARY,
+            pure_context: None,
         },
     });
 
@@ -189,6 +190,7 @@ pub fn translate_detach(
             func: Func::Scalar(ScalarFunc::Detach),
             arg_count: 1,
             collation: CollationSeq::BINARY,
+            pure_context: None,
         },
     });
 

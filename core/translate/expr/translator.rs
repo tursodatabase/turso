@@ -101,7 +101,7 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let constant_span = if expr.is_constant(resolver) {
+    let constant_span = if can_run_at_program_start(program, expr, resolver) {
         if !program.constant_span_is_open() {
             Some(program.constant_span_start())
         } else {
@@ -136,6 +136,43 @@ pub fn translate_expr(
     }
 
     Ok(target_register)
+}
+
+/// True when the expression does not depend on the row and may be computed
+/// once at the start of the program instead of where it appears.
+///
+/// Inside a CHECK, an index, a generated column or a DECODE, a function call
+/// is not moved to the program start. Such a call can raise "non-deterministic
+/// use of date()", and the error must only happen when the expression is
+/// really evaluated: not on an empty table, not in a branch that is skipped.
+/// SQLite does the same: a constant expression that contains a function call is
+/// coded in place, behind OP_Once, and never at the start of the statement
+/// (expr.c sqlite3ExprCodeRunJustOnce, the EP_HasFunc branch).
+fn can_run_at_program_start(
+    program: &ProgramBuilder,
+    expr: &ast::Expr,
+    resolver: &Resolver,
+) -> bool {
+    if !expr.is_constant(resolver) {
+        return false;
+    }
+    !(program.is_in_pure_context() && contains_function_call(expr))
+}
+
+fn contains_function_call(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let walked = walk_expr(expr, &mut |e: &ast::Expr| {
+        if matches!(
+            e,
+            ast::Expr::FunctionCall { .. } | ast::Expr::FunctionCallStar { .. }
+        ) {
+            found = true;
+        }
+        Ok(WalkControl::Continue)
+    });
+    // The callback never fails.
+    debug_assert!(walked.is_ok());
+    found
 }
 
 /// Each kind of expression is translated in its own function, which is never
@@ -953,6 +990,7 @@ fn translate_function_call_expr(
         func,
         arg_count: args_count,
         collation,
+        pure_context: program.pure_context(),
     };
 
     match &func_ctx.func {

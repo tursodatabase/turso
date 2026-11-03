@@ -76,17 +76,19 @@ pub(super) fn encode_seek_keys_for_custom_types(
         // what it is compared with. `n = 3.504` on a numeric(10,2) column
         // matches no row instead of matching 3.50.
         let reg = start_reg + i;
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
         for td in &resolved.chain {
-            if let Some(encode_expr) = td.encode() {
-                crate::translate::expr::emit_type_expr(program, encode_expr, reg, reg, resolver)?;
+            if td.encode().is_some() {
+                crate::translate::expr::emit_type_expr(
+                    program,
+                    td,
+                    crate::translate::expr::TypeExprKind::Encode,
+                    &[],
+                    reg,
+                    reg,
+                    resolver,
+                )?;
             }
         }
-        program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
 }

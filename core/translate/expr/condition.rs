@@ -637,3 +637,71 @@ fn translate_leaf_condition_expr(
     }
     Ok(())
 }
+
+/// Emits a CHECK constraint as a conditional jump. It jumps to `passed_label`
+/// when the expression is true or NULL, and falls through when it is false.
+/// Like SQLite, AND, OR and CASE skip the parts they do not need, so a function
+/// in a skipped part never runs.
+pub fn translate_check_condition(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    expr: &ast::Expr,
+    passed_label: BranchOffset,
+    resolver: &Resolver,
+) -> Result<()> {
+    let failed_label = program.allocate_label();
+    let first_new_span = program.constant_spans_next_idx();
+    translate_condition_expr(
+        program,
+        referenced_tables,
+        expr,
+        ConditionMetadata {
+            jump_if_condition_is_true: true,
+            jump_target_when_true: passed_label,
+            jump_target_when_false: failed_label,
+            jump_target_when_null: passed_label,
+        },
+        resolver,
+    )?;
+    program.constant_spans_invalidate_after(first_new_span);
+    program.preassign_label_to_next_insn(failed_label);
+    Ok(())
+}
+
+/// Evaluates a partial index WHERE clause as a conditional jump and stores 1
+/// in `dest_reg` when it is true, 0 when it is false or NULL. AND, OR and CASE
+/// skip the parts they do not need, like in SQLite.
+pub fn translate_partial_index_where_flag(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    where_expr: &ast::Expr,
+    dest_reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let true_label = program.allocate_label();
+    let not_true_label = program.allocate_label();
+    let done_label = program.allocate_label();
+    let first_new_span = program.constant_spans_next_idx();
+    translate_condition_expr(
+        program,
+        referenced_tables,
+        where_expr,
+        ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true: true_label,
+            jump_target_when_false: not_true_label,
+            jump_target_when_null: not_true_label,
+        },
+        resolver,
+    )?;
+    program.constant_spans_invalidate_after(first_new_span);
+    program.preassign_label_to_next_insn(true_label);
+    program.emit_int(1, dest_reg);
+    program.emit_insn(Insn::Goto {
+        target_pc: done_label,
+    });
+    program.preassign_label_to_next_insn(not_true_label);
+    program.emit_int(0, dest_reg);
+    program.preassign_label_to_next_insn(done_label);
+    Ok(())
+}

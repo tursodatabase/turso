@@ -1,54 +1,88 @@
 @database :memory:
 @requires-file custom_types "uses custom types"
 
-@requires strict "uses STRICT tables"
-test notnull-decode-rejects-ghost-null {
-    -- ENCODE is identity, but DECODE maps 42 → NULL.
-    -- A NOT NULL column must reject inserts that would decode to NULL.
-    CREATE TYPE tricky BASE integer
-        ENCODE value
-        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky NOT NULL) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-}
-expect {
-}
+# ENCODE, DECODE and COERCE do not run on a NULL input. When the input is
+# not NULL and the expression returns NULL, the statement fails with an error
+# that names the type. An expression that is just `value` is not checked.
 
 @requires strict "uses STRICT tables"
-test notnull-decode-ghost-null-rejected {
-    CREATE TYPE tricky BASE integer
-        ENCODE value
-        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky NOT NULL) STRICT;
+test encode-returning-null-is-an-error {
+    CREATE TYPE enc_null BASE integer
+        ENCODE CASE WHEN value = 42 THEN NULL ELSE value END
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val enc_null) STRICT;
     INSERT INTO t1 VALUES (1, 42);
 }
 expect error {
-    NOT NULL constraint failed: t1.val
+    ENCODE of type enc_null returned NULL
 }
 
 @requires strict "uses STRICT tables"
-test notnull-decode-normal-values-ok {
-    -- Non-NULL decoded values should pass.
-    CREATE TYPE tricky BASE integer
-        ENCODE value
-        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky NOT NULL) STRICT;
+test encode-returning-null-is-an-error-on-update {
+    CREATE TYPE enc_null BASE integer
+        ENCODE CASE WHEN value = 42 THEN NULL ELSE value END
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val enc_null) STRICT;
     INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 99);
+    UPDATE t1 SET val = 42 WHERE id = 1;
+}
+expect error {
+    ENCODE of type enc_null returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test encode-returning-null-is-an-error-in-comparison {
+    -- The constant is encoded to look it up in the index.
+    CREATE TYPE enc_null BASE integer
+        ENCODE CASE WHEN value = 42 THEN NULL ELSE value * 2 END
+        DECODE value / 2
+        OPERATOR '<';
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val enc_null) STRICT;
+    CREATE INDEX t1_val ON t1(val);
+    INSERT INTO t1 VALUES (1, 10);
+    SELECT id FROM t1 WHERE val = 42;
+}
+expect error {
+    ENCODE of type enc_null returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test encode-other-values-and-null-input-are-fine {
+    CREATE TYPE enc_null BASE integer
+        ENCODE CASE WHEN value = 42 THEN NULL ELSE value END
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val enc_null) STRICT;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (2, NULL);
     SELECT id, val FROM t1 ORDER BY id;
 }
 expect {
     1|10
-    2|99
+    2|
 }
 
 @requires strict "uses STRICT tables"
-test notnull-decode-actual-null-still-rejected {
-    -- Actual NULL input should still be rejected by NOT NULL.
-    CREATE TYPE tricky BASE integer
-        ENCODE value
-        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky NOT NULL) STRICT;
+test encode-is-skipped-for-null-input {
+    -- If ENCODE ran on NULL it would raise this error.
+    CREATE TYPE enc_raise BASE integer
+        ENCODE CASE WHEN value IS NULL THEN RAISE(ABORT, 'ENCODE ran on NULL') ELSE value END
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val enc_raise) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|
+}
+
+@requires strict "uses STRICT tables"
+test encode-is-skipped-for-null-input-in-a-not-null-domain {
+    -- The NOT NULL domain rejects the NULL; ENCODE does not run on it first.
+    CREATE TYPE enc_raise BASE integer
+        ENCODE CASE WHEN value IS NULL THEN RAISE(ABORT, 'ENCODE ran on NULL') ELSE value END
+        DECODE value;
+    CREATE DOMAIN nn_raise AS enc_raise NOT NULL;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val nn_raise) STRICT;
     INSERT INTO t1 VALUES (1, NULL);
 }
 expect error {
@@ -56,39 +90,342 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test notnull-decode-positive-only {
-    -- Practical example: type that decodes non-positive values to NULL.
-    CREATE TYPE positive_only BASE integer
+test decode-returning-null-is-an-error {
+    CREATE TYPE dec_null BASE integer
         ENCODE value
-        DECODE CASE WHEN value > 0 THEN value ELSE NULL END;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val positive_only NOT NULL) STRICT;
-    INSERT INTO t1 VALUES (1, 5);
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val dec_null) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    SELECT id, val FROM t1;
+}
+expect error {
+    DECODE of type dec_null returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test decode-returning-null-is-an-error-in-order-by {
+    CREATE TYPE dec_null BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END
+        OPERATOR '<';
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val dec_null) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    SELECT val, val FROM t1 ORDER BY val;
+}
+expect error {
+    DECODE of type dec_null returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test decode-other-values-and-null-are-fine {
+    CREATE TYPE dec_null BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val dec_null) STRICT;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (2, NULL);
+    INSERT INTO t1 VALUES (3, 99);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|10
+    2|
+    3|99
+}
+
+@requires strict "uses STRICT tables"
+test decode-is-skipped-for-null-input {
+    -- If DECODE ran on NULL it would raise this error.
+    CREATE TYPE dec_raise BASE integer
+        ENCODE value
+        DECODE CASE WHEN value IS NULL THEN RAISE(ABORT, 'DECODE ran on NULL') ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val dec_raise) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
     SELECT id, val FROM t1;
 }
 expect {
+    1|
+}
+
+@requires strict "uses STRICT tables"
+test decode-returning-null-is-an-error-for-an-array-element {
+    CREATE TYPE dec_null BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val dec_null[]) STRICT;
+    INSERT INTO t1 VALUES (1, '{1,42}');
+    SELECT id, val FROM t1;
+}
+expect error {
+    DECODE of type dec_null returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test coerce-returning-null-is-an-error {
+    CREATE TYPE co_null BASE integer
+        ENCODE value
+        COERCE CASE WHEN value = 42 THEN NULL ELSE value END
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val co_null) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+}
+expect error {
+    COERCE of type co_null returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test coerce-returning-null-is-an-error-in-cast {
+    CREATE TYPE co_null BASE integer
+        ENCODE value
+        COERCE CASE WHEN value = 42 THEN NULL ELSE value END
+        DECODE value;
+    SELECT CAST(42 AS co_null);
+}
+expect error {
+    COERCE of type co_null returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test coerce-other-values-and-null-input-are-fine {
+    CREATE TYPE co_null BASE integer
+        ENCODE value
+        COERCE CASE WHEN value = 42 THEN NULL ELSE value END
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val co_null) STRICT;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (2, NULL);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|10
+    2|
+}
+
+@requires strict "uses STRICT tables"
+test coerce-is-skipped-for-null-input {
+    CREATE TYPE co_raise BASE integer
+        ENCODE value
+        COERCE CASE WHEN value IS NULL THEN RAISE(ABORT, 'COERCE ran on NULL') ELSE value END
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val co_raise) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|
+}
+
+@requires strict "uses STRICT tables"
+test encode-of-a-parent-type-returning-null-names-the-parent {
+    CREATE TYPE enc_null BASE integer
+        ENCODE CASE WHEN value = 42 THEN NULL ELSE value END
+        DECODE value;
+    CREATE DOMAIN child_dom AS enc_null;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val child_dom) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+}
+expect error {
+    ENCODE of type enc_null returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test value-only-expressions-are-not-checked {
+    CREATE TYPE ident BASE integer
+        ENCODE value
+        COERCE value
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val ident) STRICT;
+    INSERT INTO t1 VALUES (1, 5);
+    INSERT INTO t1 VALUES (2, NULL);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
     1|5
+    2|
 }
 
 @requires strict "uses STRICT tables"
-test notnull-decode-positive-only-zero-rejected {
-    CREATE TYPE positive_only BASE integer
+test notnull-column-still-rejects-null {
+    CREATE TYPE ident BASE integer
         ENCODE value
-        DECODE CASE WHEN value > 0 THEN value ELSE NULL END;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val positive_only NOT NULL) STRICT;
-    INSERT INTO t1 VALUES (1, 0);
+        DECODE value;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val ident NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
 }
 expect error {
     NOT NULL constraint failed: t1.val
 }
 
+# A write computes DECODE of every custom-type column it stores, so a DECODE
+# that gives NULL for a value that is not NULL, or that fails, fails the write.
+# The row is never stored, so no later read depends on the plan.
+
 @requires strict "uses STRICT tables"
-test notnull-decode-positive-only-negative-rejected {
-    CREATE TYPE positive_only BASE integer
+test notnull-column-with-decode-returning-null-fails-the-insert {
+    CREATE TYPE tricky BASE integer
         ENCODE value
-        DECODE CASE WHEN value > 0 THEN value ELSE NULL END;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val positive_only NOT NULL) STRICT;
-    INSERT INTO t1 VALUES (1, -5);
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE nn(id INTEGER PRIMARY KEY, val tricky NOT NULL) STRICT;
+    INSERT INTO nn VALUES (1, 42);
 }
 expect error {
-    NOT NULL constraint failed: t1.val
+    DECODE of type tricky returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test nullable-column-with-decode-returning-null-fails-the-insert {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+}
+expect error {
+    DECODE of type tricky returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test decode-failure-fails-the-insert-with-an-index-on-the-column {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END
+        OPERATOR '<';
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky) STRICT;
+    CREATE INDEX t1_val ON t1(val);
+    INSERT INTO t1 VALUES (1, 42);
+}
+expect error {
+    DECODE of type tricky returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test decode-failure-fails-the-insert-with-a-covering-index {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END
+        OPERATOR '<';
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky, other INTEGER) STRICT;
+    CREATE INDEX t1_cover ON t1(other, val);
+    INSERT INTO t1 VALUES (1, 42, 7);
+}
+expect error {
+    DECODE of type tricky returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test decode-failure-fails-the-insert-with-an-index-that-skips-the-column {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky, other INTEGER) STRICT;
+    CREATE INDEX t1_other ON t1(other);
+    INSERT INTO t1 VALUES (1, 42, 7);
+}
+expect error {
+    DECODE of type tricky returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test decode-failure-in-a-later-row-fails-the-whole-insert {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky) STRICT;
+    INSERT INTO t1 VALUES (1, 10), (2, 42);
+}
+expect error {
+    DECODE of type tricky returned NULL
+}
+
+
+@requires strict "uses STRICT tables"
+test decode-raising-an-error-fails-the-insert {
+    CREATE TYPE picky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN RAISE(ABORT, 'DECODE does not take 42') ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val picky) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+}
+expect error {
+    DECODE does not take 42
+}
+
+@requires strict "uses STRICT tables"
+test decode-failure-fails-the-update {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky) STRICT;
+    INSERT INTO t1 VALUES (1, 10);
+    UPDATE t1 SET val = 42 WHERE id = 1;
+}
+expect error {
+    DECODE of type tricky returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test update-of-another-column-does-not-run-decode {
+    -- The other columns of the row are not stored again.
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky, other INTEGER) STRICT;
+    INSERT INTO t1 VALUES (1, 10, 1);
+    UPDATE t1 SET other = 2 WHERE id = 1;
+    SELECT id, val, other FROM t1;
+}
+expect {
+    1|10|2
+}
+
+@requires strict "uses STRICT tables"
+test decode-failure-fails-the-upsert-update {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky) STRICT;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (1, 11) ON CONFLICT(id) DO UPDATE SET val = 42;
+}
+expect error {
+    DECODE of type tricky returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test decode-failure-fails-the-upsert-insert {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky) STRICT;
+    INSERT INTO t1 VALUES (1, 42) ON CONFLICT(id) DO NOTHING;
+}
+expect error {
+    DECODE of type tricky returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test decode-failure-fails-insert-select {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE src(a INTEGER);
+    INSERT INTO src VALUES (1), (42);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky) STRICT;
+    INSERT INTO t1(val) SELECT a FROM src;
+}
+expect error {
+    DECODE of type tricky returned NULL
+}
+
+@requires strict "uses STRICT tables"
+test decode-in-the-type-chain-fails-the-insert {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE DOMAIN tricky_dom AS tricky;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky_dom) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+}
+expect error {
+    DECODE of type tricky returned NULL
 }

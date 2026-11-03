@@ -123,8 +123,8 @@ pub(super) fn emit_array_encode(
     resolver: &Resolver,
     table_name: &str,
 ) -> Result<()> {
-    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if type_def.has_encode_or_coerce() {
+    if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(&col.ty_str) {
+        if resolved.chain.iter().any(|td| td.has_encode_or_coerce()) {
             // Normalize input (text or blob) to blob with ANY affinity first
             program.emit_insn(Insn::ArrayEncode {
                 data: Box::new(ArrayEncodeData {
@@ -139,7 +139,7 @@ pub(super) fn emit_array_encode(
             emit_array_element_loop(program, reg, |program, element_reg| {
                 emit_store_value(
                     program,
-                    std::slice::from_ref(type_def),
+                    &resolved.chain,
                     element_reg,
                     &col.ty_params,
                     resolver,
@@ -187,11 +187,10 @@ pub(crate) fn emit_array_decode(
     col: &Column,
     resolver: &Resolver,
 ) -> Result<()> {
-    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if let Some(decode_expr) = type_def.decode() {
+    if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(&col.ty_str) {
+        if resolved.chain.iter().any(|td| td.decode().is_some()) {
             emit_array_element_loop(program, reg, |program, element_reg| {
-                emit_type_expr(program, decode_expr, element_reg, element_reg, resolver)?;
-                Ok(())
+                emit_decode(program, &resolved.chain, element_reg, resolver)
             })?;
         }
     }
@@ -247,26 +246,53 @@ pub(crate) fn emit_custom_type_encode_columns(
             continue;
         };
 
-        // Check if any type in the chain has not_null — if so, don't skip NULLs
-        let any_not_null = resolved.chain.iter().any(|td| td.not_null);
-
-        let skip_label = if !any_not_null {
-            // Skip NULL values: jump over encode if NULL
-            let label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: label,
-            });
-            Some(label)
-        } else {
-            None
-        };
-
+        // ENCODE and COERCE skip a NULL value, so a NULL reaches the NOT NULL
+        // check of the column or domain unchanged.
         emit_store_value(program, &resolved.chain, reg, &col.ty_params, resolver)?;
+    }
+    Ok(())
+}
 
-        if let Some(label) = skip_label {
-            program.preassign_label_to_next_insn(label);
+/// Runs the DECODE of each custom-type column in a contiguous register range
+/// on a copy of its stored value, and drops the result. A write does this so
+/// that a DECODE that fails, or returns NULL for a value that is not NULL, fails
+/// the write itself, whatever indexes exist and whichever columns a later read
+/// uses. Call it once the stored values are final.
+///
+/// If `only_columns` is `Some`, only check columns whose index is in the set.
+pub(crate) fn emit_custom_type_decode_check_columns(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    columns: &[Column],
+    start_reg: usize,
+    only_columns: Option<&ColumnMask>,
+    layout: &ColumnLayout,
+) -> Result<()> {
+    for (i, col) in columns.iter().enumerate() {
+        if only_columns.is_some_and(|filter| !filter.get(i)) {
+            continue;
         }
+        if col.is_virtual_generated() || col.is_array() || col.ty_str.is_empty() {
+            continue;
+        }
+        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(&col.ty_str) else {
+            continue;
+        };
+        if !resolved
+            .chain
+            .iter()
+            .any(|type_def| type_def.decode().is_some())
+        {
+            continue;
+        }
+        let stored_reg = layout.to_register(start_reg, i);
+        let scratch_reg = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: stored_reg,
+            dst_reg: scratch_reg,
+            extra_amount: 0,
+        });
+        emit_decode(program, &resolved.chain, scratch_reg, resolver)?;
     }
     Ok(())
 }

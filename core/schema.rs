@@ -6286,67 +6286,65 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
     Ok(clone.to_string())
 }
 
-pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
+/// Whether a function may appear in a CHECK, an index, a generated column or a
+/// partial index WHERE. Like SQLite, a date or time function is accepted here
+/// and fails when it runs and reads the clock or the time zone
+/// (see `check_pure` in functions/datetime.rs).
+pub(crate) fn is_deterministic_schema_function_call(func: &Func) -> bool {
     match func {
-        Func::Scalar(scalar_func) if scalar_func.is_date_time_function() => {
-            is_deterministic_datetime_call(func, args)
-        }
+        Func::Scalar(scalar_func) if scalar_func.is_date_time_function() => true,
         _ => func.is_deterministic(),
     }
 }
 
-// SQLite allows date/time functions in schema-persistent expressions only when
-// they do not depend on the current clock or local timezone. This applies to
-// expression indexes, partial index WHERE clauses, and generated columns.
-fn is_deterministic_datetime_call(func: &Func, args: &[Box<Expr>]) -> bool {
+/// Whether a call to a date or time function reads the clock or the time zone,
+/// judged from the literal arguments. An argument that is not a literal is
+/// only known when the function runs. It uses the same rules as the check that
+/// runs with the function, so both agree on what counts.
+pub(crate) fn datetime_call_reads_clock_or_time_zone(func: &Func, args: &[Box<Expr>]) -> bool {
+    let reads_clock = |arg: &Expr| {
+        string_literal(arg).is_some_and(crate::functions::datetime::reads_clock_as_time_value)
+    };
+    let reads_time_zone = |arg: &Expr| {
+        string_literal(arg).is_some_and(crate::functions::datetime::reads_time_zone_as_modifier)
+    };
     match func {
-        Func::Scalar(ScalarFunc::Date)
-        | Func::Scalar(ScalarFunc::Time)
-        | Func::Scalar(ScalarFunc::DateTime)
-        | Func::Scalar(ScalarFunc::UnixEpoch)
-        | Func::Scalar(ScalarFunc::JulianDay) => {
-            !args.is_empty()
-                && !is_current_time_expr(args[0].as_ref())
-                && !args[1..]
-                    .iter()
-                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
-        }
-        Func::Scalar(ScalarFunc::StrfTime) => {
-            args.len() >= 2
-                && !is_current_time_expr(args[1].as_ref())
-                && !args[2..]
-                    .iter()
-                    .any(|arg| is_unsafe_datetime_modifier(arg.as_ref()))
-        }
-        Func::Scalar(ScalarFunc::TimeDiff) => {
-            !args.iter().any(|arg| is_current_time_expr(arg.as_ref()))
-        }
-        _ => unreachable!("non-datetime function passed to datetime index validator"),
+        Func::Scalar(
+            ScalarFunc::Date
+            | ScalarFunc::Time
+            | ScalarFunc::DateTime
+            | ScalarFunc::UnixEpoch
+            | ScalarFunc::JulianDay,
+        ) => match args {
+            // No time value means "now".
+            [] => true,
+            [time_value, modifiers @ ..] => {
+                reads_clock(time_value) || modifiers.iter().any(|m| reads_time_zone(m))
+            }
+        },
+        Func::Scalar(ScalarFunc::StrfTime) => match args {
+            [] => false,
+            [_format] => true,
+            [_format, time_value, modifiers @ ..] => {
+                reads_clock(time_value) || modifiers.iter().any(|m| reads_time_zone(m))
+            }
+        },
+        Func::Scalar(
+            ScalarFunc::TimeDiff
+            | ScalarFunc::DatePlus
+            | ScalarFunc::DateMinus
+            | ScalarFunc::DateDiff,
+        ) => args.iter().any(|arg| reads_clock(arg)),
+        _ => unreachable!("a function that is not a date or time function was passed"),
     }
 }
 
-fn is_current_time_expr(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Literal(ast::Literal::String(value)) if string_literal_eq(value, "now")
-    ) || matches!(
-        expr,
-        Expr::Literal(
-            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
-        )
-    )
-}
-
-fn is_unsafe_datetime_modifier(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Literal(ast::Literal::String(value))
-            if string_literal_eq(value, "localtime") || string_literal_eq(value, "utc")
-    ) || is_current_time_expr(expr)
-}
-
-fn string_literal_eq(value: &str, expected: &str) -> bool {
-    value.trim_matches('\'').eq_ignore_ascii_case(expected)
+/// The text of a string literal, without its quotes.
+fn string_literal(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Literal(ast::Literal::String(value)) => Some(value.trim_matches('\'')),
+        _ => None,
+    }
 }
 
 pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
@@ -6386,7 +6384,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if matches!(func, Func::Agg(_)) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
             }
-            if !is_deterministic_schema_function_call(&func, args) {
+            if !is_deterministic_schema_function_call(&func) {
                 bail_parse_error!("non-deterministic functions prohibited in generated columns");
             }
             for arg in args {
@@ -6408,7 +6406,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if matches!(func, Func::Agg(_)) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
             }
-            if !func.is_deterministic() {
+            if !is_deterministic_schema_function_call(&func) {
                 bail_parse_error!("non-deterministic functions prohibited in generated columns");
             }
         }
@@ -8279,7 +8277,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
@@ -8293,10 +8291,6 @@ impl Index {
             })
         };
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
-        let is_deterministic_fn = |name: &str, argc: usize| {
-            let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
-        };
 
         let mut ok = true;
         let _ = walk_expr(where_clause.as_ref(), &mut |e: &Expr| -> crate::Result<
@@ -8337,15 +8331,22 @@ impl Index {
                     if filter_over.over_clause.is_some() {
                         ok = false;
                     } else {
-                        let argc = match e {
-                            Expr::FunctionCall { args, .. } => args.len(),
-                            Expr::FunctionCallStar { .. } => 0,
-                            _ => unreachable!(),
+                        let args: &[Box<Expr>] = match e {
+                            Expr::FunctionCall { args, .. } => args,
+                            _ => &[],
                         };
-                        // Reject non-deterministic functions. Function arguments can reference
-                        // columns of the indexed table (e.g., LENGTH(t0.c0)), which will be
-                        // validated by the Expr::Id and Expr::Qualified cases during the walk.
-                        if !is_deterministic_fn(name.as_str(), argc) {
+                        // Reject functions that cannot appear in a persisted expression.
+                        // Function arguments can reference columns of the indexed table
+                        // (e.g., LENGTH(t0.c0)), which will be validated by the Expr::Id
+                        // and Expr::Qualified cases during the walk.
+                        let allowed = resolver
+                            .resolve_function(name.as_str(), args.len())
+                            .is_ok_and(|func| {
+                                func.is_some_and(|func| {
+                                    is_deterministic_schema_function_call(&func)
+                                })
+                            });
+                        if !allowed {
                             ok = false;
                         }
                     }

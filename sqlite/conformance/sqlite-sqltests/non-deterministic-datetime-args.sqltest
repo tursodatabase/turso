@@ -1,0 +1,491 @@
+@database :memory:
+
+# SQLite refuses date/time calls that read the clock or time zone when they
+# run inside an index, CHECK constraint or generated column. The error happens
+# only when such a call actually runs. Creating the object does not run it, and
+# a part of an expression that is skipped (the right side of an OR that is
+# already true, a CASE branch that is not taken) never runs. Error text must
+# match SQLite's.
+
+test index-expr-column-value-now {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(date(x));
+    INSERT INTO t VALUES ('now');
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test index-expr-localtime-modifier-from-column {
+    CREATE TABLE t(x, y);
+    CREATE INDEX i ON t(date(x, y));
+    INSERT INTO t VALUES ('2020-01-01', 'localtime');
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test index-expr-update-to-now {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(datetime(x));
+    INSERT INTO t VALUES ('2020-01-01');
+    UPDATE t SET x = 'now';
+}
+expect error {
+    non-deterministic use of datetime\(\) in an index
+}
+
+test index-expr-timediff-now {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(timediff(x, '2020-01-01'));
+    INSERT INTO t VALUES ('now');
+}
+expect error {
+    non-deterministic use of timediff\(\) in an index
+}
+
+test index-expr-subsec-modifier-is-allowed {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(unixepoch(x, 'subsec'));
+    INSERT INTO t VALUES ('2020-01-01');
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+test check-constraint-column-value-now {
+    CREATE TABLE t(x CHECK (date(x) IS NOT NULL));
+    INSERT INTO t VALUES ('now');
+}
+expect error {
+    non-deterministic use of date\(\) in a CHECK constraint
+}
+
+test check-constraint-now-is-case-insensitive {
+    CREATE TABLE t(x CHECK (date(x) IS NOT NULL));
+    INSERT INTO t VALUES ('NOW');
+}
+expect error {
+    non-deterministic use of date\(\) in a CHECK constraint
+}
+
+test check-constraint-fixed-date-is-allowed {
+    CREATE TABLE t(x CHECK (date(x) IS NOT NULL));
+    INSERT INTO t VALUES ('2020-01-01');
+    SELECT x FROM t;
+}
+expect {
+    2020-01-01
+}
+
+test generated-column-column-value-now {
+    CREATE TABLE t(x, g AS (date(x)));
+    INSERT INTO t(x) VALUES ('now');
+}
+expect error {
+    non-deterministic use of date\(\) in a generated column
+}
+
+test generated-column-julianday-now {
+    CREATE TABLE t(x, g AS (julianday(x)));
+    INSERT INTO t(x) VALUES ('now');
+}
+expect error {
+    non-deterministic use of julianday\(\) in a generated column
+}
+
+test plain-select-may-read-the-clock {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES ('now');
+    SELECT date(x) IS NOT NULL FROM t;
+}
+expect {
+    1
+}
+
+test partial-index-where-column-value-now {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(x) WHERE date(x) IS NOT NULL;
+    INSERT INTO t VALUES ('now');
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test partial-index-where-fixed-date-is-allowed {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(x) WHERE date(x) IS NOT NULL;
+    INSERT INTO t VALUES ('2020-01-01');
+    INSERT INTO t VALUES ('not a date');
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
+test partial-index-where-modifier-from-column {
+    CREATE TABLE t(x, y);
+    CREATE INDEX i ON t(x) WHERE date(x, y) IS NOT NULL;
+    INSERT INTO t VALUES ('2020-01-01', 'utc');
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test index-expr-upsert-to-now {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    CREATE INDEX i ON t(date(x));
+    INSERT INTO t VALUES (1, '2020-01-01');
+    INSERT INTO t VALUES (1, 'now') ON CONFLICT(id) DO UPDATE SET x = excluded.x;
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test index-expr-insert-or-replace-with-now {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x);
+    CREATE INDEX i ON t(date(x));
+    INSERT INTO t VALUES (1, '2020-01-01');
+    INSERT OR REPLACE INTO t VALUES (1, 'now');
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test check-constraint-update-to-now {
+    CREATE TABLE t(x CHECK (date(x) IS NOT NULL));
+    INSERT INTO t VALUES ('2020-01-01');
+    UPDATE t SET x = 'now';
+}
+expect error {
+    non-deterministic use of date\(\) in a CHECK constraint
+}
+
+test generated-column-update-source-to-now {
+    CREATE TABLE t(x, g AS (date(x)));
+    INSERT INTO t(x) VALUES ('2020-01-01');
+    UPDATE t SET x = 'now';
+}
+expect error {
+    non-deterministic use of date\(\) in a generated column
+}
+
+# A virtual generated column is computed when it is read.
+
+test generated-column-read-in-select {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES ('now');
+    ALTER TABLE t ADD COLUMN g AS (date(x));
+    SELECT g IS NOT NULL FROM t;
+}
+expect error {
+    non-deterministic use of date\(\) in a generated column
+}
+
+test generated-column-read-in-where {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES ('now');
+    ALTER TABLE t ADD COLUMN g AS (date(x));
+    SELECT x FROM t WHERE g IS NOT NULL;
+}
+expect error {
+    non-deterministic use of date\(\) in a generated column
+}
+
+test generated-column-read-in-order-by {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES ('now');
+    ALTER TABLE t ADD COLUMN g AS (date(x));
+    SELECT x FROM t ORDER BY g;
+}
+expect error {
+    non-deterministic use of date\(\) in a generated column
+}
+
+test generated-column-read-in-returning {
+    CREATE TABLE t(x, g AS (date(x)));
+    INSERT INTO t(x) VALUES ('now') RETURNING g;
+}
+expect error {
+    non-deterministic use of date\(\) in a generated column
+}
+
+test generated-column-read-of-fixed-date-is-allowed {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES ('2020-01-01');
+    ALTER TABLE t ADD COLUMN g AS (date(x));
+    SELECT g FROM t WHERE g IS NOT NULL ORDER BY g;
+}
+expect {
+    2020-01-01
+}
+
+# Adding a generated column computes nothing, and a query that does not
+# read it works.
+
+test add-generated-column-over-now-rows-is-allowed {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES ('now');
+    ALTER TABLE t ADD COLUMN g AS (date(x));
+    SELECT x FROM t;
+}
+expect {
+    now
+}
+
+# CREATE INDEX computes the index entries of the rows already there.
+
+test create-index-over-now-rows {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES ('now');
+    CREATE INDEX i ON t(date(x));
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test create-partial-index-over-now-rows {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES ('now');
+    CREATE INDEX i ON t(x) WHERE date(x) IS NOT NULL;
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test create-index-on-generated-column-over-now-rows {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES ('now');
+    ALTER TABLE t ADD COLUMN g AS (date(x));
+    CREATE INDEX i ON t(g);
+}
+expect error {
+    non-deterministic use of date\(\) in a generated column
+}
+
+# date_plus, date_minus and date_diff are Turso functions behind the date
+# operators of the PostgreSQL frontend.
+
+@skip-if sqlite "date_plus, date_minus and date_diff are Turso functions"
+test date-plus-in-index-with-now {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(date_plus(x, 1));
+    INSERT INTO t VALUES ('now');
+}
+expect error {
+    non-deterministic use of date_plus\(\) in an index
+}
+
+@skip-if sqlite "date_plus, date_minus and date_diff are Turso functions"
+test date-minus-in-check-with-now {
+    CREATE TABLE t(x CHECK (date_minus(x, 1) IS NOT NULL));
+    INSERT INTO t VALUES ('now');
+}
+expect error {
+    non-deterministic use of date_minus\(\) in a CHECK constraint
+}
+
+@skip-if sqlite "date_plus, date_minus and date_diff are Turso functions"
+test date-diff-in-generated-column-with-now {
+    CREATE TABLE t(x, y, g AS (date_diff(x, y)));
+    INSERT INTO t(x, y) VALUES ('2020-01-01', 'now');
+}
+expect error {
+    non-deterministic use of date_diff\(\) in a generated column
+}
+
+@skip-if sqlite "date_plus, date_minus and date_diff are Turso functions"
+test date-plus-with-fixed-date-is-allowed {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(date_plus(x, 1));
+    INSERT INTO t VALUES ('2020-01-01');
+    SELECT date_plus(x, 1) FROM t;
+}
+expect {
+    2020-01-02
+}
+
+test check-or-does-not-run-right-side-when-left-is-true {
+    CREATE TABLE t(x CHECK (x = 1 OR date('now') IS NOT NULL));
+    INSERT INTO t VALUES (1);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test check-or-runs-right-side-when-left-is-false {
+    CREATE TABLE t(x CHECK (x = 1 OR date('now') IS NOT NULL));
+    INSERT INTO t VALUES (2);
+}
+expect error {
+    non-deterministic use of date\(\) in a CHECK constraint
+}
+
+test check-or-with-localtime-from-column-skipped {
+    CREATE TABLE t(x CHECK (x = 1 OR datetime(x, 'localtime') IS NOT NULL));
+    INSERT INTO t VALUES (1);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test check-and-does-not-run-right-side-when-left-is-false {
+    CREATE TABLE t(x CHECK (x = 1 AND date('now') IS NOT NULL));
+    INSERT INTO t VALUES (2);
+}
+expect error {
+    CHECK constraint failed
+}
+
+test check-case-does-not-run-branch-that-is-not-taken {
+    CREATE TABLE t(x CHECK (CASE WHEN x = 1 THEN 1 ELSE date('now') IS NOT NULL END));
+    INSERT INTO t VALUES (1);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test check-update-skips-right-side-of-or {
+    CREATE TABLE t(x CHECK (x < 10 OR date('now') IS NOT NULL));
+    INSERT INTO t VALUES (1);
+    UPDATE t SET x = 2;
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test create-index-on-empty-table-with-now-is-allowed {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(date('now'));
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test create-index-on-empty-table-with-subsec-is-allowed {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(date('subsec'));
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test create-index-on-empty-table-with-subsecond-is-allowed {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(date('subsecond'));
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test create-index-on-empty-table-with-no-time-value-is-allowed {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(date());
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test create-index-on-empty-table-with-uppercase-localtime-is-allowed {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(date('2020-01-01', 'LOCALTIME'));
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test create-index-on-empty-table-with-strftime-now-is-allowed {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(strftime('%s'));
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test insert-into-index-with-subsec-fails {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(date('subsec'));
+    INSERT INTO t VALUES (1);
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test insert-into-index-with-subsecond-fails {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(date('subsecond'));
+    INSERT INTO t VALUES (1);
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test create-index-with-subsec-on-table-with-rows-fails {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    CREATE INDEX i ON t(date('subsec'));
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test generated-column-with-subsec-is-created-and-fails-when-written {
+    CREATE TABLE t(x, g AS (date('subsec')));
+    CREATE INDEX i ON t(g);
+    INSERT INTO t(x) VALUES (1);
+}
+expect error {
+    non-deterministic use of date\(\) in a generated column
+}
+
+test partial-index-where-and-does-not-run-right-side-when-left-is-false {
+    CREATE TABLE t(x, y);
+    CREATE INDEX i ON t(x) WHERE y = 1 AND date('subsec') IS NOT NULL;
+    INSERT INTO t VALUES (1, 2);
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+test partial-index-where-and-runs-right-side-when-left-is-true {
+    CREATE TABLE t(x, y);
+    CREATE INDEX i ON t(x) WHERE y = 1 AND date('subsec') IS NOT NULL;
+    INSERT INTO t VALUES (1, 1);
+}
+expect error {
+    non-deterministic use of date\(\) in an index
+}
+
+test partial-index-where-or-does-not-run-right-side-when-left-is-true {
+    CREATE TABLE t(x, y);
+    CREATE INDEX i ON t(x) WHERE y = 1 OR date('now') IS NOT NULL;
+    INSERT INTO t VALUES (1, 1);
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+test partial-index-where-skipped-right-side-on-update-and-delete {
+    CREATE TABLE t(x, y);
+    CREATE INDEX i ON t(x) WHERE y = 1 AND date('subsec') IS NOT NULL;
+    INSERT INTO t VALUES (1, 2);
+    UPDATE t SET x = 5;
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}

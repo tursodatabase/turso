@@ -111,6 +111,17 @@ pub(crate) unsafe fn register_scalar_function(
     unsafe { register_scalar_function_with_options(ctx, name, -1, false, 0, func, None, None) }
 }
 
+/// Registers a function that returns the same result for the same arguments, so
+/// it may be used where a result must not change over time, such as a custom
+/// type's ENCODE and DECODE.
+pub(crate) unsafe fn register_deterministic_scalar_function(
+    ctx: *mut c_void,
+    name: *const c_char,
+    func: ScalarFunction,
+) -> ResultCode {
+    unsafe { register_scalar_function_with_options(ctx, name, -1, true, 0, func, None, None) }
+}
+
 pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
     ctx: *mut c_void,
     name: *const c_char,

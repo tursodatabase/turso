@@ -324,20 +324,16 @@ impl EmitOrderBy {
                     &plan.table_references,
                     t_ctx.resolver.schema(),
                 ) {
-                    if let Some(decode_expr) = type_def.decode() {
-                        let skip_label = program.allocate_label();
-                        program.emit_insn(Insn::IsNull {
-                            reg,
-                            target_pc: skip_label,
-                        });
+                    if type_def.decode().is_some() {
                         super::expr::emit_type_expr(
                             program,
-                            decode_expr,
+                            &type_def,
+                            super::expr::TypeExprKind::Decode,
+                            &[],
                             reg,
                             reg,
                             &t_ctx.resolver,
                         )?;
-                        program.preassign_label_to_next_insn(skip_label);
                     }
                 }
             }

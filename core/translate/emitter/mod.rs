@@ -10,8 +10,9 @@ use super::{
     },
     expr::{
         bind_and_rewrite_expr, emit_constraint_values_decode, emit_stored_column,
-        emit_table_column, emit_user_facing_column_value, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
+        emit_table_column, emit_user_facing_column_value, translate_check_condition,
+        translate_expr_no_constant_opt, translate_partial_index_where_flag, walk_expr,
+        BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, RightJoinMetadata, SemiAntiJoinMetadata},
@@ -44,7 +45,7 @@ use crate::vdbe::{
 };
 use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
-    function::Func,
+    function::{Func, PureContext},
     sync::Arc,
     util::{
         check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
@@ -1389,6 +1390,7 @@ fn emit_cdc_insns_v1(
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
         collation: CollationSeq::BINARY,
+        pure_context: None,
     };
 
     program.emit_insn(Insn::Function {
@@ -1501,6 +1503,7 @@ fn emit_cdc_insns_v2(
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
         collation: CollationSeq::BINARY,
+        pure_context: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1519,6 +1522,7 @@ fn emit_cdc_insns_v2(
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
         collation: CollationSeq::BINARY,
+        pure_context: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1625,6 +1629,7 @@ pub fn emit_cdc_commit_insns(
         func: Func::Scalar(crate::function::ScalarFunc::UnixEpoch),
         arg_count: 0,
         collation: CollationSeq::BINARY,
+        pure_context: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1641,6 +1646,7 @@ pub fn emit_cdc_commit_insns(
         func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
         arg_count: 1,
         collation: CollationSeq::BINARY,
+        pure_context: None,
     };
     program.emit_insn(Insn::Function {
         constant_mask: 0,
@@ -1712,6 +1718,7 @@ pub fn emit_cdc_autocommit_commit(
         func: Func::Scalar(crate::function::ScalarFunc::IsAutocommit),
         arg_count: 0,
         collation: CollationSeq::BINARY,
+        pure_context: None,
     };
     let autocommit_reg = program.alloc_register();
     program.emit_insn(Insn::Function {
@@ -1745,6 +1752,7 @@ pub fn emit_cdc_autocommit_commit(
                     func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
                     arg_count: 1,
                     collation: CollationSeq::BINARY,
+                    pure_context: None,
                 },
             });
             program.emit_insn(Insn::Eq {
@@ -1800,6 +1808,7 @@ pub fn emit_cdc_explicit_commit_insns(
             func: Func::Scalar(crate::function::ScalarFunc::ConnTxnId),
             arg_count: 1,
             collation: CollationSeq::BINARY,
+            pure_context: None,
         },
     });
 
@@ -2081,14 +2090,16 @@ pub(crate) fn emit_index_column_value_old_image(
             referenced_tables: table_references.clone(),
         };
         resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &expr,
-                dest_reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
+            program.with_pure_context(PureContext::Index, |program| {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(table_references),
+                    &expr,
+                    dest_reg,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )
+            })?;
             Ok(())
         })?;
     } else if let Some(generated_column) = generated_column(program, table_cursor_id, idx_col) {
@@ -2132,14 +2143,15 @@ pub(crate) fn emit_partial_index_where_old_image(
     let result_reg = program.alloc_register();
     let table_cursor = [(CursorKey::table(table_internal_id), table_cursor_id)];
     program.with_cursor_overrides(&table_cursor, |program| {
-        translate_expr_no_constant_opt(
-            program,
-            Some(table_references),
-            &where_clause,
-            result_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )
+        program.with_pure_context(PureContext::Index, |program| {
+            translate_partial_index_where_flag(
+                program,
+                table_references,
+                &where_clause,
+                result_reg,
+                resolver,
+            )
+        })
     })?;
     Ok(Some(result_reg))
 }
@@ -2250,8 +2262,6 @@ fn emit_check_constraint_bytecode(
     column_mappings: &[(&str, usize)],
 ) -> Result<()> {
     for check_constraint in check_constraints {
-        let expr_result_reg = program.alloc_register();
-
         let mut rewritten_expr = check_constraint.expr.clone();
         if let Some(referenced_tables) = referenced_tables {
             let mut binding_tables = referenced_tables.clone();
@@ -2270,29 +2280,20 @@ fn emit_check_constraint_bytecode(
             )?;
         }
 
-        translate_expr_no_constant_opt(
-            program,
-            referenced_tables,
-            &rewritten_expr,
-            expr_result_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
-
-        // CHECK constraint passes if the result is NULL or non-zero (truthy)
+        // A CHECK passes if the result is NULL (unknown) or true, as in SQLite.
+        // The expression is a conditional jump, so AND, OR and CASE skip what
+        // they do not need and a function in a skipped part never runs.
         let constraint_passed_label = program.allocate_label();
-
-        // NULL means unknown, which passes CHECK constraints in SQLite
-        program.emit_insn(Insn::IsNull {
-            reg: expr_result_reg,
-            target_pc: constraint_passed_label,
-        });
-
-        program.emit_insn(Insn::If {
-            reg: expr_result_reg,
-            target_pc: constraint_passed_label,
-            jump_if_null: false,
-        });
+        let condition_tables = referenced_tables
+            .cloned()
+            .unwrap_or_else(TableReferences::new_empty);
+        translate_check_condition(
+            program,
+            &condition_tables,
+            &rewritten_expr,
+            constraint_passed_label,
+            resolver,
+        )?;
 
         // SQLite reports a failed CHECK by its constraint name, or by the
         // expression's source text exactly as the user wrote it.
@@ -2474,17 +2475,19 @@ pub(crate) fn emit_check_constraints<'a>(
 
     resolver.enable_expr_to_reg_cache();
 
-    let result = emit_check_constraint_bytecode(
-        program,
-        check_constraints,
-        resolver,
-        or_conflict,
-        halt_on_error,
-        skip_row_label,
-        referenced_tables,
-        table_name,
-        &stored_column_mappings,
-    );
+    let result = program.with_pure_context(PureContext::Check, |program| {
+        emit_check_constraint_bytecode(
+            program,
+            check_constraints,
+            resolver,
+            or_conflict,
+            halt_on_error,
+            skip_row_label,
+            referenced_tables,
+            table_name,
+            &stored_column_mappings,
+        )
+    });
 
     // Always restore resolver state, even on error.
     resolver.expr_to_reg_cache.truncate(initial_cache_size);

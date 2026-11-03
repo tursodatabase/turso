@@ -810,6 +810,15 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
+
+            crate::translate::expr::emit_custom_type_decode_check_columns(
+                program,
+                resolver,
+                bt.columns(),
+                new_start,
+                None,
+                &layout,
+            )?;
         } else {
             // For non-STRICT tables, apply column affinity to the values.
             // This must happen early so that both index records and the table record
@@ -1817,7 +1826,7 @@ fn eval_partial_pred_for_row_image(
         .collect();
 
     let r = prg.alloc_register();
-    crate::translate::expr::emit_dml_expr_index_value(
+    crate::translate::expr::emit_dml_partial_index_where_flag(
         prg,
         resolver,
         expr,

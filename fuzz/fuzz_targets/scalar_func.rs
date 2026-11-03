@@ -2,17 +2,15 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use turso_core::functions::datetime::{
-    exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_timediff,
-    exec_unixepoch,
-};
+use turso_core::functions::datetime::{exec_datetime_general, exec_strftime, exec_timediff};
 use turso_core::functions::printf::exec_printf;
-use turso_core::io::clock::DefaultClock;
+use turso_core::io::clock::{Clock, DefaultClock};
 use turso_core::json::{
     is_json_valid, json_array, json_array_length, json_error_position, json_extract, json_insert,
     json_object, json_patch, json_quote, json_remove, json_replace, json_set, json_type,
     JsonCacheCell, JSON_VALID_FLAG_TEXT_STRICT,
 };
+use turso_core::types::AsValueRef;
 use turso_core::vdbe::Register;
 use turso_core::MathFunc;
 use turso_core::Value as CoreValue;
@@ -351,7 +349,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
                     let _ = CoreValue::exec_substring(&v1, &v2, None);
                 }
                 BinaryFunc::Timediff => {
-                    let _ = exec_timediff(&DefaultClock, [v1, v2]);
+                    let _ = exec_timediff(&DefaultClock, None, [v1, v2]);
                 }
             }
         }
@@ -407,7 +405,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
                     let _ = exec_unixepoch(&DefaultClock, vals.iter());
                 }
                 VariadicFunc::Strftime => {
-                    let _ = exec_strftime(&DefaultClock, vals.iter());
+                    let _ = exec_strftime(&DefaultClock, None, vals.iter());
                 }
             }
         }
@@ -536,6 +534,24 @@ fn execute_scalar_func(call: ScalarFuncCall) {
         }
     }
 }
+
+macro_rules! exec_without_pure_context {
+    ($name:ident, $func_type:literal) => {
+        fn $name<I, E, V>(clock: &dyn Clock, values: I) -> turso_core::Result<CoreValue>
+        where
+            V: AsValueRef,
+            E: ExactSizeIterator<Item = V>,
+            I: IntoIterator<IntoIter = E, Item = V>,
+        {
+            exec_datetime_general(clock, None, values, $func_type)
+        }
+    };
+}
+exec_without_pure_context!(exec_date, "date");
+exec_without_pure_context!(exec_time, "time");
+exec_without_pure_context!(exec_datetime_full, "datetime");
+exec_without_pure_context!(exec_julianday, "julianday");
+exec_without_pure_context!(exec_unixepoch, "unixepoch");
 
 fuzz_target!(|call: ScalarFuncCall| {
     execute_scalar_func(call);

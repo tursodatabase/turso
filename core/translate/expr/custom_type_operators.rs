@@ -404,6 +404,7 @@ fn emit_function(program: &mut ProgramBuilder, call: &OperatorCall, start_reg: u
             func: call.func.clone(),
             arg_count: call.encode.len(),
             collation: CollationSeq::BINARY,
+            pure_context: None,
         },
     });
 }
@@ -417,9 +418,14 @@ fn emit_encode(
     value_reg: usize,
     dest_reg: usize,
     resolver: &Resolver,
-) -> Result<usize> {
-    let encode = to
-        .encode()
-        .ok_or_else(|| LimboError::InternalError(format!("type {} has no ENCODE", to.name)))?;
-    emit_type_expr(program, encode, value_reg, dest_reg, resolver)
+) -> Result<()> {
+    emit_type_expr(
+        program,
+        to,
+        TypeExprKind::Encode,
+        &[],
+        value_reg,
+        dest_reg,
+        resolver,
+    )
 }

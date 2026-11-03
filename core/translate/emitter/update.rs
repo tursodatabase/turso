@@ -1,4 +1,4 @@
-use super::gencol::compute_virtual_columns;
+use super::gencol::{compute_virtual_columns, translate_generated_column_expr};
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::namespace::{NamespaceId, NamespaceRef};
@@ -27,10 +27,11 @@ use crate::{
         },
         eqp::eqp_detail_for_table_op,
         expr::{
-            emit_constraint_values_decode, emit_dml_expr_index_value, emit_returning_results,
-            emit_returning_scan_back, emit_table_column, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            NoConstantOptReason, ReturningBufferCtx,
+            emit_constraint_values_decode, emit_dml_partial_index_where_flag,
+            emit_returning_results, emit_returning_scan_back, emit_table_column,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
+            ReturningBufferCtx,
         },
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
@@ -830,20 +831,20 @@ fn emit_update_column_values<'a>(
         // If the column needs to be updated, retrieve its column index, or its expression.
         // Such a column can be directly updated, in which case `expr` is the right-side of the SET
         // clause, or it can be an indirectly updated generated columns, in which case `expr` is the
-        // column's expression.
+        // column's expression. `is_generated_expr` tells the two apart.
         let update_expr = set_clauses
             .iter()
             .find(|set_clause| set_clause.column_index == idx)
-            .map(UpdateSetClause::emitted_expr)
+            .map(|set_clause| (set_clause.emitted_expr(), false))
             .or_else(|| {
                 if column_ctx.affected_columns.get(idx) {
-                    table_column.generated_expr()
+                    table_column.generated_expr().map(|expr| (expr, true))
                 } else {
                     None
                 }
             });
 
-        if let Some(expr) = update_expr {
+        if let Some((expr, is_generated_expr)) = update_expr {
             if !skip_set_clauses {
                 // Skip if this is the sentinel value
                 if idx == ROWID_SENTINEL {
@@ -910,15 +911,27 @@ fn emit_update_column_values<'a>(
                                 .is_some_and(|r| {
                                     r.chain.iter().any(|td| td.has_encode_or_coerce())
                                 });
-                            let translate_result = if has_custom_encode {
+                            let no_constant_opt =
+                                has_custom_encode.then_some(NoConstantOptReason::CustomTypeEncode);
+                            let translate_result = if is_generated_expr {
+                                translate_generated_column_expr(
+                                    program,
+                                    Some(table_references),
+                                    expr,
+                                    target_reg,
+                                    &t_ctx.resolver,
+                                    no_constant_opt,
+                                )
+                            } else if let Some(reason) = no_constant_opt {
                                 translate_expr_no_constant_opt(
                                     program,
                                     Some(table_references),
                                     expr,
                                     target_reg,
                                     &t_ctx.resolver,
-                                    NoConstantOptReason::CustomTypeEncode,
+                                    reason,
                                 )
+                                .map(|_| ())
                             } else {
                                 translate_expr(
                                     program,
@@ -927,6 +940,7 @@ fn emit_update_column_values<'a>(
                                     target_reg,
                                     &t_ctx.resolver,
                                 )
+                                .map(|_| ())
                             };
                             program.target_union_type = prev_union;
                             translate_result?;
@@ -1862,6 +1876,15 @@ fn emit_update_insns<'a>(
                     t_ctx.resolver.schema(),
                 ),
             });
+
+            crate::translate::expr::emit_custom_type_decode_check_columns(
+                program,
+                &t_ctx.resolver,
+                btree_table.columns(),
+                start,
+                Some(&updated_column_indices),
+                &layout,
+            )?;
         }
 
         if !btree_table.check_constraints.is_empty() {
@@ -1955,7 +1978,7 @@ fn emit_update_insns<'a>(
             .expect("index.where_clause was checked to be Some above");
 
             // Evaluate the partial index predicate against the NEW row image.
-            // We use emit_dml_expr_index_value which properly sets up SelfTableContext::ForDML,
+            // We use emit_dml_partial_index_where_flag which properly sets up SelfTableContext::ForDML,
             // allowing resolve_union_from_column to find type definitions for custom type
             // functions like union_tag() in the WHERE clause.
             let new_where_expr = index
@@ -1978,7 +2001,7 @@ fn emit_update_insns<'a>(
                 .collect();
             let new_satisfied_reg = program.alloc_register();
             let bt = target_table.table.require_btree()?;
-            emit_dml_expr_index_value(
+            emit_dml_partial_index_where_flag(
                 program,
                 &t_ctx.resolver,
                 new_where_expr,

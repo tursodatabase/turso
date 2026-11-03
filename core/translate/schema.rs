@@ -3,13 +3,14 @@ use crate::HashMap;
 use crate::LimboError;
 
 use crate::ext::VTabImpl;
-use crate::function::{Deterministic, Func, ResultType, ReturnType};
+use crate::function::{Func, ResultType, ReturnType};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
-    create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, Schema, SchemaObjectType, Table, Type, TypeDef,
-    SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    create_table, datetime_call_reads_clock_or_time_zone, is_deterministic_schema_function_call,
+    translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics, BTreeTable, ColDef,
+    Column, Schema, SchemaObjectType, Table, Type, TypeDef, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -20,7 +21,7 @@ use crate::translate::emitter::{
     OperationMode, Resolver,
 };
 use crate::translate::expr::expr_type::iif_values;
-use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
+use crate::translate::expr::{takes_input_of_type, walk_expr, TypeExprKind, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
@@ -2880,7 +2881,11 @@ pub fn translate_drop_table(
 
 /// Validate an encode or decode expression for safety.
 /// Rejects subqueries, aggregates, and window functions.
-fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -> Result<()> {
+fn validate_type_expr(
+    expr: &ast::Expr,
+    kind: TypeExprSite,
+    resolver: &CatalogContext,
+) -> Result<()> {
     walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
         match e {
             ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
@@ -2902,17 +2907,49 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -
                             name.as_str()
                         );
                     }
-                    // Reject known non-deterministic built-in functions.
-                    // External functions are excluded from this check since
-                    // they default to non-deterministic but may actually be
-                    // deterministic (e.g. uuid_blob).
-                    if !matches!(func, Func::External(_)) && !func.is_deterministic() {
+                    // A date or time function is checked when it runs, as in
+                    // SQLite: it fails if it reads the clock or the time zone
+                    // where that is not allowed (CHECK, index, DECODE). Only
+                    // DECODE is also checked here, on its literal arguments,
+                    // so a bad DECODE is rejected before any row uses it.
+                    // ENCODE and COERCE convert the input once, so they may
+                    // read the clock (`'now'` is a valid date input).
+                    // Arguments that are not literals are checked when DECODE
+                    // runs.
+                    if matches!(&func, Func::Scalar(scalar) if scalar.is_date_time_function()) {
+                        if kind.is_decode() && datetime_call_reads_clock_or_time_zone(&func, args) {
+                            bail_parse_error!(
+                                "non-deterministic functions prohibited in {kind} expressions: {}",
+                                name.as_str()
+                            );
+                        }
+                    } else if !is_deterministic_schema_function_call(&func) {
+                        if matches!(func, Func::External(_)) {
+                            bail_parse_error!(
+                                "{name}() cannot be used in {kind} expressions because the extension \
+                                 did not register it as deterministic. If it always gives the same \
+                                 result for the same arguments, register it with \
+                                 register_deterministic_scalar_function",
+                                name = name.as_str()
+                            );
+                        }
                         bail_parse_error!(
                             "non-deterministic functions prohibited in {kind} expressions: {}",
                             name.as_str()
                         );
                     }
                 }
+            }
+            // current_date, current_time and current_timestamp read the clock.
+            ast::Expr::Literal(
+                literal @ (ast::Literal::CurrentDate
+                | ast::Literal::CurrentTime
+                | ast::Literal::CurrentTimestamp),
+            ) if kind.is_decode() => {
+                bail_parse_error!(
+                    "non-deterministic functions prohibited in {kind} expressions: {}",
+                    current_time_literal_name(literal)
+                );
             }
             ast::Expr::FunctionCallStar { name, .. } => {
                 bail_parse_error!(
@@ -2925,6 +2962,38 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &CatalogContext) -
         Ok(WalkControl::Continue)
     })?;
     Ok(())
+}
+
+/// Where an expression checked by [validate_type_expr] appears.
+#[derive(Clone, Copy)]
+enum TypeExprSite {
+    Type(TypeExprKind),
+    DomainCheck,
+    DomainDefault,
+}
+
+impl TypeExprSite {
+    fn is_decode(self) -> bool {
+        matches!(self, Self::Type(TypeExprKind::Decode))
+    }
+}
+
+impl std::fmt::Display for TypeExprSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Type(kind) => f.write_str(kind.name()),
+            Self::DomainCheck => f.write_str("domain CHECK"),
+            Self::DomainDefault => f.write_str("domain DEFAULT"),
+        }
+    }
+}
+
+fn current_time_literal_name(literal: &ast::Literal) -> &'static str {
+    match literal {
+        ast::Literal::CurrentDate => "current_date",
+        ast::Literal::CurrentTime => "current_time",
+        _ => "current_timestamp",
+    }
 }
 
 /// Shared persistence logic for CREATE TYPE / CREATE DOMAIN.
@@ -3100,13 +3169,25 @@ pub fn translate_create_type(
     } = body
     {
         if let Some(ref encode) = encode {
-            validate_type_expr(encode, "ENCODE", &resolver.catalog)?;
+            validate_type_expr(
+                encode,
+                TypeExprSite::Type(TypeExprKind::Encode),
+                &resolver.catalog,
+            )?;
         }
         if let Some(ref coerce) = coerce {
-            validate_type_expr(coerce, "COERCE", &resolver.catalog)?;
+            validate_type_expr(
+                coerce,
+                TypeExprSite::Type(TypeExprKind::Coerce),
+                &resolver.catalog,
+            )?;
         }
         if let Some(ref decode) = decode {
-            validate_type_expr(decode, "DECODE", &resolver.catalog)?;
+            validate_type_expr(
+                decode,
+                TypeExprSite::Type(TypeExprKind::Decode),
+                &resolver.catalog,
+            )?;
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
     }
@@ -3274,10 +3355,10 @@ pub fn translate_create_domain(
 
     // Validate CHECK and DEFAULT expressions (reject subqueries, aggregates, etc.)
     for c in constraints {
-        validate_type_expr(&c.check, "domain CHECK", &resolver.catalog)?;
+        validate_type_expr(&c.check, TypeExprSite::DomainCheck, &resolver.catalog)?;
     }
     if let Some(ref def) = default {
-        validate_type_expr(def, "domain DEFAULT", &resolver.catalog)?;
+        validate_type_expr(def, TypeExprSite::DomainDefault, &resolver.catalog)?;
     }
 
     // Build the CREATE DOMAIN SQL for persistence

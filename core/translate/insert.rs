@@ -798,6 +798,8 @@ pub fn translate_insert(
         !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
     })?;
 
+    let checks_decode_on_write = maybe_type_check_table.is_some();
+
     if insertion.has_virtual_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
         compute_virtual_columns(
@@ -929,6 +931,27 @@ pub fn translate_insert(
         &constraints,
         &mut preflight_ctx,
     )?;
+
+    if checks_decode_on_write {
+        // The stored values are final here, and the constraint errors (which
+        // do not show values) have had their chance to come first. A DECODE
+        // that fails, or returns NULL for a value that is not NULL, fails the
+        // INSERT.
+        let columns: Vec<_> = insertion
+            .col_mappings
+            .iter()
+            .map(|m| m.column.clone())
+            .collect();
+        let layout = ColumnLayout::from_columns(&columns)?;
+        crate::translate::expr::emit_custom_type_decode_check_columns(
+            program,
+            resolver,
+            &columns,
+            insertion.first_col_register(),
+            None,
+            &layout,
+        )?;
+    }
 
     // Create and insert the record
     emit_make_record(
@@ -1415,7 +1438,7 @@ fn emit_partial_index_check(
         })
         .collect();
     let reg = program.alloc_register();
-    crate::translate::expr::emit_dml_expr_index_value(
+    crate::translate::expr::emit_dml_partial_index_where_flag(
         program,
         resolver,
         expr,
@@ -1945,27 +1968,10 @@ fn emit_notnulls(
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
         }
 
-        // Determine which register to check: for custom type columns with
-        // a DECODE expression, decode the encoded value into a temp register
-        // and check the *decoded* value. This prevents "ghost NULLs" where
-        // ENCODE produces a non-NULL value but DECODE returns NULL.
-        let has_decode = resolver
-            .schema()
-            .column_has_decode(column_mapping.column, ctx.table.is_strict);
-        let check_reg = if has_decode {
-            let decoded_reg = program.alloc_register();
-            crate::translate::expr::emit_user_facing_column_value(
-                program,
-                column_mapping.register,
-                decoded_reg,
-                column_mapping.column,
-                ctx.table.is_strict,
-                resolver,
-            )?;
-            decoded_reg
-        } else {
-            column_mapping.register
-        };
+        // DECODE does not run on NULL, and a DECODE that returns NULL for a
+        // non-NULL value is an error when it runs, so the stored value is NULL
+        // exactly when the value a SELECT reads is NULL.
+        let check_reg = column_mapping.register;
 
         // For IGNORE, skip to the next row if NULL
         if on_ignore {

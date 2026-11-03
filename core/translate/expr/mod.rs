@@ -90,16 +90,20 @@ pub(crate) use affinity::{
     StorageClassMask,
 };
 pub(crate) use arrays::{
-    emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
+    emit_array_decode, emit_custom_type_decode_check_columns, emit_custom_type_decode_columns,
+    emit_custom_type_encode_columns,
 };
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
-pub use condition::translate_condition_expr;
+pub use condition::{
+    translate_check_condition, translate_condition_expr, translate_partial_index_where_flag,
+};
 pub(crate) use custom_type_operators::{custom_operator_call, emit_operator_call_on_registers};
 pub(crate) use custom_types::{
-    emit_constraint_values_decode, emit_decode, emit_dml_expr_index_value, emit_store_value,
-    emit_trigger_decode_registers, emit_type_expr, emit_user_facing_column_value,
+    emit_constraint_values_decode, emit_decode, emit_dml_expr_index_value,
+    emit_dml_partial_index_where_flag, emit_store_value, emit_trigger_decode_registers,
+    emit_type_expr, emit_user_facing_column_value, TypeExprKind,
 };
 pub(crate) use custom_types::{runs_custom_type_function, takes_input_of_type};
 pub use emission::{

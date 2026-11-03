@@ -1,3 +1,4 @@
+use crate::function::PureContext;
 use crate::{alloc, turso_assert, turso_assert_eq, types::AsValueRef, Result, Value, ValueRef};
 
 use rustc_hash::FxHashMap as HashMap;
@@ -337,6 +338,10 @@ pub struct ProgramBuilder {
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
     pub id_register_overrides: HashMap<String, usize>,
+    /// Set while emitting an expression that must be deterministic (index
+    /// expression, CHECK, generated column, DECODE). Function calls emitted
+    /// meanwhile carry it.
+    pure_context: Option<PureContext>,
     /// Hash join build signatures keyed by hash table id.
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
@@ -855,6 +860,7 @@ impl ProgramBuilder {
             trigger_conflict_override: None,
             cursor_overrides: Vec::new(),
             id_register_overrides: HashMap::default(),
+            pure_context: None,
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
@@ -2051,6 +2057,35 @@ impl ProgramBuilder {
         let result = emit(self);
         self.cursor_overrides = previous_overrides;
         result
+    }
+
+    /// Emit expressions that must be deterministic. Function calls emitted
+    /// inside `emit` carry `context`. The previous context is restored
+    /// afterwards, also when code generation returns an error.
+    ///
+    /// The new context replaces the current one, it is not combined with it.
+    /// A DECODE inside a CHECK reports "in the DECODE of type t", not "in a
+    /// CHECK constraint", because the DECODE is the code that was written
+    /// with the rule.
+    pub fn with_pure_context<T>(
+        &mut self,
+        context: PureContext,
+        emit: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let previous = self.pure_context.replace(context);
+        let result = emit(self);
+        self.pure_context = previous;
+        result
+    }
+
+    /// True while code is emitted inside [Self::with_pure_context].
+    pub fn is_in_pure_context(&self) -> bool {
+        self.pure_context.is_some()
+    }
+
+    /// The context set by [Self::with_pure_context], if any.
+    pub fn pure_context(&self) -> Option<PureContext> {
+        self.pure_context.clone()
     }
 
     // translate [CursorKey] to cursor id

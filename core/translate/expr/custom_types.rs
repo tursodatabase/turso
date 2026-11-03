@@ -1,4 +1,5 @@
 use super::*;
+use crate::function::PureContext;
 
 /// Get the effective type name of a literal expression.
 pub(super) fn literal_type_name(expr: &ast::Expr) -> Option<&'static str> {
@@ -73,10 +74,44 @@ pub(crate) fn emit_dml_expr_index_value(
         table: Arc::clone(table),
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, &expr, dest_reg, resolver)?;
+        program.with_pure_context(PureContext::Index, |program| {
+            translate_expr(program, None, &expr, dest_reg, resolver)
+        })?;
         Ok(())
     })?;
     Ok(())
+}
+
+/// Evaluate a partial index WHERE in a DML context (INSERT/UPDATE/UPSERT) from
+/// the row's stored values in `column_regs`, and store 1 in `dest_reg` when it
+/// is true, 0 when it is false or NULL.
+pub(crate) fn emit_dml_partial_index_where_flag(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    mut where_expr: ast::Expr,
+    columns: &[Column],
+    column_regs: &[usize],
+    table: &Arc<BTreeTable>,
+    dest_reg: usize,
+) -> Result<()> {
+    crate::schema::resolve_gencol_expr_columns(&mut where_expr, columns)?;
+
+    let pairs = columns.iter().zip(column_regs.iter().copied());
+    let ctx = SelfTableContext::ForDML {
+        dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs, DmlRowForm::Stored),
+        table: Arc::clone(table),
+    };
+    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
+        program.with_pure_context(PureContext::Index, |program| {
+            translate_partial_index_where_flag(
+                program,
+                &TableReferences::new_empty(),
+                &where_expr,
+                dest_reg,
+                resolver,
+            )
+        })
+    })
 }
 
 /// Emit bytecode that transforms a stored column value into its user-facing
@@ -125,23 +160,12 @@ pub(crate) fn emit_decode(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    if chain.iter().all(|td| td.decode().is_none()) {
-        return Ok(());
-    }
-    let skip_label = program.allocate_label();
-    program.emit_insn(Insn::IsNull {
-        reg,
-        target_pc: skip_label,
-    });
-
     // Apply decode in reverse order (parent/ancestor first, then child)
     for td in chain.iter().rev() {
-        if let Some(decode_expr) = td.decode() {
-            emit_type_expr(program, decode_expr, reg, reg, resolver)?;
+        if td.decode().is_some() {
+            emit_type_expr(program, td, TypeExprKind::Decode, &[], reg, reg, resolver)?;
         }
     }
-
-    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -244,24 +268,121 @@ pub(crate) fn emit_store_value(
     resolver: &Resolver,
 ) -> Result<()> {
     for type_def in chain {
-        if let Some(encode) = type_def.encode() {
-            emit_type_expr(program, encode, reg, reg, resolver)?;
+        if type_def.encode().is_some() {
+            emit_type_expr(
+                program,
+                type_def,
+                TypeExprKind::Encode,
+                &[],
+                reg,
+                reg,
+                resolver,
+            )?;
         }
         emit_coerce(program, type_def, reg, type_params, resolver)?;
     }
     Ok(())
 }
 
-/// Emit bytecode for a custom type ENCODE or DECODE expression, with `value`
-/// referencing `value_reg`. The result is written to `dest_reg`.
+/// Which of a custom type's expressions to run.
+#[derive(Clone, Copy)]
+pub(crate) enum TypeExprKind {
+    Encode,
+    Coerce,
+    Decode,
+}
+
+impl TypeExprKind {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Encode => "ENCODE",
+            Self::Coerce => "COERCE",
+            Self::Decode => "DECODE",
+        }
+    }
+
+    fn expr(self, type_def: &TypeDef) -> Option<&ast::Expr> {
+        match self {
+            Self::Encode => type_def.encode(),
+            Self::Coerce => type_def.coerce(),
+            Self::Decode => type_def.decode(),
+        }
+    }
+}
+
+/// Emits the type's ENCODE, COERCE or DECODE (`kind`) with `value` reading
+/// `value_reg`, and writes the result to `dest_reg`. Every place that runs
+/// one of these expressions goes through here, so the rules for NULL are in
+/// one place:
+/// - A NULL input is not evaluated: `dest_reg` becomes NULL.
+/// - A non-NULL input that gives NULL raises `ENCODE of type t returned NULL`
+///   (or DECODE, COERCE). An expression that is just `value` cannot give
+///   NULL for a non-NULL input, so it is not checked.
+///
+/// `bindings` give the values of the type's parameters (COERCE only).
 pub(crate) fn emit_type_expr(
     program: &mut ProgramBuilder,
-    expr: &ast::Expr,
+    type_def: &TypeDef,
+    kind: TypeExprKind,
+    bindings: &[(&str, &ast::Expr)],
     value_reg: usize,
     dest_reg: usize,
     resolver: &Resolver,
-) -> Result<usize> {
-    emit_expr_with_bindings(program, expr, value_reg, dest_reg, &[], resolver)
+) -> Result<()> {
+    let expr = kind.expr(type_def).ok_or_else(|| {
+        LimboError::InternalError(format!("type {} has no {}", type_def.name, kind.name()))
+    })?;
+    let input_is_null = program.allocate_label();
+    let end = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: value_reg,
+        target_pc: input_is_null,
+    });
+
+    // DECODE runs again to rebuild index entries, so it must give the same
+    // result every time. A date or time function in it fails at run time when
+    // it would read the clock or the time zone.
+    if matches!(kind, TypeExprKind::Decode) {
+        program.with_pure_context(
+            PureContext::CustomTypeDecode(type_def.name.as_str().into()),
+            |program| {
+                emit_expr_with_bindings(program, expr, value_reg, dest_reg, bindings, resolver)
+            },
+        )?;
+    } else {
+        emit_expr_with_bindings(program, expr, value_reg, dest_reg, bindings, resolver)?;
+    }
+
+    let is_value_only =
+        matches!(expr, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value"));
+    if !is_value_only {
+        let result_is_not_null = program.allocate_label();
+        program.emit_insn(Insn::NotNull {
+            reg: dest_reg,
+            target_pc: result_is_not_null,
+        });
+        program.emit_insn(Insn::Halt {
+            constraint_info: None,
+            err_code: crate::error::SQLITE_ERROR,
+            description: format!("{} of type {} returned NULL", kind.name(), type_def.name),
+            on_error: None,
+            description_reg: None,
+        });
+        program.preassign_label_to_next_insn(result_is_not_null);
+    }
+
+    if dest_reg != value_reg {
+        program.emit_insn(Insn::Goto { target_pc: end });
+        program.preassign_label_to_next_insn(input_is_null);
+        program.emit_insn(Insn::Null {
+            dest: dest_reg,
+            dest_end: None,
+        });
+    } else {
+        program.preassign_label_to_next_insn(input_is_null);
+    }
+    program.preassign_label_to_next_insn(end);
+    Ok(())
 }
 
 /// Emits the type's COERCE on the value in `reg`, with the type's parameters
@@ -275,9 +396,9 @@ fn emit_coerce(
     type_params: &[Box<ast::Expr>],
     resolver: &Resolver,
 ) -> Result<()> {
-    let Some(coerce) = type_def.coerce() else {
+    if type_def.coerce().is_none() {
         return Ok(());
-    };
+    }
     if type_params.is_empty() && type_def.user_params().next().is_some() {
         return Ok(());
     }
@@ -291,14 +412,15 @@ fn emit_coerce(
             (param.name.as_str(), arg)
         })
         .collect();
-    let skip_null = program.allocate_label();
-    program.emit_insn(Insn::IsNull {
+    emit_type_expr(
+        program,
+        type_def,
+        TypeExprKind::Coerce,
+        &bindings,
         reg,
-        target_pc: skip_null,
-    });
-    emit_expr_with_bindings(program, coerce, reg, reg, &bindings, resolver)?;
-    program.preassign_label_to_next_insn(skip_null);
-    Ok(())
+        reg,
+        resolver,
+    )
 }
 
 /// Translates `expr` with `value` referencing `value_reg` and each name in

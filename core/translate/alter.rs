@@ -1678,6 +1678,7 @@ pub fn translate_alter_table(
                         func: Func::AlterTable(AlterTableFunc::RenameTable),
                         arg_count: 7,
                         collation: CollationSeq::BINARY,
+                        pure_context: None,
                     },
                 });
 
@@ -2249,6 +2250,7 @@ pub fn translate_alter_table(
                         }),
                         arg_count: 8,
                         collation: CollationSeq::BINARY,
+                        pure_context: None,
                     },
                 });
 
@@ -2936,6 +2938,14 @@ fn emit_strict_column_conversion(
         check_generated: false,
         table_reference: BTreeTable::type_check_table_ref(&rewritten_table, resolver.schema()),
     });
+    crate::translate::expr::emit_custom_type_decode_check_columns(
+        program,
+        resolver,
+        rewritten_table.columns(),
+        start_reg,
+        Some(&column_mask),
+        layout,
+    )?;
     Ok(())
 }
 
@@ -3010,6 +3020,7 @@ fn translate_rename_virtual_table(
                 func: Func::AlterTable(AlterTableFunc::RenameTable),
                 arg_count: 7,
                 collation: CollationSeq::BINARY,
+                pure_context: None,
             },
         });
 

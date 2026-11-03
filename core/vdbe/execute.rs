@@ -86,8 +86,8 @@ use crate::{
     function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
-            exec_date, exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_full,
-            exec_julianday, exec_strftime, exec_time, exec_unixepoch,
+            exec_date_diff, exec_date_minus, exec_date_plus, exec_datetime_general, exec_strftime,
+            exec_timediff,
         },
         printf::exec_printf,
     },
@@ -10712,14 +10712,16 @@ pub fn op_function(
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_date(&clock, values);
+                let result =
+                    exec_datetime_general(&clock, func.pure_context.as_ref(), values, "date")?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Time => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_time(&clock, values);
+                let result =
+                    exec_datetime_general(&clock, func.pure_context.as_ref(), values, "time")?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TimeDiff => {
@@ -10730,7 +10732,7 @@ pub fn op_function(
                     let end = state.registers[*start_reg + 1].get_value();
 
                     let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                    let result = crate::functions::datetime::exec_timediff(&clock, [start, end]);
+                    let result = exec_timediff(&clock, func.pure_context.as_ref(), [start, end])?;
 
                     state.registers[*dest].set_value(result);
                 }
@@ -10744,21 +10746,24 @@ pub fn op_function(
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_datetime_full(&clock, values);
+                let result =
+                    exec_datetime_general(&clock, func.pure_context.as_ref(), values, "datetime")?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::JulianDay => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_julianday(&clock, values);
+                let result =
+                    exec_datetime_general(&clock, func.pure_context.as_ref(), values, "julianday")?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::UnixEpoch => {
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_unixepoch(&clock, values);
+                let result =
+                    exec_datetime_general(&clock, func.pure_context.as_ref(), values, "unixepoch")?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::TursoVersion => {
@@ -10809,7 +10814,7 @@ pub fn op_function(
                 let values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
-                let result = exec_strftime(&clock, values);
+                let result = exec_strftime(&clock, func.pure_context.as_ref(), values)?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::Printf => {
@@ -11428,9 +11433,15 @@ pub fn op_function(
                 let rhs = state.registers[*start_reg + 1].get_value();
                 let clock = StatementClock::new(pager.io.as_ref(), &mut state.current_time);
                 let result = match scalar_func {
-                    ScalarFunc::DatePlus => exec_date_plus(&clock, lhs, rhs)?,
-                    ScalarFunc::DateMinus => exec_date_minus(&clock, lhs, rhs)?,
-                    ScalarFunc::DateDiff => exec_date_diff(&clock, lhs, rhs)?,
+                    ScalarFunc::DatePlus => {
+                        exec_date_plus(&clock, func.pure_context.as_ref(), lhs, rhs)?
+                    }
+                    ScalarFunc::DateMinus => {
+                        exec_date_minus(&clock, func.pure_context.as_ref(), lhs, rhs)?
+                    }
+                    ScalarFunc::DateDiff => {
+                        exec_date_diff(&clock, func.pure_context.as_ref(), lhs, rhs)?
+                    }
                     _ => unreachable!(),
                 };
                 state.registers[*dest].set_value(result);

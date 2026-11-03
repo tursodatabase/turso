@@ -110,7 +110,8 @@ pub(super) fn emit_cond_jump(
         program.emit_insn(Insn::If {
             reg,
             target_pc: cond_meta.jump_target_when_true,
-            jump_if_null: false,
+            // A NULL jumps too when its target is the same as the true target.
+            jump_if_null: cond_meta.jump_target_when_null == cond_meta.jump_target_when_true,
         });
     } else {
         program.emit_insn(Insn::IfNot {

@@ -1,3 +1,4 @@
+use crate::function::PureContext;
 use crate::functions::printf::exec_printf_values;
 use crate::io::clock::Clock;
 use crate::numeric::{format_float, Numeric};
@@ -864,7 +865,15 @@ fn parse_time_of_day_ms(z: &str) -> Option<i64> {
     Some((tx.i_jd - 43_200_000) % JD_TO_MS)
 }
 
-pub fn exec_datetime_general<I, E, V>(clock: &dyn Clock, values: I, func_type: &str) -> Value
+/// Evaluates date(), time(), datetime(), julianday() or unixepoch(), named by
+/// `func_type`. With a `pure` context the call fails, as in SQLite, instead of
+/// reading the clock or the time zone.
+pub fn exec_datetime_general<I, E, V>(
+    clock: &dyn Clock,
+    pure: Option<&PureContext>,
+    values: I,
+    func_type: &str,
+) -> Result<Value>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -875,13 +884,15 @@ where
     let mut has_modifier = false;
 
     if values.len() == 0 {
+        check_pure(pure, func_type, true)?;
         set_to_current(&mut p, clock);
     } else {
         let first = values.next().unwrap();
         match arg_as_text(first.as_value_ref()) {
             ValueRef::Text(s) => {
+                check_pure(pure, func_type, reads_clock_as_time_value(s.as_str()))?;
                 if parse_date_or_time(s.as_str(), &mut p, clock).is_err() {
-                    return Value::Null;
+                    return Ok(Value::Null);
                 }
             }
             ValueRef::Numeric(Numeric::Integer(i)) => {
@@ -900,21 +911,48 @@ where
                     p.valid_jd = true;
                 }
             }
-            _ => return Value::Null,
+            _ => return Ok(Value::Null),
         }
     }
 
     for (i, val) in values.enumerate() {
         has_modifier = true;
         if let ValueRef::Text(s) = arg_as_text(val.as_value_ref()) {
+            check_pure(pure, func_type, reads_time_zone_as_modifier(s.as_str()))?;
             if parse_modifier(&mut p, s.as_str(), i).is_err() {
-                return Value::Null;
+                return Ok(Value::Null);
             }
         } else {
-            return Value::Null;
+            return Ok(Value::Null);
         }
     }
 
+    Ok(format_datetime(p, has_modifier, func_type))
+}
+
+/// Fails when `reads_clock` is true and the call must be deterministic.
+fn check_pure(pure: Option<&PureContext>, func_name: &str, reads_clock: bool) -> Result<()> {
+    match pure {
+        Some(context) if reads_clock => Err(crate::LimboError::SqlError(format!(
+            "non-deterministic use of {func_name}() in {context}",
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// A time value that is read from the clock.
+pub(crate) fn reads_clock_as_time_value(value: &str) -> bool {
+    value.eq_ignore_ascii_case("now")
+        || value.eq_ignore_ascii_case("subsec")
+        || value.eq_ignore_ascii_case("subsecond")
+}
+
+/// A modifier that is read from the time zone.
+pub(crate) fn reads_time_zone_as_modifier(modifier: &str) -> bool {
+    modifier.eq_ignore_ascii_case("localtime") || modifier.eq_ignore_ascii_case("utc")
+}
+
+fn format_datetime(mut p: DateTime, has_modifier: bool, func_type: &str) -> Value {
     p.compute_jd();
     if p.is_error || p.i_jd < 0 || p.i_jd > MAX_JD {
         return Value::Null;
@@ -986,56 +1024,18 @@ where
     }
 }
 
-pub fn exec_date<I, E, V>(clock: &dyn Clock, values: I) -> Value
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    exec_datetime_general(clock, values, "date")
-}
-
-pub fn exec_time<I, E, V>(clock: &dyn Clock, values: I) -> Value
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    exec_datetime_general(clock, values, "time")
-}
-
-pub fn exec_datetime_full<I, E, V>(clock: &dyn Clock, values: I) -> Value
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    exec_datetime_general(clock, values, "datetime")
-}
-
-pub fn exec_julianday<I, E, V>(clock: &dyn Clock, values: I) -> Value
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    exec_datetime_general(clock, values, "julianday")
-}
-
-pub fn exec_unixepoch<I, E, V>(clock: &dyn Clock, values: I) -> Value
-where
-    V: AsValueRef,
-    E: ExactSizeIterator<Item = V>,
-    I: IntoIterator<IntoIter = E, Item = V>,
-{
-    exec_datetime_general(clock, values, "unixepoch")
-}
-
-pub fn exec_date_plus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
+/// `date + days`, or `days + date`: the date that many days later.
+pub fn exec_date_plus(
+    clock: &dyn Clock,
+    pure: Option<&PureContext>,
+    lhs: &Value,
+    rhs: &Value,
+) -> Result<Value> {
     match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (date @ Value::Text(_), Value::Numeric(Numeric::Integer(days)))
         | (Value::Numeric(Numeric::Integer(days)), date @ Value::Text(_)) => {
+            check_date_operand(pure, "date_plus", date)?;
             add_days(clock, date, *days)
         }
         _ => Err(crate::LimboError::Constraint(
@@ -1045,10 +1045,16 @@ pub fn exec_date_plus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Val
 }
 
 /// `date - days`: the date that many days earlier.
-pub fn exec_date_minus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
+pub fn exec_date_minus(
+    clock: &dyn Clock,
+    pure: Option<&PureContext>,
+    lhs: &Value,
+    rhs: &Value,
+) -> Result<Value> {
     match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(_), Value::Numeric(Numeric::Integer(days))) => {
+            check_date_operand(pure, "date_minus", lhs)?;
             add_days(clock, lhs, days.saturating_neg())
         }
         _ => Err(crate::LimboError::Constraint(
@@ -1058,10 +1064,17 @@ pub fn exec_date_minus(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Va
 }
 
 /// `date - date`: the number of days from the second date to the first.
-pub fn exec_date_diff(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Value> {
+pub fn exec_date_diff(
+    clock: &dyn Clock,
+    pure: Option<&PureContext>,
+    lhs: &Value,
+    rhs: &Value,
+) -> Result<Value> {
     match (lhs, rhs) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Text(_), Value::Text(_)) => {
+            check_date_operand(pure, "date_diff", lhs)?;
+            check_date_operand(pure, "date_diff", rhs)?;
             let days = julian_day(clock, lhs)? - julian_day(clock, rhs)?;
             Ok(Value::from_i64(days.round() as i64))
         }
@@ -1071,11 +1084,18 @@ pub fn exec_date_diff(clock: &dyn Clock, lhs: &Value, rhs: &Value) -> Result<Val
     }
 }
 
+/// Fails when a date operand is a request for the current time and the call
+/// must be deterministic, like a date function's time value does.
+fn check_date_operand(pure: Option<&PureContext>, func_name: &str, date: &Value) -> Result<()> {
+    match date {
+        Value::Text(text) => check_pure(pure, func_name, reads_clock_as_time_value(text.as_str())),
+        _ => Ok(()),
+    }
+}
+
 fn add_days(clock: &dyn Clock, date: &Value, days: i64) -> Result<Value> {
-    match exec_date(
-        clock,
-        [Value::from_f64(julian_day(clock, date)? + days as f64)],
-    ) {
+    let shifted = [Value::from_f64(julian_day(clock, date)? + days as f64)];
+    match exec_datetime_general(clock, None, shifted, "date")? {
         Value::Null => Err(crate::LimboError::Constraint(
             "date out of range".to_string(),
         )),
@@ -1084,7 +1104,7 @@ fn add_days(clock: &dyn Clock, date: &Value, days: i64) -> Result<Value> {
 }
 
 fn julian_day(clock: &dyn Clock, date: &Value) -> Result<f64> {
-    match exec_julianday(clock, [date]) {
+    match exec_datetime_general(clock, None, [date], "julianday")? {
         Value::Numeric(Numeric::Float(jd)) => Ok(f64::from(jd)),
         _ => Err(crate::LimboError::Constraint(format!(
             "invalid date value: {date}"
@@ -1092,7 +1112,11 @@ fn julian_day(clock: &dyn Clock, date: &Value) -> Result<f64> {
     }
 }
 
-pub fn exec_timediff<I, E, V>(clock: &dyn Clock, values: I) -> Value
+pub fn exec_timediff<I, E, V>(
+    clock: &dyn Clock,
+    pure: Option<&PureContext>,
+    values: I,
+) -> Result<Value>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1100,7 +1124,7 @@ where
 {
     let mut values = values.into_iter();
     if values.len() < 2 {
-        return Value::Null;
+        return Ok(Value::Null);
     }
 
     let mut d1 = DateTime::default();
@@ -1110,8 +1134,9 @@ where
     let val1 = values.next().unwrap();
     match arg_as_text(val1.as_value_ref()) {
         ValueRef::Text(s) => {
+            check_pure(pure, "timediff", reads_clock_as_time_value(s.as_str()))?;
             if parse_date_or_time(s.as_str(), &mut d1, clock).is_err() {
-                return Value::Null;
+                return Ok(Value::Null);
             }
         }
         ValueRef::Numeric(Numeric::Integer(i)) => {
@@ -1130,15 +1155,16 @@ where
                 d1.valid_jd = true;
             }
         }
-        _ => return Value::Null,
+        _ => return Ok(Value::Null),
     }
 
     // Parse second argument (d2)
     let val2 = values.next().unwrap();
     match arg_as_text(val2.as_value_ref()) {
         ValueRef::Text(s) => {
+            check_pure(pure, "timediff", reads_clock_as_time_value(s.as_str()))?;
             if parse_date_or_time(s.as_str(), &mut d2, clock).is_err() {
-                return Value::Null;
+                return Ok(Value::Null);
             }
         }
         ValueRef::Numeric(Numeric::Integer(i)) => {
@@ -1157,9 +1183,13 @@ where
                 d2.valid_jd = true;
             }
         }
-        _ => return Value::Null,
+        _ => return Ok(Value::Null),
     }
 
+    Ok(timediff_between(d1, d2))
+}
+
+fn timediff_between(mut d1: DateTime, mut d2: DateTime) -> Value {
     d1.compute_jd();
     d2.compute_jd();
 
@@ -1271,7 +1301,11 @@ where
     Value::from_text(res)
 }
 
-pub fn exec_strftime<I, E, V>(clock: &dyn Clock, values: I) -> Value
+pub fn exec_strftime<I, E, V>(
+    clock: &dyn Clock,
+    pure: Option<&PureContext>,
+    values: I,
+) -> Result<Value>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -1279,13 +1313,13 @@ where
 {
     let mut values = values.into_iter();
     if values.len() < 1 {
-        return Value::Null;
+        return Ok(Value::Null);
     }
 
     let fmt_val = values.next().unwrap();
     let fmt_str = match arg_as_text(fmt_val.as_value_ref()) {
         ValueRef::Text(s) => Cow::Borrowed(s.as_str()),
-        ValueRef::Null => return Value::Null,
+        ValueRef::Null => return Ok(Value::Null),
         ValueRef::Numeric(Numeric::Float(f)) => Cow::Owned(format_float(f64::from(f))),
         val => Cow::Owned(val.to_string()),
     };
@@ -1293,12 +1327,14 @@ where
     let has_modifier = values.len() > 1;
     let mut p = DateTime::default();
     if values.len() == 0 {
+        check_pure(pure, "strftime", true)?;
         set_to_current(&mut p, clock);
     } else {
         let init_val = values.next().unwrap();
         match arg_as_text(init_val.as_value_ref()) {
             ValueRef::Text(s) => {
                 let s_str = s.as_str();
+                check_pure(pure, "strftime", reads_clock_as_time_value(s_str))?;
                 if s_str.eq_ignore_ascii_case("now") {
                     set_to_current(&mut p, clock);
                 } else if let Ok(val) = s_str.parse::<f64>() {
@@ -1313,7 +1349,7 @@ where
                     if parse_date_or_time(s_str, &mut temp_p, clock).is_ok() {
                         p = temp_p;
                     } else {
-                        return Value::Null;
+                        return Ok(Value::Null);
                     }
                 }
             }
@@ -1333,20 +1369,25 @@ where
                     p.valid_jd = true;
                 }
             }
-            _ => return Value::Null,
+            _ => return Ok(Value::Null),
         }
 
         for (i, val) in values.enumerate() {
             if let ValueRef::Text(s) = arg_as_text(val.as_value_ref()) {
+                check_pure(pure, "strftime", reads_time_zone_as_modifier(s.as_str()))?;
                 if parse_modifier(&mut p, s.as_str(), i).is_err() {
-                    return Value::Null;
+                    return Ok(Value::Null);
                 }
             } else {
-                return Value::Null;
+                return Ok(Value::Null);
             }
         }
     }
 
+    Ok(format_strftime(&fmt_str, p, has_modifier))
+}
+
+fn format_strftime(fmt_str: &str, mut p: DateTime, has_modifier: bool) -> Value {
     p.compute_jd();
     if p.is_error || p.i_jd < 0 || p.i_jd > MAX_JD {
         return Value::Null;
@@ -1510,6 +1551,44 @@ fn arg_as_text(value: ValueRef<'_>) -> ValueRef<'_> {
 mod tests {
     use super::*;
     use crate::io::clock::DefaultClock;
+
+    /// The tests below call these with no pure context, where a date or time
+    /// function never fails.
+    macro_rules! exec_without_pure_context {
+        ($name:ident, $func_type:literal) => {
+            fn $name<I, E, V>(clock: &dyn Clock, values: I) -> Value
+            where
+                V: AsValueRef,
+                E: ExactSizeIterator<Item = V>,
+                I: IntoIterator<IntoIter = E, Item = V>,
+            {
+                exec_datetime_general(clock, None, values, $func_type).unwrap()
+            }
+        };
+    }
+    exec_without_pure_context!(exec_date, "date");
+    exec_without_pure_context!(exec_time, "time");
+    exec_without_pure_context!(exec_datetime_full, "datetime");
+    exec_without_pure_context!(exec_julianday, "julianday");
+    exec_without_pure_context!(exec_unixepoch, "unixepoch");
+
+    fn exec_timediff<I, E, V>(clock: &dyn Clock, values: I) -> Value
+    where
+        V: AsValueRef,
+        E: ExactSizeIterator<Item = V>,
+        I: IntoIterator<IntoIter = E, Item = V>,
+    {
+        super::exec_timediff(clock, None, values).unwrap()
+    }
+
+    fn exec_strftime<I, E, V>(clock: &dyn Clock, values: I) -> Value
+    where
+        V: AsValueRef,
+        E: ExactSizeIterator<Item = V>,
+        I: IntoIterator<IntoIter = E, Item = V>,
+    {
+        super::exec_strftime(clock, None, values).unwrap()
+    }
 
     #[test]
     fn test_valid_get_date_from_time_value() {
@@ -2361,13 +2440,12 @@ mod tests {
 
     #[test]
     fn test_subsec_modifier() {
-        let res = exec_datetime_general(
+        let res = exec_time(
             &DefaultClock,
             &[
                 Value::build_text("2023-06-15 12:30:45"),
                 Value::build_text("subsec"),
             ],
-            "time",
         );
         assert_eq!(res.to_text().unwrap(), "12:30:45.000");
     }
@@ -2588,7 +2666,7 @@ mod tests {
             Value::build_text("2023-06-15 12:30:45".to_string()),
             Value::build_text("subsec".to_string()),
         ];
-        let res = exec_datetime_general(&DefaultClock, args, "datetime");
+        let res = exec_datetime_general(&DefaultClock, None, args, "datetime").unwrap();
         assert_eq!(res.to_text().unwrap(), "2023-06-15 12:30:45.000");
     }
 
@@ -3359,23 +3437,21 @@ mod tests {
             "23:59:59"
         );
 
-        let res1 = exec_datetime_general(
+        let res1 = exec_time(
             &DefaultClock,
             vec![
                 Value::build_text("10:30:45.123".to_string()),
                 Value::build_text("subsec".to_string()),
             ],
-            "time",
         );
         assert_eq!(res1.to_text().unwrap(), "10:30:45.123");
 
-        let res2 = exec_datetime_general(
+        let res2 = exec_time(
             &DefaultClock,
             vec![
                 Value::build_text("10:30:45.1".to_string()),
                 Value::build_text("subsec".to_string()),
             ],
-            "time",
         );
         assert_eq!(res2.to_text().unwrap(), "10:30:45.100");
     }
@@ -3510,7 +3586,8 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ];
         assert_eq!(
-            exec_datetime_general(&DefaultClock, dt_args, "time")
+            exec_datetime_general(&DefaultClock, None, dt_args, "time")
+                .unwrap()
                 .to_text()
                 .unwrap(),
             "10:30:45.120"

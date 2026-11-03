@@ -1,5 +1,7 @@
 use super::*;
-use crate::translate::emitter::gencol::emit_virtual_column_store;
+use crate::translate::emitter::gencol::{
+    emit_virtual_column_store, translate_generated_column_expr,
+};
 
 /// Read a single column from a BTreeTable cursor, transparently computing
 /// virtual generated columns inline instead of hitting `emit_column`.
@@ -85,19 +87,17 @@ pub(super) fn do_emit_table_column(
                 SelfTableContext::ForDML { .. } => None,
             };
             resolver.with_self_table_context(program, Some(self_table_context), |program, _| {
-                if end_column_emission.is_some() {
-                    translate_expr_no_constant_opt(
-                        program,
-                        referenced_tables,
-                        expr,
-                        target_register,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                } else {
-                    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-                }
-                Ok(())
+                let no_constant_opt = end_column_emission
+                    .is_some()
+                    .then_some(NoConstantOptReason::RegisterReuse);
+                translate_generated_column_expr(
+                    program,
+                    referenced_tables,
+                    expr,
+                    target_register,
+                    resolver,
+                    no_constant_opt,
+                )
             })?;
             let table = match self_table_context {
                 SelfTableContext::ForSelect {

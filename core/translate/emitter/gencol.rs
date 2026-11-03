@@ -1,7 +1,13 @@
+use crate::function::PureContext;
 use crate::schema::{BTreeTable, Column, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
-use crate::translate::expr::{emit_custom_type_encode_columns, translate_expr};
+use crate::translate::expr::{
+    emit_custom_type_encode_columns, translate_expr, translate_expr_no_constant_opt,
+    NoConstantOptReason,
+};
+use crate::translate::plan::TableReferences;
 use crate::vdbe::builder::{DmlColumnContext, DmlRowForm, SelfTableContext};
 use crate::{Arc, Result};
+use turso_parser::ast;
 
 use super::{ProgramBuilder, Resolver};
 
@@ -24,7 +30,7 @@ pub fn compute_virtual_columns(
                 continue;
             };
             let target_reg = dml_ctx.to_column_reg(idx);
-            translate_expr(program, None, expr, target_reg, resolver)?;
+            translate_generated_column_expr(program, None, expr, target_reg, resolver, None)?;
             if dml_ctx.holds_stored_value(idx) {
                 emit_virtual_column_store(program, resolver, column, target_reg, table)?;
             }
@@ -62,7 +68,7 @@ pub(crate) fn emit_gencol_expr_from_registers(
         table: Arc::clone(table),
     };
     resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, expr, target_reg, resolver)?;
+        translate_generated_column_expr(program, None, expr, target_reg, resolver, None)?;
         Ok(())
     })?;
     emit_virtual_column_store(program, resolver, column, target_reg, table)?;
@@ -96,4 +102,32 @@ pub(crate) fn emit_virtual_column_store(
         &table.name,
         &ColumnLayout::Identity { column_count: 1 },
     )
+}
+
+/// Translates the expression of a virtual generated column into `target_reg`.
+/// Every read or write of a generated column's value goes through here, so the
+/// date and time functions in the expression are checked the way SQLite checks
+/// them in a generated column.
+pub(crate) fn translate_generated_column_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_reg: usize,
+    resolver: &Resolver,
+    no_constant_opt: Option<NoConstantOptReason>,
+) -> Result<()> {
+    program.with_pure_context(PureContext::GeneratedColumn, |program| {
+        match no_constant_opt {
+            Some(reason) => translate_expr_no_constant_opt(
+                program,
+                referenced_tables,
+                expr,
+                target_reg,
+                resolver,
+                reason,
+            )?,
+            None => translate_expr(program, referenced_tables, expr, target_reg, resolver)?,
+        };
+        Ok(())
+    })
 }
