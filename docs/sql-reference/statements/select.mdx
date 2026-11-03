@@ -122,7 +122,7 @@ SELECT * FROM logs WHERE message REGEXP '^ERROR:';
 
 ### Range and Membership Tests
 
-When the left-hand expression of `BETWEEN` or `NOT BETWEEN` calls a nondeterministic function such as `random()`, it is evaluated once. This does not hold when a bound contains a subquery or when the left-hand side is a row value.
+When the left-hand expression of `BETWEEN` or `NOT BETWEEN` calls a nondeterministic function such as `random()` or contains a subquery, it is evaluated once, including for row values and result-column aliases in `WHERE`. When `BETWEEN` or `NOT BETWEEN` is itself the condition, the second comparison is skipped when the first determines the result. Subqueries in a bound (scalar, `IN`, or `EXISTS`) are evaluated before the comparisons, even when the first comparison determines the result.
 
 ```sql
 -- BETWEEN (inclusive on both ends)

@@ -2608,7 +2608,12 @@ pub fn parse_where(
         let start_idx = out_where_clause.len();
         break_predicate_at_and_boundaries(where_expr, out_where_clause);
         for expr in out_where_clause[start_idx..].iter_mut() {
-            rewrite_between_exprs(&mut expr.expr, Some(resolver))?;
+            rewrite_between_exprs(
+                &mut expr.expr,
+                Some(resolver),
+                Some(table_references),
+                result_columns,
+            )?;
             bind_and_rewrite_expr(
                 &mut expr.expr,
                 Some(table_references),
@@ -2649,7 +2654,12 @@ pub fn parse_where(
     }
 }
 
-pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -> Result<()> {
+pub fn rewrite_between_exprs(
+    expr: &mut Expr,
+    resolver: Option<&Resolver<'_>>,
+    referenced_tables: Option<&TableReferences>,
+    result_columns: Option<&[ResultSetColumn]>,
+) -> Result<()> {
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         if let Expr::Between {
             lhs,
@@ -2658,14 +2668,53 @@ pub fn rewrite_between_exprs(expr: &mut Expr, resolver: Option<&Resolver<'_>>) -
             end,
         } = e
         {
+            let mut bound_lhs = None;
+            if let (Some(resolver), Some(tables), Some(columns)) =
+                (resolver, referenced_tables, result_columns)
+            {
+                let mut lhs_has_alias = false;
+                walk_expr(lhs, &mut |expr| {
+                    if lhs_has_alias {
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    if let Expr::Id(id) = expr {
+                        let name = normalize_ident(id.as_str());
+                        lhs_has_alias = columns.iter().any(|column| {
+                            column
+                                .alias
+                                .as_ref()
+                                .is_some_and(|alias| alias.eq_ignore_ascii_case(&name))
+                        });
+                    }
+                    Ok(WalkControl::Continue)
+                })?;
+                if lhs_has_alias {
+                    let mut expr = lhs.clone();
+                    let mut tables = tables.clone();
+                    bind_and_rewrite_expr(
+                        &mut expr,
+                        Some(&mut tables),
+                        Some(columns),
+                        resolver,
+                        BindingBehavior::TryCanonicalColumnsFirst,
+                    )?;
+                    bound_lhs = Some(expr);
+                }
+            }
+            let lhs_to_check = bound_lhs.as_deref().unwrap_or(lhs);
             let lhs_is_nondeterministic = match resolver {
-                Some(resolver) => expr_contains_nondeterministic_scalar_function(lhs, resolver)?,
+                Some(resolver) => {
+                    expr_contains_nondeterministic_scalar_function(lhs_to_check, resolver)?
+                }
                 None => false,
             };
-            // A subquery in a bound runs before the comparisons, so a kept BETWEEN could not skip it
-            // the way SQLite does. Such a BETWEEN is rewritten as before.
+            // Keep the left side evaluated once. Conditions skip the second comparison
+            // when the first decides; scalar, IN and EXISTS subqueries in bounds run first.
+            // Keep the no-resolver partial-index path unchanged.
             let bounds_have_subquery = expr_contains_subquery(start) || expr_contains_subquery(end);
-            if (expr_contains_subquery(lhs) || lhs_is_nondeterministic) && !bounds_have_subquery {
+            if (expr_contains_subquery(lhs_to_check) || lhs_is_nondeterministic)
+                && (resolver.is_some() || !bounds_have_subquery)
+            {
                 return Ok(WalkControl::Continue);
             }
 

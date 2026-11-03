@@ -88,11 +88,12 @@ test between-subquery-lhs-and-bounds {
     INSERT INTO t VALUES (1), (2), (3), (4);
     SELECT COUNT(*) FROM t
     WHERE (SELECT test_nondet_counter() % 2 + t.a * 0)
-        BETWEEN (SELECT test_nondet_counter() % 2 + t.a * 0)
-        AND (SELECT test_nondet_counter() % 2 + t.a * 0);
+        BETWEEN (SELECT t.a - t.a) AND (SELECT t.a - t.a);
+    SELECT test_nondet_counter();
 }
 expect {
-    0
+    2
+    4
 }
 
 @backend cli
@@ -184,6 +185,410 @@ expect {
     0
     1
     4
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-group-by-key {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    SELECT (SELECT test_nondet_counter() + t.a * 0) BETWEEN 0 AND 0 FROM t GROUP BY a;
+    SELECT test_nondet_counter();
+}
+expect {
+    1
+    0
+    0
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-group-by-sorter {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    SELECT (SELECT test_nondet_counter() + t.a * 0) BETWEEN 0 AND 0 FROM t GROUP BY b;
+    SELECT test_nondet_counter();
+}
+expect {
+    1
+    0
+    0
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-having {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    SELECT a FROM t GROUP BY a HAVING (SELECT test_nondet_counter() + t.a * 0) BETWEEN 0 AND 0 ORDER BY a;
+    SELECT test_nondet_counter();
+}
+expect {
+    1
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-order-by {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    SELECT a FROM t ORDER BY (SELECT test_nondet_counter() + t.a * 0) BETWEEN 0 AND 0, a;
+    SELECT test_nondet_counter();
+}
+expect {
+    2
+    3
+    1
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-distinct {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    SELECT DISTINCT (SELECT test_nondet_counter() + t.a * 0) BETWEEN 0 AND 0 FROM t;
+    SELECT test_nondet_counter();
+}
+expect {
+    1
+    0
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-right-join {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    CREATE TABLE u(a INTEGER PRIMARY KEY);
+    INSERT INTO u VALUES (1), (4);
+    SELECT t.a, u.a FROM t RIGHT JOIN u ON t.a = u.a
+    WHERE (SELECT test_nondet_counter() % 2 + coalesce(t.a, 0) * 0) BETWEEN 0 AND 0
+    ORDER BY t.a, u.a;
+    SELECT test_nondet_counter();
+}
+expect {
+    1|1
+    4
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-full-join {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    CREATE TABLE u(a INTEGER PRIMARY KEY);
+    INSERT INTO u VALUES (1), (4);
+    SELECT t.a, u.a FROM t FULL JOIN u ON t.a = u.a
+    WHERE (SELECT test_nondet_counter() % 2 + coalesce(t.a, 0) * 0) BETWEEN 0 AND 0
+    ORDER BY t.a, u.a;
+    SELECT test_nondet_counter();
+}
+expect {
+    1|1
+    3|
+    6
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-left-join-unmatched {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    CREATE TABLE u(a);
+    SELECT t.a, (SELECT test_nondet_counter() + coalesce(u.a, 0)) BETWEEN 0 AND 0
+    FROM t LEFT JOIN u ON t.a = u.a;
+    SELECT test_nondet_counter();
+}
+expect {
+    1|1
+    1
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-group-by-key-not {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    SELECT (SELECT test_nondet_counter() + t.a * 0) NOT BETWEEN 0 AND 0 FROM t GROUP BY a;
+    SELECT test_nondet_counter();
+}
+expect {
+    0
+    1
+    1
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-group-by-sorter-not {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    SELECT (SELECT test_nondet_counter() + t.a * 0) NOT BETWEEN 0 AND 0 FROM t GROUP BY b;
+    SELECT test_nondet_counter();
+}
+expect {
+    0
+    1
+    1
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-having-not {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    SELECT a FROM t GROUP BY a HAVING (SELECT test_nondet_counter() + t.a * 0) NOT BETWEEN 0 AND 0 ORDER BY a;
+    SELECT test_nondet_counter();
+}
+expect {
+    2
+    3
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-order-by-not {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    SELECT a FROM t ORDER BY (SELECT test_nondet_counter() + t.a * 0) NOT BETWEEN 0 AND 0, a;
+    SELECT test_nondet_counter();
+}
+expect {
+    1
+    2
+    3
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-distinct-not {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    SELECT DISTINCT (SELECT test_nondet_counter() + t.a * 0) NOT BETWEEN 0 AND 0 FROM t;
+    SELECT test_nondet_counter();
+}
+expect {
+    0
+    1
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-right-join-not {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    CREATE TABLE u(a INTEGER PRIMARY KEY);
+    INSERT INTO u VALUES (1), (4);
+    SELECT t.a, u.a FROM t RIGHT JOIN u ON t.a = u.a
+    WHERE (SELECT test_nondet_counter() % 2 + coalesce(t.a, 0) * 0) NOT BETWEEN 0 AND 0
+    ORDER BY t.a, u.a;
+    SELECT test_nondet_counter();
+}
+expect {
+    3
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-full-join-not {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    CREATE TABLE u(a INTEGER PRIMARY KEY);
+    INSERT INTO u VALUES (1), (4);
+    SELECT t.a, u.a FROM t FULL JOIN u ON t.a = u.a
+    WHERE (SELECT test_nondet_counter() % 2 + coalesce(t.a, 0) * 0) NOT BETWEEN 0 AND 0
+    ORDER BY t.a, u.a;
+    SELECT test_nondet_counter();
+}
+expect {
+    2|
+    5
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-left-join-unmatched-not {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    CREATE TABLE u(a);
+    SELECT t.a, (SELECT test_nondet_counter() + coalesce(u.a, 0)) NOT BETWEEN 0 AND 0
+    FROM t LEFT JOIN u ON t.a = u.a;
+    SELECT test_nondet_counter();
+}
+expect {
+    1|0
+    1
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-empty-aggregate {
+    CREATE TABLE t(a);
+    SELECT count(*), (SELECT test_nondet_counter() + coalesce(t.a, 0)) BETWEEN 0 AND 0 FROM t;
+    SELECT test_nondet_counter();
+}
+expect {
+    0|1
+    1
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-counter-empty-aggregate-not {
+    CREATE TABLE t(a);
+    SELECT count(*), (SELECT test_nondet_counter() + coalesce(t.a, 0)) NOT BETWEEN 0 AND 0 FROM t;
+    SELECT test_nondet_counter();
+}
+expect {
+    0|0
+    1
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-alias-where {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT test_nondet_counter() % 2 AS r, a FROM t WHERE r BETWEEN a - a AND 0;
+}
+expect {
+    1|1
+    1|2
+    1|3
+    1|4
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-alias-not-where {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT test_nondet_counter() % 2 AS r, a FROM t WHERE r NOT BETWEEN a - a AND 0;
+}
+expect {
+    0|2
+    0|3
+    0|4
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-subquery-lower {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE test_nondet_counter() % 2 BETWEEN (SELECT 0) AND 0;
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-subquery-upper {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE test_nondet_counter() % 2 BETWEEN a - a AND (SELECT 0);
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-subquery-correlated {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE test_nondet_counter() % 2 BETWEEN 0 AND (SELECT t.a - t.a);
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-subquery-not-where {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE test_nondet_counter() % 2 NOT BETWEEN (SELECT 0) AND 0;
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-alias-subquery-bound {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT test_nondet_counter() % 2 AS r, a FROM t WHERE r BETWEEN a - a AND (SELECT 0);
+}
+expect {
+    1|1
+    1|2
+    1|3
+    1|4
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-in-select-bound {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE test_nondet_counter() % 2 BETWEEN 0 AND (0 IN (SELECT 1));
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-exists-bound {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE test_nondet_counter() % 2 BETWEEN 0 AND EXISTS(SELECT 1 WHERE 0);
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-row-where {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE (test_nondet_counter() % 2, 0) BETWEEN (a - a, 0) AND (0, 0);
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-row-not-where {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT COUNT(*) FROM t WHERE (test_nondet_counter() % 2, 0) NOT BETWEEN (a - a, 0) AND (0, 0);
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-row-value {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT SUM((test_nondet_counter() % 2, 0) BETWEEN (0, 0) AND (0, 0)) FROM t;
+}
+expect {
+    2
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-row-components {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3), (4);
+    SELECT SUM((test_nondet_counter() % 3, test_nondet_counter() % 3) BETWEEN (0, 1) AND (0, 1)) FROM t;
+    SELECT test_nondet_counter();
+}
+expect {
+    2
+    8
+}
+
+@skip-if sqlite "uses the Turso test-only counter"
+test between-once-row-null-affinity-collation {
+    CREATE TABLE t(a TEXT, b REAL, c TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('1', 1, 'B'), (NULL, NULL, NULL), ('2', 2, 'a');
+    SELECT (test_nondet_counter() % 1, a) BETWEEN (0, b) AND (0, b),
+           (test_nondet_counter() % 1, c) BETWEEN (0, 'b') AND (0, 'b') FROM t;
+    SELECT test_nondet_counter();
+}
+expect {
+    1|1
+    |
+    1|0
+    6
 }
 
 test between-volatile-condition-skips-upper-bound {

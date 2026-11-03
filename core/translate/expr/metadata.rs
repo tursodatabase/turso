@@ -29,7 +29,12 @@ pub(super) fn translate_between_expr(
     };
     let (lower_expr, upper_expr, combine_op) =
         build_between_terms(*lhs.clone(), *not, *start.clone(), *end.clone());
-    if expr_vector_size(lhs)? > 1 {
+    expr_vector_size(between_expr)?;
+    let lhs_arity = expr_vector_size(lhs)?;
+    if lhs_arity > 1
+        && !expr_contains_subquery(lhs)
+        && !expr_contains_nondeterministic_scalar_function(lhs, resolver)?
+    {
         let expr = ast::Expr::Binary(Box::new(lower_expr), combine_op, Box::new(upper_expr));
         match emit_mode {
             BinaryEmitMode::Value => {
@@ -48,7 +53,7 @@ pub(super) fn translate_between_expr(
         return Ok(target_register);
     }
 
-    let lhs_reg = program.alloc_register();
+    let lhs_reg = program.alloc_registers(lhs_arity);
     translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
     let next_comparison = program.allocate_label();
     let mut result_regs = [0; 2];
@@ -60,27 +65,45 @@ pub(super) fn translate_between_expr(
         let result_reg = program.alloc_register();
         result_regs[index] = result_reg;
         // A comparison applies column affinity to its operands in place, so each one gets its own copy.
-        let operand_reg = program.alloc_register();
+        let operand_reg = program.alloc_registers(lhs_arity);
         program.emit_insn(Insn::Copy {
             src_reg: lhs_reg,
             dst_reg: operand_reg,
-            extra_amount: 0,
+            extra_amount: lhs_arity - 1,
         });
-        let bound_reg = program.alloc_register();
+        let bound_reg = program.alloc_registers(lhs_arity);
         let next_span_idx = program.constant_spans_next_idx();
         translate_expr(program, referenced_tables, bound, bound_reg, resolver)?;
-        match emit_mode {
-            BinaryEmitMode::Value => emit_binary_insn(
+        if lhs_arity > 1 {
+            emit_binary_expr_row_valued(
                 program,
                 op,
                 operand_reg,
                 bound_reg,
+                lhs_arity,
                 result_reg,
                 lhs,
                 bound,
                 referenced_tables,
                 resolver,
-            )?,
+            )?;
+        }
+        match emit_mode {
+            BinaryEmitMode::Value => {
+                if lhs_arity == 1 {
+                    emit_binary_insn(
+                        program,
+                        op,
+                        operand_reg,
+                        bound_reg,
+                        result_reg,
+                        lhs,
+                        bound,
+                        referenced_tables,
+                        resolver,
+                    )?;
+                }
+            }
             BinaryEmitMode::Condition(metadata) => {
                 if !is_lower {
                     program.constant_spans_invalidate_after(next_span_idx);
@@ -103,18 +126,22 @@ pub(super) fn translate_between_expr(
                 } else {
                     metadata
                 };
-                emit_binary_condition_insn(
-                    program,
-                    op,
-                    operand_reg,
-                    bound_reg,
-                    result_reg,
-                    lhs,
-                    bound,
-                    referenced_tables,
-                    metadata,
-                    resolver,
-                )?;
+                if lhs_arity > 1 {
+                    emit_cond_jump(program, metadata, result_reg);
+                } else {
+                    emit_binary_condition_insn(
+                        program,
+                        op,
+                        operand_reg,
+                        bound_reg,
+                        result_reg,
+                        lhs,
+                        bound,
+                        referenced_tables,
+                        metadata,
+                        resolver,
+                    )?;
+                }
             }
         }
         if is_lower {
