@@ -745,7 +745,11 @@ mod tests {
             ))
             .build();
 
-        for sql in ["CREATE TABLE t(a)", "INSERT INTO t VALUES (1)"] {
+        for sql in [
+            "CREATE TABLE t(a)",
+            "INSERT INTO t VALUES (1)",
+            "CREATE TRIGGER tr AFTER INSERT ON t WHEN 0 AND nosuchcol BEGIN SELECT 1; END",
+        ] {
             assert!(matches!(
                 DifferentialOracle::execute_turso(&turso_conn, sql),
                 QueryResult::Ok
@@ -757,10 +761,11 @@ mod tests {
         }
 
         // SQLite's parser drops both operands of `x AND 0` before it resolves
-        // names, so SQLite accepts this statement; Turso resolves the names
-        // first, so only Turso rejects it.
+        // names, so the trigger's WHEN clause never fails there; Turso
+        // translates a WHEN clause without binding and still checks its
+        // names, so only Turso rejects the insert.
         let stmt = GeneratedStatement {
-            sql: "UPDATE t SET a = 2 WHERE 0 AND nosuchcol".to_string(),
+            sql: "INSERT INTO t VALUES (2)".to_string(),
             is_ddl: false,
             mutates_data: true,
             has_unordered_limit: false,

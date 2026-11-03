@@ -138,6 +138,10 @@ pub fn bind_and_rewrite_expr<'a>(
 /// [bind_and_rewrite_expr] without the [BINDING_REWRITES]. A HAVING clause
 /// binds its terms with this and applies the rewrites once it knows which
 /// terms move to WHERE (see select::process_having_clause).
+///
+/// Binding starts with [AndWithIntegerZero], the fold SQLite's parser does
+/// before any name is resolved, so `0 AND nosuchcol` is 0 here as it is
+/// there. The other folds wait for [BINDING_REWRITES], after the names.
 pub fn bind_expr<'a>(
     top_level_expr: &mut ast::Expr,
     mut referenced_tables: Option<&'a mut TableReferences>,
@@ -145,6 +149,7 @@ pub fn bind_expr<'a>(
     resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
+    apply_static_rewrites(top_level_expr, &[&AndWithIntegerZero], None)?;
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
