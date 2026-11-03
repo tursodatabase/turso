@@ -46,28 +46,65 @@ pub(crate) fn apply_static_rewrites(
 /// `CASE WHEN (SELECT abs(-9223372036854775807 - 1)) AND 0 ...` does not run
 /// the subquery. In [BINDING_REWRITES] it runs after binding, so names in the
 /// dropped operand are still checked, and before subquery planning, so the
-/// subquery is never planned or emitted.
+/// subquery is never planned or emitted. An expression that is translated
+/// without binding, like a column DEFAULT, gets the same fold when its
+/// bytecode is emitted (see [and_or_truth_value]).
 pub(crate) struct AndOrConstantOperand;
 
 impl StaticRewrite for AndOrConstantOperand {
     fn rewrite(
         &self,
         expr: &mut ast::Expr,
-        _resolver: Option<&Resolver<'_>>,
+        resolver: Option<&Resolver<'_>>,
     ) -> Result<WalkControl> {
-        let Expr::Binary(lhs, op @ (ast::Operator::And | ast::Operator::Or), rhs) = expr else {
-            return Ok(WalkControl::Continue);
-        };
-        let deciding_value = *op == ast::Operator::Or;
-        if literal_truth_value(lhs) == Some(deciding_value)
-            || literal_truth_value(rhs) == Some(deciding_value)
-        {
-            let folded = if deciding_value { "1" } else { "0" };
-            *expr = Expr::Literal(ast::Literal::Numeric(folded.to_string()));
-            return Ok(WalkControl::SkipChildren);
-        }
+        // The operand that replaces the node can be an AND or OR of the same
+        // shape: `(x AND 0) AND y` becomes `x AND 0`, which becomes `0`.
+        while replace_and_or_with_deciding_operand(expr, resolver)? {}
         Ok(WalkControl::Continue)
     }
+}
+
+/// Keeps the operand that decides the value of an AND or OR and drops the
+/// other, as sqlite3ExprSimplifiedAndOr does. The deciding operand is a
+/// literal, which becomes the 0 or 1 the AND or OR would have given (`0 OR 5`
+/// is 1, not 5), or an AND or OR whose own operands decide it, which is kept
+/// as it is, so `5 AND 0 AND x` keeps `5 AND 0`. Returns true when `expr`
+/// was replaced.
+fn replace_and_or_with_deciding_operand(
+    expr: &mut ast::Expr,
+    resolver: Option<&Resolver<'_>>,
+) -> Result<bool> {
+    let Expr::Binary(lhs, op @ (ast::Operator::And | ast::Operator::Or), rhs) = expr else {
+        return Ok(false);
+    };
+    let deciding_value = *op == ast::Operator::Or;
+    let (kept, dropped) = if and_or_truth_value(lhs) == Some(deciding_value) {
+        (lhs, rhs)
+    } else if and_or_truth_value(rhs) == Some(deciding_value) {
+        (rhs, lhs)
+    } else {
+        return Ok(false);
+    };
+    // An aggregate in the dropped operand still makes the query an aggregate
+    // query: `SELECT count(*) OR 1 FROM t` gives one row, not one per row.
+    let dropped_has_aggregate = match resolver {
+        Some(resolver) => expr_contains_aggregate_or_window_function(dropped, resolver)?,
+        None => true,
+    };
+    if dropped_has_aggregate {
+        return Ok(false);
+    }
+    let kept_is_and_or = matches!(
+        unwrap_parens(kept).unwrap_or(kept),
+        Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _)
+    );
+    *expr = if kept_is_and_or {
+        std::mem::take(kept.as_mut())
+    } else {
+        let folded = if deciding_value { "1" } else { "0" };
+        Expr::Literal(ast::Literal::Numeric(folded.to_string()))
+    };
+    Ok(true)
 }
 
 /// `x BETWEEN a AND b` becomes `x >= a AND x <= b` (and `NOT BETWEEN`

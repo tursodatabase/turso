@@ -1869,7 +1869,8 @@ fn move_group_by_only_having_terms_to_where(
 /// `Expr::is_always_false()` is not used because it also matches other constant false
 /// expressions such as `0.0`, `'0'` and `NOT 1`, which SQLite moves into WHERE.
 /// SQLite's parser also folds `X AND 0` into `0` when X has no function call, so it
-/// keeps `HAVING g = 2 AND 0` in HAVING, while here `g = 2` is moved.
+/// keeps `HAVING g = 2 AND 0` in HAVING. Here that conjunction stays one term, which
+/// binding folds to `0`, so it stays in HAVING too.
 fn is_literal_false(expr: &ast::Expr) -> bool {
     match expr {
         Expr::Literal(ast::Literal::Numeric(n)) => {

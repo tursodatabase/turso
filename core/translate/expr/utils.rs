@@ -90,6 +90,23 @@ pub fn truth_test_rhs(expr: &ast::Expr) -> Option<bool> {
     }
 }
 
+/// The value of an AND or OR that its literal operands decide on their own,
+/// as sqlite3ExprSimplifiedAndOr computes it: `x AND 0` is false and
+/// `x OR 1` is true whatever `x` is. An AND or OR with a decided value counts
+/// as that literal for its parent, so `5 AND 0 AND x` is false too. None
+/// when the value depends on a non-literal operand, as in `x AND 1`.
+pub fn and_or_truth_value(expr: &ast::Expr) -> Option<bool> {
+    match expr {
+        ast::Expr::Parenthesized(items) if items.len() == 1 => and_or_truth_value(&items[0]),
+        ast::Expr::Binary(lhs, op @ (ast::Operator::And | ast::Operator::Or), rhs) => {
+            let deciding_value = *op == ast::Operator::Or;
+            let decides = |operand: &ast::Expr| and_or_truth_value(operand) == Some(deciding_value);
+            (decides(lhs) || decides(rhs)).then_some(deciding_value)
+        }
+        _ => literal_truth_value(expr),
+    }
+}
+
 /// The truth value of TRUE, FALSE or an integer literal that fits in 32 bits,
 /// through parentheses: the operands SQLite folds `x AND 0` and `x OR 1` on
 /// (sqlite3ExprAlwaysFalse, sqlite3ExprAlwaysTrue). A float, a string, NULL,
