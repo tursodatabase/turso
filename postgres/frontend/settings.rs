@@ -41,14 +41,11 @@ impl PgSessionState {
     fn update_settings(
         &self,
         conn: &Connection,
-        update: impl FnOnce(&mut ConnectionSettings) -> bool,
+        update: impl FnOnce(&mut ConnectionSettings) -> Option<CoreValues>,
     ) {
-        let changed_search_path = {
-            let mut settings = self.settings.lock().unwrap();
-            update(&mut settings).then(|| settings.search_path().map(<[String]>::to_vec))
-        };
-        if let Some(search_path) = changed_search_path {
-            conn.set_search_path(search_path);
+        let changed = update(&mut self.settings.lock().unwrap());
+        if let Some(values) = changed {
+            values.apply(conn);
         }
     }
 
@@ -108,6 +105,19 @@ pub(crate) struct SettingValues {
     has_transaction_values: bool,
 }
 
+/// The values of the settings that core keeps a copy of, so core must be
+/// told when one of them changes.
+#[derive(Clone, PartialEq)]
+struct CoreValues {
+    search_path: Option<Vec<String>>,
+}
+
+impl CoreValues {
+    fn apply(self, conn: &Connection) {
+        conn.set_search_path(self.search_path);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct Setting<T> {
     session_value: T,
@@ -115,10 +125,6 @@ struct Setting<T> {
 }
 
 impl ConnectionSettings {
-    pub(crate) fn search_path(&self) -> Option<&[String]> {
-        self.current.search_path.current().as_deref()
-    }
-
     pub(crate) fn get(&self, name: &str) -> Option<&str> {
         self.current.named.get(name)?.current().as_deref()
     }
@@ -175,11 +181,11 @@ impl ConnectionSettings {
         }
     }
 
-    pub(crate) fn end_statement(
+    fn end_statement(
         &mut self,
         statement_failed: bool,
         transaction_ended: bool,
-    ) -> bool {
+    ) -> Option<CoreValues> {
         let memo_before_statement = self.memo_before_statement.take();
         let memo_to_restore = if transaction_ended {
             self.memo_before_transaction
@@ -198,7 +204,7 @@ impl ConnectionSettings {
         })
     }
 
-    pub(crate) fn rollback_transaction(&mut self) -> bool {
+    fn rollback_transaction(&mut self) -> Option<CoreValues> {
         self.memo_before_statement = None;
         let memo_before_transaction = self.memo_before_transaction.take();
         self.change_current_values(|current| {
@@ -209,18 +215,30 @@ impl ConnectionSettings {
         })
     }
 
-    pub(crate) fn rollback_to_savepoint(&mut self, saved: SettingValues) -> bool {
+    fn rollback_to_savepoint(&mut self, saved: SettingValues) -> Option<CoreValues> {
         self.change_current_values(|current| current.restore(saved))
     }
 
-    fn change_current_values(&mut self, change: impl FnOnce(&mut SettingValues)) -> bool {
-        let search_path = self.current.search_path.current().clone();
+    /// Applies `change` and returns the values core keeps if any of them
+    /// changed.
+    fn change_current_values(
+        &mut self,
+        change: impl FnOnce(&mut SettingValues),
+    ) -> Option<CoreValues> {
+        let before = self.current.core_values();
         change(&mut self.current);
-        search_path != *self.current.search_path.current()
+        let after = self.current.core_values();
+        (after != before).then_some(after)
     }
 }
 
 impl SettingValues {
+    fn core_values(&self) -> CoreValues {
+        CoreValues {
+            search_path: self.search_path.current().clone(),
+        }
+    }
+
     fn restore(&mut self, mut saved: SettingValues) {
         self.search_path = saved.search_path;
         self.has_transaction_values = saved.has_transaction_values;
