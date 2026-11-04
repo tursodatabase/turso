@@ -418,13 +418,7 @@ pub(crate) fn emit_constraint_values_decode(
         // emit_user_facing_column_value leaves arrays encoded, because SELECT
         // decodes them when it outputs the row.
         if column.is_array() {
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg: decoded_reg,
-                target_pc: skip_label,
-            });
             emit_array_decode(program, decoded_reg, column, resolver)?;
-            program.preassign_label_to_next_insn(skip_label);
         }
         info.violation_regs[i] = decoded_reg;
     }
