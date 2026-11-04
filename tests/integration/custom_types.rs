@@ -1500,17 +1500,30 @@ mod tests {
             run("UPDATE t SET v = v");
             all_true("SELECT a = ARRAY[w] FROM log", 1);
 
-            // A key on an array follows the element type's key rule, so only
-            // types whose index on a column of the type finds the row are
-            // tried. An index on a type whose DECODE changes values, such as
-            // `DECODE value - 1`, misses rows for a column of the type too.
-            let element_index_works = conn.execute("CREATE INDEX tw ON t(w)").is_ok()
-                && crate::common::limbo_exec_rows(
-                    &conn,
-                    "SELECT count(*) FROM t WHERE w = (SELECT w FROM t)",
-                ) == vec![vec![rusqlite::types::Value::Integer(1)]];
+            // A key on an array follows the element type's key rule: when an
+            // index on the element type is accepted, so is one on the array,
+            // and when it is refused because the type's DECODE can read
+            // different stored values back as the same value, so is the array.
+            // An index on a type with no OPERATOR '<' is refused before that
+            // check runs, and one on an array of it, such as cidr[], is accepted
+            // because of a bug that is also on main.
+            let element_index = conn.execute("CREATE INDEX tw ON t(w)");
+            let array_index = conn.execute("CREATE INDEX ta ON t(a)");
+            let refused_with = |result: &turso_core::Result<()>, message: &str| matches!(result, Err(e) if e.to_string().contains(message));
+            let indexes =
+                format!("{ty}: index on {ty}: {element_index:?}, on {ty}[]: {array_index:?}");
+            if element_index.is_ok() {
+                assert!(array_index.is_ok(), "{indexes}");
+            } else if refused_with(&element_index, "cannot be a key") {
+                assert!(refused_with(&array_index, "cannot be a key"), "{indexes}");
+            } else {
+                assert!(refused_with(&element_index, "OPERATOR '<'"), "{indexes}");
+            }
+            if element_index.is_ok() {
+                all_true("SELECT count(*) FROM t WHERE w = (SELECT w FROM t)", 1);
+            }
+            let element_index_works = array_index.is_ok();
             if element_index_works {
-                run("CREATE INDEX ta ON t(a)");
                 all_true(
                     "SELECT count(*) FROM t WHERE a = ARRAY[(SELECT w FROM t)]",
                     1,
@@ -1570,9 +1583,10 @@ mod tests {
             run("INSERT INTO d(id) VALUES (1)");
             all_true("SELECT da = ARRAY[dw] FROM d", 1);
             // ADD COLUMN takes only a constant default, so the array is
-            // written as text, such as '{"x"}'. Blobs have no text form, and
-            // ADD COLUMN checks the default of an integer[] or real[] column
-            // as if it were an integer or a real, so it refuses any text.
+            // written as text, such as '{"x"}'. Blobs have no text form.
+            // integer[] and real[] are skipped because of a bug that is also on
+            // main: ADD COLUMN checks their text default as if it were an
+            // integer or a real, and refuses it.
             let text_array = match s.as_bytes()[0] {
                 _ if ty == "integer" || ty == "real" => None,
                 b'\'' => Some(format!("'{{\"{}\"}}'", &s[1..s.len() - 1])),

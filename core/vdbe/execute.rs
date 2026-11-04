@@ -160,8 +160,8 @@ use super::{
         parse_text_array, serialize_array_from_blob, values_to_record_blob,
     },
     insn::{
-        AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
-        IvmSumKind, RegisterOrLiteral, SorterOpenData,
+        AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
+        IntegrityCkData, IvmSumKind, RegisterOrLiteral, SorterOpenData,
     },
     CommitState,
 };
@@ -2649,8 +2649,7 @@ pub fn op_array_encode(
         reg,
         element_affinity,
         element_type,
-        table_name,
-        col_name,
+        target,
     } = data.as_ref();
 
     let val = state.registers[*reg].get_value();
@@ -2672,12 +2671,9 @@ pub fn op_array_encode(
                     .map(|iter| iter.into_iter().all(|r| r.is_ok()))
                     .unwrap_or(false);
             if !valid {
-                return crate::error::cold_return(Err(non_array_value_error(
-                    element_type,
-                    table_name,
-                    col_name,
-                )
-                .into()));
+                return crate::error::cold_return(Err(
+                    non_array_value_error(element_type, target).into()
+                ));
             }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -2691,18 +2687,13 @@ pub fn op_array_encode(
         _ => None,
     };
     let Some(raw_elements) = raw_elements else {
-        return crate::error::cold_return(Err(non_array_value_error(
-            element_type,
-            table_name,
-            col_name,
-        )
-        .into()));
+        return crate::error::cold_return(Err(non_array_value_error(element_type, target).into()));
     };
 
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
-            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for {target} ({SQLITE_CONSTRAINT})"
         );
     }
 
@@ -2751,15 +2742,21 @@ pub fn op_array_encode(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// The error for a value that is not an array, stored in column
-/// `table_name.col_name`, or cast to an array when the names are empty.
-fn non_array_value_error(element_type: &str, table_name: &str, col_name: &str) -> LimboError {
-    let message = if col_name.is_empty() {
-        format!("cannot cast a non-array value to an array ({SQLITE_CONSTRAINT})")
-    } else {
-        format!(
+/// The error for a value that is not an array, going to `target`.
+fn non_array_value_error(element_type: &str, target: &ArrayEncodeTarget) -> LimboError {
+    let message = match target {
+        ArrayEncodeTarget::Column {
+            table_name,
+            col_name,
+        } => format!(
             "cannot store non-array value in {element_type} column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
-        )
+        ),
+        ArrayEncodeTarget::Cast => {
+            format!("cannot cast a non-array value to an array ({SQLITE_CONSTRAINT})")
+        }
+        ArrayEncodeTarget::IndexKey => {
+            format!("cannot use a non-array value as an array index key ({SQLITE_CONSTRAINT})")
+        }
     };
     LimboError::Constraint(message)
 }

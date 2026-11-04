@@ -31,6 +31,17 @@ expect {
     {1.0,2.0}
 }
 
+test array-cast-to-type-missing-its-arguments-is-plain-cast {
+    -- CAST('Ab' AS p) is SQLite's CAST, since p takes an argument the CAST
+    -- doesn't give. An array CAST does the same to each element, as for a
+    -- name that is no type at all, and doesn't run p's ENCODE.
+    CREATE TYPE p_upper(value text, m integer) BASE text ENCODE upper(value) DECODE lower(value);
+    SELECT CAST('{Ab}' AS p_upper[]), CAST('{Ab}' AS no_such_type[]), CAST('{Ab}' AS p_upper(3)[]);
+}
+expect {
+    {Ab}|{Ab}|{ab}
+}
+
 test array-alter-column-to-unknown-element-type-refused {
     CREATE TABLE alter_unknown (id INTEGER PRIMARY KEY, a integer[]) STRICT;
     INSERT INTO alter_unknown VALUES (1, '{1}');

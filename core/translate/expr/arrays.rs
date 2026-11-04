@@ -1,5 +1,5 @@
 use super::*;
-use crate::vdbe::insn::ArrayEncodeData;
+use crate::vdbe::insn::{ArrayEncodeData, ArrayEncodeTarget};
 
 /// Maximum number of array elements supported in the per-element transform loop.
 /// Limited by the fixed register block allocated at compile time.
@@ -125,12 +125,8 @@ pub(crate) enum ArrayInput<'a> {
     /// Only array blobs, such as an array read from a column.
     Blob,
     /// Text such as `'{1,2}'`, parsed into an array. Any other value is an
-    /// error that names column `table_name.col_name`. A CAST has no column and
-    /// leaves the names empty.
-    Text {
-        table_name: &'a str,
-        col_name: &'a str,
-    },
+    /// error that names `target`.
+    Text(&'a ArrayEncodeTarget),
     /// Text parsed into an array when it is one. Any other value is left as it
     /// is, so that an index key such as `'x'` matches no row, as in a scan.
     TextIfArray,
@@ -147,24 +143,20 @@ pub(crate) fn emit_array_leaf_loop(
     input: ArrayInput,
     transform_leaf: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
 ) -> Result<()> {
-    let parse = |program: &mut ProgramBuilder, table_name: &str, col_name: &str| {
+    let parse = |program: &mut ProgramBuilder, target: ArrayEncodeTarget| {
         program.emit_insn(Insn::ArrayEncode {
             data: Box::new(ArrayEncodeData {
                 reg,
                 element_affinity: Affinity::Blob,
                 element_type: "ANY".into(),
-                table_name: table_name.into(),
-                col_name: col_name.into(),
+                target,
             }),
         });
     };
     let not_an_array_label = match input {
         ArrayInput::Blob => None,
-        ArrayInput::Text {
-            table_name,
-            col_name,
-        } => {
-            parse(program, table_name, col_name);
+        ArrayInput::Text(target) => {
+            parse(program, target.clone());
             None
         }
         ArrayInput::TextIfArray => {
@@ -179,7 +171,7 @@ pub(crate) fn emit_array_leaf_loop(
                 reg: length_reg,
                 target_pc: label,
             });
-            parse(program, "", "");
+            parse(program, ArrayEncodeTarget::IndexKey);
             Some(label)
         }
     };
@@ -207,31 +199,34 @@ pub(super) fn emit_array_encode(
     resolver: &Resolver,
     table_name: &str,
 ) -> Result<()> {
+    let Some(col_name) = col.name.as_deref() else {
+        crate::bail_parse_error!("array column of table {table_name} has no name");
+    };
+    let target = ArrayEncodeTarget::Column {
+        table_name: table_name.into(),
+        col_name: col_name.into(),
+    };
     let resolved = resolve_array_element_type(col, resolver)?;
-    emit_array_encode_as(program, reg, col, resolved.as_ref(), resolver, table_name)
+    emit_array_encode_as(program, reg, col, resolved.as_ref(), resolver, target)
 }
 
 /// [emit_array_encode] for elements of the custom type `resolved`, or of the
-/// plain type `col.ty_str` when it is None.
+/// plain type `col.ty_str` when it is None, building an array for `target`.
 pub(super) fn emit_array_encode_as(
     program: &mut ProgramBuilder,
     reg: usize,
     col: &Column,
     resolved: Option<&crate::schema::ResolvedType>,
     resolver: &Resolver,
-    table_name: &str,
+    target: ArrayEncodeTarget,
 ) -> Result<()> {
-    let col_name = col.name.as_deref().unwrap_or("");
     if let Some(resolved) = resolved {
         if resolved.chain.iter().any(|td| td.has_encode_or_coerce()) {
             emit_array_leaf_loop(
                 program,
                 reg,
                 col.array_dimensions(),
-                ArrayInput::Text {
-                    table_name,
-                    col_name,
-                },
+                ArrayInput::Text(&target),
                 |program, leaf_reg| {
                     emit_store_value(program, &resolved.chain, leaf_reg, &col.ty_params, resolver)
                 },
@@ -263,8 +258,7 @@ pub(super) fn emit_array_encode_as(
             reg,
             element_affinity,
             element_type,
-            table_name: table_name.into(),
-            col_name: col_name.into(),
+            target,
         }),
     });
     Ok(())

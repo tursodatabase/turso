@@ -760,10 +760,7 @@ fn translate_cast_expr(
                     program,
                     target_register,
                     tn.array_dimensions,
-                    ArrayInput::Text {
-                        table_name: "",
-                        col_name: "",
-                    },
+                    ArrayInput::Text(&crate::vdbe::insn::ArrayEncodeTarget::Cast),
                     |program, leaf_reg| {
                         emit_custom_type_cast(program, resolved, &element_type, leaf_reg, resolver)
                     },
@@ -780,16 +777,17 @@ fn translate_cast_expr(
                 ColDef::default(),
             );
             column.set_array_dimensions(tn.array_dimensions);
-            // As in SQLite, a CAST to a name that is not a custom type, such
-            // as `double`, casts to a plain type with that name's affinity.
-            let resolved = resolver.schema().resolve_type_unchecked(cast_type_name)?;
+            // This is SQLite's CAST on each element, as `custom_type_cast_chain`
+            // decided: the element type is not a custom type, such as `double`,
+            // or a custom type that takes arguments the CAST doesn't give.
+            // Each element gets that name's affinity.
             super::arrays::emit_array_encode_as(
                 program,
                 target_register,
                 &column,
-                resolved.as_ref(),
+                None,
                 resolver,
-                "",
+                crate::vdbe::insn::ArrayEncodeTarget::Cast,
             )?;
             return Ok(target_register);
         }

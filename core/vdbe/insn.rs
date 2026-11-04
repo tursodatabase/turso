@@ -413,8 +413,35 @@ pub struct ArrayEncodeData {
     pub reg: usize,
     pub element_affinity: Affinity,
     pub element_type: Arc<str>,
-    pub table_name: Arc<str>,
-    pub col_name: Arc<str>,
+    pub target: ArrayEncodeTarget,
+}
+
+/// Where the array an ArrayEncode builds goes, which its error for a value
+/// that is not an array names.
+#[derive(Debug, Clone)]
+pub enum ArrayEncodeTarget {
+    /// Column `col_name` of table `table_name`.
+    Column {
+        table_name: Arc<str>,
+        col_name: Arc<str>,
+    },
+    /// The result of a CAST to an array type.
+    Cast,
+    /// The key of an index lookup on an array column.
+    IndexKey,
+}
+
+impl std::fmt::Display for ArrayEncodeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Column {
+                table_name,
+                col_name,
+            } => write!(f, "column {table_name}.{col_name}"),
+            Self::Cast => write!(f, "a cast"),
+            Self::IndexKey => write!(f, "an index key"),
+        }
+    }
 }
 
 /// Data for HashDistinct instruction (boxed to keep Insn small).

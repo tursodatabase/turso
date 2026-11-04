@@ -761,10 +761,7 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!(
-                    "{}.{} ({})",
-                    data.table_name, data.col_name, data.element_type
-                ),
+                format!("{} ({})", data.target, data.element_type),
             ),
             Insn::ArrayDecode { reg } => (
                 "ArrayDecode",
