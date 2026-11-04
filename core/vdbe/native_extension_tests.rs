@@ -1219,13 +1219,20 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
                 Value::from_text("alpha"),
                 Value::from_text("73"),
                 Value::from_text("-4.25"),
+                Value::from_text("'a''b'"),
+                Value::from_text(r#""a,b'c""#),
+                Value::from_text(r#"tokenize="unicode61 tokenchars '_'""#),
             ],
             addresses: None,
             calls: calls.clone(),
         },
     ));
-    conn.execute("CREATE VIRTUAL TABLE arguments USING argument_module(alpha, 73, -4.25)")
-        .unwrap();
+    let args =
+        r#"(, alpha ,, 73 /* c */, -4.25, 'a''b',, "a,b'c", tokenize="unicode61 tokenchars '_'")"#;
+    conn.execute(format!(
+        "CREATE VIRTUAL TABLE arguments USING argument_module{args}"
+    ))
+    .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     let mut schema = crate::schema::Schema::new();
     schema
@@ -1234,7 +1241,9 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
             "reloaded",
             "reloaded",
             0,
-            Some("CREATE VIRTUAL TABLE reloaded USING argument_module(alpha, 73, -4.25)"),
+            Some(&format!(
+                "create virtual table reloaded using argument_module{args}"
+            )),
             &conn.syms.read(),
             &mut crate::alloc::vec![],
             &mut crate::HashMap::default(),
