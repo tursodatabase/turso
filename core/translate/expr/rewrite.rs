@@ -146,19 +146,8 @@ impl StaticRewrite for AndOrConstantOperand {
         expr: &mut ast::Expr,
         resolver: Option<&Resolver<'_>>,
     ) -> Result<WalkControl> {
-        // SQLite looks a collation up when it compiles a comparison, on the
-        // compared operand as written, through NOT, arithmetic and function
-        // arguments. So a collation name inside the part of `x OR 1` that
-        // the fold drops is checked when the comparison around it is kept,
-        // and not otherwise: `(1 OR a COLLATE nosuch) = 1` and
-        // `abs(1 OR a COLLATE nosuch) = 1` are errors, while
-        // `SELECT 1 OR a COLLATE nosuch` and `WHERE 1 OR a COLLATE nosuch = 1`
-        // are 1. The walk visits a node before its children, so this runs
-        // on each kept comparison before a fold below it drops anything.
         if let Some(resolver) = resolver {
-            for operand in compared_operands(expr, resolver)? {
-                reject_unknown_collation(operand, resolver)?;
-            }
+            reject_unknown_compared_collation_at(expr, resolver)?;
         }
         // The operand that replaces the node can be an AND or OR of the same
         // shape: `(x AND 0) AND y` becomes `x AND 0`, which becomes `0`.
@@ -167,6 +156,26 @@ impl StaticRewrite for AndOrConstantOperand {
         })? {}
         Ok(WalkControl::Continue)
     }
+}
+
+/// SQLite looks a collation up when it compiles a comparison, on the
+/// compared operand as written, through NOT, arithmetic and function
+/// arguments. So a collation name inside the part of `x OR 1` that the fold
+/// drops is checked when the comparison around it is kept, and not
+/// otherwise: `(1 OR a COLLATE nosuch) = 1` and `abs(1 OR a COLLATE nosuch) = 1`
+/// are errors, while `SELECT 1 OR a COLLATE nosuch` and `WHERE 1 OR a COLLATE
+/// nosuch = 1` are 1. A walk that folds visits a node before its children,
+/// so this runs on each kept comparison before a fold below it drops
+/// anything: [AndOrConstantOperand] does it, and so does the subquery
+/// planner for an expression whose fold waited for its subqueries.
+pub(crate) fn reject_unknown_compared_collation_at(
+    expr: &Expr,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    for operand in compared_operands(expr, resolver)? {
+        reject_unknown_collation(operand, resolver)?;
+    }
+    Ok(())
 }
 
 /// The operands of this node whose collating sequence SQLite looks up: the
