@@ -15,14 +15,21 @@ use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
+use crate::translate::emitter::gencol::compute_virtual_columns;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
 use crate::translate::expr::expr_type::iif_values;
-use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, takes_input_of_type, translate_expr_no_constant_opt, walk_expr,
+    BindingBehavior, NoConstantOptReason, WalkControl,
+};
 use crate::translate::fkeys::emit_fk_drop_table_check;
-use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
+use crate::translate::plan::{
+    compound_column_affinity, ColumnUsedMask, IterationDirection, JoinedTable, Operation, Plan,
+    QueryDestination, Scan, TableReferences,
+};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
 use crate::translate::sequence::bind_sequence_names;
@@ -33,6 +40,7 @@ use crate::util::{
     PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
+use crate::vdbe::builder::{CursorKey, DmlColumnContext, DmlRowForm, QueryMode};
 use crate::vdbe::insn::{
     to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
@@ -678,12 +686,13 @@ fn can_compare(lty: &CheckExprType, rty: &CheckExprType, resolver: &CatalogConte
     lty.is_compatible_with(rty) || is_input_for(rty, lty) || is_input_for(lty, rty)
 }
 
+/// Checks the body of a CREATE TABLE and returns the table it describes.
 fn validate(
     body: &ast::CreateTableBody,
     table_name: &str,
     resolver: &CatalogContext,
     is_nested: bool,
-) -> Result<()> {
+) -> Result<BTreeTable> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
         options,
         columns,
@@ -860,11 +869,12 @@ fn validate(
                 }
             }
             table.resolve_custom_types(resolver.schema());
-            table.check_collates_are_allowed()?;
+            table.check_collates_are_allowed(resolver.schema())?;
         }
         table.check_key_columns(resolver.schema())?;
+        return Ok(table);
     }
-    Ok(())
+    unreachable!("translate_create_table turns CREATE TABLE AS SELECT into a column list before validating it")
 }
 
 /// Rejects a function call in a generated column expression whose argument
@@ -1241,12 +1251,17 @@ pub fn translate_create_table(
 
     // Like SQLite, the body is only checked when the table is really created,
     // so IF NOT EXISTS on an existing table succeeds whatever the body says.
-    validate(
+    let table = validate(
         &body,
         &normalized_tbl_name,
         &resolver.catalog,
         connection.is_nested_stmt(),
     )?;
+    // VACUUM creates the tables the database already has as nested
+    // statements, and those may break this rule.
+    if !connection.is_nested_stmt() {
+        translate_check_and_generated_exprs(&table, resolver, namespace)?;
+    }
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
 
@@ -1564,6 +1579,85 @@ pub fn translate_create_table(
     }
 
     Ok(())
+}
+
+/// Translates the CHECK constraints and generated columns of a new table
+/// into a program that is thrown away, the way an INSERT translates them.
+/// An expression that fails to translate, such as `CHECK (j <> '[]')` on a
+/// json column (json values can't be compared), would fail every INSERT and
+/// PRAGMA integrity_check, so CREATE TABLE fails instead.
+pub(crate) fn translate_check_and_generated_exprs(
+    table: &BTreeTable,
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+) -> Result<()> {
+    let table = Arc::new(table.clone());
+    let mut program =
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 0, 0));
+
+    let table_ref_id = program.table_reference_counter.next();
+    program.alloc_cursor_id_keyed(
+        CursorKey::table(table_ref_id),
+        CursorType::BTreeTable(table.clone()),
+    );
+    let mut table_references = TableReferences::new(
+        vec![JoinedTable {
+            op: Operation::Scan(Scan::BTreeTable {
+                iter_dir: IterationDirection::Forwards,
+                index: None,
+            }),
+            unmatched_right_rows_plan: None,
+            table: Table::BTree(table.clone()),
+            identifier: table.name.clone(),
+            has_alias: false,
+            internal_id: table_ref_id,
+            join_info: None,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            namespace,
+            indexed: None,
+            plan_estimate: None,
+        }],
+        vec![],
+    );
+    for check in &table.check_constraints {
+        let mut expr = check.expr.clone();
+        bind_and_rewrite_expr(
+            &mut expr,
+            Some(&mut table_references),
+            None,
+            resolver,
+            BindingBehavior::ResultColumnsNotAllowed,
+        )?;
+        let reg = program.alloc_register();
+        translate_expr_no_constant_opt(
+            &mut program,
+            Some(&table_references),
+            &expr,
+            reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+    }
+
+    let layout = table.column_layout()?;
+    let columns_start = program.alloc_registers(layout.column_count());
+    let rowid_reg = program.alloc_register();
+    let dml_ctx = DmlColumnContext::layout(
+        table.columns(),
+        columns_start,
+        rowid_reg,
+        layout,
+        DmlRowForm::Stored,
+    );
+    compute_virtual_columns(
+        &mut program,
+        &table.columns_topo_sort()?,
+        &dml_ctx,
+        resolver,
+        &table,
+    )
 }
 
 /// Binds the sequences named in the column defaults of `body` to the

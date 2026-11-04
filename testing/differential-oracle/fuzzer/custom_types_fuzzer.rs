@@ -23,7 +23,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use differential_fuzzer::memory::MemorySimIO;
-use turso_core::{ConnectOpts, Database, SqliteDialect};
+use turso_core::{ConnectOpts, Database};
+use turso_sqlite::SqliteDialect;
 
 // ---------------------------------------------------------------------------
 // CLI

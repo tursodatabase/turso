@@ -1042,6 +1042,36 @@ expect {
     10|20|30
 }
 
+test dot-chain-struct-in-struct-keeps-field-type {
+    CREATE TYPE inner_s AS STRUCT(d date);
+    CREATE TYPE outer_s AS STRUCT(sub inner_s);
+    CREATE TABLE t(data outer_s) STRICT;
+    INSERT INTO t VALUES (struct_pack(struct_pack('2024-01-02')));
+    SELECT data.sub.d - 1 FROM t;
+}
+expect {
+    2024-01-01
+}
+
+test dot-chain-struct-in-struct-rejects-operator-missing-for-field-type {
+    CREATE TYPE inner_s AS STRUCT(d date);
+    CREATE TYPE outer_s AS STRUCT(sub inner_s);
+    CREATE TABLE t(data outer_s) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND data.sub.d * 2 = 1;
+}
+expect error {
+    operator does not exist: date \* integer
+}
+
+test dot-access-rejects-missing-field-in-false-where-term {
+    CREATE TYPE inner_s AS STRUCT(a INT);
+    CREATE TABLE t(data inner_s) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND data.nope = 1;
+}
+expect error {
+    no such field 'nope' in struct type 'inner_s'
+}
+
 test deep-chain-function-composition {
     CREATE TYPE inner_s AS STRUCT(val INT);
     CREATE TYPE mid_s AS STRUCT(sub inner_s);

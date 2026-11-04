@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::SqliteDialect;
 use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags};
+use turso_sqlite::SqliteDialect;
 
 use crate::common::ExecRows;
 use asserting::prelude::*;

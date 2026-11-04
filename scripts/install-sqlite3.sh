@@ -5,7 +5,7 @@
 
 set -e
 
-# Keep in sync with SQLITE_VERSION in core/dialect/sqlite.rs (3.50.4).
+# Keep in sync with SQLITE_VERSION in core/dialect/engine.rs (3.50.4).
 SQLITE_VERSION="${SQLITE_VERSION:-3500400}"
 SQLITE_YEAR="${SQLITE_YEAR:-2025}"
 

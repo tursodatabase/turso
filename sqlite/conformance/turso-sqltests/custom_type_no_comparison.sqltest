@@ -428,6 +428,94 @@ expect error {
 }
 
 # ============================================================================
+# CHECK constraints and generated columns: refused when the table is created
+# or altered, not at every INSERT and PRAGMA integrity_check.
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test no-comparison-check-not-equals {
+    CREATE TABLE t(j json CHECK (j <> '{}')) STRICT;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-check-between {
+    CREATE TABLE t(j jsonb, CHECK (j BETWEEN '1' AND '2')) STRICT;
+}
+expect error {
+    values of type jsonb cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-check-in-list {
+    CREATE TABLE t(i inet CHECK (i IN ('10.0.0.1'))) STRICT;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-check-case-operand {
+    CREATE TABLE t(i inet CHECK (CASE i WHEN '10.0.0.1' THEN 0 ELSE 1 END)) STRICT;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-check-nullif {
+    CREATE TABLE t(c cidr CHECK (nullif(c, '10.0.0.0/8') IS NOT NULL)) STRICT;
+}
+expect error {
+    values of type cidr cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-generated-column {
+    CREATE TABLE t(m macaddr, g INT AS (m = '08:00:2b:01:02:03')) STRICT;
+}
+expect error {
+    values of type macaddr cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-generated-column-json-field {
+    CREATE TABLE t(j json, g INT AS (j -> 'a' < '1')) STRICT;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-add-column-check {
+    CREATE TABLE t(i inet) STRICT;
+    ALTER TABLE t ADD COLUMN n INT CHECK (i = '10.0.0.1');
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-alter-column-in-check-to-inet {
+    CREATE TABLE t(c text, n INT, CHECK (c = '10.0.0.1')) STRICT;
+    ALTER TABLE t ALTER COLUMN c TO c2 inet;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-alter-column-in-generated-column-to-inet {
+    CREATE TABLE t(c text, g INT AS (c = '10.0.0.1')) STRICT;
+    ALTER TABLE t ALTER COLUMN c TO c2 inet;
+}
+expect error {
+    values of type inet cannot be compared
+}
+
+# ============================================================================
 # What still works
 # ============================================================================
 
@@ -488,4 +576,32 @@ test no-comparison-struct-fields-compare {
 }
 expect {
     2
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-check-and-generated-column-without-comparison-work {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j json CHECK (j IS NOT NULL), g ANY AS (j ->> 'a')) STRICT;
+    INSERT INTO t VALUES (1, '{"a":5}');
+    SELECT id, g FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    1|5
+    ok
+}
+
+# The CHECK still names the column after it is renamed.
+@requires strict "uses STRICT tables"
+test no-comparison-alter-column-renames-column-in-check {
+    CREATE TABLE t(c text, n INT, CHECK (c <> 'x')) STRICT;
+    INSERT INTO t VALUES ('a', 1);
+    ALTER TABLE t ALTER COLUMN c TO c2 text;
+    INSERT INTO t VALUES ('b', 2);
+    SELECT c2 FROM t ORDER BY c2;
+    PRAGMA integrity_check;
+}
+expect {
+    a
+    b
+    ok
 }

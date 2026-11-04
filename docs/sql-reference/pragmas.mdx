@@ -535,7 +535,7 @@ SQLite's default value `NORMAL` is rejected:
 
 ```sql
 PRAGMA locking_mode = normal;
--- Parse error: locking_mode must be EXCLUSIVE
+-- locking_mode must be EXCLUSIVE
 ```
 
 Writing the pragma does not change how Turso locks the database file. It only checks the

@@ -15,7 +15,9 @@ use crate::translate::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
     },
-    expr::expr_type::{type_of, type_ordering, type_without_comparison, ExprType, TypeEnv},
+    expr::expr_type::{
+        column_type, type_of, type_ordering, type_without_comparison, ExprType, TypeEnv,
+    },
     expr::{
         bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
         translate_expr, unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
@@ -460,7 +462,7 @@ pub(crate) fn emit_refill_index(
             }),
             unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
+            identifier: tbl_name,
             has_alias: false,
             internal_id: table_ref,
             join_info: None,
@@ -699,7 +701,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::Halt {
                 constraint_info: None,
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description: format_unique_violation_desc(tbl_name.as_str(), idx),
+                description: format_unique_violation_desc(tbl, idx),
                 on_error: None,
                 description_reg: None,
             });
@@ -1077,7 +1079,8 @@ fn resolve_sorted_columns_with_catalog(
         let index_column = if let Some((pos, column_name, column)) =
             resolve_index_column(unwrapped_expr, table)
         {
-            let collation = key_collation(explicit_collation, column.type_ordering())?
+            let ty = column_type(column, table.is_strict, schema);
+            let collation = key_collation(explicit_collation, &ty, schema)?
                 .unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
@@ -1097,8 +1100,8 @@ fn resolve_sorted_columns_with_catalog(
             if !validate_index_expression(unwrapped_expr, table) {
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
-            let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;
-            let collation = key_collation(explicit_collation, ordering)?;
+            let ty = expression_type(unwrapped_expr, table, schema, syms)?;
+            let collation = key_collation(explicit_collation, &ty, schema)?;
             IndexColumn {
                 name: sc.expr.to_string(),
                 order,
@@ -1158,7 +1161,7 @@ pub(crate) fn expression_type_ordering(
     schema: &Schema,
     syms: &SymbolTable,
 ) -> crate::Result<Option<TypeOrdering>> {
-    let ty = index_expression_type(expr, table, schema, syms)?;
+    let ty = expression_type(expr, table, schema, syms)?;
     Ok(type_ordering(&ty, schema))
 }
 
@@ -1171,14 +1174,15 @@ pub(crate) fn check_index_expression_has_comparison(
     schema: &Schema,
     syms: &SymbolTable,
 ) -> crate::Result<()> {
-    let ty = index_expression_type(expr, table, schema, syms)?;
+    let ty = expression_type(expr, table, schema, syms)?;
     match type_without_comparison(&ty, schema) {
         Some(type_def) => Err(no_comparison_error(&ty, type_def)),
         None => Ok(()),
     }
 }
 
-fn index_expression_type(
+/// The type of an index expression over `table`'s columns.
+fn expression_type(
     expr: &Expr,
     table: &BTreeTable,
     schema: &Schema,

@@ -500,8 +500,8 @@ pub enum Expr {
         base: Box<Expr>,
         /// field or variant name
         field: Name,
-        /// pre-resolved field/variant index (populated during binding)
-        resolved: Option<FieldAccessResolution>,
+        /// the field or variant, found when the expression is bound
+        resolved: FieldAccessResolution,
     },
     /// call to a built-in function
     FunctionCall {

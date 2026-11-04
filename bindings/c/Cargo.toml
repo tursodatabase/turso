@@ -23,6 +23,7 @@ doc = false
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+turso_sqlite = { workspace = true }
 env_logger = { workspace = true, default-features = false }
 libc = "0.2.169"
 turso_core = { workspace = true, features = ["conn_raw_api"] }

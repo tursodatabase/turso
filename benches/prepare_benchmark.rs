@@ -18,7 +18,8 @@
 use divan::{black_box, AllocProfiler, Bencher};
 use mimalloc::MiMalloc;
 use std::sync::Arc;
-use turso_core::{ConnectOpts, Connection, Database, MemoryIO, SqliteDialect, StepResult};
+use turso_core::{ConnectOpts, Connection, Database, MemoryIO, StepResult};
+use turso_sqlite::SqliteDialect;
 
 #[global_allocator]
 static ALLOC: AllocProfiler<MiMalloc> = AllocProfiler::new(MiMalloc);
@@ -523,7 +524,7 @@ const TPCH_IDS: [usize; 21] = [
 fn tpch_sql(n: usize) -> &'static str {
     macro_rules! q {
         ($num:literal) => {
-            include_str!(concat!("../../perf/tpc-h/queries/", $num, ".sql"))
+            include_str!(concat!("../perf/tpc-h/queries/", $num, ".sql"))
         };
     }
     match n {
@@ -573,7 +574,7 @@ const CLICKBENCH_IDS: [usize; 42] = [
 ];
 
 fn clickbench_sql(n: usize) -> &'static str {
-    include_str!("../../perf/clickbench/queries.sql")
+    include_str!("../perf/clickbench/queries.sql")
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with("--"))
@@ -584,7 +585,7 @@ fn clickbench_sql(n: usize) -> &'static str {
 #[turso_macros::divan_bench(args = CLICKBENCH_IDS)]
 fn corpus_clickbench(bencher: Bencher, q: usize) {
     let (db, conn) = open_db();
-    execute(&db, &conn, include_str!("../../perf/clickbench/create.sql"));
+    execute(&db, &conn, include_str!("../perf/clickbench/create.sql"));
     let sql = clickbench_sql(q);
     let _warmup = conn.prepare(sql).unwrap();
     bencher.bench_local(|| {
@@ -608,7 +609,7 @@ fn bench_corpus_query(bencher: Bencher, schema: &str, sql: &str) {
 
 macro_rules! corpus_queries {
     ($dir:literal, [$($n:literal),* $(,)?]) => {
-        &[$(($n, include_str!(concat!("../../perf/", $dir, "/queries/", $n, ".sql")))),*]
+        &[$(($n, include_str!(concat!("../perf/", $dir, "/queries/", $n, ".sql")))),*]
     };
 }
 
@@ -639,8 +640,8 @@ const JOB_QUERIES: &[(&str, &str)] = corpus_queries!(
 );
 
 const JOB_SCHEMA: &str = concat!(
-    include_str!("../../perf/job/schema.sql"),
-    include_str!("../../perf/job/fkindexes.sql"),
+    include_str!("../perf/job/schema.sql"),
+    include_str!("../perf/job/fkindexes.sql"),
 );
 
 // Several JOB queries take hundreds of milliseconds to plan today, so cap
@@ -667,7 +668,7 @@ const TPCDS_QUERIES: &[(&str, &str)] = corpus_queries!(
     ]
 );
 
-const TPCDS_SCHEMA: &str = include_str!("../../perf/tpc-ds/schema.sql");
+const TPCDS_SCHEMA: &str = include_str!("../perf/tpc-ds/schema.sql");
 
 #[turso_macros::divan_bench(args = TPCDS_QUERIES.iter().map(|(name, _)| *name), sample_count = 10)]
 fn corpus_tpcds(bencher: Bencher, q: &str) {

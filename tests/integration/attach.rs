@@ -9,8 +9,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::SqliteDialect;
 use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags};
+use turso_sqlite::SqliteDialect;
 
 const PAGE_SIZE_OFFSET: u64 = 16;
 const RESERVED_SPACE_OFFSET: u64 = 20;

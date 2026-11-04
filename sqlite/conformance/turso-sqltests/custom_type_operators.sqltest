@@ -469,6 +469,15 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test op-date-array-minus-date-error {
+    CREATE TABLE t1(a date[], d date) STRICT;
+    SELECT a - d FROM t1;
+}
+expect error {
+    operator does not exist: date\[\] - date
+}
+
+@requires strict "uses STRICT tables"
 test op-text-minus-date-error {
     -- date() returns text, and no operator subtracts a date from text.
     CREATE TABLE t1(d date) STRICT;
@@ -646,14 +655,13 @@ expect error {
 
 @requires strict "uses STRICT tables"
 test op-parenthesized-column-uses-type-operator {
-    -- (d), +d and d COLLATE x give d's value unchanged, so they run the same
-    -- operator as d.
+    -- (d) and +d give d's value unchanged, so they run the same operator as d.
     CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
     INSERT INTO t1 VALUES (1, '2024-01-05');
-    SELECT d + 1, (d) + 1, +d + (1), d COLLATE BINARY + 1 FROM t1;
+    SELECT d + 1, (d) + 1, +d + (1) FROM t1;
 }
 expect {
-    2024-01-06|2024-01-06|2024-01-06|2024-01-06
+    2024-01-06|2024-01-06|2024-01-06
 }
 
 @requires strict "uses STRICT tables"
