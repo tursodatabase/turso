@@ -485,6 +485,26 @@ expect error {
     misuse of aggregate function count
 }
 
+# SQLite resolves every name before it drops an operand of `x OR 1`, so a
+# wrong column name inside a subquery of that operand is still an error.
+
+test or-with-a-constant-operand-still-checks-a-name-inside-a-dropped-subquery {
+    CREATE TABLE dropped_sub(a);
+    SELECT (SELECT nosuchcol) OR 1 FROM dropped_sub;
+}
+expect error {
+    no such column: nosuchcol
+}
+
+test and-with-a-constant-false-operand-still-checks-a-name-inside-a-dropped-subquery {
+    CREATE TABLE dropped_sub(a);
+    INSERT INTO dropped_sub VALUES (1);
+    UPDATE dropped_sub SET a = EXISTS (SELECT 1 WHERE nosuchcol = 1) AND FALSE;
+}
+expect error {
+    no such column: nosuchcol
+}
+
 # `x AND 0` is decided before names are resolved, as in SQLite's parser.
 
 test and-with-integer-zero-drops-an-unknown-column-name-like-the-parser {

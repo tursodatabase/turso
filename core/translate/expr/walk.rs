@@ -207,6 +207,25 @@ pub fn expr_references_subquery_id(expr: &ast::Expr, subquery_id: TableInternalI
     found
 }
 
+/// Returns true if this expression holds a subquery, planned or not.
+pub fn expr_contains_subquery(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if matches!(
+            e,
+            ast::Expr::Subquery(_)
+                | ast::Expr::Exists(_)
+                | ast::Expr::InSelect { .. }
+                | ast::Expr::SubqueryResult { .. }
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
 pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
     let mut found = false;
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
