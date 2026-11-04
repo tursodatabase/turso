@@ -208,6 +208,24 @@ pub fn expr_references_subquery_id(expr: &ast::Expr, subquery_id: TableInternalI
 }
 
 /// Returns true if this expression holds a subquery, planned or not.
+/// True if the expression has a subquery the subquery planner has not
+/// planned yet (an EXISTS, a scalar subquery or an IN subquery still in its
+/// AST form), as against one already replaced by [ast::Expr::SubqueryResult].
+pub fn expr_contains_unplanned_subquery(expr: &ast::Expr) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if matches!(
+            e,
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. }
+        ) {
+            found = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
 pub fn expr_contains_subquery(expr: &ast::Expr) -> bool {
     let mut found = false;
     let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
