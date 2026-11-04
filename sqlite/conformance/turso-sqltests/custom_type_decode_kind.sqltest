@@ -83,6 +83,22 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test decode-kind-upsert-compares-decoded-values {
+    -- The DO UPDATE WHERE compares excluded.c and c as reals: as text,
+    -- '12.0' > 9.6 and '10.0' > 9.6 would both be false.
+    CREATE TYPE price(value any) BASE text ENCODE CAST(CAST(value AS real) AS text) DECODE CAST(value AS real);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c price, d integer) STRICT;
+    INSERT INTO t VALUES (1, 10, 0), (2, 10, 0);
+    INSERT INTO t VALUES (1, 12, 0) ON CONFLICT(id) DO UPDATE SET d = 1 WHERE excluded.c > 9.6;
+    INSERT INTO t VALUES (2, 12, 0) ON CONFLICT(id) DO UPDATE SET d = 2 WHERE c > 9.6;
+    SELECT id, c, d FROM t ORDER BY id;
+}
+expect {
+    1|10.0|1
+    2|10.0|2
+}
+
+@requires strict "uses STRICT tables"
 test decode-kind-nested-type-and-domain {
     -- A DECODE that casts to another custom type, or to a domain, reads as
     -- that type's kind.

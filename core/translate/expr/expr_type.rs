@@ -906,7 +906,8 @@ fn stored_type(type_def: &TypeDef) -> ExprType {
 /// The kind of value a custom type or domain reads as, worked out when the
 /// type is registered: the kind its DECODE gives, or without a DECODE the
 /// kind of its BASE. A domain reads as the type it is based on. `None` when
-/// the kind varies.
+/// the kind can't be worked out, such as a DECODE that gives a text or an integer
+/// depending on the value.
 pub(crate) fn value_type(
     type_def: &TypeDef,
     schema: &Schema,

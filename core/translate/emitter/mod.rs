@@ -204,6 +204,16 @@ impl RegisterColumn {
         }
     }
 
+    /// A column of the table being written whose register holds the value
+    /// DECODE gave, so comparisons use the affinity of that value's kind.
+    pub fn decoded_table_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
+        Self {
+            affinity: column.comparison_affinity(),
+            collation: crate::translate::collate::column_collation(column),
+            column_type: column_type(column, is_strict, schema),
+        }
+    }
+
     /// NEW.x or OLD.x in a trigger. It has the collation and type of column x
     /// but, as in SQLite, no affinity unless x is the rowid alias.
     /// See https://www.sqlite.org/forum/forumpost/819f2d6627

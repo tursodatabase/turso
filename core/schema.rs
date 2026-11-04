@@ -7794,8 +7794,8 @@ pub struct Column {
     /// types by `BTreeTable::resolve_custom_types`, never stored in the SQL.
     type_ordering: Option<TypeOrdering>,
     /// The affinity of the values a custom-type column reads as, which
-    /// comparisons use. `affinity()` is that of the stored form. None only
-    /// for a column without a custom type.
+    /// comparisons use. `affinity()` is that of the stored form. None for a
+    /// column without a custom type or array type, which compares by `affinity()`.
     value_affinity: Option<Affinity>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
@@ -8178,6 +8178,7 @@ impl Column {
             // Arrays are stored as record-format blobs regardless of element type.
             self.set_ty(Type::Blob);
             self.override_affinity(Affinity::Blob);
+            self.value_affinity = Some(Affinity::Blob);
             self.type_ordering = crate::translate::expr::expr_type::type_ordering(
                 &crate::translate::expr::expr_type::column_type(self, true, schema),
                 schema,

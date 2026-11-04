@@ -659,11 +659,7 @@ pub(super) fn choose_best_in_seek_candidate(
             }
 
             let lhs_affinity = if let Some(col_pos) = constraint.table_col_pos {
-                btree
-                    .columns()
-                    .get(col_pos)
-                    .map(|col| col.comparison_affinity())
-                    .unwrap_or(Affinity::Blob)
+                btree.columns()[col_pos].comparison_affinity()
             } else {
                 Affinity::Integer
             };
