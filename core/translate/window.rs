@@ -1,7 +1,7 @@
 use crate::alloc::TursoSliceExt;
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
 use crate::namespace::NamespaceRef;
-use crate::schema::INTEGER_RANGE_OFFSETS;
+use crate::schema::RangeOffsets;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
@@ -2715,12 +2715,13 @@ fn emit_window_range_test(
 }
 
 /// Fails unless a RANGE frame ordered by `order_expr` may have the offset
-/// `offset`. A custom type takes offsets of the types it declares, as
-/// PostgreSQL's `in_range` functions do: `RANGE BETWEEN 1 PRECEDING` works
-/// over a bigint, but not over a date, a uuid or a type made with CREATE TYPE.
-/// Arrays take none. SQLite's own types take any number, checked when the
-/// statement runs, as in SQLite, and smallint and bigint values, which are
-/// plain integers. Other custom types are refused there: `x + CAST(1 AS
+/// `offset`. A custom type takes the offsets it declares, as PostgreSQL's
+/// `in_range` functions do: `RANGE BETWEEN 1 PRECEDING` works over a bigint,
+/// but not over a date, a uuid or a type made with CREATE TYPE. Arrays take
+/// none. Other values, including those whose type nothing declares, sort with
+/// SQLite's comparison, so they take any number, checked when the statement
+/// runs, as in SQLite, and smallint and bigint values, which are plain
+/// integers. Other custom types are refused there: `x + CAST(1 AS
 /// numeric(5,2))` is a numeric, which doesn't compare with x's numbers.
 ///
 /// A parameter or a string is read as the column's type when the statement
@@ -2734,18 +2735,19 @@ fn check_range_offset_type(
 ) -> Result<Option<String>> {
     let schema = env.schema();
     let order_type = type_of(order_expr, env);
-    // The column type's name and the offset types it takes. None for SQLite's
-    // own types.
+    // The column type's name and the offsets it takes. None for values that
+    // sort with SQLite's comparison.
     let column = match &order_type {
         ExprType::Custom { type_def, .. } => schema
-            .range_offset_types(type_def)?
-            .map(|(base, offset_types)| (base.name.clone(), offset_types)),
-        ExprType::Array { .. } => Some((range_offset_type_name(&order_type, schema)?, &[][..])),
-        // The result of a custom type's operator that declares no result type.
-        ExprType::Unknown => Some(("unknown".to_string(), &[][..])),
+            .range_offsets(type_def)?
+            .map(|(base, offsets)| (base.name.clone(), offsets)),
+        ExprType::Array { .. } => Some((
+            range_offset_type_name(&order_type, schema)?,
+            RangeOffsets::None,
+        )),
         _ => None,
     };
-    if let Some((column_type, &[])) = &column {
+    if let Some((column_type, RangeOffsets::None)) = &column {
         crate::bail_parse_error!(
             "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {column_type}"
         );
@@ -2756,7 +2758,7 @@ fn check_range_offset_type(
         return Ok(None);
     }
     match column {
-        Some((column_type, offset_types))
+        Some((column_type, offsets))
             if matches!(
                 offset_type,
                 ExprType::Untyped | ExprType::Builtin(BuiltinType::Any)
@@ -2764,17 +2766,17 @@ fn check_range_offset_type(
         {
             // numeric's `+` and `-` read a string or parameter exactly, and
             // fail on one that isn't a number.
-            if !offset_types.contains(&"numeric") {
+            if offsets == RangeOffsets::Integer {
                 return Ok(Some(column_type));
             }
         }
-        Some((column_type, offset_types)) => {
+        Some((column_type, offsets)) => {
             let offset_type = range_offset_type_name(&offset_type, schema)?;
-            if !offset_types.contains(&offset_type.as_str()) {
+            if !offsets.type_names().contains(&offset_type.as_str()) {
                 crate::bail_parse_error!(
                     "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
                      {column_type} and offset type {offset_type}; cast the offset to {}",
-                    offset_types[0]
+                    offsets.type_names()[0]
                 );
             }
         }
@@ -2784,7 +2786,10 @@ fn check_range_offset_type(
         ) =>
         {
             let offset_type = range_offset_type_name(&offset_type, schema)?;
-            if !INTEGER_RANGE_OFFSETS.contains(&offset_type.as_str()) {
+            if !RangeOffsets::Integer
+                .type_names()
+                .contains(&offset_type.as_str())
+            {
                 crate::bail_parse_error!(
                     "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type \
                      {offset_type} over a value without a custom type; cast the offset to \
