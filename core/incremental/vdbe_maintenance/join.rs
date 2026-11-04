@@ -541,6 +541,7 @@ pub(super) fn emit_inner_join(
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::EngineDialect),
         None,
+        crate::security::roles::RoleId::SUPERUSER,
     );
 
     let emit_eph_insert = |program: &mut ProgramBuilder| {
@@ -792,6 +793,7 @@ pub(super) fn emit_semi_or_anti_join(
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::EngineDialect),
         None,
+        crate::security::roles::RoleId::SUPERUSER,
     );
 
     let state_cursor = program.alloc_cursor_id(CursorType::BTreeTable(state_table.clone()));

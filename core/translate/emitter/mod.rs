@@ -183,8 +183,10 @@ pub struct Resolver<'a> {
     /// not use a sequence or a PRAGMA anywhere, including inside a view.
     pub(crate) role_is_not_superuser: bool,
     /// The role whose access row-level security limits in the statement being
-    /// compiled. The superuser for statements the engine runs on its own
-    /// behalf and inside [`Resolver::without_row_security`].
+    /// compiled. Every caller of [`Resolver::new`] says which role it is, so
+    /// that compiling a statement as the superuser is a visible choice: the
+    /// engine makes it for the statements it runs on its own behalf and
+    /// inside [`Resolver::without_row_security`].
     pub(crate) row_security_role: RoleId,
 }
 
@@ -375,6 +377,7 @@ impl Resolver<'static> {
             DoubleQuotedDml::Enabled,
             Arc::new(crate::EngineDialect),
             None,
+            RoleId::SUPERUSER,
         )
     }
 }
@@ -401,6 +404,7 @@ impl<'a> Resolver<'a> {
         dqs_dml: DoubleQuotedDml,
         dialect: Arc<dyn crate::dialect::Dialect>,
         search_path: Option<&[String]>,
+        row_security_role: RoleId,
     ) -> Self {
         Self {
             catalog: CatalogContext::new(
@@ -425,7 +429,7 @@ impl<'a> Resolver<'a> {
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
             role_is_not_superuser: false,
-            row_security_role: RoleId::SUPERUSER,
+            row_security_role,
         }
     }
 

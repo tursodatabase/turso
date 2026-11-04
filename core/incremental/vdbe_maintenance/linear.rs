@@ -47,6 +47,7 @@ pub(super) fn emit_filter(
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::EngineDialect),
         None,
+        crate::security::roles::RoleId::SUPERUSER,
     );
     let (table_references, binding_remap) = stream_table_references(program, &input.schema);
 
@@ -394,6 +395,7 @@ fn emit_project_rows(
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::EngineDialect),
         None,
+        crate::security::roles::RoleId::SUPERUSER,
     );
     let (table_references, binding_remap) = stream_table_references(program, &input.schema);
 

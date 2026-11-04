@@ -181,6 +181,7 @@ fn emit_group_aggregate_rows(
         connection.get_dqs_dml().into(),
         Arc::new(crate::dialect::EngineDialect),
         None,
+        crate::security::roles::RoleId::SUPERUSER,
     );
 
     turso_assert!(

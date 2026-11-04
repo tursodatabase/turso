@@ -137,6 +137,13 @@ pub fn translate(
         connection.search_path()
     };
     let qualifiers = connection.qualifiers(schema);
+    // Only a statement of the connection's user is limited by row-level
+    // security. The engine's own statements read every row.
+    let row_security_role = if matches!(origin, crate::statement::StatementOrigin::Root) {
+        connection.current_role()
+    } else {
+        crate::security::roles::RoleId::SUPERUSER
+    };
     let mut resolver = Resolver::new(
         schema,
         connection.database_schemas(),
@@ -152,6 +159,7 @@ pub fn translate(
             connection.dialect()
         },
         search_path.as_deref(),
+        row_security_role,
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
@@ -164,9 +172,6 @@ pub fn translate(
     })?;
 
     let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
-    if check_privileges {
-        resolver.row_security_role = connection.current_role();
-    }
     if check_privileges
         && !resolver
             .schema()
