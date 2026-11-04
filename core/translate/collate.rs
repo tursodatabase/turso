@@ -543,13 +543,9 @@ pub fn in_subquery_collation(
     let rhs_type = query_column_type(query, column, resolver);
     let lhs_type = type_of(lhs, &lhs_context.type_env());
     let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
-    if has_collate {
-        check_type_accepts_collate(&lhs_type, schema)?;
-        check_type_accepts_collate(&rhs_type, schema)?;
-    }
     let orders = [
-        operand_order(&lhs_type, schema),
-        operand_order(&rhs_type, schema),
+        operand_order(&lhs_type, schema, has_collate)?,
+        operand_order(&rhs_type, schema, has_collate)?,
     ];
     if let Some(ordering) = common_ordering(orders, has_collate)? {
         return Ok(CollationSeq::Type(ordering));
@@ -698,10 +694,7 @@ fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
     for (expr, context) in exprs {
         let context = context.borrow();
         let ty = type_of(expr, &context.type_env());
-        if has_collate {
-            check_type_accepts_collate(&ty, context.schema())?;
-        }
-        orders.push(operand_order(&ty, context.schema()));
+        orders.push(operand_order(&ty, context.schema(), has_collate)?);
     }
     common_ordering(orders, has_collate)
 }
@@ -766,20 +759,23 @@ pub(crate) fn key_collation(
     }
 }
 
-/// Fails when `ty` is a custom type whose values take no COLLATE, as in
-/// PostgreSQL, where only text types take one: `date`, `uuid` and a type with
-/// an integer base don't, `varchar` and a type with a text base do. Arrays
-/// and SQLite's own types are left to the rules for their order.
+/// Fails when values of `ty` take no COLLATE. As in PostgreSQL, only text
+/// types take one: `date`, `uuid` and a type with an integer base don't,
+/// `varchar` and a type with a text base do. No array takes one, because
+/// arrays compare element by element without a collation, so the COLLATE
+/// would be ignored. SQLite's own types all take one.
 pub(crate) fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
-    let ExprType::Custom { type_def, .. } = ty else {
-        return Ok(());
+    let refused_type = match ty {
+        ExprType::Custom { type_def, .. } if !schema.type_accepts_collate(type_def)? => {
+            type_def.name.as_str()
+        }
+        ExprType::Array { .. } => type_ordering(ty, schema)
+            .expect("an array type has an order")
+            .name(),
+        _ => return Ok(()),
     };
-    if schema.type_accepts_collate(type_def)? {
-        return Ok(());
-    }
     Err(LimboError::ParseError(format!(
-        "collations are not supported by type {}",
-        type_def.name
+        "collations are not supported by type {refused_type}"
     )))
 }
 
@@ -803,14 +799,20 @@ enum OperandOrder {
     ArrayOfUnknownElements,
 }
 
-fn operand_order(ty: &ExprType, schema: &Schema) -> OperandOrder {
-    if ty.is_array_of_unknown_elements() {
-        return OperandOrder::ArrayOfUnknownElements;
+/// The order a value of type `ty` brings to a comparison. `has_collate` says
+/// whether a COLLATE applies to the compared values; it is an error when `ty`
+/// takes none.
+fn operand_order(ty: &ExprType, schema: &Schema, has_collate: bool) -> Result<OperandOrder> {
+    if has_collate {
+        check_type_accepts_collate(ty, schema)?;
     }
-    match type_ordering(ty, schema) {
+    if ty.is_array_of_unknown_elements() {
+        return Ok(OperandOrder::ArrayOfUnknownElements);
+    }
+    Ok(match type_ordering(ty, schema) {
         Some(ordering) => OperandOrder::Type(ordering),
         None => OperandOrder::None,
-    }
+    })
 }
 
 /// The collation of one expression, or None when it has none (SQLite's

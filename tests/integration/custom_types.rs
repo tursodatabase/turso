@@ -996,17 +996,15 @@ mod tests {
     }
 
     /// Only text types take a COLLATE, as in PostgreSQL. Tries every kind of
-    /// column type in every place a COLLATE can be written: a custom type
-    /// that isn't text refuses it, and every other type behaves as before.
+    /// column type in every place a COLLATE can be written: an array or a
+    /// custom type that isn't text refuses it, and every other type behaves
+    /// as before.
     #[test]
     fn test_collate_only_on_text_types() {
         enum Collate {
             Accepted,
             /// Refused with an error that names this type.
             Refused(&'static str),
-            /// An array: refused, naming this order, wherever its values are
-            /// compared, and accepted elsewhere.
-            Array(&'static str),
         }
         struct Kind {
             ty: &'static str,
@@ -1099,82 +1097,68 @@ mod tests {
                 strict: true,
                 stored: "ARRAY[1]",
                 probe: "ARRAY[1]",
-                collate: Collate::Array("array"),
+                collate: Collate::Refused("array"),
             },
             Kind {
                 ty: "text[]",
                 strict: true,
                 stored: "ARRAY['ABC']",
                 probe: "ARRAY['abc']",
-                collate: Collate::Array("text_array"),
+                collate: Collate::Refused("text_array"),
+            },
+            Kind {
+                ty: "date[]",
+                strict: true,
+                stored: "ARRAY['2024-01-02']",
+                probe: "ARRAY['2024-01-02']",
+                collate: Collate::Refused("text_array"),
             },
         ];
-        // (statement, whether it compares values of the column, whether it
-        // returns the count 1 when accepted). `{n}` keeps the names of
-        // created objects apart.
+        // (statement, whether it returns the count 1 when accepted). `{n}`
+        // keeps the names of created objects apart.
         let places = [
             (
                 "SELECT count(*) FROM t WHERE c = {probe} COLLATE NOCASE",
-                true,
                 true,
             ),
             (
                 "SELECT count(*) FROM t WHERE c COLLATE NOCASE = {probe}",
                 true,
-                true,
             ),
             (
                 "SELECT count(*) FROM t WHERE c COLLATE NOCASE IN ({probe})",
-                true,
                 true,
             ),
             // An IN list compares with the collation of its left side only.
             (
                 "SELECT count(*) FROM t WHERE c IN ({probe} COLLATE NOCASE)",
-                true,
                 false,
             ),
             (
                 "SELECT count(*) FROM t WHERE c IN (SELECT {probe} COLLATE NOCASE)",
                 true,
-                true,
             ),
-            ("SELECT c COLLATE NOCASE FROM t", false, false),
-            ("SELECT c FROM t ORDER BY c COLLATE NOCASE", true, false),
+            ("SELECT c COLLATE NOCASE FROM t", false),
+            ("SELECT c FROM t ORDER BY c COLLATE NOCASE", false),
             (
                 "SELECT c FROM t UNION SELECT c FROM t ORDER BY c COLLATE NOCASE",
-                true,
                 false,
             ),
-            (
-                "SELECT count(*) FROM t GROUP BY c COLLATE NOCASE",
-                true,
-                true,
-            ),
-            ("SELECT DISTINCT c COLLATE NOCASE FROM t", true, false),
-            (
-                "CREATE TABLE t{n}(c {ty} COLLATE NOCASE){strict}",
-                true,
-                false,
-            ),
+            ("SELECT count(*) FROM t GROUP BY c COLLATE NOCASE", true),
+            ("SELECT DISTINCT c COLLATE NOCASE FROM t", false),
+            ("CREATE TABLE t{n}(c {ty} COLLATE NOCASE){strict}", false),
             (
                 "CREATE TABLE t{n}(c {ty}, UNIQUE(c COLLATE NOCASE)){strict}",
-                true,
                 false,
             ),
             // Two key columns, because a key of only an integer[] column is
             // taken for a rowid alias (#11315).
             (
                 "CREATE TABLE t{n}(c {ty}, k integer, PRIMARY KEY(c COLLATE NOCASE, k)){strict}",
-                true,
                 false,
             ),
-            ("CREATE INDEX i{n} ON t(c COLLATE NOCASE)", true, false),
-            (
-                "ALTER TABLE t ADD COLUMN c{n} {ty} COLLATE NOCASE",
-                true,
-                false,
-            ),
+            ("CREATE INDEX i{n} ON t(c COLLATE NOCASE)", false),
+            ("ALTER TABLE t ADD COLUMN c{n} {ty} COLLATE NOCASE", false),
         ];
         for kind in &kinds {
             let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
@@ -1193,7 +1177,7 @@ mod tests {
                 .unwrap();
             conn.execute(format!("INSERT INTO t VALUES ({})", kind.stored))
                 .unwrap();
-            for (n, (place, compares, counts_rows)) in places.iter().enumerate() {
+            for (n, (place, counts_rows)) in places.iter().enumerate() {
                 let sql = place
                     .replace("{n}", &n.to_string())
                     .replace("{ty}", kind.ty)
@@ -1203,7 +1187,6 @@ mod tests {
                 let refused_by = match kind.collate {
                     Collate::Accepted => None,
                     Collate::Refused(name) => Some(name),
-                    Collate::Array(order) => compares.then_some(order),
                 };
                 match refused_by {
                     Some(name) => {
