@@ -1,5 +1,95 @@
 use super::*;
 
+/// Fails when a comparison, BETWEEN or IN list of this expression puts row
+/// values of different sizes side by side, as SQLite's resolver does before
+/// anything is folded: `1 OR (1, 2) = (1, 2, 3)` is "row value misused".
+/// A row value in any other place, like `(1, 2) + 1`, is only reported when
+/// it is compiled, so it is left alone here.
+pub fn reject_row_value_misuse(expr: &Expr) -> Result<()> {
+    walk_expr(expr, &mut |e| {
+        match e {
+            Expr::Binary(lhs, op, rhs) if is_comparison(op) => {
+                if let (Some(left), Some(right)) = (row_value_width(lhs), row_value_width(rhs)) {
+                    if left != right {
+                        crate::bail_parse_error!("row value misused");
+                    }
+                }
+            }
+            Expr::Between {
+                lhs, start, end, ..
+            } => {
+                if let (Some(left), Some(start), Some(end)) = (
+                    row_value_width(lhs),
+                    row_value_width(start),
+                    row_value_width(end),
+                ) {
+                    if left != start || left != end {
+                        crate::bail_parse_error!("row value misused");
+                    }
+                }
+            }
+            Expr::InList { lhs, rhs, .. } => {
+                let Some(left) = row_value_width(lhs) else {
+                    return Ok(WalkControl::Continue);
+                };
+                for element in rhs.iter() {
+                    let Some(width) = row_value_width(element) else {
+                        continue;
+                    };
+                    if width == left {
+                        continue;
+                    }
+                    if left == 1 {
+                        crate::bail_parse_error!("row value misused");
+                    }
+                    crate::bail_parse_error!(
+                        "IN(...) element has {width} term{} - expected {left}",
+                        if width == 1 { "" } else { "s" }
+                    );
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
+fn is_comparison(op: &ast::Operator) -> bool {
+    use ast::Operator::*;
+    matches!(
+        *op,
+        Equals | NotEquals | Less | LessEquals | Greater | GreaterEquals | Is | IsNot
+    )
+}
+
+/// How many values this operand stands for, when that is known before it is
+/// bound: a parenthesized list, a subquery with named result columns, or one
+/// value. None for a subquery with a `*` to expand.
+fn row_value_width(expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Parenthesized(exprs) => Some(exprs.len()),
+        Expr::Subquery(select) => select_column_count(select),
+        Expr::SubqueryResult {
+            query_type: SubqueryType::RowValue { num_regs, .. },
+            ..
+        } => Some(*num_regs),
+        _ => Some(1),
+    }
+}
+
+/// The number of result columns of a select, or None when a `*` has to be
+/// expanded to know it.
+pub(crate) fn select_column_count(select: &ast::Select) -> Option<usize> {
+    match &select.body.select {
+        ast::OneSelect::Select { columns, .. } => columns
+            .iter()
+            .all(|column| matches!(column, ast::ResultColumn::Expr(..)))
+            .then_some(columns.len()),
+        ast::OneSelect::Values(rows) => rows.first().map(|row| row.len()),
+    }
+}
+
 /// Get the number of values returned by an expression
 pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
     Ok(match unwrap_parens(expr)? {
