@@ -270,13 +270,13 @@ pub(crate) fn emit_store_value(
 }
 
 /// Emits what comparing the value in `reg` with stored values of `chain`'s
-/// types runs: each type's ENCODE, then the affinity of `base`, so the value
-/// has the kind the stored values have. COERCE does not run, and a value that
-/// doesn't convert is kept as it is.
+/// types runs: each type's ENCODE, then the affinity of `storage_class`, so
+/// the value has the kind the stored values have. COERCE does not run, and a
+/// value that doesn't convert is kept as it is.
 pub(crate) fn emit_encode_for_comparison(
     program: &mut ProgramBuilder,
     chain: &[crate::sync::Arc<TypeDef>],
-    base: &str,
+    storage_class: crate::types::StorageClass,
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
@@ -288,7 +288,7 @@ pub(crate) fn emit_encode_for_comparison(
     program.emit_insn(Insn::Affinity {
         start_reg: reg,
         count: std::num::NonZeroUsize::MIN,
-        affinities: Affinity::affinity(base).aff_mask().to_string(),
+        affinities: storage_class.affinity().aff_mask().to_string(),
     });
     Ok(())
 }

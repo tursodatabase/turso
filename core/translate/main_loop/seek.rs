@@ -84,7 +84,7 @@ pub(super) fn encode_seek_keys_for_custom_types(
         crate::translate::expr::emit_encode_for_comparison(
             program,
             &resolved.chain,
-            &resolved.primitive,
+            resolved.storage_class()?,
             reg,
             resolver,
         )?;

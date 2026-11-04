@@ -424,6 +424,10 @@ fn emit_encode(
             to.name
         )));
     }
+    let resolved = resolver
+        .schema()
+        .resolve_type_unchecked(&to.name)?
+        .ok_or_else(|| LimboError::InternalError(format!("type {} does not resolve", to.name)))?;
     program.emit_insn(Insn::Copy {
         src_reg: value_reg,
         dst_reg: dest_reg,
@@ -432,7 +436,7 @@ fn emit_encode(
     emit_encode_for_comparison(
         program,
         std::slice::from_ref(to),
-        to.base(),
+        resolved.storage_class()?,
         dest_reg,
         resolver,
     )
