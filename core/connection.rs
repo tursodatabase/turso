@@ -554,6 +554,11 @@ pub struct Connection {
     /// for its own rules. Only a Rust API caller (the sync engine's row
     /// replay) can set it.
     pub(super) triggers_enabled: AtomicBool,
+    /// Whether INSERT and UPDATE statements prepared on this connection write
+    /// the values they are given to custom-type columns as stored values,
+    /// without ENCODE. Set only on the connection VACUUM builds its copy of
+    /// the database with, like SQLite's `DBFLAG_Vacuum`.
+    pub(super) writes_stored_values: AtomicBool,
     /// Number of active top-level write statements on this connection.
     ///
     /// This is currently only 0 or 1. We return Busy instead of allowing a
@@ -2032,6 +2037,15 @@ impl Connection {
 
     pub fn triggers_enabled(&self) -> bool {
         self.triggers_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_writes_stored_values(&self, enable: bool) {
+        self.writes_stored_values.store(enable, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub(crate) fn writes_stored_values(&self) -> bool {
+        self.writes_stored_values.load(Ordering::Acquire)
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
