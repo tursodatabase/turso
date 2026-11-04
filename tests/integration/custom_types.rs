@@ -1042,6 +1042,14 @@ mod tests {
         "SELECT count(DISTINCT c) FROM t",
         "SELECT c FROM t ORDER BY c",
         "SELECT c FROM t ORDER BY +c",
+        // The planner drops these ORDER BY and DISTINCT keys, which PostgreSQL
+        // refuses all the same.
+        "SELECT c FROM t ORDER BY id, c",
+        "SELECT c FROM t ORDER BY rowid, c",
+        "SELECT count(*) FROM t ORDER BY c",
+        "SELECT EXISTS (SELECT 1 FROM t ORDER BY c)",
+        "SELECT EXISTS (SELECT DISTINCT c FROM t)",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM t ORDER BY c)",
         "SELECT min(c) FROM t",
         "SELECT max(c) FROM t",
         "SELECT c FROM t UNION SELECT d FROM t",
@@ -1095,6 +1103,8 @@ mod tests {
         "SELECT coalesce(c, d) FROM t",
         "SELECT CAST(c AS text) = 'x' FROM t",
         "SELECT c FROM t ORDER BY CAST(c AS text)",
+        "SELECT EXISTS (SELECT c FROM t ORDER BY id)",
+        "SELECT DISTINCT id FROM t WHERE c IS NULL",
         "SELECT count(c) FROM t",
         "CREATE INDEX i{n} ON t(CAST(c AS text))",
         "CREATE VIEW v{n} AS SELECT c FROM t",

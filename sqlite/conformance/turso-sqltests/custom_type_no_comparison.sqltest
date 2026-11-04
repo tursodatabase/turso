@@ -72,6 +72,51 @@ expect error {
     values of type json cannot be compared
 }
 
+# The planner drops ORDER BY terms after a rowid, since rows come out in rowid
+# order, but such a term is refused all the same, as in PostgreSQL.
+@requires strict "uses STRICT tables"
+test no-comparison-json-order-by-after-rowid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j json) STRICT;
+    INSERT INTO t VALUES (1, '{}');
+    SELECT j FROM t ORDER BY id, j;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+# EXISTS drops the ORDER BY and DISTINCT of its subquery.
+@requires strict "uses STRICT tables"
+test no-comparison-json-order-by-in-exists {
+    CREATE TABLE t(j json) STRICT;
+    INSERT INTO t VALUES ('{}');
+    SELECT EXISTS (SELECT 1 FROM t ORDER BY j);
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-distinct-in-exists {
+    CREATE TABLE t(j json) STRICT;
+    INSERT INTO t VALUES ('{}');
+    SELECT EXISTS (SELECT DISTINCT j FROM t);
+}
+expect error {
+    values of type json cannot be compared
+}
+
+# A query with an aggregate and no GROUP BY returns one row and drops its
+# ORDER BY.
+@requires strict "uses STRICT tables"
+test no-comparison-json-order-by-in-single-row-aggregate {
+    CREATE TABLE t(j json) STRICT;
+    INSERT INTO t VALUES ('{}');
+    SELECT count(*) FROM t ORDER BY j;
+}
+expect error {
+    values of type json cannot be compared
+}
+
 @requires strict "uses STRICT tables"
 test no-comparison-json-aggregates {
     CREATE TABLE t(j json) STRICT;

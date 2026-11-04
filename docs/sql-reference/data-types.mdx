@@ -171,7 +171,7 @@ INSERT INTO events VALUES (
 Values of `json`, `jsonb`, `inet`, `cidr`, `macaddr` and `macaddr8` are stored as the text or blob they were written as, and comparing that would give other answers than PostgreSQL. For example, PostgreSQL treats jsonb `'{"a":1,"b":2}'` and `'{"b":2,"a":1}'` as equal, and the same for inet `'::1'` and `'0:0:0:0:0:0:0:1'`. So any statement that compares these values is an error. The same applies to domains over these types, to STRUCT and UNION types, and to the result of `->` on a json or jsonb value. That covers:
 
 - `=`, `<`, `IS`, `IN`, `BETWEEN`, `CASE x WHEN` and `nullif`
-- `GROUP BY`, `DISTINCT`, `ORDER BY`, `PARTITION BY`, `min` and `max`
+- `GROUP BY`, `DISTINCT`, `ORDER BY`, `PARTITION BY`, `min` and `max`. `ORDER BY` and `DISTINCT` are refused even where they can't change the result, as in PostgreSQL: `ORDER BY id, body` when `id` is the INTEGER PRIMARY KEY, and inside `EXISTS (...)`.
 - joins on these columns, and `UNION`, `INTERSECT` and `EXCEPT`. `UNION ALL` works, since it keeps every row without comparing them; only an `ORDER BY` on one of these columns is refused.
 - `PRIMARY KEY`, `UNIQUE`, `REFERENCES`, and indexes on these columns or on expressions of these types (`CREATE INDEX ... ON docs((body -> 'a'))`)
 - arrays of these types (`json[]`, `ARRAY[inet_column]`, `array_agg(json_column)`, `array_append(arr, inet_column)`, `arr || inet_column`), and passing these values to any array function or operator (`array_position(arr, inet_column)`, `arr @> inet_column`), because array functions compare elements
