@@ -1096,7 +1096,7 @@ fn is_domain(ty: &ExprType) -> bool {
 /// The type a domain is based on, without parameters: the first custom type
 /// under the domain, or the built-in type it is stored as. Other types are
 /// returned unchanged.
-fn without_domain(ty: ExprType, schema: &Schema) -> ExprType {
+pub(crate) fn without_domain(ty: ExprType, schema: &Schema) -> ExprType {
     let ExprType::Custom { type_def, .. } = &ty else {
         return ty;
     };

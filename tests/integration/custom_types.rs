@@ -1143,6 +1143,10 @@ mod tests {
             ("CAST(1 AS bigint)", custom("bigint"), None),
             ("CAST(1 AS numeric(5, 2))", custom("numeric"), None),
             ("CAST(1 AS boolean)", custom("boolean"), None),
+            // A domain offset is checked as the type it is based on.
+            ("CAST(1 AS pos)", known("integer"), None),
+            ("CAST(1 AS big)", custom("bigint"), None),
+            ("CAST('2026-01-01' AS day)", custom("date"), None),
         ];
         // (frame, the rows it holds for the row `t` when ordered ascending,
         // and when ordered descending). `{k}` is the offset.
@@ -1272,7 +1276,7 @@ mod tests {
                                 OffsetType::Null => {
                                     let error = result.expect_err(&context).to_string();
                                     assert!(
-                                        error.contains("offset must be a non-negative number"),
+                                        error.contains("offset must be a non-negative"),
                                         "{context}: {error}"
                                     );
                                 }
@@ -1281,9 +1285,7 @@ mod tests {
                                 {
                                     let error = result.expect_err(&context).to_string();
                                     assert!(
-                                        error.contains(&format!(
-                                            "RANGE offset over column type {name} must be an integer"
-                                        )),
+                                        error.contains("offset must be a non-negative integer"),
                                         "{context}: {error}"
                                     );
                                 }

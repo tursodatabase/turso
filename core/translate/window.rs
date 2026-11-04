@@ -7,7 +7,7 @@ use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TranslateCtx};
-use crate::translate::expr::expr_type::{type_of, BuiltinType, ExprType, TypeEnv};
+use crate::translate::expr::expr_type::{type_of, without_domain, BuiltinType, ExprType, TypeEnv};
 use crate::translate::expr::{
     custom_operator_call, emit_operator_call_on_registers,
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
@@ -980,39 +980,18 @@ fn emit_frame_offset(
             dest_end: None,
         });
     }
-    emit_window_check_offset(program, reg, mode, pos);
-    if mode == turso_parser::ast::FrameMode::Range {
-        let window = plan.window.as_ref().expect("missing window");
-        let [(order_expr, ..)] = window.order_by.as_slice() else {
-            unreachable!("RANGE offsets require exactly one ORDER BY expression");
-        };
-        let context = ExprContext::new(Some(&plan.table_references), resolver);
-        if let Some(column_type) = check_range_offset_type(order_expr, expr, &context.type_env())? {
-            // A parameter or a string, whose number is known only now, over a
-            // column that takes only integer offsets: '1' becomes 1, and 1.5
-            // is an error, as PostgreSQL reads it as the column's type.
-            let label_ok = program.allocate_label();
-            let label_halt = program.allocate_label();
-            program.emit_insn(Insn::MustBeInt {
-                reg,
-                target_pc: Some(label_halt),
-            });
-            program.emit_insn(Insn::Goto {
-                target_pc: label_ok,
-            });
-            program.preassign_label_to_next_insn(label_halt);
-            program.emit_insn(Insn::Halt {
-                constraint_info: None,
-                err_code: crate::error::SQLITE_ERROR,
-                description: format!(
-                    "RANGE offset over column type {column_type} must be an integer"
-                ),
-                on_error: None,
-                description_reg: None,
-            });
-            program.preassign_label_to_next_insn(label_ok);
+    let integer_only = match mode {
+        turso_parser::ast::FrameMode::Range => {
+            let window = plan.window.as_ref().expect("missing window");
+            let [(order_expr, ..)] = window.order_by.as_slice() else {
+                unreachable!("RANGE offsets require exactly one ORDER BY expression");
+            };
+            let context = ExprContext::new(Some(&plan.table_references), resolver);
+            check_range_offset_type(order_expr, expr, &context.type_env())?
         }
-    }
+        _ => true,
+    };
+    emit_window_check_offset(program, reg, integer_only, pos);
     Ok(())
 }
 
@@ -1046,20 +1025,19 @@ fn is_constant_frame_offset(expr: &Expr, resolver: &Resolver<'_>) -> Result<bool
 }
 
 /// Emit a runtime check that the frame-offset register holds a
-/// non-negative integer, halting the program with the standard SQLite
-/// error message on failure. Mirrors `windowCheckValue` at
-/// `window.c:1482-1523`.
+/// non-negative integer, or with `integer_only` false a non-negative number,
+/// halting the program with the standard SQLite error message on failure.
+/// Mirrors `windowCheckValue` at `window.c:1482-1523`.
 fn emit_window_check_offset(
     program: &mut ProgramBuilder,
     offset_reg: usize,
-    mode: turso_parser::ast::FrameMode,
+    integer_only: bool,
     pos: FrameBoundPosition,
 ) {
-    use turso_parser::ast::FrameMode;
     let label_halt = program.allocate_label();
     let label_ok = program.allocate_label();
     let reg_zero = program.alloc_register();
-    if mode == FrameMode::Range {
+    if !integer_only {
         // A RANGE offset has to be a number. This checks that indirectly:
         // comparing with NUMERIC affinity turns a number (or numeric-looking
         // text) into a number, and in SQLite's type ordering numbers sort
@@ -1082,10 +1060,10 @@ fn emit_window_check_offset(
             collation: CollationSeq::for_internal_values(),
         });
     } else {
-        // A ROWS / GROUPS offset has to be an integer. MustBeInt converts
-        // it, or jumps to our own Halt if it can't — so the user gets
-        // SQLite's specific frame-offset error rather than a generic
-        // "datatype mismatch".
+        // A ROWS / GROUPS offset, or a RANGE offset over smallint or bigint,
+        // has to be an integer. MustBeInt converts it, or jumps to our own
+        // Halt if it can't — so the user gets SQLite's specific frame-offset
+        // error rather than a generic "datatype mismatch".
         program.emit_insn(Insn::MustBeInt {
             reg: offset_reg,
             target_pc: Some(label_halt),
@@ -1104,15 +1082,11 @@ fn emit_window_check_offset(
         collation: CollationSeq::for_internal_values(),
     });
     program.preassign_label_to_next_insn(label_halt);
-    let msg = match (mode, pos) {
-        (FrameMode::Range, FrameBoundPosition::Start) => {
-            "frame starting offset must be a non-negative number"
-        }
-        (FrameMode::Range, FrameBoundPosition::End) => {
-            "frame ending offset must be a non-negative number"
-        }
-        (_, FrameBoundPosition::Start) => "frame starting offset must be a non-negative integer",
-        (_, FrameBoundPosition::End) => "frame ending offset must be a non-negative integer",
+    let msg = match (integer_only, pos) {
+        (false, FrameBoundPosition::Start) => "frame starting offset must be a non-negative number",
+        (false, FrameBoundPosition::End) => "frame ending offset must be a non-negative number",
+        (true, FrameBoundPosition::Start) => "frame starting offset must be a non-negative integer",
+        (true, FrameBoundPosition::End) => "frame ending offset must be a non-negative integer",
     };
     program.emit_insn(Insn::Halt {
         constraint_info: None,
@@ -2724,23 +2698,24 @@ fn emit_window_range_test(
 /// integers. Other custom types are refused there: `x + CAST(1 AS
 /// numeric(5,2))` is a numeric, which doesn't compare with x's numbers.
 ///
+/// A domain is checked as the type it is based on, on either side.
+///
 /// A parameter or a string is read as the column's type when the statement
-/// runs, as PostgreSQL does. Over a column that takes only integer offsets
-/// this returns the column type's name: the offset must then be made an
-/// integer, or the statement fails.
-fn check_range_offset_type(
-    order_expr: &Expr,
-    offset: &Expr,
-    env: &TypeEnv,
-) -> Result<Option<String>> {
+/// runs, as PostgreSQL does. Returns whether the column takes only integer
+/// offsets: the offset must then be made an integer when the statement runs,
+/// so that '1' is 1 and '1.5' is an error.
+fn check_range_offset_type(order_expr: &Expr, offset: &Expr, env: &TypeEnv) -> Result<bool> {
     let schema = env.schema();
-    let order_type = type_of(order_expr, env);
+    let order_type = without_domain(type_of(order_expr, env), schema);
     // The column type's name and the offsets it takes. None for values that
     // sort with SQLite's comparison.
     let column = match &order_type {
-        ExprType::Custom { type_def, .. } => schema
-            .range_offsets(type_def)?
-            .map(|(base, offsets)| (base.name.clone(), offsets)),
+        ExprType::Custom { type_def, .. } => Some((
+            type_def.name.clone(),
+            type_def
+                .range_offsets
+                .expect("a type that is not a domain declares its RANGE offsets"),
+        )),
         ExprType::Array { .. } => Some((
             range_offset_type_name(&order_type, schema)?,
             RangeOffsets::None,
@@ -2752,24 +2727,16 @@ fn check_range_offset_type(
             "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {column_type}"
         );
     }
-    let offset_type = type_of(offset, env);
-    // A NULL offset fails when the statement runs, as any other NULL offset.
-    if matches!(offset_type, ExprType::Null) {
-        return Ok(None);
-    }
+    let integer_only = matches!(column, Some((_, RangeOffsets::Integer)));
+    let offset_type = without_domain(type_of(offset, env), schema);
     match column {
-        Some((column_type, offsets))
-            if matches!(
-                offset_type,
-                ExprType::Untyped | ExprType::Builtin(BuiltinType::Any)
-            ) =>
-        {
-            // numeric's `+` and `-` read a string or parameter exactly, and
-            // fail on one that isn't a number.
-            if offsets == RangeOffsets::Integer {
-                return Ok(Some(column_type));
-            }
-        }
+        // A NULL offset fails when the statement runs, as any other NULL
+        // offset. numeric's `+` and `-` read a string or parameter exactly,
+        // and fail on one that isn't a number.
+        _ if matches!(
+            offset_type,
+            ExprType::Null | ExprType::Untyped | ExprType::Builtin(BuiltinType::Any)
+        ) => {}
         Some((column_type, offsets)) => {
             let offset_type = range_offset_type_name(&offset_type, schema)?;
             if !offsets.type_names().contains(&offset_type.as_str()) {
@@ -2799,7 +2766,7 @@ fn check_range_offset_type(
         }
         None => {}
     }
-    Ok(None)
+    Ok(integer_only)
 }
 
 /// The name of `ty` in a RANGE offset error, as PostgreSQL would call it: a

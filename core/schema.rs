@@ -1945,22 +1945,6 @@ impl Schema {
         Ok(resolved.base_type().cloned())
     }
 
-    /// The type whose RANGE offsets values of `type_def` take, and those
-    /// offsets: `type_def` itself, or the type a domain is based on. None for a
-    /// domain over a plain SQLite type, which takes the offsets SQLite does.
-    pub fn range_offsets(
-        &self,
-        type_def: &Arc<TypeDef>,
-    ) -> Result<Option<(Arc<TypeDef>, RangeOffsets)>> {
-        let Some(base) = self.without_domains(type_def)? else {
-            return Ok(None);
-        };
-        let offsets = base
-            .range_offsets
-            .expect("a type that is not a domain declares its RANGE offsets");
-        Ok(Some((base, offsets)))
-    }
-
     /// Returns whether a domain in the column's type chain has NOT NULL, and the
     /// domain CHECK constraints with `value` rewritten to the column name.
     pub fn column_domain_constraints(

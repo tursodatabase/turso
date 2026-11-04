@@ -633,7 +633,29 @@ test cmp-bigint-window-range-decimal-string-offset-is-an-error {
     SELECT count(*) OVER (ORDER BY b RANGE BETWEEN '1.5' PRECEDING AND CURRENT ROW) FROM t;
 }
 expect error {
-    RANGE offset over column type bigint must be an integer
+    frame starting offset must be a non-negative integer
+}
+
+@requires strict "uses STRICT tables"
+test cmp-window-range-domain-offset-checked-as-its-base-type {
+    -- An offset of a domain over integer is an integer offset.
+    CREATE DOMAIN pos AS integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b bigint, n numeric(10,2), i integer) STRICT;
+    INSERT INTO t VALUES (1, 1, 1, 1), (2, 2, 2.5, 2), (3, 4, 4, 4);
+    SELECT 'b', count(*) OVER (ORDER BY b RANGE BETWEEN CAST(1 AS pos) PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    SELECT 'n', count(*) OVER (ORDER BY n RANGE BETWEEN CAST(1 AS pos) PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    SELECT 'i', count(*) OVER (ORDER BY i RANGE BETWEEN CAST(1 AS pos) PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+}
+expect {
+    b|1
+    b|2
+    b|1
+    n|1
+    n|1
+    n|1
+    i|1
+    i|2
+    i|1
 }
 
 @requires strict "uses STRICT tables"
