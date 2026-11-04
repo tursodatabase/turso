@@ -1920,6 +1920,27 @@ impl Schema {
         Ok(Some(ResolvedType { primitive, chain }))
     }
 
+    /// The plain SQL type the type takes as input: its input type, followed
+    /// through custom types. A type declared `(value date)` takes text, as
+    /// date is declared `(value text)`.
+    pub fn plain_input_type(&self, resolved: &ResolvedType) -> Result<String> {
+        let mut input_type = resolved.input_type().to_string();
+        let mut seen = vec![resolved.leaf().name.to_lowercase()];
+        while let Some(next) = self.resolve_type_unchecked(&input_type)? {
+            let name = input_type.to_lowercase();
+            if seen.contains(&name) {
+                return Err(LimboError::ParseError(format!(
+                    "the value types of type {} lead back to type {}",
+                    resolved.leaf().name,
+                    input_type
+                )));
+            }
+            seen.push(name);
+            input_type = next.input_type().to_string();
+        }
+        Ok(input_type)
+    }
+
     /// `type_def` itself, or the type a domain is based on: a domain stores,
     /// sorts and computes with its values as that type does. None for a domain
     /// over a plain SQLite type, such as `CREATE DOMAIN pos AS integer`.
@@ -5311,8 +5332,8 @@ impl BTreeTable {
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
                 col.override_affinity(Affinity::Blob);
-            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
-                col.ty_str = type_def.value_input_type().to_uppercase();
+            } else if let Some(resolved) = schema.resolve_type(&col.ty_str, table.is_strict)? {
+                col.ty_str = schema.plain_input_type(&resolved)?.to_uppercase();
             }
         }
         Ok(Arc::new(modified))

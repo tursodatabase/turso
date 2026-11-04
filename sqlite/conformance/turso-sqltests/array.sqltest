@@ -1919,3 +1919,10 @@ expect {
     {1,NULL}|2
     {NULL,0}|1
 }
+
+test array-cast-to-float-array-converts-elements-to-real {
+    SELECT CAST('{5,1.5}' AS FLOAT[]), typeof(CAST('{5}' AS FLOAT[])[1]), typeof(CAST('{5}' AS DOUBLE[])[1]);
+}
+expect {
+    {5.0,1.5}|real|real
+}

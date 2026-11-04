@@ -789,11 +789,11 @@ fn translate_cast_expr(
             // CAST to that type would, then stores it as a column of the type
             // does: CAST(5.5 AS smallint) is 5, as are CAST(5.5 AS bigint) and
             // CAST(5.5 AS d) for a domain d over integer.
-            let input_type = resolved.input_type();
+            let input_type = resolver.schema().plain_input_type(&resolved)?;
             if !input_type.eq_ignore_ascii_case("any") {
                 program.emit_insn(Insn::Cast {
                     reg: target_register,
-                    affinity: Affinity::of_written_type(input_type),
+                    affinity: Affinity::of_written_type(&input_type),
                 });
             }
             emit_store_value(program, &resolved, target_register, &ty_params, resolver)?;

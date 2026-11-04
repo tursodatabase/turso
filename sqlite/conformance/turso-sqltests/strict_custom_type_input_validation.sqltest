@@ -301,6 +301,24 @@ expect {
     integer|1|0
 }
 
+test cast-converts-to-the-plain-type-a-custom-value-type-takes {
+    CREATE TYPE ev(value date) BASE text ENCODE value DECODE value;
+    CREATE TYPE jv(value json) BASE text ENCODE value DECODE value;
+    CREATE TYPE bv(value bytea) BASE blob ENCODE value DECODE value;
+    SELECT CAST('2024-01-01' AS ev), CAST('[1]' AS jv), hex(CAST(x'ab' AS bv)), typeof(CAST('ab' AS bv));
+}
+expect {
+    2024-01-01|[1]|AB|blob
+}
+
+test cast-fails-when-value-types-lead-back-to-the-type {
+    CREATE TYPE cyc(value cyc) BASE text;
+    SELECT CAST('a' AS cyc);
+}
+expect error {
+    the value types of type cyc lead back to type cyc
+}
+
 test cast-to-domain-converts-as-its-base {
     CREATE DOMAIN d AS integer;
     SELECT typeof(CAST('7' AS d)), CAST('7' AS d);

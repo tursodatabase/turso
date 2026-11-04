@@ -2752,6 +2752,10 @@ pub fn op_array_encode(
                     SQLITE_CONSTRAINT
                 );
             }
+        } else if !element_type.eq_ignore_ascii_case("ANY") {
+            // A type name a STRICT column doesn't take, like FLOAT, converts
+            // as a column of that type in a non-STRICT table does.
+            apply_affinity_char(&mut reg_tmp, Affinity::affinity(element_type));
         }
         coerced_elements.push(reg_tmp.get_value().clone());
     }
