@@ -173,21 +173,20 @@ jobs:
         with:
           prefix-key: "v1-rust"
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install PostgreSQL 18 clients
+      - name: Install PostgreSQL clients
         run: |
+          pg_version=$(jq -r .postgres.version versions.json)
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl --fail --silent --show-error --location \
             https://www.postgresql.org/media/keys/ACCC4CF8.asc \
             -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
           echo 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main' | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update
-          sudo apt-get install -y postgresql-client-18
-          echo '/usr/lib/postgresql/18/bin' >> "$GITHUB_PATH"
+          sudo apt-get install -y "postgresql-client-$pg_version"
+          echo "/usr/lib/postgresql/$pg_version/bin" >> "$GITHUB_PATH"
       - name: Check fuzzer and comparison logic
         run: cargo test --locked --profile pg-dump-fuzzer -p turso_pg_dump_fuzzer
       - name: Compare generated PostgreSQL and Turso dumps
-        env:
-          POSTGRES_VERSION: "18"
         run: make -C postgres/conformance fuzz-pgdump FUZZ_ARGS='--cases 100 --fail-fast'
       - name: Upload generation report and failure artifacts
         if: always()

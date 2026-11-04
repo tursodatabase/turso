@@ -79,7 +79,7 @@ run-one-postgres: build-runner
 # PostgreSQL server. Prints its seed; rerun a failure with SEED=<n>, and
 # set GEN_CASES=<n> for more statements.
 run-sqlstate-fuzzer:
-	POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh cargo test -p turso_pg_server --test sqlstate_differential -- --nocapture
+	./with-postgres.sh cargo test -p turso_pg_server --test sqlstate_differential -- --nocapture
 
 build-dump-fuzzer:
 	cd $(ROOT_DIR) && cargo build $(FUZZER_CARGO_PROFILE) --package turso_pg_dump_fuzzer
@@ -87,11 +87,11 @@ build-dump-fuzzer:
 test-pgdump: build-tursopg build-dump-fuzzer
 	cd $(ROOT_DIR) && cargo test $(FUZZER_CARGO_PROFILE) --package turso_pg_dump_fuzzer
 	@for fixture in $(or $(FILE),$(wildcard pgdump/*.sql)); do \
-		POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results replay "$$fixture" || exit $$?; \
+		./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results replay "$$fixture" || exit $$?; \
 	done
 
 fuzz-pgdump: build-tursopg build-dump-fuzzer
-	POSTGRES_VERSION=$${POSTGRES_VERSION:-18} ./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results --profile $(PGDUMP_PROFILE) fuzz $(FUZZ_ARGS)
+	./with-postgres.sh "$(PGDUMP_FUZZER)" --binary "$(TURSOPG)" --output pgdump/results --profile $(PGDUMP_PROFILE) fuzz $(FUZZ_ARGS)
 
 # Run the upstream PostgreSQL regress corpus with pass/fail statuses.
 # Exit 0 means every test matched its status in run.py's STATUS table;

@@ -1,0 +1,9 @@
+{
+  "postgres": {
+    "version": "18"
+  },
+  "sqlite": {
+    "version": "3.50.4",
+    "release_year": 2025
+  }
+}

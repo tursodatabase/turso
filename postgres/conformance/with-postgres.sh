@@ -8,11 +8,12 @@
 # command, and removes the container.
 #
 # To test against another PostgreSQL version, set POSTGRES_VERSION, for
-# example POSTGRES_VERSION=18. To upgrade the version for everyone, change
-# the default below.
+# example POSTGRES_VERSION=17. To change the version for everyone, change
+# postgres.version in versions.json at the repository root.
 set -euo pipefail
 
-POSTGRES_VERSION="${POSTGRES_VERSION:-17}"
+VERSIONS_FILE="$(dirname "${BASH_SOURCE[0]}")/../../versions.json"
+POSTGRES_VERSION="${POSTGRES_VERSION:-$(jq -r .postgres.version "$VERSIONS_FILE")}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-mirror.gcr.io/library/postgres:$POSTGRES_VERSION}"
 
 if [[ -n "${PG_DSN:-}" ]]; then
