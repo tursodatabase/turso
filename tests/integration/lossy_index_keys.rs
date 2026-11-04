@@ -46,10 +46,13 @@
 //!                                          (col_*, tbl_* forms)
 //! - core/schema.rs                         automatic_from_primary_key/unique, and
 //!                                          loading an index from the schema table
-//! - core/translate/alter.rs                ALTER TABLE ADD COLUMN REFERENCES
-//!                                          (alter_references); ADD COLUMN UNIQUE
-//!                                          (alter_unique)
-//! - core/translate/alter.rs, vdbe/execute.rs   ALTER COLUMN ... TO (alter pairs)
+//! - core/translate/alter.rs                ALTER TABLE ADD COLUMN with REFERENCES,
+//!                                          UNIQUE or PRIMARY KEY (AddColumn* forms)
+//! - core/translate/alter.rs                ALTER COLUMN that gives a column with no
+//!                                          key a REFERENCES, UNIQUE or PRIMARY KEY
+//!                                          (AlterColumn* forms)
+//! - core/translate/alter.rs, vdbe/execute.rs   ALTER COLUMN ... TO on a column
+//!                                          that already has a key (alter pairs)
 //! - core/translate/fkeys.rs, insert.rs     FOREIGN KEY, both sides (fk_* forms)
 //! - core/translate/upsert.rs               ON CONFLICT target (upsert_target)
 //! - core/translate/optimizer/mod.rs        automatic index on a join
@@ -484,8 +487,14 @@ enum Form {
     FkBoth,
     /// `t.c` is a PRIMARY KEY that another table's FOREIGN KEY refers to.
     FkReferenced,
-    AlterUnique,
-    AlterReferences,
+    AddColumnUnique,
+    AddColumnPrimaryKey,
+    AddColumnReferences,
+    /// `t.x` has the base type and no key, and ALTER COLUMN changes it to
+    /// `c <type>` with the constraint.
+    AlterColumnUnique,
+    AlterColumnPrimaryKey,
+    AlterColumnReferences,
     UpsertTarget,
 }
 
@@ -513,8 +522,12 @@ const FORMS: &[Form] = &[
     Form::FkParent,
     Form::FkBoth,
     Form::FkReferenced,
-    Form::AlterUnique,
-    Form::AlterReferences,
+    Form::AddColumnUnique,
+    Form::AddColumnPrimaryKey,
+    Form::AddColumnReferences,
+    Form::AlterColumnUnique,
+    Form::AlterColumnPrimaryKey,
+    Form::AlterColumnReferences,
     Form::UpsertTarget,
 ];
 
@@ -712,19 +725,48 @@ fn script(form: Form, ty: &TypeSpec) -> Script {
             s.unique = Unique::OnC;
             s.not_null = true;
         }
-        Form::AlterUnique => {
+        Form::AddColumnUnique => {
             s.pre
                 .push("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER) STRICT".to_string());
             s.decl
                 .push(format!("ALTER TABLE t ADD COLUMN c {} UNIQUE", ty.name));
             s.data_phase = false;
         }
-        Form::AlterReferences => {
+        Form::AddColumnPrimaryKey => {
+            s.pre
+                .push("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER) STRICT".to_string());
+            s.decl.push(format!(
+                "ALTER TABLE t ADD COLUMN c {} PRIMARY KEY",
+                ty.name
+            ));
+            s.data_phase = false;
+        }
+        Form::AddColumnReferences => {
             s.pre.push(parent_base);
             s.pre
                 .push("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER) STRICT".to_string());
             s.decl.push(format!(
                 "ALTER TABLE t ADD COLUMN c {} REFERENCES p(c)",
+                ty.name
+            ));
+            s.data_phase = false;
+        }
+        Form::AlterColumnUnique | Form::AlterColumnPrimaryKey | Form::AlterColumnReferences => {
+            let constraint = match form {
+                Form::AlterColumnUnique => "UNIQUE",
+                Form::AlterColumnPrimaryKey => "PRIMARY KEY",
+                Form::AlterColumnReferences => {
+                    s.pre.push(parent_base);
+                    "REFERENCES p(c)"
+                }
+                _ => unreachable!(),
+            };
+            s.pre.push(format!(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, x {}) STRICT",
+                ty.base
+            ));
+            s.decl.push(format!(
+                "ALTER TABLE t ALTER COLUMN x TO c {} {constraint}",
                 ty.name
             ));
             s.data_phase = false;
@@ -758,10 +800,14 @@ fn expectation(form: Form, ty: &TypeSpec) -> Expect {
         | Form::IndexExprPlus
         | Form::IndexExprCastOwn
         | Form::IndexExprCastBase => Expect::Allow,
-        // SQLite refuses ADD COLUMN ... UNIQUE for every type.
-        Form::AlterUnique => {
+        // ADD COLUMN cannot add a UNIQUE or PRIMARY KEY column (SQLite's rule),
+        // and ALTER COLUMN follows the same rule, for every type.
+        Form::AddColumnUnique | Form::AlterColumnUnique => {
             Expect::RefuseExisting("Cannot add a UNIQUE column in ALTER TABLE statement".into())
         }
+        Form::AddColumnPrimaryKey | Form::AlterColumnPrimaryKey => Expect::RefuseExisting(
+            "Cannot add a PRIMARY KEY column in ALTER TABLE statement".into(),
+        ),
         // `p.c` has no unique key, so there is nothing to refuse for the type.
         Form::FkParent => {
             Expect::RefuseExisting("foreign key mismatch - \"t\" referencing \"p\"".into())
@@ -880,16 +926,11 @@ fn is_rowid_alias_type(ty: &TypeSpec) -> bool {
     ty.name == "integer"
 }
 
-/// ALTER COLUMN cases that cannot be set up or that have no key to check:
-///   - the starting type already refuses the key (a COLLATE on an array, an
-///     index on a type with a DECODE and no OPERATOR '<'), so the table cannot
-///     be created first;
-///   - an inline `INTEGER PRIMARY KEY` is the rowid, and ALTER COLUMN replaces the
-///     column with one that has no PRIMARY KEY, so no key is left (ALTER COLUMN
-///     drops the key silently today; not related to lossy types).
+/// ALTER COLUMN cases that cannot be set up: the starting type already refuses
+/// the key (a COLLATE on an array, an index on a type with a DECODE and no
+/// OPERATOR '<'), so the table cannot be created first.
 fn alter_case_is_skipped(form: Form, from: &TypeSpec) -> bool {
     matches!(expectation(form, from), Expect::RefuseExisting(_))
-        || (form == Form::ColPk && is_rowid_alias_type(from))
 }
 
 /// Types that only appear as the starting type of an ALTER COLUMN: the built-in
@@ -2207,7 +2248,7 @@ fn report(stats: &Stats, findings: &[Finding]) -> String {
     );
     let _ = writeln!(
         out,
-        "  ALTER COLUMN cases not run (starting type refuses the key, or no key is left): {}",
+        "  ALTER COLUMN cases not run (starting type refuses the key): {}",
         stats.alter_skipped
     );
     let _ = writeln!(out, "  unique-key model checks: {}", stats.unique_checks);

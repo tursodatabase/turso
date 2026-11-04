@@ -72,6 +72,18 @@ expect error {
     column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
 }
 
+# ALTER COLUMN that gives a column with no key a REFERENCES.
+@requires strict "uses STRICT tables"
+test lossy-alter-column-adds-references {
+    CREATE TYPE lossy_ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE parent(c text PRIMARY KEY) STRICT;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x text) STRICT;
+    ALTER TABLE t ALTER COLUMN x TO c lossy_ci REFERENCES parent(c);
+}
+expect error {
+    column 'c' of type 'lossy_ci' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value\. Index CAST\(c AS text\) instead
+}
+
 # Changing the type of a column that is already a key must be refused too.
 @requires strict "uses STRICT tables"
 test lossy-alter-column-type-of-a-key {

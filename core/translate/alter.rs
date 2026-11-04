@@ -1247,76 +1247,13 @@ pub fn translate_alter_table(
             // Add foreign key constraints and CHECK constraints to the btree table
             for constraint in &constraints {
                 match &constraint.constraint {
-                    ast::ColumnConstraint::ForeignKey {
-                        clause,
-                        defer_clause,
-                    } => {
-                        if clause.columns.len() > 1 {
-                            return Err(LimboError::ParseError(format!(
-                                "foreign key on {new_column_name} should reference only one column of table {}",
-                                clause.tbl_name.as_str()
-                            )));
-                        }
-                        let decl_order = btree
-                            .foreign_keys
-                            .iter()
-                            .map(|fk| fk.decl_order)
-                            .max()
-                            .map_or(0, |order| order + 1);
-                        let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
-                        let (parent_namespace, parent_table) = demangle_name(
+                    ast::ColumnConstraint::ForeignKey { .. } => {
+                        add_column_foreign_key(
+                            &mut btree,
+                            &new_column_name,
+                            constraint,
                             resolver.catalog.dialect.supports_namespaces(),
-                            &mangled_parent_table,
-                        );
-                        let fk = ForeignKey {
-                            constraint_name: constraint
-                                .name
-                                .as_ref()
-                                .map(|n| normalize_ident(n.as_str())),
-                            parent_table: parent_table.to_string(),
-                            parent_namespace,
-                            parent_columns: clause
-                                .columns
-                                .iter()
-                                .map(|c| normalize_ident(c.col_name.as_str()))
-                                .collect::<Vec<_>>()
-                                .into_boxed_slice(),
-                            on_delete: clause
-                                .args
-                                .iter()
-                                .find_map(|arg| {
-                                    if let ast::RefArg::OnDelete(act) = arg {
-                                        Some(*act)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(ast::RefAct::NoAction),
-                            on_update: clause
-                                .args
-                                .iter()
-                                .find_map(|arg| {
-                                    if let ast::RefArg::OnUpdate(act) = arg {
-                                        Some(*act)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or(ast::RefAct::NoAction),
-                            child_columns: Box::from([new_column_name.to_string()]),
-                            deferred: match defer_clause {
-                                Some(d) => {
-                                    d.deferrable
-                                        && matches!(
-                                            d.init_deferred,
-                                            Some(ast::InitDeferredPred::InitiallyDeferred)
-                                        )
-                                }
-                                None => false,
-                            },
-                            decl_order,
-                        };
-                        btree.foreign_keys.push(Arc::new(fk));
+                        )?;
                     }
                     ast::ColumnConstraint::Check { expr, source } => {
                         let column_names: Vec<&str> = btree
@@ -1966,6 +1903,21 @@ pub fn translate_alter_table(
                     table.rename_column_in_keys(old_name, new_name);
                 }
                 table.columns_mut()[column_index] = replacement_column.clone();
+                // An inline REFERENCES in the new definition is a new FOREIGN KEY
+                // of the table, so the key checks below see it.
+                for constraint in &definition.constraints {
+                    if matches!(
+                        constraint.constraint,
+                        ast::ColumnConstraint::ForeignKey { .. }
+                    ) {
+                        add_column_foreign_key(
+                            &mut table,
+                            col_name,
+                            constraint,
+                            resolver.catalog.dialect.supports_namespaces(),
+                        )?;
+                    }
+                }
                 table.resolve_custom_types(resolver.schema());
                 let column = &table.columns()[column_index];
                 key_collation(column.text_collation(), column.type_ordering())?;
@@ -2408,6 +2360,77 @@ pub fn translate_alter_table(
         }
     };
 
+    Ok(())
+}
+
+/// Adds the FOREIGN KEY of an inline `REFERENCES` clause on column
+/// `column_name` to `table`. `constraint` must be a
+/// [ast::ColumnConstraint::ForeignKey].
+fn add_column_foreign_key(
+    table: &mut BTreeTable,
+    column_name: &str,
+    constraint: &ast::NamedColumnConstraint,
+    supports_namespaces: bool,
+) -> Result<()> {
+    let ast::ColumnConstraint::ForeignKey {
+        clause,
+        defer_clause,
+    } = &constraint.constraint
+    else {
+        unreachable!("add_column_foreign_key called with a constraint that is not REFERENCES");
+    };
+    if clause.columns.len() > 1 {
+        return Err(LimboError::ParseError(format!(
+            "foreign key on {column_name} should reference only one column of table {}",
+            clause.tbl_name.as_str()
+        )));
+    }
+    let decl_order = table
+        .foreign_keys
+        .iter()
+        .map(|fk| fk.decl_order)
+        .max()
+        .map_or(0, |order| order + 1);
+    let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+    let (parent_namespace, parent_table) =
+        demangle_name(supports_namespaces, &mangled_parent_table);
+    let find_action = |on_delete: bool| {
+        clause
+            .args
+            .iter()
+            .find_map(|arg| match arg {
+                ast::RefArg::OnDelete(act) if on_delete => Some(*act),
+                ast::RefArg::OnUpdate(act) if !on_delete => Some(*act),
+                _ => None,
+            })
+            .unwrap_or(ast::RefAct::NoAction)
+    };
+    let fk = ForeignKey {
+        constraint_name: constraint
+            .name
+            .as_ref()
+            .map(|n| normalize_ident(n.as_str())),
+        parent_table: parent_table.to_string(),
+        parent_namespace,
+        parent_columns: clause
+            .columns
+            .iter()
+            .map(|c| normalize_ident(c.col_name.as_str()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        on_delete: find_action(true),
+        on_update: find_action(false),
+        child_columns: Box::from([column_name.to_string()]),
+        deferred: defer_clause.as_ref().is_some_and(|d| {
+            d.deferrable
+                && matches!(
+                    d.init_deferred,
+                    Some(ast::InitDeferredPred::InitiallyDeferred)
+                )
+        }),
+        decl_order,
+    };
+    table.foreign_keys.push(Arc::new(fk));
     Ok(())
 }
 
