@@ -516,8 +516,9 @@ fn emit_halt_if_table_has_rows(
 }
 
 /// Existing rows read the DEFAULT of a column added with a custom type as the
-/// type stores it, so when the table has rows, store the default once here: a
-/// default the type can't store fails the ALTER instead of every later read.
+/// type stores it, so when the table has rows, encode the default once here
+/// and discard it: a default the type can't store fails the ALTER instead of
+/// every later read.
 fn emit_add_column_custom_type_default_check(
     program: &mut ProgramBuilder,
     original_btree: &Arc<BTreeTable>,
@@ -537,24 +538,14 @@ fn emit_add_column_custom_type_default_check(
     }
     emit_if_table_has_rows(program, original_btree, database_id, |program| {
         let default_reg = program.alloc_register();
-        translate_expr_no_constant_opt(
+        crate::translate::expr::emit_encoded_default(
             program,
-            None,
+            column,
             default_expr,
-            default_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
-        crate::translate::expr::emit_custom_type_encode_columns(
-            program,
-            resolver,
-            std::slice::from_ref(column),
-            default_reg,
-            None,
             &original_btree.name,
-            &ColumnLayout::Identity { column_count: 1 },
-        )?;
-        Ok(())
+            default_reg,
+            resolver,
+        )
     })
 }
 

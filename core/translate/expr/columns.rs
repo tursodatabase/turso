@@ -148,6 +148,28 @@ pub fn emit_stored_column(
     program.emit_column_or_rowid(cursor_id, column_index, target_register);
     let has_field_label = program.allocate_label();
     program.emit_column_has_field(cursor_id, column_index, has_field_label);
+    emit_encoded_default(
+        program,
+        column,
+        default_expr,
+        &table.name,
+        target_register,
+        resolver,
+    )?;
+    program.preassign_label_to_next_insn(has_field_label);
+    Ok(())
+}
+
+/// Evaluates the DEFAULT of a custom-type column into `target_register` and
+/// encodes it as the type stores it.
+pub(crate) fn emit_encoded_default(
+    program: &mut ProgramBuilder,
+    column: &Column,
+    default_expr: &ast::Expr,
+    table_name: &str,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
     translate_expr_no_constant_opt(
         program,
         None,
@@ -162,9 +184,7 @@ pub fn emit_stored_column(
         std::slice::from_ref(column),
         target_register,
         None,
-        &table.name,
+        table_name,
         &ColumnLayout::Identity { column_count: 1 },
-    )?;
-    program.preassign_label_to_next_insn(has_field_label);
-    Ok(())
+    )
 }
