@@ -157,9 +157,14 @@ fn translate_expr_by_kind(
             target_register,
             resolver,
         ),
-        ast::Expr::Between { .. } => {
-            translate_between_expr(program, referenced_tables, expr, target_register, resolver)
-        }
+        ast::Expr::Between { .. } => translate_between_expr(
+            program,
+            referenced_tables,
+            expr,
+            target_register,
+            resolver,
+            BinaryEmitMode::Value,
+        ),
         ast::Expr::Binary(..) => {
             translate_binary_expr(program, referenced_tables, expr, target_register, resolver)
         }
