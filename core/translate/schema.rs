@@ -3510,6 +3510,15 @@ fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
     if type_registry_key(type_def.base()) == registry_key {
         return Ok(true);
     }
+    // `CREATE TYPE outer_t(value inner_t)` converts every value with inner_t.
+    if type_def
+        .params()
+        .iter()
+        .filter_map(|param| param.ty.as_deref())
+        .any(|name| type_registry_key(name) == registry_key)
+    {
+        return Ok(true);
+    }
     let struct_field_types = type_def
         .struct_def()
         .into_iter()

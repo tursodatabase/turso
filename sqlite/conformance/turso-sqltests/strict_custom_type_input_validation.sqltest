@@ -373,15 +373,24 @@ expect error {
     the value types of type cyc lead back to type cyc
 }
 
-test insert-refuses-a-value-type-that-was-dropped {
+test drop-type-refuses-a-type-another-type-takes-values-of {
     CREATE TYPE inner_t(value text) BASE text;
     CREATE TYPE outer_t(value inner_t) BASE text;
     DROP TYPE inner_t;
-    CREATE TABLE t(c outer_t) STRICT;
-    INSERT INTO t VALUES ('x');
 }
 expect error {
-    type outer_t takes values of type inner_t, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
+    cannot drop type inner_t: type outer_t depends on it
+}
+
+test drop-type-succeeds-once-no-type-takes-values-of-it {
+    CREATE TYPE inner_t(value text) BASE text;
+    CREATE TYPE outer_t(value inner_t) BASE text;
+    DROP TYPE outer_t;
+    DROP TYPE inner_t;
+    SELECT count(*) FROM sqlite_turso_types WHERE name IN ('inner_t', 'outer_t');
+}
+expect {
+    0
 }
 
 test add-virtual-column-refuses-rows-its-custom-type-refuses {
@@ -420,16 +429,6 @@ expect {
     eq||
     lt|1,2|1,2
     gt||
-}
-
-test cast-refuses-a-value-type-that-was-dropped {
-    CREATE TYPE inner_t(value text) BASE text;
-    CREATE TYPE outer_t(value inner_t) BASE text;
-    DROP TYPE inner_t;
-    SELECT CAST('x' AS outer_t);
-}
-expect error {
-    type outer_t takes values of type inner_t, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
 }
 
 test cast-to-domain-converts-as-its-base {
