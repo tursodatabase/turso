@@ -277,11 +277,28 @@ expect {
     integer|5
 }
 
-test cast-to-smallint-refuses-a-fraction {
-    SELECT CAST(5.5 AS smallint);
+test cast-to-integer-types-converts-as-sqlite-cast {
+    CREATE DOMAIN d2 AS smallint;
+    CREATE DOMAIN d8 AS bigint;
+    SELECT CAST(5.5 AS smallint), CAST(5.5 AS int2), CAST(5.5 AS d2), CAST(5.5 AS bigint), CAST(5.5 AS int8), CAST(5.5 AS d8);
+}
+expect {
+    5|5|5|5|5|5
+}
+
+test cast-to-smallint-checks-range-after-converting {
+    SELECT CAST(40000.5 AS smallint);
 }
 expect error {
-    cannot store REAL value as type smallint
+    integer out of range for smallint
+}
+
+test cast-converts-to-the-value-type-before-encode {
+    CREATE TYPE iv(value integer) BASE integer ENCODE CAST(value AS text) DECODE value;
+    SELECT typeof(CAST(1.5 AS iv)), CAST(1.5 AS iv), CAST('abc' AS iv);
+}
+expect {
+    integer|1|0
 }
 
 test cast-to-domain-converts-as-its-base {

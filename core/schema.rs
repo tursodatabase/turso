@@ -435,6 +435,16 @@ impl ResolvedType {
         self.chain.iter().find(|type_def| !type_def.is_domain)
     }
 
+    /// The SQL type the type takes as input: the `value` type of the type, or
+    /// of the type a domain is based on, or the plain type a domain is based
+    /// on.
+    pub fn input_type(&self) -> &str {
+        self.base_type()
+            .map_or(self.primitive.as_str(), |type_def| {
+                type_def.value_input_type()
+            })
+    }
+
     /// The kind of value the type stores: the kind of its BASE, or of the
     /// plain type a domain is based on.
     pub fn stored_value_type(&self) -> crate::Result<crate::types::ValueType> {

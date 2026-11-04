@@ -246,7 +246,7 @@ SELECT -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1;
 -- -1.50|2.50
 ```
 
-A type with no ENCODE, COERCE or DECODE, such as `bigint` or `bytea`, holds its value as its BASE, so a CAST to it is SQLite's CAST to the BASE: `CAST(1.5 AS bigint)` is `1`, and `CAST('ab' AS bytea)` is a blob.
+A CAST first converts the value to the type's `value` type as SQLite's CAST does, then runs ENCODE and COERCE. `CAST(5.5 AS smallint)` and `CAST(5.5 AS bigint)` are `5`, `CAST('ab' AS bytea)` is a blob, and `CAST(40000.5 AS smallint)` fails smallint's range check. A type without a `value` type takes its BASE as input type; `value any` converts nothing.
 
 A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the value as the column holds it.
 
