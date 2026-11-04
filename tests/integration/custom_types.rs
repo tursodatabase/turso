@@ -1240,6 +1240,20 @@ mod tests {
                 });
             }
         }
+        // Stored forms that sort in the opposite order of the values.
+        let negated = "CREATE TYPE t_neg(value integer) BASE integer ENCODE -value DECODE -value";
+        kinds.push(Kind {
+            setup: negated.to_string(),
+            ty: "t_neg".to_string(),
+            name: "t_neg".to_string(),
+            sample: "7",
+        });
+        kinds.push(Kind {
+            setup: format!("{negated}; CREATE DOMAIN dom_t_neg AS t_neg"),
+            ty: "dom_t_neg".to_string(),
+            name: "dom_t_neg".to_string(),
+            sample: "7",
+        });
         for (base, sample) in [
             ("integer", "7"),
             ("uuid", "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'"),
@@ -1347,6 +1361,36 @@ mod tests {
                     "SELECT count(*) FROM t WHERE a = ARRAY[(SELECT w FROM t)]",
                     1,
                 );
+            }
+
+            // Elements sort and compare by their values, with and without an
+            // index, for types whose values are numbers: 7 sorts before 8.
+            if s == "7" {
+                run(&format!(
+                    "CREATE TABLE o(id INTEGER PRIMARY KEY, a {ty}[]) STRICT"
+                ));
+                run("INSERT INTO o VALUES (1, ARRAY[7]), (2, ARRAY[8])");
+                let sorts_by_value = |step: &str| {
+                    for (sql, expected) in [
+                        (
+                            "SELECT group_concat(id) FROM (SELECT id FROM o ORDER BY a[1])",
+                            "1,2",
+                        ),
+                        (
+                            "SELECT group_concat(o1.id || '<' || o2.id) \
+                             FROM o o1, o o2 WHERE o1.a < o2.a",
+                            "1<2",
+                        ),
+                    ] {
+                        let rows: Vec<(String,)> = conn.exec_rows(sql);
+                        assert_eq!(rows, vec![(expected.to_string(),)], "{ty}: {sql} ({step})");
+                    }
+                };
+                sorts_by_value("without an index");
+                if element_index_works {
+                    run("CREATE INDEX oa ON o(a)");
+                    sorts_by_value("with an index");
+                }
             }
 
             run("UPDATE t SET w = w, a = array_append(a, w)");

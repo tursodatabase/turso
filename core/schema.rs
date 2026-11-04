@@ -7759,9 +7759,20 @@ impl Column {
     /// Whether an index on this column is ordered differently from how its
     /// values compare. A custom type without an ordering is indexed by its
     /// stored form, which does not sort like the values the column reads as,
-    /// so such an index can serve `=` but not a range or ORDER BY.
+    /// so such an index can serve `=` but not a range or ORDER BY. An array
+    /// holds the values of its elements and is indexed by their stored forms,
+    /// so it follows its element type.
     pub fn index_order_differs_from_value_order(&self, schema: &Schema, is_strict: bool) -> bool {
-        self.type_ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
+        let ordering = if self.is_array() {
+            schema
+                .resolve_type(&self.ty_str, is_strict)
+                .ok()
+                .flatten()
+                .and_then(|resolved| resolved.ordering())
+        } else {
+            self.type_ordering
+        };
+        ordering.is_none() && schema.get_type_def(&self.ty_str, is_strict).is_some()
     }
     /// Fill in what a column of a STRICT table gets from its custom type: the
     /// type, affinity and key order of the type it is stored as. Every path
