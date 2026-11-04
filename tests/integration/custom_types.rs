@@ -1002,8 +1002,7 @@ mod tests {
                 RowCopy::DropColumn,
                 RowCopy::OnUpdateCascade,
             ] {
-                // Array columns can't be keys, so they can't be cascaded.
-                if row_copy == RowCopy::OnUpdateCascade && copied_type.column_type.ends_with("[]") {
+                if row_copy == RowCopy::OnUpdateCascade && copied_type.new_key.is_none() {
                     continue;
                 }
                 let column_type = copied_type.column_type;
@@ -1030,33 +1029,36 @@ mod tests {
         "CREATE TYPE shout BASE text ENCODE upper(value) DECODE lower(value)",
     ];
 
+    // Arrays and types with a DECODE other than `value` can't be keys, so
+    // they have no ON UPDATE CASCADE copy.
     const COPIED_TYPES: &[CopiedType] = &[
-        CopiedType::new("plus1", "5", "9"),
-        CopiedType::new("x100", "1", "2"),
-        CopiedType::new("cents", "42", "43"),
-        CopiedType::new("shout", "'Hi'", "'Yo'"),
-        CopiedType::new("plus1[]", "ARRAY[1, 2]", "ARRAY[3]"),
-        CopiedType::new("shout[]", "ARRAY['a', 'B']", "ARRAY['c']"),
+        CopiedType::new("plus1", "5", Some("9")),
+        CopiedType::new("x100", "1", Some("2")),
+        CopiedType::new("cents", "42", None),
+        CopiedType::new("shout", "'Hi'", None),
+        CopiedType::new("plus1[]", "ARRAY[1, 2]", None),
+        CopiedType::new("shout[]", "ARRAY['a', 'B']", None),
     ];
 
-    /// A custom-type column and two values to write to it.
+    /// A custom-type column and the values to write to it.
     struct CopiedType {
         column_type: &'static str,
         value: &'static str,
-        /// The parent key's new value in the ON UPDATE CASCADE copy.
-        new_value: &'static str,
+        /// The parent key's new value in the ON UPDATE CASCADE copy, or
+        /// `None` if the type can't be a key.
+        new_key: Option<&'static str>,
     }
 
     impl CopiedType {
         const fn new(
             column_type: &'static str,
             value: &'static str,
-            new_value: &'static str,
+            new_key: Option<&'static str>,
         ) -> Self {
             Self {
                 column_type,
                 value,
-                new_value,
+                new_key,
             }
         }
     }
@@ -1087,7 +1089,7 @@ mod tests {
         let CopiedType {
             column_type,
             value,
-            new_value,
+            new_key,
         } = copied_type;
         match row_copy {
             RowCopy::Vacuum | RowCopy::VacuumInto => {
@@ -1127,7 +1129,8 @@ mod tests {
                 ))?;
                 conn.execute(format!("INSERT INTO parent VALUES ({value})"))?;
                 conn.execute(format!("INSERT INTO child VALUES (1, {value})"))?;
-                conn.execute(format!("UPDATE parent SET k = {new_value}"))?;
+                let new_key = new_key.expect("only key types are cascaded");
+                conn.execute(format!("UPDATE parent SET k = {new_key}"))?;
                 Ok((
                     first_value(&conn, "SELECT k FROM parent")?,
                     first_value(&conn, "SELECT k FROM child")?,
