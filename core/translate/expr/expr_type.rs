@@ -253,6 +253,10 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             type_name: Some(type_name),
             ..
         } => cast_type(type_name, env.schema()),
+        // SQLite's CAST without a type name converts as a CAST to NUMERIC does.
+        ast::Expr::Cast {
+            type_name: None, ..
+        } => ExprType::Builtin(BuiltinType::Numeric),
         ast::Expr::Unary(op, inner) => match op {
             ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Integer),
             ast::UnaryOperator::BitwiseNot => {
@@ -332,10 +336,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         | ast::Expr::DoublyQualified(..)
         | ast::Expr::Subquery(_)
         | ast::Expr::Default
-        | ast::Expr::FieldAccess { resolved: None, .. }
-        | ast::Expr::Cast {
-            type_name: None, ..
-        } => ExprType::Unknown,
+        | ast::Expr::FieldAccess { resolved: None, .. } => ExprType::Unknown,
         // A row value such as `(a, b)` or `(SELECT x, y ...)` is not one value.
         ast::Expr::Parenthesized(_)
         | ast::Expr::SubqueryResult {

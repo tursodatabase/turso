@@ -754,6 +754,50 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-date-operator-result-window-range-offset {
+    -- date - date is a number of days, an integer, so it takes RANGE offsets.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t(d) VALUES ('2026-01-01'), ('2026-01-02'), ('2026-01-04');
+    SELECT count(*) OVER (ORDER BY d - CAST('2026-01-01' AS date) RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+}
+expect {
+    1
+    2
+    1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-date-operator-date-result-window-range-offset-is-an-error {
+    -- date + 1 is a date, which takes no RANGE offsets.
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) OVER (ORDER BY d + 1 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-missing-operator-window-range-offset-is-an-error {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) OVER (ORDER BY d * d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    operator does not exist: date \* date
+}
+
+@requires strict "uses STRICT tables"
+test cmp-array-operator-window-range-offset-is-an-error {
+    -- Nothing declares the type of + on an array, so the value takes no RANGE
+    -- offsets.
+    CREATE TABLE t(a integer[]) STRICT;
+    INSERT INTO t VALUES ('{1}');
+    SELECT count(*) OVER (ORDER BY a + 1 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type value
+}
+
+@requires strict "uses STRICT tables"
 test cmp-text-array-elements-compare-as-text {
     -- The elements of a text[] are texts, also when an array is read from its
     -- text form: '{1}' and '{1.0}' are different arrays, and '{b,10}' sorts

@@ -964,7 +964,8 @@ fn emit_frame_offset(
     mode: turso_parser::ast::FrameMode,
     pos: FrameBoundPosition,
 ) -> Result<()> {
-    if is_constant_frame_offset(expr, resolver)? {
+    let is_constant = is_constant_frame_offset(expr, resolver)?;
+    if is_constant {
         translate_expr_no_constant_opt(
             program,
             Some(&plan.table_references),
@@ -986,7 +987,7 @@ fn emit_frame_offset(
                 unreachable!("RANGE offsets require exactly one ORDER BY expression");
             };
             let context = ExprContext::new(Some(&plan.table_references), resolver);
-            check_range_offset_type(order_expr, expr, &context.type_env())?
+            check_range_offset_type(order_expr, is_constant.then_some(expr), &context.type_env())?
         }
         turso_parser::ast::FrameMode::Rows | turso_parser::ast::FrameMode::Groups => true,
     };
@@ -2691,9 +2692,9 @@ fn emit_window_range_test(
 /// `offset`. A custom type takes the offsets its RangeOffsets kind takes, as
 /// PostgreSQL's `in_range` functions do: `RANGE BETWEEN 1 PRECEDING` works
 /// over a bigint, but not over a date, a uuid or a type made with CREATE
-/// TYPE. Arrays take none. Other values, including those whose type nothing
-/// declares, sort with SQLite's comparison, so they take any number, checked
-/// when the statement runs, as in SQLite, and smallint and bigint values,
+/// TYPE. Arrays take none, and neither do values whose type nothing declares,
+/// since they may be custom-type values. Other values sort with SQLite's
+/// comparison, so they take any number, checked when the statement runs, as in SQLite, and smallint and bigint values,
 /// which are plain integers. Other custom types are refused there: `x +
 /// CAST(1 AS numeric(5,2))` is a numeric, which doesn't compare with x's
 /// numbers.
@@ -2704,10 +2705,20 @@ fn emit_window_range_test(
 /// runs, as PostgreSQL does. Returns whether the column takes only integer
 /// offsets: the offset must then be made an integer when the statement runs,
 /// so that '1' is 1 and '1.5' is an error.
-fn check_range_offset_type(order_expr: &Expr, offset: &Expr, env: &TypeEnv) -> Result<bool> {
+///
+/// `offset` is None when it is not a constant: the frame then reads it as
+/// NULL, as SQLite does.
+fn check_range_offset_type(
+    order_expr: &Expr,
+    offset: Option<&Expr>,
+    env: &TypeEnv,
+) -> Result<bool> {
     let schema = env.schema();
     let order_type = without_domain(type_of(order_expr, env), schema);
-    let offset_type = without_domain(type_of(offset, env), schema);
+    let offset_type = match offset {
+        Some(offset) => without_domain(type_of(offset, env), schema),
+        None => ExprType::Null,
+    };
     let column = range_column(&order_type);
     match (column, range_offset(&offset_type)) {
         (RangeColumn::Custom(RangeOffsets::None), _) => crate::bail_parse_error!(
@@ -2755,11 +2766,13 @@ enum RangeColumn {
     Custom(RangeOffsets),
 }
 
-/// `ty` is not a domain.
+/// `ty` is not a domain. A value whose type nothing declares, such as the
+/// result of `+` on an array, may be a custom type's value, so it takes no
+/// offsets.
 fn range_column(ty: &ExprType) -> RangeColumn {
     match ty {
         ExprType::Custom { type_def, .. } => RangeColumn::Custom(declared_range_offsets(type_def)),
-        ExprType::Array { .. } => RangeColumn::Custom(RangeOffsets::None),
+        ExprType::Array { .. } | ExprType::Unknown => RangeColumn::Custom(RangeOffsets::None),
         ExprType::Builtin(
             BuiltinType::Integer
             | BuiltinType::Real
@@ -2770,8 +2783,7 @@ fn range_column(ty: &ExprType) -> RangeColumn {
             | BuiltinType::Any,
         )
         | ExprType::Untyped
-        | ExprType::Null
-        | ExprType::Unknown => RangeColumn::Sqlite,
+        | ExprType::Null => RangeColumn::Sqlite,
     }
 }
 
@@ -2791,8 +2803,7 @@ enum RangeOffset {
 /// `ty` is not a domain. An integer written in the statement is an integer
 /// and a decimal such as 1.5 is a numeric, as in PostgreSQL. A real is
 /// inexact, and SQLite's `CAST(x AS numeric)` may give one. A value whose type
-/// is only known when the statement runs, such as a subquery's, is refused
-/// over a custom type, since it may not be a number.
+/// nothing declares may be a custom type's value, so it is refused everywhere.
 fn range_offset(ty: &ExprType) -> RangeOffset {
     match ty {
         ExprType::Null | ExprType::Untyped | ExprType::Builtin(BuiltinType::Any) => {
@@ -2802,10 +2813,9 @@ fn range_offset(ty: &ExprType) -> RangeOffset {
         ExprType::Builtin(BuiltinType::Decimal) => RangeOffset::Plain(RangeOffsets::Numeric),
         ExprType::Builtin(
             BuiltinType::Real | BuiltinType::Numeric | BuiltinType::Text | BuiltinType::Blob,
-        )
-        | ExprType::Unknown => RangeOffset::Plain(RangeOffsets::None),
+        ) => RangeOffset::Plain(RangeOffsets::None),
         ExprType::Custom { type_def, .. } => RangeOffset::Custom(declared_range_offsets(type_def)),
-        ExprType::Array { .. } => RangeOffset::Custom(RangeOffsets::None),
+        ExprType::Array { .. } | ExprType::Unknown => RangeOffset::Custom(RangeOffsets::None),
     }
 }
 

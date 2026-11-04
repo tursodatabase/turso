@@ -1071,8 +1071,7 @@ mod tests {
                 offsets: Offsets::Sqlite,
             },
             // SQLite's CAST to numeric, a decimal, a string, NULL, and a CAST
-            // without a type name, whose type is only known when the
-            // statement runs.
+            // without a type name.
             sqlite_order("CAST(c AS numeric)"),
             sqlite_order("0.5"),
             sqlite_order("'a'"),
@@ -1117,6 +1116,34 @@ mod tests {
             kind("cents", no_values, none("cents")),
             kind("label", no_values, none("label")),
             kind("integer[]", no_values, none("integer[]")),
+            // Values built from a custom column with an operator: `date - date`
+            // is an integer, and `date + 1` is a date.
+            Kind {
+                ty: "date",
+                strict: true,
+                order: "c - c",
+                values: ["'2026-01-01'", "'2026-01-02'", "'2026-01-04'"],
+                offsets: Offsets::Sqlite,
+            },
+            Kind {
+                order: "c + 1",
+                ..kind("date", no_values, none("date"))
+            },
+            // `+` on an array gives a value whose type nothing declares, which
+            // may be a custom type's value.
+            Kind {
+                order: "c + 1",
+                ..kind("integer[]", no_values, none("value"))
+            },
+            // SQLite's CAST without a type name gives a SQLite number, also
+            // from a custom type's value.
+            Kind {
+                ty: "numeric(10, 2)",
+                strict: true,
+                order: "CAST(c AS)",
+                values: ["1", "2.5", "4"],
+                offsets: Offsets::Sqlite,
+            },
         ];
         enum OffsetType {
             /// Known when the statement is prepared. An error names it `name`.
@@ -1163,9 +1190,17 @@ mod tests {
             ("CAST(1.5 AS REAL)", known("real", Number::None), None),
             ("x'01'", known("blob", Number::None), None),
             ("CAST(1 AS TEXT)", known("text", Number::None), None),
-            // A CAST without a type name, whose type is only known when the
-            // statement runs.
-            ("CAST(1 AS)", known("value", Number::None), None),
+            // SQLite's CAST without a type name, which converts as a CAST to
+            // NUMERIC does.
+            ("CAST(1 AS)", known("numeric", Number::None), None),
+            // `+` on an array, whose type nothing declares.
+            (
+                "CAST('{1}' AS integer[]) + 1",
+                custom("value", Number::None),
+                None,
+            ),
+            // An offset that is not a constant is NULL, as in SQLite.
+            ("(SELECT 1)", OffsetType::Null, None),
             (
                 "CAST('{1}' AS integer[])",
                 custom("integer[]", Number::None),
