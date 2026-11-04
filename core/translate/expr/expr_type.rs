@@ -10,7 +10,7 @@ use turso_parser::ast;
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
-use crate::schema::{array_without_comparison_error, BTreeTable, Column, Schema, Table, TypeDef};
+use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr_context::TableMetadata;
@@ -630,7 +630,7 @@ pub(crate) fn type_without_comparison<'a>(
 /// type compares.
 pub(crate) fn check_array_element_compares(element: &ExprType, schema: &Schema) -> Result<()> {
     match type_without_comparison(element, schema) {
-        Some(type_def) => Err(array_without_comparison_error(type_def)),
+        Some(type_def) => schema.check_array_element_type(&type_def.name),
         None => Ok(()),
     }
 }

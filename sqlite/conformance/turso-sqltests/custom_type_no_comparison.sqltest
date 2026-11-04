@@ -117,12 +117,23 @@ expect error {
     values of type json cannot be compared
 }
 
-# UNION ALL does not compare its rows, but its columns' collations are worked
-# out like those of UNION, so it is refused too.
+# UNION ALL keeps every row without comparing them, so it works. With ORDER BY
+# it compares.
 @requires strict "uses STRICT tables"
-test no-comparison-json-union-all {
+test no-comparison-json-union-all-keeps-rows {
     CREATE TABLE t(j json) STRICT;
+    INSERT INTO t VALUES ('{"a":1}');
     SELECT j FROM t UNION ALL SELECT j FROM t;
+}
+expect {
+    {"a":1}
+    {"a":1}
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-union-all-order-by {
+    CREATE TABLE t(j json) STRICT;
+    SELECT j FROM t UNION ALL SELECT j FROM t ORDER BY 1;
 }
 expect error {
     values of type json cannot be compared

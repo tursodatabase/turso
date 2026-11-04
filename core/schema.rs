@@ -322,15 +322,6 @@ fn builtin_has_comparison(type_name: &str) -> bool {
     )
 }
 
-/// The error for an array whose elements have `element_type`, whose values
-/// can't be compared.
-pub(crate) fn array_without_comparison_error(element_type: &TypeDef) -> crate::LimboError {
-    crate::LimboError::ParseError(format!(
-        "arrays of type {} are not supported, because values of type {} cannot be compared",
-        element_type.name, element_type.name
-    ))
-}
-
 /// Operators on built-in types. User types have none: `x + 1` on a user type is
 /// an error. The functions read plain values as they are, so nothing is encoded first:
 /// - `numeric op x` and `x op numeric` for `+ - * / %`, and `-numeric`, compute
@@ -1917,7 +1908,11 @@ impl Schema {
         // Array functions such as array_position and @> compare elements
         // without asking how their type compares.
         if !self.type_has_comparison(type_def) {
-            return Err(array_without_comparison_error(type_def));
+            crate::bail_parse_error!(
+                "arrays of type {} are not supported, because values of type {} cannot be compared",
+                type_def.name,
+                type_def.name
+            );
         }
         Ok(())
     }

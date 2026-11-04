@@ -138,7 +138,7 @@ pub fn emit_program_for_compound_select(
 
     let real_query_destination = right_most.query_destination.clone();
     let num_result_cols = right_most.result_columns.len();
-    let collations = compound_collations(left, right_most, resolver)?;
+    let collations = compound_collations(left, right_most, has_order_by, resolver)?;
 
     // When ORDER BY is present, redirect compound output to a collection index,
     // then sort and emit to the real destination afterwards.
@@ -816,11 +816,21 @@ fn create_collection_index(
 /// The collation of each compound result column. Every ephemeral index of the
 /// compound, including those of nested arms, uses it, as SQLite's
 /// multiSelectCollSeq does.
+///
+/// UNION ALL without ORDER BY keeps every row and compares none, so its columns
+/// need no collation. That keeps it working for types whose values can't be
+/// compared.
 fn compound_collations(
     left: &[(SelectPlan, CompoundOperator)],
     right_most: &SelectPlan,
+    has_order_by: bool,
     resolver: &Resolver,
 ) -> crate::Result<Vec<CollationSeq>> {
+    let compares_rows =
+        has_order_by || left.iter().any(|(_, op)| *op != CompoundOperator::UnionAll);
+    if !compares_rows {
+        return Ok(vec![CollationSeq::BINARY; right_most.result_columns.len()]);
+    }
     let arms: Vec<&SelectPlan> = left
         .iter()
         .map(|(select, _)| select)

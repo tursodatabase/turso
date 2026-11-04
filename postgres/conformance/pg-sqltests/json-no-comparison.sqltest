@@ -91,3 +91,13 @@ expect {
     1
     1
 }
+
+test json-union-all-works {
+    CREATE TABLE t(id integer, j json);
+    INSERT INTO t VALUES (1, '{"a":1}');
+    SELECT id FROM (SELECT id, j FROM t UNION ALL SELECT id, j FROM t) u;
+}
+expect {
+    1
+    1
+}

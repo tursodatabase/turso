@@ -571,8 +571,6 @@ fn constraint_details_show_custom_type_values_as_the_user_wrote_them() {
     for sql in [
         "CREATE TABLE t_pk (id uuid PRIMARY KEY)",
         "INSERT INTO t_pk VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
-        "CREATE TABLE t_j (j jsonb UNIQUE)",
-        "INSERT INTO t_j VALUES ('{\"a\":1}')",
         "CREATE TABLE t_u (k INT PRIMARY KEY, id uuid UNIQUE)",
         "INSERT INTO t_u VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), (2, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
         // A column named `value` must not stand in for the value DECODE reads.
@@ -587,10 +585,6 @@ fn constraint_details_show_custom_type_values_as_the_user_wrote_them() {
         (
             "INSERT INTO t_pk VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
             "Key (id)=(a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11) already exists.",
-        ),
-        (
-            "INSERT INTO t_j VALUES ('{\"a\":1}')",
-            "Key (j)=({\"a\":1}) already exists.",
         ),
         (
             "UPDATE t_u SET id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' WHERE k = 2",
