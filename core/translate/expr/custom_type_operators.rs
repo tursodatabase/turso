@@ -30,6 +30,24 @@ pub(crate) fn custom_operator_call(
     find_operator_call(expr, &types, env)
 }
 
+/// Fails when no function runs the operator expression `expr`, as in
+/// `date * 2`, for an expression that is bound but not yet compiled. An
+/// operand whose type is not known yet, such as a subquery that is not planned
+/// yet, leaves the decision to a check once it is known.
+pub(crate) fn check_custom_operator(expr: &ast::Expr, env: &TypeEnv) -> Result<()> {
+    let Some((_, operands)) = decided_operator(expr, env) else {
+        return Ok(());
+    };
+    let types: Vec<ExprType> = operands
+        .iter()
+        .map(|operand| type_of(operand, env))
+        .collect();
+    if types.iter().any(|ty| matches!(ty, ExprType::NotKnownYet)) {
+        return Ok(());
+    }
+    find_operator_call(expr, &types, env).map(|_| ())
+}
+
 /// The function that runs the operator expression `expr` when an operand is a
 /// custom-type value. `None` means SQLite's operator runs: `expr` is not an
 /// operator a custom type decides, no operand has a custom type, an operand is
@@ -204,7 +222,10 @@ impl<'a> Operand<'a> {
             (Some(ty), _) => ty.type_def.name.clone(),
             // A value whose type is only known when the statement runs, such as
             // the result of json_extract().
-            (None, ExprType::Builtin(BuiltinType::Any) | ExprType::Unknown) => "value".to_string(),
+            (
+                None,
+                ExprType::Builtin(BuiltinType::Any) | ExprType::Unknown | ExprType::NotKnownYet,
+            ) => "value".to_string(),
             (None, ty) => ty.to_string(),
         }
     }

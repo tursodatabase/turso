@@ -802,6 +802,100 @@ expect error {
     cannot compare type numeric with type integer\[\]
 }
 
+# An operator that no function of a date runs is refused even where the query
+# never evaluates it, so its result can't reach a COLLATE unchecked.
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-missing-operator {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND (d * 2) COLLATE NOCASE = 'x';
+}
+expect error {
+    operator does not exist: date \* integer
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-missing-operator {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND d * 2 = 1;
+}
+expect error {
+    operator does not exist: date \* integer
+}
+
+# A scalar subquery has no type until it is planned; a COLLATE on its text
+# still applies.
+@requires strict "uses STRICT tables"
+test collate-on-scalar-subquery-applies {
+    CREATE TABLE t(d date) STRICT;
+    SELECT (SELECT 'a') COLLATE NOCASE = 'A';
+}
+expect {
+    1
+}
+
+# A subquery's type is known once it is planned, so a COLLATE on a date it
+# returns fails even where the query never evaluates it.
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-date-subquery {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND (SELECT d FROM t) COLLATE NOCASE = 'x';
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-missing-operator-on-subquery {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND (SELECT d FROM t) * 2 = 1;
+}
+expect error {
+    operator does not exist: date \* integer
+}
+
+# SQLite's own types all take a COLLATE: integer, real, a decimal written in
+# the statement, a number of either kind, text, blob, a column without a type,
+# a string literal and NULL.
+@requires strict "uses STRICT tables"
+test collate-allowed-on-sqlite-types {
+    CREATE TABLE t(i integer, r real, s text, b blob, x any) STRICT;
+    INSERT INTO t VALUES (1, 1.5, 'a', x'61', 'X');
+    SELECT i COLLATE NOCASE, r COLLATE NOCASE, 0.5 COLLATE NOCASE, (i + x) COLLATE NOCASE, s COLLATE NOCASE = 'A', b COLLATE NOCASE = 'A', x COLLATE NOCASE = 'x', 'a' COLLATE NOCASE = 'A', NULL COLLATE NOCASE IS NULL FROM t;
+}
+expect {
+    1|1.5|0.5|1|1|0|1|1|1
+}
+
+# Nothing says that an array plus a number is text.
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-value-of-unknown-type {
+    CREATE TABLE t(a integer[]) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND (a + 1) COLLATE NOCASE = 'x';
+}
+expect error {
+    collations are not supported by type unknown
+}
+
+# A COLLATE inside a row value applies to one of its values.
+@requires strict "uses STRICT tables"
+test collate-inside-row-value-applies {
+    CREATE TABLE t(s text) STRICT;
+    INSERT INTO t VALUES ('a');
+    SELECT (1, s COLLATE NOCASE) = (SELECT 1, 'A') FROM t;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-date-inside-row-value {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND (1, d COLLATE NOCASE) = (SELECT 1, 'x');
+}
+expect error {
+    collations are not supported by type date
+}
+
 @requires strict "uses STRICT tables"
 test create-table-rejects-collate-on-date-column {
     CREATE TABLE t(d date COLLATE NOCASE) STRICT;

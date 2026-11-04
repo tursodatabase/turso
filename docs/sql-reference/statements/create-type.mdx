@@ -152,7 +152,7 @@ SELECT * FROM t WHERE d = '2024-01-02' COLLATE nocase;
 -- Parse error: collations are not supported by type date
 ```
 
-Columns of SQLite's own types, and all columns of a table that is not STRICT, take any COLLATE as in SQLite.
+Columns of SQLite's own types, and all columns of a table that is not STRICT, take any COLLATE as in SQLite. A value whose type nothing declares, such as `a + 1` for an array `a`, takes none: it fails with `collations are not supported by type unknown`.
 
 ### Arithmetic
 

@@ -720,10 +720,9 @@ fn common_ordering(
             OperandOrder::Type(ordering) => ordering,
         };
         match found {
-            Some((other, other_ty)) if other != ordering => {
-                return Err(cannot_compare(other_ty, ty))
-            }
-            _ => found = Some((ordering, ty)),
+            None => found = Some((ordering, ty)),
+            Some((other, _)) if other == ordering => found = Some((ordering, ty)),
+            Some((_, other_ty)) => return Err(cannot_compare(other_ty, ty)),
         }
     }
     match (found, array_of_unknown_elements) {
@@ -802,26 +801,54 @@ pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -
             }
             Ok(())
         }
-        _ => Ok(()),
+        // These compare a value with the values of a subquery, whose types are
+        // known only once it is planned. Planning it checks the comparison
+        // through [in_subquery_collation].
+        Expr::InSelect { .. } | Expr::InTable { .. } | Expr::SubqueryResult { .. } => Ok(()),
+        // These compare nothing with a collation.
+        Expr::Binary(..)
+        | Expr::Case { base: None, .. }
+        | Expr::Cast { .. }
+        | Expr::Column { .. }
+        | Expr::Default
+        | Expr::DoublyQualified(..)
+        | Expr::Exists(_)
+        | Expr::FieldAccess { .. }
+        | Expr::FunctionCallStar { .. }
+        | Expr::Id(_)
+        | Expr::IsNull(_)
+        | Expr::Like { .. }
+        | Expr::Literal(_)
+        | Expr::MergedColumn(_)
+        | Expr::Name(_)
+        | Expr::NotNull(_)
+        | Expr::Parenthesized(_)
+        | Expr::Qualified(..)
+        | Expr::Raise(..)
+        | Expr::Register { .. }
+        | Expr::RowId { .. }
+        | Expr::Subquery(_)
+        | Expr::Unary(..)
+        | Expr::Variable(_) => Ok(()),
+        Expr::Array { .. } | Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
     }
 }
 
 /// The check of [check_expr_collation] for `lhs` compared with `rhs`. Row
 /// values compare element by element, each pair with its own collation.
 fn check_comparison(lhs: &Expr, rhs: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
-    match (lhs, rhs) {
-        (Expr::Parenthesized(lhs), Expr::Parenthesized(rhs))
-            if lhs.len() > 1 && lhs.len() == rhs.len() =>
-        {
-            lhs.iter()
+    if let (Expr::Parenthesized(lhs), Expr::Parenthesized(rhs)) = (lhs, rhs) {
+        if lhs.len() > 1 && lhs.len() == rhs.len() {
+            return lhs
+                .iter()
                 .zip(rhs)
-                .try_for_each(|(lhs, rhs)| check_comparison(lhs, rhs, context))
-        }
-        _ => {
-            common_type_ordering([(lhs, context), (rhs, context)])?;
-            Ok(())
+                .try_for_each(|(lhs, rhs)| check_comparison(lhs, rhs, context));
         }
     }
+    common_type_ordering([(lhs, context), (rhs, context)])?;
+    Ok(())
 }
 
 /// Fails when values of `ty` take no COLLATE. As in PostgreSQL, only text
@@ -833,7 +860,17 @@ fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
     let accepts = match ty {
         ExprType::Custom { type_def, .. } => schema.type_accepts_collate(type_def)?,
         ExprType::Array { .. } => false,
-        _ => true,
+        ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null => true,
+        // Nothing says the value is text, as in `(d * 2) COLLATE nocase` when no
+        // function runs `*` for a date d.
+        ExprType::Unknown => false,
+        // Checked again once the type is known: `(SELECT d) COLLATE nocase` is
+        // checked as a date when it is compiled.
+        ExprType::NotKnownYet => true,
+        // A COLLATE inside a row value, as in `(1, s COLLATE nocase) = (SELECT
+        // 1, 'a')`, applies to one of its values, and that value is checked as
+        // the operand of its own COLLATE.
+        ExprType::RowValue => true,
     };
     if accepts {
         return Ok(());
