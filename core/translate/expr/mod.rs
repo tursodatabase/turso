@@ -135,10 +135,13 @@ pub use utils::{
     truth_test_rhs, unwrap_parens, unwrap_parens_owned,
 };
 pub use vectors::expr_vector_size;
-pub(crate) use walk::expression_can_fail_on_input;
 pub use walk::{
     expr_contains_function_that_changes_within_statement,
     expr_contains_nondeterministic_scalar_function, expr_contains_subquery,
     expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
     walk_expr, walk_expr_mut, WalkControl,
+};
+pub(crate) use walk::{
+    expression_can_fail_on_input, is_aggregate_or_window_function, walk_function_calls,
+    FunctionCalls,
 };
