@@ -1190,27 +1190,34 @@ impl Default for Schema {
     }
 }
 
-/// The offsets a RANGE frame over values of a type may have, as PostgreSQL's
-/// `in_range` functions list them. Only number types take one: in PostgreSQL
-/// date, time and timestamp take an interval, which Turso does not have.
+/// What kind of number a type's values are in a RANGE frame, which decides
+/// the offsets a frame over them may have, as PostgreSQL's `in_range`
+/// functions do. The same kind says which frames a value of the type may be
+/// the offset of. Only number types take an offset: in PostgreSQL date, time
+/// and timestamp take an interval, which Turso does not have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeOffsets {
-    /// `RANGE BETWEEN 1 PRECEDING` over a date is an error.
+    /// Not a number: `RANGE BETWEEN 1 PRECEDING` over a date is an error, and
+    /// so is a date offset.
     None,
-    /// An integer, smallint or bigint, as over a bigint.
+    /// An integer type, such as smallint or bigint. It takes integer offsets.
     Integer,
-    /// An integer, smallint, bigint or numeric, as over a numeric.
-    IntegerOrNumeric,
+    /// numeric. It takes integer and numeric offsets.
+    Numeric,
 }
 
 impl RangeOffsets {
-    /// The names of the offset types allowed.
-    pub fn type_names(self) -> &'static [&'static str] {
-        match self {
-            RangeOffsets::None => &[],
-            RangeOffsets::Integer => &["integer", "smallint", "bigint"],
-            RangeOffsets::IntegerOrNumeric => &["integer", "smallint", "bigint", "numeric"],
-        }
+    /// Whether a frame over values of this kind may have an offset of kind
+    /// `offset`.
+    pub fn takes(self, offset: RangeOffsets) -> bool {
+        matches!(
+            (self, offset),
+            (RangeOffsets::Integer, RangeOffsets::Integer)
+                | (
+                    RangeOffsets::Numeric,
+                    RangeOffsets::Integer | RangeOffsets::Numeric
+                )
+        )
     }
 }
 
@@ -1246,7 +1253,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         (RangeOffsets::None, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
         (RangeOffsets::None, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
         (RangeOffsets::None, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
-        (RangeOffsets::IntegerOrNumeric, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
+        (RangeOffsets::Numeric, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
     ];
 
     for &(range_offsets, sql) in types {

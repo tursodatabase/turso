@@ -1005,19 +1005,30 @@ mod tests {
     /// keep SQLite's rules.
     #[test]
     fn test_range_offsets_only_on_types_postgres_allows() {
+        /// What kind of number a type is to PostgreSQL's `in_range` functions.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Number {
+            Integer,
+            Numeric,
+            None,
+        }
+        /// The `in_range` pairs PostgreSQL has for numbers: an integer column
+        /// takes integer offsets, and a numeric column takes integer and
+        /// numeric offsets.
+        fn takes(column: Number, offset: Number) -> bool {
+            matches!(
+                (column, offset),
+                (Number::Integer, Number::Integer)
+                    | (Number::Numeric, Number::Integer | Number::Numeric)
+            )
+        }
         enum Offsets {
             /// A SQLite type, or a domain over one: SQLite's rules apply.
             Sqlite,
-            /// Offsets of these types are accepted. Others are refused with an
+            /// A custom type of this kind of number. A refused offset gets an
             /// error that names the type `name`.
-            Takes {
-                name: &'static str,
-                offset_types: &'static [&'static str],
-            },
+            Takes { name: &'static str, number: Number },
         }
-        const INTEGERS: &[&str] = &["integer", "smallint", "bigint"];
-        const NUMERICS: &[&str] = &["integer", "smallint", "bigint", "numeric"];
-        const NONE: &[&str] = &[];
         struct Kind {
             ty: &'static str,
             strict: bool,
@@ -1031,10 +1042,8 @@ mod tests {
             values,
             offsets,
         };
-        let none = |name| Offsets::Takes {
-            name,
-            offset_types: NONE,
-        };
+        let takes_kind = |name, number| Offsets::Takes { name, number };
+        let none = |name| takes_kind(name, Number::None);
         let no_values = ["NULL", "NULL", "NULL"];
         let kinds = [
             kind("integer", ["1", "2", "4"], Offsets::Sqlite),
@@ -1051,42 +1060,27 @@ mod tests {
             kind(
                 "smallint",
                 ["1", "2", "4"],
-                Offsets::Takes {
-                    name: "smallint",
-                    offset_types: INTEGERS,
-                },
+                takes_kind("smallint", Number::Integer),
             ),
             kind(
                 "bigint",
                 ["1", "2", "4"],
-                Offsets::Takes {
-                    name: "bigint",
-                    offset_types: INTEGERS,
-                },
+                takes_kind("bigint", Number::Integer),
             ),
             kind(
                 "big",
                 ["1", "2", "4"],
-                Offsets::Takes {
-                    name: "bigint",
-                    offset_types: INTEGERS,
-                },
+                takes_kind("bigint", Number::Integer),
             ),
             kind(
                 "numeric(10, 2)",
                 ["1", "2.5", "4"],
-                Offsets::Takes {
-                    name: "numeric",
-                    offset_types: NUMERICS,
-                },
+                takes_kind("numeric", Number::Numeric),
             ),
             kind(
                 "amount",
                 ["1", "2.5", "4"],
-                Offsets::Takes {
-                    name: "numeric",
-                    offset_types: NUMERICS,
-                },
+                takes_kind("numeric", Number::Numeric),
             ),
             // Types without an order, such as json and inet, are left out:
             // ORDER BY refuses them before the frame is looked at.
@@ -1105,7 +1099,11 @@ mod tests {
         ];
         enum OffsetType {
             /// Known when the statement is prepared. An error names it `name`.
-            Known { name: &'static str, custom: bool },
+            Known {
+                name: &'static str,
+                custom: bool,
+                number: Number,
+            },
             /// A string or a parameter, read as the column's type when the
             /// statement runs.
             ColumnType { integer: bool },
@@ -1113,19 +1111,25 @@ mod tests {
             /// when the statement runs.
             Null,
         }
-        let known = |name| OffsetType::Known {
+        let known = |name, number| OffsetType::Known {
             name,
             custom: false,
+            number,
         };
-        let custom = |name| OffsetType::Known { name, custom: true };
+        let custom = |name, number| OffsetType::Known {
+            name,
+            custom: true,
+            number,
+        };
         // (offset, its type, the value bound to ?1). A CAST to numeric without
-        // arguments is SQLite's CAST, whose result may be an integer or a real.
+        // arguments is SQLite's CAST, whose result may be an integer or a real,
+        // so it is not a number PostgreSQL's numeric takes.
         let offsets = [
-            ("1", known("integer"), None),
-            ("1.5", known("numeric"), None),
-            ("CAST(1.5 AS REAL)", known("real"), None),
-            ("x'01'", known("blob"), None),
-            ("CAST(1 AS numeric)", known("unknown"), None),
+            ("1", known("integer", Number::Integer), None),
+            ("1.5", known("numeric", Number::Numeric), None),
+            ("CAST(1.5 AS REAL)", known("real", Number::None), None),
+            ("x'01'", known("blob", Number::None), None),
+            ("CAST(1 AS numeric)", known("numeric", Number::None), None),
             ("'1'", OffsetType::ColumnType { integer: true }, None),
             ("'1.5'", OffsetType::ColumnType { integer: false }, None),
             (
@@ -1139,14 +1143,26 @@ mod tests {
                 Some(turso_core::Value::build_text("1.5")),
             ),
             ("NULL", OffsetType::Null, None),
-            ("CAST(1 AS smallint)", custom("smallint"), None),
-            ("CAST(1 AS bigint)", custom("bigint"), None),
-            ("CAST(1 AS numeric(5, 2))", custom("numeric"), None),
-            ("CAST(1 AS boolean)", custom("boolean"), None),
+            (
+                "CAST(1 AS smallint)",
+                custom("smallint", Number::Integer),
+                None,
+            ),
+            ("CAST(1 AS bigint)", custom("bigint", Number::Integer), None),
+            (
+                "CAST(1 AS numeric(5, 2))",
+                custom("numeric", Number::Numeric),
+                None,
+            ),
+            ("CAST(1 AS boolean)", custom("boolean", Number::None), None),
             // A domain offset is checked as the type it is based on.
-            ("CAST(1 AS pos)", known("integer"), None),
-            ("CAST(1 AS big)", custom("bigint"), None),
-            ("CAST('2026-01-01' AS day)", custom("date"), None),
+            ("CAST(1 AS pos)", known("integer", Number::Integer), None),
+            ("CAST(1 AS big)", custom("bigint", Number::Integer), None),
+            (
+                "CAST('2026-01-01' AS day)",
+                custom("date", Number::None),
+                None,
+            ),
         ];
         // (frame, the rows it holds for the row `t` when ordered ascending,
         // and when ordered descending). `{k}` is the offset.
@@ -1210,7 +1226,7 @@ mod tests {
             if !matches!(
                 kind.offsets,
                 Offsets::Takes {
-                    offset_types: NONE,
+                    number: Number::None,
                     ..
                 }
             ) {
@@ -1243,9 +1259,11 @@ mod tests {
                             // type, which doesn't compare with SQLite's numbers.
                             // Others keep SQLite's rules.
                             Offsets::Sqlite => match offset_type {
-                                OffsetType::Known { name, custom: true }
-                                    if !INTEGERS.contains(name) =>
-                                {
+                                OffsetType::Known {
+                                    name,
+                                    custom: true,
+                                    number,
+                                } if *number != Number::Integer => {
                                     refused(format!(
                                         "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type {name} over a value without a custom type"
                                     ))
@@ -1261,16 +1279,18 @@ mod tests {
                             },
                             Offsets::Takes {
                                 name,
-                                offset_types: &[],
+                                number: Number::None,
                             } => {
                                 refused(format!(
                                     "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name}"
                                 ))
                             }
-                            Offsets::Takes { name, offset_types } => match offset_type {
+                            Offsets::Takes { name, number } => match offset_type {
                                 OffsetType::Known {
-                                    name: offset_type, ..
-                                } if !offset_types.contains(offset_type) => refused(format!(
+                                    name: offset_type,
+                                    number: offset_number,
+                                    ..
+                                } if !takes(*number, *offset_number) => refused(format!(
                                     "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name} and offset type {offset_type}"
                                 )),
                                 OffsetType::Null => {
@@ -1281,7 +1301,7 @@ mod tests {
                                     );
                                 }
                                 OffsetType::ColumnType { integer: false }
-                                    if !offset_types.contains(&"numeric") =>
+                                    if *number != Number::Numeric =>
                                 {
                                     let error = result.expect_err(&context).to_string();
                                     assert!(
