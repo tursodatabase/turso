@@ -974,3 +974,29 @@ expect {
     mvcc
     2|x
 }
+# OR IGNORE only ignores constraint failures. A SQL error raised by a function
+# in a trigger (here a multi-character LIKE escape, or a LIKE/GLOB pattern over
+# the length limit) still fails the statement.
+test insert-or-ignore-does-not-ignore-like-escape-error-in-trigger {
+    CREATE TABLE t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+        INSERT INTO log SELECT 'a' LIKE 'a' ESCAPE 'xx';
+    END;
+    INSERT OR IGNORE INTO t VALUES (1);
+}
+expect error {
+    ESCAPE expression must be a single character
+}
+
+test insert-or-ignore-does-not-ignore-glob-pattern-error-in-trigger {
+    CREATE TABLE t(a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+        INSERT INTO log SELECT 'a' GLOB printf('%.*c', 50001, 'a');
+    END;
+    INSERT OR IGNORE INTO t VALUES (1);
+}
+expect error {
+    LIKE or GLOB pattern too complex
+}

@@ -672,7 +672,7 @@ pub fn json_string_to_db_type(
             // f64, which is exactly what ->> and json_extract return.
             match json_string.parse::<f64>() {
                 Ok(float_val) => Ok(Value::from_f64(float_val)),
-                Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
+                Err(_) => Err(LimboError::SqlError("malformed JSON".to_string())),
             }
         }
         ElementType::INT | ElementType::INT5 => {
@@ -686,7 +686,7 @@ pub fn json_string_to_db_type(
                 let res = f64::from_str(&json_string);
                 match res {
                     Ok(num) => Ok(Value::from_f64(num)),
-                    Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
+                    Err(_) => Err(LimboError::SqlError("malformed JSON".to_string())),
                 }
             }
         }
@@ -709,7 +709,7 @@ fn json5_hex_literal_to_i64(payload: &str) -> crate::Result<Option<i64>> {
     };
     let digits = digits.trim_start_matches('0');
     if digits.len() > 16 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(LimboError::Constraint("malformed JSON".to_string()));
+        return Err(LimboError::SqlError("malformed JSON".to_string()));
     }
     let magnitude = if digits.is_empty() {
         0

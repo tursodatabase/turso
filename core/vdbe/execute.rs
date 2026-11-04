@@ -10404,7 +10404,7 @@ pub fn op_function(
                                 let mut chars = escape_cow.chars();
                                 let c = chars.next();
                                 if c.is_none() || chars.next().is_some() {
-                                    return Err(LimboError::Constraint(
+                                    return Err(LimboError::SqlError(
                                         "ESCAPE expression must be a single character".to_string(),
                                     )
                                     .into());
