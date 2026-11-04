@@ -15,15 +15,13 @@ use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::catalog::CatalogContext;
 use crate::translate::collate::CollationSeq;
-use crate::translate::emitter::gencol::compute_virtual_columns;
 use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
 use crate::translate::expr::expr_type::iif_values;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, takes_input_of_type, translate_expr_no_constant_opt, walk_expr,
-    BindingBehavior, NoConstantOptReason, WalkControl,
+    bind_and_rewrite_expr, takes_input_of_type, walk_expr, BindingBehavior, WalkControl,
 };
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{
@@ -40,7 +38,6 @@ use crate::util::{
     PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::builder::{CursorKey, DmlColumnContext, DmlRowForm, QueryMode};
 use crate::vdbe::insn::{
     to_u32, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
@@ -49,7 +46,7 @@ use crate::{Connection, Value, MAIN_DB_ID};
 
 use turso_ext::VTabKind;
 use turso_parser::ast;
-use turso_parser::ast::ColumnDefinition;
+use turso_parser::ast::{ColumnDefinition, TableInternalId};
 
 /// Validate a CHECK constraint expression at CREATE TABLE / ALTER TABLE ADD COLUMN time.
 /// Rejects non-existent columns, non-existent functions, aggregates, window functions,
@@ -1260,7 +1257,7 @@ pub fn translate_create_table(
     // VACUUM creates the tables the database already has as nested
     // statements, and those may break this rule.
     if !connection.is_nested_stmt() {
-        translate_check_and_generated_exprs(&table, resolver, namespace)?;
+        bind_check_and_generated_exprs(&table, resolver, namespace)?;
     }
     let bound_sequence_names = resolver.catalog.dialect.binds_names_at_create()
         && bind_default_sequence_names(&mut body, resolver)?;
@@ -1581,25 +1578,20 @@ pub fn translate_create_table(
     Ok(())
 }
 
-/// Translates the CHECK constraints and generated columns of a new table
-/// into a program that is thrown away, the way an INSERT translates them.
-/// An expression that fails to translate, such as `CHECK (j <> '[]')` on a
-/// json column (json values can't be compared), would fail every INSERT and
-/// PRAGMA integrity_check, so CREATE TABLE fails instead.
-pub(crate) fn translate_check_and_generated_exprs(
+/// Binds the CHECK constraints and generated columns of a new table, as an
+/// INSERT binds them, which checks their custom type operators and
+/// comparisons (see [check_custom_types]). An expression that breaks those
+/// rules, such as `CHECK (j <> '[]')` on a json column (json values can't be
+/// compared), would fail every INSERT and PRAGMA integrity_check, so CREATE
+/// TABLE fails instead. The expressions are not translated: SQLite reports
+/// the other errors in them, such as `CHECK (a COLLATE nosuch = 'x')`, only
+/// when a row is written.
+pub(crate) fn bind_check_and_generated_exprs(
     table: &BTreeTable,
     resolver: &Resolver,
     namespace: NamespaceRef,
 ) -> Result<()> {
     let table = Arc::new(table.clone());
-    let mut program =
-        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 0, 0));
-
-    let table_ref_id = program.table_reference_counter.next();
-    program.alloc_cursor_id_keyed(
-        CursorKey::table(table_ref_id),
-        CursorType::BTreeTable(table.clone()),
-    );
     let mut table_references = TableReferences::new(
         vec![JoinedTable {
             op: Operation::Scan(Scan::BTreeTable {
@@ -1610,7 +1602,9 @@ pub(crate) fn translate_check_and_generated_exprs(
             table: Table::BTree(table.clone()),
             identifier: table.name.clone(),
             has_alias: false,
-            internal_id: table_ref_id,
+            // The id that generated column expressions refer to their table
+            // by.
+            internal_id: TableInternalId::SELF_TABLE,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
             column_use_counts: Vec::new(),
@@ -1621,8 +1615,13 @@ pub(crate) fn translate_check_and_generated_exprs(
         }],
         vec![],
     );
-    for check in &table.check_constraints {
-        let mut expr = check.expr.clone();
+    let checks = table.check_constraints.iter().map(|check| &check.expr);
+    let generated = table
+        .columns()
+        .iter()
+        .filter_map(|column| column.generated_expr());
+    for expr in checks.chain(generated) {
+        let mut expr = expr.clone();
         bind_and_rewrite_expr(
             &mut expr,
             Some(&mut table_references),
@@ -1630,34 +1629,8 @@ pub(crate) fn translate_check_and_generated_exprs(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        let reg = program.alloc_register();
-        translate_expr_no_constant_opt(
-            &mut program,
-            Some(&table_references),
-            &expr,
-            reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
     }
-
-    let layout = table.column_layout()?;
-    let columns_start = program.alloc_registers(layout.column_count());
-    let rowid_reg = program.alloc_register();
-    let dml_ctx = DmlColumnContext::layout(
-        table.columns(),
-        columns_start,
-        rowid_reg,
-        layout,
-        DmlRowForm::Stored,
-    );
-    compute_virtual_columns(
-        &mut program,
-        &table.columns_topo_sort()?,
-        &dml_ctx,
-        resolver,
-        &table,
-    )
+    Ok(())
 }
 
 /// Binds the sequences named in the column defaults of `body` to the

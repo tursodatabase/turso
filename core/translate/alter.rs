@@ -12,7 +12,7 @@ use super::{
     index::emit_refill_index,
     planner::ROWID_STRS,
     schema::{
-        translate_check_and_generated_exprs, validate_check_expr, validate_default_expr,
+        bind_check_and_generated_exprs, validate_check_expr, validate_default_expr,
         validate_generated_function_calls, SQLITE_TABLEID,
     },
     update::translate_update_for_schema_change,
@@ -1940,7 +1940,7 @@ pub fn translate_alter_table(
                         validate_check_expr(expr, &table.name, &column_names, &resolver.catalog)?;
                     }
                 }
-                translate_check_and_generated_exprs(&table, resolver, namespace)?;
+                bind_check_and_generated_exprs(&table, resolver, namespace)?;
                 Some(table)
             } else {
                 None
