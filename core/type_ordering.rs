@@ -113,7 +113,9 @@ impl Hash for ArraySortKey<'_> {
     }
 }
 
-/// Array elements compared in SQLite's order, element by element.
+/// Array elements compared element by element, as PostgreSQL's `array_cmp`
+/// does: a NULL element is greater than any other element and equal to
+/// another NULL. Other elements compare in SQLite's order.
 struct ArrayElements(Vec<Value>);
 
 impl PartialEq for ArrayElements {
@@ -134,8 +136,24 @@ impl Ord for ArrayElements {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0
             .iter()
-            .map(AsValueRef::as_value_ref)
-            .cmp(other.0.iter().map(AsValueRef::as_value_ref))
+            .map(NullLast::of)
+            .cmp(other.0.iter().map(NullLast::of))
+    }
+}
+
+/// An array element ordered with NULL after every other value.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum NullLast<'a> {
+    Value(ValueRef<'a>),
+    Null,
+}
+
+impl<'a> NullLast<'a> {
+    fn of(value: &'a Value) -> Self {
+        match value.as_value_ref() {
+            ValueRef::Null => Self::Null,
+            value => Self::Value(value),
+        }
     }
 }
 
@@ -214,8 +232,11 @@ mod tests {
                 &[Value::from_text("{}")],
                 &[Value::from_text("{1}"), Value::from_text("{1.0}")],
                 &[Value::from_text("{1, 2}")],
+                &[Value::from_text("{1, NULL}")],
+                &[Value::from_text("{1, NULL, 1}")],
                 &[Value::from_text("{2}")],
                 &[Value::from_text("{a}")],
+                &[Value::from_text("{NULL}")],
                 &[int(5)],
                 &[Value::from_text("not an array")],
                 &[Value::from_blob(crate::alloc::vec![0xff, 0xff])],
