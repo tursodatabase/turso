@@ -1996,10 +1996,10 @@ fn translate_function_call_expr(
                     target_register,
                     func_ctx,
                 ),
-                ScalarFunc::ArrayAppend
+                ScalarFunc::ArrayLength
+                | ScalarFunc::ArrayAppend
                 | ScalarFunc::ArrayPrepend
                 | ScalarFunc::ArrayCat
-                | ScalarFunc::ArrayLength
                 | ScalarFunc::ArrayRemove
                 | ScalarFunc::ArrayContains
                 | ScalarFunc::ArrayPosition
