@@ -32,11 +32,11 @@ use crate::storage::pager::{
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
-use crate::types::StrictType;
 use crate::types::{
     compare_immutable, compare_record, AsValueRef, Extendable, IOCompletions, IOResult,
     ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
+use crate::types::{StorageClass, StrictType};
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
@@ -2629,14 +2629,14 @@ pub fn op_convert_to_type(
     load_insn!(
         ConvertToType {
             reg,
-            value_type,
+            storage_class,
             description
         },
         insn
     );
     let reg = &mut state.registers[*reg];
     if !matches!(reg.get_value(), Value::Null) {
-        if let Err(actual) = convert_to_strict_type(reg, *value_type) {
+        if let Err(actual) = convert_to_strict_type(reg, *storage_class) {
             return Err(
                 datatype_violation(format!("cannot store {actual} value {description}")).into(),
             );
@@ -2772,22 +2772,16 @@ pub fn op_array_encode(
 }
 
 /// Converts the non-NULL value in `reg` as a STRICT column storing
-/// `value_type` does: applies that column's affinity, so '5' becomes 5 for
+/// `storage_class` does: applies that column's affinity, so '5' becomes 5 for
 /// INTEGER and 5 becomes 5.0 for REAL. Returns the value's kind when it still
-/// isn't `value_type`.
-fn convert_to_strict_type(reg: &mut Register, value_type: ValueType) -> Result<(), ValueType> {
-    let affinity = match value_type {
-        ValueType::Integer => Affinity::Integer,
-        ValueType::Float => Affinity::Real,
-        ValueType::Text => Affinity::Text,
-        ValueType::Blob => Affinity::Blob,
-        ValueType::Null | ValueType::Error => {
-            unreachable!("no STRICT column stores {value_type} values")
-        }
-    };
-    apply_affinity_char(reg, affinity);
+/// isn't of `storage_class`.
+fn convert_to_strict_type(
+    reg: &mut Register,
+    storage_class: StorageClass,
+) -> Result<(), ValueType> {
+    apply_affinity_char(reg, storage_class.affinity());
     let actual = reg.get_value().value_type();
-    if actual == value_type {
+    if actual == storage_class.value_type() {
         Ok(())
     } else {
         Err(actual)

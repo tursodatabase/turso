@@ -730,7 +730,7 @@ fn emit_strict_type_check(
     col_reg: usize,
 ) -> Result<()> {
     let value_type = match StrictType::named(&type_check_col.ty_str) {
-        Some(StrictType::Stores(value_type)) => value_type,
+        Some(StrictType::Stores(storage_class)) => storage_class.value_type(),
         Some(StrictType::Any) => return Ok(()),
         None => {
             return Err(LimboError::InternalError(format!(

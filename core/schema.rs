@@ -446,11 +446,11 @@ impl ResolvedType {
             })
     }
 
-    /// The kind of value the type stores: the kind of its BASE, or of the
-    /// plain type a domain is based on.
-    pub fn stored_value_type(&self) -> crate::Result<crate::types::ValueType> {
+    /// The storage class of the values the type stores: that of its BASE, or
+    /// of the plain type a domain is based on.
+    pub fn storage_class(&self) -> crate::Result<crate::types::StorageClass> {
         match StrictType::named(&self.primitive) {
-            Some(StrictType::Stores(value_type)) => Ok(value_type),
+            Some(StrictType::Stores(storage_class)) => Ok(storage_class),
             Some(StrictType::Any) | None => Err(crate::LimboError::InternalError(format!(
                 "type {} is based on {}, which is not INTEGER, REAL, TEXT or BLOB",
                 self.leaf().name,

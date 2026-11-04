@@ -756,14 +756,14 @@ pub fn insn_to_row(
             ),
             Insn::ConvertToType {
                 reg,
-                value_type,
+                storage_class,
                 description,
             } => (
                 "ConvertToType",
                 *reg as i64,
                 0,
                 0,
-                Value::build_text(value_type.to_string()),
+                Value::build_text(crate::types::StrictType::Stores(*storage_class).name()),
                 0,
                 description.clone(),
             ),

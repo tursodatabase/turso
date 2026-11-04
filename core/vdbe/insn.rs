@@ -977,12 +977,12 @@ pub enum Insn {
         table_reference: Arc<BTreeTable>, // P4
     },
 
-    /// Converts the value in `reg` as a STRICT column storing `value_type`
+    /// Converts the value in `reg` as a STRICT column storing `storage_class`
     /// does, and fails with "cannot store <kind> value <description>" when it
     /// can't: '5' becomes 5 for INTEGER, 'abc' is an error. NULL is left as it is.
     ConvertToType {
         reg: usize,
-        value_type: crate::types::ValueType,
+        storage_class: crate::types::StorageClass,
         description: String,
     },
 

@@ -351,6 +351,21 @@ expect error {
     type uv takes values of type nosuchtype, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
 }
 
+# A quoted value type names the same type as in a STRICT column: "text" is TEXT.
+test quoted-value-type-is-the-plain-type {
+    CREATE TYPE qt(value "text") BASE text;
+    CREATE TYPE qi(value `INT`) BASE integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER, c qt) STRICT;
+    INSERT INTO t(id, n) VALUES (1, 1);
+    UPDATE t SET c = 'a';
+    SELECT id, n, c FROM t;
+    SELECT CAST('5' AS qi), typeof(CAST('5' AS qi));
+}
+expect {
+    1|1|a
+    5|integer
+}
+
 test create-type-refuses-a-value-type-that-leads-back-to-the-type {
     CREATE TYPE cyc(value cyc) BASE text;
 }

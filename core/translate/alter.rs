@@ -616,8 +616,8 @@ fn emit_column_constraints_validation(
             StrictType::named(&column.ty_str),
         ) {
             (true, _) => Some(VirtualColumnCheck::Store),
-            (false, Some(StrictType::Stores(value_type))) => {
-                Some(VirtualColumnCheck::Kind(value_type))
+            (false, Some(StrictType::Stores(storage_class))) => {
+                Some(VirtualColumnCheck::Kind(storage_class.value_type()))
             }
             (false, Some(StrictType::Any)) => None,
             (false, None) => {

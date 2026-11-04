@@ -249,7 +249,7 @@ pub(crate) fn emit_store_value(
 ) -> Result<()> {
     let convert = Insn::ConvertToType {
         reg,
-        value_type: resolved.stored_value_type()?,
+        storage_class: resolved.storage_class()?,
         description: format!(
             "as type {} (BASE {})",
             resolved.leaf().name,

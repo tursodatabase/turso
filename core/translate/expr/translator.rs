@@ -791,9 +791,9 @@ fn translate_cast_expr(
             // does: CAST(5.5 AS smallint) is 5, as are CAST(5.5 AS bigint) and
             // CAST(5.5 AS d) for a domain d over integer.
             match resolver.schema().plain_input_type(&resolved)? {
-                input_type @ StrictType::Stores(_) => program.emit_insn(Insn::Cast {
+                StrictType::Stores(storage_class) => program.emit_insn(Insn::Cast {
                     reg: target_register,
-                    affinity: Affinity::of_written_type(input_type.name()),
+                    affinity: storage_class.affinity(),
                 }),
                 StrictType::Any => {}
             }
