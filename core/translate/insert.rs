@@ -761,10 +761,10 @@ pub fn translate_insert(
             .schema()
             .column_has_custom_type(column, ctx.table.is_strict)
     };
-    let types_checked_first = has_before_triggers || insertion.has_virtual_columns();
+    let types_checked_first = has_before_triggers || insertion.has_generated_columns();
     if !types_checked_first {
         emit_notnulls(program, &ctx, &insertion, resolver, false, |column| {
-            !column.is_virtual_generated() && !has_custom_type(column)
+            !column.is_generated() && !has_custom_type(column)
         })?;
     }
     if let Some(type_check_table) = &maybe_type_check_table {
@@ -797,10 +797,10 @@ pub fn translate_insert(
         });
     }
     emit_notnulls(program, &ctx, &insertion, resolver, true, |column| {
-        !column.is_virtual_generated() && (types_checked_first || has_custom_type(column))
+        !column.is_generated() && (types_checked_first || has_custom_type(column))
     })?;
 
-    if insertion.has_virtual_columns() {
+    if insertion.has_generated_columns() {
         //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
         compute_virtual_columns(
             program,
@@ -827,7 +827,7 @@ pub fn translate_insert(
             &insertion,
             resolver,
             true,
-            Column::is_virtual_generated,
+            Column::is_generated,
         )?;
     }
 
@@ -2605,7 +2605,7 @@ impl<'a> Insertion<'a> {
         self.record_reg
     }
 
-    fn has_virtual_columns(&self) -> bool {
+    fn has_generated_columns(&self) -> bool {
         self.col_mappings.len() - self.num_non_virtual_cols > 0
     }
 

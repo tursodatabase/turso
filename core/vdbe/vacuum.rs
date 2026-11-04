@@ -1234,7 +1234,7 @@ pub(crate) fn build_copy_sql(
     let mut data_columns: Vec<String> = Vec::new();
     let mut rowid_alias_col_idx: Option<usize> = None;
     for (i, col) in btree.columns().iter().enumerate() {
-        if col.is_virtual_generated() {
+        if col.is_generated() {
             continue;
         }
         if col.is_rowid_alias() {
@@ -1279,7 +1279,7 @@ pub(crate) fn build_copy_sql(
             let mut filtered: Vec<&str> = Vec::new();
             let mut col_physical_idx = 0;
             for (i, col) in btree.columns().iter().enumerate() {
-                if col.is_virtual_generated() {
+                if col.is_generated() {
                     continue;
                 }
                 if i != alias_idx {

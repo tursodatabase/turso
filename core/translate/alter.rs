@@ -1064,7 +1064,7 @@ pub fn translate_alter_table(
             {
                 let affected = btree.columns_affected_by_update([dropped_index])?;
                 for idx in &affected {
-                    if idx != dropped_index && btree.columns()[idx].is_virtual_generated() {
+                    if idx != dropped_index && btree.columns()[idx].is_generated() {
                         return Err(LimboError::ParseError(format!(
                             "error in table {table_name} after drop column: no such column: {column_name}"
                         )));

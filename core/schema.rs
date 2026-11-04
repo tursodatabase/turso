@@ -6071,7 +6071,7 @@ impl BTreeTable {
         {
             let mut guard = self.columns_mut();
             for i in 0..guard.len() {
-                if guard[i].is_virtual_generated() {
+                if guard[i].is_generated() {
                     let mut expr = guard[i].generated_expr().cloned().unwrap();
                     resolve_gencol_expr_columns(&mut expr, &guard)?;
                     *guard[i].generated_expr_mut().unwrap() = expr;

@@ -1621,7 +1621,7 @@ fn emit_update_insns<'a>(
             &column_ctx,
             skip_row_label,
             t_ctx,
-            |column| !column.is_virtual_generated(),
+            |column| !column.is_generated(),
         )?;
     }
 
@@ -1688,7 +1688,7 @@ fn emit_update_insns<'a>(
                 &column_ctx,
                 skip_row_label,
                 t_ctx,
-                |column| !column.is_virtual_generated(),
+                |column| !column.is_generated(),
             )?;
         }
         let has_check_constraints = !btree.check_constraints.is_empty();
