@@ -760,7 +760,10 @@ fn translate_cast_expr(
                     program,
                     target_register,
                     tn.array_dimensions,
-                    Some(("", "")),
+                    ArrayInput::Text {
+                        table_name: "",
+                        col_name: "",
+                    },
                     |program, leaf_reg| {
                         emit_custom_type_cast(program, resolved, &element_type, leaf_reg, resolver)
                     },

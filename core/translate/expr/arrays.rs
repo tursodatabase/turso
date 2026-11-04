@@ -119,19 +119,35 @@ pub(super) fn emit_array_element_loop(
     Ok(())
 }
 
+/// What an array leaf loop accepts in place of an array blob.
+#[derive(Clone, Copy)]
+pub(crate) enum ArrayInput<'a> {
+    /// Only array blobs, such as an array read from a column.
+    Blob,
+    /// Text such as `'{1,2}'`, parsed into an array. Any other value is an
+    /// error that names column `table_name.col_name`. A CAST has no column and
+    /// leaves the names empty.
+    Text {
+        table_name: &'a str,
+        col_name: &'a str,
+    },
+    /// Text parsed into an array when it is one. Any other value is left as it
+    /// is, so that an index key such as `'x'` matches no row, as in a scan.
+    TextIfArray,
+}
+
 /// Runs `transform_leaf` on the register holding each leaf element of the
 /// array in `reg`: each element of a one-dimensional array, and each element
-/// of each inner array of an array of arrays (`dimensions` > 1).
-/// `input_names`, the table and column names for errors, makes each level
-/// first turn text input such as `'{1,2}'` into an array blob.
+/// of each inner array of an array of arrays (`dimensions` > 1). Each level
+/// first turns text into an array blob as `input` says.
 pub(crate) fn emit_array_leaf_loop(
     program: &mut ProgramBuilder,
     reg: usize,
     dimensions: u32,
-    input_names: Option<(&str, &str)>,
+    input: ArrayInput,
     transform_leaf: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
 ) -> Result<()> {
-    if let Some((table_name, col_name)) = input_names {
+    let parse = |program: &mut ProgramBuilder, table_name: &str, col_name: &str| {
         program.emit_insn(Insn::ArrayEncode {
             data: Box::new(ArrayEncodeData {
                 reg,
@@ -141,20 +157,43 @@ pub(crate) fn emit_array_leaf_loop(
                 col_name: col_name.into(),
             }),
         });
-    }
+    };
+    let not_an_array_label = match input {
+        ArrayInput::Blob => None,
+        ArrayInput::Text {
+            table_name,
+            col_name,
+        } => {
+            parse(program, table_name, col_name);
+            None
+        }
+        ArrayInput::TextIfArray => {
+            // array_length is NULL for a value that is not an array.
+            let length_reg = program.alloc_register();
+            program.emit_insn(Insn::ArrayLength {
+                reg,
+                dest: length_reg,
+            });
+            let label = program.allocate_label();
+            program.emit_insn(Insn::IsNull {
+                reg: length_reg,
+                target_pc: label,
+            });
+            parse(program, "", "");
+            Some(label)
+        }
+    };
     emit_array_element_loop(program, reg, |program, element_reg| {
         if dimensions > 1 {
-            emit_array_leaf_loop(
-                program,
-                element_reg,
-                dimensions - 1,
-                input_names,
-                transform_leaf,
-            )
+            emit_array_leaf_loop(program, element_reg, dimensions - 1, input, transform_leaf)
         } else {
             transform_leaf(program, element_reg)
         }
-    })
+    })?;
+    if let Some(label) = not_an_array_label {
+        program.preassign_label_to_next_insn(label);
+    }
+    Ok(())
 }
 
 /// Emit bytecode that turns the array value in `reg` into what an array column
@@ -176,7 +215,10 @@ pub(super) fn emit_array_encode(
                 program,
                 reg,
                 col.array_dimensions(),
-                Some((table_name, col_name)),
+                ArrayInput::Text {
+                    table_name,
+                    col_name,
+                },
                 |program, leaf_reg| {
                     emit_store_value(program, &resolved.chain, leaf_reg, &col.ty_params, resolver)
                 },
@@ -240,7 +282,7 @@ pub(crate) fn emit_array_decode(
         program,
         reg,
         col.array_dimensions(),
-        None,
+        ArrayInput::Blob,
         |program, leaf_reg| emit_decode(program, &resolved.chain, leaf_reg, resolver),
     )
 }

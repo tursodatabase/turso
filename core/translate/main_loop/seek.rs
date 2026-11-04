@@ -83,7 +83,7 @@ pub(super) fn encode_seek_keys_for_custom_types(
                 program,
                 reg,
                 table_col.array_dimensions(),
-                Some(("", "")),
+                crate::translate::expr::ArrayInput::TextIfArray,
                 |program, leaf_reg| {
                     emit_seek_key_encode(program, &resolved.chain, leaf_reg, resolver)
                 },

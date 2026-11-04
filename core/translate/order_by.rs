@@ -50,6 +50,19 @@ fn result_column_custom_type_info<'a>(
     }
 }
 
+/// For a sort key that is a column of a custom type with a DECODE, returns
+/// the type: the sort key holds the column's stored form, so that the sorter
+/// compares stored values. An array of the type holds the values of its
+/// elements instead, as it does everywhere outside its column.
+fn sort_key_stored_form_type(
+    expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<std::sync::Arc<crate::schema::TypeDef>> {
+    let (column, type_def) = result_column_custom_type_info(expr, referenced_tables, schema)?;
+    (!column.is_array() && type_def.decode().is_some()).then_some(type_def)
+}
+
 // Metadata for handling ORDER BY operations
 #[derive(Debug)]
 pub struct SortMetadata {
@@ -319,16 +332,12 @@ impl EmitOrderBy {
             // (on-disk) value (decode was suppressed during sorter insert). Apply
             // DECODE now so the result set contains human-readable values.
             if remapping.deduplicated {
-                if let Some((column, type_def)) = result_column_custom_type_info(
+                if let Some(type_def) = sort_key_stored_form_type(
                     &rc.expr,
                     &plan.table_references,
                     t_ctx.resolver.schema(),
                 ) {
                     if let Some(decode_expr) = type_def.decode() {
-                        if column.is_array() {
-                            super::expr::emit_array_decode(program, reg, column, &t_ctx.resolver)?;
-                            continue;
-                        }
                         let skip_label = program.allocate_label();
                         program.emit_insn(Insn::IsNull {
                             reg,
@@ -430,12 +439,12 @@ impl EmitOrderBy {
                     extra_amount: 0,
                 });
             } else {
-                // Sort keys must be encoded (on-disk) values. Suppress decode so the
-                // sorter compares stored values, with SQLite's comparison or the
-                // built-in type's own order (numeric).
+                // Sort keys of custom type columns hold stored values. Suppress
+                // decode so the sorter compares them with SQLite's comparison or
+                // the built-in type's own order (numeric).
                 let is_custom =
-                    result_column_custom_type_info(expr, &plan.table_references, resolver.schema())
-                        .is_some_and(|(_, td)| td.decode().is_some());
+                    sort_key_stored_form_type(expr, &plan.table_references, resolver.schema())
+                        .is_some();
                 if is_custom {
                     program.flags.set_suppress_custom_type_decode(true);
                 }

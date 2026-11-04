@@ -1361,6 +1361,8 @@ mod tests {
                     "SELECT count(*) FROM t WHERE a = ARRAY[(SELECT w FROM t)]",
                     1,
                 );
+                // A key that is not an array matches no row, as in a scan.
+                all_true("SELECT count(*) = 0 FROM t WHERE a = 'x'", 1);
             }
 
             // Elements sort and compare by their values, with and without an
@@ -1377,6 +1379,10 @@ mod tests {
                             "1,2",
                         ),
                         (
+                            "SELECT group_concat(id) FROM (SELECT id FROM o ORDER BY a)",
+                            "1,2",
+                        ),
+                        (
                             "SELECT group_concat(o1.id || '<' || o2.id) \
                              FROM o o1, o o2 WHERE o1.a < o2.a",
                             "1<2",
@@ -1385,6 +1391,13 @@ mod tests {
                         let rows: Vec<(String,)> = conn.exec_rows(sql);
                         assert_eq!(rows, vec![(expected.to_string(),)], "{ty}: {sql} ({step})");
                     }
+                    // A sort key that is also a result column is read back
+                    // from the sorter.
+                    assert_eq!(
+                        crate::common::limbo_exec_rows(&conn, "SELECT a FROM o ORDER BY a"),
+                        crate::common::limbo_exec_rows(&conn, "SELECT a FROM o ORDER BY id"),
+                        "{ty}: SELECT a FROM o ORDER BY a ({step})"
+                    );
                 };
                 sorts_by_value("without an index");
                 if element_index_works {

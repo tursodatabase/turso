@@ -9,6 +9,21 @@ expect error {
     cannot store non-array value in INTEGER column tc1.vals
 }
 
+test array-cast-of-non-array-names-no-column {
+    SELECT CAST('x' AS integer[]);
+}
+expect error {
+    cannot cast a non-array value to an array
+}
+
+test array-cast-of-non-array-to-custom-type-names-no-column {
+    CREATE TYPE cast_x(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    SELECT CAST('x' AS cast_x[]);
+}
+expect error {
+    cannot cast a non-array value to an array
+}
+
 test array-infinity-rejected {
     CREATE TABLE inf1 (id INTEGER PRIMARY KEY, vals real[]) STRICT;
     INSERT INTO inf1 VALUES (1, '{1e309}');

@@ -2672,13 +2672,12 @@ pub fn op_array_encode(
                     .map(|iter| iter.into_iter().all(|r| r.is_ok()))
                     .unwrap_or(false);
             if !valid {
-                bail_constraint_error!(
-                    "cannot store non-array value in {} column {}.{} ({})",
+                return crate::error::cold_return(Err(non_array_value_error(
                     element_type,
                     table_name,
                     col_name,
-                    SQLITE_CONSTRAINT
-                );
+                )
+                .into()));
             }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -2692,13 +2691,12 @@ pub fn op_array_encode(
         _ => None,
     };
     let Some(raw_elements) = raw_elements else {
-        bail_constraint_error!(
-            "cannot store non-array value in {} column {}.{} ({})",
+        return crate::error::cold_return(Err(non_array_value_error(
             element_type,
             table_name,
             col_name,
-            SQLITE_CONSTRAINT
-        );
+        )
+        .into()));
     };
 
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
@@ -2751,6 +2749,19 @@ pub fn op_array_encode(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// The error for a value that is not an array, stored in column
+/// `table_name.col_name`, or cast to an array when the names are empty.
+fn non_array_value_error(element_type: &str, table_name: &str, col_name: &str) -> LimboError {
+    let message = if col_name.is_empty() {
+        format!("cannot cast a non-array value to an array ({SQLITE_CONSTRAINT})")
+    } else {
+        format!(
+            "cannot store non-array value in {element_type} column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
+        )
+    };
+    LimboError::Constraint(message)
 }
 
 /// Convert a native record-format array BLOB to PG text representation for display.

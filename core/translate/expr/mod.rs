@@ -91,7 +91,7 @@ pub(crate) use affinity::{
 };
 pub(crate) use arrays::{
     emit_array_decode, emit_array_leaf_loop, emit_array_text, emit_custom_type_decode_columns,
-    emit_custom_type_encode_columns,
+    emit_custom_type_encode_columns, ArrayInput,
 };
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
