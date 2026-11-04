@@ -1217,6 +1217,177 @@ mod tests {
         conn.close().unwrap();
     }
 
+    /// Every way of storing a value of a custom type stores what a STRICT column
+    /// of the type's BASE stores when given the ENCODE result: the same kind and
+    /// value, or an error naming the same kind. CAST gives that value too.
+    #[test]
+    fn test_stored_value_has_the_kind_of_the_base() {
+        // ENCODE results for the input 7, one per kind a value can have.
+        let encodes = [
+            "value",
+            "value + 0.0",
+            "value + 0.5",
+            "value / 3.0",
+            "value + 9007199254740986",
+            "CAST(value AS text)",
+            "CAST(value AS text) || '.0'",
+            "'x' || value",
+            "CAST(value AS blob)",
+        ];
+        let bases = ["integer", "real", "text", "blob"];
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+
+        let mut mismatches = vec![];
+        for (e, encode) in encodes.iter().enumerate() {
+            for base in bases {
+                let ty = format!("t_{e}_{base}");
+                conn.execute(format!(
+                    "CREATE TYPE {ty}(value any) BASE {base} ENCODE {encode} DECODE value"
+                ))
+                .unwrap();
+                let plain_value = encode.replace("value", "7");
+                let expected = stored_kind_and_value(
+                    &conn,
+                    &[
+                        &format!("CREATE TABLE plain_{ty}(c {base}) STRICT"),
+                        &format!("INSERT INTO plain_{ty} VALUES ({plain_value})"),
+                    ],
+                    &format!("SELECT typeof(c), quote(c) FROM plain_{ty}"),
+                );
+                let table_with_c = |prefix: &str, column: &str| {
+                    format!("CREATE TABLE {prefix}_{ty}(id INTEGER PRIMARY KEY, {column}) STRICT")
+                };
+                let select =
+                    |prefix: &str| format!("SELECT typeof(c), quote(c) FROM {prefix}_{ty}");
+                let paths: Vec<(&str, Vec<String>, String)> = vec![
+                    (
+                        "INSERT",
+                        vec![
+                            table_with_c("ins", &format!("c {ty}")),
+                            format!("INSERT INTO ins_{ty} VALUES (1, 7)"),
+                        ],
+                        select("ins"),
+                    ),
+                    (
+                        "UPDATE",
+                        vec![
+                            table_with_c("upd", &format!("c {ty}")),
+                            format!("INSERT INTO upd_{ty} VALUES (1, NULL)"),
+                            format!("UPDATE upd_{ty} SET c = 7"),
+                        ],
+                        select("upd"),
+                    ),
+                    (
+                        "UPSERT",
+                        vec![
+                            table_with_c("ups", &format!("c {ty}")),
+                            format!("INSERT INTO ups_{ty} VALUES (1, NULL)"),
+                            format!(
+                                "INSERT INTO ups_{ty} VALUES (1, NULL) \
+                                 ON CONFLICT(id) DO UPDATE SET c = 7"
+                            ),
+                        ],
+                        select("ups"),
+                    ),
+                    (
+                        "DEFAULT",
+                        vec![
+                            table_with_c("def", &format!("c {ty} DEFAULT 7")),
+                            format!("INSERT INTO def_{ty}(id) VALUES (1)"),
+                        ],
+                        select("def"),
+                    ),
+                    (
+                        "ADD COLUMN DEFAULT",
+                        vec![
+                            format!("CREATE TABLE add_{ty}(id INTEGER PRIMARY KEY) STRICT"),
+                            format!("INSERT INTO add_{ty} VALUES (1)"),
+                            format!("ALTER TABLE add_{ty} ADD COLUMN c {ty} DEFAULT 7"),
+                        ],
+                        select("add"),
+                    ),
+                    (
+                        "ALTER COLUMN",
+                        vec![
+                            table_with_c("alt", "c integer"),
+                            format!("INSERT INTO alt_{ty} VALUES (1, 7)"),
+                            format!("ALTER TABLE alt_{ty} ALTER COLUMN c TO d {ty}"),
+                        ],
+                        format!("SELECT typeof(d), quote(d) FROM alt_{ty}"),
+                    ),
+                    (
+                        "virtual generated column",
+                        vec![
+                            table_with_c("gen", &format!("a integer, c {ty} AS (a)")),
+                            format!("INSERT INTO gen_{ty}(id, a) VALUES (1, 7)"),
+                        ],
+                        select("gen"),
+                    ),
+                    (
+                        "domain",
+                        vec![
+                            format!("CREATE DOMAIN dom_{ty} AS {ty}"),
+                            table_with_c("dom", &format!("c dom_{ty}")),
+                            format!("INSERT INTO dom_{ty} VALUES (1, 7)"),
+                        ],
+                        select("dom"),
+                    ),
+                    (
+                        "CAST",
+                        vec![],
+                        format!("SELECT typeof(CAST(7 AS {ty})), quote(CAST(7 AS {ty}))"),
+                    ),
+                ];
+                for (path, setup, select) in paths {
+                    let setup: Vec<&str> = setup.iter().map(String::as_str).collect();
+                    let actual = stored_kind_and_value(&conn, &setup, &select);
+                    if actual != expected {
+                        mismatches.push(format!(
+                            "ENCODE {encode}, BASE {base}, {path}: expected {expected:?}, got {actual:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// Runs `setup`, then `select`, which returns the stored kind and value. An
+    /// error is reduced to the "cannot store KIND value" part of its message, so
+    /// errors about the same kind compare equal whatever column or type they name.
+    fn stored_kind_and_value(
+        conn: &Arc<turso_core::Connection>,
+        setup: &[&str],
+        select: &str,
+    ) -> Result<(String, String), String> {
+        let run = || -> turso_core::Result<(String, String)> {
+            for sql in setup {
+                conn.execute(sql)?;
+            }
+            let mut stmt = conn.prepare(select)?;
+            let mut rows = vec![];
+            stmt.run_with_row_callback(|row| {
+                rows.push((row.get::<String>(0)?, row.get::<String>(1)?));
+                Ok(())
+            })?;
+            assert_eq!(rows.len(), 1, "{select}");
+            Ok(rows.remove(0))
+        };
+        run().map_err(|err| {
+            let message = err.to_string();
+            match message.find("cannot store ") {
+                Some(start) => message[start..]
+                    .split(" value")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                None => message,
+            }
+        })
+    }
+
     /// Only text types take a COLLATE, as in PostgreSQL. Tries every kind of
     /// column type in every place a COLLATE can be written: an array or a
     /// custom type that isn't text refuses it, and every other type behaves

@@ -8,8 +8,9 @@ use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, Table, Type, TypeDef, TypeOrigin,
-    SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
+    TypeDefKind, TypeOrigin, UnionDef, SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -3139,6 +3140,9 @@ pub fn translate_create_type(
         crate::schema::check_type_param_use(params, encode, decode)?;
         let type_def =
             TypeDef::from_create_type(&normalized_name, body, TypeOrigin::User, String::new())?;
+        resolver
+            .schema()
+            .plain_value_type(&normalized_name, type_def.value_input_type())?;
         // A CAST to the type from its own DECODE would run that DECODE again
         // without end.
         if type_def_uses_type(&type_def, &type_registry_key(&normalized_name))? {
@@ -3575,8 +3579,8 @@ fn find_cast_to_type(schema: &Schema, registry_key: &str) -> Result<Option<Strin
     Ok(type_use)
 }
 
-/// The name of the first other type or domain that uses the type: as its
-/// BASE, a field or variant, or a CAST in one of its expressions.
+/// The name of the first other type or domain whose definition names the
+/// type (see type_def_uses_type).
 fn find_type_using(schema: &Schema, registry_key: &str) -> Result<Option<String>> {
     for (name, type_def) in schema.type_registry.iter() {
         if type_registry_key(name) != registry_key && type_def_uses_type(type_def, registry_key)? {
@@ -3586,32 +3590,72 @@ fn find_type_using(schema: &Schema, registry_key: &str) -> Result<Option<String>
     Ok(None)
 }
 
+/// Whether the definition of `type_def` names the type `registry_key`. Every
+/// field is listed by name, so a new field has to say whether it can name one.
 fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
-    if type_registry_key(type_def.base()) == registry_key {
-        return Ok(true);
-    }
-    let struct_field_types = type_def
-        .struct_def()
+    let TypeDef {
+        name: _,
+        is_builtin: _,
+        not_null: _,
+        is_domain: _,
+        accepts_collate: _,
+        sql: _,
+        domain_checks,
+        kind,
+    } = type_def;
+    let (type_names, exprs): (Vec<&str>, Vec<&ast::Expr>) = match kind {
+        TypeDefKind::Custom {
+            params,
+            base,
+            encode,
+            coerce,
+            decode,
+            default,
+            // These name functions and comparison rules, never a type.
+            ordering: _,
+            operators: _,
+            operator_signatures: _,
+            // Worked out from the parts above.
+            value_type: _,
+            stored_type: _,
+        } => (
+            std::iter::once(base.as_str())
+                // `CREATE TYPE outer_t(value inner_t)` converts every value
+                // with inner_t.
+                .chain(params.iter().filter_map(|param| param.ty.as_deref()))
+                .collect(),
+            [encode, coerce, decode, default]
+                .into_iter()
+                .flatten()
+                .map(|expr| expr.as_ref())
+                .collect(),
+        ),
+        TypeDefKind::Struct(StructDef { fields }) => (
+            fields
+                .iter()
+                .map(|field| field.type_name.as_str())
+                .collect(),
+            Vec::new(),
+        ),
+        TypeDefKind::Union(UnionDef {
+            variants,
+            tag_names: _,
+        }) => (
+            variants
+                .iter()
+                .map(|variant| variant.type_name.as_str())
+                .collect(),
+            Vec::new(),
+        ),
+    };
+    if type_names
         .into_iter()
-        .flat_map(|def| def.fields.iter().map(|field| &field.type_name));
-    let union_variant_types = type_def
-        .union_def()
-        .into_iter()
-        .flat_map(|def| def.variants.iter().map(|variant| &variant.type_name));
-    if struct_field_types
-        .chain(union_variant_types)
         .any(|name| type_registry_key(name) == registry_key)
     {
         return Ok(true);
     }
-    let exprs = [
-        type_def.encode(),
-        type_def.coerce(),
-        type_def.decode(),
-        type_def.default_expr(),
-    ];
-    let domain_checks = type_def.domain_checks.iter().map(|c| c.check.as_ref());
-    for expr in exprs.into_iter().flatten().chain(domain_checks) {
+    let domain_checks = domain_checks.iter().map(|c| c.check.as_ref());
+    for expr in exprs.into_iter().chain(domain_checks) {
         if expr_casts_to_type(expr, registry_key)? {
             return Ok(true);
         }
