@@ -1103,23 +1103,46 @@ mod tests {
             kind("label", no_values, none("label")),
             kind("integer[]", no_values, none("integer[]")),
         ];
-        // (offset, the type an error names it by, whether that is a custom
-        // type). NULL is accepted wherever the column type takes offsets, and
-        // then fails when the statement runs. A CAST to numeric without
+        enum OffsetType {
+            /// Known when the statement is prepared. An error names it `name`.
+            Known { name: &'static str, custom: bool },
+            /// A string or a parameter, read as the column's type when the
+            /// statement runs.
+            ColumnType { integer: bool },
+            /// Accepted wherever the column type takes offsets, and then fails
+            /// when the statement runs.
+            Null,
+        }
+        let known = |name| OffsetType::Known {
+            name,
+            custom: false,
+        };
+        let custom = |name| OffsetType::Known { name, custom: true };
+        // (offset, its type, the value bound to ?1). A CAST to numeric without
         // arguments is SQLite's CAST, whose result may be an integer or a real.
         let offsets = [
-            ("1", Some("integer"), false),
-            ("1.5", Some("numeric"), false),
-            ("CAST(1.5 AS REAL)", Some("real"), false),
-            ("'1'", Some("text"), false),
-            ("x'01'", Some("blob"), false),
-            ("?", Some("unknown"), false),
-            ("NULL", None, false),
-            ("CAST(1 AS numeric)", Some("unknown"), false),
-            ("CAST(1 AS smallint)", Some("smallint"), true),
-            ("CAST(1 AS bigint)", Some("bigint"), true),
-            ("CAST(1 AS numeric(5, 2))", Some("numeric"), true),
-            ("CAST(1 AS boolean)", Some("boolean"), true),
+            ("1", known("integer"), None),
+            ("1.5", known("numeric"), None),
+            ("CAST(1.5 AS REAL)", known("real"), None),
+            ("x'01'", known("blob"), None),
+            ("CAST(1 AS numeric)", known("unknown"), None),
+            ("'1'", OffsetType::ColumnType { integer: true }, None),
+            ("'1.5'", OffsetType::ColumnType { integer: false }, None),
+            (
+                "?1",
+                OffsetType::ColumnType { integer: true },
+                Some(turso_core::Value::from_i64(1)),
+            ),
+            (
+                "?1",
+                OffsetType::ColumnType { integer: false },
+                Some(turso_core::Value::build_text("1.5")),
+            ),
+            ("NULL", OffsetType::Null, None),
+            ("CAST(1 AS smallint)", custom("smallint"), None),
+            ("CAST(1 AS bigint)", custom("bigint"), None),
+            ("CAST(1 AS numeric(5, 2))", custom("numeric"), None),
+            ("CAST(1 AS boolean)", custom("boolean"), None),
         ];
         // (frame, the rows it holds for the row `t` when ordered ascending,
         // and when ordered descending). `{k}` is the offset.
@@ -1145,16 +1168,21 @@ mod tests {
                 "u.c >= t.c + {k}",
             ),
         ];
-        let counts =
-            |conn: &Arc<turso_core::Connection>, sql: &str| -> turso_core::Result<Vec<i64>> {
-                let mut stmt = conn.prepare(sql)?;
-                let mut rows = Vec::new();
-                stmt.run_with_row_callback(|row| {
-                    rows.push(row.get::<i64>(0)?);
-                    Ok(())
-                })?;
-                Ok(rows)
-            };
+        let counts = |conn: &Arc<turso_core::Connection>,
+                      sql: &str,
+                      param: &Option<turso_core::Value>|
+         -> turso_core::Result<Vec<i64>> {
+            let mut stmt = conn.prepare(sql)?;
+            if let Some(param) = param {
+                stmt.bind_at(1.try_into().unwrap(), param.clone())?;
+            }
+            let mut rows = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                rows.push(row.get::<i64>(0)?);
+                Ok(())
+            })?;
+            Ok(rows)
+        };
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
         let db = TempDatabase::builder().with_opts(opts).build();
         let conn = db.connect_limbo();
@@ -1187,7 +1215,7 @@ mod tests {
                         .unwrap();
                 }
             }
-            for (offset, offset_type, custom_offset) in offsets {
+            for (offset, offset_type, param) in &offsets {
                 for (frame, asc_rows, desc_rows) in frames {
                     for (order, rows) in [("ASC", asc_rows), ("DESC", desc_rows)] {
                         let window = format!(
@@ -1197,21 +1225,26 @@ mod tests {
                         .replace("{k}", offset);
                         let context =
                             format!("type {} (strict={}): {window}", kind.ty, kind.strict);
-                        let result = counts(&conn, &window);
+                        let result = counts(&conn, &window, param);
+                        let refused = |refusal: String| {
+                            let error = match conn.prepare(&window) {
+                                Ok(_) => panic!("{context}: expected an error"),
+                                Err(error) => error.to_string(),
+                            };
+                            assert!(error.contains(&refusal), "{context}: {error}");
+                        };
                         match &kind.offsets {
-                            // An offset of a custom type is refused: adding it
-                            // gives a value of that type, which doesn't compare
-                            // with SQLite's numbers. Others keep SQLite's rules.
+                            // An offset of a custom type other than smallint and
+                            // bigint is refused: adding it gives a value of that
+                            // type, which doesn't compare with SQLite's numbers.
+                            // Others keep SQLite's rules.
                             Offsets::Sqlite => match offset_type {
-                                Some(offset_type) if custom_offset => {
-                                    let error = match conn.prepare(&window) {
-                                        Ok(_) => panic!("{context}: expected an error"),
-                                        Err(error) => error.to_string(),
-                                    };
-                                    let refusal = format!(
-                                        "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type {offset_type} over a value without a custom type"
-                                    );
-                                    assert!(error.contains(&refusal), "{context}: {error}");
+                                OffsetType::Known { name, custom: true }
+                                    if !INTEGERS.contains(name) =>
+                                {
+                                    refused(format!(
+                                        "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type {name} over a value without a custom type"
+                                    ))
                                 }
                                 _ => {
                                     if let Err(error) = result {
@@ -1222,47 +1255,51 @@ mod tests {
                                     }
                                 }
                             },
-                            Offsets::Takes { name, offset_types } => {
-                                let refusal = match offset_type {
-                                    _ if offset_types.is_empty() => Some(format!(
-                                        "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name}"
-                                    )),
-                                    Some(offset_type) if !offset_types.contains(&offset_type) => {
-                                        Some(format!(
-                                            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name} and offset type {offset_type}"
-                                        ))
-                                    }
-                                    _ => None,
-                                };
-                                match (refusal, offset_type) {
-                                    (Some(refusal), _) => {
-                                        let error = match conn.prepare(&window) {
-                                            Ok(_) => panic!("{context}: expected an error"),
-                                            Err(error) => error.to_string(),
-                                        };
-                                        assert!(error.contains(&refusal), "{context}: {error}");
-                                    }
-                                    (None, None) => {
-                                        let error = result.expect_err(&context).to_string();
-                                        assert!(
-                                            error.contains("offset must be a non-negative number"),
-                                            "{context}: {error}"
-                                        );
-                                    }
-                                    (None, Some(_)) => {
-                                        let expected_sql = format!(
-                                            "SELECT (SELECT count(*) FROM {table} u WHERE {rows}) \
-                                             FROM {table} t ORDER BY id"
-                                        )
-                                        .replace("{k}", offset);
-                                        let expected = counts(&conn, &expected_sql)
-                                            .unwrap_or_else(|e| panic!("{expected_sql}: {e}"));
-                                        let actual =
-                                            result.unwrap_or_else(|e| panic!("{context}: {e}"));
-                                        assert_eq!(actual, expected, "{context}");
-                                    }
-                                }
+                            Offsets::Takes {
+                                name,
+                                offset_types: &[],
+                            } => {
+                                refused(format!(
+                                    "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name}"
+                                ))
                             }
+                            Offsets::Takes { name, offset_types } => match offset_type {
+                                OffsetType::Known {
+                                    name: offset_type, ..
+                                } if !offset_types.contains(offset_type) => refused(format!(
+                                    "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name} and offset type {offset_type}"
+                                )),
+                                OffsetType::Null => {
+                                    let error = result.expect_err(&context).to_string();
+                                    assert!(
+                                        error.contains("offset must be a non-negative number"),
+                                        "{context}: {error}"
+                                    );
+                                }
+                                OffsetType::ColumnType { integer: false }
+                                    if !offset_types.contains(&"numeric") =>
+                                {
+                                    let error = result.expect_err(&context).to_string();
+                                    assert!(
+                                        error.contains(&format!(
+                                            "RANGE offset over column type {name} must be an integer"
+                                        )),
+                                        "{context}: {error}"
+                                    );
+                                }
+                                _ => {
+                                    let expected_sql = format!(
+                                        "SELECT (SELECT count(*) FROM {table} u WHERE {rows}) \
+                                         FROM {table} t ORDER BY id"
+                                    )
+                                    .replace("{k}", offset);
+                                    let expected = counts(&conn, &expected_sql, param)
+                                        .unwrap_or_else(|e| panic!("{expected_sql}: {e}"));
+                                    let actual =
+                                        result.unwrap_or_else(|e| panic!("{context}: {e}"));
+                                    assert_eq!(actual, expected, "{context}");
+                                }
+                            },
                         }
                     }
                 }

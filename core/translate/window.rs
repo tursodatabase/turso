@@ -1,6 +1,7 @@
 use crate::alloc::TursoSliceExt;
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
 use crate::namespace::NamespaceRef;
+use crate::schema::INTEGER_RANGE_OFFSETS;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
@@ -980,6 +981,38 @@ fn emit_frame_offset(
         });
     }
     emit_window_check_offset(program, reg, mode, pos);
+    if mode == turso_parser::ast::FrameMode::Range {
+        let window = plan.window.as_ref().expect("missing window");
+        let [(order_expr, ..)] = window.order_by.as_slice() else {
+            unreachable!("RANGE offsets require exactly one ORDER BY expression");
+        };
+        let context = ExprContext::new(Some(&plan.table_references), resolver);
+        if let Some(column_type) = check_range_offset_type(order_expr, expr, &context.type_env())? {
+            // A parameter or a string, whose number is known only now, over a
+            // column that takes only integer offsets: '1' becomes 1, and 1.5
+            // is an error, as PostgreSQL reads it as the column's type.
+            let label_ok = program.allocate_label();
+            let label_halt = program.allocate_label();
+            program.emit_insn(Insn::MustBeInt {
+                reg,
+                target_pc: Some(label_halt),
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: label_ok,
+            });
+            program.preassign_label_to_next_insn(label_halt);
+            program.emit_insn(Insn::Halt {
+                constraint_info: None,
+                err_code: crate::error::SQLITE_ERROR,
+                description: format!(
+                    "RANGE offset over column type {column_type} must be an integer"
+                ),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(label_ok);
+        }
+    }
     Ok(())
 }
 
@@ -2562,7 +2595,6 @@ fn emit_window_range_test(
     let offset_expr = frame_offset_expr(&window.frame, offset_bound);
     let context = ExprContext::new(Some(&plan.table_references), resolver);
     let env = context.type_env();
-    check_range_offset_type(order_expr, offset_expr, &env)?;
     // The offset is added with the ORDER BY value's own `+` or `-`, chosen by
     // the value's type as in any other arithmetic: numeric adds exactly.
     // None means SQLite's operator runs.
@@ -2687,9 +2719,19 @@ fn emit_window_range_test(
 /// PostgreSQL's `in_range` functions do: `RANGE BETWEEN 1 PRECEDING` works
 /// over a bigint, but not over a date, a uuid or a type made with CREATE TYPE.
 /// Arrays take none. SQLite's own types take any number, checked when the
-/// statement runs, as in SQLite, but not a value of a custom type: `x +
-/// CAST(1 AS numeric)` is a numeric, which doesn't compare with x's numbers.
-fn check_range_offset_type(order_expr: &Expr, offset: &Expr, env: &TypeEnv) -> Result<()> {
+/// statement runs, as in SQLite, and smallint and bigint values, which are
+/// plain integers. Other custom types are refused there: `x + CAST(1 AS
+/// numeric(5,2))` is a numeric, which doesn't compare with x's numbers.
+///
+/// A parameter or a string is read as the column's type when the statement
+/// runs, as PostgreSQL does. Over a column that takes only integer offsets
+/// this returns the column type's name: the offset must then be made an
+/// integer, or the statement fails.
+fn check_range_offset_type(
+    order_expr: &Expr,
+    offset: &Expr,
+    env: &TypeEnv,
+) -> Result<Option<String>> {
     let schema = env.schema();
     let order_type = type_of(order_expr, env);
     // The column type's name and the offset types it takes. None for SQLite's
@@ -2711,9 +2753,21 @@ fn check_range_offset_type(order_expr: &Expr, offset: &Expr, env: &TypeEnv) -> R
     let offset_type = type_of(offset, env);
     // A NULL offset fails when the statement runs, as any other NULL offset.
     if matches!(offset_type, ExprType::Null) {
-        return Ok(());
+        return Ok(None);
     }
     match column {
+        Some((column_type, offset_types))
+            if matches!(
+                offset_type,
+                ExprType::Untyped | ExprType::Builtin(BuiltinType::Any)
+            ) =>
+        {
+            // numeric's `+` and `-` read a string or parameter exactly, and
+            // fail on one that isn't a number.
+            if !offset_types.contains(&"numeric") {
+                return Ok(Some(column_type));
+            }
+        }
         Some((column_type, offset_types)) => {
             let offset_type = range_offset_type_name(&offset_type, schema)?;
             if !offset_types.contains(&offset_type.as_str()) {
@@ -2730,15 +2784,17 @@ fn check_range_offset_type(order_expr: &Expr, offset: &Expr, env: &TypeEnv) -> R
         ) =>
         {
             let offset_type = range_offset_type_name(&offset_type, schema)?;
-            crate::bail_parse_error!(
-                "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type \
-                 {offset_type} over a value without a custom type; cast the offset to integer \
-                 or real"
-            );
+            if !INTEGER_RANGE_OFFSETS.contains(&offset_type.as_str()) {
+                crate::bail_parse_error!(
+                    "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type \
+                     {offset_type} over a value without a custom type; cast the offset to \
+                     integer or real"
+                );
+            }
         }
         None => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 /// The name of `ty` in a RANGE offset error, as PostgreSQL would call it: a

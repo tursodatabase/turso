@@ -607,13 +607,33 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test cmp-bigint-window-range-parameter-offset-is-an-error {
-    -- The type of a parameter isn't known before the statement runs.
+test cmp-window-range-string-offset-read-as-column-type {
+    -- A string offset is read as the column's type when the statement runs,
+    -- as in PostgreSQL: '1' is the integer 1 over a bigint, and '1.5' is an
+    -- exact numeric over a numeric.
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b bigint, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 1, 1), (2, 2, 2.5), (3, 4, 4);
+    SELECT 'b', b, count(*) OVER (ORDER BY b RANGE BETWEEN '1' PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    SELECT 'n', n, count(*) OVER (ORDER BY n RANGE BETWEEN CURRENT ROW AND '1.5' FOLLOWING) FROM t ORDER BY id;
+}
+expect {
+    b|1|1
+    b|2|2
+    b|4|1
+    n|1.00|2
+    n|2.50|2
+    n|4.00|1
+}
+
+@requires strict "uses STRICT tables"
+test cmp-bigint-window-range-decimal-string-offset-is-an-error {
+    -- '1.5' read as a bigint is not an integer.
     CREATE TABLE t(b bigint) STRICT;
-    SELECT count(*) OVER (ORDER BY b RANGE BETWEEN ? PRECEDING AND CURRENT ROW) FROM t;
+    INSERT INTO t VALUES (1);
+    SELECT count(*) OVER (ORDER BY b RANGE BETWEEN '1.5' PRECEDING AND CURRENT ROW) FROM t;
 }
 expect error {
-    RANGE with offset PRECEDING/FOLLOWING is not supported for column type bigint and offset type unknown
+    RANGE offset over column type bigint must be an integer
 }
 
 @requires strict "uses STRICT tables"
@@ -659,12 +679,17 @@ test cmp-sqlite-type-window-range-offset-unchanged {
     CREATE TABLE t(id INTEGER PRIMARY KEY, i integer, x text) STRICT;
     INSERT INTO t VALUES (1, 1, 'a'), (2, 2, 'b'), (3, 4, 'c');
     SELECT 'i', i, count(*) OVER (ORDER BY i RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
+    -- A bigint is a plain integer, so it is an offset here too.
+    SELECT 'big', i, count(*) OVER (ORDER BY i RANGE BETWEEN CAST(1 AS bigint) PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
     SELECT 'x', x, count(*) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id;
 }
 expect {
     i|1|1
     i|2|2
     i|4|1
+    big|1|1
+    big|2|2
+    big|4|1
     x|a|1
     x|b|1
     x|c|1

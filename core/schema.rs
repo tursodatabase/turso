@@ -1193,6 +1193,9 @@ impl Default for Schema {
     }
 }
 
+/// The types a RANGE offset over an integer may have, as in PostgreSQL.
+pub const INTEGER_RANGE_OFFSETS: &[&str] = &["integer", "smallint", "bigint"];
+
 fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
@@ -1201,7 +1204,6 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
     // types take one: in PostgreSQL date, time and timestamp take an interval,
     // which Turso does not have.
     const NO_OFFSETS: &[&str] = &[];
-    const INTEGER_OFFSETS: &[&str] = &["integer", "smallint", "bigint"];
     const NUMERIC_OFFSETS: &[&str] = &["integer", "smallint", "bigint", "numeric"];
     let types: &[(&[&str], &str)] = &[
         #[cfg(feature = "uuid")]
@@ -1224,8 +1226,8 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         (NO_OFFSETS, "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
         (NO_OFFSETS, "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
         (NO_OFFSETS, "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
-        (INTEGER_OFFSETS, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
-        (INTEGER_OFFSETS, "CREATE TYPE bigint(value integer) BASE integer"),
+        (INTEGER_RANGE_OFFSETS, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
+        (INTEGER_RANGE_OFFSETS, "CREATE TYPE bigint(value integer) BASE integer"),
         (NO_OFFSETS, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
         (NO_OFFSETS, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
         (NO_OFFSETS, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),

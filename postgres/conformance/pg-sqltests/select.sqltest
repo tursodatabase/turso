@@ -1614,3 +1614,19 @@ test window-range-decimal-offset-over-bigint-is-an-error {
 expect error {
     RANGE with offset PRECEDING/FOLLOWING is not supported for column type bigint and offset type numeric
 }
+
+test window-range-string-and-bigint-offsets {
+    CREATE TABLE range_strings(b bigint, i int4);
+    INSERT INTO range_strings VALUES (1, 1), (2, 2), (4, 4);
+    SELECT b, count(*) OVER (ORDER BY b RANGE BETWEEN '1' PRECEDING AND CURRENT ROW) FROM range_strings ORDER BY b;
+    SELECT i, count(*) OVER (ORDER BY i RANGE BETWEEN 1::int8 PRECEDING AND CURRENT ROW) FROM range_strings ORDER BY i;
+    DROP TABLE range_strings;
+}
+expect {
+    1|1
+    2|2
+    4|1
+    1|1
+    2|2
+    4|1
+}

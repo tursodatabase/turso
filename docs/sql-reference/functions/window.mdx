@@ -69,9 +69,9 @@ where `<start>` and `<end>` (or the shorthand `<bound>`) are one of:
   | `smallint`, `bigint` | `integer`, `smallint`, `bigint` |
   | `numeric` | `integer`, `smallint`, `bigint`, `numeric` (a decimal such as `1.5`) |
   | any other custom type, a domain over one, or an array | none |
-  | a SQLite type (`INTEGER`, `REAL`, ...) | any value that is not of a custom type, as in SQLite |
+  | a SQLite type (`INTEGER`, `REAL`, ...) | any value that is not of a custom type, as in SQLite, and `smallint` or `bigint` values |
 
-  For example, `ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW` over a `date` column is an error, because PostgreSQL needs an `interval` offset there and Turso has no `interval` type. A parameter such as `?` has no known type, so it can't be the offset over a custom type; write `CAST(? AS integer)`. When the `ORDER BY` value is a `numeric`, the bounds are computed with numeric arithmetic.
+  For example, `ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW` over a `date` column is an error, because PostgreSQL needs an `interval` offset there and Turso has no `interval` type. A parameter such as `?`, or a string such as `'1'`, is read as the column's type when the statement runs, as in PostgreSQL: over a `bigint` column `'1.5'` is an error, and over a `numeric` column it is the exact decimal 1.5. When the `ORDER BY` value is a `numeric`, the bounds are computed with numeric arithmetic.
 - `GROUPS` counts peer groups (sets of rows that are equal on the `ORDER BY` expression).
 
 Example — a three-row moving window:
