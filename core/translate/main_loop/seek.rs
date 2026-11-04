@@ -66,14 +66,9 @@ pub(super) fn encode_seek_keys_for_custom_types(
             .catalog
             .dialect
             .converts_strings_compared_with_custom_types();
-        let encodes = !((compares_key_as_it_is && resolved.reads_stored_values_unchanged())
-            || resolved.chain.iter().all(|td| td.encode().is_none()));
-        // The key already has the affinity the column's values compare with.
-        // The index holds stored values, which have the stored affinity:
-        // with `BASE text DECODE CAST(value AS real)`, `c = 9.5` seeks '9.5'.
-        let stored_affinity = table_col.affinity();
-        let converts_to_stored = table_col.comparison_affinity() != stored_affinity;
-        if !encodes && !converts_to_stored {
+        if (compares_key_as_it_is && resolved.reads_stored_values_unchanged())
+            || resolved.chain.iter().all(|td| td.encode().is_none())
+        {
             continue;
         }
         // The index holds encoded values, so the key is encoded too. COERCE
@@ -86,25 +81,10 @@ pub(super) fn encode_seek_keys_for_custom_types(
             reg,
             target_pc: skip_label,
         });
-        if encodes {
-            for td in &resolved.chain {
-                if let Some(encode_expr) = td.encode() {
-                    crate::translate::expr::emit_type_expr(
-                        program,
-                        encode_expr,
-                        reg,
-                        reg,
-                        resolver,
-                    )?;
-                }
+        for td in &resolved.chain {
+            if let Some(encode_expr) = td.encode() {
+                crate::translate::expr::emit_type_expr(program, encode_expr, reg, reg, resolver)?;
             }
-        }
-        if stored_affinity != Affinity::Blob {
-            program.emit_insn(Insn::Affinity {
-                start_reg: reg,
-                count: std::num::NonZeroUsize::MIN,
-                affinities: stored_affinity.aff_mask().to_string(),
-            });
         }
         program.preassign_label_to_next_insn(skip_label);
     }
@@ -247,14 +227,6 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let null_matching_mask = NullMatchingMask::from(null_matching_bits);
 
         if let Some(idx) = self.seek_index {
-            let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
-            if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
-                self.program.emit_insn(Insn::Affinity {
-                    start_reg: self.start_reg,
-                    count: std::num::NonZeroUsize::new(num_regs).unwrap(),
-                    affinities,
-                });
-            }
             encode_seek_keys_for_custom_types(
                 self.program,
                 self.tables,
@@ -264,6 +236,14 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 0,
                 &self.t_ctx.resolver,
             )?;
+            let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
+            if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
+                self.program.emit_insn(Insn::Affinity {
+                    start_reg: self.start_reg,
+                    count: std::num::NonZeroUsize::new(num_regs).unwrap(),
+                    affinities,
+                });
+            }
             if use_bloom_filter {
                 turso_assert!(
                     idx.ephemeral,
@@ -374,14 +354,6 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     NoConstantOptReason::RegisterReuse,
                 )?;
                 if let Some(idx) = self.seek_index {
-                    let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
-                    if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
-                        self.program.emit_insn(Insn::Affinity {
-                            start_reg: self.start_reg,
-                            count: std::num::NonZeroUsize::new(num_regs).unwrap(),
-                            affinities,
-                        });
-                    }
                     encode_seek_keys_for_custom_types(
                         self.program,
                         self.tables,
@@ -391,6 +363,14 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         self.seek_def.prefix.len(),
                         &self.t_ctx.resolver,
                     )?;
+                    let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
+                    if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
+                        self.program.emit_insn(Insn::Affinity {
+                            start_reg: self.start_reg,
+                            count: std::num::NonZeroUsize::new(num_regs).unwrap(),
+                            affinities,
+                        });
+                    }
                 }
                 if !expr.is_nonnull(
                     &TableMetadata::new(Some(self.tables)),

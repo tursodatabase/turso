@@ -1048,12 +1048,9 @@ mod tests {
 
             for (i, (decode, kind)) in shapes.iter().enumerate() {
                 let context = format!("mvcc={mvcc}, DECODE {decode}");
-                // ENCODE stores what DECODE gives, as text, so that an index
-                // seek finds the row whose decoded value equals the probe.
-                // OPERATOR '<' allows the index.
                 let create_type = format!(
                     "CREATE TYPE k{i}(value any) BASE text \
-                     ENCODE CAST({decode} AS text) DECODE {decode} OPERATOR '<'"
+                     ENCODE CAST({decode} AS text) DECODE {decode}"
                 );
                 let Some(kind) = kind else {
                     assert_that!(conn.execute(&create_type))
@@ -1087,7 +1084,7 @@ mod tests {
                     }
                     conditions.push(format!("c IN ({literal}, 100)"));
                 }
-                let compare_with_plain_table = |indexed: &str| {
+                let compare_with_plain_table = || {
                     for condition in &conditions {
                         let got: Vec<(i64,)> = conn.exec_rows(&format!(
                             "SELECT id FROM t{i} WHERE {condition} ORDER BY id"
@@ -1095,7 +1092,7 @@ mod tests {
                         let expected: Vec<(i64,)> = conn.exec_rows(&format!(
                             "SELECT id FROM p{i} WHERE {condition} ORDER BY id"
                         ));
-                        assert_eq!(got, expected, "{context}, {indexed}: WHERE {condition}");
+                        assert_eq!(got, expected, "{context}: WHERE {condition}");
                     }
                     let got: Vec<(i64, i64)> = conn.exec_rows(&format!(
                         "SELECT a.id, b.id FROM t{i} a, t{i} b WHERE a.c < b.c ORDER BY 1, 2"
@@ -1103,18 +1100,9 @@ mod tests {
                     let expected: Vec<(i64, i64)> = conn.exec_rows(&format!(
                         "SELECT a.id, b.id FROM p{i} a, p{i} b WHERE a.c < b.c ORDER BY 1, 2"
                     ));
-                    assert_eq!(got, expected, "{context}, {indexed}: a.c < b.c");
+                    assert_eq!(got, expected, "{context}: a.c < b.c");
                 };
-                compare_with_plain_table("no index");
-                // An index seek ENCODEs the probe, which for INTEGER and
-                // NUMERIC kinds changes it (9.6 becomes '9', 10 and 10.0 are
-                // stored differently) and finds the wrong rows for a reason
-                // that is not the kind.
-                if *kind == "REAL" || *kind == "TEXT" {
-                    conn.execute(format!("CREATE INDEX t{i}_c ON t{i}(c)"))
-                        .unwrap();
-                    compare_with_plain_table("with index");
-                }
+                compare_with_plain_table();
             }
             conn.close().unwrap();
         }

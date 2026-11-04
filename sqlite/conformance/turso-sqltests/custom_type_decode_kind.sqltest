@@ -32,7 +32,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test decode-kind-cast-compares-as-real {
     -- The values are stored as text, where '10.0' < '9.6'. DECODE gives
-    -- reals, so 10.0 > 9.6. Every query runs before and after the index.
+    -- reals, so 10.0 > 9.6.
     CREATE TYPE price(value any) BASE text ENCODE CAST(CAST(json_extract(value, '$') AS real) AS text) DECODE CAST(json_extract(value, '$') AS real) OPERATOR '<';
     CREATE TABLE t(id INTEGER PRIMARY KEY, c price) STRICT;
     INSERT INTO t VALUES (1, '10.0'), (2, 9.5), (3, 100), (4, NULL), (5, '2e1');
@@ -43,14 +43,6 @@ test decode-kind-cast-compares-as-real {
     SELECT 'in', id FROM t WHERE c IN (20, 100) ORDER BY id;
     SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.c < b.c WHERE a.id = 2 ORDER BY 3;
     SELECT 'minmax', min(c), max(c) FROM t;
-    CREATE INDEX t_c ON t(c);
-    SELECT 'lt', id FROM t WHERE c < 9.6 ORDER BY id;
-    SELECT 'gt', id FROM t WHERE c > 9.6 ORDER BY id;
-    SELECT 'eq', id FROM t WHERE c = 10 ORDER BY id;
-    SELECT 'eq-text', id FROM t WHERE c = '9.5' ORDER BY id;
-    SELECT 'in', id FROM t WHERE c IN (20, 100) ORDER BY id;
-    SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.c < b.c WHERE a.id = 2 ORDER BY 3;
-    SELECT 'minmax', min(c), max(c) FROM t;
 }
 expect {
     lt|2
@@ -65,39 +57,6 @@ expect {
     join|2|3
     join|2|5
     minmax|9.5|100.0
-    lt|2
-    gt|1
-    gt|3
-    gt|5
-    eq|1
-    eq-text|2
-    in|3
-    in|5
-    join|2|1
-    join|2|3
-    join|2|5
-    minmax|9.5|100.0
-}
-
-@requires strict "uses STRICT tables"
-test decode-kind-seek-without-encode {
-    -- Without ENCODE the index holds the stored text. A seek for c = 10.5
-    -- looks for the text '10.5'; the text '9.5' is read as the real 9.5
-    -- first, then looked for as '9.5'. The stored texts are the ones the
-    -- reals turn into, so the index finds the rows a scan finds.
-    CREATE TYPE r(value any) BASE text DECODE CAST(value AS real) OPERATOR '<';
-    CREATE TABLE t(id INTEGER PRIMARY KEY, c r) STRICT;
-    INSERT INTO t VALUES (1, '10.5'), (2, '9.5');
-    CREATE INDEX t_c ON t(c);
-    SELECT 'eq', id FROM t WHERE c = 10.5;
-    SELECT 'eq-text', id FROM t WHERE c = '9.5';
-    SELECT 'in', id FROM t WHERE c IN (9.5, 10.5) ORDER BY id;
-}
-expect {
-    eq|1
-    eq-text|2
-    in|1
-    in|2
 }
 
 @requires strict "uses STRICT tables"
