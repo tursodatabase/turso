@@ -995,6 +995,163 @@ mod tests {
         }
     }
 
+    /// Every statement that copies a row must copy custom-type values as
+    /// stored. Running DECODE and then ENCODE again changes the value of a
+    /// type whose DECODE does not undo its ENCODE, like `plus1` and `x100`.
+    #[test]
+    fn test_row_copies_keep_custom_type_values() {
+        let mut changed = Vec::new();
+        for copied_type in COPIED_TYPES {
+            for row_copy in [
+                RowCopy::Vacuum,
+                RowCopy::VacuumInto,
+                RowCopy::DropColumn,
+                RowCopy::OnUpdateCascade,
+            ] {
+                // Array columns can't be keys, so they can't be cascaded.
+                if row_copy == RowCopy::OnUpdateCascade && copied_type.column_type.ends_with("[]") {
+                    continue;
+                }
+                let column_type = copied_type.column_type;
+                match copy_custom_type_value(copied_type, row_copy) {
+                    Ok((before, after)) if before == after => {}
+                    Ok((before, after)) => {
+                        changed.push(format!("{row_copy:?} {column_type}: {before} -> {after}"))
+                    }
+                    Err(e) => changed.push(format!("{row_copy:?} {column_type}: {e}")),
+                }
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "row copies changed values:\n{}",
+            changed.join("\n")
+        );
+    }
+
+    const CREATE_COPIED_TYPES: &[&str] = &[
+        "CREATE TYPE plus1 BASE integer ENCODE value + 1 DECODE value",
+        "CREATE TYPE x100 BASE integer ENCODE value * 100 DECODE value",
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TYPE shout BASE text ENCODE upper(value) DECODE lower(value)",
+    ];
+
+    const COPIED_TYPES: &[CopiedType] = &[
+        CopiedType::new("plus1", "5", "9"),
+        CopiedType::new("x100", "1", "2"),
+        CopiedType::new("cents", "42", "43"),
+        CopiedType::new("shout", "'Hi'", "'Yo'"),
+        CopiedType::new("plus1[]", "ARRAY[1, 2]", "ARRAY[3]"),
+        CopiedType::new("shout[]", "ARRAY['a', 'B']", "ARRAY['c']"),
+    ];
+
+    /// A custom-type column and two values to write to it.
+    struct CopiedType {
+        column_type: &'static str,
+        value: &'static str,
+        /// The parent key's new value in the ON UPDATE CASCADE copy.
+        new_value: &'static str,
+    }
+
+    impl CopiedType {
+        const fn new(
+            column_type: &'static str,
+            value: &'static str,
+            new_value: &'static str,
+        ) -> Self {
+            Self {
+                column_type,
+                value,
+                new_value,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RowCopy {
+        Vacuum,
+        VacuumInto,
+        DropColumn,
+        OnUpdateCascade,
+    }
+
+    /// Writes a value of `copied_type`, copies it with `row_copy` and returns
+    /// the value read before and after the copy. For ON UPDATE CASCADE these
+    /// are the parent's new key and the child's copy of it.
+    fn copy_custom_type_value(
+        copied_type: &CopiedType,
+        row_copy: RowCopy,
+    ) -> turso_core::Result<(String, String)> {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_vacuum(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        for sql in CREATE_COPIED_TYPES {
+            conn.execute(sql)?;
+        }
+        let CopiedType {
+            column_type,
+            value,
+            new_value,
+        } = copied_type;
+        match row_copy {
+            RowCopy::Vacuum | RowCopy::VacuumInto => {
+                conn.execute(format!(
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, v {column_type}) STRICT"
+                ))?;
+                conn.execute(format!("INSERT INTO t VALUES (1, {value})"))?;
+                let before = first_value(&conn, "SELECT v FROM t")?;
+                if row_copy == RowCopy::Vacuum {
+                    conn.execute("VACUUM")?;
+                    return Ok((before, first_value(&conn, "SELECT v FROM t")?));
+                }
+                let dest_dir = TempDir::new().unwrap();
+                let dest_path = dest_dir.path().join("copy.db");
+                conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+                let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+                let dest_conn = dest_db.connect_limbo();
+                Ok((before, first_value(&dest_conn, "SELECT v FROM t")?))
+            }
+            RowCopy::DropColumn => {
+                conn.execute(format!(
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, dropped INTEGER, v {column_type}) STRICT"
+                ))?;
+                conn.execute(format!("INSERT INTO t VALUES (1, 0, {value})"))?;
+                let before = first_value(&conn, "SELECT v FROM t")?;
+                conn.execute("ALTER TABLE t DROP COLUMN dropped")?;
+                Ok((before, first_value(&conn, "SELECT v FROM t")?))
+            }
+            RowCopy::OnUpdateCascade => {
+                conn.execute("PRAGMA foreign_keys = ON")?;
+                conn.execute(format!(
+                    "CREATE TABLE parent(k {column_type} PRIMARY KEY) STRICT"
+                ))?;
+                conn.execute(format!(
+                    "CREATE TABLE child(id INTEGER PRIMARY KEY, \
+                     k {column_type} REFERENCES parent(k) ON UPDATE CASCADE) STRICT"
+                ))?;
+                conn.execute(format!("INSERT INTO parent VALUES ({value})"))?;
+                conn.execute(format!("INSERT INTO child VALUES (1, {value})"))?;
+                conn.execute(format!("UPDATE parent SET k = {new_value}"))?;
+                Ok((
+                    first_value(&conn, "SELECT k FROM parent")?,
+                    first_value(&conn, "SELECT k FROM child")?,
+                ))
+            }
+        }
+    }
+
+    fn first_value(conn: &Arc<turso_core::Connection>, query: &str) -> turso_core::Result<String> {
+        let mut stmt = conn.prepare(query)?;
+        let mut value = None;
+        stmt.run_with_row_callback(|row| {
+            value.get_or_insert(row.get::<&turso_core::Value>(0)?.to_string());
+            Ok(())
+        })?;
+        Ok(value.unwrap_or_else(|| panic!("{query} returned no row")))
+    }
+
     /// Arrays compare as in PostgreSQL's `array_cmp`: element by element, a
     /// NULL element is greater than any other element and equal to another
     /// NULL, and when one array is a prefix of the other the shorter is
