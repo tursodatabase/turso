@@ -372,6 +372,15 @@ impl PathOperation for SetOperation {
                 .splice(array_value_idx..end_pos, value.iter().copied());
 
             // update parent
+            // Appends through an object key have already grown this array's
+            // header during path traversal. Other append paths leave the
+            // placeholder outside the encoded array size, so include it here.
+            let array_payload_delta =
+                if matches!(target.field_key_index, JsonLocationKind::ObjectProperty(_)) {
+                    delta
+                } else {
+                    delta + target.delta
+                };
             let h_delta = if matches!(
                 target.field_key_index,
                 JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
@@ -379,7 +388,7 @@ impl PathOperation for SetOperation {
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
-                    (obj_value_size as isize + delta) as usize,
+                    (obj_value_size as isize + array_payload_delta) as usize,
                     true,
                 )?;
                 new_h_delta as isize - obj_value_header_size as isize
@@ -618,6 +627,15 @@ impl PathOperation for InsertOperation {
                 .splice(array_value_idx..end_pos, value.iter().copied());
 
             // update parent
+            // Appends through an object key have already grown this array's
+            // header during path traversal. Other append paths leave the
+            // placeholder outside the encoded array size, so include it here.
+            let array_payload_delta =
+                if matches!(target.field_key_index, JsonLocationKind::ObjectProperty(_)) {
+                    delta
+                } else {
+                    delta + target.delta
+                };
             let h_delta = if matches!(
                 target.field_key_index,
                 JsonLocationKind::ObjectProperty(_) | JsonLocationKind::DocumentRoot
@@ -625,7 +643,7 @@ impl PathOperation for InsertOperation {
                 let new_h_delta = json.write_element_header(
                     obj_value_idx,
                     ElementType::ARRAY,
-                    (obj_value_size as isize + delta) as usize,
+                    (obj_value_size as isize + array_payload_delta) as usize,
                     true,
                 )?;
                 new_h_delta as isize - obj_value_header_size as isize
