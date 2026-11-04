@@ -2023,6 +2023,13 @@ impl Schema {
     /// Parse a CREATE TYPE SQL string and add the type to the in-memory
     /// registry. `syms` has the functions its DECODE may call.
     pub fn add_type_from_sql(&mut self, sql: &str, syms: &SymbolTable) -> crate::Result<()> {
+        self.insert_type_from_sql(sql)?;
+        self.update_value_types(syms)
+    }
+
+    /// Parse a CREATE TYPE or CREATE DOMAIN SQL string and add the type to the
+    /// in-memory registry without working out the kind its DECODE gives.
+    fn insert_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
         use turso_parser::ast::{Cmd, Stmt};
         use turso_parser::parser::Parser;
 
@@ -2062,7 +2069,7 @@ impl Schema {
                 )));
             }
         }
-        self.update_value_types(syms)
+        Ok(())
     }
 
     /// Works out again the kind of value each user-defined type reads as. A
@@ -2104,10 +2111,11 @@ impl Schema {
         syms: &SymbolTable,
     ) -> crate::Result<()> {
         for sql in type_sqls {
-            self.add_type_from_sql(sql, syms).map_err(|e| {
+            self.insert_type_from_sql(sql).map_err(|e| {
                 crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
             })?;
         }
+        self.update_value_types(syms)?;
         self.resolve_all_custom_type_affinities()?;
         Ok(())
     }
