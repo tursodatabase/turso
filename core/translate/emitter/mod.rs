@@ -295,16 +295,26 @@ struct SelfTableScope {
 impl SelfTableScope {
     fn new(context: SelfTableContext) -> Self {
         let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => {
-                Some(table.columns().iter().map(|c| c.affinity()).collect())
-            }
+            SelfTableContext::ForDML { table, .. } => Some(
+                table
+                    .columns()
+                    .iter()
+                    .map(|c| c.comparison_affinity())
+                    .collect(),
+            ),
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
             } => referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| btree.columns().iter().map(|c| c.affinity()).collect()),
+                .map(|btree| {
+                    btree
+                        .columns()
+                        .iter()
+                        .map(|c| c.comparison_affinity())
+                        .collect()
+                }),
         };
 
         Self {

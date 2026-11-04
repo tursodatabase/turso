@@ -117,7 +117,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
-use crate::translate::expr::expr_type::ExprType;
+use crate::translate::expr::expr_type::{value_type, BuiltinType, ExprType};
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
     column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
@@ -250,6 +250,12 @@ pub enum TypeDefKind {
         /// own order, such as numeric. `None` compares the stored values as
         /// SQLite does.
         ordering: Option<TypeOrdering>,
+        /// The kind of value the type reads as: what DECODE gives, or the
+        /// stored value without a DECODE. A domain reads as the type it is
+        /// based on. `None` when the kind varies, as with BASE any. Set when
+        /// the type is registered, since a DECODE may call functions of the
+        /// connection.
+        value_type: Option<BuiltinType>,
         operators: std::vec::Vec<TypeOperator>,
         /// How operators such as `+` and `-x` run on values of this type.
         operator_signatures: std::vec::Vec<OperatorSignature>,
@@ -307,6 +313,18 @@ fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
     match type_name {
         "numeric" => Some(TypeOrdering::Numeric),
         _ => None,
+    }
+}
+
+/// The kind of value a built-in type reads as. uuid, jsonb and numeric store
+/// blobs and DECODE them to text; every other built-in type reads as its BASE
+/// stores. The built-in types are registered before any connection's
+/// functions, so the kind of `uuid_str(value)` can't be worked out from the
+/// DECODE then; a test checks these against the DECODE of each type.
+fn builtin_value_type(type_name: &str, base: &str) -> Option<BuiltinType> {
+    match type_name {
+        "uuid" | "jsonb" | "numeric" => Some(BuiltinType::Text),
+        _ => crate::translate::expr::expr_type::primitive_value_type(base),
     }
 }
 
@@ -551,6 +569,20 @@ impl TypeDef {
         }
     }
 
+    /// The kind of value the type reads as. STRUCT and UNION values are blobs.
+    pub(crate) fn value_type(&self) -> Option<BuiltinType> {
+        match &self.kind {
+            TypeDefKind::Custom { value_type, .. } => *value_type,
+            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => Some(BuiltinType::Blob),
+        }
+    }
+
+    fn set_value_type(&mut self, kind: Option<BuiltinType>) {
+        if let TypeDefKind::Custom { value_type, .. } = &mut self.kind {
+            *value_type = kind;
+        }
+    }
+
     /// Whether ORDER BY and CREATE INDEX accept values of the type. A type
     /// with its own order sorts in it. Otherwise values sort by their stored
     /// value, which only keeps the order of the decoded values when the type
@@ -657,10 +689,14 @@ impl TypeDef {
                 // CREATE TYPE checks where type parameters are used. A type
                 // already stored by an earlier version is loaded unchecked, so
                 // the database still opens and DROP TYPE can remove it.
-                let (ordering, operator_signatures) = if is_builtin {
-                    (builtin_ordering(type_name), builtin_signatures(type_name))
+                let (ordering, value_type, operator_signatures) = if is_builtin {
+                    (
+                        builtin_ordering(type_name),
+                        builtin_value_type(type_name, base),
+                        builtin_signatures(type_name),
+                    )
                 } else {
-                    (None, std::vec::Vec::new())
+                    (None, None, std::vec::Vec::new())
                 };
                 Self {
                     name: type_name.to_string(),
@@ -676,6 +712,7 @@ impl TypeDef {
                         coerce: coerce.clone(),
                         decode: decode.clone(),
                         ordering,
+                        value_type,
                         operators: operators.clone(),
                         operator_signatures,
                         default: default.clone(),
@@ -769,6 +806,7 @@ impl TypeDef {
                 decode: None,
                 // A domain has the order and arithmetic of the type it is based on.
                 ordering: None,
+                value_type: None,
                 operators: std::vec::Vec::new(),
                 operator_signatures: std::vec::Vec::new(),
                 default,
@@ -1982,8 +2020,9 @@ impl Schema {
         }
     }
 
-    /// Parse a CREATE TYPE SQL string and add the type to the in-memory registry.
-    pub fn add_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
+    /// Parse a CREATE TYPE SQL string and add the type to the in-memory
+    /// registry. `syms` has the functions its DECODE may call.
+    pub fn add_type_from_sql(&mut self, sql: &str, syms: &SymbolTable) -> crate::Result<()> {
         use turso_parser::ast::{Cmd, Stmt};
         use turso_parser::parser::Parser;
 
@@ -1993,8 +2032,9 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let type_def =
+                let mut type_def =
                     TypeDef::from_create_type(&type_name, &body, false, sql.to_string())?;
+                type_def.set_value_type(value_type(&type_def, self, syms));
                 self.type_registry
                     .insert(type_registry_key(&type_name), Arc::new(type_def));
             }
@@ -2006,7 +2046,7 @@ impl Schema {
                 constraints,
                 ..
             }))) => {
-                let type_def = TypeDef::from_domain(
+                let mut type_def = TypeDef::from_domain(
                     &domain_name,
                     &base_type,
                     not_null,
@@ -2014,6 +2054,7 @@ impl Schema {
                     default,
                     sql.to_string(),
                 );
+                type_def.set_value_type(value_type(&type_def, self, syms));
                 self.type_registry
                     .insert(type_registry_key(&domain_name), Arc::new(type_def));
             }
@@ -2028,9 +2069,13 @@ impl Schema {
 
     /// Load type definitions from CREATE TYPE SQL strings and resolve custom
     /// type affinities on all STRICT tables.
-    fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
+    fn load_type_definitions(
+        &mut self,
+        type_sqls: &[String],
+        syms: &SymbolTable,
+    ) -> crate::Result<()> {
         for sql in type_sqls {
-            self.add_type_from_sql(sql).map_err(|e| {
+            self.add_type_from_sql(sql, syms).map_err(|e| {
                 crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
             })?;
         }
@@ -3625,7 +3670,7 @@ impl Schema {
             self.refuse_custom_types()?;
         }
         if !type_sqls.is_empty() {
-            self.load_type_definitions(type_sqls)?;
+            self.load_type_definitions(type_sqls, syms)?;
         }
         if !self.namespace_names_loaded && !materialized_view_info.is_empty() {
             // A view body names tables by their namespace, so the views wait
@@ -7380,6 +7425,10 @@ pub struct Column {
     /// Keys on the column use it instead of `collation`. Set from the schema's
     /// types by `BTreeTable::resolve_custom_types`, never stored in the SQL.
     type_ordering: Option<TypeOrdering>,
+    /// The affinity of the values a custom-type column reads as, which
+    /// comparisons use. `affinity()` is that of the stored form. None for a
+    /// column whose values compare in its type's own order, or as stored.
+    value_affinity: Option<Affinity>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -7537,6 +7586,7 @@ impl Column {
             info,
             collation: col,
             type_ordering: None,
+            value_affinity: None,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -7783,7 +7833,18 @@ impl Column {
             self.set_ty(base_ty);
             self.override_affinity(Affinity::affinity(&resolved.primitive));
             self.type_ordering = resolved.ordering();
+            self.value_affinity = match self.type_ordering {
+                Some(_) => None,
+                None => resolved.leaf().value_type().map(BuiltinType::affinity),
+            };
         }
+    }
+    /// The affinity comparisons with the column's values use: that of the
+    /// values a custom type reads as, which may differ from what it stores
+    /// (`BASE text DECODE CAST(value AS real)` compares as REAL).
+    #[inline]
+    pub fn comparison_affinity(&self) -> Affinity {
+        self.value_affinity.unwrap_or_else(|| self.affinity())
     }
     /// Set the key order of a derived table's column, which takes it from the
     /// type of the expression the column comes from.
@@ -8457,6 +8518,36 @@ mod tests {
         assert!(schema
             .get_table(NamespaceId::ROOT, SCHEMA_TABLE_NAME)
             .is_some());
+    }
+
+    #[test]
+    fn builtin_types_read_as_the_kind_their_decode_gives() {
+        use crate::{
+            translate::expr::expr_type::value_type, ConnectOpts, Database, DatabaseOpts, MemoryIO,
+            OpenFlags, SqliteDialect, IO, MAIN_DB_ID,
+        };
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let syms = conn.syms.read();
+        conn.with_schema(MAIN_DB_ID, |schema| {
+            assert!(schema.type_registry.values().all(|t| t.is_builtin));
+            for (name, type_def) in &schema.type_registry {
+                assert_eq!(
+                    type_def.value_type(),
+                    value_type(type_def, schema, &syms),
+                    "built-in type {name}"
+                );
+            }
+        });
     }
 
     #[test]

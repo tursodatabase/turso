@@ -22,7 +22,10 @@ pub(crate) use vtab::{
     create_virtual_table, ExtensionCursor, ExtensionTable, ModuleImplementation,
 };
 
-use crate::{function::ExternalFunc, Connection, Database};
+use crate::{
+    function::{ExternalFunc, ReturnType},
+    Connection, Database,
+};
 use crate::{vtab::VirtualTable, SymbolTable};
 #[cfg(feature = "fs")]
 use crate::{LimboError, IO};
@@ -103,12 +106,17 @@ pub struct VTabImpl {
     pub(crate) implementation: ModuleImplementation,
 }
 
+/// Registers a function that core implements through the extension API.
+/// Unlike a loaded extension's function, it states the type it returns, so
+/// expressions that call it have a known type. `None` means the type depends
+/// on the arguments: `time_get(t, 'second')` is a REAL, other fields INTEGERs.
 pub(crate) unsafe fn register_scalar_function(
     ctx: *mut c_void,
     name: *const c_char,
     func: ScalarFunction,
+    return_type: Option<ReturnType>,
 ) -> ResultCode {
-    unsafe { register_scalar_function_with_options(ctx, name, -1, false, 0, func, None, None) }
+    unsafe { add_scalar_function(ctx, name, -1, false, 0, func, None, None, return_type) }
 }
 
 pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
@@ -120,6 +128,33 @@ pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
     callback: ScalarFunction,
     context_destructor: Option<ContextDestructor>,
     value_destructor: Option<ValueDestructor>,
+) -> ResultCode {
+    unsafe {
+        add_scalar_function(
+            ctx,
+            name,
+            argc,
+            deterministic,
+            context,
+            callback,
+            context_destructor,
+            value_destructor,
+            None,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn add_scalar_function(
+    ctx: *mut c_void,
+    name: *const c_char,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    callback: ScalarFunction,
+    context_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+    return_type: Option<ReturnType>,
 ) -> ResultCode {
     if ctx.is_null() || name.is_null() {
         return ResultCode::InvalidArgs;
@@ -138,7 +173,7 @@ pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
         context_destructor,
         value_destructor,
     ) {
-        Ok(function) => function,
+        Ok(function) => function.with_return_type(return_type),
         Err(_) => return ResultCode::InvalidArgs,
     };
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };

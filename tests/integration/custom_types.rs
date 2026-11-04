@@ -994,4 +994,134 @@ mod tests {
             conn.close().unwrap();
         }
     }
+
+    /// CREATE TYPE refuses a DECODE whose kind of value it can't tell. Every
+    /// other type's column compares like a plain column of the kind its DECODE
+    /// gives, holding the decoded values: with BASE text and DECODE
+    /// CAST(value AS real), '10.0' > 9.6 although the text '10.0' < '9.6'.
+    #[test]
+    fn test_decode_kind_decides_comparisons() {
+        // Each DECODE, and the column type of a plain table that compares the
+        // same way, or None when CREATE TYPE must refuse it.
+        let shapes: &[(&str, Option<&str>)] = &[
+            ("json_extract(value, '$')", None),
+            ("CAST(json_extract(value, '$') AS real)", Some("REAL")),
+            ("CAST(value AS real)", Some("REAL")),
+            ("CAST(value AS integer)", Some("INTEGER")),
+            ("CAST(value AS numeric)", Some("NUMERIC")),
+            ("CASE WHEN value = '' THEN 0 ELSE value END", None),
+            (
+                "CASE WHEN value = '' THEN 0.0 ELSE CAST(value AS real) END",
+                Some("REAL"),
+            ),
+            ("coalesce(value, 0)", None),
+            ("coalesce(CAST(value AS integer), 0)", Some("INTEGER")),
+            ("iif(value = '', NULL, CAST(value AS real))", Some("REAL")),
+            ("ifnull(value, 'x')", Some("TEXT")),
+            ("lower(value)", Some("TEXT")),
+            ("value * 1.0", Some("REAL")),
+            ("value + 0", Some("NUMERIC")),
+            ("NULL", None),
+            ("CAST(value AS int_text)", Some("INTEGER")),
+            ("CAST(value AS real_domain)", Some("REAL")),
+            ("CAST(value AS numeric(10, 2))", None),
+        ];
+        // Valid JSON, so that json_extract accepts each of them.
+        let values = [
+            "'10.0'", "'9.5'", "'100'", "'2e1'", "'-3'", "'0.50'", "NULL",
+        ];
+        let literals = ["9.6", "10", "'10'", "0", "-3", "'9.5'"];
+
+        for mvcc in [false, true] {
+            let db = TempDatabase::builder()
+                .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE int_text(value any) BASE text \
+                 ENCODE CAST(CAST(value AS integer) AS text) DECODE CAST(value AS integer)",
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TYPE real_text(value any) BASE text \
+                 ENCODE CAST(CAST(value AS real) AS text) DECODE CAST(value AS real)",
+            )
+            .unwrap();
+            conn.execute("CREATE DOMAIN real_domain AS real_text")
+                .unwrap();
+
+            for (i, (decode, kind)) in shapes.iter().enumerate() {
+                let context = format!("mvcc={mvcc}, DECODE {decode}");
+                // ENCODE stores what DECODE gives, as text, so that an index
+                // seek finds the row whose decoded value equals the probe.
+                // OPERATOR '<' allows the index.
+                let create_type = format!(
+                    "CREATE TYPE k{i}(value any) BASE text \
+                     ENCODE CAST({decode} AS text) DECODE {decode} OPERATOR '<'"
+                );
+                let Some(kind) = kind else {
+                    assert_that!(conn.execute(&create_type))
+                        .named(&context)
+                        .err()
+                        .display_string()
+                        .contains("wrap it in CAST(... AS <type>)");
+                    continue;
+                };
+                conn.execute(&create_type)
+                    .unwrap_or_else(|e| panic!("{context}: {e}"));
+                conn.execute(format!(
+                    "CREATE TABLE t{i}(id INTEGER PRIMARY KEY, c k{i}) STRICT"
+                ))
+                .unwrap();
+                for (id, value) in values.iter().enumerate() {
+                    conn.execute(format!("INSERT INTO t{i} VALUES ({id}, {value})"))
+                        .unwrap_or_else(|e| panic!("{context}: {e}"));
+                }
+                conn.execute(format!(
+                    "CREATE TABLE p{i}(id INTEGER PRIMARY KEY, c {kind})"
+                ))
+                .unwrap();
+                conn.execute(format!("INSERT INTO p{i} SELECT id, c FROM t{i}"))
+                    .unwrap();
+
+                let mut conditions = Vec::new();
+                for literal in literals {
+                    for op in ["<", "=", ">"] {
+                        conditions.push(format!("c {op} {literal}"));
+                    }
+                    conditions.push(format!("c IN ({literal}, 100)"));
+                }
+                let compare_with_plain_table = |indexed: &str| {
+                    for condition in &conditions {
+                        let got: Vec<(i64,)> = conn.exec_rows(&format!(
+                            "SELECT id FROM t{i} WHERE {condition} ORDER BY id"
+                        ));
+                        let expected: Vec<(i64,)> = conn.exec_rows(&format!(
+                            "SELECT id FROM p{i} WHERE {condition} ORDER BY id"
+                        ));
+                        assert_eq!(got, expected, "{context}, {indexed}: WHERE {condition}");
+                    }
+                    let got: Vec<(i64, i64)> = conn.exec_rows(&format!(
+                        "SELECT a.id, b.id FROM t{i} a, t{i} b WHERE a.c < b.c ORDER BY 1, 2"
+                    ));
+                    let expected: Vec<(i64, i64)> = conn.exec_rows(&format!(
+                        "SELECT a.id, b.id FROM p{i} a, p{i} b WHERE a.c < b.c ORDER BY 1, 2"
+                    ));
+                    assert_eq!(got, expected, "{context}, {indexed}: a.c < b.c");
+                };
+                compare_with_plain_table("no index");
+                // An index seek ENCODEs the probe, which for INTEGER and
+                // NUMERIC kinds changes it (9.6 becomes '9', 10 and 10.0 are
+                // stored differently) and finds the wrong rows for a reason
+                // that is not the kind.
+                if *kind == "REAL" || *kind == "TEXT" {
+                    conn.execute(format!("CREATE INDEX t{i}_c ON t{i}(c)"))
+                        .unwrap();
+                    compare_with_plain_table("with index");
+                }
+            }
+            conn.close().unwrap();
+        }
+    }
 }

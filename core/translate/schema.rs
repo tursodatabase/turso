@@ -19,7 +19,7 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
-use crate::translate::expr::expr_type::iif_values;
+use crate::translate::expr::expr_type::{decode_type, iif_values, value_kind, ExprType};
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
@@ -3136,12 +3136,42 @@ pub fn translate_create_type(
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
+        let type_def = TypeDef::from_create_type(&normalized_name, body, false, String::new())?;
+        check_decode_type(&type_def, resolver)?;
     }
 
     // Build canonical SQL (without IF NOT EXISTS) for persistence
     let sql = build_create_type_sql(&normalized_name, body);
 
     persist_type_definition(normalized_name, sql, resolver, program)
+}
+
+/// Refuse a DECODE when the kind of value it returns can't be worked out:
+/// comparisons with the type's values convert the other side to that kind,
+/// so they would have to guess it.
+fn check_decode_type(type_def: &TypeDef, resolver: &Resolver) -> Result<()> {
+    let schema = resolver.schema();
+    let Some(ty) = decode_type(type_def, schema, resolver.catalog.symbol_table) else {
+        return Ok(());
+    };
+    if value_kind(&ty, schema).is_some() {
+        return Ok(());
+    }
+    let name = &type_def.name;
+    if let ExprType::Custom {
+        type_def: other, ..
+    } = &ty
+    {
+        if schema.type_ordering(other).is_some() {
+            bail_parse_error!(
+                "DECODE of type {name} returns a {}, which only compares in its own order; wrap it in CAST(... AS <type>), such as CAST(... AS text)",
+                other.name
+            );
+        }
+    }
+    bail_parse_error!(
+        "cannot tell what kind of value DECODE of type {name} returns; wrap it in CAST(... AS <type>), such as CAST(... AS text)"
+    );
 }
 
 /// Build canonical CREATE TYPE SQL from a normalized name and parsed body.

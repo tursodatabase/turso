@@ -106,6 +106,8 @@ pub enum ExtFunc {
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
         context_owner: Arc<ExternalContext>,
+        /// Only functions core registers know it; a loaded extension can't say.
+        return_type: Option<ReturnType>,
     },
     Aggregate {
         context: usize,
@@ -181,8 +183,10 @@ impl ExtFunc {
 
     pub fn return_type(&self) -> Option<crate::native_ext::ReturnType> {
         match self {
-            Self::NativeScalar { return_type, .. } => *return_type,
-            Self::Scalar { .. } | Self::Aggregate { .. } | Self::NativeAggregate { .. } => None,
+            Self::NativeScalar { return_type, .. } | Self::Scalar { return_type, .. } => {
+                *return_type
+            }
+            Self::Aggregate { .. } | Self::NativeAggregate { .. } => None,
         }
     }
 
@@ -243,8 +247,23 @@ impl ExternalFunc {
                 context_destructor,
                 value_destructor,
                 context_owner: ExternalContext::new(context, context_destructor),
+                return_type: None,
             },
         })
+    }
+
+    /// Declares the kind of value a scalar function returns, so that the type
+    /// of a call to it is known, as in a custom type's DECODE.
+    pub fn with_return_type(mut self, return_type: Option<ReturnType>) -> Self {
+        let ExtFunc::Scalar {
+            return_type: declared,
+            ..
+        } = &mut self.func
+        else {
+            unreachable!("only scalar functions declare a return type");
+        };
+        *declared = return_type;
+        self
     }
 
     pub fn new_aggregate(

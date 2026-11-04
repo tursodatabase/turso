@@ -1,0 +1,155 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+# A column of a custom type compares by the kind of value its DECODE gives,
+# not by how the value is stored. CREATE TYPE refuses a DECODE when it can't
+# tell that kind.
+
+@requires strict "uses STRICT tables"
+test decode-kind-refuses-untyped-function {
+    CREATE TYPE j(value any) BASE text ENCODE CAST(value AS text) DECODE json_extract(value, '$');
+}
+expect error {
+    cannot tell what kind of value DECODE of type j returns
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-refuses-mixed-case {
+    CREATE TYPE m(value any) BASE text ENCODE CAST(value AS text) DECODE CASE WHEN value = '' THEN 0 ELSE value END;
+}
+expect error {
+    cannot tell what kind of value DECODE of type m returns
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-refuses-type-with-own-order {
+    CREATE TYPE n(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS numeric(10, 2));
+}
+expect error {
+    DECODE of type n returns a numeric, which only compares in its own order
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-cast-compares-as-real {
+    -- The values are stored as text, where '10.0' < '9.6'. DECODE gives
+    -- reals, so 10.0 > 9.6. Every query runs before and after the index.
+    CREATE TYPE price(value any) BASE text ENCODE CAST(CAST(json_extract(value, '$') AS real) AS text) DECODE CAST(json_extract(value, '$') AS real) OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c price) STRICT;
+    INSERT INTO t VALUES (1, '10.0'), (2, 9.5), (3, 100), (4, NULL), (5, '2e1');
+    SELECT 'lt', id FROM t WHERE c < 9.6 ORDER BY id;
+    SELECT 'gt', id FROM t WHERE c > 9.6 ORDER BY id;
+    SELECT 'eq', id FROM t WHERE c = 10 ORDER BY id;
+    SELECT 'eq-text', id FROM t WHERE c = '9.5' ORDER BY id;
+    SELECT 'in', id FROM t WHERE c IN (20, 100) ORDER BY id;
+    SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.c < b.c WHERE a.id = 2 ORDER BY 3;
+    SELECT 'minmax', min(c), max(c) FROM t;
+    CREATE INDEX t_c ON t(c);
+    SELECT 'lt', id FROM t WHERE c < 9.6 ORDER BY id;
+    SELECT 'gt', id FROM t WHERE c > 9.6 ORDER BY id;
+    SELECT 'eq', id FROM t WHERE c = 10 ORDER BY id;
+    SELECT 'eq-text', id FROM t WHERE c = '9.5' ORDER BY id;
+    SELECT 'in', id FROM t WHERE c IN (20, 100) ORDER BY id;
+    SELECT 'join', a.id, b.id FROM t a JOIN t b ON a.c < b.c WHERE a.id = 2 ORDER BY 3;
+    SELECT 'minmax', min(c), max(c) FROM t;
+}
+expect {
+    lt|2
+    gt|1
+    gt|3
+    gt|5
+    eq|1
+    eq-text|2
+    in|3
+    in|5
+    join|2|1
+    join|2|3
+    join|2|5
+    minmax|9.5|100.0
+    lt|2
+    gt|1
+    gt|3
+    gt|5
+    eq|1
+    eq-text|2
+    in|3
+    in|5
+    join|2|1
+    join|2|3
+    join|2|5
+    minmax|9.5|100.0
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-seek-without-encode {
+    -- Without ENCODE the index holds the stored text. A seek for c = 10.5
+    -- looks for the text '10.5'; the text '9.5' is read as the real 9.5
+    -- first, then looked for as '9.5'. The stored texts are the ones the
+    -- reals turn into, so the index finds the rows a scan finds.
+    CREATE TYPE r(value any) BASE text DECODE CAST(value AS real) OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c r) STRICT;
+    INSERT INTO t VALUES (1, '10.5'), (2, '9.5');
+    CREATE INDEX t_c ON t(c);
+    SELECT 'eq', id FROM t WHERE c = 10.5;
+    SELECT 'eq-text', id FROM t WHERE c = '9.5';
+    SELECT 'in', id FROM t WHERE c IN (9.5, 10.5) ORDER BY id;
+}
+expect {
+    eq|1
+    eq-text|2
+    in|1
+    in|2
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-check-and-generated-column {
+    -- CHECK and generated columns compare the decoded value too.
+    CREATE TYPE price(value any) BASE text ENCODE CAST(CAST(value AS real) AS text) DECODE CAST(value AS real);
+    CREATE TABLE g(id INTEGER PRIMARY KEY, c price CHECK (c < 50), small INTEGER GENERATED ALWAYS AS (c < 9.6)) STRICT;
+    INSERT INTO g(id, c) VALUES (1, 9.5), (2, 10);
+    SELECT id, small FROM g ORDER BY id;
+}
+expect {
+    1|1
+    2|0
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-check-rejects-by-decoded-value {
+    CREATE TYPE price(value any) BASE text ENCODE CAST(CAST(value AS real) AS text) DECODE CAST(value AS real);
+    CREATE TABLE g(id INTEGER PRIMARY KEY, c price CHECK (c < 9.6)) STRICT;
+    INSERT INTO g VALUES (1, 10);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-nested-type-and-domain {
+    -- A DECODE that casts to another custom type, or to a domain, reads as
+    -- that type's kind.
+    CREATE TYPE int_text(value any) BASE text ENCODE CAST(CAST(value AS integer) AS text) DECODE CAST(value AS integer);
+    CREATE TYPE wrapped(value any) BASE text ENCODE CAST(CAST(value AS integer) AS text) DECODE CAST(value AS int_text);
+    CREATE DOMAIN positive AS int_text CHECK (value > 0);
+    CREATE TYPE via_domain(value any) BASE text ENCODE CAST(CAST(value AS integer) AS text) DECODE CAST(value AS positive);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, w wrapped, d via_domain) STRICT;
+    INSERT INTO t VALUES (1, 10, 10), (2, 9, 9);
+    SELECT 'wrapped', id FROM t WHERE w > 9 ORDER BY id;
+    SELECT 'domain', id FROM t WHERE d > 9 ORDER BY id;
+}
+expect {
+    wrapped|1
+    domain|1
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-uuid-compares-as-text {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, x uuid) STRICT;
+    INSERT INTO u VALUES (1, '01945ca0-3189-76c0-9a8f-caf310fc8b8e'), (2, '550e8400-e29b-41d4-a716-446655440000');
+    SELECT 'eq', id FROM u WHERE x = '550e8400-e29b-41d4-a716-446655440000';
+    CREATE INDEX u_x ON u(x);
+    SELECT 'eq', id FROM u WHERE x = '550e8400-e29b-41d4-a716-446655440000';
+}
+expect {
+    eq|2
+    eq|2
+}

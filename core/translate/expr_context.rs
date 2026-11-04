@@ -134,7 +134,9 @@ impl<'a> TableMetadata<'a> {
 impl ExprProperties for TableMetadata<'_> {
     fn column_affinity(&self, source: TableInternalId, column: usize) -> Option<Affinity> {
         let (_, table) = self.tables?.find_table_by_internal_id(source)?;
-        table.get_column_at(column).map(|column| column.affinity())
+        table
+            .get_column_at(column)
+            .map(|column| column.comparison_affinity())
     }
 
     fn column_collation(

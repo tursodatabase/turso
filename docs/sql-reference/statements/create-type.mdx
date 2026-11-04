@@ -64,12 +64,13 @@ The ENCODE expression is evaluated whenever a value is written to a column of th
 - **ENCODE**: Transforms the input value into the base storage form. Runs on INSERT, UPDATE, and CAST, and on a constant compared with a column of the type (`WHERE c = 42` encodes `42` first).
 - **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT, and on CAST after ENCODE (see [CAST Support](#cast-support)).
 - **NULL handling**: NULL values bypass both ENCODE and DECODE. A NULL input produces a NULL output without evaluating the expression.
+- **Kind of value**: CREATE TYPE works out the kind of value DECODE returns (integer, real, numeric, text or blob), and a column of the type compares like a plain column of that kind. With `BASE text ENCODE CAST(value AS text) DECODE CAST(value AS real)`, `WHERE c < 9.6` compares numbers, so a stored `'10.0'` is not less than `9.6`. When the kind can't be worked out, CREATE TYPE fails with `cannot tell what kind of value DECODE of type t returns; wrap it in CAST(... AS <type>)`. This happens with a function that can return different kinds, such as `json_extract` or a function from a loaded extension, with a CASE or `coalesce` whose branches give different kinds, and with `NULL`. Write `DECODE CAST(json_extract(value, '$') AS real)` instead. A DECODE that returns a type with its own order, such as `CAST(value AS numeric(10,2))`, fails the same way.
 
 ```sql
 -- Store text in reversed form
 CREATE TYPE reversed_text BASE text
-    ENCODE turso_reverse(value)
-    DECODE turso_reverse(value);
+    ENCODE reverse(value)
+    DECODE reverse(value);
 ```
 
 The ENCODE expression is the place to put validation logic. If the ENCODE expression raises an error, the INSERT or UPDATE is aborted.
@@ -129,8 +130,8 @@ ORDER BY and indexes sort a custom type by its stored value, using SQLite's comp
 
 ```sql
 CREATE TYPE reversed_text BASE text
-    ENCODE turso_reverse(value)
-    DECODE turso_reverse(value)
+    ENCODE reverse(value)
+    DECODE reverse(value)
     OPERATOR '<';
 CREATE TABLE t(w reversed_text) STRICT;
 INSERT INTO t VALUES ('apple'), ('banana'), ('cherry');

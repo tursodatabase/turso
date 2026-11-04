@@ -180,7 +180,7 @@ impl<'a> Operand<'a> {
             }
             _ => None,
         };
-        let sqlite_type = sqlite_operand_type(expr_type.clone(), env.schema());
+        let sqlite_type = sqlite_operand_type(expr_type.clone());
         let may_be_integer = matches!(
             sqlite_type,
             ExprType::Builtin(BuiltinType::Integer | BuiltinType::Numeric | BuiltinType::Any)
