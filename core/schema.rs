@@ -2062,15 +2062,14 @@ impl Schema {
                 )));
             }
         }
-        self.update_value_types(syms);
-        Ok(())
+        self.update_value_types(syms)
     }
 
     /// Works out again the kind of value each user-defined type reads as. A
     /// type's kind can depend on a type created after it, as with
     /// `DECODE CAST(value AS b)` before `CREATE TYPE b`, so this repeats until
     /// no kind changes. Built-in types name their kind when they are created.
-    fn update_value_types(&mut self, syms: &SymbolTable) {
+    fn update_value_types(&mut self, syms: &SymbolTable) -> Result<()> {
         // Each pass settles at least one more type of a chain of types
         // referring to each other, so a pass per type is enough.
         for _ in 0..=self.type_registry.len() {
@@ -2086,14 +2085,15 @@ impl Schema {
                         (key.clone(), updated)
                     })
                 })
-                .collect();
+                .try_collect()?;
             if changed.is_empty() {
-                return;
+                return Ok(());
             }
             for (key, type_def) in changed {
                 self.type_registry.insert(key, Arc::new(type_def));
             }
         }
+        Ok(())
     }
 
     /// Load type definitions from CREATE TYPE SQL strings and resolve custom
