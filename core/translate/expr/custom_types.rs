@@ -416,7 +416,7 @@ pub(crate) fn emit_constraint_values_decode(
             resolver,
         )?;
         if column.is_array() {
-            emit_array_text(program, decoded_reg);
+            program.emit_insn(Insn::ArrayDecode { reg: decoded_reg });
         }
         info.violation_regs[i] = decoded_reg;
     }
