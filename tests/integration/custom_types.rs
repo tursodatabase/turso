@@ -1097,21 +1097,21 @@ mod tests {
                 strict: true,
                 stored: "ARRAY[1]",
                 probe: "ARRAY[1]",
-                collate: Collate::Refused("array"),
+                collate: Collate::Refused("integer[]"),
             },
             Kind {
                 ty: "text[]",
                 strict: true,
                 stored: "ARRAY['ABC']",
                 probe: "ARRAY['abc']",
-                collate: Collate::Refused("text_array"),
+                collate: Collate::Refused("text[]"),
             },
             Kind {
                 ty: "date[]",
                 strict: true,
                 stored: "ARRAY['2024-01-02']",
                 probe: "ARRAY['2024-01-02']",
-                collate: Collate::Refused("text_array"),
+                collate: Collate::Refused("date[]"),
             },
         ];
         // (statement, whether it returns the count 1 when accepted). `{n}`

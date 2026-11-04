@@ -202,13 +202,10 @@ impl<'a> Operand<'a> {
     fn type_name(&self) -> String {
         match (&self.value_type, self.expr_type) {
             (Some(ty), _) => ty.type_def.name.clone(),
-            (None, ExprType::Builtin(BuiltinType::Any)) => "value".to_string(),
-            (None, ExprType::Builtin(BuiltinType::Decimal)) => "numeric".to_string(),
-            (None, ExprType::Builtin(builtin)) => format!("{builtin:?}").to_lowercase(),
-            (None, ExprType::Custom { type_def, .. }) => type_def.name.clone(),
-            (None, ExprType::Untyped) => "text".to_string(),
-            (None, ExprType::Null) => "null".to_string(),
-            (None, _) => "value".to_string(),
+            // A value whose type is only known when the statement runs, such as
+            // the result of json_extract().
+            (None, ExprType::Builtin(BuiltinType::Any) | ExprType::Unknown) => "value".to_string(),
+            (None, ty) => ty.to_string(),
         }
     }
 }

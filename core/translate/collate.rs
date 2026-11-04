@@ -539,15 +539,12 @@ pub fn in_subquery_collation(
     let rhs = &query.select_result_columns()[column].expr;
     let lhs_context = ExprContext::new(lhs_tables, resolver);
     let rhs_context = ExprContext::new(Some(query.select_table_references()), resolver);
-    let schema = resolver.schema();
-    let rhs_type = query_column_type(query, column, resolver);
-    let lhs_type = type_of(lhs, &lhs_context.type_env());
-    let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
-    let orders = [
-        operand_order(&lhs_type, schema, has_collate)?,
-        operand_order(&rhs_type, schema, has_collate)?,
+    let types = [
+        type_of(lhs, &lhs_context.type_env()),
+        query_column_type(query, column, resolver),
     ];
-    if let Some(ordering) = common_ordering(orders, has_collate)? {
+    let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
+    if let Some(ordering) = common_ordering(&types, resolver.schema(), has_collate)? {
         return Ok(CollationSeq::Type(ordering));
     }
     comparison_collation_across_queries(lhs, &lhs_context, rhs, &rhs_context)
@@ -689,52 +686,55 @@ fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
     exprs: impl IntoIterator<Item = (&'a Expr, C)>,
     has_collate: bool,
 ) -> Result<Option<TypeOrdering>> {
-    // Most comparisons have two operands; keep their orders off the heap.
-    let mut orders: SmallVec<[OperandOrder; 2]> = SmallVec::new();
+    // Most comparisons have two operands; keep their types off the heap.
+    let mut types: SmallVec<[ExprType; 2]> = SmallVec::new();
+    let mut schema = None;
     for (expr, context) in exprs {
-        let context = context.borrow();
-        let ty = type_of(expr, &context.type_env());
-        orders.push(operand_order(&ty, context.schema(), has_collate)?);
+        let context: ExprContext<'c, 's> = *context.borrow();
+        types.push(type_of(expr, &context.type_env()));
+        schema.get_or_insert(context.schema());
     }
-    common_ordering(orders, has_collate)
+    match schema {
+        Some(schema) => common_ordering(&types, schema, has_collate),
+        None => Ok(None),
+    }
 }
 
-/// The one order among `orders`, as [common_type_ordering] decides it.
-/// `has_collate` says whether any of the values has a COLLATE operator.
+/// The one order among values of `types`, as [common_type_ordering] decides
+/// it. `has_collate` says whether a COLLATE applies to the values. Every
+/// COLLATE that applies to a value is checked here, through [operand_order].
 fn common_ordering(
-    orders: impl IntoIterator<Item = OperandOrder>,
+    types: &[ExprType],
+    schema: &Schema,
     has_collate: bool,
 ) -> Result<Option<TypeOrdering>> {
-    let mut found: Option<TypeOrdering> = None;
-    let mut has_array_of_unknown_elements = false;
-    for order in orders {
-        let ordering = match order {
+    let mut found: Option<(TypeOrdering, &ExprType)> = None;
+    let mut array_of_unknown_elements = None;
+    for ty in types {
+        let ordering = match operand_order(ty, schema, has_collate)? {
             OperandOrder::None => continue,
             OperandOrder::ArrayOfUnknownElements => {
-                has_array_of_unknown_elements = true;
+                array_of_unknown_elements.get_or_insert(ty);
                 continue;
             }
             OperandOrder::Type(ordering) => ordering,
         };
         match found {
-            Some(other) if other != ordering => return Err(cannot_compare(other, ordering)),
-            _ => found = Some(ordering),
+            Some((other, other_ty)) if other != ordering => {
+                return Err(cannot_compare(other_ty, ty))
+            }
+            _ => found = Some((ordering, ty)),
         }
     }
-    let found = match (found, has_array_of_unknown_elements) {
-        (None, true) => Some(TypeOrdering::Array),
-        (Some(other), true) if !matches!(other, TypeOrdering::Array | TypeOrdering::TextArray) => {
-            return Err(cannot_compare(other, TypeOrdering::Array));
+    match (found, array_of_unknown_elements) {
+        (None, Some(_)) => Ok(Some(TypeOrdering::Array)),
+        (Some((other, other_ty)), Some(array_ty))
+            if !matches!(other, TypeOrdering::Array | TypeOrdering::TextArray) =>
+        {
+            Err(cannot_compare(other_ty, array_ty))
         }
-        (found, _) => found,
-    };
-    if let (Some(ordering), true) = (found, has_collate) {
-        return Err(LimboError::ParseError(format!(
-            "collations are not supported by type {}",
-            ordering.name()
-        )));
+        (found, _) => Ok(found.map(|(ordering, _)| ordering)),
     }
-    Ok(found)
 }
 
 /// How the values of a table or index column of type `ty` compare: the order
@@ -746,17 +746,21 @@ pub(crate) fn key_collation(
     ty: &ExprType,
     schema: &Schema,
 ) -> Result<Option<CollationSeq>> {
-    if explicit_collation.is_some() {
-        check_type_accepts_collate(ty, schema)?;
-    }
-    match (type_ordering(ty, schema), explicit_collation) {
-        (Some(ordering), Some(_)) => Err(LimboError::ParseError(format!(
-            "collations are not supported by type {}",
-            ordering.name()
-        ))),
-        (Some(ordering), None) => Ok(Some(CollationSeq::Type(ordering))),
-        (None, explicit_collation) => Ok(explicit_collation.map(CollationSeq::Text)),
-    }
+    let ordering = common_ordering(
+        std::slice::from_ref(ty),
+        schema,
+        explicit_collation.is_some(),
+    )?;
+    Ok(match ordering {
+        Some(ordering) => Some(CollationSeq::Type(ordering)),
+        None => explicit_collation.map(CollationSeq::Text),
+    })
+}
+
+/// Fails when `operand`, the operand of a COLLATE operator, has a type that
+/// takes no COLLATE, such as `d COLLATE nocase` for a date d.
+pub(crate) fn check_collate_operand(operand: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    common_ordering_of([(operand, context)], true).map(|_| ())
 }
 
 /// Fails when values of `ty` take no COLLATE. As in PostgreSQL, only text
@@ -764,27 +768,22 @@ pub(crate) fn key_collation(
 /// `varchar` and a type with a text base do. No array takes one, because
 /// arrays compare element by element without a collation, so the COLLATE
 /// would be ignored. SQLite's own types all take one.
-pub(crate) fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
-    let refused_type = match ty {
-        ExprType::Custom { type_def, .. } if !schema.type_accepts_collate(type_def)? => {
-            type_def.name.as_str()
-        }
-        ExprType::Array { .. } => type_ordering(ty, schema)
-            .expect("an array type has an order")
-            .name(),
-        _ => return Ok(()),
+fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
+    let accepts = match ty {
+        ExprType::Custom { type_def, .. } => schema.type_accepts_collate(type_def)?,
+        ExprType::Array { .. } => false,
+        _ => true,
     };
+    if accepts {
+        return Ok(());
+    }
     Err(LimboError::ParseError(format!(
-        "collations are not supported by type {refused_type}"
+        "collations are not supported by type {ty}"
     )))
 }
 
-fn cannot_compare(a: TypeOrdering, b: TypeOrdering) -> LimboError {
-    LimboError::ParseError(format!(
-        "cannot compare type {} with type {}",
-        a.name(),
-        b.name()
-    ))
+fn cannot_compare(a: &ExprType, b: &ExprType) -> LimboError {
+    LimboError::ParseError(format!("cannot compare type {a} with type {b}"))
 }
 
 /// The order a value brings to a comparison with other values.

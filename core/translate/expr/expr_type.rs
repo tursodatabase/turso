@@ -108,6 +108,33 @@ impl ExprType {
     }
 }
 
+/// The type's name for an error message, as a column declares it: `date`,
+/// `integer[]`. An array whose element type nothing declares is `anyarray`,
+/// as in PostgreSQL.
+impl std::fmt::Display for ExprType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Custom { type_def, .. } => f.write_str(&type_def.name),
+            _ if self.is_array_of_unknown_elements() => f.write_str("anyarray"),
+            Self::Array {
+                element,
+                dimensions,
+            } => write!(f, "{element}{}", "[]".repeat(*dimensions as usize)),
+            Self::Builtin(builtin) => f.write_str(match builtin {
+                BuiltinType::Integer => "integer",
+                BuiltinType::Real => "real",
+                BuiltinType::Decimal | BuiltinType::Numeric => "numeric",
+                BuiltinType::Text => "text",
+                BuiltinType::Blob => "blob",
+                BuiltinType::Any => "any",
+            }),
+            Self::Untyped => f.write_str("text"),
+            Self::Null => f.write_str("null"),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
 /// Type names are unique within a schema, so two definitions with the same name
 /// are the same type.
 pub(crate) fn same_type_def(a: &TypeDef, b: &TypeDef) -> bool {

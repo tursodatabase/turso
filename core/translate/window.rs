@@ -2578,11 +2578,11 @@ fn emit_window_range_test(
     // A type with its own order but no `+` or `-` has no distance to add. A
     // NULL offset is rejected before any arithmetic, so it needs no call.
     let collation = context.expr_collation(order_expr)?;
-    if let CollationSeq::Type(ordering) = collation {
+    if let CollationSeq::Type(_) = collation {
         if type_arithmetic.is_none() && !matches!(type_of(offset_expr, &env), ExprType::Null) {
             crate::bail_parse_error!(
                 "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
-                ordering.name()
+                type_of(order_expr, &env)
             )
         }
     }

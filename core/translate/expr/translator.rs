@@ -912,11 +912,7 @@ fn translate_collate_expr(
     // types that take no collation, such as `d COLLATE nocase` for a date d.
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
     resolver.resolve_collation(collation.as_str())?;
-    let ty = type_of(
-        expr,
-        &ExprContext::new(referenced_tables, resolver).type_env(),
-    );
-    check_type_accepts_collate(&ty, resolver.schema())?;
+    check_collate_operand(expr, &ExprContext::new(referenced_tables, resolver))?;
     Ok(target_register)
 }
 

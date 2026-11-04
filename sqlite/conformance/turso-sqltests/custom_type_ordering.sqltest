@@ -491,7 +491,7 @@ test create-table-rejects-collate-on-array-column {
     CREATE TABLE t(x integer[] COLLATE NOCASE) STRICT;
 }
 expect error {
-    collations are not supported by type array
+    collations are not supported by type integer\[\]
 }
 
 @requires strict "uses STRICT tables"
@@ -499,7 +499,7 @@ test create-table-rejects-collate-on-text-array-column {
     CREATE TABLE t(x text[] COLLATE RTRIM) STRICT;
 }
 expect error {
-    collations are not supported by type text_array
+    collations are not supported by type text\[\]
 }
 
 @requires strict "uses STRICT tables"
@@ -669,7 +669,7 @@ test select-rejects-collate-on-integer-array-column {
     SELECT a COLLATE NOCASE FROM t;
 }
 expect error {
-    collations are not supported by type array
+    collations are not supported by type integer\[\]
 }
 
 @requires strict "uses STRICT tables"
@@ -678,7 +678,26 @@ test select-rejects-collate-on-date-array-column {
     SELECT a COLLATE NOCASE FROM t;
 }
 expect error {
-    collations are not supported by type text_array
+    collations are not supported by type date\[\]
+}
+
+@requires strict "uses STRICT tables"
+test select-rejects-collate-on-two-dimensional-array-column {
+    CREATE TABLE t(a integer[][]) STRICT;
+    SELECT a COLLATE NOCASE FROM t;
+}
+expect error {
+    collations are not supported by type integer\[\]\[\]
+}
+
+# ARRAY[x] over a column without a type has no declared element type.
+@requires strict "uses STRICT tables"
+test select-rejects-collate-on-array-of-any-values {
+    CREATE TABLE t(x any) STRICT;
+    SELECT ARRAY[x] COLLATE NOCASE FROM t;
+}
+expect error {
+    collations are not supported by type anyarray
 }
 
 @requires strict "uses STRICT tables"

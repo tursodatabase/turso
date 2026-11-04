@@ -469,6 +469,15 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test op-date-array-minus-date-error {
+    CREATE TABLE t1(a date[], d date) STRICT;
+    SELECT a - d FROM t1;
+}
+expect error {
+    operator does not exist: date\[\] - date
+}
+
+@requires strict "uses STRICT tables"
 test op-text-minus-date-error {
     -- date() returns text, and no operator subtracts a date from text.
     CREATE TABLE t1(d date) STRICT;
