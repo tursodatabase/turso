@@ -12,6 +12,21 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+# Turso accepts a FOREIGN KEY that names a column the table does not have
+# (SQLite refuses it), so databases with such tables exist. ALTER TABLE must
+# keep working on them.
+test alter-table-with-foreign-key-on-missing-column {
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE t (a INTEGER, FOREIGN KEY (zz) REFERENCES p (id));
+    ALTER TABLE t ADD COLUMN b INTEGER;
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT;
+    INSERT INTO t VALUES ('x', 1);
+    SELECT * FROM t;
+}
+expect {
+    x|1
+}
+
 test fail-alter-column-primary-key {
     CREATE TABLE t (a);
     ALTER TABLE t ALTER COLUMN a TO a PRIMARY KEY;

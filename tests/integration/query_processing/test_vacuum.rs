@@ -211,20 +211,21 @@ fn custom_type_sql_snapshot(conn: &Arc<Connection>) -> Vec<(String, String)> {
 
 fn create_custom_type_ordering_fixture(conn: &Arc<Connection>) -> anyhow::Result<()> {
     conn.execute(
-        "CREATE TYPE rev \
+        "CREATE TYPE shout \
          BASE text \
-         ENCODE string_reverse(value) \
-         DECODE string_reverse(value) \
+         ENCODE upper(value) \
          OPERATOR '<'",
     )?;
     conn.execute(
         "CREATE TABLE words(
             id INTEGER PRIMARY KEY,
-            word rev NOT NULL DEFAULT 'banana'
+            word shout NOT NULL DEFAULT 'banana'
         ) STRICT",
     )?;
     conn.execute("CREATE INDEX words_word_idx ON words(word)")?;
-    conn.execute("INSERT INTO words(id, word) VALUES (1, 'cherry')")?;
+    // Byte order of the inputs (Cherry < apple < banana) differs from the order
+    // of the stored upper-case values (APPLE < BANANA < CHERRY).
+    conn.execute("INSERT INTO words(id, word) VALUES (1, 'Cherry')")?;
     conn.execute("INSERT INTO words(id, word) VALUES (2, 'apple')")?;
     conn.execute("INSERT INTO words(id, word) VALUES (3, 'banana')")?;
     conn.execute("INSERT INTO words(id) VALUES (4)")?;
@@ -232,30 +233,30 @@ fn create_custom_type_ordering_fixture(conn: &Arc<Connection>) -> anyhow::Result
 }
 
 fn assert_custom_type_ordering_fixture(conn: &Arc<Connection>) {
+    // The type has no DECODE, so words read back as they are stored (upper case).
     let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, word FROM words ORDER BY id");
     assert_eq!(
         rows,
         vec![
-            (1, "cherry".to_string()),
-            (2, "apple".to_string()),
-            (3, "banana".to_string()),
-            (4, "banana".to_string()),
+            (1, "CHERRY".to_string()),
+            (2, "APPLE".to_string()),
+            (3, "BANANA".to_string()),
+            (4, "BANANA".to_string()),
         ],
     );
 
-    // The index sorts the stored (reversed) text: ananab < elppa < yrrehc.
     let ordered: Vec<(i64, String)> = conn.exec_rows(
         "SELECT id, word FROM words INDEXED BY words_word_idx ORDER BY word ASC, id ASC",
     );
     assert_eq!(
         ordered,
         vec![
-            (3, "banana".to_string()),
-            (4, "banana".to_string()),
-            (2, "apple".to_string()),
-            (1, "cherry".to_string()),
+            (2, "APPLE".to_string()),
+            (3, "BANANA".to_string()),
+            (4, "BANANA".to_string()),
+            (1, "CHERRY".to_string()),
         ],
-        "the stored-value order should survive when scanning the custom-type index",
+        "the order should survive when scanning the custom-type index",
     );
 
     let desc: Vec<(i64, String)> = conn.exec_rows(
@@ -264,12 +265,12 @@ fn assert_custom_type_ordering_fixture(conn: &Arc<Connection>) {
     assert_eq!(
         desc,
         vec![
-            (1, "cherry".to_string()),
-            (2, "apple".to_string()),
-            (4, "banana".to_string()),
-            (3, "banana".to_string()),
+            (1, "CHERRY".to_string()),
+            (4, "BANANA".to_string()),
+            (3, "BANANA".to_string()),
+            (2, "APPLE".to_string()),
         ],
-        "descending scans over the custom-type index should use the stored-value order",
+        "descending scans over the custom-type index should use the same order",
     );
 }
 
@@ -277,7 +278,7 @@ fn assert_custom_type_reusable_for_new_schema(conn: &Arc<Connection>) -> anyhow:
     conn.execute(
         "CREATE TABLE extra_words(
             id INTEGER PRIMARY KEY,
-            word rev NOT NULL DEFAULT 'kiwi'
+            word shout NOT NULL DEFAULT 'kiwi'
         ) STRICT",
     )?;
     conn.execute("CREATE INDEX extra_words_word_idx ON extra_words(word)")?;
@@ -285,16 +286,15 @@ fn assert_custom_type_reusable_for_new_schema(conn: &Arc<Connection>) -> anyhow:
     conn.execute("INSERT INTO extra_words(id, word) VALUES (2, 'apricot')")?;
     conn.execute("INSERT INTO extra_words(id, word) VALUES (3, 'pear')")?;
 
-    // Stored (reversed) text: iwik < raep < tocirpa.
     let rows: Vec<(i64, String)> = conn.exec_rows(
         "SELECT id, word FROM extra_words INDEXED BY extra_words_word_idx ORDER BY word ASC, id ASC",
     );
     assert_eq!(
         rows,
         vec![
-            (1, "kiwi".to_string()),
-            (3, "pear".to_string()),
-            (2, "apricot".to_string()),
+            (2, "APRICOT".to_string()),
+            (1, "KIWI".to_string()),
+            (3, "PEAR".to_string()),
         ],
         "the preserved custom type should remain usable in new tables and indexes after VACUUM",
     );
@@ -4396,6 +4396,46 @@ fn test_vacuum_keeps_a_table_with_collate_on_numeric_column() -> anyhow::Result<
     assert_eq!(rows, vec![(2,), (1,)]);
     let schema: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
     assert_eq!(schema, vec![(stored_sql.to_string(),)]);
+    Ok(())
+}
+
+/// VACUUM replays the stored CREATE INDEX and CREATE TABLE, so a key on a lossy
+/// custom type column fails with the same error as the statement that made it.
+#[test]
+fn test_vacuum_refuses_a_key_on_a_lossy_custom_type_column() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_custom_types(true);
+    // (the table and key SQLite creates, the table SQL stored in its place)
+    let cases = [
+        (
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT); CREATE INDEX i ON t (c);",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, c ci) STRICT",
+        ),
+        (
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT UNIQUE);",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, c ci UNIQUE) STRICT",
+        ),
+    ];
+    for (i, (sqlite_sql, stored_sql)) in cases.into_iter().enumerate() {
+        let dir = TempDir::new()?;
+        let db_path = dir.path().join(format!("lossy_key_{i}.db"));
+        {
+            let sqlite_conn = SqliteConnection::open(&db_path)?;
+            sqlite_conn.execute_batch(&format!("{sqlite_sql} PRAGMA writable_schema = ON;"))?;
+            sqlite_conn.execute(
+                "UPDATE sqlite_schema SET sql = ?1 WHERE name = 't'",
+                [stored_sql],
+            )?;
+        }
+        let tmp_db = TempDatabase::new_with_existent_with_opts(&db_path, opts);
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TYPE ci BASE text ENCODE value DECODE lower(value) OPERATOR '<'")?;
+
+        let err = conn.execute("VACUUM").unwrap_err().to_string();
+        assert!(
+            err.contains("column 'c' of type 'ci' cannot be a key"),
+            "{stored_sql}: unexpected error: {err}"
+        );
+    }
     Ok(())
 }
 
