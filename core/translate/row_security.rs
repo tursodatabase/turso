@@ -22,6 +22,7 @@ use crate::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral},
     },
+    vtab::{VirtualTable, VirtualTableType},
     Result, MAIN_DB_ID,
 };
 
@@ -376,13 +377,13 @@ pub fn reject_write_with_row_security(
 
 /// Virtual tables that read the database file directly would show the rows
 /// row-level security hides.
-pub fn reject_raw_storage_for_roles(table_name: &str, resolver: &Resolver) -> Result<()> {
-    if resolver.row_security_role.is_some()
-        && ["sqlite_dbpage", "btree_dump"]
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(table_name))
-    {
-        bail_parse_error!("permission denied: {table_name} requires the superuser");
+pub fn reject_raw_storage_for_roles(table: &VirtualTable, resolver: &Resolver) -> Result<()> {
+    let reads_raw_storage = matches!(
+        &table.vtab_type,
+        VirtualTableType::Internal(internal) if internal.read().reads_raw_storage()
+    );
+    if resolver.row_security_role.is_some() && reads_raw_storage {
+        bail_parse_error!("permission denied: {} requires the superuser", table.name);
     }
     Ok(())
 }

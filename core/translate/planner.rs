@@ -2164,10 +2164,7 @@ fn parse_table(
             if let VirtualTableType::Pragma(pragma) = &tbl.vtab_type {
                 crate::translate::roles::check_pragma_function(resolver, &pragma.pragma_name)?;
             }
-            crate::translate::row_security::reject_raw_storage_for_roles(
-                table_name.as_str(),
-                resolver,
-            )?;
+            crate::translate::row_security::reject_raw_storage_for_roles(tbl, resolver)?;
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {

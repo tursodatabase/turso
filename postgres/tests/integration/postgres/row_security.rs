@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use crate::common::TempDatabase;
+use parking_lot::RwLock;
 use turso_core::{Numeric, Value};
 use turso_pg::PgConnection;
 
@@ -816,6 +819,115 @@ fn rolled_back_first_enable_leaves_no_row_security_behind() {
         .unwrap();
     conn.execute("SET ROLE alice").unwrap();
     assert_eq!(integers(&conn, "SELECT id FROM docs ORDER BY id"), [1]);
+}
+
+/// A virtual table that reads pages would show the rows that row-level
+/// security hides, whatever its name.
+#[test]
+fn role_cannot_read_a_virtual_table_that_reads_raw_storage() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    create_docs_with_owner_policy(&conn);
+    conn.inner()
+        .register_internal_vtab(PageReader {
+            reads_raw_storage: true,
+        })
+        .unwrap();
+    conn.inner()
+        .register_internal_vtab(PageReader {
+            reads_raw_storage: false,
+        })
+        .unwrap();
+
+    conn.execute("SET ROLE alice").unwrap();
+
+    assert_error_contains(
+        &conn,
+        "SELECT * FROM raw_page_reader",
+        "permission denied: raw_page_reader requires the superuser",
+    );
+    assert_eq!(
+        rows(&conn, "SELECT * FROM page_reader"),
+        Vec::<Vec<Value>>::new()
+    );
+}
+
+/// An empty virtual table that claims to read the database file when
+/// `reads_raw_storage` is set.
+#[derive(Debug)]
+struct PageReader {
+    reads_raw_storage: bool,
+}
+
+impl turso_core::InternalVirtualTable for PageReader {
+    fn name(&self) -> String {
+        if self.reads_raw_storage {
+            "raw_page_reader".to_string()
+        } else {
+            "page_reader".to_string()
+        }
+    }
+
+    fn sql(&self) -> String {
+        format!("CREATE TABLE {}(data BLOB)", self.name())
+    }
+
+    fn reads_raw_storage(&self) -> bool {
+        self.reads_raw_storage
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<turso_core::Connection>,
+    ) -> turso_core::Result<Arc<RwLock<dyn turso_core::InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(EmptyCursor)))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        Ok(turso_ext::IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 1.0,
+            estimated_rows: 0,
+            constraint_usages: constraints
+                .iter()
+                .map(|_| turso_ext::ConstraintUsage {
+                    argv_index: None,
+                    omit: false,
+                })
+                .collect(),
+        })
+    }
+}
+
+struct EmptyCursor;
+
+impl turso_core::InternalVirtualTableCursor for EmptyCursor {
+    fn next(&mut self) -> Result<bool, turso_core::LimboError> {
+        Ok(false)
+    }
+
+    fn rowid(&self) -> i64 {
+        0
+    }
+
+    fn column(&self, _column: usize) -> Result<Value, turso_core::LimboError> {
+        unreachable!("the table has no rows")
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, turso_core::LimboError> {
+        Ok(false)
+    }
 }
 
 fn create_docs_with_row_security(conn: &PgConnection) {
