@@ -393,6 +393,44 @@ mod tests {
             .contains("malformed database schema");
     }
 
+    /// An array column whose stored value is not an array is a damaged
+    /// database. Reading it through DECODE must fail, not loop forever.
+    #[test]
+    fn test_decode_of_array_column_holding_a_non_array_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("array_column_holding_integer.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TYPE d1(value integer) BASE integer DECODE value - 1")
+                .unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b integer) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+
+            // Turso has no writable_schema pragma. Use the same schema-write
+            // bypass as VACUUM during prepare, then execute normally.
+            conn.start_nested();
+            let stmt = conn.prepare(
+                "UPDATE sqlite_schema \
+                 SET sql = 'CREATE TABLE t(id INTEGER PRIMARY KEY, b d1[]) STRICT' \
+                 WHERE name = 't'",
+            );
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        let mut stmt = conn.prepare("SELECT b FROM t").unwrap();
+        assert_that!(stmt.run_collect_rows())
+            .err()
+            .display_string()
+            .contains("expected an array, but the value is not an array");
+    }
+
     /// After reopening, schema changes (CREATE TABLE) that use a previously
     /// defined custom type must still work. The type must survive the schema
     /// change and new tables must encode/decode correctly.

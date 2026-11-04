@@ -25,6 +25,22 @@ pub(super) fn emit_array_element_loop(
     let reg_acc = program.alloc_register();
 
     program.emit_insn(Insn::ArrayLength { reg, dest: reg_len });
+    // ArrayLength is NULL for a value that is not an array. An array column
+    // and each level of an array of arrays hold only arrays and NULLs, so
+    // this is a damaged value; stop instead of looping with no end.
+    let is_array_label = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: reg_len,
+        target_pc: is_array_label,
+    });
+    program.emit_insn(Insn::Halt {
+        constraint_info: None,
+        err_code: SQLITE_ERROR,
+        description: "expected an array, but the value is not an array".to_string(),
+        on_error: None,
+        description_reg: None,
+    });
+    program.preassign_label_to_next_insn(is_array_label);
     // array_agg of no elements is NULL, not an empty array.
     program.emit_insn(Insn::IfNot {
         reg: reg_len,
