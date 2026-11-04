@@ -127,6 +127,34 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test decode-kind-refuses-round-of-integer {
+    -- In PostgreSQL, round() of an exact number gives an exact number, so
+    -- the kind of round() of an integer is not known.
+    CREATE TYPE ri(value any) BASE integer ENCODE value DECODE round(value);
+}
+expect error {
+    cannot tell what kind of value DECODE of type ri returns
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-true-or-false-is-integer {
+    -- Like a comparison, these give 1, 0 or NULL, so they compare as
+    -- integers: 1 < '09' as numbers, although the text '1' > '09'.
+    CREATE TYPE bt(value any) BASE integer ENCODE value DECODE value BETWEEN 1 AND 5;
+    CREATE TYPE il(value any) BASE integer ENCODE value DECODE value IN (1, 2);
+    CREATE TYPE lk(value any) BASE text ENCODE value DECODE value LIKE 'a%';
+    CREATE TYPE gb(value any) BASE text ENCODE value DECODE value GLOB 'a*';
+    CREATE TYPE rx(value any) BASE text ENCODE value DECODE value REGEXP '^a';
+    CREATE TYPE nn(value any) BASE text ENCODE value DECODE value NOT NULL;
+    CREATE TABLE t(a bt, b il, c lk, d gb, e rx, f nn) STRICT;
+    INSERT INTO t VALUES (3, 1, 'abc', 'abc', 'abc', 'abc');
+    SELECT a < '09', b < '09', c < '09', d < '09', e < '09', f < '09' FROM t;
+}
+expect {
+    1|1|1|1|1|1
+}
+
+@requires strict "uses STRICT tables"
 test decode-kind-follows-the-type-it-casts-to {
     -- a's DECODE casts to b, so a reads as b's kind, text: c > 9 compares
     -- with the text '9', and the text '10' sorts before '9'.

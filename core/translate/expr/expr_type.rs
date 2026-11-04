@@ -322,22 +322,42 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             resolved: Some(resolution),
             ..
         } => field_type(&type_of(base, env), resolution, env.schema()),
-        // Expressions whose value is never a custom-type value. SQLite's affinity
-        // gives their built-in type.
+        // Like a comparison, these give 1, 0 or NULL. `x LIKE p` and `x GLOB p`
+        // call like() and glob(), which do the same.
         ast::Expr::Between { .. }
         | ast::Expr::InList { .. }
         | ast::Expr::InSelect { .. }
         | ast::Expr::InTable { .. }
         | ast::Expr::IsNull(_)
         | ast::Expr::NotNull(_)
-        | ast::Expr::Like { .. }
+        | ast::Expr::Like {
+            op: ast::LikeOperator::Like | ast::LikeOperator::Glob,
+            ..
+        }
         | ast::Expr::Exists(_)
         | ast::Expr::SubqueryResult {
             query_type: ast::SubqueryType::Exists { .. } | ast::SubqueryType::In { .. },
             ..
-        }
-        | ast::Expr::FunctionCallStar { .. }
-        | ast::Expr::Raise(..) => affinity_type(expr, env),
+        } => ExprType::Builtin(BuiltinType::Integer),
+        // `x REGEXP p` calls regexp(p, x), which an extension may define.
+        ast::Expr::Like {
+            op: ast::LikeOperator::Regexp,
+            lhs,
+            rhs,
+            ..
+        } => function_type(
+            &ast::Name::exact(String::from("regexp")),
+            &[rhs.clone(), lhs.clone()],
+            env,
+        ),
+        // MATCH is only allowed as an FTS index query, which gives no value.
+        ast::Expr::Like {
+            op: ast::LikeOperator::Match,
+            ..
+        } => ExprType::Unknown,
+        // Expressions whose value is never a custom-type value. SQLite's affinity
+        // gives their built-in type.
+        ast::Expr::FunctionCallStar { .. } | ast::Expr::Raise(..) => affinity_type(expr, env),
         ast::Expr::Id(name) | ast::Expr::Name(name) => env.name_type(name.as_str()),
         // Not bound or planned yet: subqueries, `DEFAULT`, and field access on
         // an unbound base.
@@ -790,22 +810,20 @@ fn custom_operator_type(expr: &ast::Expr, types: &[ExprType], env: &TypeEnv) -> 
 /// type reads as: `smallint * 2` is an integer. A decimal written in the
 /// statement is a REAL to SQLite.
 pub(super) fn sqlite_operand_type(ty: ExprType) -> ExprType {
-    match &ty {
-        ExprType::Custom { type_def, .. } => read_type(type_def),
-        ExprType::Builtin(BuiltinType::Decimal) => ExprType::Builtin(BuiltinType::Real),
-        ExprType::Builtin(_)
-        | ExprType::Array { .. }
-        | ExprType::Untyped
-        | ExprType::Null
-        | ExprType::Unknown => ty,
-    }
+    operand_type(ty, read_type)
 }
 
 /// Like [`sqlite_operand_type`], for a value in its stored form: a custom
 /// value is a value of the type it is stored as.
 fn stored_operand_type(ty: ExprType, schema: &Schema) -> ExprType {
+    operand_type(ty, |type_def| stored_type(type_def, schema))
+}
+
+/// The type an operand has for SQLite's own arithmetic, where `custom_type`
+/// gives the type of a custom value.
+fn operand_type(ty: ExprType, custom_type: impl FnOnce(&TypeDef) -> ExprType) -> ExprType {
     match &ty {
-        ExprType::Custom { type_def, .. } => stored_type(type_def, schema),
+        ExprType::Custom { type_def, .. } => custom_type(type_def),
         ExprType::Builtin(BuiltinType::Decimal) => ExprType::Builtin(BuiltinType::Real),
         ExprType::Builtin(_)
         | ExprType::Array { .. }
@@ -825,7 +843,12 @@ fn read_type(type_def: &TypeDef) -> ExprType {
 fn negated_type(ty: ExprType) -> ExprType {
     match ty {
         ExprType::Builtin(BuiltinType::Decimal) => ty,
-        ty => arithmetic_type(
+        ExprType::Builtin(_)
+        | ExprType::Custom { .. }
+        | ExprType::Array { .. }
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown => arithmetic_type(
             &ExprType::Builtin(BuiltinType::Integer),
             &sqlite_operand_type(ty),
         ),
@@ -1228,7 +1251,12 @@ fn lacks_exact_numbers(ty: &ExprType) -> bool {
 fn read_type_unless_exact_numbers(ty: ExprType) -> ExprType {
     match &ty {
         ExprType::Custom { type_def, .. } if lacks_exact_numbers(&ty) => read_type(type_def),
-        _ => ty,
+        ExprType::Custom { .. }
+        | ExprType::Builtin(_)
+        | ExprType::Array { .. }
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown => ty,
     }
 }
 

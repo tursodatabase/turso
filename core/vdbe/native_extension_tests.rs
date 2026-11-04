@@ -656,7 +656,7 @@ fn extension_constructors_validate_argument_counts() {
     for (argc, valid) in [(-2, false), (-1, true), (0, true), (2, true)] {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let functions = [
-            ExternalFunc::new_scalar("c_double".into(), argc, true, 0, c_double, None, None),
+            ExternalFunc::new_scalar("c_double".into(), argc, true, 0, c_double, None, None, None),
             ExternalFunc::new_aggregate(
                 "c_aggregate".into(),
                 argc,
@@ -773,6 +773,7 @@ fn rejected_c_functions_leave_context_ownership_with_the_caller() {
                         context,
                         c_double,
                         Some(drop_context),
+                        None,
                         None,
                     )
                 };
@@ -1863,8 +1864,17 @@ fn c_extensions_still_execute_with_native_registration() {
                 .unwrap(),
             )
             .extension_function(
-                ExternalFunc::new_scalar("C_OpEn_DoUbLe".into(), 1, true, 0, c_double, None, None)
-                    .unwrap(),
+                ExternalFunc::new_scalar(
+                    "C_OpEn_DoUbLe".into(),
+                    1,
+                    true,
+                    0,
+                    c_double,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
             ),
     );
     let other = conn.db.connect(ConnectOpts::new()).unwrap();

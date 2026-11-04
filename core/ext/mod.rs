@@ -172,8 +172,9 @@ unsafe fn add_scalar_function(
         callback,
         context_destructor,
         value_destructor,
+        return_type,
     ) {
-        Ok(function) => function.with_return_type(return_type),
+        Ok(function) => function,
         Err(_) => return ResultCode::InvalidArgs,
     };
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };

@@ -1109,28 +1109,26 @@ mod tests {
     }
 
     /// A type whose DECODE casts to another type reads as that type's kind:
-    /// here `a` reads as text, because `b`'s DECODE gives text. This holds
-    /// after reopening too, when the kinds are worked out as the types load.
+    /// here `a` reads as a real, because `b`'s DECODE gives a real, although
+    /// both store text. This holds after reopening too, when the kinds are
+    /// worked out as the types load.
     #[test]
     fn test_decode_kind_follows_the_type_it_casts_to() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("decode_kind_cast_type.db");
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
-        // '10' > 9 as a number, but not as text: a text is greater than any
-        // number, so only text-to-text comparisons decide the order.
+        // As reals, 10.0 > 9.6 > 9.0. As text, '10' < '9' < '9.6'.
         let check = |conn: &Arc<turso_core::Connection>, context: &str| {
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE c < 9.6 ORDER BY id");
+            assert_eq!(rows, vec![(2,)], "{context}: WHERE c < 9.6");
             let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE c > 9 ORDER BY id");
-            assert_eq!(rows, vec![], "{context}: WHERE c > 9");
-            let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE c > '9' ORDER BY id");
-            assert_eq!(rows, vec![], "{context}: WHERE c > '9'");
-            let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE c < '9' ORDER BY id");
-            assert_eq!(rows, vec![(1,)], "{context}: WHERE c < '9'");
+            assert_eq!(rows, vec![(1,)], "{context}: WHERE c > 9");
         };
         {
             let db = TempDatabase::new_with_existent_with_opts(&path, opts);
             let conn = db.connect_limbo();
             conn.execute(
-                "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value)",
+                "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS real)",
             )
             .unwrap();
             conn.execute(

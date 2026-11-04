@@ -227,6 +227,10 @@ impl ExtFunc {
 }
 
 impl ExternalFunc {
+    /// `return_type` is the kind of value the function returns, when it
+    /// declares one, so that the type of a call to it is known, as in a
+    /// custom type's DECODE.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_scalar(
         name: String,
         argc: i32,
@@ -235,6 +239,7 @@ impl ExternalFunc {
         callback: ScalarFunction,
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
+        return_type: Option<ReturnType>,
     ) -> crate::Result<Self> {
         Self::validate_arg_count(argc)?;
         Ok(Self {
@@ -247,23 +252,9 @@ impl ExternalFunc {
                 context_destructor,
                 value_destructor,
                 context_owner: ExternalContext::new(context, context_destructor),
-                return_type: None,
+                return_type,
             },
         })
-    }
-
-    /// Declares the kind of value a scalar function returns, so that the type
-    /// of a call to it is known, as in a custom type's DECODE.
-    pub fn with_return_type(mut self, return_type: Option<ReturnType>) -> Self {
-        let ExtFunc::Scalar {
-            return_type: declared,
-            ..
-        } = &mut self.func
-        else {
-            unreachable!("only scalar functions declare a return type");
-        };
-        *declared = return_type;
-        self
     }
 
     pub fn new_aggregate(
