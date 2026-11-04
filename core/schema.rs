@@ -6958,64 +6958,13 @@ pub fn create_table(
                             }
                             collation = Some(collation_seq);
                         }
-                        ast::ColumnConstraint::ForeignKey {
-                            clause,
-                            defer_clause,
-                        } => {
-                            if clause.columns.len() > 1 {
-                                crate::bail_parse_error!(
-                                    "foreign key on {} should reference only one column of table {}",
-                                    name,
-                                    clause.tbl_name.as_str()
-                                );
-                            }
-                            let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
-                            let (parent_namespace, parent_table) =
-                                demangle_name(supports_namespaces, &mangled_parent_table);
-                            let fk = ForeignKey {
-                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
-                                parent_table: parent_table.to_string(),
-                                parent_namespace,
-                                parent_columns: clause
-                                    .columns
-                                    .iter()
-                                    .map(|c| normalize_ident(c.col_name.as_str()))
-                                    .try_collect()?,
-                                on_delete: clause
-                                    .args
-                                    .iter()
-                                    .find_map(|arg| {
-                                        if let ast::RefArg::OnDelete(act) = arg {
-                                            Some(*act)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(RefAct::NoAction),
-                                on_update: clause
-                                    .args
-                                    .iter()
-                                    .find_map(|arg| {
-                                        if let ast::RefArg::OnUpdate(act) = arg {
-                                            Some(*act)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(RefAct::NoAction),
-                                child_columns: Box::from([name.clone()]),
-                                deferred: match defer_clause {
-                                    Some(d) => {
-                                        d.deferrable
-                                            && matches!(
-                                                d.init_deferred,
-                                                Some(InitDeferredPred::InitiallyDeferred)
-                                            )
-                                    }
-                                    None => false,
-                                },
-                                decl_order: column_fk_order,
-                            };
+                        ast::ColumnConstraint::ForeignKey { .. } => {
+                            let fk = ForeignKey::from_column_constraint(
+                                &name,
+                                c_def,
+                                column_fk_order,
+                                supports_namespaces,
+                            )?;
                             foreign_keys.try_push(Arc::new(fk))?;
                             column_fk_order += 1;
                         }
@@ -7321,6 +7270,62 @@ fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
 }
 
 impl ForeignKey {
+    /// Builds the foreign key of a column constraint such as
+    /// `c REFERENCES parent(p) ON DELETE CASCADE`. Used by CREATE TABLE,
+    /// ADD COLUMN and ALTER COLUMN.
+    pub fn from_column_constraint(
+        child_column: &str,
+        constraint: &ast::NamedColumnConstraint,
+        decl_order: usize,
+        supports_namespaces: bool,
+    ) -> Result<Self> {
+        let ast::ColumnConstraint::ForeignKey {
+            clause,
+            defer_clause,
+        } = &constraint.constraint
+        else {
+            unreachable!("from_column_constraint called with a constraint that is not REFERENCES");
+        };
+        if clause.columns.len() > 1 {
+            crate::bail_parse_error!(
+                "foreign key on {} should reference only one column of table {}",
+                child_column,
+                clause.tbl_name.as_str()
+            );
+        }
+        let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+        let (parent_namespace, parent_table) =
+            demangle_name(supports_namespaces, &mangled_parent_table);
+        let find_action = |on_delete: bool| {
+            clause
+                .args
+                .iter()
+                .find_map(|arg| match arg {
+                    ast::RefArg::OnDelete(act) if on_delete => Some(*act),
+                    ast::RefArg::OnUpdate(act) if !on_delete => Some(*act),
+                    _ => None,
+                })
+                .unwrap_or(RefAct::NoAction)
+        };
+        Ok(ForeignKey {
+            constraint_name: constraint.name.as_ref().map(|n| n.as_str().to_owned()),
+            parent_table: parent_table.to_string(),
+            parent_namespace,
+            parent_columns: clause
+                .columns
+                .iter()
+                .map(|c| normalize_ident(c.col_name.as_str()))
+                .try_collect()?,
+            on_delete: find_action(true),
+            on_update: find_action(false),
+            child_columns: Box::from([child_column.to_string()]),
+            deferred: defer_clause.as_ref().is_some_and(|d| {
+                d.deferrable && matches!(d.init_deferred, Some(InitDeferredPred::InitiallyDeferred))
+            }),
+            decl_order,
+        })
+    }
+
     pub fn child_key_assigned(&self, child: &BTreeTable, updated_cols: &ColumnMask) -> bool {
         self.child_columns.iter().any(|cname| {
             child

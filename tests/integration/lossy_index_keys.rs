@@ -29,6 +29,8 @@
 //!     (see `TypeSpec::expressions_decode`).
 //!   - declaration form (see `Form`)
 //!   - index before data or data before index (CREATE INDEX forms)
+//!   - plain or virtual generated column `c <type> AS (w)` (see `Generated`).
+//!     Generated cases check only the declaration, not the queries.
 //!   - ALTER COLUMN: the table is created with a key on a column of an allowed
 //!     type, then the column's type is changed (see `alter_pairs`), with the
 //!     rows in before or after the change. Both sides of the pair are allowed
@@ -580,15 +582,30 @@ struct Script {
     twin_collation: &'static str,
 }
 
-fn base_table(ty: &TypeSpec, constraint_in_column: &str, table_constraint: &str) -> String {
+/// Whether the key column `c` of `t` is an ordinary column or a virtual
+/// generated column `c <type> AS (w)`, where `w` holds the type's base type.
+/// STORED generated columns are refused for every type ("Stored generated
+/// columns are not supported"), so they cannot have a key.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Generated {
+    No,
+    Virtual,
+}
+
+/// `c_ty` is the type of `c` and its generated clause; `w` is the `w` column
+/// (with a leading comma) or empty.
+fn base_table(c_ty: &str, w: &str, constraint_in_column: &str, table_constraint: &str) -> String {
     format!(
-        "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, c {} {}{}) STRICT",
-        ty.name, constraint_in_column, table_constraint
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER{w}, c {c_ty} {constraint_in_column}{table_constraint}) STRICT"
     )
 }
 
-fn script(form: Form, ty: &TypeSpec) -> Script {
-    let plain_table = base_table(ty, "", "");
+fn script(form: Form, ty: &TypeSpec, generated: Generated) -> Script {
+    let (c_ty, w) = match generated {
+        Generated::No => (ty.name.to_string(), String::new()),
+        Generated::Virtual => (format!("{} AS (w)", ty.name), format!(", w {}", ty.base)),
+    };
+    let plain_table = base_table(&c_ty, &w, "", "");
     let parent_base = format!("CREATE TABLE p(c {} PRIMARY KEY) STRICT", ty.base);
     let mut s = Script {
         pre: vec![],
@@ -638,55 +655,57 @@ fn script(form: Form, ty: &TypeSpec) -> Script {
             }
         }
         Form::ColUnique => {
-            s.decl.push(base_table(ty, "UNIQUE", ""));
+            s.decl.push(base_table(&c_ty, &w, "UNIQUE", ""));
             s.unique = Unique::OnC;
         }
         Form::TblUnique => {
-            s.decl.push(base_table(ty, "", ", UNIQUE(c)"));
+            s.decl.push(base_table(&c_ty, &w, "", ", UNIQUE(c)"));
             s.unique = Unique::OnC;
         }
         Form::TblUniqueMulti => {
-            s.decl.push(base_table(ty, "", ", UNIQUE(k, c)"));
+            s.decl.push(base_table(&c_ty, &w, "", ", UNIQUE(k, c)"));
             s.unique = Unique::OnKC;
         }
         Form::ColUniqueCollate => {
-            s.decl.push(base_table(ty, "COLLATE nocase UNIQUE", ""));
+            s.decl
+                .push(base_table(&c_ty, &w, "COLLATE nocase UNIQUE", ""));
             s.unique = Unique::OnC;
             s.twin_collation = "COLLATE nocase";
         }
         Form::ColPk => {
             s.decl.push(format!(
-                "CREATE TABLE t(id INTEGER, k INTEGER, c {} PRIMARY KEY) STRICT",
-                ty.name
+                "CREATE TABLE t(id INTEGER, k INTEGER{w}, c {c_ty} PRIMARY KEY) STRICT"
             ));
             s.unique = Unique::OnC;
             s.not_null = true;
         }
         Form::TblPk => {
             s.decl.push(format!(
-                "CREATE TABLE t(id INTEGER, k INTEGER, c {}, PRIMARY KEY(c)) STRICT",
-                ty.name
+                "CREATE TABLE t(id INTEGER, k INTEGER{w}, c {c_ty}, PRIMARY KEY(c)) STRICT"
             ));
             s.unique = Unique::OnC;
             s.not_null = true;
         }
         Form::TblPkMulti => {
             s.decl.push(format!(
-                "CREATE TABLE t(id INTEGER, k INTEGER, c {}, PRIMARY KEY(k, c)) STRICT",
-                ty.name
+                "CREATE TABLE t(id INTEGER, k INTEGER{w}, c {c_ty}, PRIMARY KEY(k, c)) STRICT"
             ));
             s.unique = Unique::OnKC;
             s.not_null = true;
         }
         Form::FkChildColumn => {
             s.pre.push(parent_base);
-            s.decl.push(base_table(ty, "REFERENCES p(c)", ""));
+            s.decl.push(base_table(&c_ty, &w, "REFERENCES p(c)", ""));
             s.fk_child = true;
         }
         Form::FkChildTable => {
             s.pre.push(parent_base);
-            s.decl
-                .push(base_table(ty, "", ", FOREIGN KEY(c) REFERENCES p(c)"));
+            s.decl.push(base_table(
+                &c_ty,
+                &w,
+                "",
+                ", FOREIGN KEY(c) REFERENCES p(c)",
+            ));
             s.fk_child = true;
         }
         Form::FkParent => {
@@ -711,12 +730,11 @@ fn script(form: Form, ty: &TypeSpec) -> Script {
         Form::FkBoth => {
             s.decl
                 .push(format!("CREATE TABLE p(c {} PRIMARY KEY) STRICT", ty.name));
-            s.decl.push(base_table(ty, "REFERENCES p(c)", ""));
+            s.decl.push(base_table(&c_ty, &w, "REFERENCES p(c)", ""));
         }
         Form::FkReferenced => {
             s.decl.push(format!(
-                "CREATE TABLE t(id INTEGER, k INTEGER, c {}, PRIMARY KEY(c)) STRICT",
-                ty.name
+                "CREATE TABLE t(id INTEGER, k INTEGER{w}, c {c_ty}, PRIMARY KEY(c)) STRICT"
             ));
             s.decl.push(format!(
                 "CREATE TABLE ch(id INTEGER PRIMARY KEY, c {} REFERENCES t(c)) STRICT",
@@ -726,29 +744,28 @@ fn script(form: Form, ty: &TypeSpec) -> Script {
             s.not_null = true;
         }
         Form::AddColumnUnique => {
-            s.pre
-                .push("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER) STRICT".to_string());
+            s.pre.push(format!(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER{w}) STRICT"
+            ));
             s.decl
-                .push(format!("ALTER TABLE t ADD COLUMN c {} UNIQUE", ty.name));
+                .push(format!("ALTER TABLE t ADD COLUMN c {c_ty} UNIQUE"));
             s.data_phase = false;
         }
         Form::AddColumnPrimaryKey => {
-            s.pre
-                .push("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER) STRICT".to_string());
-            s.decl.push(format!(
-                "ALTER TABLE t ADD COLUMN c {} PRIMARY KEY",
-                ty.name
+            s.pre.push(format!(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER{w}) STRICT"
             ));
+            s.decl
+                .push(format!("ALTER TABLE t ADD COLUMN c {c_ty} PRIMARY KEY"));
             s.data_phase = false;
         }
         Form::AddColumnReferences => {
             s.pre.push(parent_base);
-            s.pre
-                .push("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER) STRICT".to_string());
-            s.decl.push(format!(
-                "ALTER TABLE t ADD COLUMN c {} REFERENCES p(c)",
-                ty.name
+            s.pre.push(format!(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER{w}) STRICT"
             ));
+            s.decl
+                .push(format!("ALTER TABLE t ADD COLUMN c {c_ty} REFERENCES p(c)"));
             s.data_phase = false;
         }
         Form::AlterColumnUnique | Form::AlterColumnPrimaryKey | Form::AlterColumnReferences => {
@@ -762,12 +779,11 @@ fn script(form: Form, ty: &TypeSpec) -> Script {
                 _ => unreachable!(),
             };
             s.pre.push(format!(
-                "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, x {}) STRICT",
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER{w}, x {}) STRICT",
                 ty.base
             ));
             s.decl.push(format!(
-                "ALTER TABLE t ALTER COLUMN x TO c {} {constraint}",
-                ty.name
+                "ALTER TABLE t ALTER COLUMN x TO c {c_ty} {constraint}"
             ));
             s.data_phase = false;
         }
@@ -777,21 +793,45 @@ fn script(form: Form, ty: &TypeSpec) -> Script {
             } else {
                 ""
             };
-            s.pre.push(base_table(ty, unique, ""));
+            s.pre.push(base_table(&c_ty, &w, unique, ""));
+            // A generated `c` takes its value from `w`.
+            let value_column = match generated {
+                Generated::No => "c",
+                Generated::Virtual => "w",
+            };
             s.decl.push(format!(
-                "INSERT INTO t(id, k, c) VALUES (1, 0, {}) ON CONFLICT(c) DO NOTHING",
+                "INSERT INTO t(id, k, {value_column}) VALUES (1, 0, {}) ON CONFLICT(c) DO NOTHING",
                 ty.pool[0]
             ));
             s.data_phase = false;
         }
     }
+    // The rows and queries write `c` directly, so a generated `c` only gets the
+    // declaration checked.
+    if generated == Generated::Virtual {
+        s.data_phase = false;
+    }
     s
 }
 
-/// Every (form, type) pair is exactly "allowed" or "refused with this message".
-fn expectation(form: Form, ty: &TypeSpec) -> Expect {
+/// The forms that also run with a generated `c`: every form that declares `c`
+/// in `t` with the type under test. In `FkParent` the type is on `p.c`.
+fn form_has_generated_variant(form: Form) -> bool {
+    form != Form::FkParent
+}
+
+/// Every (form, type, generated) case is exactly "allowed" or "refused with
+/// this message".
+fn expectation(form: Form, ty: &TypeSpec, generated: Generated) -> Expect {
     let lossy = ty.kind == Kind::Lossy;
     match form {
+        // A generated column cannot be part of a PRIMARY KEY, for every type.
+        // ADD COLUMN and ALTER COLUMN refuse any PRIMARY KEY first (below).
+        Form::ColPk | Form::TblPk | Form::TblPkMulti | Form::FkReferenced
+            if generated == Generated::Virtual =>
+        {
+            Expect::RefuseExisting("generated column \"c\" cannot be part of the PRIMARY KEY".into())
+        }
         // No key on `c`, or a key on an expression whose value is what the
         // query sees (explicit conversions stay allowed on every type). A
         // partial index keys on `k`; `c` only appears in its WHERE.
@@ -930,7 +970,10 @@ fn is_rowid_alias_type(ty: &TypeSpec) -> bool {
 /// the key (a COLLATE on an array, an index on a type with a DECODE and no
 /// OPERATOR '<'), so the table cannot be created first.
 fn alter_case_is_skipped(form: Form, from: &TypeSpec) -> bool {
-    matches!(expectation(form, from), Expect::RefuseExisting(_))
+    matches!(
+        expectation(form, from, Generated::No),
+        Expect::RefuseExisting(_)
+    )
 }
 
 /// Types that only appear as the starting type of an ALTER COLUMN: the built-in
@@ -1435,6 +1478,7 @@ struct Finding {
     data_first: bool,
     rows: Vec<DataRow>,
     alter_from: Option<&'static str>,
+    generated: Generated,
     outcome_failure: Option<Outcome>,
 }
 
@@ -1481,6 +1525,8 @@ struct Case<'a> {
     /// Set for an ALTER COLUMN case: the table is created with this type for `c`
     /// and the key `form`, then `c` is changed to `ty`.
     alter_from: Option<&'a TypeSpec>,
+    /// Whether `c` is a virtual generated column. Only for declared cases.
+    generated: Generated,
 }
 
 impl Case<'_> {
@@ -1488,6 +1534,9 @@ impl Case<'_> {
         let mut name = format!("{:?}", self.form);
         if let Some(from) = self.alter_from {
             name = format!("{name} after ALTER COLUMN from {}", from.name);
+        }
+        if self.generated == Generated::Virtual {
+            name.push_str("/generated");
         }
         if self.data_first {
             name.push_str("/data-first");
@@ -1503,7 +1552,7 @@ impl Case<'_> {
     fn expectation(&self) -> Expect {
         match self.alter_from {
             Some(from) => alter_expectation(self.form, from, self.ty),
-            None => expectation(self.form, self.ty),
+            None => expectation(self.form, self.ty, self.generated),
         }
     }
 
@@ -1520,6 +1569,7 @@ impl Case<'_> {
             data_first: self.data_first,
             rows: self.rows.clone(),
             alter_from: self.alter_from.map(|t| t.name),
+            generated: self.generated,
             outcome_failure: None,
         }
     }
@@ -1562,7 +1612,7 @@ fn exec(db: &Db, sql: &str, statements: &mut Vec<String>) -> Result<Rows, String
 
 fn build_declared(case: &Case, stats: &mut Stats) -> Built {
     let ty = case.ty;
-    let sc = script(case.form, ty);
+    let sc = script(case.form, ty, case.generated);
     let db = open();
     let mut statements: Vec<String> = Vec::new();
     let mut load_problems = Vec::new();
@@ -1631,7 +1681,7 @@ fn build_declared(case: &Case, stats: &mut Stats) -> Built {
 /// same values and differ only in the key.
 fn build_altered(case: &Case, from: &TypeSpec, stats: &mut Stats) -> Built {
     let ty = case.ty;
-    let sc = script(case.form, from);
+    let sc = script(case.form, from, Generated::No);
     let db = open();
     let mut statements: Vec<String> = Vec::new();
     let mut load_problems = Vec::new();
@@ -1942,7 +1992,7 @@ fn plan_class(db: &Db, sql: &str) -> String {
 
 fn compare_queries(case: &Case, built: &Built, stats: &mut Stats, scale: &Scale) -> Vec<Finding> {
     let ty = case.ty;
-    let sc = script(case.form, case.declared_ty());
+    let sc = script(case.form, case.declared_ty(), case.generated);
     let mut out = Vec::new();
     if !ty.expressions_decode() {
         stats.skipped_no_baseline += 1;
@@ -2063,6 +2113,7 @@ fn minimize(finding: &Finding) -> Option<Vec<String>> {
             data_first: finding.data_first,
             rows: rows.to_vec(),
             alter_from,
+            generated: finding.generated,
         };
         let built = build(&case, &mut Stats::default());
         if !built.has_t {
@@ -2114,12 +2165,13 @@ fn run_matrix(scale: &Scale) -> (Stats, Vec<Finding>) {
             .iter()
             .filter(|f| !scale.decoded_sort || **f == Form::None)
         {
-            let orders: &[bool] =
-                if script(*form, ty).index_on_existing_table && *form != Form::IndexUnique {
-                    &[false, true]
-                } else {
-                    &[false]
-                };
+            let orders: &[bool] = if script(*form, ty, Generated::No).index_on_existing_table
+                && *form != Form::IndexUnique
+            {
+                &[false, true]
+            } else {
+                &[false]
+            };
             for &data_first in orders {
                 for &seed in &scale.seeds {
                     let case = Case {
@@ -2128,9 +2180,23 @@ fn run_matrix(scale: &Scale) -> (Stats, Vec<Finding>) {
                         data_first,
                         rows: gen_rows(ty, scale.rows, seed),
                         alter_from: None,
+                        generated: Generated::No,
                     };
                     run_case(&case, seed == scale.seeds[0], scale, &mut stats, &mut all);
                 }
+            }
+            // The same declaration with `c` a virtual generated column. Only the
+            // declaration is checked, and it does not depend on the data.
+            if !scale.decoded_sort && form_has_generated_variant(*form) {
+                let case = Case {
+                    ty,
+                    form: *form,
+                    data_first: false,
+                    rows: vec![],
+                    alter_from: None,
+                    generated: Generated::Virtual,
+                };
+                run_case(&case, true, scale, &mut stats, &mut all);
             }
         }
     }
@@ -2155,6 +2221,7 @@ fn run_matrix(scale: &Scale) -> (Stats, Vec<Finding>) {
                             data_first,
                             rows: alter_rows(from, to, scale.rows, seed),
                             alter_from: Some(from),
+                            generated: Generated::No,
                         };
                         run_case(&case, seed == scale.seeds[0], scale, &mut stats, &mut all);
                     }
@@ -2390,7 +2457,18 @@ fn print_declaration_outcomes() {
                 data_first: false,
                 rows,
                 alter_from: None,
+                generated: Generated::No,
             });
+            if form_has_generated_variant(*form) {
+                cases.push(Case {
+                    ty,
+                    form: *form,
+                    data_first: false,
+                    rows: vec![],
+                    alter_from: None,
+                    generated: Generated::Virtual,
+                });
+            }
         }
     }
     for (from, to) in alter_pairs(&types, &source_only) {
@@ -2404,6 +2482,7 @@ fn print_declaration_outcomes() {
                 data_first: true,
                 rows: alter_rows(from, to, 4, 1),
                 alter_from: Some(from),
+                generated: Generated::No,
             });
         }
     }

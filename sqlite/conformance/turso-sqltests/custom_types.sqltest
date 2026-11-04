@@ -2103,7 +2103,7 @@ expect {
 
 @requires strict "uses STRICT tables"
 test virtual-custom-type-column-in-an-index {
-    CREATE TYPE scaled BASE integer ENCODE value * 100 DECODE value;
+    CREATE TYPE scaled BASE integer ENCODE value * 100 DECODE value OPERATOR '<';
     CREATE TABLE t(w integer PRIMARY KEY, y scaled AS (w)) STRICT;
     CREATE INDEX t_y ON t(y);
     INSERT INTO t(w) VALUES (300);
@@ -2157,7 +2157,7 @@ expect {
 # for y as an index on a stored column of the type.
 @requires strict "uses STRICT tables"
 test virtual-custom-type-column-index-built-after-rows {
-    CREATE TYPE scaled BASE integer ENCODE value * 100 DECODE value;
+    CREATE TYPE scaled BASE integer ENCODE value * 100 DECODE value OPERATOR '<';
     CREATE TABLE t(id integer PRIMARY KEY, w integer UNIQUE, y scaled AS (w)) STRICT;
     INSERT INTO t(id, w) VALUES (1, 3), (2, 1);
     CREATE INDEX t_y ON t(y);

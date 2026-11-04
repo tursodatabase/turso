@@ -1,5 +1,5 @@
 use crate::alloc::TursoIteratorExt;
-use crate::namespace::{demangle_name, NamespaceId, NamespaceRef};
+use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
@@ -2372,64 +2372,18 @@ fn add_column_foreign_key(
     constraint: &ast::NamedColumnConstraint,
     supports_namespaces: bool,
 ) -> Result<()> {
-    let ast::ColumnConstraint::ForeignKey {
-        clause,
-        defer_clause,
-    } = &constraint.constraint
-    else {
-        unreachable!("add_column_foreign_key called with a constraint that is not REFERENCES");
-    };
-    if clause.columns.len() > 1 {
-        return Err(LimboError::ParseError(format!(
-            "foreign key on {column_name} should reference only one column of table {}",
-            clause.tbl_name.as_str()
-        )));
-    }
     let decl_order = table
         .foreign_keys
         .iter()
         .map(|fk| fk.decl_order)
         .max()
         .map_or(0, |order| order + 1);
-    let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
-    let (parent_namespace, parent_table) =
-        demangle_name(supports_namespaces, &mangled_parent_table);
-    let find_action = |on_delete: bool| {
-        clause
-            .args
-            .iter()
-            .find_map(|arg| match arg {
-                ast::RefArg::OnDelete(act) if on_delete => Some(*act),
-                ast::RefArg::OnUpdate(act) if !on_delete => Some(*act),
-                _ => None,
-            })
-            .unwrap_or(ast::RefAct::NoAction)
-    };
-    let fk = ForeignKey {
-        constraint_name: constraint
-            .name
-            .as_ref()
-            .map(|n| normalize_ident(n.as_str())),
-        parent_table: parent_table.to_string(),
-        parent_namespace,
-        parent_columns: clause
-            .columns
-            .iter()
-            .map(|c| normalize_ident(c.col_name.as_str()))
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-        on_delete: find_action(true),
-        on_update: find_action(false),
-        child_columns: Box::from([column_name.to_string()]),
-        deferred: defer_clause.as_ref().is_some_and(|d| {
-            d.deferrable
-                && matches!(
-                    d.init_deferred,
-                    Some(ast::InitDeferredPred::InitiallyDeferred)
-                )
-        }),
+    let fk = ForeignKey::from_column_constraint(
+        column_name,
+        constraint,
         decl_order,
-    };
+        supports_namespaces,
+    )?;
     table.foreign_keys.push(Arc::new(fk));
     Ok(())
 }

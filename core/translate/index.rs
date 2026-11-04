@@ -226,8 +226,9 @@ pub fn translate_create_index(
     // Block CREATE INDEX on STRUCT/UNION columns, on types that can't be sorted
     // and on lossy types
     for col in &columns {
-        if col.expr.is_none() {
-            // Simple column reference (not expression index)
+        // A table column, including a virtual generated column. `col.expr` also
+        // holds a virtual generated column's expression, so it cannot tell.
+        if col.expression().is_none() {
             if let Some(column) = tbl.columns().get(col.pos_in_table) {
                 if let Some(type_def) = resolver
                     .schema()
