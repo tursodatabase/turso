@@ -12,7 +12,7 @@ use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
-use crate::translate::expr::{check_custom_types, walk_expr, WalkControl};
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
     affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
     fire_fk_update_actions, ParentKeyNewProbeMode,
@@ -671,9 +671,6 @@ pub fn emit_upsert(
             decoded_column_types.as_deref(),
             &layout,
         )?;
-        // Binding left the column names for this rewrite, so the check runs
-        // now that they are registers of known types.
-        check_custom_types(pred, None, resolver)?;
         let pr = program.alloc_register();
         translate_expr(program, None, pred, pr, resolver)?;
         program.emit_insn(Insn::IfNot {
@@ -699,7 +696,6 @@ pub fn emit_upsert(
             decoded_column_types.as_deref(),
             &layout,
         )?;
-        check_custom_types(expr, None, resolver)?;
         if *col_idx == ROWID_SENTINEL {
             let r = program.alloc_register();
             translate_expr_no_constant_opt(
