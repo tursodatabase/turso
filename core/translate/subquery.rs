@@ -33,6 +33,7 @@ use crate::{
             check_custom_types, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
             WalkControl,
         },
+        insert::expr_contains_subquery,
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
@@ -655,7 +656,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
             shared,
         );
         for expr in exprs {
-            let has_subquery = custom_types_enabled && contains_subquery(expr)?;
+            let has_subquery = custom_types_enabled && expr_contains_subquery(expr);
             walk_expr_mut(expr, &mut subquery_parser)?;
             if has_subquery {
                 let expr: &ast::Expr = expr;
@@ -670,22 +671,6 @@ fn plan_subqueries_with_outer_query_access<'a>(
         check_custom_types(expr, Some(referenced_tables), resolver)?;
     }
     Ok(())
-}
-
-fn contains_subquery(expr: &ast::Expr) -> Result<bool> {
-    let mut found = false;
-    walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-        found |= matches!(
-            expr,
-            ast::Expr::Subquery(_) | ast::Expr::InSelect { .. } | ast::Expr::Exists(_)
-        );
-        Ok(if found {
-            WalkControl::SkipChildren
-        } else {
-            WalkControl::Continue
-        })
-    })?;
-    Ok(found)
 }
 
 /// Most subqueries can reference columns from the outer query,
