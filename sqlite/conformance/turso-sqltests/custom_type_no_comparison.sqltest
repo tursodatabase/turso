@@ -249,6 +249,15 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test no-comparison-json-index-on-expression {
+    CREATE TABLE t(j json) STRICT;
+    CREATE INDEX t_j ON t((j -> 'a'));
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
 test no-comparison-json-foreign-key-child {
     CREATE TABLE p(k text PRIMARY KEY) STRICT;
     CREATE TABLE c(j json REFERENCES p(k)) STRICT;
@@ -340,6 +349,26 @@ test no-comparison-array-concat {
     CREATE TABLE n(a inet, b inet) STRICT;
     INSERT INTO n VALUES ('::1', '0:0:0:0:0:0:0:1');
     SELECT array_position(ARRAY[1] || a, b) FROM n;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-position-of-value {
+    CREATE TABLE n(a inet) STRICT;
+    INSERT INTO n VALUES ('::1');
+    SELECT array_position(ARRAY['0:0:0:0:0:0:0:1'], a) FROM n;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-contains-value {
+    CREATE TABLE n(a inet) STRICT;
+    INSERT INTO n VALUES ('::1');
+    SELECT array_contains(ARRAY['0:0:0:0:0:0:0:1'], a) FROM n;
 }
 expect error {
     arrays of type inet are not supported, because values of type inet cannot be compared

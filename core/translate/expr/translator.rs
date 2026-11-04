@@ -1224,6 +1224,14 @@ fn translate_function_call_expr(
             }
         },
         Func::Scalar(srf) => {
+            if srf.is_array_function() {
+                let context = ExprContext::new(referenced_tables, resolver);
+                check_array_arguments(
+                    args.iter().map(|arg| arg.as_ref()),
+                    &context.type_env(),
+                    resolver.schema(),
+                )?;
+            }
             match srf {
                 ScalarFunc::Cast => {
                     unreachable!("this is always ast::Expr::Cast")
@@ -1231,13 +1239,6 @@ fn translate_function_call_expr(
                 // Arity and custom-types checks are done at bind time
                 // in validate_custom_type_function_call.
                 ScalarFunc::Array => {
-                    let context = ExprContext::new(referenced_tables, resolver);
-                    for arg in args {
-                        check_array_element_compares(
-                            &type_of(arg, &context.type_env()),
-                            resolver.schema(),
-                        )?;
-                    }
                     translate_variadic_insn!(
                         program,
                         referenced_tables,
@@ -1995,24 +1996,10 @@ fn translate_function_call_expr(
                     target_register,
                     func_ctx,
                 ),
-                ScalarFunc::ArrayAppend | ScalarFunc::ArrayPrepend | ScalarFunc::ArrayCat => {
-                    let context = ExprContext::new(referenced_tables, resolver);
-                    for arg in args {
-                        check_array_element_compares(
-                            &type_of(arg, &context.type_env()),
-                            resolver.schema(),
-                        )?;
-                    }
-                    translate_function(
-                        program,
-                        args,
-                        referenced_tables,
-                        resolver,
-                        target_register,
-                        func_ctx,
-                    )
-                }
-                ScalarFunc::ArrayLength
+                ScalarFunc::ArrayAppend
+                | ScalarFunc::ArrayPrepend
+                | ScalarFunc::ArrayCat
+                | ScalarFunc::ArrayLength
                 | ScalarFunc::ArrayRemove
                 | ScalarFunc::ArrayContains
                 | ScalarFunc::ArrayPosition

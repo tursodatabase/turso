@@ -699,7 +699,7 @@ pub(super) fn emit_binary_insn(
             if is_array(lhs_expr, referenced_tables, resolver)
                 || is_array(rhs_expr, referenced_tables, resolver)
             {
-                check_array_concat_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
+                check_array_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
                     rhs,
@@ -715,6 +715,7 @@ pub(super) fn emit_binary_insn(
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
             resolver.require_custom_types("Array features")?;
+            check_array_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
@@ -1006,7 +1007,7 @@ pub(super) fn emit_binary_condition_insn(
             if is_array(lhs_expr, referenced_tables, resolver)
                 || is_array(rhs_expr, referenced_tables, resolver)
             {
-                check_array_concat_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
+                check_array_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
                     rhs,
@@ -1023,6 +1024,7 @@ pub(super) fn emit_binary_condition_insn(
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
             resolver.require_custom_types("Array features")?;
+            check_array_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
@@ -1051,17 +1053,12 @@ fn is_array(expr: &Expr, referenced_tables: Option<&TableReferences>, resolver: 
     type_of(expr, &TypeEnv::new(referenced_tables, resolver)).is_array()
 }
 
-/// `||` on an array appends or prepends the other operand, so both operands
-/// must be values an array may hold.
-fn check_array_concat_operands(
+fn check_array_operands(
     lhs: &Expr,
     rhs: &Expr,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
 ) -> Result<()> {
     let env = TypeEnv::new(referenced_tables, resolver);
-    for operand in [lhs, rhs] {
-        check_array_element_compares(&type_of(operand, &env), resolver.schema())?;
-    }
-    Ok(())
+    check_array_arguments([lhs, rhs], &env, resolver.schema())
 }

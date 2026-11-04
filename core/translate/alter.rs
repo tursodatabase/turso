@@ -30,7 +30,7 @@ use crate::{
             emit_stored_column, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
             NoConstantOptReason, WalkControl,
         },
-        index::expression_type_ordering,
+        index::{check_index_expression_has_comparison, expression_type_ordering},
         plan::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
             TableReferences,
@@ -2483,6 +2483,7 @@ fn reject_change_of_indexed_column_order(
                     .expect("expression index column must have an expression");
                 let mut renamed = expr.as_ref().clone();
                 rename_identifiers(&mut renamed, column_name, new_column_name);
+                check_index_expression_has_comparison(&renamed, rewritten_table, schema, syms)?;
                 expression_type_ordering(expr, original_table, schema, syms)?
                     != expression_type_ordering(&renamed, rewritten_table, schema, syms)?
             } else {

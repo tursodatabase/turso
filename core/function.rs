@@ -1458,6 +1458,27 @@ impl Display for ScalarFunc {
 }
 
 impl ScalarFunc {
+    pub fn is_array_function(&self) -> bool {
+        matches!(
+            self,
+            Self::Array
+                | Self::ArrayElement
+                | Self::ArraySetElement
+                | Self::ArrayLength
+                | Self::ArrayAppend
+                | Self::ArrayPrepend
+                | Self::ArrayCat
+                | Self::ArrayRemove
+                | Self::ArrayContains
+                | Self::ArrayPosition
+                | Self::ArraySlice
+                | Self::StringToArray
+                | Self::ArrayToString
+                | Self::ArrayOverlap
+                | Self::ArrayContainsAll
+        )
+    }
+
     /// Returns true for internal functions that should not appear in PRAGMA function_list.
     pub fn is_internal(&self) -> bool {
         matches!(

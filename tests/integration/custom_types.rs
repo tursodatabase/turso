@@ -1055,6 +1055,7 @@ mod tests {
         "SELECT count(*) FROM t a LEFT JOIN t b ON a.c = b.d",
         "CREATE INDEX i{n} ON t(c)",
         "CREATE INDEX i{n} ON t((c))",
+        "CREATE INDEX i{n} ON t((coalesce(c, d)))",
         "CREATE INDEX i{n} ON t(id) WHERE c = d",
         "CREATE TABLE u{n}(k {ty} PRIMARY KEY) STRICT",
         "CREATE TABLE u{n}(k {ty} UNIQUE) STRICT",
@@ -1067,6 +1068,12 @@ mod tests {
         "SELECT array_prepend(c, NULL) FROM t",
         "SELECT ARRAY[1] || c FROM t",
         "SELECT c || ARRAY[1] FROM t",
+        "SELECT array_position(ARRAY[1], c) FROM t",
+        "SELECT array_contains(ARRAY[1], c) FROM t",
+        "SELECT array_remove(ARRAY[1], c) FROM t",
+        "SELECT array_set_element(ARRAY[1], 1, c) FROM t",
+        "SELECT ARRAY[1] @> c FROM t",
+        "SELECT c && ARRAY[1] FROM t",
         "CREATE TABLE u{n}(k {ty}[]) STRICT",
     ];
 
@@ -1131,6 +1138,35 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// CREATE INDEX refuses an index on a json expression, but a database that
+    /// already has one, made by an earlier version, must still open.
+    #[test]
+    fn test_open_file_with_index_on_json_expression() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("json_expression_index.db");
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch(
+                "CREATE TABLE t(j TEXT);
+                 CREATE INDEX x ON t(j);
+                 PRAGMA writable_schema = ON;
+                 UPDATE sqlite_schema SET sql = 'CREATE TABLE t(j json) STRICT'
+                  WHERE name = 't';
+                 UPDATE sqlite_schema SET sql = 'CREATE INDEX x ON t((j -> ''x''))'
+                  WHERE name = 'x';",
+            )
+            .unwrap();
+        drop(sqlite);
+
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.execute(r#"INSERT INTO t VALUES ('{"x":1}')"#).unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT j FROM t");
+        assert_eq!(rows, vec![(r#"{"x":1}"#.to_string(),)]);
+        conn.execute("DROP INDEX x").unwrap();
     }
 
     fn database_with_table_of_type(ty: &str) -> (TempDatabase, Arc<turso_core::Connection>) {

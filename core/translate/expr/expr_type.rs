@@ -624,11 +624,24 @@ pub(crate) fn type_without_comparison<'a>(
     }
 }
 
-/// Fails when `element`, put into an array by `ARRAY[...]`, array_agg,
-/// array_append, array_prepend, array_cat or `||`, has a type whose values
-/// can't be compared. Array functions such as array_position and `@>` compare
-/// elements without asking how their type compares, and an array built from
-/// untyped arguments has no element type for `=` to check.
+/// Fails when an argument of an array function or of `||`, `@>` or `&&` on
+/// arrays has a type whose values can't be compared. These put their arguments
+/// into arrays or compare them with array elements.
+pub(crate) fn check_array_arguments<'a>(
+    args: impl IntoIterator<Item = &'a ast::Expr>,
+    env: &TypeEnv,
+    schema: &Schema,
+) -> Result<()> {
+    for arg in args {
+        check_array_element_compares(&type_of(arg, env), schema)?;
+    }
+    Ok(())
+}
+
+/// Fails when `element`, put into an array, has a type whose values can't be
+/// compared. Array functions such as array_position and `@>` compare elements
+/// without asking how their type compares, and an array built from untyped
+/// arguments has no element type for `=` to check.
 pub(crate) fn check_array_element_compares(element: &ExprType, schema: &Schema) -> Result<()> {
     match type_without_comparison(element, schema) {
         Some(type_def) => schema.check_array_element_type(&type_def.name),
