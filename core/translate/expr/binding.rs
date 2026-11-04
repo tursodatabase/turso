@@ -603,29 +603,27 @@ pub fn bind_and_rewrite_expr<'a>(
             Ok(WalkControl::Continue)
         },
     )?;
-    check_collate_operands(top_level_expr, referenced_tables.as_deref(), resolver)
+    check_collations(top_level_expr, referenced_tables.as_deref(), resolver)
 }
 
-/// Fails when the operand of a COLLATE operator in `expr` has a type that
-/// takes no COLLATE. This runs on every expression a statement binds, so it
-/// also catches a COLLATE the planner never compiles, as in
-/// `WHERE 0 AND d COLLATE nocase = 'x'`. Its operand is bound only once the
+/// Fails when `expr` applies a COLLATE to a type that takes none, or compares
+/// two types with different orders. This runs on every expression a statement
+/// binds, so it also catches what the planner never compiles, as in
+/// `WHERE 0 AND d COLLATE nocase = 'x'`. The operands are bound only once the
 /// walk is done, so this is a second walk.
-fn check_collate_operands(
+fn check_collations(
     expr: &ast::Expr,
     tables: Option<&TableReferences>,
     resolver: &Resolver<'_>,
 ) -> Result<()> {
-    // Only custom types and arrays refuse a COLLATE, and both need a type
-    // registry.
+    // Only custom types and arrays refuse a COLLATE or a comparison, and both
+    // need a type registry.
     if resolver.schema().type_registry.is_empty() {
         return Ok(());
     }
     let context = ExprContext::new(tables, resolver);
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
-        if let Expr::Collate(operand, _) = expr {
-            check_collate_operand(operand, &context)?;
-        }
+        check_expr_collation(expr, &context)?;
         Ok(WalkControl::Continue)
     })?;
     Ok(())

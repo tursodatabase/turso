@@ -5,7 +5,8 @@ use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
 use super::collate::{
-    check_collate_operand, comparison_collation, first_collation, in_list_collation, CollationSeq,
+    check_collate_operand, check_expr_collation, comparison_collation, first_collation,
+    in_list_collation, CollationSeq,
 };
 use super::emitter::Resolver;
 use super::expr_context::{ExprContext, ExprProperties};

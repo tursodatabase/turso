@@ -763,6 +763,67 @@ pub(crate) fn check_collate_operand(operand: &Expr, context: &ExprContext<'_, '_
     common_ordering_of([(operand, context)], true).map(|_| ())
 }
 
+/// Fails when `expr` itself, not counting its operands, applies a COLLATE to
+/// a type that takes none or compares two types with different orders. These
+/// are the errors that compiling `expr` would give, found by the same
+/// checks, so that `WHERE 0 AND d = 'x' COLLATE nocase` fails like
+/// `WHERE d = 'x' COLLATE nocase` for a date d.
+pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    match expr {
+        Expr::Collate(operand, _) => check_collate_operand(operand, context),
+        Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, context),
+        // Compiled as `lhs >= start AND lhs <= end`.
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            check_comparison(lhs, start, context)?;
+            check_comparison(lhs, end, context)
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            let operands =
+                std::iter::once(lhs.as_ref()).chain(rhs.iter().map(|item| item.as_ref()));
+            common_type_ordering(operands.map(|expr| (expr, context)))?;
+            Ok(())
+        }
+        // Compiled as `base = when` for each WHEN.
+        Expr::Case {
+            base: Some(base),
+            when_then_pairs,
+            ..
+        } => when_then_pairs
+            .iter()
+            .try_for_each(|(when, _)| check_comparison(base, when, context)),
+        Expr::FunctionCall { name, args, .. } => {
+            let func = context
+                .catalog()
+                .resolve_function(name.as_str(), args.len())?;
+            if func.is_some_and(|func| func.needs_collation()) {
+                common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The check of [check_expr_collation] for `lhs` compared with `rhs`. Row
+/// values compare element by element, each pair with its own collation.
+fn check_comparison(lhs: &Expr, rhs: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    match (lhs, rhs) {
+        (Expr::Parenthesized(lhs), Expr::Parenthesized(rhs))
+            if lhs.len() > 1 && lhs.len() == rhs.len() =>
+        {
+            lhs.iter()
+                .zip(rhs)
+                .try_for_each(|(lhs, rhs)| check_comparison(lhs, rhs, context))
+        }
+        _ => {
+            common_type_ordering([(lhs, context), (rhs, context)])?;
+            Ok(())
+        }
+    }
+}
+
 /// Fails when values of `ty` take no COLLATE. As in PostgreSQL, only text
 /// types take one: `date`, `uuid` and a type with an integer base don't,
 /// `varchar` and a type with a text base do. No array takes one, because

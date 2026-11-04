@@ -737,6 +737,71 @@ expect error {
     collations are not supported by type date
 }
 
+# A comparison that would apply a COLLATE to a date is refused even where the
+# query never evaluates it, wherever the COLLATE is written.
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-compared-value {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND d = 'x' COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-in-between {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND d BETWEEN 'a' COLLATE NOCASE AND 'z';
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-in-in-list {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND d IN ('x' COLLATE NOCASE);
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-in-case-when {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND CASE d WHEN 'x' COLLATE NOCASE THEN 1 END;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-in-max {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND max(d, 'x' COLLATE NOCASE) IS NULL;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-in-row-value {
+    CREATE TABLE t(d date) STRICT;
+    SELECT 1 FROM t WHERE 0 AND (d, 1) = ('x' COLLATE NOCASE, 1);
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-numeric-compared-with-array {
+    CREATE TABLE t(n numeric(10, 2), a integer[]) STRICT;
+    SELECT 1 FROM t WHERE 0 AND n = a;
+}
+expect error {
+    cannot compare type numeric with type integer\[\]
+}
+
 @requires strict "uses STRICT tables"
 test create-table-rejects-collate-on-date-column {
     CREATE TABLE t(d date COLLATE NOCASE) STRICT;
