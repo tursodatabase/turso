@@ -387,10 +387,13 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             op: ast::LikeOperator::Match,
             ..
         } => ExprType::Unknown,
+        // RAISE stops the statement and gives no value, so like NULL it adds no
+        // kind to a CASE or coalesce: `coalesce(CAST(value AS integer),
+        // RAISE(ABORT, 'bad'))` is an integer.
+        ast::Expr::Raise(..) => ExprType::Null,
         // Expressions whose value is never a custom-type value. SQLite's affinity
         // gives their built-in type.
         ast::Expr::FunctionCallStar { .. }
-        | ast::Expr::Raise(..)
         // `CAST(x AS)`, a SQLite cast with no type name.
         | ast::Expr::Cast {
             type_name: None, ..
@@ -828,7 +831,11 @@ fn binary_type(
             }
             ExprType::Builtin(BuiltinType::Text)
         }
-        Operator::ArrowRight | Operator::ArrowRightShift => affinity_type(expr, env),
+        // `->` gives the JSON text of what it extracts, or NULL (SQLite's
+        // json.c registers it with JSON_JSON, "Result is always JSON").
+        Operator::ArrowRight => ExprType::Builtin(BuiltinType::Text),
+        // `->>` gives the SQL value it extracts, whose kind varies.
+        Operator::ArrowRightShift => affinity_type(expr, env),
     }
 }
 

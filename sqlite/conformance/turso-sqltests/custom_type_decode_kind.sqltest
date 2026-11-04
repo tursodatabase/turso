@@ -99,6 +99,40 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test decode-kind-raise-adds-no-kind {
+    -- RAISE gives no value, so the coalesce reads as an integer: 10 > 9,
+    -- although the text '10' < '9'.
+    CREATE TYPE s(value any) BASE text ENCODE value DECODE coalesce(CAST(value AS integer), RAISE(ABORT, 'bad'));
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c s) STRICT;
+    INSERT INTO t VALUES (1, '10'), (2, '9');
+    SELECT id, typeof(c) FROM t WHERE c > 9;
+}
+expect {
+    1|integer
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-json-arrow-is-text {
+    -- `->` always gives JSON text, so c compares as text: '10' < '9'.
+    CREATE TYPE j(value any) BASE text ENCODE value DECODE value -> '$.a';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c j) STRICT;
+    INSERT INTO t VALUES (1, '{"a":10}'), (2, '{"a":9}');
+    SELECT id, typeof(c), c FROM t WHERE c < 9;
+}
+expect {
+    1|text|10
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-refuses-json-double-arrow {
+    -- `->>` gives the SQL value it extracts, whose kind varies.
+    CREATE TYPE j(value any) BASE text ENCODE value DECODE value ->> '$.a';
+}
+expect error {
+    cannot tell what kind of value DECODE of type j returns
+}
+
+@requires strict "uses STRICT tables"
 test decode-kind-nested-type-and-domain {
     -- A DECODE that casts to another custom type, or to a domain, reads as
     -- that type's kind.

@@ -209,8 +209,7 @@ impl RegisterColumn {
     pub fn decoded_table_column(column: &Column, is_strict: bool, schema: &Schema) -> Self {
         Self {
             affinity: column.comparison_affinity(),
-            collation: crate::translate::collate::column_collation(column),
-            column_type: column_type(column, is_strict, schema),
+            ..Self::table_column(column, is_strict, schema)
         }
     }
 
