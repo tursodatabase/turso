@@ -1358,7 +1358,7 @@ impl Value {
     pub fn exec_like(pattern: &str, text: &str, escape: Option<char>) -> Result<bool, LimboError> {
         const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
         if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
-            return Err(LimboError::Constraint(
+            return Err(LimboError::SqlError(
                 "LIKE or GLOB pattern too complex".to_string(),
             ));
         }
@@ -1412,8 +1412,8 @@ impl Value {
         const GLOB_CHARS: [char; 3] = ['*', '?', '['];
 
         if pattern.len() > MAX_GLOB_PATTERN_LENGTH {
-            return Err(LimboError::Constraint(
-                "GLOB pattern too complex".to_string(),
+            return Err(LimboError::SqlError(
+                "LIKE or GLOB pattern too complex".to_string(),
             ));
         }
         let pattern = sqlite_text_prefix(pattern);
