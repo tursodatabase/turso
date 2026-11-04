@@ -8211,6 +8211,8 @@ impl Column {
     pub fn comparison_affinity(&self) -> Affinity {
         match self.value_affinity {
             Some(affinity) => affinity,
+            // #11380: also reached by a column whose custom type was never
+            // resolved, which this can't tell from a column without one.
             None => self.affinity(),
         }
     }
