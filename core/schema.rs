@@ -456,6 +456,12 @@ pub struct TypeDef {
     pub not_null: bool,
     /// Whether this is a domain (CREATE DOMAIN) vs a custom type (CREATE TYPE).
     pub is_domain: bool,
+    /// The types the offset of a RANGE frame over values of the type may have,
+    /// as PostgreSQL's `in_range` functions list them: `RANGE BETWEEN 1
+    /// PRECEDING` over a bigint has an integer offset. Empty when the type
+    /// takes no offsets. None for a domain, which takes the offsets of the
+    /// type it is based on.
+    pub range_offset_types: Option<&'static [&'static str]>,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -667,6 +673,7 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    range_offset_types: Some(&[]),
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Custom {
@@ -699,6 +706,7 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    range_offset_types: Some(&[]),
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -731,6 +739,7 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    range_offset_types: Some(&[]),
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -759,6 +768,7 @@ impl TypeDef {
             is_builtin: false,
             not_null,
             is_domain: true,
+            range_offset_types: None,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
@@ -1187,16 +1197,22 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
 
-    let type_sqls: &[&str] = &[
+    // The types a RANGE offset over values of the type may have. Only number
+    // types take one: in PostgreSQL date, time and timestamp take an interval,
+    // which Turso does not have.
+    const NO_OFFSETS: &[&str] = &[];
+    const INTEGER_OFFSETS: &[&str] = &["integer", "smallint", "bigint"];
+    const NUMERIC_OFFSETS: &[&str] = &["integer", "smallint", "bigint", "numeric"];
+    let types: &[(&[&str], &str)] = &[
         #[cfg(feature = "uuid")]
-        "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'",
-        "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+        (NO_OFFSETS, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
+        (NO_OFFSETS, "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'"),
         #[cfg(feature = "json")]
-        "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
+        (NO_OFFSETS, "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value"),
         #[cfg(feature = "json")]
-        "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
+        (NO_OFFSETS, "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)"),
+        (NO_OFFSETS, "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'"),
+        (NO_OFFSETS, "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'"),
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -1205,20 +1221,20 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         // the fraction outright, silently dropping precision on insert.
         // Caveat: Turso's `%f` directive is millisecond resolution, so PG's
         // microsecond inputs are clamped to 3 digits (`.123456` -> `.123`).
-        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'",
-        "CREATE TYPE bigint(value integer) BASE integer",
-        "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
-        "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
-        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)",
+        (NO_OFFSETS, "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_OFFSETS, "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_OFFSETS, "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (INTEGER_OFFSETS, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
+        (INTEGER_OFFSETS, "CREATE TYPE bigint(value integer) BASE integer"),
+        (NO_OFFSETS, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
+        (NO_OFFSETS, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
+        (NO_OFFSETS, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
+        (NO_OFFSETS, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
+        (NO_OFFSETS, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
+        (NUMERIC_OFFSETS, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
     ];
 
-    for sql in type_sqls {
+    for &(range_offset_types, sql) in types {
         let mut parser = Parser::new(sql.as_bytes());
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
@@ -1229,7 +1245,8 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
             )));
         };
 
-        let type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string())?;
+        let mut type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string())?;
+        type_def.range_offset_types = Some(range_offset_types);
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
@@ -1911,6 +1928,23 @@ impl Schema {
                 LimboError::InternalError(format!("domain {} is not registered", type_def.name))
             })?;
         Ok(resolved.base_type().cloned())
+    }
+
+    /// The type whose RANGE offsets values of `type_def` take, and the types
+    /// those offsets may have: `type_def` itself, or the type a domain is based
+    /// on. None for a domain over a plain SQLite type, which takes the offsets
+    /// SQLite does.
+    pub fn range_offset_types(
+        &self,
+        type_def: &Arc<TypeDef>,
+    ) -> Result<Option<(Arc<TypeDef>, &'static [&'static str])>> {
+        let Some(base) = self.without_domains(type_def)? else {
+            return Ok(None);
+        };
+        let offset_types = base
+            .range_offset_types
+            .expect("a type that is not a domain declares its RANGE offsets");
+        Ok(Some((base, offset_types)))
     }
 
     /// Returns whether a domain in the column's type chain has NOT NULL, and the

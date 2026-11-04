@@ -6,7 +6,7 @@ use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TranslateCtx};
-use crate::translate::expr::expr_type::{type_of, ExprType};
+use crate::translate::expr::expr_type::{type_of, BuiltinType, ExprType, TypeEnv};
 use crate::translate::expr::{
     custom_operator_call, emit_operator_call_on_registers,
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
@@ -30,6 +30,7 @@ use crate::vdbe::insn::{
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Connection;
 use crate::Result;
+use crate::Schema;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
@@ -2558,10 +2559,13 @@ fn emit_window_range_test(
     } else {
         (op, false)
     };
-    // The offset is added with the ORDER BY value's own `+` or `-`, chosen by
-    // the value's type as in any other arithmetic: numeric adds exactly, and
-    // a date moves by days. None means SQLite's operator runs.
     let offset_expr = frame_offset_expr(&window.frame, offset_bound);
+    let context = ExprContext::new(Some(&plan.table_references), resolver);
+    let env = context.type_env();
+    check_range_offset_type(order_expr, offset_expr, &env)?;
+    // The offset is added with the ORDER BY value's own `+` or `-`, chosen by
+    // the value's type as in any other arithmetic: numeric adds exactly.
+    // None means SQLite's operator runs.
     let operator = if subtract {
         turso_parser::ast::Operator::Subtract
     } else {
@@ -2572,20 +2576,8 @@ fn emit_window_range_test(
         operator,
         Box::new(offset_expr.clone()),
     );
-    let context = ExprContext::new(Some(&plan.table_references), resolver);
-    let env = context.type_env();
     let type_arithmetic = custom_operator_call(&arithmetic, &env)?;
-    // A type with its own order but no `+` or `-` has no distance to add. A
-    // NULL offset is rejected before any arithmetic, so it needs no call.
     let collation = context.expr_collation(order_expr)?;
-    if let CollationSeq::Type(ordering) = collation {
-        if type_arithmetic.is_none() && !matches!(type_of(offset_expr, &env), ExprType::Null) {
-            crate::bail_parse_error!(
-                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
-                ordering.name()
-            )
-        }
-    }
     let big_null = matches!(
         (sort_order, nulls_order),
         (SortOrder::Asc, Some(turso_parser::ast::NullsOrder::Last))
@@ -2688,6 +2680,94 @@ fn emit_window_range_test(
     );
     program.preassign_label_to_next_insn(label_done);
     Ok(())
+}
+
+/// Fails unless a RANGE frame ordered by `order_expr` may have the offset
+/// `offset`. A custom type takes offsets of the types it declares, as
+/// PostgreSQL's `in_range` functions do: `RANGE BETWEEN 1 PRECEDING` works
+/// over a bigint, but not over a date, a uuid or a type made with CREATE TYPE.
+/// Arrays take none. SQLite's own types take any number, checked when the
+/// statement runs, as in SQLite, but not a value of a custom type: `x +
+/// CAST(1 AS numeric)` is a numeric, which doesn't compare with x's numbers.
+fn check_range_offset_type(order_expr: &Expr, offset: &Expr, env: &TypeEnv) -> Result<()> {
+    let schema = env.schema();
+    let order_type = type_of(order_expr, env);
+    // The column type's name and the offset types it takes. None for SQLite's
+    // own types.
+    let column = match &order_type {
+        ExprType::Custom { type_def, .. } => schema
+            .range_offset_types(type_def)?
+            .map(|(base, offset_types)| (base.name.clone(), offset_types)),
+        ExprType::Array { .. } => Some((range_offset_type_name(&order_type, schema)?, &[][..])),
+        // The result of a custom type's operator that declares no result type.
+        ExprType::Unknown => Some(("unknown".to_string(), &[][..])),
+        _ => None,
+    };
+    if let Some((column_type, &[])) = &column {
+        crate::bail_parse_error!(
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {column_type}"
+        );
+    }
+    let offset_type = type_of(offset, env);
+    // A NULL offset fails when the statement runs, as any other NULL offset.
+    if matches!(offset_type, ExprType::Null) {
+        return Ok(());
+    }
+    match column {
+        Some((column_type, offset_types)) => {
+            let offset_type = range_offset_type_name(&offset_type, schema)?;
+            if !offset_types.contains(&offset_type.as_str()) {
+                crate::bail_parse_error!(
+                    "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
+                     {column_type} and offset type {offset_type}; cast the offset to {}",
+                    offset_types[0]
+                );
+            }
+        }
+        None if matches!(
+            offset_type,
+            ExprType::Custom { .. } | ExprType::Array { .. }
+        ) =>
+        {
+            let offset_type = range_offset_type_name(&offset_type, schema)?;
+            crate::bail_parse_error!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type \
+                 {offset_type} over a value without a custom type; cast the offset to integer \
+                 or real"
+            );
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+/// The name of `ty` in a RANGE offset error, as PostgreSQL would call it: a
+/// decimal written in the statement is a numeric, and a domain is named by
+/// the type it is based on. A value whose type isn't known before the
+/// statement runs, such as a parameter, is "unknown" and takes no offset.
+fn range_offset_type_name(ty: &ExprType, schema: &Schema) -> Result<String> {
+    Ok(match ty {
+        ExprType::Builtin(BuiltinType::Integer) => "integer".to_string(),
+        ExprType::Builtin(BuiltinType::Decimal) => "numeric".to_string(),
+        ExprType::Builtin(BuiltinType::Real) => "real".to_string(),
+        ExprType::Builtin(BuiltinType::Text) | ExprType::Untyped => "text".to_string(),
+        ExprType::Builtin(BuiltinType::Blob) => "blob".to_string(),
+        ExprType::Custom { type_def, .. } => match schema.without_domains(type_def)? {
+            Some(base) => base.name.clone(),
+            None => type_def.name.clone(),
+        },
+        ExprType::Array {
+            element,
+            dimensions,
+        } => format!(
+            "{}{}",
+            range_offset_type_name(element, schema)?,
+            "[]".repeat(*dimensions as usize)
+        ),
+        ExprType::Builtin(BuiltinType::Numeric | BuiltinType::Any)
+        | ExprType::Null
+        | ExprType::Unknown => "unknown".to_string(),
+    })
 }
 
 /// The `N` of the frame's `N PRECEDING` or `N FOLLOWING` bound.

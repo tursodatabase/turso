@@ -1582,3 +1582,35 @@ expect {
     1
     0
 }
+
+test window-range-offset-over-bigint-and-numeric {
+    CREATE TABLE range_offsets(b bigint, n numeric(10, 2));
+    INSERT INTO range_offsets VALUES (1, 1), (2, 2.5), (4, 4);
+    SELECT b, count(*) OVER (ORDER BY b RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM range_offsets ORDER BY b;
+    SELECT n, count(*) OVER (ORDER BY n RANGE BETWEEN CURRENT ROW AND 1.5 FOLLOWING) FROM range_offsets ORDER BY n;
+    DROP TABLE range_offsets;
+}
+expect {
+    1|1
+    2|2
+    4|1
+    1.00|2
+    2.50|2
+    4.00|1
+}
+
+test window-range-offset-over-date-is-an-error {
+    CREATE TABLE range_dates(d date);
+    SELECT count(*) OVER (ORDER BY d RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM range_dates;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type date
+}
+
+test window-range-decimal-offset-over-bigint-is-an-error {
+    CREATE TABLE range_bigints(b bigint);
+    SELECT count(*) OVER (ORDER BY b RANGE BETWEEN 1.5 PRECEDING AND CURRENT ROW) FROM range_bigints;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type bigint and offset type numeric
+}
