@@ -1079,7 +1079,7 @@ impl DeferredOperation {
                     }
                     FrontendStmt::RefreshMatview(_)
                     | FrontendStmt::CommentOn(_)
-                    | FrontendStmt::GrantOrRevoke => {
+                    | FrontendStmt::GrantSelect => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
@@ -1628,7 +1628,7 @@ fn try_prepare_special(
         | FrontendStmt::CopyFrom(_)
         | FrontendStmt::RefreshMatview(_)
         | FrontendStmt::CommentOn(_)
-        | FrontendStmt::GrantOrRevoke) => crate::Statement::with_deferred(
+        | FrontendStmt::GrantSelect) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
@@ -1693,8 +1693,8 @@ fn check_frontend_privileges(conn: &Connection, stmt: &FrontendStmt) -> Result<(
         | FrontendStmt::ResetAll
         | FrontendStmt::DiscardAll
         | FrontendStmt::CopyTo(_) => return Ok(()),
-        // Privileges are not stored yet, so GRANT and REVOKE change nothing.
-        FrontendStmt::GrantOrRevoke => return Ok(()),
+        // Every role may read every table until privileges are stored.
+        FrontendStmt::GrantSelect => return Ok(()),
         FrontendStmt::CreateSchema(_) => PermissionDenied::privilege(
             Action::Create,
             Object::Database(catalog::db_name_from_path(conn.db_file_path())),

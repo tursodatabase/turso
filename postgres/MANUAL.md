@@ -234,25 +234,27 @@ Only a superuser can drop policies.
 DROP POLICY own_documents ON documents;
 ```
 
-### `GRANT` and `REVOKE` — accepted but ignored
+### `GRANT SELECT` — let roles read tables
 
 **Synopsis:**
 
 ```sql
-GRANT privileges ON object TO role
-REVOKE privileges ON object FROM role
+GRANT SELECT ON [ TABLE ] table_name [, ...] TO role [, ...]
 ```
 
 **Description:**
 
-`GRANT` and `REVOKE` of privileges on tables and other objects are accepted
-and do nothing, so that scripts written for PostgreSQL run unchanged.
-Privileges are not checked yet: a role that is not a superuser may read and
-write the rows of every table that row-level security does not hide.
+`GRANT SELECT` on tables succeeds and stores nothing, because every role may
+already read every table, except the rows that row-level security hides. It is
+accepted so that scripts written for PostgreSQL run unchanged.
 
 **Notes:**
 
-Granting a role to another role is not supported.
+Privileges are not stored yet, so any other `GRANT`, and `REVOKE`, fail with
+an error instead of claiming to change what a role may do. This includes
+other privileges, column lists, `WITH GRANT OPTION`, `ON ALL TABLES IN
+SCHEMA`, and objects other than tables. Granting a role to another role is not
+supported.
 
 ### `SET ROLE` — set the current role
 
@@ -288,7 +290,8 @@ keeps the role, and `DISCARD ALL` resets it.
 
 **Notes:**
 
-Ownership and table privileges are not supported yet, and `GRANT` is ignored.
+Ownership and table privileges are not supported yet; only `GRANT SELECT` on
+tables is accepted.
 A role that is not a superuser may read the rows of every table, except the
 rows that row-level security hides, but it cannot insert, update, delete or
 truncate rows, call `nextval` or `setval`, create, alter or drop objects,

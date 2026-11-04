@@ -7021,12 +7021,38 @@ pub fn is_drop_matview(parse_result: &ParseResult) -> bool {
     )
 }
 
-/// Returns true if the parse result is a GRANT or REVOKE statement.
-fn is_grant_or_revoke(parse_result: &ParseResult) -> bool {
-    use pg_query::NodeRef;
+/// Returns true if the parse result is `GRANT SELECT ON <tables> TO <roles>`.
+/// Privileges are not stored, and every role may read every table and write
+/// none, so this is the only GRANT that is true without storing it. Any other
+/// GRANT or REVOKE is rejected rather than reported as done.
+fn is_grant_select(parse_result: &ParseResult) -> Result<bool, ParseError> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::{GrantTargetType, ObjectType};
 
     let nodes = parse_result.protobuf.nodes();
-    !nodes.is_empty() && matches!(&nodes[0].0, NodeRef::GrantStmt(_))
+    let Some((NodeRef::GrantStmt(grant), ..)) = nodes.first() else {
+        return Ok(false);
+    };
+    if !grant.is_grant {
+        return Err(not_supported("REVOKE"));
+    }
+    let only_select = !grant.privileges.is_empty()
+        && grant.privileges.iter().all(|privilege| {
+            matches!(
+                &privilege.node,
+                Some(Node::AccessPriv(privilege))
+                    if privilege.priv_name.eq_ignore_ascii_case("select")
+                        && privilege.cols.is_empty()
+            )
+        });
+    if grant.targtype != GrantTargetType::AclTargetObject as i32
+        || grant.objtype != ObjectType::ObjectTable as i32
+        || !only_select
+        || grant.grant_option
+    {
+        return Err(not_supported("GRANT other than GRANT SELECT ON a table"));
+    }
+    Ok(true)
 }
 
 /// A COMMENT ON statement. Comments are accepted for PostgreSQL
@@ -7268,8 +7294,8 @@ pub enum FrontendStmt {
     DropSchema(PgDropSchemaStmt),
     RefreshMatview(PgRefreshMatviewStmt),
     CommentOn(PgCommentOnStmt),
-    /// GRANT or REVOKE of privileges on objects, which are not checked yet.
-    GrantOrRevoke,
+    /// GRANT SELECT on tables, which every role has until privileges are stored.
+    GrantSelect,
     CopyFrom(PgCopyFromStmt),
     CopyTo(crate::copy::CopyToStdout),
 }
@@ -7307,8 +7333,8 @@ pub fn frontend_stmt(
     if let Some(stmt) = try_extract_comment_on(parse_result) {
         return Ok(Some(FrontendStmt::CommentOn(stmt)));
     }
-    if is_grant_or_revoke(parse_result) {
-        return Ok(Some(FrontendStmt::GrantOrRevoke));
+    if is_grant_select(parse_result)? {
+        return Ok(Some(FrontendStmt::GrantSelect));
     }
     if let Some(stmt) = try_extract_copy_from(parse_result)? {
         return Ok(Some(FrontendStmt::CopyFrom(stmt)));
@@ -8041,7 +8067,7 @@ mod tests {
                 FrontendStmt::DropSchema(_) => "drop schema",
                 FrontendStmt::RefreshMatview(_) => "refresh matview",
                 FrontendStmt::CommentOn(_) => "comment on",
-                FrontendStmt::GrantOrRevoke => "grant or revoke",
+                FrontendStmt::GrantSelect => "grant select",
                 FrontendStmt::CopyFrom(_) => "copy from",
                 FrontendStmt::CopyTo(_) => "copy to",
             })
@@ -8060,8 +8086,7 @@ mod tests {
             ("DROP SCHEMA app CASCADE", "drop schema"),
             ("REFRESH MATERIALIZED VIEW mv", "refresh matview"),
             ("COMMENT ON TABLE t IS 'x'", "comment on"),
-            ("GRANT SELECT ON t TO PUBLIC", "grant or revoke"),
-            ("REVOKE SELECT ON t FROM PUBLIC", "grant or revoke"),
+            ("GRANT SELECT ON t TO PUBLIC", "grant select"),
             ("COPY t FROM '/tmp/t.csv'", "copy from"),
             ("COPY t TO STDOUT", "copy to"),
         ] {
