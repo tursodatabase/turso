@@ -3,7 +3,7 @@ use std::{borrow::Borrow, cmp::Ordering, collections::HashMap, hash::Hasher, str
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, Literal, UnaryOperator};
+use turso_parser::ast::{Expr, Literal, Operator, UnaryOperator};
 
 use crate::{
     function::ExternalCollation,
@@ -510,6 +510,9 @@ pub fn comparison_collation_across_queries(
     rhs: &Expr,
     rhs_context: &ExprContext<'_, '_>,
 ) -> Result<CollationSeq> {
+    // Code generation for `c IS NULL` asks for a collation too. Any comparison
+    // with NULL has the same result under every collation. Binding refuses the
+    // ones PostgreSQL refuses, such as `j = NULL` (see [check_expr_collation]).
     if compares_null_with_value_without_comparison(lhs, lhs_context, rhs, rhs_context) {
         return Ok(CollationSeq::BINARY);
     }
@@ -780,6 +783,13 @@ pub(crate) fn check_collate_operand(operand: &Expr, context: &ExprContext<'_, '_
 pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
     match expr {
         Expr::Collate(operand, _) => check_collate_operand(operand, context),
+        // `j IS NULL` compares no values, so it works on every type, as in
+        // PostgreSQL. `j = NULL` is refused, as in PostgreSQL.
+        Expr::Binary(lhs, Operator::Is | Operator::IsNot, rhs)
+            if compares_null_with_value_without_comparison(lhs, context, rhs, context) =>
+        {
+            Ok(())
+        }
         Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, context),
         // Compiled as `lhs >= start AND lhs <= end`.
         Expr::Between {
@@ -860,16 +870,13 @@ fn check_comparison(lhs: &Expr, rhs: &Expr, context: &ExprContext<'_, '_>) -> Re
         }
         return Ok(());
     }
-    if compares_null_with_value_without_comparison(lhs, context, rhs, context) {
-        return Ok(());
-    }
     common_type_ordering([(lhs, context), (rhs, context)])?;
     Ok(())
 }
 
 /// Whether one operand of a comparison is the NULL literal and the other has
 /// a type whose values can't be compared. Such a comparison never compares two
-/// values, so it is allowed: `c IS NULL` is parsed as one.
+/// values: `c IS NULL` is parsed as one.
 fn compares_null_with_value_without_comparison(
     lhs: &Expr,
     lhs_context: &ExprContext<'_, '_>,
@@ -1157,7 +1164,7 @@ mod tests {
     use crate::namespace::NamespaceRef;
     use crate::{sync::Arc, MAIN_DB_ID};
 
-    use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
+    use turso_parser::ast::{Literal, Name, TableInternalId, UnaryOperator};
 
     use crate::{
         schema::{BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Table, Type},

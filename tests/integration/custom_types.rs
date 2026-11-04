@@ -1025,6 +1025,9 @@ mod tests {
         "SELECT c >= d FROM t",
         "SELECT c IS d FROM t",
         "SELECT c IS NOT d FROM t",
+        // PostgreSQL refuses these too: only IS NULL works on every type.
+        "SELECT c = NULL FROM t",
+        "SELECT c < NULL FROM t",
         "SELECT c BETWEEN d AND d FROM t",
         "SELECT c IN (d) FROM t",
         "SELECT c FROM t WHERE c IN (SELECT d FROM t)",
@@ -1087,7 +1090,6 @@ mod tests {
     const NOT_COMPARISONS: &[&str] = &[
         "SELECT c, d FROM t",
         "SELECT c IS NULL, c IS NOT NULL, c ISNULL, c NOTNULL, c NOT NULL FROM t",
-        "SELECT c = NULL FROM t",
         "SELECT * FROM (SELECT c FROM t)",
         "WITH w AS (SELECT c FROM t) SELECT c FROM w",
         "SELECT coalesce(c, d) FROM t",
