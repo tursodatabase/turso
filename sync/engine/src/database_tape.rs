@@ -956,7 +956,7 @@ fn quote_ident(name: &str) -> String {
 mod tests {
     use std::sync::Arc;
     use turso_core::ConnectOpts;
-    use turso_core::SqliteDialect;
+    use turso_sqlite::SqliteDialect;
 
     use tempfile::NamedTempFile;
 

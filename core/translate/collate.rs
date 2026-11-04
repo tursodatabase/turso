@@ -1588,7 +1588,7 @@ mod typed_value_order_tests {
     use crate::sync::Arc;
     use crate::vdbe::{builder::CursorType, insn::Insn};
     use crate::{
-        ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO,
+        ConnectOpts, Connection, Database, DatabaseOpts, EngineDialect, MemoryIO, OpenFlags, IO,
     };
 
     /// Each query, with the number of its instructions that compare values the
@@ -1730,7 +1730,7 @@ mod typed_value_order_tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_custom_types(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();

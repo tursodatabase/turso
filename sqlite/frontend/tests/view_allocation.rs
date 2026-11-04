@@ -1,4 +1,4 @@
-#![cfg(all(nightly, feature = "allocation_metric", feature = "fs"))]
+#![cfg(nightly)]
 #![feature(allocator_api)]
 
 use std::{cell::Cell, ptr::NonNull, sync::Arc};
@@ -6,9 +6,8 @@ use turso_core::alloc::{
     current_allocation_site, set_allocator, AllocError, AllocationSite, ApiAllocator, Global,
     Layout, SchemaAllocationSite, TursoAllocBackend,
 };
-use turso_core::{
-    Database, DatabaseOpts, LimboError, OpenOptions, PlatformIO, SqliteDialect, Value,
-};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, LimboError, OpenOptions, PlatformIO, Value};
+use turso_sqlite::SqliteDialect;
 
 thread_local! {
     static FAIL_VIEW_COLUMNS: Cell<bool> = const { Cell::new(false) };
@@ -62,7 +61,7 @@ fn view_column_allocation_failure_returns_out_of_memory() {
     assert!(matches!(result, Err(LimboError::OutOfMemory)));
 
     let db = Database::open(io.clone(), path.to_str().unwrap(), options.clone()).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     let mut stmt = conn.prepare("SELECT * FROM v").unwrap();
     assert_eq!(stmt.get_column_name(0), "second");
     assert_eq!(stmt.get_column_name(1), "first");
@@ -106,7 +105,7 @@ fn view_column_allocation_failure_returns_out_of_memory() {
     assert!(matches!(result, Err(LimboError::OutOfMemory)));
 
     let db = Database::open(io, path.to_str().unwrap(), options).unwrap();
-    let conn = db.connect().unwrap();
+    let conn = db.connect(ConnectOpts::new()).unwrap();
     let mut stmt = conn.prepare("SELECT * FROM mv").unwrap();
     assert_eq!(
         stmt.run_collect_rows().unwrap(),

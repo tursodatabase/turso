@@ -5,7 +5,7 @@ use std::{
         Arc, Mutex,
     },
 };
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use turso_core::{
     Buffer, Completion, ConnectOpts, DatabaseStorage, LimboError, OpenDbAsyncState, OpenFlags,
@@ -3267,7 +3267,7 @@ mod tests {
     };
     use tempfile::NamedTempFile;
     use turso_core::ConnectOpts;
-    use turso_core::SqliteDialect;
+    use turso_sqlite::SqliteDialect;
 
     #[test]
     fn sync_database_paths_include_core_sync_and_mvcc_files() {

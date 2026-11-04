@@ -637,6 +637,7 @@ fn simulation_integrity_check(env: &SimulatorEnv) -> anyhow::Result<()> {
 #[cfg(test)]
 mod integrity_tests {
     use super::*;
+    use turso_sqlite::SqliteDialect;
 
     #[test]
     fn wal_integrity_check_uses_exported_database() -> anyhow::Result<()> {
@@ -693,7 +694,7 @@ mod integrity_tests {
         let reopened = turso_core::Database::open_file(
             Arc::new(turso_core::PlatformIO::new()?),
             path.to_str().unwrap(),
-            Arc::new(turso_core::SqliteDialect),
+            Arc::new(SqliteDialect),
         )?
         .connect(turso_core::ConnectOpts::new())?;
         let rows = reopened

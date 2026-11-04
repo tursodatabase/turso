@@ -679,7 +679,8 @@ impl std::ops::Deref for Statement {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use turso_core::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO};
+    use turso_core::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+    use turso_sqlite::SqliteDialect;
 
     #[test]
     fn reset_reports_frontend_errors() {

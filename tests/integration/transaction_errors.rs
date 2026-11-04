@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use crate::common::{limbo_exec_rows, sqlite_exec_rows};
-use turso_core::{ConnectOpts, Database, SqliteDialect, IO};
+use turso_core::{ConnectOpts, Database, IO};
+use turso_sqlite::SqliteDialect;
 
 fn memory_database(mvcc: bool) -> Arc<Database> {
     let io = Arc::new(turso_core::MemoryIO::new()) as Arc<dyn IO>;

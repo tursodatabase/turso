@@ -6165,7 +6165,7 @@ pub mod test {
     };
     use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use crate::{
         io::FileSyncType,
         storage::{
@@ -6220,7 +6220,7 @@ pub mod test {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new().with_multiprocess_wal(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         // db + tmp directory
@@ -6524,7 +6524,7 @@ pub mod test {
         let db = Database::open_file(
             shared_wal_test_io(),
             path.to_str().unwrap(),
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let writer = db.connect(ConnectOpts::new()).unwrap();

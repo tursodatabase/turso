@@ -12485,7 +12485,7 @@ impl Clock for StatementClock<'_> {
     }
 }
 
-pub(crate) type OpAttachState = crate::dialect::sqlite::attach::AttachDatabaseState;
+pub(crate) type OpAttachState = crate::attach::AttachDatabaseState;
 
 /// LIKE with an operand that is not TEXT: both are converted to TEXT first.
 #[inline(never)]
@@ -19651,7 +19651,7 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
 
 // Compat for applications that test for SQLite.
 fn execute_sqlite_version() -> String {
-    crate::dialect::sqlite::SQLITE_VERSION.to_string()
+    crate::dialect::engine::SQLITE_VERSION.to_string()
 }
 
 fn execute_turso_version(version_integer: i64) -> String {
@@ -20744,7 +20744,7 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
 
     /// A weighted step must leave the same exact total as the weighted sum
@@ -20819,7 +20819,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -20880,7 +20880,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -20945,7 +20945,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -21007,7 +21007,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -21032,7 +21032,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -21077,7 +21077,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -21280,7 +21280,7 @@ mod tests {
     fn test_execute_sqlite_version() {
         assert_eq!(
             execute_sqlite_version(),
-            crate::dialect::sqlite::SQLITE_VERSION
+            crate::dialect::engine::SQLITE_VERSION
         );
     }
 
@@ -21748,7 +21748,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();

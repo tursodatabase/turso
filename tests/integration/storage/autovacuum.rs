@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::SqliteDialect;
 use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO};
+use turso_sqlite::SqliteDialect;
 
 #[test]
 fn test_autovacuum_readonly_behavior() {

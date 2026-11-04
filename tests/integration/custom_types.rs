@@ -4,6 +4,7 @@ mod tests {
     use asserting::prelude::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use turso_sqlite::SqliteDialect;
 
     #[test]
     fn test_uuid_invalid_update_and_upsert_preserve_rows() {
@@ -358,7 +359,7 @@ mod tests {
             turso_core::OpenFlags::default(),
             opts,
             None,
-            Arc::new(turso_core::SqliteDialect),
+            Arc::new(SqliteDialect),
         );
         let Err(err) = result else {
             panic!("open must fail when a stored type does not parse");
@@ -564,7 +565,7 @@ mod tests {
             let error = turso_core::Database::open_file(
                 io,
                 path.to_str().unwrap(),
-                Arc::new(turso_core::SqliteDialect),
+                Arc::new(SqliteDialect),
             )
             .and_then(|db| db.connect(turso_core::ConnectOpts::new()))
             .and_then(|conn| conn.execute("SELECT 1"))

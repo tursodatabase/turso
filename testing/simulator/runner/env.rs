@@ -6,7 +6,7 @@ use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use turso_core::ConnectOpts;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use bitmaps::Bitmap;
 use garde::Validate;
