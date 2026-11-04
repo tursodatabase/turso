@@ -12,8 +12,8 @@ use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextC
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     apply_binding_rewrites, bind_and_rewrite_expr, bind_and_rewrite_sort_key, bind_expr,
-    expr_vector_size, integer_literal_truth_value, walk_expr, walk_expr_mut, BindingBehavior,
-    WalkControl,
+    expr_vector_size, integer_literal_truth_value, reject_unknown_collation, walk_expr,
+    walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -893,6 +893,19 @@ fn prepare_one_select_plan(
             }
 
             if !windows.is_empty() {
+                // A window's PARTITION BY and ORDER BY keys sort rows, so
+                // SQLite looks their collation up on the key as written, as
+                // for ORDER BY (see bind_and_rewrite_sort_key). A named window
+                // got that when it was bound; one written in OVER gets it here.
+                for window in windows.iter() {
+                    let keys = window
+                        .partition_by
+                        .iter()
+                        .chain(window.order_by.iter().map(|(expr, _, _)| expr));
+                    for key in keys {
+                        reject_unknown_collation(key, resolver)?;
+                    }
+                }
                 plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
             }
 
