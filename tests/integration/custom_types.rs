@@ -1229,4 +1229,177 @@ mod tests {
             }
         }
     }
+
+    /// Arrays compare as in PostgreSQL's `array_cmp`: element by element, a
+    /// NULL element is greater than any other element and equal to another
+    /// NULL, and when one array is a prefix of the other the shorter is
+    /// smaller. Checks every pair of arrays of up to two elements, under every
+    /// comparison operator, in WHERE with and without an index, ORDER BY,
+    /// GROUP BY and DISTINCT, against that rule computed here.
+    #[test]
+    fn test_array_comparisons_sort_null_elements_last() {
+        /// An element: `None` is NULL, `Some(k)` is the k-th smallest value.
+        type Array = Vec<Option<usize>>;
+
+        fn expected_order(left: &Array, right: &Array) -> std::cmp::Ordering {
+            use std::cmp::Ordering;
+            for (l, r) in left.iter().zip(right) {
+                let order = match (l, r) {
+                    (None, None) => Ordering::Equal,
+                    (None, Some(_)) => Ordering::Greater,
+                    (Some(_), None) => Ordering::Less,
+                    (Some(l), Some(r)) => l.cmp(r),
+                };
+                if order.is_ne() {
+                    return order;
+                }
+            }
+            left.len().cmp(&right.len())
+        }
+
+        let element_types: [(&str, [&str; 2]); 3] = [
+            ("integer", ["1", "2"]),
+            ("real", ["1.5", "2.5"]),
+            ("text", ["'a'", "'b'"]),
+        ];
+        let symbols = [None, Some(0), Some(1)];
+        let mut arrays: Vec<Array> = vec![vec![]];
+        arrays.extend(symbols.iter().map(|&s| vec![s]));
+        arrays.extend(
+            symbols
+                .iter()
+                .flat_map(|&a| symbols.iter().map(move |&b| vec![a, b])),
+        );
+        let n = arrays.len() as i64;
+        let operators = [
+            ("=", std::cmp::Ordering::is_eq as fn(_) -> bool),
+            ("<>", std::cmp::Ordering::is_ne),
+            ("<", std::cmp::Ordering::is_lt),
+            ("<=", std::cmp::Ordering::is_le),
+            (">", std::cmp::Ordering::is_gt),
+            (">=", std::cmp::Ordering::is_ge),
+        ];
+
+        for mvcc in [false, true] {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::builder()
+                .with_opts(opts)
+                .with_mvcc(mvcc)
+                .build();
+            let conn = db.connect_limbo();
+
+            for (element_type, values) in element_types {
+                // `ARRAY[]` and `ARRAY[NULL]` have no element type to infer, so they
+                // get a CAST, and a CAST keeps the planner from seeking the index.
+                let untyped = |array: &Array| array.iter().all(Option::is_none);
+                let literal = |array: &Array| {
+                    let elements: Vec<&str> = array
+                        .iter()
+                        .map(|e| e.map_or("NULL", |k| values[k]))
+                        .collect();
+                    let literal = format!("ARRAY[{}]", elements.join(","));
+                    if untyped(array) {
+                        format!("CAST({literal} AS {element_type}[])")
+                    } else {
+                        literal
+                    }
+                };
+                let plain = format!("plain_{element_type}");
+                let indexed = format!("indexed_{element_type}");
+                for table in [&plain, &indexed] {
+                    conn.execute(format!(
+                        "CREATE TABLE {table}(id INTEGER PRIMARY KEY, a {element_type}[]) STRICT"
+                    ))
+                    .unwrap();
+                    // Each array twice, as rows i and i + n.
+                    for (i, array) in arrays.iter().enumerate() {
+                        for id in [i as i64, i as i64 + n] {
+                            conn.execute(format!(
+                                "INSERT INTO {table} VALUES ({id}, {})",
+                                literal(array)
+                            ))
+                            .unwrap();
+                        }
+                    }
+                }
+                conn.execute(format!("CREATE INDEX {indexed}_a ON {indexed}(a)"))
+                    .unwrap();
+                let array_of = |id: i64| &arrays[(id % n) as usize];
+                let context = format!("mvcc={mvcc}, {element_type}[]");
+
+                for (op, holds) in operators {
+                    let rows: Vec<(i64, i64, i64)> = conn.exec_rows(&format!(
+                        "SELECT l.id, r.id, l.a {op} r.a FROM {plain} l, {plain} r \
+                         WHERE l.id < {n} AND r.id < {n}"
+                    ));
+                    assert_eq!(rows.len(), arrays.len() * arrays.len(), "{context}");
+                    for (l, r, result) in rows {
+                        let (left, right) = (array_of(l), array_of(r));
+                        assert_eq!(
+                            result,
+                            holds(expected_order(left, right)) as i64,
+                            "{context}: {left:?} {op} {right:?}"
+                        );
+                    }
+
+                    for right in &arrays {
+                        let expected: Vec<(i64,)> = (0..2 * n)
+                            .filter(|&id| holds(expected_order(array_of(id), right)))
+                            .map(|id| (id,))
+                            .collect();
+                        for source in [plain.clone(), format!("{indexed} INDEXED BY {indexed}_a")] {
+                            let query = format!(
+                                "SELECT id FROM {source} WHERE a {op} {} ORDER BY id",
+                                literal(right)
+                            );
+                            if source != plain && op != "<>" && !untyped(right) {
+                                let plan: Vec<(i64, i64, i64, String)> =
+                                    conn.exec_rows(&format!("EXPLAIN QUERY PLAN {query}"));
+                                assert!(
+                                    plan.iter().any(|(.., detail)| detail.starts_with("SEARCH")),
+                                    "{context}: {query} does not seek the index: {plan:?}"
+                                );
+                            }
+                            let rows: Vec<(i64,)> = conn.exec_rows(&query);
+                            assert_eq!(rows, expected, "{context}: {query}");
+                        }
+                    }
+                }
+
+                for table in [&plain, &indexed] {
+                    for direction in ["ASC", "DESC"] {
+                        let ids: Vec<(i64,)> = conn
+                            .exec_rows(&format!("SELECT id FROM {table} ORDER BY a {direction}"));
+                        let sorted: Vec<&Array> = ids.iter().map(|&(id,)| array_of(id)).collect();
+                        assert_eq!(sorted.len(), 2 * arrays.len(), "{context}");
+                        for pair in sorted.windows(2) {
+                            let order = expected_order(pair[0], pair[1]);
+                            let in_order = match direction {
+                                "ASC" => order.is_le(),
+                                _ => order.is_ge(),
+                            };
+                            assert!(
+                                in_order,
+                                "{context}: {table} ORDER BY a {direction}: {sorted:?}"
+                            );
+                        }
+                    }
+
+                    let groups: Vec<(i64, i64, i64)> = conn.exec_rows(&format!(
+                        "SELECT min(id), max(id), count(*) FROM {table} GROUP BY a ORDER BY a"
+                    ));
+                    let mut expected: Vec<(i64, i64, i64)> =
+                        (0..n).map(|i| (i, i + n, 2)).collect();
+                    expected.sort_by(|l, r| expected_order(array_of(l.0), array_of(r.0)));
+                    assert_eq!(groups, expected, "{context}: {table} GROUP BY a");
+
+                    let distinct: Vec<(i64,)> = conn.exec_rows(&format!(
+                        "SELECT count(*) FROM (SELECT DISTINCT a FROM {table})"
+                    ));
+                    assert_eq!(distinct, vec![(n,)], "{context}: {table} DISTINCT a");
+                }
+            }
+            conn.close().unwrap();
+        }
+    }
 }

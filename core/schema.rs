@@ -5425,7 +5425,7 @@ impl BTreeTable {
                     && definition
                         .col_type
                         .as_ref()
-                        .is_some_and(|ty| is_rowid_alias_type(&ty.name)),
+                        .is_some_and(is_rowid_alias_type),
             );
         }
         Ok(column)
@@ -6815,7 +6815,7 @@ pub fn create_table(
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
                     Some(written_type) => {
-                        typename_exactly_integer = is_rowid_alias_type(&written_type.name);
+                        typename_exactly_integer = is_rowid_alias_type(written_type);
                         type_from_name(&ty_str).0
                     }
                     None => Type::Null,
@@ -7655,10 +7655,9 @@ impl Column {
             .unwrap_or_default();
 
         let (ty, typename_exactly_integer) = match value.col_type {
-            Some(ref written_type) => (
-                type_from_name(&ty_str).0,
-                is_rowid_alias_type(&written_type.name),
-            ),
+            Some(ref written_type) => {
+                (type_from_name(&ty_str).0, is_rowid_alias_type(written_type))
+            }
             None => (Type::Null, false),
         };
 

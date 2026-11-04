@@ -845,12 +845,15 @@ fn validate(
             } else if table.has_autoincrement {
                 // SQLite allows AUTOINCREMENT only on a key declared exactly as
                 // INTEGER PRIMARY KEY: quotes around INTEGER are allowed, a size
-                // such as INTEGER(8) and an inline DESC are not. This is checked
-                // here rather than in `create_table` so that databases where older
-                // Turso versions stored such tables still open.
+                // such as INTEGER(8), an array type such as INTEGER[] and an
+                // inline DESC are not. This is checked here rather than in
+                // `create_table` so that databases where older Turso versions
+                // stored such tables still open.
                 let (pk_name, pk_order) = &table.primary_key_columns[0];
                 let is_integer_primary_key = table.get_column(pk_name).is_some_and(|(_, col)| {
-                    col.ty_str.eq_ignore_ascii_case("INTEGER") && col.ty_params.is_empty()
+                    col.ty_str.eq_ignore_ascii_case("INTEGER")
+                        && col.ty_params.is_empty()
+                        && !col.is_array()
                 }) && !(table.primary_key_is_inline
                     && *pk_order == ast::SortOrder::Desc);
                 if !is_integer_primary_key {
