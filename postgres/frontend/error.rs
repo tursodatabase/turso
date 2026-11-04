@@ -511,6 +511,18 @@ mod tests {
                 SQLSTATE_UNDEFINED_COLUMN,
             ),
             ("malformed JSON", SQLSTATE_INVALID_TEXT_REPRESENTATION),
+            (
+                "values of type inet cannot be compared; to compare their text, CAST them to text",
+                SQLSTATE_UNDEFINED_FUNCTION,
+            ),
+            (
+                "column 'k' of type 'jsonb' cannot be a key: values of type jsonb cannot be compared",
+                SQLSTATE_UNDEFINED_OBJECT,
+            ),
+            (
+                "arrays of type jsonb are not supported, because values of type jsonb cannot be compared",
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+            ),
             ("sequence \"s.q\" does not exist", SQLSTATE_UNDEFINED_TABLE),
             ("schema \"s\" does not exist", SQLSTATE_INVALID_SCHEMA_NAME),
             (

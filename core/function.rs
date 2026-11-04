@@ -1458,25 +1458,129 @@ impl Display for ScalarFunc {
 }
 
 impl ScalarFunc {
+    /// Functions that put their arguments into arrays or compare them with array
+    /// elements. Every variant is listed, so a new function must say which it is.
     pub fn is_array_function(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Array
-                | Self::ArrayElement
-                | Self::ArraySetElement
-                | Self::ArrayLength
-                | Self::ArrayAppend
-                | Self::ArrayPrepend
-                | Self::ArrayCat
-                | Self::ArrayRemove
-                | Self::ArrayContains
-                | Self::ArrayPosition
-                | Self::ArraySlice
-                | Self::StringToArray
-                | Self::ArrayToString
-                | Self::ArrayOverlap
-                | Self::ArrayContainsAll
-        )
+            | Self::ArrayElement
+            | Self::ArraySetElement
+            | Self::ArrayLength
+            | Self::ArrayAppend
+            | Self::ArrayPrepend
+            | Self::ArrayCat
+            | Self::ArrayRemove
+            | Self::ArrayContains
+            | Self::ArrayPosition
+            | Self::ArraySlice
+            | Self::StringToArray
+            | Self::ArrayToString
+            | Self::ArrayOverlap
+            | Self::ArrayContainsAll => true,
+            #[cfg(feature = "fs")]
+            #[cfg(not(target_family = "wasm"))]
+            Self::LoadExtension => false,
+            #[cfg(feature = "test_helper")]
+            Self::TestNondetCounter => false,
+            Self::Cast
+            | Self::Changes
+            | Self::Char
+            | Self::Coalesce
+            | Self::Concat
+            | Self::ConcatWs
+            | Self::Glob
+            | Self::IfNull
+            | Self::Iif
+            | Self::Instr
+            | Self::Like
+            | Self::Abs
+            | Self::Upper
+            | Self::Lower
+            | Self::Random
+            | Self::RandomBlob
+            | Self::Trim
+            | Self::LTrim
+            | Self::RTrim
+            | Self::Round
+            | Self::Length
+            | Self::OctetLength
+            | Self::Min
+            | Self::Max
+            | Self::Nullif
+            | Self::Sign
+            | Self::Substr
+            | Self::Substring
+            | Self::Soundex
+            | Self::Date
+            | Self::Time
+            | Self::TotalChanges
+            | Self::DateTime
+            | Self::Subtype
+            | Self::Typeof
+            | Self::Unicode
+            | Self::Unistr
+            | Self::UnistrQuote
+            | Self::Quote
+            | Self::SqliteVersion
+            | Self::TursoVersion
+            | Self::SqliteSourceId
+            | Self::UnixEpoch
+            | Self::JulianDay
+            | Self::Hex
+            | Self::Unhex
+            | Self::GetByte
+            | Self::SetByte
+            | Self::ZeroBlob
+            | Self::LastInsertRowid
+            | Self::Replace
+            | Self::StrfTime
+            | Self::Printf
+            | Self::Likely
+            | Self::TimeDiff
+            | Self::Likelihood
+            | Self::TableColumnsJsonArray
+            | Self::BinRecordJsonObject
+            | Self::Attach
+            | Self::Detach
+            | Self::Unlikely
+            | Self::StatInit
+            | Self::StatPush
+            | Self::StatGet
+            | Self::ConnTxnId
+            | Self::IsAutocommit
+            | Self::SequenceWatermark
+            | Self::TestUintEncode
+            | Self::TestUintDecode
+            | Self::StringReverse
+            | Self::Gcd
+            | Self::Lcm
+            | Self::Repeat
+            | Self::Lpad
+            | Self::Rpad
+            | Self::BooleanToInt
+            | Self::IntToBoolean
+            | Self::ValidateIpAddr
+            | Self::NumericEncode
+            | Self::NumericFit
+            | Self::NumericDecode
+            | Self::NumericAdd
+            | Self::NumericSub
+            | Self::NumericMul
+            | Self::NumericDiv
+            | Self::NumericMod
+            | Self::NumericNeg
+            | Self::DatePlus
+            | Self::DateMinus
+            | Self::DateDiff
+            | Self::StructPack
+            | Self::StructExtractFunc
+            | Self::UnionValueFunc
+            | Self::UnionTagFunc
+            | Self::UnionExtractFunc
+            | Self::NextVal
+            | Self::CurrVal
+            | Self::SetVal => false,
+        }
     }
 
     /// Returns true for internal functions that should not appear in PRAGMA function_list.

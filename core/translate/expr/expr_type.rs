@@ -621,10 +621,13 @@ pub(crate) fn type_without_comparison<'a>(
         }
         ExprType::Array { element, .. } => type_without_comparison(element, schema),
         ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null => None,
-        // Mixed with a type that can't be compared, an expression whose type
-        // nothing declares has that type (see [common_scalar_type]). On its own
-        // it is a new value, such as the number `ARRAY[1] + 1`, or its statement
-        // fails, as `json_column + 1` does.
+        // An expression whose type nothing declares never holds a stored value
+        // of a type that can't be compared: it is a row value such as `(j, 1)`,
+        // whose columns are compared one by one, the input `value` of a type's
+        // ENCODE or DECODE, `CAST(x AS)` (a number), the number `ARRAY[1] + 1`,
+        // or an operator such as `json_column + 1` whose statement fails. Mixed
+        // with a type that can't be compared, it has that type (see
+        // [common_scalar_type]).
         ExprType::Unknown => None,
     }
 }
