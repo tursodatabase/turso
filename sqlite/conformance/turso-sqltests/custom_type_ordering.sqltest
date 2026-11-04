@@ -925,6 +925,58 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test false-where-term-rejects-collate-on-date-in-nested-struct {
+    CREATE TYPE inner_t AS STRUCT(d date, s text);
+    CREATE TYPE outer_t AS STRUCT(i inner_t, n integer);
+    CREATE TABLE t(o outer_t) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND o.i.d COLLATE NOCASE = 'x';
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test collate-on-text-in-nested-struct-applies {
+    CREATE TYPE inner_t AS STRUCT(d date, s text);
+    CREATE TYPE outer_t AS STRUCT(i inner_t, n integer);
+    CREATE TABLE t(o outer_t) STRICT;
+    INSERT INTO t VALUES (struct_pack(struct_pack('2024-01-02', 'A'), 1));
+    SELECT o.i.s COLLATE NOCASE = 'a' FROM t;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test upsert-false-where-term-rejects-collate-on-excluded-date {
+    CREATE TABLE t(id integer PRIMARY KEY, d date) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-02');
+    INSERT INTO t VALUES (1, '2024-01-03') ON CONFLICT(id) DO UPDATE SET d = excluded.d WHERE 0 AND excluded.d COLLATE NOCASE = 'x';
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test upsert-set-rejects-collate-on-date-in-branch-never-taken {
+    CREATE TABLE t(id integer PRIMARY KEY, d date) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-02');
+    INSERT INTO t VALUES (1, '2024-01-03') ON CONFLICT(id) DO UPDATE SET d = CASE WHEN 0 THEN d COLLATE NOCASE ELSE d END;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test false-where-term-rejects-default {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t WHERE 0 AND DEFAULT COLLATE NOCASE = 'x';
+}
+expect error {
+    DEFAULT is only valid in INSERT VALUES
+}
+
+@requires strict "uses STRICT tables"
 test create-table-rejects-collate-on-date-column {
     CREATE TABLE t(d date COLLATE NOCASE) STRICT;
 }

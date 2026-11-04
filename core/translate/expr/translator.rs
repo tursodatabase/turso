@@ -3087,73 +3087,28 @@ fn translate_field_access_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let ast::Expr::FieldAccess {
-        base,
-        field,
-        resolved,
-    } = expr
-    else {
+    let ast::Expr::FieldAccess { base, resolved, .. } = expr else {
         unreachable!("translate_field_access_expr expects Expr::FieldAccess");
     };
     let base_reg = program.alloc_register();
     translate_expr(program, referenced_tables, base, base_reg, resolver)?;
-
-    // Fast path: if the field was resolved during binding, emit directly.
-    if let Some(resolution) = resolved {
-        match resolution {
-            ast::FieldAccessResolution::StructField { field_index } => {
-                program.emit_insn(Insn::StructField {
-                    src_reg: base_reg,
-                    field_index: *field_index,
-                    dest: target_register,
-                });
-                return Ok(target_register);
-            }
-            ast::FieldAccessResolution::UnionVariant { tag_index } => {
-                program.emit_insn(Insn::UnionExtract {
-                    src_reg: base_reg,
-                    expected_tag: *tag_index,
-                    dest: target_register,
-                });
-                return Ok(target_register);
-            }
+    match resolved {
+        ast::FieldAccessResolution::StructField { field_index } => {
+            program.emit_insn(Insn::StructField {
+                src_reg: base_reg,
+                field_index: *field_index,
+                dest: target_register,
+            });
+        }
+        ast::FieldAccessResolution::UnionVariant { tag_index } => {
+            program.emit_insn(Insn::UnionExtract {
+                src_reg: base_reg,
+                expected_tag: *tag_index,
+                dest: target_register,
+            });
         }
     }
-
-    // Slow path: recursively resolve the base expression's output type,
-    // then look up the field/variant in that type.
-    let td = resolve_expr_output_type(base, referenced_tables, resolver)?;
-    let field_name = normalize_ident(field.as_str());
-
-    if let Some((idx, _)) = td.find_struct_field(&field_name) {
-        program.emit_insn(Insn::StructField {
-            src_reg: base_reg,
-            field_index: idx,
-            dest: target_register,
-        });
-        Ok(target_register)
-    } else if let Some(tag_index) = td.resolve_union_tag_index(&field_name) {
-        program.emit_insn(Insn::UnionExtract {
-            src_reg: base_reg,
-            expected_tag: tag_index,
-            dest: target_register,
-        });
-        Ok(target_register)
-    } else if td.is_struct() {
-        crate::bail_parse_error!(
-            "no such field '{}' in struct type '{}'",
-            field_name,
-            td.name
-        );
-    } else if td.is_union() {
-        crate::bail_parse_error!(
-            "no such variant '{}' in union type '{}'",
-            field_name,
-            td.name
-        );
-    } else {
-        crate::bail_parse_error!("type '{}' is not a struct or union type", td.name);
-    }
+    Ok(target_register)
 }
 
 #[inline(never)]

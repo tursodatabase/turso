@@ -316,7 +316,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         ast::Expr::MergedColumn(columns) => common_type(columns.iter().map(|c| c.as_ref()), env),
         ast::Expr::FieldAccess {
             base,
-            resolved: Some(resolution),
+            resolved: resolution,
             ..
         } => field_type(&type_of(base, env), resolution, env.schema()),
         // Expressions whose value is never a custom-type value. SQLite's affinity
@@ -339,15 +339,13 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         | ast::Expr::Cast {
             type_name: None, ..
         } => affinity_type(expr, env),
-        // Not bound or planned yet: names, subqueries, `DEFAULT`, and field
-        // access on an unbound base.
+        // Not bound or planned yet: names, subqueries and `DEFAULT`.
         ast::Expr::Id(_)
         | ast::Expr::Name(_)
         | ast::Expr::Qualified(..)
         | ast::Expr::DoublyQualified(..)
         | ast::Expr::Subquery(_)
-        | ast::Expr::Default
-        | ast::Expr::FieldAccess { resolved: None, .. } => ExprType::NotKnownYet,
+        | ast::Expr::Default => ExprType::NotKnownYet,
         ast::Expr::Parenthesized(_)
         | ast::Expr::SubqueryResult {
             query_type: ast::SubqueryType::RowValue { .. },
