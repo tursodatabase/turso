@@ -164,7 +164,7 @@ A window `RANGE` frame with an offset (`RANGE 1 PRECEDING`) allows an offset onl
 | `smallint`, `bigint` | `integer`, `smallint`, `bigint` |
 | `numeric` | `integer`, `smallint`, `bigint`, `numeric` (a decimal such as `1.5`) |
 | any other custom type (such as `date`), an array, or a value with no known type | none |
-| a SQLite type (`INTEGER`, `REAL`, ...) | any value that is not of a custom type, as in SQLite, and `smallint` or `bigint` values |
+| a SQLite type (`INTEGER`, `REAL`, ...) | any value that is not a custom type, an array or a value with no known type, as in SQLite, and `smallint` or `bigint` values |
 
 A parameter or a string offset (`'1'`) is read as the column's type when the statement runs. A domain counts as the type it is based on. When the `ORDER BY` value is a numeric, the bounds are computed with numeric's `+` and `-`.
 
