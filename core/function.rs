@@ -1913,10 +1913,11 @@ pub enum ResultType {
     /// `abs`: like NumberOfTheFirstArgumentsType, but a text or blob argument
     /// is not converted first and gives a real: `abs('3')` is 3.0.
     AbsOfTheFirstArgument,
-    /// A number that is a real when an argument is a real. SQLite always
-    /// returns a real, but PostgreSQL computes these exactly for an exact
-    /// argument (`round(0.25, 1)` and `mod(10, 4)`), so without a real
-    /// argument the kind of number is not known.
+    /// A number that is a real when an argument is a real, or when the first
+    /// argument is a text or blob (`round(t, 2)` of a text column `t`). SQLite
+    /// always returns a real, but PostgreSQL computes these exactly for an
+    /// exact argument (`round(0.25, 1)` and `mod(10, 4)`), so otherwise the
+    /// kind of number is not known.
     RealForARealArgument,
     /// A blob for a blob first argument, else text: `substr`.
     TextOrBlobLikeTheFirstArgument,

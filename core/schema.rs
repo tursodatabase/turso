@@ -2032,9 +2032,8 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let mut type_def =
+                let type_def =
                     TypeDef::from_create_type(&type_name, &body, false, sql.to_string())?;
-                type_def.set_value_type(value_type(&type_def, self, syms));
                 self.type_registry
                     .insert(type_registry_key(&type_name), Arc::new(type_def));
             }
@@ -2046,7 +2045,7 @@ impl Schema {
                 constraints,
                 ..
             }))) => {
-                let mut type_def = TypeDef::from_domain(
+                let type_def = TypeDef::from_domain(
                     &domain_name,
                     &base_type,
                     not_null,
@@ -2054,7 +2053,6 @@ impl Schema {
                     default,
                     sql.to_string(),
                 );
-                type_def.set_value_type(value_type(&type_def, self, syms));
                 self.type_registry
                     .insert(type_registry_key(&domain_name), Arc::new(type_def));
             }
@@ -2064,7 +2062,38 @@ impl Schema {
                 )));
             }
         }
+        self.update_value_types(syms);
         Ok(())
+    }
+
+    /// Works out again the kind of value each user-defined type reads as. A
+    /// type's kind can depend on a type created after it, as with
+    /// `DECODE CAST(value AS b)` before `CREATE TYPE b`, so this repeats until
+    /// no kind changes. Built-in types name their kind when they are created.
+    fn update_value_types(&mut self, syms: &SymbolTable) {
+        // Each pass settles at least one more type of a chain of types
+        // referring to each other, so a pass per type is enough.
+        for _ in 0..=self.type_registry.len() {
+            let changed: Vec<(String, TypeDef)> = self
+                .type_registry
+                .iter()
+                .filter(|(_, type_def)| !type_def.is_builtin)
+                .filter_map(|(key, type_def)| {
+                    let kind = value_type(type_def, self, syms);
+                    (kind != type_def.value_type()).then(|| {
+                        let mut updated = (**type_def).clone();
+                        updated.set_value_type(kind);
+                        (key.clone(), updated)
+                    })
+                })
+                .collect();
+            if changed.is_empty() {
+                return;
+            }
+            for (key, type_def) in changed {
+                self.type_registry.insert(key, Arc::new(type_def));
+            }
+        }
     }
 
     /// Load type definitions from CREATE TYPE SQL strings and resolve custom

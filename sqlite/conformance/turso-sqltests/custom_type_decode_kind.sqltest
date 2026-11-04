@@ -153,3 +153,32 @@ expect {
     eq|2
     eq|2
 }
+
+@requires strict "uses STRICT tables"
+test decode-kind-round-is-real {
+    -- round gives a real or NULL for any argument, so this DECODE's kind is
+    -- known: '10' > 9.6 although the text '10' < '9.6'.
+    CREATE TYPE r(value any) BASE text ENCODE value DECODE round(value, 2);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c r) STRICT;
+    INSERT INTO t VALUES (1, '10'), (2, '9');
+    SELECT id FROM t WHERE c > 9.6;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test decode-kind-follows-a-type-created-later {
+    -- a's DECODE casts to b, created after a and the table. Once b exists, a
+    -- reads as b's kind, text, so c > 9 compares with the text '9', and the
+    -- text '10' sorts before '9'.
+    CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b);
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c a) STRICT;
+    CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value);
+    INSERT INTO t VALUES (1, '10'), (2, '9');
+    SELECT 'gt-number', id FROM t WHERE c > 9;
+    SELECT 'lt-text', id FROM t WHERE c < '9';
+}
+expect {
+    lt-text|1
+}

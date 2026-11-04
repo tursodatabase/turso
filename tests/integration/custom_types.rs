@@ -1020,6 +1020,7 @@ mod tests {
             ("ifnull(value, 'x')", Some("TEXT")),
             ("lower(value)", Some("TEXT")),
             ("value * 1.0", Some("REAL")),
+            ("round(value, 2)", Some("REAL")),
             ("value + 0", Some("NUMERIC")),
             ("NULL", None),
             ("CAST(value AS int_text)", Some("INTEGER")),
@@ -1123,6 +1124,58 @@ mod tests {
             }
             conn.close().unwrap();
         }
+    }
+
+    /// A type whose DECODE casts to a type created after it reads as that
+    /// type's kind once it exists: here `a` reads as text, because `b`'s
+    /// DECODE gives text. This holds for a table created before `b`, and
+    /// after reopening, when the types load in the order they were created.
+    #[test]
+    fn test_decode_kind_follows_a_type_created_later() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("decode_kind_later_type.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        // '10' > 9 as a number, but not as text: a text is greater than any
+        // number, so only text-to-text comparisons decide the order.
+        let check = |conn: &Arc<turso_core::Connection>, context: &str| {
+            for table in ["before_b", "after_b"] {
+                let rows: Vec<(i64,)> =
+                    conn.exec_rows(&format!("SELECT id FROM {table} WHERE c > 9 ORDER BY id"));
+                assert_eq!(rows, vec![], "{context}: {table} WHERE c > 9");
+                let rows: Vec<(i64,)> =
+                    conn.exec_rows(&format!("SELECT id FROM {table} WHERE c > '9' ORDER BY id"));
+                assert_eq!(rows, vec![], "{context}: {table} WHERE c > '9'");
+                let rows: Vec<(i64,)> =
+                    conn.exec_rows(&format!("SELECT id FROM {table} WHERE c < '9' ORDER BY id"));
+                assert_eq!(rows, vec![(1,)], "{context}: {table} WHERE c < '9'");
+            }
+        };
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b)",
+            )
+            .unwrap();
+            conn.execute("CREATE TABLE before_b(id INTEGER PRIMARY KEY, c a) STRICT")
+                .unwrap();
+            conn.execute(
+                "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value)",
+            )
+            .unwrap();
+            conn.execute("CREATE TABLE after_b(id INTEGER PRIMARY KEY, c a) STRICT")
+                .unwrap();
+            for table in ["before_b", "after_b"] {
+                conn.execute(format!("INSERT INTO {table} VALUES (1, '10'), (2, '9')"))
+                    .unwrap();
+            }
+            check(&conn, "same session");
+            conn.close().unwrap();
+        }
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        check(&conn, "after reopen");
+        conn.close().unwrap();
     }
 
     /// Arrays compare as in PostgreSQL's `array_cmp`: element by element, a

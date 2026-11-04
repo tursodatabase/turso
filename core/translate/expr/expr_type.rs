@@ -1006,7 +1006,12 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
         ResultType::RealForARealArgument => {
             let is_real =
                 |arg: &ast::Expr| matches!(type_of(arg, env), ExprType::Builtin(BuiltinType::Real));
-            if args.iter().any(|arg| is_real(arg)) {
+            // A text or blob is not an exact number, so it is converted to a real.
+            let first_is_not_a_number = matches!(
+                first_argument(),
+                Some(ExprType::Builtin(BuiltinType::Text | BuiltinType::Blob))
+            );
+            if first_is_not_a_number || args.iter().any(|arg| is_real(arg)) {
                 ExprType::Builtin(BuiltinType::Real)
             } else {
                 any
