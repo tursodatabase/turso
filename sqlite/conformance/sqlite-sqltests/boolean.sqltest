@@ -974,3 +974,46 @@ test case-with-a-base-still-runs-both-row-operands {
 expect error {
     malformed JSON
 }
+
+# A CHECK constraint, a trigger WHEN clause and a partial index WHERE are
+# conditions, so SQLite decides an AND or OR in them with jumps and skips the
+# operand the other decides (sqlite3ExprIfTrue/IfFalse). A function in the
+# skipped operand never runs.
+
+test check-constraint-or-skips-the-operand-that-is-not-reached {
+    CREATE TABLE check_or(a, b TEXT CHECK (a > 0 OR json_extract(b, '$.a')));
+    INSERT INTO check_or VALUES (1, 'bare');
+    SELECT a FROM check_or;
+}
+expect {
+    1
+}
+
+test check-constraint-and-skips-the-operand-that-is-not-reached {
+    CREATE TABLE check_and(a, b TEXT CHECK (a = 0 AND json_extract(b, '$.a')));
+    INSERT INTO check_and VALUES (1, 'bare');
+}
+expect error {
+    CHECK constraint failed
+}
+
+test trigger-when-or-skips-the-operand-that-is-not-reached {
+    CREATE TABLE trig_or(x, y TEXT);
+    CREATE TABLE trig_log(n);
+    CREATE TRIGGER trig_or_t AFTER INSERT ON trig_or WHEN new.x > 0 OR json_extract(new.y, '$.a') BEGIN INSERT INTO trig_log VALUES (1); END;
+    INSERT INTO trig_or VALUES (1, 'bare');
+    SELECT count(*) FROM trig_log;
+}
+expect {
+    1
+}
+
+test partial-index-where-or-skips-the-operand-that-is-not-reached {
+    CREATE TABLE part_or(a, b TEXT);
+    CREATE INDEX part_or_idx ON part_or(a) WHERE a > 0 OR json_extract(b, '$.a');
+    INSERT INTO part_or VALUES (1, 'bare');
+    SELECT a FROM part_or;
+}
+expect {
+    1
+}
