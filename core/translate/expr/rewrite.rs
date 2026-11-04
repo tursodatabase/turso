@@ -240,7 +240,7 @@ pub(crate) fn replace_and_or_with_deciding_operand(
     // query: `SELECT count(*) OR 1 FROM t` gives one row, not one per row.
     let dropped_has_aggregate = match resolver {
         Some(resolver) => {
-            reject_unknown_function(dropped, resolver)?;
+            check_function_calls(dropped, resolver)?;
             expr_contains_aggregate_or_window_function(dropped, resolver)?
         }
         None => true,

@@ -2042,34 +2042,7 @@ fn translate_function_call_expr(
                     Ok(target_register)
                 }
                 ScalarFunc::Likelihood => {
-                    if args.len() != 2 {
-                        crate::bail_parse_error!(
-                            "likelihood() function must have exactly 2 arguments",
-                        );
-                    }
-
-                    if let ast::Expr::Literal(ast::Literal::Numeric(ref value)) = args[1].as_ref() {
-                        if let Ok(probability) = value.parse::<f64>() {
-                            if !(0.0..=1.0).contains(&probability) {
-                                crate::bail_parse_error!(
-                                            "second argument to likelihood() must be a constant between 0.0 and 1.0",
-                                        );
-                            }
-                            if !value.contains('.') {
-                                crate::bail_parse_error!(
-                                            "second argument to likelihood() must be a floating point number with decimal point",
-                                        );
-                            }
-                        } else {
-                            crate::bail_parse_error!(
-                                "second argument to likelihood() must be a floating point constant",
-                            );
-                        }
-                    } else {
-                        crate::bail_parse_error!(
-                                    "second argument to likelihood() must be a constant between 0.0 and 1.0",
-                                );
-                    }
+                    check_likelihood_arguments(args)?;
                     translate_expr(
                         program,
                         referenced_tables,

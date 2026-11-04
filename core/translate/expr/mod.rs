@@ -136,13 +136,13 @@ pub use utils::{
 };
 pub(crate) use vectors::select_column_count;
 pub use vectors::{expr_vector_size, reject_row_value_misuse};
+pub(crate) use walk::{
+    check_function_calls, check_likelihood_arguments, expression_can_fail_on_input,
+    is_aggregate_or_window_function, reject_unknown_collation, walk_function_calls, FunctionCalls,
+};
 pub use walk::{
     expr_contains_function_that_changes_within_statement,
     expr_contains_nondeterministic_scalar_function, expr_contains_subquery,
     expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
     walk_expr, walk_expr_mut, WalkControl,
-};
-pub(crate) use walk::{
-    expression_can_fail_on_input, is_aggregate_or_window_function, reject_unknown_collation,
-    reject_unknown_function, walk_function_calls, FunctionCalls,
 };
