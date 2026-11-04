@@ -145,13 +145,20 @@ pub(super) fn emit_array_encode(
             });
 
             emit_array_element_loop(program, reg, |program, element_reg| {
+                let skip_label = program.allocate_label();
+                program.emit_insn(Insn::IsNull {
+                    reg: element_reg,
+                    target_pc: skip_label,
+                });
                 emit_store_value(
                     program,
                     std::slice::from_ref(type_def),
                     element_reg,
                     &col.ty_params,
                     resolver,
-                )
+                )?;
+                program.preassign_label_to_next_insn(skip_label);
+                Ok(())
             })?;
         }
     }
@@ -196,16 +203,14 @@ pub(crate) fn emit_array_decode(
     resolver: &Resolver,
 ) -> Result<()> {
     if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if let Some(decode_expr) = type_def.decode() {
+        if type_def.decode().is_some() {
             emit_array_element_loop(program, reg, |program, element_reg| {
-                let skip_label = program.allocate_label();
-                program.emit_insn(Insn::IsNull {
-                    reg: element_reg,
-                    target_pc: skip_label,
-                });
-                emit_type_expr(program, decode_expr, element_reg, element_reg, resolver)?;
-                program.preassign_label_to_next_insn(skip_label);
-                Ok(())
+                emit_decode(
+                    program,
+                    std::slice::from_ref(type_def),
+                    element_reg,
+                    resolver,
+                )
             })?;
         }
     }

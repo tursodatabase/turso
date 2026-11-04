@@ -65,7 +65,7 @@ The ENCODE expression is evaluated whenever a value is written to a column of th
 - **DECODE**: Transforms the stored value back into the presentation form. Runs on SELECT, and on CAST after ENCODE (see [CAST Support](#cast-support)).
 - **NULL handling**: NULL values bypass both ENCODE and DECODE. A NULL input produces a NULL output without evaluating the expression.
 
-For arrays of a custom type, NULL elements also bypass DECODE and remain NULL in query results.
+For arrays of a custom type, NULL elements also bypass ENCODE and DECODE and remain NULL when stored and read.
 
 ```sql
 -- Store text in reversed form
