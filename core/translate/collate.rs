@@ -625,13 +625,7 @@ pub fn compound_column_collation(
     column: usize,
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
-    let columns = arms.iter().map(|select| {
-        (
-            &select.result_columns[column].expr,
-            ExprContext::new(Some(&select.table_references), resolver),
-        )
-    });
-    first_collation(columns)
+    first_collation(compound_column_exprs(arms, column, resolver))
 }
 
 /// The collation of a compound SELECT's ORDER BY term `column COLLATE name`,
@@ -644,14 +638,23 @@ pub fn compound_order_by_collation(
     explicit_collation: TextCollation,
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
-    let columns = arms.iter().map(|select| {
+    common_ordering_of(compound_column_exprs(arms, column, resolver), true)?;
+    Ok(CollationSeq::Text(explicit_collation))
+}
+
+/// Column `column` of every SELECT in `arms`, each with the context its
+/// columns refer to.
+fn compound_column_exprs<'a, 's>(
+    arms: &'a [&'a SelectPlan],
+    column: usize,
+    resolver: &'a Resolver<'s>,
+) -> impl Iterator<Item = (&'a Expr, ExprContext<'a, 's>)> + Clone + 'a {
+    arms.iter().map(move |select| {
         (
             &select.result_columns[column].expr,
             ExprContext::new(Some(&select.table_references), resolver),
         )
-    });
-    common_ordering_of(columns, true)?;
-    Ok(CollationSeq::Text(explicit_collation))
+    })
 }
 
 /// The text collation of the first expression that has one, BINARY when none
