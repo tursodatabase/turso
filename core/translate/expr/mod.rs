@@ -133,7 +133,7 @@ pub use utils::{
     as_binary_components, integer_literal_truth_value, maybe_apply_affinity, sanitize_string,
     truth_test_rhs, unwrap_parens, unwrap_parens_owned,
 };
-pub use vectors::expr_vector_size;
+pub use vectors::{expr_vector_size, reject_row_value_misuse};
 pub use walk::{
     expr_contains_function_that_changes_within_statement,
     expr_contains_nondeterministic_scalar_function, expr_contains_subquery,
