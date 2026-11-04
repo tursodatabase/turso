@@ -1,0 +1,984 @@
+# Who can read a table with row-level security, through the PostgreSQL
+# frontend. Policies cannot be created yet, so every table here has
+# row-level security and no policies: the superuser reads and writes every
+# row, and a role that is not a superuser sees no row, as in PostgreSQL.
+#
+# Each test first reads as the superuser, then as a role, so the expected
+# output shows both. The role is granted SELECT, because without it
+# PostgreSQL refuses to read the table at all. PostgreSQL roles belong to the
+# whole server, so every test uses its own role and table names.
+#
+# Views are not tested: a PostgreSQL view reads its tables as the view's
+# owner, which bypasses row-level security, while Turso reads them as the
+# role that runs the query. RIGHT and FULL JOIN are not tested either,
+# because Turso rejects them for a role on a table with row-level security.
+
+@database :memory:
+
+test count-of-all-rows {
+    CREATE ROLE ra_role_1;
+    CREATE TABLE ra_docs_1 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_1 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_1 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_1 TO ra_role_1;
+    SELECT count(*) FROM ra_docs_1;
+    SET ROLE ra_role_1;
+    SELECT count(*) FROM ra_docs_1;
+}
+expect {
+    3
+    0
+}
+
+test select-star {
+    CREATE ROLE ra_role_2;
+    CREATE TABLE ra_docs_2 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_2 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_2 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_2 TO ra_role_2;
+    SELECT * FROM ra_docs_2 ORDER BY id;
+    SET ROLE ra_role_2;
+    SELECT * FROM ra_docs_2 ORDER BY id;
+}
+expect {
+    1|alice|a
+    2|bob|b
+    3|alice|c
+}
+
+test primary-key-lookup {
+    CREATE ROLE ra_role_3;
+    CREATE TABLE ra_docs_3 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_3 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_3 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_3 TO ra_role_3;
+    SELECT title FROM ra_docs_3 WHERE id = 2;
+    SET ROLE ra_role_3;
+    SELECT title FROM ra_docs_3 WHERE id = 2;
+}
+expect {
+    b
+}
+
+test primary-key-in-list {
+    CREATE ROLE ra_role_4;
+    CREATE TABLE ra_docs_4 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_4 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_4 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_4 TO ra_role_4;
+    SELECT id FROM ra_docs_4 WHERE id IN (1, 3) ORDER BY id;
+    SET ROLE ra_role_4;
+    SELECT id FROM ra_docs_4 WHERE id IN (1, 3) ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test primary-key-or {
+    CREATE ROLE ra_role_5;
+    CREATE TABLE ra_docs_5 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_5 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_5 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_5 TO ra_role_5;
+    SELECT id FROM ra_docs_5 WHERE id = 1 OR id = 2 ORDER BY id;
+    SET ROLE ra_role_5;
+    SELECT id FROM ra_docs_5 WHERE id = 1 OR id = 2 ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test primary-key-range {
+    CREATE ROLE ra_role_6;
+    CREATE TABLE ra_docs_6 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_6 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_6 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_6 TO ra_role_6;
+    SELECT id FROM ra_docs_6 WHERE id BETWEEN 2 AND 3 ORDER BY id;
+    SET ROLE ra_role_6;
+    SELECT id FROM ra_docs_6 WHERE id BETWEEN 2 AND 3 ORDER BY id;
+}
+expect {
+    2
+    3
+}
+
+test secondary-index-lookup {
+    CREATE ROLE ra_role_7;
+    CREATE TABLE ra_docs_7 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_7 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE INDEX ra_owner_idx_ra_docs_7 ON ra_docs_7 (owner);
+    ALTER TABLE ra_docs_7 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_7 TO ra_role_7;
+    SELECT id FROM ra_docs_7 WHERE owner = 'alice' ORDER BY id;
+    SET ROLE ra_role_7;
+    SELECT id FROM ra_docs_7 WHERE owner = 'alice' ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test count-through-secondary-index {
+    CREATE ROLE ra_role_8;
+    CREATE TABLE ra_docs_8 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_8 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE INDEX ra_owner_idx_ra_docs_8 ON ra_docs_8 (owner);
+    ALTER TABLE ra_docs_8 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_8 TO ra_role_8;
+    SELECT count(*) FROM ra_docs_8 WHERE owner = 'alice';
+    SET ROLE ra_role_8;
+    SELECT count(*) FROM ra_docs_8 WHERE owner = 'alice';
+}
+expect {
+    2
+    0
+}
+
+test filter-on-column-without-index {
+    CREATE ROLE ra_role_9;
+    CREATE TABLE ra_docs_9 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_9 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_9 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_9 TO ra_role_9;
+    SELECT id FROM ra_docs_9 WHERE title = 'c';
+    SET ROLE ra_role_9;
+    SELECT id FROM ra_docs_9 WHERE title = 'c';
+}
+expect {
+    3
+}
+
+test is-not-null {
+    CREATE ROLE ra_role_10;
+    CREATE TABLE ra_docs_10 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_10 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_10 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_10 TO ra_role_10;
+    SELECT count(*) FROM ra_docs_10 WHERE title IS NOT NULL;
+    SET ROLE ra_role_10;
+    SELECT count(*) FROM ra_docs_10 WHERE title IS NOT NULL;
+}
+expect {
+    3
+    0
+}
+
+test order-by-limit-offset {
+    CREATE ROLE ra_role_11;
+    CREATE TABLE ra_docs_11 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_11 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_11 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_11 TO ra_role_11;
+    SELECT id FROM ra_docs_11 ORDER BY id DESC LIMIT 2 OFFSET 1;
+    SET ROLE ra_role_11;
+    SELECT id FROM ra_docs_11 ORDER BY id DESC LIMIT 2 OFFSET 1;
+}
+expect {
+    2
+    1
+}
+
+test distinct {
+    CREATE ROLE ra_role_12;
+    CREATE TABLE ra_docs_12 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_12 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_12 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_12 TO ra_role_12;
+    SELECT DISTINCT owner FROM ra_docs_12 ORDER BY owner;
+    SET ROLE ra_role_12;
+    SELECT DISTINCT owner FROM ra_docs_12 ORDER BY owner;
+}
+expect {
+    alice
+    bob
+}
+
+test aggregates {
+    CREATE ROLE ra_role_13;
+    CREATE TABLE ra_docs_13 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_13 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_13 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_13 TO ra_role_13;
+    SELECT count(*), count(id), count(DISTINCT owner), coalesce(max(id), -1), coalesce(sum(id), -1) FROM ra_docs_13;
+    SET ROLE ra_role_13;
+    SELECT count(*), count(id), count(DISTINCT owner), coalesce(max(id), -1), coalesce(sum(id), -1) FROM ra_docs_13;
+}
+expect {
+    3|3|2|3|6
+    0|0|0|-1|-1
+}
+
+test group-by {
+    CREATE ROLE ra_role_14;
+    CREATE TABLE ra_docs_14 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_14 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_14 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_14 TO ra_role_14;
+    SELECT owner, count(*) FROM ra_docs_14 GROUP BY owner ORDER BY owner;
+    SET ROLE ra_role_14;
+    SELECT owner, count(*) FROM ra_docs_14 GROUP BY owner ORDER BY owner;
+}
+expect {
+    alice|2
+    bob|1
+}
+
+test having {
+    CREATE ROLE ra_role_15;
+    CREATE TABLE ra_docs_15 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_15 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_15 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_15 TO ra_role_15;
+    SELECT owner FROM ra_docs_15 GROUP BY owner HAVING count(*) > 1;
+    SET ROLE ra_role_15;
+    SELECT owner FROM ra_docs_15 GROUP BY owner HAVING count(*) > 1;
+}
+expect {
+    alice
+}
+
+test window-function {
+    CREATE ROLE ra_role_16;
+    CREATE TABLE ra_docs_16 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_16 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_16 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_16 TO ra_role_16;
+    SELECT id, row_number() OVER (ORDER BY id DESC) FROM ra_docs_16 ORDER BY id;
+    SET ROLE ra_role_16;
+    SELECT id, row_number() OVER (ORDER BY id DESC) FROM ra_docs_16 ORDER BY id;
+}
+expect {
+    1|3
+    2|2
+    3|1
+}
+
+test case-on-exists {
+    CREATE ROLE ra_role_17;
+    CREATE TABLE ra_docs_17 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_17 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_17 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_17 TO ra_role_17;
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM ra_docs_17) THEN 'some' ELSE 'none' END;
+    SET ROLE ra_role_17;
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM ra_docs_17) THEN 'some' ELSE 'none' END;
+}
+expect {
+    some
+    none
+}
+
+test inner-join {
+    CREATE ROLE ra_role_18;
+    CREATE TABLE ra_docs_18 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_18 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_18 (id INT);
+    INSERT INTO ra_notes_18 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_18 TO ra_role_18;
+    ALTER TABLE ra_docs_18 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_18 TO ra_role_18;
+    SELECT n.id FROM ra_notes_18 n JOIN ra_docs_18 d ON d.id = n.id ORDER BY n.id;
+    SET ROLE ra_role_18;
+    SELECT n.id FROM ra_notes_18 n JOIN ra_docs_18 d ON d.id = n.id ORDER BY n.id;
+}
+expect {
+    1
+    2
+}
+
+test join-using {
+    CREATE ROLE ra_role_19;
+    CREATE TABLE ra_docs_19 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_19 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_19 (id INT);
+    INSERT INTO ra_notes_19 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_19 TO ra_role_19;
+    ALTER TABLE ra_docs_19 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_19 TO ra_role_19;
+    SELECT id FROM ra_notes_19 JOIN ra_docs_19 USING (id) ORDER BY id;
+    SET ROLE ra_role_19;
+    SELECT id FROM ra_notes_19 JOIN ra_docs_19 USING (id) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test left-join-shows-hidden-rows-as-nulls {
+    CREATE ROLE ra_role_20;
+    CREATE TABLE ra_docs_20 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_20 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_20 (id INT);
+    INSERT INTO ra_notes_20 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_20 TO ra_role_20;
+    ALTER TABLE ra_docs_20 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_20 TO ra_role_20;
+    SELECT n.id, coalesce(d.title, 'none') FROM ra_notes_20 n LEFT JOIN ra_docs_20 d ON d.id = n.id ORDER BY n.id;
+    SET ROLE ra_role_20;
+    SELECT n.id, coalesce(d.title, 'none') FROM ra_notes_20 n LEFT JOIN ra_docs_20 d ON d.id = n.id ORDER BY n.id;
+}
+expect {
+    1|a
+    2|b
+    4|none
+    1|none
+    2|none
+    4|none
+}
+
+test left-join-from-table-with-row-security {
+    CREATE ROLE ra_role_21;
+    CREATE TABLE ra_docs_21 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_21 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_21 (id INT);
+    INSERT INTO ra_notes_21 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_21 TO ra_role_21;
+    ALTER TABLE ra_docs_21 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_21 TO ra_role_21;
+    SELECT d.id, coalesce(n.id, -1) FROM ra_docs_21 d LEFT JOIN ra_notes_21 n ON n.id = d.id ORDER BY d.id;
+    SET ROLE ra_role_21;
+    SELECT d.id, coalesce(n.id, -1) FROM ra_docs_21 d LEFT JOIN ra_notes_21 n ON n.id = d.id ORDER BY d.id;
+}
+expect {
+    1|1
+    2|2
+    3|-1
+}
+
+test left-join-anti-join {
+    CREATE ROLE ra_role_22;
+    CREATE TABLE ra_docs_22 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_22 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_22 (id INT);
+    INSERT INTO ra_notes_22 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_22 TO ra_role_22;
+    ALTER TABLE ra_docs_22 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_22 TO ra_role_22;
+    SELECT n.id FROM ra_notes_22 n LEFT JOIN ra_docs_22 d ON d.id = n.id WHERE d.id IS NULL ORDER BY n.id;
+    SET ROLE ra_role_22;
+    SELECT n.id FROM ra_notes_22 n LEFT JOIN ra_docs_22 d ON d.id = n.id WHERE d.id IS NULL ORDER BY n.id;
+}
+expect {
+    4
+    1
+    2
+    4
+}
+
+test cross-join {
+    CREATE ROLE ra_role_23;
+    CREATE TABLE ra_docs_23 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_23 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_23 (id INT);
+    INSERT INTO ra_notes_23 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_23 TO ra_role_23;
+    ALTER TABLE ra_docs_23 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_23 TO ra_role_23;
+    SELECT count(*) FROM ra_notes_23, ra_docs_23;
+    SET ROLE ra_role_23;
+    SELECT count(*) FROM ra_notes_23, ra_docs_23;
+}
+expect {
+    9
+    0
+}
+
+test self-join {
+    CREATE ROLE ra_role_24;
+    CREATE TABLE ra_docs_24 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_24 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_24 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_24 TO ra_role_24;
+    SELECT count(*) FROM ra_docs_24 a JOIN ra_docs_24 b ON a.owner = b.owner;
+    SET ROLE ra_role_24;
+    SELECT count(*) FROM ra_docs_24 a JOIN ra_docs_24 b ON a.owner = b.owner;
+}
+expect {
+    5
+    0
+}
+
+test join-with-values {
+    CREATE ROLE ra_role_25;
+    CREATE TABLE ra_docs_25 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_25 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_25 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_25 TO ra_role_25;
+    SELECT d.title FROM (VALUES (1), (3)) AS v(x) JOIN ra_docs_25 d ON d.id = v.x ORDER BY d.title;
+    SET ROLE ra_role_25;
+    SELECT d.title FROM (VALUES (1), (3)) AS v(x) JOIN ra_docs_25 d ON d.id = v.x ORDER BY d.title;
+}
+expect {
+    a
+    c
+}
+
+test table-without-row-security-in-the-same-query {
+    CREATE ROLE ra_role_26;
+    CREATE TABLE ra_docs_26 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_26 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_26 (id INT);
+    INSERT INTO ra_notes_26 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_26 TO ra_role_26;
+    ALTER TABLE ra_docs_26 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_26 TO ra_role_26;
+    SELECT (SELECT count(*) FROM ra_notes_26), (SELECT count(*) FROM ra_docs_26);
+    SET ROLE ra_role_26;
+    SELECT (SELECT count(*) FROM ra_notes_26), (SELECT count(*) FROM ra_docs_26);
+}
+expect {
+    3|3
+    3|0
+}
+
+test in-subquery {
+    CREATE ROLE ra_role_27;
+    CREATE TABLE ra_docs_27 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_27 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_27 (id INT);
+    INSERT INTO ra_notes_27 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_27 TO ra_role_27;
+    ALTER TABLE ra_docs_27 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_27 TO ra_role_27;
+    SELECT id FROM ra_notes_27 WHERE id IN (SELECT id FROM ra_docs_27) ORDER BY id;
+    SET ROLE ra_role_27;
+    SELECT id FROM ra_notes_27 WHERE id IN (SELECT id FROM ra_docs_27) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test not-in-subquery {
+    CREATE ROLE ra_role_28;
+    CREATE TABLE ra_docs_28 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_28 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_28 (id INT);
+    INSERT INTO ra_notes_28 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_28 TO ra_role_28;
+    ALTER TABLE ra_docs_28 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_28 TO ra_role_28;
+    SELECT id FROM ra_notes_28 WHERE id NOT IN (SELECT id FROM ra_docs_28) ORDER BY id;
+    SET ROLE ra_role_28;
+    SELECT id FROM ra_notes_28 WHERE id NOT IN (SELECT id FROM ra_docs_28) ORDER BY id;
+}
+expect {
+    4
+    1
+    2
+    4
+}
+
+test exists-subquery {
+    CREATE ROLE ra_role_29;
+    CREATE TABLE ra_docs_29 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_29 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_29 (id INT);
+    INSERT INTO ra_notes_29 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_29 TO ra_role_29;
+    ALTER TABLE ra_docs_29 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_29 TO ra_role_29;
+    SELECT id FROM ra_notes_29 n WHERE EXISTS (SELECT 1 FROM ra_docs_29 d WHERE d.id = n.id) ORDER BY id;
+    SET ROLE ra_role_29;
+    SELECT id FROM ra_notes_29 n WHERE EXISTS (SELECT 1 FROM ra_docs_29 d WHERE d.id = n.id) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test not-exists-subquery {
+    CREATE ROLE ra_role_30;
+    CREATE TABLE ra_docs_30 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_30 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_30 (id INT);
+    INSERT INTO ra_notes_30 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_30 TO ra_role_30;
+    ALTER TABLE ra_docs_30 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_30 TO ra_role_30;
+    SELECT id FROM ra_notes_30 n WHERE NOT EXISTS (SELECT 1 FROM ra_docs_30 d WHERE d.id = n.id) ORDER BY id;
+    SET ROLE ra_role_30;
+    SELECT id FROM ra_notes_30 n WHERE NOT EXISTS (SELECT 1 FROM ra_docs_30 d WHERE d.id = n.id) ORDER BY id;
+}
+expect {
+    4
+    1
+    2
+    4
+}
+
+test correlated-scalar-subquery {
+    CREATE ROLE ra_role_31;
+    CREATE TABLE ra_docs_31 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_31 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_31 (id INT);
+    INSERT INTO ra_notes_31 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_31 TO ra_role_31;
+    ALTER TABLE ra_docs_31 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_31 TO ra_role_31;
+    SELECT n.id, coalesce((SELECT d.title FROM ra_docs_31 d WHERE d.id = n.id), 'none') FROM ra_notes_31 n ORDER BY n.id;
+    SET ROLE ra_role_31;
+    SELECT n.id, coalesce((SELECT d.title FROM ra_docs_31 d WHERE d.id = n.id), 'none') FROM ra_notes_31 n ORDER BY n.id;
+}
+expect {
+    1|a
+    2|b
+    4|none
+    1|none
+    2|none
+    4|none
+}
+
+test uncorrelated-scalar-subquery {
+    CREATE ROLE ra_role_32;
+    CREATE TABLE ra_docs_32 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_32 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_32 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_32 TO ra_role_32;
+    SELECT coalesce((SELECT max(id) FROM ra_docs_32), -1);
+    SET ROLE ra_role_32;
+    SELECT coalesce((SELECT max(id) FROM ra_docs_32), -1);
+}
+expect {
+    3
+    -1
+}
+
+test equals-any-subquery {
+    CREATE ROLE ra_role_33;
+    CREATE TABLE ra_docs_33 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_33 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_33 (id INT);
+    INSERT INTO ra_notes_33 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_33 TO ra_role_33;
+    ALTER TABLE ra_docs_33 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_33 TO ra_role_33;
+    SELECT id FROM ra_notes_33 WHERE id = ANY (SELECT id FROM ra_docs_33) ORDER BY id;
+    SET ROLE ra_role_33;
+    SELECT id FROM ra_notes_33 WHERE id = ANY (SELECT id FROM ra_docs_33) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test derived-table {
+    CREATE ROLE ra_role_34;
+    CREATE TABLE ra_docs_34 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_34 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_34 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_34 TO ra_role_34;
+    SELECT count(*) FROM (SELECT id FROM ra_docs_34 WHERE id > 1) AS sub;
+    SET ROLE ra_role_34;
+    SELECT count(*) FROM (SELECT id FROM ra_docs_34 WHERE id > 1) AS sub;
+}
+expect {
+    2
+    0
+}
+
+test lateral-subquery {
+    CREATE ROLE ra_role_35;
+    CREATE TABLE ra_docs_35 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_35 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_35 (id INT);
+    INSERT INTO ra_notes_35 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_35 TO ra_role_35;
+    ALTER TABLE ra_docs_35 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_35 TO ra_role_35;
+    SELECT n.id, l.c FROM ra_notes_35 n, LATERAL (SELECT count(*) AS c FROM ra_docs_35 d WHERE d.id <= n.id) AS l ORDER BY n.id;
+    SET ROLE ra_role_35;
+    SELECT n.id, l.c FROM ra_notes_35 n, LATERAL (SELECT count(*) AS c FROM ra_docs_35 d WHERE d.id <= n.id) AS l ORDER BY n.id;
+}
+expect {
+    1|1
+    2|2
+    4|3
+    1|0
+    2|0
+    4|0
+}
+
+test cte {
+    CREATE ROLE ra_role_36;
+    CREATE TABLE ra_docs_36 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_36 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_36 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_36 TO ra_role_36;
+    WITH sub AS (SELECT id FROM ra_docs_36) SELECT count(*) FROM sub;
+    SET ROLE ra_role_36;
+    WITH sub AS (SELECT id FROM ra_docs_36) SELECT count(*) FROM sub;
+}
+expect {
+    3
+    0
+}
+
+test recursive-cte {
+    CREATE ROLE ra_role_37;
+    CREATE TABLE ra_docs_37 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_37 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_37 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_37 TO ra_role_37;
+    WITH RECURSIVE r(id) AS (SELECT id FROM ra_docs_37 WHERE id = 1 UNION ALL SELECT d.id FROM ra_docs_37 d JOIN r ON d.id = r.id + 1) SELECT id FROM r ORDER BY id;
+    SET ROLE ra_role_37;
+    WITH RECURSIVE r(id) AS (SELECT id FROM ra_docs_37 WHERE id = 1 UNION ALL SELECT d.id FROM ra_docs_37 d JOIN r ON d.id = r.id + 1) SELECT id FROM r ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+test union {
+    CREATE ROLE ra_role_38;
+    CREATE TABLE ra_docs_38 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_38 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_38 (id INT);
+    INSERT INTO ra_notes_38 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_38 TO ra_role_38;
+    ALTER TABLE ra_docs_38 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_38 TO ra_role_38;
+    SELECT id FROM ra_docs_38 UNION SELECT id FROM ra_notes_38 ORDER BY id;
+    SET ROLE ra_role_38;
+    SELECT id FROM ra_docs_38 UNION SELECT id FROM ra_notes_38 ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    4
+    1
+    2
+    4
+}
+
+test union-all {
+    CREATE ROLE ra_role_39;
+    CREATE TABLE ra_docs_39 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_39 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_39 (id INT);
+    INSERT INTO ra_notes_39 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_39 TO ra_role_39;
+    ALTER TABLE ra_docs_39 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_39 TO ra_role_39;
+    SELECT count(*) FROM (SELECT id FROM ra_docs_39 UNION ALL SELECT id FROM ra_notes_39) AS u;
+    SET ROLE ra_role_39;
+    SELECT count(*) FROM (SELECT id FROM ra_docs_39 UNION ALL SELECT id FROM ra_notes_39) AS u;
+}
+expect {
+    6
+    3
+}
+
+test intersect {
+    CREATE ROLE ra_role_40;
+    CREATE TABLE ra_docs_40 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_40 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_40 (id INT);
+    INSERT INTO ra_notes_40 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_40 TO ra_role_40;
+    ALTER TABLE ra_docs_40 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_40 TO ra_role_40;
+    SELECT id FROM ra_notes_40 INTERSECT SELECT id FROM ra_docs_40 ORDER BY id;
+    SET ROLE ra_role_40;
+    SELECT id FROM ra_notes_40 INTERSECT SELECT id FROM ra_docs_40 ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test except {
+    CREATE ROLE ra_role_41;
+    CREATE TABLE ra_docs_41 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_41 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_41 (id INT);
+    INSERT INTO ra_notes_41 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_41 TO ra_role_41;
+    ALTER TABLE ra_docs_41 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_41 TO ra_role_41;
+    SELECT id FROM ra_notes_41 EXCEPT SELECT id FROM ra_docs_41 ORDER BY id;
+    SET ROLE ra_role_41;
+    SELECT id FROM ra_notes_41 EXCEPT SELECT id FROM ra_docs_41 ORDER BY id;
+}
+expect {
+    4
+    1
+    2
+    4
+}
+
+test reset-role-reads-every-row-again {
+    CREATE ROLE ra_role_42;
+    CREATE TABLE ra_docs_42 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_42 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_42 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_42 TO ra_role_42;
+    SET ROLE ra_role_42;
+    SELECT count(*) FROM ra_docs_42;
+    RESET ROLE;
+    SELECT count(*) FROM ra_docs_42;
+}
+expect {
+    0
+    3
+}
+
+test set-role-none-reads-every-row-again {
+    CREATE ROLE ra_role_43;
+    CREATE TABLE ra_docs_43 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_43 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_43 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_43 TO ra_role_43;
+    SET ROLE ra_role_43;
+    SELECT count(*) FROM ra_docs_43;
+    SET ROLE NONE;
+    SELECT count(*) FROM ra_docs_43;
+}
+expect {
+    0
+    3
+}
+
+test set-role-to-the-superuser-reads-every-row {
+    CREATE ROLE ra_role_44;
+    CREATE TABLE ra_docs_44 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_44 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_44 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_44 TO ra_role_44;
+    SET ROLE postgres;
+    SELECT count(*) FROM ra_docs_44;
+}
+expect {
+    3
+}
+
+test set-local-role-ends-with-the-transaction {
+    CREATE ROLE ra_role_45;
+    CREATE TABLE ra_docs_45 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_45 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_45 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_45 TO ra_role_45;
+    BEGIN;
+    SET LOCAL ROLE ra_role_45;
+    SELECT count(*) FROM ra_docs_45;
+    COMMIT;
+    SELECT count(*) FROM ra_docs_45;
+}
+expect {
+    0
+    3
+}
+
+test every-role-reads-no-rows {
+    CREATE ROLE ra_role_46;
+    CREATE TABLE ra_docs_46 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_46 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_46 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_46 TO ra_role_46;
+    CREATE ROLE ra_other_46;
+    GRANT SELECT ON ra_docs_46 TO ra_other_46;
+    SET ROLE ra_role_46;
+    SELECT count(*) FROM ra_docs_46;
+    RESET ROLE;
+    SET ROLE ra_other_46;
+    SELECT count(*) FROM ra_docs_46;
+}
+expect {
+    0
+    0
+}
+
+test table-with-quoted-mixed-case-name {
+    CREATE ROLE ra_role_47;
+    CREATE TABLE "RaDocs47" (id INT);
+    INSERT INTO "RaDocs47" VALUES (1), (2);
+    ALTER TABLE "RaDocs47" ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON "RaDocs47" TO ra_role_47;
+    SELECT count(*) FROM "RaDocs47";
+    SET ROLE ra_role_47;
+    SELECT count(*) FROM "RaDocs47";
+}
+expect {
+    2
+    0
+}
+
+test grant-before-enabling-row-security {
+    CREATE ROLE ra_role_48;
+    CREATE TABLE ra_docs_48 (id INT);
+    INSERT INTO ra_docs_48 VALUES (1);
+    GRANT SELECT ON ra_docs_48 TO ra_role_48;
+    ALTER TABLE ra_docs_48 ENABLE ROW LEVEL SECURITY;
+    SET ROLE ra_role_48;
+    SELECT count(*) FROM ra_docs_48;
+}
+expect {
+    0
+}
+
+test disabling-row-security-shows-the-rows-to-the-role {
+    CREATE ROLE ra_role_49;
+    CREATE TABLE ra_docs_49 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_49 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_49 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_49 TO ra_role_49;
+    ALTER TABLE ra_docs_49 DISABLE ROW LEVEL SECURITY;
+    SET ROLE ra_role_49;
+    SELECT count(*) FROM ra_docs_49;
+}
+expect {
+    3
+}
+
+test enabling-row-security-hides-the-rows-in-the-same-transaction {
+    CREATE ROLE ra_role_50;
+    CREATE TABLE ra_docs_50 (id INT);
+    INSERT INTO ra_docs_50 VALUES (1), (2);
+    GRANT SELECT ON ra_docs_50 TO ra_role_50;
+    BEGIN;
+    ALTER TABLE ra_docs_50 ENABLE ROW LEVEL SECURITY;
+    SET LOCAL ROLE ra_role_50;
+    SELECT count(*) FROM ra_docs_50;
+    ROLLBACK;
+    SET ROLE ra_role_50;
+    SELECT count(*) FROM ra_docs_50;
+}
+expect {
+    0
+    2
+}
+
+test rows-inserted-after-enabling-are-hidden-too {
+    CREATE ROLE ra_role_51;
+    CREATE TABLE ra_docs_51 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_51 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_51 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_51 TO ra_role_51;
+    INSERT INTO ra_docs_51 VALUES (4, 'carol', 'd');
+    SELECT count(*) FROM ra_docs_51;
+    SET ROLE ra_role_51;
+    SELECT count(*) FROM ra_docs_51;
+}
+expect {
+    4
+    0
+}
+
+test superuser-inserts-updates-and-deletes-rows {
+    CREATE ROLE ra_role_52;
+    CREATE TABLE ra_docs_52 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_52 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_52 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_52 TO ra_role_52;
+    INSERT INTO ra_docs_52 VALUES (5, 'erin', 'e');
+    UPDATE ra_docs_52 SET title = 'z' WHERE id = 1;
+    DELETE FROM ra_docs_52 WHERE id = 2;
+    SELECT id, title FROM ra_docs_52 ORDER BY id;
+}
+expect {
+    1|z
+    3|c
+    5|e
+}
+
+test superuser-inserts-rows-selected-from-table-with-row-security {
+    CREATE ROLE ra_role_53;
+    CREATE TABLE ra_docs_53 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_53 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_53 (id INT);
+    INSERT INTO ra_notes_53 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_53 TO ra_role_53;
+    ALTER TABLE ra_docs_53 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_53 TO ra_role_53;
+    INSERT INTO ra_notes_53 SELECT id + 10 FROM ra_docs_53;
+    SELECT id FROM ra_notes_53 ORDER BY id;
+}
+expect {
+    1
+    2
+    4
+    11
+    12
+    13
+}
+
+test superuser-updates-from-table-with-row-security {
+    CREATE ROLE ra_role_54;
+    CREATE TABLE ra_docs_54 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_54 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_54 (id INT);
+    INSERT INTO ra_notes_54 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_54 TO ra_role_54;
+    ALTER TABLE ra_docs_54 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_54 TO ra_role_54;
+    UPDATE ra_notes_54 SET id = d.id * 10 FROM ra_docs_54 d WHERE d.id = ra_notes_54.id;
+    SELECT id FROM ra_notes_54 ORDER BY id;
+}
+expect {
+    4
+    10
+    20
+}
+
+test superuser-deletes-with-subquery-on-table-with-row-security {
+    CREATE ROLE ra_role_55;
+    CREATE TABLE ra_docs_55 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_55 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    CREATE TABLE ra_notes_55 (id INT);
+    INSERT INTO ra_notes_55 VALUES (1), (2), (4);
+    GRANT SELECT ON ra_notes_55 TO ra_role_55;
+    ALTER TABLE ra_docs_55 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_55 TO ra_role_55;
+    DELETE FROM ra_notes_55 WHERE id IN (SELECT id FROM ra_docs_55);
+    SELECT id FROM ra_notes_55;
+}
+expect {
+    4
+}
+
+test role-cannot-insert-rows {
+    CREATE ROLE ra_role_56;
+    CREATE TABLE ra_docs_56 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_56 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_56 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_56 TO ra_role_56;
+    SET ROLE ra_role_56;
+    INSERT INTO ra_docs_56 VALUES (9, 'mallory', 'x');
+}
+@sqlstate 42501
+expect error {
+    permission denied for table ra_docs_56
+}
+
+test role-cannot-update-rows {
+    CREATE ROLE ra_role_57;
+    CREATE TABLE ra_docs_57 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_57 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_57 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_57 TO ra_role_57;
+    SET ROLE ra_role_57;
+    UPDATE ra_docs_57 SET title = 'x' WHERE id = 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table ra_docs_57
+}
+
+test role-cannot-delete-rows {
+    CREATE ROLE ra_role_58;
+    CREATE TABLE ra_docs_58 (id INT PRIMARY KEY, owner TEXT, title TEXT);
+    INSERT INTO ra_docs_58 VALUES (1, 'alice', 'a'), (2, 'bob', 'b'), (3, 'alice', 'c');
+    ALTER TABLE ra_docs_58 ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT ON ra_docs_58 TO ra_role_58;
+    SET ROLE ra_role_58;
+    DELETE FROM ra_docs_58 WHERE id = 1;
+}
+@sqlstate 42501
+expect error {
+    permission denied for table ra_docs_58
+}
