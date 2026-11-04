@@ -7460,6 +7460,15 @@ pub struct ResolvedFkRef {
 }
 
 impl ResolvedFkRef {
+    /// Whether the foreign key points from a table to itself.
+    pub fn is_self_reference(&self) -> bool {
+        self.child_namespace == self.fk.parent_namespace
+            && self
+                .child_table
+                .name
+                .eq_ignore_ascii_case(&self.fk.parent_table)
+    }
+
     /// Returns if any referenced parent column can change when these column positions are updated.
     pub fn parent_key_may_change(
         &self,
