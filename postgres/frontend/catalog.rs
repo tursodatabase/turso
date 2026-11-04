@@ -11,11 +11,11 @@ use turso_core::{
         BTreeTable, GeneratedType, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX,
     },
     security::roles::{Role, RoleCatalog, RoleId},
-    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions,
-    Result, Statement, Value, WalkControl,
+    Connection, Dialect, Func, IOResult, LimboError, NamespaceId, OpenOptions, Result, Statement,
+    Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::{self, RefAct, SortOrder};
+use turso_parser::ast::{RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
@@ -2164,7 +2164,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(render_expr(&chk.expr)), // conbin
+                    Value::build_text(expression_text(&chk.expr, btree)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -2213,9 +2213,9 @@ impl SnapshotRows for PgAttrdefTable {
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 let adbin = match (&col.default, col.generated_type()) {
-                    (Some(default_expr), _) => render_expr(default_expr),
+                    (Some(default_expr), _) => column_expression_text(default_expr, btree, col),
                     (None, GeneratedType::Stored { expr, .. }) => {
-                        generation_expression_text(expr, btree)
+                        column_expression_text(expr, btree, col)
                     }
                     (None, _) => continue,
                 };
@@ -2232,11 +2232,20 @@ impl SnapshotRows for PgAttrdefTable {
     }
 }
 
-/// A generation expression as `pg_get_expr` prints it.
-fn generation_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable) -> String {
+/// The DEFAULT or generation expression of `column` as `pg_get_expr` prints it.
+fn column_expression_text(
+    expr: &turso_parser::ast::Expr,
+    table: &BTreeTable,
+    column: &turso_core::schema::Column,
+) -> String {
+    typed_expression_text(expr, table, column_type_text(column).as_deref())
+}
+
+/// An expression of `table` as `pg_get_expr` prints it.
+fn expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable) -> String {
     use turso_parser::ast::{Expr, LikeOperator, Literal, Operator, UnaryOperator};
 
-    let text = |expr: &Expr| generation_expression_text(expr, table);
+    let text = |expr: &Expr| expression_text(expr, table);
     match expr {
         Expr::Column { column, .. } => quote_identifier(
             table.columns()[*column]
@@ -2248,7 +2257,7 @@ fn generation_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable
         Expr::Literal(Literal::Null) => "NULL".to_string(),
         Expr::Literal(Literal::True) => "true".to_string(),
         Expr::Literal(Literal::False) => "false".to_string(),
-        Expr::Literal(Literal::String(quoted)) => format!("{quoted}::text"),
+        Expr::Literal(Literal::String(quoted)) => quoted.clone(),
         Expr::Literal(Literal::Numeric(number)) => numeric_literal_text(number),
         Expr::Parenthesized(exprs) if exprs.len() == 1 => text(&exprs[0]),
         Expr::Cast {
@@ -2262,13 +2271,34 @@ fn generation_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable
             }
             _ => format!("({})::{}", text(operand), cast_type_text(type_name)),
         },
-        Expr::Binary(lhs, Operator::Is, rhs) => {
-            format!("(NOT ({} IS DISTINCT FROM {}))", text(lhs), text(rhs))
-        }
-        Expr::Binary(lhs, Operator::IsNot, rhs) => {
-            format!("({} IS DISTINCT FROM {})", text(lhs), text(rhs))
+        Expr::Binary(lhs, op @ (Operator::Is | Operator::IsNot), rhs) => {
+            let is = *op == Operator::Is;
+            if let Some(truth) = boolean_constant(rhs).filter(|_| is_boolean(lhs, table)) {
+                let not = if is { "" } else { " NOT" };
+                let truth = if truth { "TRUE" } else { "FALSE" };
+                return format!("({} IS{not} {truth})", text(lhs));
+            }
+            let (lhs, rhs) = operands_text(lhs, rhs, table);
+            if is {
+                format!("(NOT ({lhs} IS DISTINCT FROM {rhs}))")
+            } else {
+                format!("({lhs} IS DISTINCT FROM {rhs})")
+            }
         }
         Expr::Binary(lhs, op, rhs) => {
+            let (lhs, rhs) = match op {
+                Operator::Equals
+                | Operator::NotEquals
+                | Operator::Less
+                | Operator::LessEquals
+                | Operator::Greater
+                | Operator::GreaterEquals => operands_text(lhs, rhs, table),
+                Operator::Concat => (
+                    typed_expression_text(lhs, table, Some("text")),
+                    typed_expression_text(rhs, table, Some("text")),
+                ),
+                _ => (text(lhs), text(rhs)),
+            };
             let op = match op {
                 Operator::Equals => "=".to_string(),
                 Operator::NotEquals => "<>".to_string(),
@@ -2276,7 +2306,7 @@ fn generation_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable
                 Operator::Or => "OR".to_string(),
                 op => op.to_string(),
             };
-            format!("({} {op} {})", text(lhs), text(rhs))
+            format!("({lhs} {op} {rhs})")
         }
         Expr::Unary(UnaryOperator::Not, operand) => match operand.as_ref() {
             Expr::FunctionCall { name, args, .. }
@@ -2311,7 +2341,11 @@ fn generation_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable
             }
         }
         Expr::InList { lhs, not, rhs } if !rhs.is_empty() => {
-            let elements: Vec<String> = rhs.iter().map(|e| text(e)).collect();
+            let element_type = operand_type(lhs, table);
+            let elements: Vec<String> = rhs
+                .iter()
+                .map(|e| typed_expression_text(e, table, element_type.as_deref()))
+                .collect();
             let comparison = if *not { "<> ALL" } else { "= ANY" };
             format!(
                 "({} {comparison} (ARRAY[{}]))",
@@ -2346,7 +2380,11 @@ fn generation_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable
                 _ => ("~", rhs),
             };
             let not = if *not { "!" } else { "" };
-            format!("({} {not}{op} {})", text(lhs), text(pattern))
+            format!(
+                "({} {not}{op} {})",
+                text(lhs),
+                typed_expression_text(pattern, table, Some("text"))
+            )
         }
         Expr::FunctionCall {
             name,
@@ -2360,6 +2398,11 @@ fn generation_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable
             && filter_over.filter_clause.is_none()
             && filter_over.over_clause.is_none() =>
         {
+            if args.is_empty() {
+                if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
+                    return keyword.to_string();
+                }
+            }
             let name = name.as_str().to_lowercase();
             if name == "textlike" && args.len() == 2 {
                 return like_text(&args[0], false, &args[1], table);
@@ -2394,6 +2437,114 @@ fn generation_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable
             sql
         }
         _ => fallback_expression_text(expr, table),
+    }
+}
+
+/// `expr` as `pg_get_expr` prints it where its value has type `ty`, which labels a string
+/// literal with that type.
+fn typed_expression_text(
+    expr: &turso_parser::ast::Expr,
+    table: &BTreeTable,
+    ty: Option<&str>,
+) -> String {
+    use turso_parser::ast::{Expr, Literal};
+
+    match (expr, ty) {
+        (Expr::Literal(Literal::String(quoted)), Some(ty)) => format!("{quoted}::{ty}"),
+        (Expr::Parenthesized(exprs), _) if exprs.len() == 1 => {
+            typed_expression_text(&exprs[0], table, ty)
+        }
+        _ => expression_text(expr, table),
+    }
+}
+
+/// The two operands of a comparison, each string literal labeled with the type of the other
+/// operand.
+fn operands_text(
+    lhs: &turso_parser::ast::Expr,
+    rhs: &turso_parser::ast::Expr,
+    table: &BTreeTable,
+) -> (String, String) {
+    (
+        typed_expression_text(lhs, table, operand_type(rhs, table).as_deref()),
+        typed_expression_text(rhs, table, operand_type(lhs, table).as_deref()),
+    )
+}
+
+/// The PostgreSQL type of `expr` when it is a column or a cast.
+fn operand_type(expr: &turso_parser::ast::Expr, table: &BTreeTable) -> Option<String> {
+    use turso_parser::ast::Expr;
+
+    match expr {
+        Expr::Column { column, .. } => column_type_text(&table.columns()[*column]),
+        Expr::Id(name) => column_type_text(table.get_column(name.as_str())?.1),
+        Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } => Some(cast_type_text(type_name)),
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => operand_type(&exprs[0], table),
+        _ => None,
+    }
+}
+
+/// The PostgreSQL name of the type of `column`, if it is a type this catalog knows.
+fn column_type_text(column: &turso_core::schema::Column) -> Option<String> {
+    let base = column.ty_str.split('(').next().unwrap_or_default().trim();
+    let oid = sqlite_type_to_pg_oid(base);
+    if oid == 25 && !base.eq_ignore_ascii_case("text") {
+        return None;
+    }
+    let name = crate::functions::format_type(oid, -1);
+    if name == "unknown" {
+        return None;
+    }
+    Some(if column.is_array() {
+        format!("{name}[]")
+    } else {
+        name
+    })
+}
+
+/// The truth value that the translator writes `IS [NOT] TRUE` and `IS [NOT] FALSE` with.
+fn boolean_constant(expr: &turso_parser::ast::Expr) -> Option<bool> {
+    use turso_parser::ast::{Expr, Literal};
+
+    match expr {
+        Expr::Literal(Literal::Numeric(n)) if n == "1" => Some(true),
+        Expr::Literal(Literal::Numeric(n)) if n == "0" => Some(false),
+        Expr::Literal(Literal::True) => Some(true),
+        Expr::Literal(Literal::False) => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether `expr` has a boolean value.
+fn is_boolean(expr: &turso_parser::ast::Expr, table: &BTreeTable) -> bool {
+    use turso_parser::ast::{Expr, Literal, Operator, UnaryOperator};
+
+    match expr {
+        Expr::Binary(_, op, _) => matches!(
+            op,
+            Operator::Equals
+                | Operator::NotEquals
+                | Operator::Less
+                | Operator::LessEquals
+                | Operator::Greater
+                | Operator::GreaterEquals
+                | Operator::And
+                | Operator::Or
+                | Operator::Is
+                | Operator::IsNot
+        ),
+        Expr::Unary(UnaryOperator::Not, _)
+        | Expr::IsNull(_)
+        | Expr::NotNull(_)
+        | Expr::Between { .. }
+        | Expr::InList { .. }
+        | Expr::Like { .. }
+        | Expr::Literal(Literal::True | Literal::False) => true,
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_boolean(&exprs[0], table),
+        _ => operand_type(expr, table).is_some_and(|ty| ty == "boolean"),
     }
 }
 
@@ -2448,7 +2599,7 @@ fn glob_like_text(
     };
     Some(format!(
         "({} {op} '{}'::text)",
-        generation_expression_text(&lhs, table),
+        expression_text(&lhs, table),
         glob_pattern_to_like(glob)?
     ))
 }
@@ -2494,25 +2645,35 @@ fn like_text(
     let op = if not { "!~~" } else { "~~" };
     format!(
         "({} {op} {})",
-        generation_expression_text(lhs, table),
-        generation_expression_text(rhs, table)
+        expression_text(lhs, table),
+        typed_expression_text(rhs, table, Some("text"))
     )
 }
 
-/// The stored SQL of an expression that has no PostgreSQL form here, with its columns named.
+/// The stored SQL of an expression that has no PostgreSQL form here, with its columns and role
+/// keywords named.
 fn fallback_expression_text(expr: &turso_parser::ast::Expr, table: &BTreeTable) -> String {
+    use turso_core::{walk_expr_mut, WalkControl};
     use turso_parser::ast::{Expr, Name};
 
     let mut expr = expr.clone();
-    turso_core::walk_expr_mut(&mut expr, &mut |e: &mut Expr| {
-        if let Expr::Column { column, .. } = e {
-            let name = table.columns()[*column]
-                .name
-                .as_deref()
-                .expect("table columns have names");
-            *e = Expr::Id(Name::from_string(quote_identifier(name)));
+    walk_expr_mut(&mut expr, &mut |e: &mut Expr| {
+        match e {
+            Expr::Column { column, .. } => {
+                let name = table.columns()[*column]
+                    .name
+                    .as_deref()
+                    .expect("table columns have names");
+                *e = Expr::Id(Name::from_string(quote_identifier(name)));
+            }
+            Expr::FunctionCall { name, args, .. } if args.is_empty() => {
+                if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
+                    *e = Expr::Id(Name::from_string(keyword));
+                }
+            }
+            _ => {}
         }
-        Ok(turso_core::WalkControl::Continue)
+        Ok(WalkControl::Continue)
     })
     .expect("naming the columns of an expression does not fail");
     expr.to_string()
@@ -4153,7 +4314,7 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // CHECK constraints
         for chk in &btree.check_constraints {
             if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", render_expr(&chk.expr)));
+                return Some(format!("CHECK ({})", expression_text(&chk.expr, btree)));
             }
             constraint_oid += 1;
         }
@@ -4177,22 +4338,6 @@ fn constraint_column_list<'a>(
         })
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn render_expr(expr: &ast::Expr) -> String {
-    let mut expr = expr.clone();
-    walk_expr_mut(&mut expr, &mut |expr| {
-        if let ast::Expr::FunctionCall { name, args, .. } = expr {
-            if args.is_empty() {
-                if let Some(keyword) = turso_pg_parser::translator::role_keyword(name.as_str()) {
-                    *expr = ast::Expr::Id(ast::Name::from_string(keyword));
-                }
-            }
-        }
-        Ok(WalkControl::Continue)
-    })
-    .expect("rewriting role functions does not fail");
-    expr.to_string()
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).
@@ -4421,7 +4566,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_expression_text_names_columns_in_expressions_it_cannot_print() {
+    fn expression_text_names_columns_in_expressions_it_cannot_print() {
         use turso_parser::ast::{Expr, Name, TableInternalId};
 
         let table = BTreeTable::from_sql("CREATE TABLE t (a INTEGER, \"Mixed\" TEXT)", 2).unwrap();
@@ -4434,10 +4579,7 @@ mod tests {
             }),
             Name::exact("BINARY".to_string()),
         );
-        assert_eq!(
-            generation_expression_text(&expr, &table),
-            "\"Mixed\" COLLATE BINARY"
-        );
+        assert_eq!(expression_text(&expr, &table), "\"Mixed\" COLLATE BINARY");
     }
 
     #[test]

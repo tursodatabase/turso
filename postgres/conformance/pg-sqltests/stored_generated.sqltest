@@ -1090,3 +1090,20 @@ test stored-generated-column-drop-expression-quoted-mixed-case-name {
 expect {
     z
 }
+
+test stored-generated-column-catalog-typed-literal-and-boolean-test-deparse {
+    CREATE TABLE t (a int, d date, t text,
+        g boolean GENERATED ALWAYS AS (d > '2020-01-01') STORED,
+        k boolean GENERATED ALWAYS AS (a > 0 IS TRUE) STORED,
+        o boolean GENERATED ALWAYS AS (a IS NOT DISTINCT FROM 1) STORED,
+        q text GENERATED ALWAYS AS (t || 'z') STORED);
+    SELECT a.attname, pg_get_expr(d.adbin, d.adrelid)
+    FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+    ORDER BY a.attnum;
+}
+expect {
+    g|(d > '2020-01-01'::date)
+    k|((a > 0) IS TRUE)
+    o|(NOT (a IS DISTINCT FROM 1))
+    q|(t || 'z'::text)
+}
