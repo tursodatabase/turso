@@ -313,12 +313,15 @@ fn builtin_ordering(type_name: &str) -> Option<TypeOrdering> {
 /// the type, so they are not compared at all. json has no comparison in
 /// PostgreSQL. jsonb ignores key order, inet and cidr compare address bytes and
 /// masks, and macaddr accepts several spellings of one address, none of which
-/// comparing the stored text or blob does.
+/// comparing the stored text or blob does. A built-in type missing from this
+/// list has no comparison until it is added.
 fn builtin_has_comparison(type_name: &str) -> bool {
-    !matches!(
-        type_name,
-        "json" | "jsonb" | "inet" | "cidr" | "macaddr" | "macaddr8"
-    )
+    match type_name {
+        "uuid" | "boolean" | "varchar" | "date" | "time" | "timestamp" | "timestamptz"
+        | "smallint" | "bigint" | "bytea" | "numeric" => true,
+        "json" | "jsonb" | "inet" | "cidr" | "macaddr" | "macaddr8" => false,
+        _ => false,
+    }
 }
 
 /// Operators on built-in types. User types have none: `x + 1` on a user type is
@@ -8606,6 +8609,20 @@ mod tests {
         assert!(schema
             .get_table(NamespaceId::ROOT, SCHEMA_TABLE_NAME)
             .is_some());
+    }
+
+    #[test]
+    fn every_builtin_type_says_whether_it_has_a_comparison() {
+        let without_comparison = ["json", "jsonb", "inet", "cidr", "macaddr", "macaddr8"];
+        let schema = Schema::new();
+        for type_def in schema.type_registry.values() {
+            let name = type_def.name.as_str();
+            assert_eq!(
+                type_def.has_comparison(),
+                !without_comparison.contains(&name),
+                "built-in type {name} is missing from builtin_has_comparison"
+            );
+        }
     }
 
     #[test]
