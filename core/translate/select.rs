@@ -1050,7 +1050,18 @@ fn result_column_is_a_sort_key(
     order_by: &[ast::SortedColumn],
     group_by: Option<&ast::GroupBy>,
 ) -> bool {
-    let names_column = |key: &ast::Expr| match key {
+    // SQLite reads an ORDER BY or GROUP BY term through parentheses and a
+    // leading `+` to decide whether it names a result column, so `(k)`,
+    // `((k))`, `(1)` and `+1` name it as `k` and `1` do. (A `-1` is the
+    // position -1, out of range, handled where positions are resolved.)
+    fn skip_parens(key: &ast::Expr) -> &ast::Expr {
+        match key {
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => skip_parens(&exprs[0]),
+            ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => skip_parens(inner),
+            _ => key,
+        }
+    }
+    let names_column = |key: &ast::Expr| match skip_parens(key) {
         ast::Expr::Literal(ast::Literal::Numeric(number)) => {
             number.parse::<usize>().ok() == Some(output_index + 1)
         }
