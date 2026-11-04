@@ -12,7 +12,10 @@ use crate::{
     translate::{
         catalog::CatalogContext,
         emitter::Resolver,
-        expr::expr_type::{query_column_type, type_of, type_ordering, ExprType},
+        expr::{
+            expr_type::{query_column_type, type_of, type_ordering, ExprType},
+            row_value_component_expr, row_value_len,
+        },
         expr_context::{ExprContext, ExprProperties},
         plan::{Plan, SelectPlan, TableReferences},
     },
@@ -539,13 +542,12 @@ pub fn in_subquery_collation(
     let rhs = &query.select_result_columns()[column].expr;
     let lhs_context = ExprContext::new(lhs_tables, resolver);
     let rhs_context = ExprContext::new(Some(query.select_table_references()), resolver);
-    let rhs_order = operand_order(
-        &query_column_type(query, column, resolver),
-        resolver.schema(),
-    );
-    let lhs_order = expr_operand_order(lhs, &lhs_context);
+    let types = [
+        type_of(lhs, &lhs_context.type_env()),
+        query_column_type(query, column, resolver),
+    ];
     let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
-    if let Some(ordering) = common_ordering([lhs_order, rhs_order], has_collate)? {
+    if let Some(ordering) = common_ordering(&types, resolver.schema(), has_collate)? {
         return Ok(CollationSeq::Type(ordering));
     }
     comparison_collation_across_queries(lhs, &lhs_context, rhs, &rhs_context)
@@ -619,13 +621,36 @@ pub fn compound_column_collation(
     column: usize,
     resolver: &Resolver,
 ) -> Result<CollationSeq> {
-    let columns = arms.iter().map(|select| {
+    first_collation(compound_column_exprs(arms, column, resolver))
+}
+
+/// The collation of a compound SELECT's ORDER BY term `column COLLATE name`,
+/// where `arms` are its SELECTs. The COLLATE applies to the column of every
+/// SELECT, so it is an error when any of them has a type that takes none, as
+/// in a comparison.
+pub fn compound_order_by_collation(
+    arms: &[&SelectPlan],
+    column: usize,
+    explicit_collation: TextCollation,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    common_ordering_of(compound_column_exprs(arms, column, resolver), true)?;
+    Ok(CollationSeq::Text(explicit_collation))
+}
+
+/// Column `column` of every SELECT in `arms`, each with the context its
+/// columns refer to.
+fn compound_column_exprs<'a, 's>(
+    arms: &'a [&'a SelectPlan],
+    column: usize,
+    resolver: &'a Resolver<'s>,
+) -> impl Iterator<Item = (&'a Expr, ExprContext<'a, 's>)> + Clone + 'a {
+    arms.iter().map(move |select| {
         (
             &select.result_columns[column].expr,
             ExprContext::new(Some(&select.table_references), resolver),
         )
-    });
-    first_collation(columns)
+    })
 }
 
 /// The text collation of the first expression that has one, BINARY when none
@@ -644,83 +669,225 @@ pub(crate) fn first_text_collation<'a, 'c, 's: 'c>(
 /// The order that values compared with each other use when one of them has a
 /// type with an order. Text collations do not apply to such types, so an
 /// explicit COLLATE among them is an error, and so are two different orders:
-/// PostgreSQL has no operator that compares numeric with an array.
-fn common_type_ordering<'a, 'c, 's: 'c>(
-    exprs: impl IntoIterator<Item = (&'a Expr, impl Borrow<ExprContext<'c, 's>>)>,
+/// PostgreSQL has no operator that compares numeric with an array. An
+/// explicit COLLATE is also an error when any of the values has a custom type
+/// that takes no COLLATE, such as `d = '2024-01-02' COLLATE nocase` for a
+/// date column d.
+fn common_type_ordering<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
+    exprs: impl IntoIterator<Item = (&'a Expr, C)> + Clone,
 ) -> Result<Option<TypeOrdering>> {
-    let mut has_collate = false;
-    // Most comparisons have two operands; keep their orders off the heap.
-    let orders: SmallVec<[OperandOrder; 2]> = exprs
+    let has_collate = exprs
+        .clone()
         .into_iter()
-        .map(|(expr, context)| {
-            has_collate |= has_collate_operator(expr);
-            expr_operand_order(expr, context.borrow())
-        })
-        .collect();
-    common_ordering(orders, has_collate)
+        .any(|(expr, _)| has_collate_operator(expr));
+    common_ordering_of(exprs, has_collate)
 }
 
-/// The one order among `orders`, as [common_type_ordering] decides it.
-/// `has_collate` says whether any of the values has a COLLATE operator.
-fn common_ordering(
-    orders: impl IntoIterator<Item = OperandOrder>,
+/// The one order among the types of `exprs`, as [common_type_ordering]
+/// decides it. `has_collate` says whether a COLLATE applies to the values.
+fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
+    exprs: impl IntoIterator<Item = (&'a Expr, C)>,
     has_collate: bool,
 ) -> Result<Option<TypeOrdering>> {
-    let mut found: Option<TypeOrdering> = None;
-    let mut has_array_of_unknown_elements = false;
-    for order in orders {
-        let ordering = match order {
+    // Most comparisons have two operands; keep their types off the heap.
+    let mut types: SmallVec<[ExprType; 2]> = SmallVec::new();
+    let mut schema = None;
+    for (expr, context) in exprs {
+        let context: ExprContext<'c, 's> = *context.borrow();
+        types.push(type_of(expr, &context.type_env()));
+        schema.get_or_insert(context.schema());
+    }
+    match schema {
+        Some(schema) => common_ordering(&types, schema, has_collate),
+        None => Ok(None),
+    }
+}
+
+/// The one order among values of `types`, as [common_type_ordering] decides
+/// it. `has_collate` says whether a COLLATE applies to the values. Every
+/// COLLATE that applies to a value is checked here, through [operand_order].
+fn common_ordering(
+    types: &[ExprType],
+    schema: &Schema,
+    has_collate: bool,
+) -> Result<Option<TypeOrdering>> {
+    let mut found: Option<(TypeOrdering, &ExprType)> = None;
+    let mut array_of_unknown_elements = None;
+    for ty in types {
+        let ordering = match operand_order(ty, schema, has_collate)? {
             OperandOrder::None => continue,
             OperandOrder::ArrayOfUnknownElements => {
-                has_array_of_unknown_elements = true;
+                array_of_unknown_elements.get_or_insert(ty);
                 continue;
             }
             OperandOrder::Type(ordering) => ordering,
         };
         match found {
-            Some(other) if other != ordering => return Err(cannot_compare(other, ordering)),
-            _ => found = Some(ordering),
+            None => found = Some((ordering, ty)),
+            Some((other, _)) if other == ordering => found = Some((ordering, ty)),
+            Some((_, other_ty)) => return Err(cannot_compare(other_ty, ty)),
         }
     }
-    let found = match (found, has_array_of_unknown_elements) {
-        (None, true) => Some(TypeOrdering::Array),
-        (Some(other), true) if !matches!(other, TypeOrdering::Array | TypeOrdering::TextArray) => {
-            return Err(cannot_compare(other, TypeOrdering::Array));
+    match (found, array_of_unknown_elements) {
+        (None, Some(_)) => Ok(Some(TypeOrdering::Array)),
+        (Some((other, other_ty)), Some(array_ty))
+            if !matches!(other, TypeOrdering::Array | TypeOrdering::TextArray) =>
+        {
+            Err(cannot_compare(other_ty, array_ty))
         }
-        (found, _) => found,
-    };
-    if let (Some(ordering), true) = (found, has_collate) {
-        return Err(LimboError::ParseError(format!(
-            "collations are not supported by type {}",
-            ordering.name()
-        )));
+        (found, _) => Ok(found.map(|(ordering, _)| ordering)),
     }
-    Ok(found)
 }
 
-/// How the values of a table or index column compare: the order of its type
-/// when it has one, otherwise the explicit COLLATE, if any. A type with its own
-/// order doesn't accept a COLLATE.
+/// How the values of a table or index column of type `ty` compare: the order
+/// of its type when it has one, otherwise the explicit COLLATE, if any. A type
+/// with its own order doesn't accept a COLLATE, and neither does a custom type
+/// that isn't text.
 pub(crate) fn key_collation(
     explicit_collation: Option<TextCollation>,
-    ordering: Option<TypeOrdering>,
+    ty: &ExprType,
+    schema: &Schema,
 ) -> Result<Option<CollationSeq>> {
-    match (ordering, explicit_collation) {
-        (Some(ordering), Some(_)) => Err(LimboError::ParseError(format!(
-            "collations are not supported by type {}",
-            ordering.name()
-        ))),
-        (Some(ordering), None) => Ok(Some(CollationSeq::Type(ordering))),
-        (None, explicit_collation) => Ok(explicit_collation.map(CollationSeq::Text)),
+    let ordering = common_ordering(
+        std::slice::from_ref(ty),
+        schema,
+        explicit_collation.is_some(),
+    )?;
+    Ok(match ordering {
+        Some(ordering) => Some(CollationSeq::Type(ordering)),
+        None => explicit_collation.map(CollationSeq::Text),
+    })
+}
+
+/// Fails when `operand`, the operand of a COLLATE operator, has a type that
+/// takes no COLLATE, such as `d COLLATE nocase` for a date d.
+pub(crate) fn check_collate_operand(operand: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    common_ordering_of([(operand, context)], true).map(|_| ())
+}
+
+/// Fails when `expr` itself, not counting its operands, applies a COLLATE to
+/// a type that takes none or compares two types with different orders. These
+/// are the errors that compiling `expr` would give, found by the same
+/// checks, so that `WHERE 0 AND d = 'x' COLLATE nocase` fails like
+/// `WHERE d = 'x' COLLATE nocase` for a date d.
+pub(crate) fn check_expr_collation(expr: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    match expr {
+        Expr::Collate(operand, _) => check_collate_operand(operand, context),
+        Expr::Binary(lhs, op, rhs) if op.is_comparison() => check_comparison(lhs, rhs, context),
+        // Compiled as `lhs >= start AND lhs <= end`.
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            check_comparison(lhs, start, context)?;
+            check_comparison(lhs, end, context)
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            let operands =
+                std::iter::once(lhs.as_ref()).chain(rhs.iter().map(|item| item.as_ref()));
+            common_type_ordering(operands.map(|expr| (expr, context)))?;
+            Ok(())
+        }
+        // Compiled as `base = when` for each WHEN.
+        Expr::Case {
+            base: Some(base),
+            when_then_pairs,
+            ..
+        } => when_then_pairs
+            .iter()
+            .try_for_each(|(when, _)| check_comparison(base, when, context)),
+        Expr::FunctionCall { name, args, .. } => {
+            let func = context
+                .catalog()
+                .resolve_function(name.as_str(), args.len())?;
+            if func.is_some_and(|func| func.needs_collation()) {
+                common_type_ordering(args.iter().map(|arg| (arg.as_ref(), context)))?;
+            }
+            Ok(())
+        }
+        // These compare a value with the values of a subquery, whose types are
+        // known only once it is planned. Planning it checks the comparison
+        // through [in_subquery_collation].
+        Expr::InSelect { .. } | Expr::InTable { .. } | Expr::SubqueryResult { .. } => Ok(()),
+        // These compare nothing with a collation.
+        Expr::Binary(..)
+        | Expr::Case { base: None, .. }
+        | Expr::Cast { .. }
+        | Expr::Column { .. }
+        | Expr::Default
+        | Expr::DoublyQualified(..)
+        | Expr::Exists(_)
+        | Expr::FieldAccess { .. }
+        | Expr::FunctionCallStar { .. }
+        | Expr::Id(_)
+        | Expr::IsNull(_)
+        | Expr::Like { .. }
+        | Expr::Literal(_)
+        | Expr::MergedColumn(_)
+        | Expr::Name(_)
+        | Expr::NotNull(_)
+        | Expr::Parenthesized(_)
+        | Expr::Qualified(..)
+        | Expr::Raise(..)
+        | Expr::Register { .. }
+        | Expr::RowId { .. }
+        | Expr::Subquery(_)
+        | Expr::Unary(..)
+        | Expr::Variable(_) => Ok(()),
+        Expr::Array { .. } | Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
     }
 }
 
-fn cannot_compare(a: TypeOrdering, b: TypeOrdering) -> LimboError {
-    LimboError::ParseError(format!(
-        "cannot compare type {} with type {}",
-        a.name(),
-        b.name()
-    ))
+/// The check of [check_expr_collation] for `lhs` compared with `rhs`. Row
+/// values, as in `(SELECT d, 1) = ('x' COLLATE nocase, 1)`, compare element by
+/// element, each pair with its own collation, split as code generation splits
+/// them.
+fn check_comparison(lhs: &Expr, rhs: &Expr, context: &ExprContext<'_, '_>) -> Result<()> {
+    let len = row_value_len(lhs)?.max(row_value_len(rhs)?);
+    if len > 1 {
+        for idx in 0..len {
+            let lhs = row_value_component_expr(lhs, idx)?;
+            let rhs = row_value_component_expr(rhs, idx)?;
+            check_comparison(&lhs, &rhs, context)?;
+        }
+        return Ok(());
+    }
+    common_type_ordering([(lhs, context), (rhs, context)])?;
+    Ok(())
+}
+
+/// Fails when values of `ty` take no COLLATE. As in PostgreSQL, only text
+/// types take one: `date`, `uuid` and a type with an integer base don't,
+/// `varchar` and a type with a text base do. No array takes one, because
+/// arrays compare element by element without a collation, so the COLLATE
+/// would be ignored. SQLite's own types all take one.
+fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
+    let accepts = match ty {
+        ExprType::Custom { type_def, .. } => schema.type_accepts_collate(type_def)?,
+        ExprType::Array { .. } => false,
+        ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null => true,
+        // Nothing says the value is text, as in `(d * 2) COLLATE nocase` when no
+        // function runs `*` for a date d.
+        ExprType::Unknown => false,
+        // Checked again once the type is known: `(SELECT d) COLLATE nocase` is
+        // checked as a date when it is compiled.
+        ExprType::NotKnownYet => true,
+        // A COLLATE inside a row value, as in `(1, s COLLATE nocase) = (SELECT
+        // 1, 'a')`, applies to one of its values, and that value is checked as
+        // the operand of its own COLLATE.
+        ExprType::RowValue => true,
+    };
+    if accepts {
+        return Ok(());
+    }
+    Err(LimboError::ParseError(format!(
+        "collations are not supported by type {ty}"
+    )))
+}
+
+fn cannot_compare(a: &ExprType, b: &ExprType) -> LimboError {
+    LimboError::ParseError(format!("cannot compare type {a} with type {b}"))
 }
 
 /// The order a value brings to a comparison with other values.
@@ -735,19 +902,27 @@ enum OperandOrder {
     ArrayOfUnknownElements,
 }
 
-fn expr_operand_order(expr: &Expr, context: &ExprContext<'_, '_>) -> OperandOrder {
-    let ty = type_of(expr, &context.type_env());
-    operand_order(&ty, context.schema())
-}
-
-fn operand_order(ty: &ExprType, schema: &Schema) -> OperandOrder {
-    if ty.is_array_of_unknown_elements() {
-        return OperandOrder::ArrayOfUnknownElements;
+/// The order a value of type `ty` brings to a comparison. `has_collate` says
+/// whether a COLLATE applies to the compared values; it is an error when `ty`
+/// takes none.
+fn operand_order(ty: &ExprType, schema: &Schema, has_collate: bool) -> Result<OperandOrder> {
+    if has_collate {
+        check_type_accepts_collate(ty, schema)?;
     }
-    match type_ordering(ty, schema) {
+    if ty.is_array_of_unknown_elements() {
+        return Ok(OperandOrder::ArrayOfUnknownElements);
+    }
+    Ok(match type_ordering(ty, schema) {
+        // The values compare in the type's order, which no COLLATE changes, so
+        // a COLLATE here would be ignored.
+        Some(_) if has_collate => {
+            return Err(LimboError::ParseError(format!(
+                "collations are not supported by type {ty}"
+            )))
+        }
         Some(ordering) => OperandOrder::Type(ordering),
         None => OperandOrder::None,
-    }
+    })
 }
 
 /// The collation of one expression, or None when it has none (SQLite's

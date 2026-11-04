@@ -41,9 +41,16 @@ pub(crate) enum ExprType {
     /// Parameters (`?`) should be untyped too, but are `Builtin(Any)` for now.
     Untyped,
     Null,
-    /// A value whose type nothing declares: the result of a custom type's own
-    /// operator function, or of an operator on an array.
+    /// A value whose type nothing declares, such as `array_column + 1`, or that
+    /// has no type because it is an error, such as `date_column * 2` when no
+    /// function runs `*` for a date.
     Unknown,
+    /// An expression whose type is known only once its statement is bound and
+    /// planned: a name, a subquery, or DEFAULT. `(SELECT s FROM t)` is this
+    /// while its statement is bound, and the type of `s` once it is planned.
+    NotKnownYet,
+    /// Several values, as in `(a, b)` or `(SELECT x, y ...)`.
+    RowValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +103,11 @@ impl ExprType {
     fn is_unknown_element(&self) -> bool {
         matches!(
             self,
-            Self::Builtin(BuiltinType::Any) | Self::Null | Self::Unknown
+            Self::Builtin(BuiltinType::Any)
+                | Self::Null
+                | Self::Unknown
+                | Self::NotKnownYet
+                | Self::RowValue
         )
     }
 
@@ -104,6 +115,34 @@ impl ExprType {
         match self {
             Self::Array { dimensions, .. } => *dimensions,
             _ => 0,
+        }
+    }
+}
+
+/// The type's name for an error message, as a column declares it: `date`,
+/// `integer[]`. An array whose element type nothing declares is `anyarray`,
+/// as in PostgreSQL.
+impl std::fmt::Display for ExprType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Custom { type_def, .. } => f.write_str(&type_def.name),
+            Self::Array { element, .. } if element.is_unknown_element() => f.write_str("anyarray"),
+            Self::Array {
+                element,
+                dimensions,
+            } => write!(f, "{element}{}", "[]".repeat(*dimensions as usize)),
+            Self::Builtin(builtin) => f.write_str(match builtin {
+                BuiltinType::Integer => "integer",
+                BuiltinType::Real => "real",
+                BuiltinType::Decimal | BuiltinType::Numeric => "numeric",
+                BuiltinType::Text => "text",
+                BuiltinType::Blob => "blob",
+                BuiltinType::Any => "any",
+            }),
+            Self::Untyped => f.write_str("text"),
+            Self::Null => f.write_str("null"),
+            Self::Unknown | Self::NotKnownYet => f.write_str("unknown"),
+            Self::RowValue => f.write_str("record"),
         }
     }
 }
@@ -277,7 +316,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         ast::Expr::MergedColumn(columns) => common_type(columns.iter().map(|c| c.as_ref()), env),
         ast::Expr::FieldAccess {
             base,
-            resolved: Some(resolution),
+            resolved: resolution,
             ..
         } => field_type(&type_of(base, env), resolution, env.schema()),
         // Expressions whose value is never a custom-type value. SQLite's affinity
@@ -295,25 +334,23 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             ..
         }
         | ast::Expr::FunctionCallStar { .. }
-        | ast::Expr::Raise(..) => affinity_type(expr, env),
-        // Not bound or planned yet: names, subqueries, `DEFAULT`, and field
-        // access on an unbound base.
+        | ast::Expr::Raise(..)
+        // `CAST(x AS)`, a SQLite cast with no type name.
+        | ast::Expr::Cast {
+            type_name: None, ..
+        } => affinity_type(expr, env),
+        // Not bound or planned yet: names, subqueries and `DEFAULT`.
         ast::Expr::Id(_)
         | ast::Expr::Name(_)
         | ast::Expr::Qualified(..)
         | ast::Expr::DoublyQualified(..)
         | ast::Expr::Subquery(_)
-        | ast::Expr::Default
-        | ast::Expr::FieldAccess { resolved: None, .. }
-        | ast::Expr::Cast {
-            type_name: None, ..
-        } => ExprType::Unknown,
-        // A row value such as `(a, b)` or `(SELECT x, y ...)` is not one value.
+        | ast::Expr::Default => ExprType::NotKnownYet,
         ast::Expr::Parenthesized(_)
         | ast::Expr::SubqueryResult {
             query_type: ast::SubqueryType::RowValue { .. },
             ..
-        } => ExprType::Unknown,
+        } => ExprType::RowValue,
         ast::Expr::Collate(..) => unreachable!("without_wrappers looks through COLLATE"),
         ast::Expr::Array { .. } | ast::Expr::Subscript { .. } => {
             unreachable!("Array and Subscript are desugared into function calls by the parser")
@@ -605,7 +642,12 @@ pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrderi
                 TypeOrdering::Array
             })
         }
-        ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null | ExprType::Unknown => None,
+        ExprType::Builtin(_)
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown
+        | ExprType::NotKnownYet
+        | ExprType::RowValue => None,
     }
 }
 
@@ -785,8 +827,9 @@ pub(crate) fn stored_type(type_def: &TypeDef, schema: &Schema) -> ExprType {
 
 /// The result of SQLite's arithmetic: `INTEGER + INTEGER` is an integer, an
 /// integer or real mixed with a real is a real, and any other mix of built-in
-/// values is some number. With an array or an unknown value on either side the
-/// result is unknown.
+/// values is some number. With an array, a row value or an unknown value on
+/// either side the result is unknown. Otherwise, with a value whose type is
+/// not known yet on either side, the result's type is not known yet either.
 fn arithmetic_type(lhs: &ExprType, rhs: &ExprType) -> ExprType {
     use BuiltinType::{Integer, Numeric, Real};
     let is_custom_or_decimal = |ty: &ExprType| {
@@ -799,10 +842,17 @@ fn arithmetic_type(lhs: &ExprType, rhs: &ExprType) -> ExprType {
         !is_custom_or_decimal(lhs) && !is_custom_or_decimal(rhs),
         "operands of SQLite arithmetic must be typed as SQLite sees them first"
     );
-    let is_array_or_unknown =
-        |ty: &ExprType| matches!(ty, ExprType::Array { .. } | ExprType::Unknown);
-    if is_array_or_unknown(lhs) || is_array_or_unknown(rhs) {
+    let has_no_number_type = |ty: &ExprType| {
+        matches!(
+            ty,
+            ExprType::Array { .. } | ExprType::RowValue | ExprType::Unknown
+        )
+    };
+    if has_no_number_type(lhs) || has_no_number_type(rhs) {
         return ExprType::Unknown;
+    }
+    if matches!(lhs, ExprType::NotKnownYet) || matches!(rhs, ExprType::NotKnownYet) {
+        return ExprType::NotKnownYet;
     }
     ExprType::Builtin(match (lhs, rhs) {
         (ExprType::Builtin(Integer), ExprType::Builtin(Integer)) => Integer,
@@ -1000,7 +1050,9 @@ fn common_element_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
 fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
     use BuiltinType::{Decimal, Integer, Numeric, Real, Text};
     match (a, b) {
-        (ExprType::Unknown, _) | (_, ExprType::Unknown) => ExprType::Unknown,
+        (ExprType::Unknown | ExprType::RowValue, _)
+        | (_, ExprType::Unknown | ExprType::RowValue) => ExprType::Unknown,
+        (ExprType::NotKnownYet, _) | (_, ExprType::NotKnownYet) => ExprType::NotKnownYet,
         (ExprType::Untyped, ExprType::Untyped) => ExprType::Untyped,
         (
             ExprType::Untyped | ExprType::Builtin(Text),
