@@ -21,7 +21,7 @@ addr  opcode             p1  p2  p3  p4                                 p5  comm
    4  NewRowid            0   2   0                                      0  r[2]=rowid
    5  TypeCheck           3   2   0                                      0
    6  IsNull              3  26   0                                      0  if (r[3]==NULL) goto 26
-   7  ConvertToType       3   0   0  INT                                 0  as type smallint (BASE INTEGER)
+   7  ConvertToType       3   0   0  INTEGER                             0  as type smallint (BASE INTEGER)
    8  IsNull              3  25   0                                      0  if (r[3]==NULL) goto 25
    9  Copy                3   7   0                                      0  r[7]=r[3]
   10  Copy                7   9   0                                      0  r[9]=r[7]
@@ -39,9 +39,9 @@ addr  opcode             p1  p2  p3  p4                                 p5  comm
   22  Copy                3   3   0                                      0  r[3]=r[3]
   23  Goto                0  25   0                                      0
   24  Halt                1   2   0  integer out of range for smallint   0
-  25  ConvertToType       3   0   0  INT                                 0  as type smallint (BASE INTEGER)
+  25  ConvertToType       3   0   0  INTEGER                             0  as type smallint (BASE INTEGER)
   26  IsNull              4  28   0                                      0  if (r[4]==NULL) goto 28
-  27  ConvertToType       4   0   0  INT                                 0  as type bigint (BASE INTEGER)
+  27  ConvertToType       4   0   0  INTEGER                             0  as type bigint (BASE INTEGER)
   28  TypeCheck           3   2   0                                      0
   29  Copy                3  17   0                                      0  r[17]=r[3]
   30  Integer             0  18   0                                      0  r[18]=0
