@@ -131,19 +131,21 @@ pub fn emit_stored_column(
     resolver: &Resolver,
 ) -> Result<()> {
     let table = program.btree_table_from_cursor(cursor_id).map(Arc::clone);
-    let encoded_default = table.as_ref().and_then(|table| {
-        let column = &table.columns()[column_index];
-        let default_expr = column.default.as_ref()?;
-        let resolved = resolver
-            .schema()
-            .resolve_type(&column.ty_str, table.is_strict)
-            .ok()??;
-        resolved
-            .chain
-            .iter()
-            .any(|td| td.has_encode_or_coerce())
-            .then_some((table, column, default_expr))
-    });
+    let encoded_default = match table.as_ref() {
+        Some(table) => {
+            let column = &table.columns()[column_index];
+            let custom_type = resolver
+                .schema()
+                .resolve_type(&column.ty_str, table.is_strict)?;
+            match (column.default.as_ref(), custom_type) {
+                (Some(default_expr), Some(_)) => Some((table, column, default_expr)),
+                // A plain column's default is stored as written; without a
+                // DEFAULT, a row written before ADD COLUMN reads NULL.
+                (Some(_), None) | (None, _) => None,
+            }
+        }
+        None => None,
+    };
     let Some((table, column, default_expr)) = encoded_default else {
         program.emit_column_or_rowid(cursor_id, column_index, target_register);
         return Ok(());
@@ -152,6 +154,28 @@ pub fn emit_stored_column(
     program.emit_column_or_rowid(cursor_id, column_index, target_register);
     let has_field_label = program.allocate_label();
     program.emit_column_has_field(cursor_id, column_index, has_field_label);
+    emit_encoded_default(
+        program,
+        column,
+        default_expr,
+        &table.name,
+        target_register,
+        resolver,
+    )?;
+    program.preassign_label_to_next_insn(has_field_label);
+    Ok(())
+}
+
+/// Evaluates the DEFAULT of a custom-type column into `target_register` and
+/// encodes it as the type stores it.
+pub(crate) fn emit_encoded_default(
+    program: &mut ProgramBuilder,
+    column: &Column,
+    default_expr: &ast::Expr,
+    table_name: &str,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
     translate_expr_no_constant_opt(
         program,
         None,
@@ -166,9 +190,7 @@ pub fn emit_stored_column(
         std::slice::from_ref(column),
         target_register,
         None,
-        &table.name,
+        table_name,
         &ColumnLayout::Identity { column_count: 1 },
-    )?;
-    program.preassign_label_to_next_insn(has_field_label);
-    Ok(())
+    )
 }

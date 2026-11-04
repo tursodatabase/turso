@@ -2,6 +2,7 @@ use crate::alloc::TursoIteratorExt;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
+use crate::types::StrictType;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
 use turso_parser::{
     ast::{self, TableInternalId},
@@ -496,33 +497,77 @@ fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
     Ok(!ok)
 }
 
-fn emit_add_column_default_type_validation(
+/// Fails the ALTER with `message` when the table has rows.
+fn emit_halt_if_table_has_rows(
     program: &mut ProgramBuilder,
     original_btree: &Arc<BTreeTable>,
     database_id: usize,
+    message: &str,
 ) -> Result<()> {
-    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    emit_if_table_has_rows(program, original_btree, database_id, |program| {
+        program.emit_insn(Insn::Halt {
+            constraint_info: None,
+            err_code: 1,
+            description: message.to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        Ok(())
+    })
+}
+
+/// Existing rows read the DEFAULT of a column added with a custom type as the
+/// type stores it, so when the table has rows, encode the default once here
+/// and discard it: a default the type can't store fails the ALTER instead of
+/// every later read.
+fn emit_add_column_custom_type_default_check(
+    program: &mut ProgramBuilder,
+    original_btree: &Arc<BTreeTable>,
+    database_id: usize,
+    column: &Column,
+    resolver: &Resolver,
+) -> Result<()> {
+    // Without a DEFAULT existing rows read NULL, which no type encodes; a
+    // plain type's DEFAULT is checked by default_type_mismatch.
+    let custom_type = resolver
+        .schema()
+        .resolve_type(&column.ty_str, original_btree.is_strict)?;
+    if let (Some(default_expr), Some(_)) = (column.default.as_ref(), custom_type) {
+        emit_if_table_has_rows(program, original_btree, database_id, |program| {
+            let default_reg = program.alloc_register();
+            crate::translate::expr::emit_encoded_default(
+                program,
+                column,
+                default_expr,
+                &original_btree.name,
+                default_reg,
+                resolver,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Emits `body` so that it runs only when the table has at least one row.
+fn emit_if_table_has_rows(
+    program: &mut ProgramBuilder,
+    original_btree: &Arc<BTreeTable>,
+    database_id: usize,
+    body: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
     program.emit_insn(Insn::OpenRead {
-        cursor_id: check_cursor_id,
+        cursor_id,
         root_page: original_btree.root_page,
         db: database_id,
     });
-
-    let skip_check_label = program.allocate_label();
+    let skip_label = program.allocate_label();
     program.emit_insn(Insn::Rewind {
-        cursor_id: check_cursor_id,
-        pc_if_empty: skip_check_label,
+        cursor_id,
+        pc_if_empty: skip_label,
     });
-
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: 1,
-        description: "type mismatch on DEFAULT".to_string(),
-        on_error: None,
-        description_reg: None,
-    });
-
-    program.preassign_label_to_next_insn(skip_check_label);
+    body(program)?;
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -562,13 +607,25 @@ fn emit_column_constraints_validation(
         check_constraints.extend(domain_checks);
     }
 
-    let strict_virtual_type = if table.is_strict && column.is_virtual_generated() {
-        column.strict_value_type()
+    let virtual_column_check = if table.is_strict && column.is_virtual_generated() {
+        let custom_type = resolver.with_schema(database_id, |schema| {
+            schema.resolve_type(&column.ty_str, true)
+        })?;
+        if column.is_array() || custom_type.is_some() {
+            Some(VirtualColumnCheck::Store)
+        } else {
+            match column.strict_type(&table.name)? {
+                StrictType::Stores(storage_class) => {
+                    Some(VirtualColumnCheck::Kind(storage_class.value_type()))
+                }
+                StrictType::Any => None,
+            }
+        }
     } else {
         None
     };
 
-    if !has_notnull && check_constraints.is_empty() && strict_virtual_type.is_none() {
+    if !has_notnull && check_constraints.is_empty() && virtual_column_check.is_none() {
         return Ok(());
     }
 
@@ -638,21 +695,43 @@ fn emit_column_constraints_validation(
     )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
-    if let Some(value_type) = strict_virtual_type {
-        let type_passed = program.allocate_label();
-        program.emit_insn(Insn::IsType {
-            reg: result_reg,
-            target_pc: type_passed,
-            value_type,
-        });
-        program.emit_insn(Insn::Halt {
-            constraint_info: None,
-            err_code: 1,
-            description: "type mismatch on DEFAULT".to_string(),
-            on_error: None,
-            description_reg: None,
-        });
-        program.preassign_label_to_next_insn(type_passed);
+    match virtual_column_check {
+        Some(VirtualColumnCheck::Kind(value_type)) => {
+            let type_passed = program.allocate_label();
+            program.emit_insn(Insn::IsType {
+                reg: result_reg,
+                target_pc: type_passed,
+                value_type,
+            });
+            program.emit_insn(Insn::Halt {
+                constraint_info: None,
+                err_code: 1,
+                description: "type mismatch on DEFAULT".to_string(),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(type_passed);
+        }
+        Some(VirtualColumnCheck::Store) => {
+            // Store a copy, so the CHECK constraints below see the computed
+            // value as reads of the column do.
+            let store_reg = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: store_reg,
+                extra_amount: 0,
+            });
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                resolver,
+                std::slice::from_ref(column),
+                store_reg,
+                None,
+                &table.name,
+                &ColumnLayout::Identity { column_count: 1 },
+            )?;
+        }
+        None => {}
     }
 
     if !check_constraints.is_empty() {
@@ -722,6 +801,15 @@ fn emit_column_constraints_validation(
 
     program.preassign_label_to_next_insn(skip_label);
     Ok(())
+}
+
+/// How ADD COLUMN checks a new virtual column of a STRICT table against the
+/// rows already in the table.
+enum VirtualColumnCheck {
+    /// The value must have this kind, as in a STRICT column of a plain type.
+    Kind(crate::types::ValueType),
+    /// The value must store as the column's custom or array type does.
+    Store,
 }
 
 pub fn translate_alter_table(
@@ -1356,33 +1444,30 @@ pub fn translate_alter_table(
                 };
 
                 if needs_empty_table_check {
-                    let check_cursor_id =
-                        program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
-                    program.emit_insn(Insn::OpenRead {
-                        cursor_id: check_cursor_id,
-                        root_page: original_btree.root_page,
-                        db: database_id,
-                    });
-
-                    let skip_error_label = program.allocate_label();
-                    program.emit_insn(Insn::Rewind {
-                        cursor_id: check_cursor_id,
-                        pc_if_empty: skip_error_label,
-                    });
-
-                    program.emit_insn(Insn::Halt {
-                        constraint_info: None,
-                        err_code: 1,
-                        description: error_message.to_string(),
-                        on_error: None,
-                        description_reg: None,
-                    });
-
-                    program.preassign_label_to_next_insn(skip_error_label);
+                    emit_halt_if_table_has_rows(
+                        program,
+                        &original_btree,
+                        database_id,
+                        error_message,
+                    )?;
                 }
 
                 if default_type_mismatch {
-                    emit_add_column_default_type_validation(program, &original_btree, database_id)?;
+                    emit_halt_if_table_has_rows(
+                        program,
+                        &original_btree,
+                        database_id,
+                        "type mismatch on DEFAULT",
+                    )?;
+                }
+                if btree.is_strict && !computes_default_for_existing_rows {
+                    emit_add_column_custom_type_default_check(
+                        program,
+                        &original_btree,
+                        database_id,
+                        &column,
+                        resolver,
+                    )?;
                 }
             }
 
@@ -2678,7 +2763,15 @@ fn strict_column_type_changed(old: &Column, new: &Column, schema: &Schema) -> bo
         schema.get_type_def(&old.ty_str, true),
         schema.get_type_def(&new.ty_str, true),
     ) {
-        (None, None) => old.strict_value_type() != new.strict_value_type(),
+        (None, None) => match (
+            StrictType::named(&old.ty_str),
+            StrictType::named(&new.ty_str),
+        ) {
+            (Some(old_type), Some(new_type)) => old_type != new_type,
+            // Rewriting re-checks every row, so a name that isn't a STRICT
+            // type never skips the check.
+            (None, _) | (_, None) => true,
+        },
         (Some(_), Some(_)) => !old.has_same_declared_type(new),
         _ => true,
     }
