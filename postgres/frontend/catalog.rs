@@ -18,6 +18,7 @@ use turso_pg_parser::quote_identifier;
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
+use turso_sqlite::SqliteDialect;
 
 /// PostgreSQL uses OID zero when no object is referenced.
 const PG_INVALID_OID: i64 = 0;
@@ -48,7 +49,7 @@ impl Dialect for PostgresDialect {
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
         // handle falls back to SQLite parsing.
         let Ok(parse_result) = turso_pg_parser::parse(sql) else {
-            return turso_core::dialect::sqlite::parse(sql);
+            return turso_core::dialect::engine::parse(sql);
         };
         let stmts = &parse_result.protobuf.stmts;
         if stmts.is_empty() {
@@ -65,7 +66,7 @@ impl Dialect for PostgresDialect {
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate_with_prereqs(&parse_result) {
             Ok(translated) => Ok((Some(translated.cmd), consumed)),
-            Err(_) => turso_core::dialect::sqlite::parse(sql),
+            Err(_) => turso_core::dialect::engine::parse(sql),
         }
     }
 
@@ -103,7 +104,7 @@ impl Dialect for PostgresDialect {
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::sqlite::parse_table_sql_ast(sql);
+            return turso_core::dialect::engine::parse_table_sql_ast(sql);
         };
 
         let parse_result =
@@ -122,7 +123,7 @@ impl Dialect for PostgresDialect {
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::sqlite::table_sql_for_replay(sql);
+            return turso_core::dialect::engine::table_sql_for_replay(sql);
         };
 
         let stmt = self.parse_table_sql_ast(sql)?;
@@ -166,11 +167,11 @@ impl Dialect for PostgresDialect {
     }
 
     fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
-        turso_core::dialect::sqlite::SqliteDialect.format_rewritten_table_sql(stmt)
+        SqliteDialect.format_rewritten_table_sql(stmt)
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)
+        turso_core::dialect::engine::register_builtin_catalog(schema, enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -186,7 +187,7 @@ impl Dialect for PostgresDialect {
         if name.eq_ignore_ascii_case("random") {
             return Ok(None);
         }
-        turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
+        turso_core::dialect::engine::resolve_builtin_function(name, arg_count)
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -4133,7 +4134,7 @@ mod tests {
         let error = PostgresDialect.parse_table_sql(sql, 2).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Parse error: PostgreSQL does not support WITHOUT ROWID table 't'"
+            "PostgreSQL does not support WITHOUT ROWID table 't'"
         );
         assert!(PostgresDialect
             .parse_table_sql("CREATE TABLE t(a TEXT PRIMARY KEY, b)", 2)
@@ -4705,7 +4706,7 @@ mod tests {
             crate::OpenFlags::default(),
             crate::DatabaseOpts::new(),
             None,
-            Arc::new(turso_core::SqliteDialect),
+            Arc::new(SqliteDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();

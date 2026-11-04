@@ -2785,13 +2785,15 @@ enum RangeColumn {
     Custom(RangeOffsets),
 }
 
-/// `ty` is not a domain. A value whose type nothing declares, such as the
-/// result of `+` on an array, may be a custom type's value, so it takes no
-/// offsets.
+/// `ty` is not a domain. A value whose type nothing declares or that isn't known
+/// yet, such as the result of `+` on an array, may be a custom type's value, so
+/// it takes no offsets, and neither does a row value such as `(a, b)`.
 fn range_column(ty: &ExprType) -> RangeColumn {
     match ty {
         ExprType::Custom { type_def, .. } => RangeColumn::Custom(declared_range_offsets(type_def)),
-        ExprType::Array { .. } | ExprType::Unknown => RangeColumn::Custom(RangeOffsets::None),
+        ExprType::Array { .. } | ExprType::Unknown | ExprType::NotKnownYet | ExprType::RowValue => {
+            RangeColumn::Custom(RangeOffsets::None)
+        }
         ExprType::Builtin(
             BuiltinType::Integer
             | BuiltinType::Real
@@ -2837,7 +2839,9 @@ fn range_offset(ty: &ExprType) -> RangeOffset {
             | BuiltinType::Any,
         ) => RangeOffset::Plain(RangeOffsets::None),
         ExprType::Custom { type_def, .. } => RangeOffset::Custom(declared_range_offsets(type_def)),
-        ExprType::Array { .. } | ExprType::Unknown => RangeOffset::Custom(RangeOffsets::None),
+        ExprType::Array { .. } | ExprType::Unknown | ExprType::NotKnownYet | ExprType::RowValue => {
+            RangeOffset::Custom(RangeOffsets::None)
+        }
     }
 }
 

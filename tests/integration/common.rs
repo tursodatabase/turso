@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{
-    Clock, ConnectOpts, Connection, Database, Dialect, FromValueRow, Row, SqliteDialect, IO,
-};
+use turso_core::{Clock, ConnectOpts, Connection, Database, Dialect, FromValueRow, Row, IO};
+use turso_sqlite::SqliteDialect;
 
 /// Temp directories holding test databases, deleted when the test process exits.
 ///
@@ -713,8 +712,8 @@ impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7
 mod tests {
     use std::{sync::Arc, vec};
     use tempfile::TempDir;
-    use turso_core::SqliteDialect;
     use turso_core::{ConnectOpts, Database, StepResult, IO};
+    use turso_sqlite::SqliteDialect;
 
     use crate::common::{do_flush, ExecRows};
 

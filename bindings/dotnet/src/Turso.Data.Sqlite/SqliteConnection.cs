@@ -132,7 +132,7 @@ public partial class SqliteConnection : DbConnection
         set => _readUncommitted = value;
     }
 
-    // The SQLite version Turso tracks (SQLITE_VERSION in core/dialect/sqlite.rs).
+    // The SQLite version Turso tracks (SQLITE_VERSION in core/dialect/engine.rs).
     public override string ServerVersion => "3.50.4";
 
     public override ConnectionState State => _managedConnection?.State

@@ -26,6 +26,7 @@ path = "probe.rs"
 path = "lib.rs"
 
 [dependencies]
+turso_sqlite = { workspace = true }
 turso_core = { workspace = true, features = ["simulator", "test_helper"] }
 turso_parser = { workspace = true }
 sql_gen_prop = { path = "../sql_gen_prop" }

@@ -17,6 +17,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use turso_core::{ConnectOpts, Database, OpenFlags, StepResult};
+use turso_sqlite::SqliteDialect;
 
 struct CountingAllocator;
 
@@ -98,7 +99,7 @@ fn database_lifecycle(io: &Arc<dyn turso_core::IO + Send>, path: &std::path::Pat
         OpenFlags::Create,
         turso_core::DatabaseOpts::new(),
         None,
-        Arc::new(turso_core::SqliteDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
 

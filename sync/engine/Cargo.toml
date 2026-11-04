@@ -12,6 +12,7 @@ default = ["simd"]
 simd = ["turso_core/simd"]
 
 [dependencies]
+turso_sqlite = { path = "../../sqlite/frontend", version = "0.9.0-pre.2" }
 turso_core = { path = "../../core", version = "0.9.0-pre.2", default-features = false, features = [
     "baseline",
     "conn_raw_api",

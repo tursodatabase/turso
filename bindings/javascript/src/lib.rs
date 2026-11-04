@@ -25,7 +25,7 @@ use std::{
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 use turso_core::ConnectOpts;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 /// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
 ///
@@ -117,20 +117,33 @@ pub enum DbTask {
 }
 
 impl Task for DbTask {
-    type Output = u32;
-    type JsValue = u32;
+    type Output = std::result::Result<(), napi::Error<String>>;
+    type JsValue = ();
 
     fn compute(&mut self) -> Result<Self::Output> {
         match self {
-            DbTask::Connect { db } => {
-                connect_sync(db)?;
-                Ok(0)
-            }
+            DbTask::Connect { db } => Ok(connect_sync(db)),
         }
     }
 
-    fn resolve(&mut self, _: Env, output: Self::Output) -> Result<Self::JsValue> {
-        Ok(output)
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        output.map_err(|e| task_error(&env, e))
+    }
+}
+
+/// napi lets a task fail only with a napi `Status` as its code, so a task
+/// whose error has a SQLite result code name returns that error from
+/// `compute` and turns it into a JS error here.
+fn task_error(env: &Env, e: napi::Error<String>) -> napi::Error {
+    let js_error = env
+        .create_error(Error::from_reason(&e.reason))
+        .and_then(|mut js_error| {
+            js_error.set_named_property("code", e.status.as_str())?;
+            Ok(js_error.to_unknown())
+        });
+    match js_error {
+        Ok(js_error) => js_error.into(),
+        Err(err) => err,
     }
 }
 
@@ -205,12 +218,12 @@ pub struct TableColumn {
 
 /// Step one statement. Returns the step constant plus the requested sleep in
 /// milliseconds, which is nonzero only for `STEP_SLEEP`.
-fn step_sync(stmt: &StatementHandle) -> napi::Result<(u32, u32)> {
+fn step_sync(stmt: &StatementHandle) -> napi::Result<(u32, u32), String> {
     let mut guard = stmt.borrow_mut();
     let core_stmt = guard
         .as_mut()
-        .ok_or_else(|| create_generic_error("statement has been finalized"))?;
-    match core_stmt.step() {
+        .ok_or_else(|| with_string_code(create_generic_error("statement has been finalized")))?;
+    match core_stmt.step_with_structured_errors() {
         Ok(turso_core::StepResult::Row) => Ok((STEP_ROW, 0)),
         Ok(turso_core::StepResult::IO) => Ok((STEP_IO, 0)),
         Ok(turso_core::StepResult::Yield) => Ok((STEP_SLEEP, 1)),
@@ -221,12 +234,74 @@ fn step_sync(stmt: &StatementHandle) -> napi::Result<(u32, u32)> {
             Ok((STEP_SLEEP, sleep_ms))
         }
         Ok(turso_core::StepResult::Done) => Ok((STEP_DONE, 0)),
-        Ok(turso_core::StepResult::Interrupt) => {
-            Err(create_generic_error("statement was interrupted"))
+        Ok(turso_core::StepResult::Interrupt) => Err(Error::new(
+            "SQLITE_INTERRUPT".to_string(),
+            "statement was interrupted",
+        )),
+        Ok(turso_core::StepResult::Busy) => {
+            Err(Error::new("SQLITE_BUSY".to_string(), "database is locked"))
         }
-        Ok(turso_core::StepResult::Busy) => Err(create_generic_error("database is locked")),
-        Err(e) => Err(to_generic_error("step failed", e)),
+        Err(e) => Err(to_sqlite_error(e)),
     }
+}
+
+/// Converts an engine error the way better-sqlite3 reports SQLite errors: the
+/// message is the engine's message and `code` is the name of the extended
+/// SQLite result code.
+fn to_sqlite_error(e: turso_core::LimboError) -> napi::Error<String> {
+    Error::new(
+        sqlite_result_code_name(e.sqlite_extended_result_code()).to_string(),
+        e.to_string(),
+    )
+}
+
+fn sqlite_result_code_name(code: i32) -> &'static str {
+    match code {
+        275 => "SQLITE_CONSTRAINT_CHECK",
+        787 => "SQLITE_CONSTRAINT_FOREIGNKEY",
+        1299 => "SQLITE_CONSTRAINT_NOTNULL",
+        1555 => "SQLITE_CONSTRAINT_PRIMARYKEY",
+        1811 => "SQLITE_CONSTRAINT_TRIGGER",
+        2067 => "SQLITE_CONSTRAINT_UNIQUE",
+        3091 => "SQLITE_CONSTRAINT_DATATYPE",
+        // An extended code without a name here is reported by its primary code.
+        code if code > 0xff => sqlite_result_code_name(code & 0xff),
+        1 => "SQLITE_ERROR",
+        2 => "SQLITE_INTERNAL",
+        3 => "SQLITE_PERM",
+        4 => "SQLITE_ABORT",
+        5 => "SQLITE_BUSY",
+        6 => "SQLITE_LOCKED",
+        7 => "SQLITE_NOMEM",
+        8 => "SQLITE_READONLY",
+        9 => "SQLITE_INTERRUPT",
+        10 => "SQLITE_IOERR",
+        11 => "SQLITE_CORRUPT",
+        12 => "SQLITE_NOTFOUND",
+        13 => "SQLITE_FULL",
+        14 => "SQLITE_CANTOPEN",
+        15 => "SQLITE_PROTOCOL",
+        16 => "SQLITE_EMPTY",
+        17 => "SQLITE_SCHEMA",
+        18 => "SQLITE_TOOBIG",
+        19 => "SQLITE_CONSTRAINT",
+        20 => "SQLITE_MISMATCH",
+        21 => "SQLITE_MISUSE",
+        22 => "SQLITE_NOLFS",
+        23 => "SQLITE_AUTH",
+        24 => "SQLITE_FORMAT",
+        25 => "SQLITE_RANGE",
+        26 => "SQLITE_NOTADB",
+        27 => "SQLITE_NOTICE",
+        28 => "SQLITE_WARNING",
+        _ => unreachable!("{code} is not a SQLite result code"),
+    }
+}
+
+/// Lets a function that returns engine errors with a SQLite result code name
+/// also return the binding's own errors, which keep their napi status as code.
+fn with_string_code(e: napi::Error) -> napi::Error<String> {
+    Error::new(e.status.as_ref().to_string(), &e.reason)
 }
 
 fn to_generic_error<E: std::error::Error>(message: &str, e: E) -> napi::Error {
@@ -290,7 +365,7 @@ pub fn apply_experimental_features(
     opts
 }
 
-fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
+fn connect_sync(db: &DatabaseInner) -> napi::Result<(), String> {
     if db.connect.get().is_some() {
         return Ok(());
     }
@@ -332,7 +407,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         if let Some(encryption) = &opts.encryption {
             Some(
                 turso_core::EncryptionKey::from_hex_string(&encryption.hexkey)
-                    .map_err(|e| to_generic_error("invalid encryption key", e))?,
+                    .map_err(|e| with_string_code(to_generic_error("invalid encryption key", e)))?,
             )
         } else {
             None
@@ -349,13 +424,13 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         encryption_opts,
         Arc::new(SqliteDialect),
     )
-    .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
+    .map_err(to_sqlite_error)?;
 
     // Pass the encryption key at connect time to set up the encryption context
     // before the pager reads page 1. This is required for encrypted databases.
     let conn = db_core
         .connect(ConnectOpts::new().with_encryption_key(encryption_key))
-        .map_err(|e| to_generic_error("failed to connect", e))?;
+        .map_err(to_sqlite_error)?;
 
     if let Some(busy_timeout) = busy_timeout {
         conn.set_busy_timeout(busy_timeout);
@@ -440,8 +515,8 @@ impl Database {
     /// Connect the database synchronously
     /// This method is idempotent and can be called multiple times safely until the database will be closed
     #[napi]
-    pub fn connect_sync(&self) -> napi::Result<()> {
-        connect_sync(self.inner()?)
+    pub fn connect_sync(&self) -> napi::Result<(), String> {
+        connect_sync(self.inner().map_err(with_string_code)?)
     }
 
     /// Connect the database asynchronously
@@ -497,12 +572,13 @@ impl Database {
     ///
     /// A promise resolving to a `Statement` instance.
     #[napi(ts_return_type = "Promise<Statement>")]
-    pub fn prepare(&self, sql: String) -> napi::Result<Statement> {
-        let inner = self.inner()?;
+    pub fn prepare(&self, sql: String) -> napi::Result<Statement, String> {
+        let inner = self.inner().map_err(with_string_code)?;
         let stmt = self
-            .conn()?
+            .conn()
+            .map_err(with_string_code)?
             .prepare(&sql)
-            .map_err(|e| to_generic_error("prepare failed", e))?;
+            .map_err(to_sqlite_error)?;
         let column_names: Vec<std::ffi::CString> = (0..stmt.num_columns())
             .map(|i| std::ffi::CString::new(stmt.get_column_name(i).to_string()).unwrap())
             .collect();
@@ -620,9 +696,9 @@ impl Database {
 
     /// Runs the I/O loop synchronously.
     #[napi]
-    pub fn io_loop_sync(&self) -> napi::Result<()> {
-        let io = &self.inner()?.io;
-        io.step().map_err(|e| to_generic_error("IO error", e))?;
+    pub fn io_loop_sync(&self) -> napi::Result<(), String> {
+        let io = &self.inner().map_err(with_string_code)?.io;
+        io.step().map_err(to_sqlite_error)?;
         Ok(())
     }
 
@@ -675,7 +751,7 @@ impl BatchExecutor {
     /// Step the current statement. Returns `[step, sleepMs]`; `sleepMs` is the
     /// delay to wait before stepping again and is nonzero only for `STEP_SLEEP`.
     #[napi]
-    pub fn step_sync(&mut self) -> Result<(u32, u32)> {
+    pub fn step_sync(&mut self) -> Result<(u32, u32), String> {
         loop {
             if self.stmt.is_none() && self.position >= self.sql.len() {
                 return Ok((STEP_DONE, 0));
@@ -694,7 +770,7 @@ impl BatchExecutor {
                         self.stmt = Some(stmt);
                     }
                     Ok(None) => return Ok((STEP_DONE, 0)),
-                    Err(err) => return Err(to_generic_error("failed to consume stmt", err)),
+                    Err(err) => return Err(to_sqlite_error(err)),
                 }
             }
             let stmt = self.stmt.as_ref().unwrap();
@@ -733,13 +809,16 @@ impl Statement {
         Ok(&self.stmt)
     }
     #[napi]
-    pub fn reset(&self) -> Result<()> {
-        let mut guard = self.statement_handle()?.borrow_mut();
+    pub fn reset(&self) -> Result<(), String> {
+        let mut guard = self
+            .statement_handle()
+            .map_err(with_string_code)?
+            .borrow_mut();
         guard
             .as_mut()
-            .ok_or_else(|| create_generic_error("statement has been finalized"))?
+            .ok_or_else(|| with_string_code(create_generic_error("statement has been finalized")))?
             .reset()
-            .map_err(|e| to_generic_error("reset failed", e))?;
+            .map_err(to_sqlite_error)?;
         Ok(())
     }
 
@@ -856,8 +935,8 @@ impl Statement {
     /// requested, and `sleepMs` is the delay to wait before stepping again
     /// (nonzero only for `STEP_SLEEP`).
     #[napi]
-    pub fn step_sync(&self) -> Result<(u32, u32)> {
-        step_sync(self.statement_handle()?)
+    pub fn step_sync(&self) -> Result<(u32, u32), String> {
+        step_sync(self.statement_handle().map_err(with_string_code)?)
     }
 
     /// Get the current row data according to the presentation mode
@@ -990,18 +1069,15 @@ pub struct IoLoopTask {
 }
 
 impl Task for IoLoopTask {
-    type Output = ();
+    type Output = std::result::Result<(), napi::Error<String>>;
     type JsValue = ();
 
     fn compute(&mut self) -> napi::Result<Self::Output> {
-        self.io
-            .step()
-            .map_err(|e| to_generic_error("IO error", e))?;
-        Ok(())
+        Ok(self.io.step().map_err(to_sqlite_error))
     }
 
-    fn resolve(&mut self, _env: Env, _output: Self::Output) -> napi::Result<Self::JsValue> {
-        Ok(())
+    fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+        output.map_err(|e| task_error(&env, e))
     }
 }
 

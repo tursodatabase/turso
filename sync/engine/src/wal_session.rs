@@ -71,8 +71,9 @@ mod tests {
     };
     use turso_core::{
         Clock, Completion, ConnectOpts, Database, DatabaseOpts, File, MemoryIO, OpenFlags,
-        Result as CoreResult, SqliteDialect, IO,
+        Result as CoreResult, IO,
     };
+    use turso_sqlite::SqliteDialect;
 
     #[derive(Clone)]
     struct FailWalPwritevIo {

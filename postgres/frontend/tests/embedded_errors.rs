@@ -4,6 +4,7 @@ use turso_pg::{
     Connection, DatabaseOpts, Error, ErrorReport, LimboError, OpenFlags, StepResult,
     TransactionState,
 };
+use turso_sqlite::SqliteDialect;
 
 fn pg_connection() -> (Arc<dyn turso_core::IO>, Connection) {
     let (io, db) =
@@ -1978,7 +1979,7 @@ fn sqlite_connection() -> (Arc<dyn turso_core::IO>, Arc<turso_core::Connection>)
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(turso_core::SqliteDialect),
+        Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect(turso_core::ConnectOpts::new()).unwrap();

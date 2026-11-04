@@ -262,7 +262,7 @@ mod tests {
     use crate::sync::Arc;
     use crate::util::IOExt;
     use crate::{ConnectOpts, Connection, Database, OpenFlags};
-    use crate::{Result, SqliteDialect};
+    use crate::{EngineDialect, Result};
 
     /// Helper to create a test connection with a table and materialized view
     fn create_test_connection() -> Result<Arc<Connection>> {
@@ -288,7 +288,7 @@ mod tests {
                 unsafe_testing: false,
             },
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         let conn = db.connect(ConnectOpts::new())?;
 

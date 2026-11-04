@@ -145,7 +145,7 @@ pub fn translate(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         if is_engine_statement {
-            Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
+            Arc::new(crate::dialect::EngineDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
         },
@@ -288,7 +288,7 @@ fn translate_statement(
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            crate::dialect::sqlite::attach::translate_attach(
+            crate::attach::translate_attach(
                 &expr,
                 resolver,
                 &db_name,
@@ -403,12 +403,9 @@ fn translate_statement(
                 connection,
             )?
         }
-        ast::Stmt::Detach { name } => crate::dialect::sqlite::attach::translate_detach(
-            &name,
-            resolver,
-            program,
-            connection.clone(),
-        )?,
+        ast::Stmt::Detach { name } => {
+            crate::attach::translate_detach(&name, resolver, program, connection.clone())?
+        }
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
@@ -669,7 +666,7 @@ mod tests {
     use crate::vdbe::insn::{ClearBtreeCount, Insn};
     use crate::ConnectOpts;
     use crate::Database;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
 
     #[test]
     fn view_expansion_restores_context_after_errors() {
@@ -717,7 +714,7 @@ mod tests {
     #[test]
     fn test_regexp_no_function_registered() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         let schema = db.schema.lock().clone();
         let pager = conn.pager.load().clone();
@@ -751,7 +748,7 @@ mod tests {
     #[test]
     fn nth_value_reads_from_saved_rows_without_an_accumulator() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE items(value)").unwrap();
 
@@ -786,7 +783,7 @@ mod tests {
     #[test]
     fn delete_without_where_clears_table_and_index_btrees() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
             .unwrap();
@@ -868,7 +865,7 @@ mod tests {
     #[test]
     fn delete_keeps_row_loop_when_rows_need_individual_processing() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)")
             .unwrap();
@@ -923,7 +920,7 @@ mod tests {
     #[test]
     fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
@@ -977,7 +974,7 @@ mod tests {
     #[test]
     fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
             .unwrap();
@@ -1020,7 +1017,7 @@ mod tests {
     #[test]
     fn test_trigger_compile_error_does_not_poison_future_insert_compilation() {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("CREATE TABLE ref(x);").unwrap();
