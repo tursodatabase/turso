@@ -644,9 +644,10 @@ impl TypeDef {
     pub fn from_create_type(
         type_name: &str,
         body: &ast::CreateTypeBody,
-        is_builtin: bool,
+        origin: TypeOrigin,
         sql: String,
     ) -> crate::Result<Self> {
+        let is_builtin = matches!(origin, TypeOrigin::Builtin { .. });
         Ok(match body {
             ast::CreateTypeBody::CustomType {
                 params,
@@ -670,7 +671,11 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
-                    accepts_collate: Some(base.eq_ignore_ascii_case("text")),
+                    accepts_collate: Some(match origin {
+                        TypeOrigin::Builtin { accepts_collate } => accepts_collate,
+                        // A user type takes a COLLATE when its values are text.
+                        TypeOrigin::User => base.eq_ignore_ascii_case("text"),
+                    }),
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Custom {
@@ -1190,6 +1195,16 @@ impl Default for Schema {
     }
 }
 
+/// Whether a type is built into Turso or made by a user's CREATE TYPE.
+#[derive(Debug, Clone, Copy)]
+pub enum TypeOrigin {
+    /// `accepts_collate` says whether values of the type take a COLLATE.
+    Builtin {
+        accepts_collate: bool,
+    },
+    User,
+}
+
 fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
@@ -1240,8 +1255,12 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
             )));
         };
 
-        let mut type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string())?;
-        type_def.accepts_collate = Some(accepts_collate);
+        let type_def = TypeDef::from_create_type(
+            &type_name,
+            &body,
+            TypeOrigin::Builtin { accepts_collate },
+            sql.to_string(),
+        )?;
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
@@ -2024,8 +2043,12 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let type_def =
-                    TypeDef::from_create_type(&type_name, &body, false, sql.to_string())?;
+                let type_def = TypeDef::from_create_type(
+                    &type_name,
+                    &body,
+                    TypeOrigin::User,
+                    sql.to_string(),
+                )?;
                 self.type_registry
                     .insert(type_registry_key(&type_name), Arc::new(type_def));
             }
