@@ -2767,11 +2767,11 @@ pub fn op_array_encode(
                 }
             }
             Some(StrictType::Any) => {}
-            // Only a CAST reaches here, as STRICT tables refuse other element
-            // types: CAST('{5}' AS FLOAT[]) converts each element as SQLite's
-            // CAST to FLOAT does.
             None => {
-                apply_affinity_char(&mut reg_tmp, Affinity::affinity(element_type));
+                return Err(LimboError::InternalError(format!(
+                    "array elements of {table_name}.{col_name} have type {element_type}, which is not INTEGER, REAL, TEXT, BLOB or ANY"
+                ))
+                .into());
             }
         }
         coerced_elements.push(reg_tmp.get_value().clone());

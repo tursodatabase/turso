@@ -20,6 +20,7 @@ use crate::{
     },
     HashSet,
 };
+use crate::{types::StrictType, LimboError, Result};
 use turso_parser::ast::{self, TableInternalId};
 
 /// Maximum number of errors to report with integrity check. If we exceed this number we will
@@ -399,7 +400,7 @@ fn translate_integrity_check_for_schema(
                     type_check_col,
                     col_name,
                     col_reg,
-                );
+                )?;
             }
             if col.notnull() {
                 emit_notnull_check(program, &registers, btree_table, col_name, col_reg);
@@ -727,9 +728,16 @@ fn emit_strict_type_check(
     type_check_col: &Column,
     col_name: &str,
     col_reg: usize,
-) {
-    let Some(value_type) = type_check_col.strict_value_type() else {
-        return;
+) -> Result<()> {
+    let value_type = match StrictType::named(&type_check_col.ty_str) {
+        Some(StrictType::Stores(value_type)) => value_type,
+        Some(StrictType::Any) => return Ok(()),
+        None => {
+            return Err(LimboError::InternalError(format!(
+                "STRICT column {}.{} has type {}, which is not INTEGER, REAL, TEXT, BLOB or ANY",
+                btree_table.name, col_name, type_check_col.ty_str
+            )))
+        }
     };
 
     let type_ok = program.allocate_label();
@@ -749,6 +757,7 @@ fn emit_strict_type_check(
     );
     emit_integrity_result_row(program, registers);
     program.preassign_label_to_next_insn(type_ok);
+    Ok(())
 }
 
 fn emit_notnull_check(

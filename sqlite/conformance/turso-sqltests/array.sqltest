@@ -1920,9 +1920,24 @@ expect {
     {NULL,0}|1
 }
 
-test array-cast-to-float-array-converts-elements-to-real {
-    SELECT CAST('{5,1.5}' AS FLOAT[]), typeof(CAST('{5}' AS FLOAT[])[1]), typeof(CAST('{5}' AS DOUBLE[])[1]);
+test array-cast-to-real-array-converts-elements-to-real {
+    SELECT CAST('{5,1.5}' AS REAL[]), typeof(CAST('{5}' AS REAL[])[1]);
 }
 expect {
-    {5.0,1.5}|real|real
+    {5.0,1.5}|real
+}
+
+# Array element types follow STRICT columns: FLOAT is not a STRICT type.
+test array-cast-refuses-float-elements {
+    SELECT CAST('{5}' AS FLOAT[]);
+}
+expect error {
+    unknown datatype for array elements: "FLOAT"
+}
+
+test array-cast-refuses-unknown-element-type {
+    SELECT CAST('{1}' AS nosuchtype[]);
+}
+expect error {
+    unknown datatype for array elements: "nosuchtype"
 }

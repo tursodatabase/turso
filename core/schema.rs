@@ -1858,12 +1858,18 @@ impl Schema {
             .ordering()
     }
 
-    /// Fails when `element_type` has its own order, as numeric does. Array
-    /// elements compare by their stored form, which does not sort in the
-    /// type's order.
+    /// Fails when `element_type` is neither a STRICT type nor a custom type,
+    /// or when it has its own order, as numeric does. Array elements compare
+    /// by their stored form, which does not sort in the type's order.
     pub fn check_array_element_type(&self, element_type: &str) -> crate::Result<()> {
         let Some(type_def) = self.get_type_def_unchecked(element_type) else {
-            return Ok(());
+            return match StrictType::named(element_type) {
+                Some(StrictType::Stores(_) | StrictType::Any) => Ok(()),
+                None => crate::bail_parse_error!(
+                    "unknown datatype for array elements: \"{}\"",
+                    element_type
+                ),
+            };
         };
         if self.type_ordering(type_def).is_some() {
             crate::bail_parse_error!(
@@ -7507,13 +7513,6 @@ impl Column {
     #[inline]
     pub fn affinity(&self) -> Affinity {
         self.info.affinity()
-    }
-
-    pub fn strict_value_type(&self) -> Option<crate::types::ValueType> {
-        match StrictType::named(&self.ty_str) {
-            Some(StrictType::Stores(value_type)) => Some(value_type),
-            Some(StrictType::Any) | None => None,
-        }
     }
 
     pub fn new_default_text(

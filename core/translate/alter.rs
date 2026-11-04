@@ -2,6 +2,7 @@ use crate::alloc::TursoIteratorExt;
 use crate::namespace::{demangle_name, NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
+use crate::types::StrictType;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
 use turso_parser::{
     ast::{self, TableInternalId},
@@ -607,7 +608,24 @@ fn emit_column_constraints_validation(
     }
 
     let strict_virtual_type = if table.is_strict && column.is_virtual_generated() {
-        column.strict_value_type()
+        match StrictType::named(&column.ty_str) {
+            Some(StrictType::Stores(value_type)) => Some(value_type),
+            Some(StrictType::Any) => None,
+            // A custom type's ENCODE converts and checks the value when
+            // compute_virtual_columns computes it below.
+            None if resolver.with_schema(database_id, |schema| {
+                schema.get_type_def(&column.ty_str, true).is_some()
+            }) =>
+            {
+                None
+            }
+            None => {
+                return Err(LimboError::InternalError(format!(
+                    "STRICT table {} gets a column of type {}, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type",
+                    table.name, column.ty_str
+                )))
+            }
+        }
     } else {
         None
     };
@@ -2704,7 +2722,15 @@ fn strict_column_type_changed(old: &Column, new: &Column, schema: &Schema) -> bo
         schema.get_type_def(&old.ty_str, true),
         schema.get_type_def(&new.ty_str, true),
     ) {
-        (None, None) => old.strict_value_type() != new.strict_value_type(),
+        (None, None) => match (
+            StrictType::named(&old.ty_str),
+            StrictType::named(&new.ty_str),
+        ) {
+            (Some(old_type), Some(new_type)) => old_type != new_type,
+            // Rewriting re-checks every row, so a name that isn't a STRICT
+            // type never skips the check.
+            (None, _) | (_, None) => true,
+        },
         (Some(_), Some(_)) => !old.has_same_declared_type(new),
         _ => true,
     }
