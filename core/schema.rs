@@ -2289,7 +2289,7 @@ impl Schema {
     /// after all of those are, whatever order the types were added in. Built-in
     /// types name their kinds when they are created.
     fn update_value_types(&mut self, syms: &SymbolTable) -> Result<()> {
-        let mut pending: Vec<String> = self
+        let mut pending: std::vec::Vec<String> = self
             .type_registry
             .iter()
             .filter(|(_, type_def)| type_def.kinds_pending())
@@ -2297,10 +2297,10 @@ impl Schema {
             .collect();
         pending.sort();
         // For each pending type, the other pending types its definition names.
-        let mut waits_for: Vec<(String, Vec<String>)> = Vec::new();
+        let mut waits_for: std::vec::Vec<(String, std::vec::Vec<String>)> = std::vec::Vec::new();
         for key in &pending {
             let type_def = &self.type_registry[key];
-            let mut names = Vec::new();
+            let mut names = std::vec::Vec::new();
             for other in &pending {
                 if type_def_uses_type(type_def, other)? {
                     names.push(other.clone());
@@ -2309,14 +2309,14 @@ impl Schema {
             waits_for.push((key.clone(), names));
         }
         while !waits_for.is_empty() {
-            let (ready, waiting): (Vec<_>, Vec<_>) =
+            let (ready, waiting): (std::vec::Vec<_>, std::vec::Vec<_>) =
                 waits_for.into_iter().partition(|(_, names)| {
                     names
                         .iter()
                         .all(|name| !self.type_registry[name].kinds_pending())
                 });
             if ready.is_empty() {
-                let names: Vec<&str> = waiting
+                let names: std::vec::Vec<&str> = waiting
                     .iter()
                     .map(|(key, _)| self.type_registry[key].name.as_str())
                     .collect();
