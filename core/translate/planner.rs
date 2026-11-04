@@ -20,9 +20,9 @@ use crate::translate::{
     expr::{
         apply_static_rewrites, expr_contains_function_that_changes_within_statement,
         expr_contains_nondeterministic_scalar_function, expr_vector_size,
-        is_aggregate_or_window_function, reject_unknown_function, unwrap_parens,
-        walk_function_calls, AndWithIntegerZero, BetweenToComparisons, BindingBehavior,
-        FunctionCalls, WalkControl,
+        is_aggregate_or_window_function, reject_unknown_function, select_column_count,
+        unwrap_parens, walk_function_calls, AndWithIntegerZero, BetweenToComparisons,
+        BindingBehavior, FunctionCalls, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -2634,6 +2634,7 @@ pub fn parse_where(
             // the terms after a constant false one, so `WHERE 0 AND
             // nosuchfunc(a)` fails here too.
             reject_unknown_function(&expr.expr, resolver)?;
+            reject_in_subquery_column_mismatch(&expr.expr)?;
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
         // considered independently by constraint extraction and range planning.
@@ -3076,6 +3077,7 @@ fn parse_join(
                     )?;
                     reject_aggregate_in_predicate(&predicate.expr, resolver)?;
                     reject_unknown_function(&predicate.expr, resolver)?;
+                    reject_in_subquery_column_mismatch(&predicate.expr)?;
                 }
             }
             ast::JoinConstraint::Using(distinct_names) => {
@@ -3329,6 +3331,40 @@ fn reject_aggregate_in_predicate(expr: &Expr, resolver: &Resolver) -> Result<()>
             crate::bail_parse_error!("misuse of {kind} function {}{args}", name.as_str())
         },
     )
+}
+
+/// SQLite's WHERE clause analysis (exprAnalyze) checks that the subquery of
+/// an `x IN (SELECT ...)` term returns as many columns as `x` has, before
+/// any fold or constant false term can make the planner skip the term. It
+/// looks through AND, OR and parentheses only, and not at NOT IN. A `*` in
+/// the subquery is counted when the subquery is planned.
+fn reject_in_subquery_column_mismatch(expr: &Expr) -> Result<()> {
+    let expr = unwrap_parens(expr).unwrap_or(expr);
+    match expr {
+        Expr::Binary(lhs, ast::Operator::And | ast::Operator::Or, rhs) => {
+            reject_in_subquery_column_mismatch(lhs)?;
+            reject_in_subquery_column_mismatch(rhs)
+        }
+        Expr::InSelect {
+            lhs,
+            not: false,
+            rhs,
+        } => {
+            let lhs_column_count = match unwrap_parens(lhs).unwrap_or(lhs) {
+                Expr::Parenthesized(exprs) => exprs.len(),
+                _ => 1,
+            };
+            match select_column_count(rhs) {
+                Some(count) if count != lhs_column_count => {
+                    crate::bail_parse_error!(
+                        "sub-select returns {count} columns - expected {lhs_column_count}"
+                    )
+                }
+                _ => Ok(()),
+            }
+        }
+        _ => Ok(()),
+    }
 }
 
 pub fn parse_row_id<F>(
