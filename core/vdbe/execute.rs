@@ -32,6 +32,7 @@ use crate::storage::pager::{
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
+use crate::types::StrictType;
 use crate::types::{
     compare_immutable, compare_record, AsValueRef, Extendable, IOCompletions, IOResult,
     ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
@@ -2586,16 +2587,27 @@ pub fn op_type_check(
                 // An INTEGER PRIMARY KEY gets its rowid later.
                 return Ok(());
             }
-            if let Some(expected_type) = col.strict_value_type() {
-                if let Err(value_type) = convert_to_strict_type(reg, expected_type) {
-                    bail_constraint_error!(
-                        "cannot store {} value in {} column {}.{} ({})",
-                        value_type,
-                        col.ty_str,
+            match StrictType::named(&col.ty_str) {
+                Some(StrictType::Stores(expected_type)) => {
+                    if let Err(value_type) = convert_to_strict_type(reg, expected_type) {
+                        bail_constraint_error!(
+                            "cannot store {} value in {} column {}.{} ({})",
+                            value_type,
+                            col.ty_str,
+                            &table_reference.name,
+                            col.name.as_deref().unwrap_or(""),
+                            SQLITE_CONSTRAINT
+                        );
+                    }
+                }
+                Some(StrictType::Any) => {}
+                None => {
+                    return Err(LimboError::InternalError(format!(
+                        "STRICT column {}.{} has type {}, which is not INTEGER, REAL, TEXT, BLOB or ANY",
                         &table_reference.name,
                         col.name.as_deref().unwrap_or(""),
-                        SQLITE_CONSTRAINT
-                    );
+                        col.ty_str
+                    )));
                 }
             }
             Ok(())
@@ -2743,19 +2755,24 @@ pub fn op_array_encode(
         }
 
         let mut reg_tmp = Register::Value(elem);
-        if let Some(expected_type) = ValueType::stored_by_strict_column(element_type) {
-            if let Err(value_type) = convert_to_strict_type(&mut reg_tmp, expected_type) {
-                bail_constraint_error!(
-                    "cannot store {} value in {} ({})",
-                    value_type,
-                    element_type,
-                    SQLITE_CONSTRAINT
-                );
+        match StrictType::named(element_type) {
+            Some(StrictType::Stores(expected_type)) => {
+                if let Err(value_type) = convert_to_strict_type(&mut reg_tmp, expected_type) {
+                    bail_constraint_error!(
+                        "cannot store {} value in {} ({})",
+                        value_type,
+                        element_type,
+                        SQLITE_CONSTRAINT
+                    );
+                }
             }
-        } else if !element_type.eq_ignore_ascii_case("ANY") {
-            // A type name a STRICT column doesn't take, like FLOAT, converts
-            // as a column of that type in a non-STRICT table does.
-            apply_affinity_char(&mut reg_tmp, Affinity::affinity(element_type));
+            Some(StrictType::Any) => {}
+            // Only a CAST reaches here, as STRICT tables refuse other element
+            // types: CAST('{5}' AS FLOAT[]) converts each element as SQLite's
+            // CAST to FLOAT does.
+            None => {
+                apply_affinity_char(&mut reg_tmp, Affinity::affinity(element_type));
+            }
         }
         coerced_elements.push(reg_tmp.get_value().clone());
     }
@@ -2783,9 +2800,11 @@ fn convert_to_strict_type(reg: &mut Register, value_type: ValueType) -> Result<(
         }
     };
     apply_affinity_char(reg, affinity);
-    match reg.get_value().value_type() {
-        actual if actual == value_type => Ok(()),
-        actual => Err(actual),
+    let actual = reg.get_value().value_type();
+    if actual == value_type {
+        Ok(())
+    } else {
+        Err(actual)
     }
 }
 

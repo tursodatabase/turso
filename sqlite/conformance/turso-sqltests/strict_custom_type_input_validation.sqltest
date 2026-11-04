@@ -311,6 +311,49 @@ expect {
     2024-01-01|[1]|AB|blob
 }
 
+test cast-and-insert-convert-to-each-plain-value-type {
+    CREATE TYPE ti(value integer) BASE text ENCODE typeof(value) DECODE value;
+    CREATE TYPE tr(value real) BASE text ENCODE typeof(value) DECODE value;
+    CREATE TYPE tt(value text) BASE text ENCODE typeof(value) DECODE value;
+    CREATE TYPE tb(value blob) BASE text ENCODE typeof(value) DECODE value;
+    CREATE TYPE ta(value any) BASE text ENCODE typeof(value) DECODE value;
+    CREATE TYPE tu(value uuid) BASE text ENCODE typeof(value) DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, i ti, r tr, x tt, b tb, a ta, u tu) STRICT;
+    INSERT INTO t VALUES (1, '5', '5', 5, x'05', 5, 5);
+    SELECT CAST('5' AS ti), CAST('5' AS tr), CAST(5 AS tt), CAST(5 AS tb), CAST(5 AS ta), CAST(5 AS tu);
+    SELECT i, r, x, b, a, u FROM t;
+}
+expect {
+    integer|real|text|blob|integer|integer
+    integer|real|text|blob|integer|integer
+}
+
+test insert-refuses-input-its-plain-value-type-refuses {
+    CREATE TYPE tb(value blob) BASE text ENCODE typeof(value) DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b tb) STRICT;
+    INSERT INTO t VALUES (1, 5);
+}
+expect error {
+    cannot store INT value in BLOB column t.b
+}
+
+test cast-refuses-a-value-type-strict-columns-refuse {
+    CREATE TYPE fv(value float) BASE real;
+    SELECT CAST('2' AS fv);
+}
+expect error {
+    type fv takes values of type float, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
+}
+
+test insert-refuses-a-value-type-strict-columns-refuse {
+    CREATE TYPE fv(value float) BASE real;
+    CREATE TABLE f(c fv) STRICT;
+    INSERT INTO f VALUES (2);
+}
+expect error {
+    type fv takes values of type float, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
+}
+
 test cast-fails-when-value-types-lead-back-to-the-type {
     CREATE TYPE cyc(value cyc) BASE text;
     SELECT CAST('a' AS cyc);

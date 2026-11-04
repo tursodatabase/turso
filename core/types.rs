@@ -47,17 +47,41 @@ pub enum ValueType {
     Error,
 }
 
-impl ValueType {
-    /// The kind of value a STRICT column declared `type_name` stores: INTEGER,
-    /// INT, REAL, TEXT or BLOB. None for ANY and every other name.
-    pub fn stored_by_strict_column(type_name: &str) -> Option<Self> {
+/// What a STRICT column of a plain type stores.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StrictType {
+    /// INTEGER, INT, REAL, TEXT or BLOB: only values of this kind.
+    Stores(ValueType),
+    /// ANY: every value, unchanged.
+    Any,
+}
+
+impl StrictType {
+    /// The STRICT column type named `type_name`. None for a name a STRICT
+    /// table refuses, such as FLOAT.
+    pub fn named(type_name: &str) -> Option<Self> {
         turso_macros::match_ignore_ascii_case!(match type_name.as_bytes() {
-            b"INTEGER" | b"INT" => Some(Self::Integer),
-            b"REAL" => Some(Self::Float),
-            b"BLOB" => Some(Self::Blob),
-            b"TEXT" => Some(Self::Text),
+            b"INTEGER" | b"INT" => Some(Self::Stores(ValueType::Integer)),
+            b"REAL" => Some(Self::Stores(ValueType::Float)),
+            b"BLOB" => Some(Self::Stores(ValueType::Blob)),
+            b"TEXT" => Some(Self::Stores(ValueType::Text)),
+            b"ANY" => Some(Self::Any),
             _ => None,
         })
+    }
+
+    /// The type name a STRICT column of this type is declared with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Stores(ValueType::Integer) => "INTEGER",
+            Self::Stores(ValueType::Float) => "REAL",
+            Self::Stores(ValueType::Text) => "TEXT",
+            Self::Stores(ValueType::Blob) => "BLOB",
+            Self::Stores(value_type @ (ValueType::Null | ValueType::Error)) => {
+                unreachable!("no STRICT column stores {value_type} values")
+            }
+            Self::Any => "ANY",
+        }
     }
 }
 

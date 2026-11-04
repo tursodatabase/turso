@@ -19,6 +19,7 @@ use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_co
 use crate::translate::planner::ROWID_STRS;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
+use crate::types::StrictType;
 use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
@@ -448,13 +449,14 @@ impl ResolvedType {
     /// The kind of value the type stores: the kind of its BASE, or of the
     /// plain type a domain is based on.
     pub fn stored_value_type(&self) -> crate::Result<crate::types::ValueType> {
-        crate::types::ValueType::stored_by_strict_column(&self.primitive).ok_or_else(|| {
-            crate::LimboError::InternalError(format!(
-                "type {} is based on {}, which is not a STRICT column type",
+        match StrictType::named(&self.primitive) {
+            Some(StrictType::Stores(value_type)) => Ok(value_type),
+            Some(StrictType::Any) | None => Err(crate::LimboError::InternalError(format!(
+                "type {} is based on {}, which is not INTEGER, REAL, TEXT or BLOB",
                 self.leaf().name,
                 self.primitive
-            ))
-        })
+            ))),
+        }
     }
 
     pub fn reads_stored_values_unchanged(&self) -> bool {
@@ -1922,8 +1924,9 @@ impl Schema {
 
     /// The plain SQL type the type takes as input: its input type, followed
     /// through custom types. A type declared `(value date)` takes text, as
-    /// date is declared `(value text)`.
-    pub fn plain_input_type(&self, resolved: &ResolvedType) -> Result<String> {
+    /// date is declared `(value text)`. Fails for a name a STRICT column
+    /// can't be declared with, such as `(value float)`.
+    pub fn plain_input_type(&self, resolved: &ResolvedType) -> Result<StrictType> {
         let mut input_type = resolved.input_type().to_string();
         let mut seen = vec![resolved.leaf().name.to_lowercase()];
         while let Some(next) = self.resolve_type_unchecked(&input_type)? {
@@ -1938,7 +1941,13 @@ impl Schema {
             seen.push(name);
             input_type = next.input_type().to_string();
         }
-        Ok(input_type)
+        StrictType::named(&input_type).ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "type {} takes values of type {}, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type",
+                resolved.leaf().name,
+                input_type
+            ))
+        })
     }
 
     /// `type_def` itself, or the type a domain is based on: a domain stores,
@@ -5333,7 +5342,7 @@ impl BTreeTable {
                 col.ty_str = "ANY".to_string();
                 col.override_affinity(Affinity::Blob);
             } else if let Some(resolved) = schema.resolve_type(&col.ty_str, table.is_strict)? {
-                col.ty_str = schema.plain_input_type(&resolved)?.to_uppercase();
+                col.ty_str = schema.plain_input_type(&resolved)?.name().to_string();
             }
         }
         Ok(Arc::new(modified))
@@ -7501,7 +7510,10 @@ impl Column {
     }
 
     pub fn strict_value_type(&self) -> Option<crate::types::ValueType> {
-        crate::types::ValueType::stored_by_strict_column(&self.ty_str)
+        match StrictType::named(&self.ty_str) {
+            Some(StrictType::Stores(value_type)) => Some(value_type),
+            Some(StrictType::Any) | None => None,
+        }
     }
 
     pub fn new_default_text(

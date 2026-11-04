@@ -526,27 +526,25 @@ fn emit_add_column_custom_type_default_check(
     column: &Column,
     resolver: &Resolver,
 ) -> Result<()> {
-    let Some(default_expr) = column.default.as_ref() else {
-        return Ok(());
-    };
-    if resolver
+    // Without a DEFAULT existing rows read NULL, which no type encodes; a
+    // plain type's DEFAULT is checked by default_type_mismatch.
+    let custom_type = resolver
         .schema()
-        .resolve_type(&column.ty_str, original_btree.is_strict)?
-        .is_none()
-    {
-        return Ok(());
+        .resolve_type(&column.ty_str, original_btree.is_strict)?;
+    if let (Some(default_expr), Some(_)) = (column.default.as_ref(), custom_type) {
+        emit_if_table_has_rows(program, original_btree, database_id, |program| {
+            let default_reg = program.alloc_register();
+            crate::translate::expr::emit_encoded_default(
+                program,
+                column,
+                default_expr,
+                &original_btree.name,
+                default_reg,
+                resolver,
+            )
+        })?;
     }
-    emit_if_table_has_rows(program, original_btree, database_id, |program| {
-        let default_reg = program.alloc_register();
-        crate::translate::expr::emit_encoded_default(
-            program,
-            column,
-            default_expr,
-            &original_btree.name,
-            default_reg,
-            resolver,
-        )
-    })
+    Ok(())
 }
 
 /// Emits `body` so that it runs only when the table has at least one row.

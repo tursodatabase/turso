@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::StrictType;
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
 #[derive(Debug)]
@@ -789,12 +790,12 @@ fn translate_cast_expr(
             // CAST to that type would, then stores it as a column of the type
             // does: CAST(5.5 AS smallint) is 5, as are CAST(5.5 AS bigint) and
             // CAST(5.5 AS d) for a domain d over integer.
-            let input_type = resolver.schema().plain_input_type(&resolved)?;
-            if !input_type.eq_ignore_ascii_case("any") {
-                program.emit_insn(Insn::Cast {
+            match resolver.schema().plain_input_type(&resolved)? {
+                input_type @ StrictType::Stores(_) => program.emit_insn(Insn::Cast {
                     reg: target_register,
-                    affinity: Affinity::of_written_type(&input_type),
-                });
+                    affinity: Affinity::of_written_type(input_type.name()),
+                }),
+                StrictType::Any => {}
             }
             emit_store_value(program, &resolved, target_register, &ty_params, resolver)?;
             emit_decode(program, chain, target_register, resolver)?;
