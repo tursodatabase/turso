@@ -3583,7 +3583,6 @@ fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
             default,
             // These name functions and comparison rules, never a type.
             ordering: _,
-            operators: _,
             operator_signatures: _,
         } => (
             std::iter::once(base.as_str())

@@ -417,7 +417,7 @@ expect {
 # A key that doesn't convert to the BASE is compared as it is, as for a
 # STRICT INTEGER column: integers sort before text.
 test index-and-scan-agree-on-a-key-that-does-not-convert {
-    CREATE TYPE iv BASE integer ENCODE value DECODE value OPERATOR '<';
+    CREATE TYPE iv BASE integer ENCODE value DECODE value;
     CREATE TABLE t(id INTEGER PRIMARY KEY, c iv) STRICT;
     INSERT INTO t VALUES (1, 5), (2, 10);
     CREATE INDEX i ON t(c);
@@ -493,7 +493,7 @@ expect {
 # An index seek encodes its key and converts it to the BASE, as stored values are.
 @requires strict "uses STRICT tables"
 test index-seek-finds-converted-values {
-    CREATE TYPE tx(value integer) BASE integer ENCODE CAST(value AS text) DECODE value OPERATOR '<';
+    CREATE TYPE tx(value integer) BASE integer ENCODE CAST(value AS text) DECODE value;
     CREATE TABLE t(id INTEGER PRIMARY KEY, c tx) STRICT;
     CREATE INDEX tc ON t(c);
     INSERT INTO t VALUES (1, 5), (2, 6);
