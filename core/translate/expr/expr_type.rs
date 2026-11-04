@@ -883,10 +883,7 @@ fn operand_type(ty: ExprType, custom_type: impl FnOnce(&TypeDef) -> ExprType) ->
 
 /// The built-in type of the values a custom type reads as.
 fn read_type(type_def: &TypeDef) -> ExprType {
-    // The kind is unknown only while Schema::update_value_types is still
-    // working out kinds, where ANY keeps a type that depends on this one
-    // unknown until a later pass. Types left unknown are refused there.
-    ExprType::Builtin(type_def.value_type().unwrap_or(BuiltinType::Any))
+    ExprType::Builtin(type_def.value_type())
 }
 
 /// The type of `-x` and `abs(x)`. Negating a decimal written in the statement
@@ -910,9 +907,7 @@ fn negated_type(ty: ExprType) -> ExprType {
 
 /// The built-in type a custom type's values are stored as.
 fn stored_type(type_def: &TypeDef) -> ExprType {
-    // As in read_type, the kind is unknown only while kinds are being
-    // worked out.
-    ExprType::Builtin(type_def.stored_type().unwrap_or(BuiltinType::Any))
+    ExprType::Builtin(type_def.stored_type())
 }
 
 /// The kind of value a custom type or domain reads as, worked out when the
@@ -924,16 +919,19 @@ pub(crate) fn value_type(
     schema: &Schema,
     syms: &SymbolTable,
 ) -> Option<BuiltinType> {
-    match decode_type(type_def, schema, syms) {
+    let base = base_value_type(type_def.base(), schema)?;
+    match decode_type(type_def, base, schema, syms) {
         Some(ty) => value_kind(&ty, schema),
-        None => base_value_type(type_def.base(), schema),
+        None => Some(base),
     }
 }
 
 /// The type of a custom type's DECODE, in which `value` is a value of the
-/// type's BASE. None without a DECODE, or when DECODE gives `value` unchanged.
+/// type's BASE, whose kind is `base`. None without a DECODE, or when DECODE
+/// gives `value` unchanged.
 pub(crate) fn decode_type(
     type_def: &TypeDef,
+    base: BuiltinType,
     schema: &Schema,
     syms: &SymbolTable,
 ) -> Option<ExprType> {
@@ -941,12 +939,10 @@ pub(crate) fn decode_type(
         return None;
     }
     let decode = type_def.decode()?;
-    let value =
-        ExprType::Builtin(base_value_type(type_def.base(), schema).unwrap_or(BuiltinType::Any));
     Some(type_of(
         decode,
         &TypeEnv::TypeBody {
-            value,
+            value: ExprType::Builtin(base),
             params: type_def.params(),
             schema,
             syms,
@@ -955,9 +951,9 @@ pub(crate) fn decode_type(
 }
 
 /// The kind of value a BASE holds: that of a type it names, or of a SQLite type.
-fn base_value_type(base: &str, schema: &Schema) -> Option<BuiltinType> {
+pub(crate) fn base_value_type(base: &str, schema: &Schema) -> Option<BuiltinType> {
     match schema.get_type_def_unchecked(base) {
-        Some(type_def) => type_def.value_type(),
+        Some(type_def) => Some(type_def.value_type()),
         None => primitive_value_type(base),
     }
 }
@@ -966,7 +962,7 @@ fn base_value_type(base: &str, schema: &Schema) -> Option<BuiltinType> {
 /// or, for a domain, the type the domain is based on.
 pub(crate) fn stored_value_type(type_def: &TypeDef, schema: &Schema) -> Option<BuiltinType> {
     match schema.get_type_def_unchecked(type_def.base()) {
-        Some(base) => base.stored_type(),
+        Some(base) => Some(base.stored_type()),
         None => primitive_value_type(type_def.base()),
     }
 }
@@ -1009,7 +1005,7 @@ pub(crate) fn value_kind(ty: &ExprType, schema: &Schema) -> Option<BuiltinType> 
         ExprType::Array { .. } => Some(BuiltinType::Blob),
         ExprType::Custom { type_def, .. } => match schema.type_ordering(type_def) {
             Some(_) => None,
-            None => type_def.value_type(),
+            None => Some(type_def.value_type()),
         },
     }
 }

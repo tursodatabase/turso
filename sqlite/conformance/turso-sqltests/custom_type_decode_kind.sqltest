@@ -203,6 +203,16 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test create-type-refused-when-two-types-would-cast-to-each-other {
+    -- The kinds of a and b would each depend on the other's.
+    CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b);
+    CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS a);
+}
+expect error {
+    cannot create type b: type a already casts to it; create b before a
+}
+
+@requires strict "uses STRICT tables"
 test create-domain-refused-when-an-index-casts-to-its-name {
     CREATE TABLE t(id INTEGER PRIMARY KEY, c text) STRICT;
     CREATE INDEX t_c ON t(CAST(c AS b));

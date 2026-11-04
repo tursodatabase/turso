@@ -17,6 +17,7 @@ use crate::translate::expr::{
 };
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::schema::type_def_uses_type;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
 use crate::types::StrictType;
@@ -252,15 +253,10 @@ pub enum TypeDefKind {
         /// own order, such as numeric. `None` compares the stored values as
         /// SQLite does.
         ordering: Option<TypeOrdering>,
-        /// The kind of value the type reads as: what DECODE gives, or the
-        /// stored value without a DECODE. A domain reads as the type it is
-        /// based on. `None` when the kind varies, as with BASE any. Set when
-        /// the type is registered, since a DECODE may call functions of the
-        /// connection.
-        value_type: Option<BuiltinType>,
-        /// The kind of value the type stores: that of its BASE, which for a
-        /// domain is the type it is based on. Set when the type is registered.
-        stored_type: Option<BuiltinType>,
+        /// The kinds of value the type reads as and stores. `None` only while
+        /// the type is being registered (see Schema::update_value_types),
+        /// since a DECODE may call functions of the connection.
+        kinds: Option<ValueKinds>,
         operators: std::vec::Vec<TypeOperator>,
         /// How operators such as `+` and `-x` run on values of this type.
         operator_signatures: std::vec::Vec<OperatorSignature>,
@@ -268,6 +264,16 @@ pub enum TypeDefKind {
     },
     Struct(StructDef),
     Union(UnionDef),
+}
+
+/// The kinds of value a custom type reads as and stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueKinds {
+    /// What DECODE gives, or the stored value without a DECODE. A domain
+    /// reads as the type it is based on.
+    pub read: BuiltinType,
+    /// That of the BASE, which for a domain is the type it is based on.
+    pub stored: BuiltinType,
 }
 
 /// One way an operator runs when an operand has a custom type: `args[0] op
@@ -608,29 +614,43 @@ impl TypeDef {
     }
 
     /// The kind of value the type reads as. STRUCT and UNION values are blobs.
-    pub(crate) fn value_type(&self) -> Option<BuiltinType> {
-        match &self.kind {
-            TypeDefKind::Custom { value_type, .. } => *value_type,
-            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => Some(BuiltinType::Blob),
-        }
+    pub(crate) fn value_type(&self) -> BuiltinType {
+        self.kinds().read
     }
 
     /// The kind of value the type stores. STRUCT and UNION values are blobs.
-    pub(crate) fn stored_type(&self) -> Option<BuiltinType> {
+    pub(crate) fn stored_type(&self) -> BuiltinType {
+        self.kinds().stored
+    }
+
+    /// Whether the type's kinds are still to be worked out, which is only
+    /// the case while it is being registered.
+    fn kinds_pending(&self) -> bool {
+        matches!(self.kind, TypeDefKind::Custom { kinds: None, .. })
+    }
+
+    fn kinds(&self) -> ValueKinds {
         match &self.kind {
-            TypeDefKind::Custom { stored_type, .. } => *stored_type,
-            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => Some(BuiltinType::Blob),
+            TypeDefKind::Custom {
+                kinds: Some(kinds), ..
+            } => *kinds,
+            TypeDefKind::Custom { kinds: None, .. } => panic!(
+                "kinds of type {} were read before they were worked out",
+                self.name
+            ),
+            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => ValueKinds {
+                read: BuiltinType::Blob,
+                stored: BuiltinType::Blob,
+            },
         }
     }
 
-    fn set_kinds(&mut self, kinds: (Option<BuiltinType>, Option<BuiltinType>)) {
-        if let TypeDefKind::Custom {
-            value_type,
-            stored_type,
-            ..
-        } = &mut self.kind
-        {
-            (*value_type, *stored_type) = kinds;
+    fn set_kinds(&mut self, new_kinds: ValueKinds) {
+        match &mut self.kind {
+            TypeDefKind::Custom { kinds, .. } => *kinds = Some(new_kinds),
+            TypeDefKind::Struct(_) | TypeDefKind::Union(_) => {
+                unreachable!("STRUCT and UNION types are never pending")
+            }
         }
     }
 
@@ -743,15 +763,23 @@ impl TypeDef {
                 // the database still opens and DROP TYPE can remove it.
                 // A built-in type's BASE is a SQLite type. A user type's kinds
                 // are worked out once it is registered.
-                let (ordering, value_type, stored_type, operator_signatures) = if is_builtin {
+                let (ordering, kinds, operator_signatures) = if is_builtin {
+                    let Some(stored) = primitive_value_type(base) else {
+                        return Err(crate::LimboError::InternalError(format!(
+                            "built-in type {type_name} has BASE {base}"
+                        )));
+                    };
+                    let kinds = ValueKinds {
+                        read: builtin_value_type(type_name)?,
+                        stored,
+                    };
                     (
                         builtin_ordering(type_name),
-                        Some(builtin_value_type(type_name)?),
-                        primitive_value_type(base),
+                        Some(kinds),
                         builtin_signatures(type_name),
                     )
                 } else {
-                    (None, None, None, std::vec::Vec::new())
+                    (None, None, std::vec::Vec::new())
                 };
                 Self {
                     name: type_name.to_string(),
@@ -772,8 +800,7 @@ impl TypeDef {
                         coerce: coerce.clone(),
                         decode: decode.clone(),
                         ordering,
-                        value_type,
-                        stored_type,
+                        kinds,
                         operators: operators.clone(),
                         operator_signatures,
                         default: default.clone(),
@@ -870,8 +897,7 @@ impl TypeDef {
                 decode: None,
                 // A domain has the order and arithmetic of the type it is based on.
                 ordering: None,
-                value_type: None,
-                stored_type: None,
+                kinds: None,
                 operators: std::vec::Vec::new(),
                 operator_signatures: std::vec::Vec::new(),
                 default,
@@ -2257,60 +2283,70 @@ impl Schema {
         Ok(())
     }
 
-    /// Works out again the kinds of value each user-defined type reads as and
-    /// stores. A type's kind can depend on the kind of a type its DECODE casts
-    /// to or its domain is based on, so this repeats until no kind changes,
-    /// whatever order the types were added in. Built-in types name their kinds
-    /// when they are created.
+    /// Works out the kinds of value each newly added type reads as and
+    /// stores. A type's kinds can depend on the kinds of the types its
+    /// definition names (see type_def_uses_type), so a type is worked out only
+    /// after all of those are, whatever order the types were added in. Built-in
+    /// types name their kinds when they are created.
     fn update_value_types(&mut self, syms: &SymbolTable) -> Result<()> {
-        // Each pass settles at least one more type of a chain of types
-        // referring to each other, so a pass per type is enough.
-        for _ in 0..=self.type_registry.len() {
-            let changed: Vec<(String, TypeDef)> = self
-                .type_registry
-                .iter()
-                .filter(|(_, type_def)| !type_def.is_builtin)
-                .filter_map(|(key, type_def)| {
-                    let kinds = (
-                        value_type(type_def, self, syms),
-                        stored_value_type(type_def, self),
-                    );
-                    (kinds != (type_def.value_type(), type_def.stored_type())).then(|| {
-                        let mut updated = (**type_def).clone();
-                        updated.set_kinds(kinds);
-                        (key.clone(), updated)
-                    })
-                })
-                .try_collect()?;
-            if changed.is_empty() {
-                return self.check_value_types_known();
+        let mut pending: Vec<String> = self
+            .type_registry
+            .iter()
+            .filter(|(_, type_def)| type_def.kinds_pending())
+            .map(|(key, _)| key.clone())
+            .collect();
+        pending.sort();
+        // For each pending type, the other pending types its definition names.
+        let mut waits_for: Vec<(String, Vec<String>)> = Vec::new();
+        for key in &pending {
+            let type_def = &self.type_registry[key];
+            let mut names = Vec::new();
+            for other in &pending {
+                if type_def_uses_type(type_def, other)? {
+                    names.push(other.clone());
+                }
             }
-            for (key, type_def) in changed {
-                self.type_registry.insert(key, Arc::new(type_def));
-            }
+            waits_for.push((key.clone(), names));
         }
-        Err(LimboError::InternalError(
-            "kinds of user-defined types kept changing".to_string(),
-        ))
-    }
-
-    /// Fails when a type stores or reads as no known kind. CREATE TYPE and
-    /// CREATE DOMAIN refuse such types, so comparisons and arithmetic with a
-    /// type's values never have to guess its kind.
-    fn check_value_types_known(&self) -> Result<()> {
-        for type_def in self.type_registry.values() {
-            if type_def.stored_type().is_none() {
-                return Err(LimboError::ParseError(format!(
-                    "cannot tell what kind of value type {} stores",
-                    type_def.name
-                )));
+        while !waits_for.is_empty() {
+            let (ready, waiting): (Vec<_>, Vec<_>) =
+                waits_for.into_iter().partition(|(_, names)| {
+                    names
+                        .iter()
+                        .all(|name| !self.type_registry[name].kinds_pending())
+                });
+            if ready.is_empty() {
+                let names: Vec<&str> = waiting
+                    .iter()
+                    .map(|(key, _)| self.type_registry[key].name.as_str())
+                    .collect();
+                return Err(LimboError::ParseError(match names.as_slice() {
+                    [name] => format!("cannot tell the kinds of type {name}: it names itself"),
+                    _ => format!(
+                        "cannot tell the kinds of types {}: they name each other",
+                        names.join(", ")
+                    ),
+                }));
             }
-            if type_def.value_type().is_none() {
-                return Err(LimboError::ParseError(format!(
-                    "cannot tell what kind of value DECODE of type {} returns",
-                    type_def.name
-                )));
+            for (key, _) in ready {
+                let type_def = &self.type_registry[&key];
+                let Some(stored) = stored_value_type(type_def, self) else {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot tell what kind of value type {} stores",
+                        type_def.name
+                    )));
+                };
+                let Some(read) = value_type(type_def, self, syms) else {
+                    return Err(LimboError::ParseError(format!(
+                        "cannot tell what kind of value DECODE of type {} returns",
+                        type_def.name
+                    )));
+                };
+                let mut updated = (**type_def).clone();
+                updated.set_kinds(ValueKinds { read, stored });
+                self.type_registry.insert(key, Arc::new(updated));
             }
+            waits_for = waiting;
         }
         Ok(())
     }
@@ -8154,7 +8190,7 @@ impl Column {
             self.type_ordering = resolved.ordering();
             self.value_affinity = match self.type_ordering {
                 Some(_) => None,
-                None => resolved.leaf().value_type().map(BuiltinType::affinity),
+                None => Some(resolved.leaf().value_type().affinity()),
             };
         }
     }
@@ -8879,12 +8915,24 @@ mod tests {
             assert!(schema.type_registry.values().all(|t| t.is_builtin));
             for (name, type_def) in &schema.type_registry {
                 assert_eq!(
-                    type_def.value_type(),
+                    Some(type_def.value_type()),
                     value_type(type_def, schema, &syms),
                     "built-in type {name}"
                 );
             }
         });
+    }
+
+    #[test]
+    #[should_panic(expected = "kinds of type price were read before they were worked out")]
+    fn reading_the_kind_of_a_type_not_yet_worked_out_panics() {
+        let mut schema = Schema::new();
+        schema
+            .insert_type_from_sql(
+                "CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)",
+            )
+            .unwrap();
+        schema.get_type_def_unchecked("price").unwrap().value_type();
     }
 
     #[test]

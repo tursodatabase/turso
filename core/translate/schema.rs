@@ -20,7 +20,9 @@ use crate::translate::emitter::{
     emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
     OperationMode, Resolver,
 };
-use crate::translate::expr::expr_type::{decode_type, iif_values, value_type, ExprType};
+use crate::translate::expr::expr_type::{
+    base_value_type, decode_type, iif_values, value_type, ExprType,
+};
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
 use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
@@ -3167,15 +3169,17 @@ fn check_decode_type(type_def: &TypeDef, resolver: &Resolver) -> Result<()> {
         return Ok(());
     }
     let name = &type_def.name;
-    if let Some(ExprType::Custom {
-        type_def: other, ..
-    }) = decode_type(type_def, schema, syms)
-    {
-        if schema.type_ordering(&other).is_some() {
-            bail_parse_error!(
-                "DECODE of type {name} returns a {}, which only compares in its own order; wrap it in CAST(... AS <type>), such as CAST(... AS text)",
-                other.name
-            );
+    if let Some(base) = base_value_type(type_def.base(), schema) {
+        if let Some(ExprType::Custom {
+            type_def: other, ..
+        }) = decode_type(type_def, base, schema, syms)
+        {
+            if schema.type_ordering(&other).is_some() {
+                bail_parse_error!(
+                    "DECODE of type {name} returns a {}, which only compares in its own order; wrap it in CAST(... AS <type>), such as CAST(... AS text)",
+                    other.name
+                );
+            }
         }
     }
     bail_parse_error!(
@@ -3592,7 +3596,7 @@ fn find_type_using(schema: &Schema, registry_key: &str) -> Result<Option<String>
 
 /// Whether the definition of `type_def` names the type `registry_key`. Every
 /// field is listed by name, so a new field has to say whether it can name one.
-fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
+pub(crate) fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
     let TypeDef {
         name: _,
         is_builtin: _,
@@ -3616,8 +3620,7 @@ fn type_def_uses_type(type_def: &TypeDef, registry_key: &str) -> Result<bool> {
             operators: _,
             operator_signatures: _,
             // Worked out from the parts above.
-            value_type: _,
-            stored_type: _,
+            kinds: _,
         } => (
             std::iter::once(base.as_str())
                 // `CREATE TYPE outer_t(value inner_t)` converts every value

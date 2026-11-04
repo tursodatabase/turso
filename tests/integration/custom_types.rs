@@ -391,32 +391,71 @@ mod tests {
         let err = reopen_after_storing_type_sql("CREATE DOMAIN r AS r");
         assert!(
             err.contains("malformed database schema")
-                && err.contains("cannot tell what kind of value type r stores"),
+                && err.contains("cannot tell the kinds of type r: it names itself"),
             "unexpected error: {err}"
         );
     }
 
     /// An earlier version could store a type whose ENCODE casts to itself.
-    /// Such a type still opens, and DROP TYPE removes it.
+    /// Its kinds would depend on themselves, so the database does not open.
     #[test]
-    fn test_drop_type_that_casts_to_itself_stored_by_an_earlier_version() {
-        let (_temp_dir, path) = database_with_stored_type_sql(
+    fn test_reopen_fails_when_stored_type_casts_to_itself() {
+        let err = reopen_after_storing_type_sql(
             "CREATE TYPE r BASE integer ENCODE CAST(value AS r) DECODE value",
+        );
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell the kinds of type r: it names itself"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// CREATE TYPE refuses a type whose name another type already casts to,
+    /// so two types casting to each other can only come from stored SQL.
+    #[test]
+    fn test_reopen_fails_when_stored_types_cast_to_each_other() {
+        let (_temp_dir, path) = database_with_stored_types_a_and_b(
+            "CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b)",
+            "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS a)",
+        );
+        let err = open_error(&path);
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell the kinds of types a, b: they name each other"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The kinds of a type stored before a type its DECODE casts to are
+    /// worked out after that type's.
+    #[test]
+    fn test_reopen_with_type_stored_before_the_type_it_casts_to() {
+        let (_temp_dir, path) = database_with_stored_types_a_and_b(
+            "CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b)",
+            "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS integer)",
         );
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
         let db = TempDatabase::new_with_existent_with_opts(&path, opts);
         let conn = db.connect_limbo();
-        conn.execute("DROP TABLE t").unwrap();
-        conn.execute("DROP TYPE r").unwrap();
-        let rows: Vec<(i64,)> =
-            conn.exec_rows("SELECT count(*) FROM sqlite_turso_types WHERE name = 'r'");
-        assert_eq!(rows, vec![(0,)]);
+        conn.start_nested();
+        let names: Vec<(String,)> = conn.exec_rows(
+            "SELECT name FROM __turso_internal_types WHERE name IN ('a', 'b') ORDER BY rowid",
+        );
+        conn.end_nested();
+        assert_eq!(names, vec![("a".to_string(),), ("b".to_string(),)]);
+        // a reads as b's kind, integer, so 10 > 9 although the text '10' < '9'.
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT id FROM t WHERE c > 9");
+        assert_eq!(rows, vec![(1,)]);
     }
 
     /// Returns the error from opening a database storing `type_sql` as the
     /// SQL of type `r` (see database_with_stored_type_sql).
     fn reopen_after_storing_type_sql(type_sql: &str) -> String {
         let (_temp_dir, path) = database_with_stored_type_sql(type_sql);
+        open_error(&path)
+    }
+
+    fn open_error(path: &std::path::Path) -> String {
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
         let io = Arc::new(turso_core::PlatformIO::new().unwrap());
         match turso_core::Database::open_file_with_flags(
@@ -427,7 +466,7 @@ mod tests {
             None,
             Arc::new(SqliteDialect),
         ) {
-            Ok(_) => panic!("open must fail for stored type SQL {type_sql}"),
+            Ok(_) => panic!("open must fail for {}", path.display()),
             Err(err) => err.to_string(),
         }
     }
@@ -449,18 +488,52 @@ mod tests {
             .unwrap();
             conn.execute("CREATE TABLE t(a r) STRICT").unwrap();
             conn.execute("INSERT INTO t VALUES ('10')").unwrap();
-
-            conn.start_nested();
-            let stmt = conn.prepare(format!(
-                "UPDATE __turso_internal_types SET sql = '{type_sql}' WHERE name = 'r'"
-            ));
-            conn.end_nested();
-            stmt.unwrap().run_ignore_rows().unwrap();
-
+            replace_stored_type_sql(&conn, "r", type_sql);
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.close().unwrap();
         }
         (temp_dir, path)
+    }
+
+    /// Creates types `a` and `b`, in that order, and a table
+    /// `t(id INTEGER PRIMARY KEY, c a)` holding the text values '10' and '9'.
+    /// Then replaces the stored SQL of the types with `a_sql` and `b_sql`.
+    fn database_with_stored_types_a_and_b(
+        a_sql: &str,
+        b_sql: &str,
+    ) -> (TempDir, std::path::PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_stored_types_a_and_b.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            for name in ["a", "b"] {
+                conn.execute(format!(
+                    "CREATE TYPE {name}(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS text)"
+                ))
+                .unwrap();
+            }
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c a) STRICT")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, '10'), (2, '9')")
+                .unwrap();
+            replace_stored_type_sql(&conn, "a", a_sql);
+            replace_stored_type_sql(&conn, "b", b_sql);
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+        (temp_dir, path)
+    }
+
+    fn replace_stored_type_sql(conn: &Arc<turso_core::Connection>, name: &str, type_sql: &str) {
+        conn.start_nested();
+        let stmt = conn.prepare(format!(
+            "UPDATE __turso_internal_types SET sql = '{type_sql}' WHERE name = '{name}'"
+        ));
+        conn.end_nested();
+        stmt.unwrap().run_ignore_rows().unwrap();
     }
 
     #[test]
