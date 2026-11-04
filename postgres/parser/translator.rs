@@ -1298,13 +1298,7 @@ impl PostgreSQLTranslator {
             })
             .ok_or_else(|| ParseError::ParseError("TRUNCATE: missing table name".into()))?;
         let tbl_name = self.qualified_name_from_range_var(relation)?;
-        Ok(ast::Stmt::Delete {
-            with: None,
-            tbl_name,
-            indexed: None,
-            where_clause: None,
-            returning: vec![],
-        })
+        Ok(ast::Stmt::Truncate { tbl_name })
     }
 
     fn translate_create_view(
@@ -9635,16 +9629,10 @@ mod tests {
         let parsed = crate::parse(sql).unwrap();
         let translated = translator.translate(&parsed).unwrap();
 
-        if let ast::Stmt::Delete {
-            tbl_name,
-            where_clause,
-            ..
-        } = translated
-        {
+        if let ast::Stmt::Truncate { tbl_name } = translated {
             assert_eq!(tbl_name.name.as_str(), "users");
-            assert!(where_clause.is_none(), "TRUNCATE should have no WHERE");
         } else {
-            panic!("Expected Delete for TRUNCATE, got: {translated:?}");
+            panic!("Expected Truncate, got: {translated:?}");
         }
     }
 

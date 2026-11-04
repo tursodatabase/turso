@@ -1555,7 +1555,9 @@ pub(crate) fn current_schemas(conn: &Connection, include_implicit: bool) -> Vec<
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     let table_name = match stmt {
         ast::Stmt::Insert { tbl_name, .. } => Some(tbl_name.name.as_str()),
-        ast::Stmt::Delete { tbl_name, .. } => Some(tbl_name.name.as_str()),
+        ast::Stmt::Delete { tbl_name, .. } | ast::Stmt::Truncate { tbl_name } => {
+            Some(tbl_name.name.as_str())
+        }
         ast::Stmt::Update(update) => Some(update.tbl_name.name.as_str()),
         _ => None,
     };
@@ -1571,6 +1573,7 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     let verb = match stmt {
         ast::Stmt::Insert { .. } => "insert into",
         ast::Stmt::Delete { .. } => "delete from",
+        ast::Stmt::Truncate { .. } => "truncate",
         ast::Stmt::Update { .. } => "update",
         _ => unreachable!(),
     };
@@ -2045,6 +2048,7 @@ fn drop_schema_commands(
             format!("cannot drop schema \"{name}\" because other objects depend on it"),
         ));
     }
+    reject_drop_of_schema_referenced_from_outside(conn, &name, &objects)?;
 
     let mut commands: Vec<_> = objects
         .iter()
@@ -2060,6 +2064,46 @@ fn drop_schema_commands(
         context: CommandContext::DropSchema,
     });
     Ok(commands)
+}
+
+/// Rejects DROP SCHEMA ... CASCADE when a table in another schema has a
+/// foreign key to a table of `schema`. PostgreSQL drops that foreign key, but
+/// a foreign key cannot be dropped here, and keeping it would make every
+/// later write to the referencing table fail.
+fn reject_drop_of_schema_referenced_from_outside(
+    conn: &Arc<Connection>,
+    schema: &str,
+    objects: &[SchemaObject],
+) -> Result<()> {
+    let Some(namespace) = conn.qualifier(schema) else {
+        return Ok(());
+    };
+    let ns = namespace.target.id;
+    for object in objects {
+        let SchemaObject::Table(table) = object else {
+            continue;
+        };
+        let outside = conn.with_schema(namespace.database_id(), |s| {
+            if !s.any_resolved_fks_referencing(ns, table) {
+                return Ok(None);
+            }
+            Ok::<_, LimboError>(
+                s.resolved_fks_referencing(ns, table)?
+                    .into_iter()
+                    .find(|fk_ref| fk_ref.child_namespace != ns)
+                    .map(|fk_ref| fk_ref.child_table.name.clone()),
+            )
+        })?;
+        if let Some(child) = outside {
+            return Err(sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "DROP SCHEMA ... CASCADE is not supported when a table in another schema references the schema: table {child} references {schema}.{table}"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// An object of a schema, which DROP SCHEMA ... CASCADE drops.

@@ -89,3 +89,110 @@ test fk-references-table-in-other-schema {
 }
 @sqlstate 23503
 expect error {}
+
+test fk-drop-referenced-table {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id) ON DELETE CASCADE);
+    DROP TABLE parent;
+}
+@sqlstate 2BP01
+expect error {}
+
+test fk-truncate-referenced-table {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    TRUNCATE parent;
+}
+@sqlstate 0A000
+expect error {}
+
+test fk-drop-child-then-parent {
+    CREATE TABLE parent (id int PRIMARY KEY);
+    CREATE TABLE child (pid int REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1);
+    DROP TABLE child;
+    DROP TABLE parent;
+    CREATE TABLE parent (id int);
+    SELECT count(*) FROM parent;
+}
+expect {
+    0
+}
+
+test fk-self-reference-delete-all {
+    CREATE TABLE t (id int PRIMARY KEY, parent int REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2);
+    DELETE FROM t;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test fk-self-reference-update-moves-keys {
+    CREATE TABLE t (id int PRIMARY KEY, parent int REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    UPDATE t SET id = id + 10, parent = parent + 10;
+    SELECT id, parent FROM t ORDER BY id;
+}
+expect {
+    11|
+    12|11
+}
+
+test fk-self-reference-truncate-and-drop {
+    CREATE TABLE t (id int PRIMARY KEY, parent int REFERENCES t(id));
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    TRUNCATE t;
+    INSERT INTO t VALUES (1, NULL), (2, 1);
+    DROP TABLE t;
+    CREATE TABLE t (id int);
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+test fk-swap-referenced-keys {
+    CREATE TABLE parent (id int PRIMARY KEY, code int UNIQUE);
+    CREATE TABLE child (code int REFERENCES parent(code));
+    INSERT INTO parent VALUES (1, 10), (2, 20);
+    INSERT INTO child VALUES (10);
+    UPDATE parent SET code = CASE code WHEN 10 THEN 30 ELSE 10 END;
+    SELECT id, code FROM parent ORDER BY id;
+}
+expect {
+    1|30
+    2|10
+}
+
+# PostgreSQL drops the foreign key of the table outside the schema. tursopg
+# cannot drop a foreign key, so it refuses instead of keeping a foreign key to
+# a table that no longer exists.
+@skip-if postgres "PostgreSQL drops the foreign key that references the schema"
+test fk-drop-schema-referenced-from-other-schema {
+    DROP SCHEMA IF EXISTS fk_ref CASCADE;
+    CREATE SCHEMA fk_ref;
+    CREATE TABLE fk_ref.accounts (id int PRIMARY KEY);
+    CREATE TABLE settings (id int PRIMARY KEY REFERENCES fk_ref.accounts(id));
+    DROP SCHEMA fk_ref CASCADE;
+}
+@sqlstate 0A000
+expect error {}
+
+test fk-drop-schema-with-references-inside {
+    DROP SCHEMA IF EXISTS fk_inside CASCADE;
+    CREATE SCHEMA fk_inside;
+    CREATE TABLE fk_inside.parent (id int PRIMARY KEY);
+    CREATE TABLE fk_inside.child (pid int REFERENCES fk_inside.parent(id));
+    INSERT INTO fk_inside.parent VALUES (1);
+    INSERT INTO fk_inside.child VALUES (1);
+    DROP SCHEMA fk_inside CASCADE;
+    SELECT count(*) FROM pg_namespace WHERE nspname = 'fk_inside';
+}
+expect {
+    0
+}

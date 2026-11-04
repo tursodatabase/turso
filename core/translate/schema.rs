@@ -2,6 +2,7 @@ use crate::sync::Arc;
 use crate::HashMap;
 use crate::LimboError;
 
+use crate::dialect::TableRemoval;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, ResultType, ReturnType};
 use crate::namespace::is_reserved_object_name;
@@ -21,7 +22,7 @@ use crate::translate::emitter::{
 };
 use crate::translate::expr::expr_type::iif_values;
 use crate::translate::expr::{takes_input_of_type, walk_expr, WalkControl};
-use crate::translate::fkeys::emit_fk_drop_table_check;
+use crate::translate::fkeys::{emit_fk_drop_table_check, reject_removal_of_referenced_table};
 use crate::translate::plan::{compound_column_affinity, Plan, QueryDestination};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::select::{emit_select_plan, prepare_select_plan};
@@ -2185,6 +2186,13 @@ pub fn translate_drop_table(
         );
     };
     validate_drop_table(&resolver.catalog, namespace, name, connection)?;
+    reject_removal_of_referenced_table(
+        resolver,
+        connection,
+        namespace,
+        name,
+        TableRemoval::DropTable,
+    )?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()

@@ -1,10 +1,11 @@
+use crate::error::sqlstate_error;
 use crate::functions::validate_pg_input;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use turso_core::{
-    dialect::POSTGRES_TABLE_SQL_PREFIX,
+    dialect::{TableRemoval, POSTGRES_TABLE_SQL_PREFIX},
     namespace::mangle_name,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Schema, Sequence, Table, UniqueSet, AUTOINCREMENT_SEQ_PREFIX},
@@ -15,6 +16,9 @@ use turso_core::{
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{self, RefAct, SortOrder};
 use turso_pg_parser::quote_identifier;
+use turso_pg_parser::sqlstate::{
+    SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST, SQLSTATE_FEATURE_NOT_SUPPORTED,
+};
 
 use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 pub use turso_pg_parser::translator::{is_catalog_table_name, is_catalog_view_name};
@@ -228,6 +232,28 @@ impl Dialect for PostgresDialect {
 
     fn enforces_foreign_keys_by_default(&self) -> bool {
         true
+    }
+
+    fn referenced_table_removal_error(
+        &self,
+        removal: TableRemoval,
+        table: &str,
+        referencing_table: &str,
+    ) -> Option<LimboError> {
+        Some(match removal {
+            TableRemoval::DropTable => sqlstate_error(
+                SQLSTATE_DEPENDENT_OBJECTS_STILL_EXIST,
+                format!(
+                    "cannot drop table {table} because other objects depend on it: table {referencing_table} references it"
+                ),
+            ),
+            TableRemoval::Truncate => sqlstate_error(
+                SQLSTATE_FEATURE_NOT_SUPPORTED,
+                format!(
+                    "cannot truncate a table referenced in a foreign key constraint: table {referencing_table} references {table}"
+                ),
+            ),
+        })
     }
 
     fn mod_of_integers_is_integer(&self) -> bool {

@@ -71,7 +71,7 @@ impl StmtClass {
             Stmt::Select(_) => Some(Self::Select),
             Stmt::Insert { .. } => Some(Self::Insert),
             Stmt::Update(_) => Some(Self::Update),
-            Stmt::Delete { .. } => Some(Self::Delete),
+            Stmt::Delete { .. } | Stmt::Truncate { .. } => Some(Self::Delete),
             Stmt::AlterTable(_)
             | Stmt::CreateIndex { .. }
             | Stmt::CreateTable { .. }

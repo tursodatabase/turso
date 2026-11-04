@@ -2127,3 +2127,31 @@ fn command_result_kind_preserves_effects_errors_and_completion() {
     assert_eq!(schema.result_kind(), Command);
     assert!(schema.run_ignore_rows().is_err());
 }
+
+/// A statement prepared before the referencing table exists is compiled again
+/// when it runs, and the new program must still refuse to remove the
+/// referenced table instead of running the ON DELETE CASCADE of the new table.
+#[test]
+fn removal_prepared_before_the_referencing_table_exists_is_rejected() {
+    for (sql, sqlstate) in [("DROP TABLE p", "2BP01"), ("TRUNCATE p", "0A000")] {
+        let (_io, conn) = pg_connection();
+        conn.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+        conn.execute("INSERT INTO p VALUES (1)").unwrap();
+        let mut stmt = conn.prepare(sql).unwrap();
+        conn.execute("CREATE TABLE c (pid INT REFERENCES p (id) ON DELETE CASCADE)")
+            .unwrap();
+        conn.execute("INSERT INTO c VALUES (1)").unwrap();
+
+        let error = stmt
+            .run_ignore_rows()
+            .expect_err(&format!("{sql} must fail"));
+        assert_eq!(error.sqlstate, sqlstate, "{sql}: {error:?}");
+
+        let rows = conn
+            .prepare("SELECT count(*) FROM c")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows[0][0], Value::from_i64(1), "{sql}");
+    }
+}
