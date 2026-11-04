@@ -251,6 +251,46 @@ expect {
     2|2|text
 }
 
+# The same type with other parameters is another type: the child's varchar(3)
+# still checks the length of the cascaded key.
+@requires strict "uses STRICT tables"
+test cascade-update-into-shorter-varchar-checks-length {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id varchar(10) PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id varchar(3)
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES ('abc');
+    INSERT INTO child VALUES (1, 'abc');
+
+    UPDATE parent SET id = 'abcdef';
+}
+expect error {
+    value too long for varchar
+}
+
+# The cascade finds child rows by stored key, as the foreign key check does.
+# 'A' and 'a' both read back as 'a', but only the child of 'A' moves.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-finds-children-by-stored-key {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE ci BASE text ENCODE value DECODE lower(value);
+    CREATE TABLE parent(id ci PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id ci
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES ('A'), ('a');
+    INSERT INTO child VALUES (1, 'A'), (2, 'a');
+
+    UPDATE parent SET id = 'B' WHERE rowid = 1;
+    SELECT id, parent_id FROM child ORDER BY id;
+}
+expect {
+    1|b
+    2|a
+}
+
 # A SET DEFAULT action writes the column's DEFAULT, which is a user value, so
 # it still goes through ENCODE.
 @requires strict "uses STRICT tables"
