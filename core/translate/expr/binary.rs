@@ -699,6 +699,7 @@ pub(super) fn emit_binary_insn(
             if is_array(lhs_expr, referenced_tables, resolver)
                 || is_array(rhs_expr, referenced_tables, resolver)
             {
+                check_array_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
                     rhs,
@@ -714,6 +715,7 @@ pub(super) fn emit_binary_insn(
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
             resolver.require_custom_types("Array features")?;
+            check_array_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
@@ -1005,6 +1007,7 @@ pub(super) fn emit_binary_condition_insn(
             if is_array(lhs_expr, referenced_tables, resolver)
                 || is_array(rhs_expr, referenced_tables, resolver)
             {
+                check_array_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
                     rhs,
@@ -1021,6 +1024,7 @@ pub(super) fn emit_binary_condition_insn(
         }
         ast::Operator::ArrayContains | ast::Operator::ArrayOverlap => {
             resolver.require_custom_types("Array features")?;
+            check_array_operands(lhs_expr, rhs_expr, referenced_tables, resolver)?;
             let start = contiguous_operands(program, lhs, rhs);
             let func = match op {
                 ast::Operator::ArrayContains => ScalarFunc::ArrayContainsAll,
@@ -1047,4 +1051,14 @@ pub(super) fn emit_binary_condition_insn(
 
 fn is_array(expr: &Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> bool {
     type_of(expr, &TypeEnv::new(referenced_tables, resolver)).is_array()
+}
+
+fn check_array_operands(
+    lhs: &Expr,
+    rhs: &Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<()> {
+    let env = TypeEnv::new(referenced_tables, resolver);
+    check_array_arguments([lhs, rhs], &env, resolver.schema())
 }

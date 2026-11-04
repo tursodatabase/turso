@@ -191,6 +191,27 @@ expect error {
     values of type inet cannot be compared
 }
 
+# `ARRAY[1] + 1` has no declared type. Mixed with it, a json value is still
+# json, so comparing the result is refused.
+@requires strict "uses STRICT tables"
+test no-comparison-coalesce-of-json-and-untyped-value {
+    CREATE TABLE t(j json, k json) STRICT;
+    INSERT INTO t VALUES ('{"a":1,"b":2}', '{"b":2,"a":1}');
+    SELECT coalesce(j, ARRAY[1] + 1) = coalesce(k, ARRAY[1] + 1) FROM t;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-order-by-coalesce-of-json-and-untyped-value {
+    CREATE TABLE t(j json) STRICT;
+    SELECT j FROM t ORDER BY coalesce(ARRAY[1] + 1, j);
+}
+expect error {
+    values of type json cannot be compared
+}
+
 # `->` on jsonb gives json, as in PostgreSQL, so comparing it is refused.
 @requires strict "uses STRICT tables"
 test no-comparison-json-arrow-result {
@@ -243,6 +264,15 @@ expect error {
 test no-comparison-json-expression-index {
     CREATE TABLE t(j json) STRICT;
     CREATE INDEX t_j ON t((j));
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-index-on-expression {
+    CREATE TABLE t(j json) STRICT;
+    CREATE INDEX t_j ON t((j -> 'a'));
 }
 expect error {
     values of type json cannot be compared
@@ -319,6 +349,47 @@ expect error {
 
 test no-comparison-array-cast {
     SELECT CAST('{}' AS inet[]);
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+# PostgreSQL: true. Comparing the text of '::1' and '0:0:0:0:0:0:0:1' gives false.
+@requires strict "uses STRICT tables"
+test no-comparison-array-append {
+    CREATE TABLE n(a inet, b inet) STRICT;
+    INSERT INTO n VALUES ('::1', '0:0:0:0:0:0:0:1');
+    SELECT array_append(NULL, a) @> array_append(NULL, b) FROM n;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-concat {
+    CREATE TABLE n(a inet, b inet) STRICT;
+    INSERT INTO n VALUES ('::1', '0:0:0:0:0:0:0:1');
+    SELECT array_position(ARRAY[1] || a, b) FROM n;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-position-of-value {
+    CREATE TABLE n(a inet) STRICT;
+    INSERT INTO n VALUES ('::1');
+    SELECT array_position(ARRAY['0:0:0:0:0:0:0:1'], a) FROM n;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-contains-value {
+    CREATE TABLE n(a inet) STRICT;
+    INSERT INTO n VALUES ('::1');
+    SELECT array_contains(ARRAY['0:0:0:0:0:0:0:1'], a) FROM n;
 }
 expect error {
     arrays of type inet are not supported, because values of type inet cannot be compared

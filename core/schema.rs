@@ -1848,27 +1848,6 @@ impl Schema {
         }
     }
 
-    /// Fails when `column` can't be a key (an index, UNIQUE, PRIMARY KEY or
-    /// FOREIGN KEY column) because values of its type can't be compared.
-    pub fn check_key_column_has_comparison(
-        &self,
-        column: &Column,
-        is_strict: bool,
-    ) -> crate::Result<()> {
-        use crate::translate::expr::expr_type::{column_type, type_without_comparison};
-        let ty = column_type(column, is_strict, self);
-        let Some(type_def) = type_without_comparison(&ty, self) else {
-            return Ok(());
-        };
-        crate::bail_parse_error!(
-            "column '{}' of type '{}{}' cannot be a key: values of type {} cannot be compared",
-            column.name.as_deref().unwrap_or_default(),
-            column.ty_str,
-            "[]".repeat(column.array_dimensions() as usize),
-            type_def.name
-        );
-    }
-
     /// Fails when `element_type` has its own order, as numeric does. Array
     /// elements compare by their stored form, which does not sort in the
     /// type's order.
@@ -1908,6 +1887,66 @@ impl Schema {
             .ok()
             .flatten()
             .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()))
+    }
+
+    /// Fails when `column` cannot be an index, UNIQUE, PRIMARY KEY or FOREIGN
+    /// KEY column: values of its type can't be compared, or it is lossy (see
+    /// [Self::column_is_lossy]).
+    pub fn check_column_can_be_key(&self, column: &Column, is_strict: bool) -> crate::Result<()> {
+        self.check_key_column_has_comparison(column, is_strict)?;
+        if !self.column_is_lossy(column, is_strict) {
+            return Ok(());
+        }
+        let brackets = "[]".repeat(column.array_dimensions() as usize);
+        let name = column.name.as_deref().unwrap_or_default();
+        // A type that cannot be resolved counts as lossy and has no primitive,
+        // so the hint falls back to the type's name.
+        let primitive = match self.resolve_type_unchecked(&column.ty_str) {
+            Ok(Some(resolved)) => resolved.primitive,
+            _ => column.ty_str.clone(),
+        };
+        crate::bail_parse_error!(
+            "column '{name}' of type '{}{brackets}' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value. Index CAST({name} AS {primitive}{brackets}) instead",
+            column.ty_str
+        );
+    }
+
+    /// Fails when values of `column`'s type can't be compared, so it cannot be
+    /// a key.
+    pub fn check_key_column_has_comparison(
+        &self,
+        column: &Column,
+        is_strict: bool,
+    ) -> crate::Result<()> {
+        use crate::translate::expr::expr_type::{column_type, type_without_comparison};
+        let ty = column_type(column, is_strict, self);
+        let Some(type_def) = type_without_comparison(&ty, self) else {
+            return Ok(());
+        };
+        crate::bail_parse_error!(
+            "column '{}' of type '{}{}' cannot be a key: values of type {} cannot be compared",
+            column.name.as_deref().unwrap_or_default(),
+            column.ty_str,
+            "[]".repeat(column.array_dimensions() as usize),
+            type_def.name
+        );
+    }
+
+    /// Whether different stored values of the column might read back as the same
+    /// value, so a key on the column would tell apart values that queries
+    /// treat as equal. The column's type decides: built-in types, types
+    /// without a DECODE and types whose DECODE is `value` are not lossy, and a
+    /// domain or array follows the type it is based on. Everything else is
+    /// lossy, including a type that cannot be resolved.
+    pub fn column_is_lossy(&self, column: &Column, is_strict: bool) -> bool {
+        match self.resolve_type(&column.ty_str, is_strict) {
+            Ok(None) => false,
+            Ok(Some(resolved)) => !resolved
+                .chain
+                .iter()
+                .all(|td| td.is_builtin || td.decode_returns_value_unchanged()),
+            Err(_) => true,
+        }
     }
 
     /// Look up a custom type definition by name without a strictness check.
@@ -5356,9 +5395,22 @@ impl BTreeTable {
     }
 
     /// Fails when a column of a UNIQUE, PRIMARY KEY or FOREIGN KEY of the
-    /// table has a type whose values can't be compared. Call this after
-    /// [Self::resolve_custom_types].
-    pub(crate) fn check_keys_have_comparison(&self, schema: &Schema) -> Result<()> {
+    /// table can't be a key. See [Schema::check_column_can_be_key].
+    pub(crate) fn check_key_columns(&self, schema: &Schema) -> Result<()> {
+        for column in &self.columns {
+            if self.is_key_column(column) {
+                schema.check_column_can_be_key(column, self.is_strict)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `column` is part of a UNIQUE, PRIMARY KEY or FOREIGN KEY of the
+    /// table.
+    pub(crate) fn is_key_column(&self, column: &Column) -> bool {
+        let Some(name) = column.name.as_deref() else {
+            return false;
+        };
         let unique_columns = self
             .unique_sets
             .iter()
@@ -5367,12 +5419,33 @@ impl BTreeTable {
             .foreign_keys
             .iter()
             .flat_map(|fk| fk.child_columns.iter().map(String::as_str));
-        for name in unique_columns.chain(foreign_columns) {
-            if let Some((_, column)) = self.get_column(name) {
-                schema.check_key_column_has_comparison(column, self.is_strict)?;
+        unique_columns
+            .chain(foreign_columns)
+            .any(|key| key.eq_ignore_ascii_case(name))
+    }
+
+    /// Renames a column inside the UNIQUE, PRIMARY KEY and FOREIGN KEY lists.
+    /// Does not touch the column itself.
+    pub(crate) fn rename_column_in_keys(&mut self, old_name: &str, new_name: &str) {
+        for key in self.unique_sets.iter_mut().flat_map(|set| &mut set.columns) {
+            if key.name.eq_ignore_ascii_case(old_name) {
+                key.name = new_name.to_string();
             }
         }
-        Ok(())
+        for foreign_key in &mut self.foreign_keys {
+            if foreign_key
+                .child_columns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(old_name))
+            {
+                let foreign_key = Arc::make_mut(foreign_key);
+                for name in foreign_key.child_columns.iter_mut() {
+                    if name.eq_ignore_ascii_case(old_name) {
+                        *name = new_name.to_string();
+                    }
+                }
+            }
+        }
     }
 
     /// Fill in what custom type columns get from their type:
@@ -6931,64 +7004,13 @@ pub fn create_table(
                             }
                             collation = Some(collation_seq);
                         }
-                        ast::ColumnConstraint::ForeignKey {
-                            clause,
-                            defer_clause,
-                        } => {
-                            if clause.columns.len() > 1 {
-                                crate::bail_parse_error!(
-                                    "foreign key on {} should reference only one column of table {}",
-                                    name,
-                                    clause.tbl_name.as_str()
-                                );
-                            }
-                            let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
-                            let (parent_namespace, parent_table) =
-                                demangle_name(supports_namespaces, &mangled_parent_table);
-                            let fk = ForeignKey {
-                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
-                                parent_table: parent_table.to_string(),
-                                parent_namespace,
-                                parent_columns: clause
-                                    .columns
-                                    .iter()
-                                    .map(|c| normalize_ident(c.col_name.as_str()))
-                                    .try_collect()?,
-                                on_delete: clause
-                                    .args
-                                    .iter()
-                                    .find_map(|arg| {
-                                        if let ast::RefArg::OnDelete(act) = arg {
-                                            Some(*act)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(RefAct::NoAction),
-                                on_update: clause
-                                    .args
-                                    .iter()
-                                    .find_map(|arg| {
-                                        if let ast::RefArg::OnUpdate(act) = arg {
-                                            Some(*act)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(RefAct::NoAction),
-                                child_columns: Box::from([name.clone()]),
-                                deferred: match defer_clause {
-                                    Some(d) => {
-                                        d.deferrable
-                                            && matches!(
-                                                d.init_deferred,
-                                                Some(InitDeferredPred::InitiallyDeferred)
-                                            )
-                                    }
-                                    None => false,
-                                },
-                                decl_order: column_fk_order,
-                            };
+                        ast::ColumnConstraint::ForeignKey { .. } => {
+                            let fk = ForeignKey::from_column_constraint(
+                                &name,
+                                c_def,
+                                column_fk_order,
+                                supports_namespaces,
+                            )?;
                             foreign_keys.try_push(Arc::new(fk))?;
                             column_fk_order += 1;
                         }
@@ -7294,6 +7316,62 @@ fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
 }
 
 impl ForeignKey {
+    /// Builds the foreign key of a column constraint such as
+    /// `c REFERENCES parent(p) ON DELETE CASCADE`. Used by CREATE TABLE,
+    /// ADD COLUMN and ALTER COLUMN.
+    pub fn from_column_constraint(
+        child_column: &str,
+        constraint: &ast::NamedColumnConstraint,
+        decl_order: usize,
+        supports_namespaces: bool,
+    ) -> Result<Self> {
+        let ast::ColumnConstraint::ForeignKey {
+            clause,
+            defer_clause,
+        } = &constraint.constraint
+        else {
+            unreachable!("from_column_constraint called with a constraint that is not REFERENCES");
+        };
+        if clause.columns.len() > 1 {
+            crate::bail_parse_error!(
+                "foreign key on {} should reference only one column of table {}",
+                child_column,
+                clause.tbl_name.as_str()
+            );
+        }
+        let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+        let (parent_namespace, parent_table) =
+            demangle_name(supports_namespaces, &mangled_parent_table);
+        let find_action = |on_delete: bool| {
+            clause
+                .args
+                .iter()
+                .find_map(|arg| match arg {
+                    ast::RefArg::OnDelete(act) if on_delete => Some(*act),
+                    ast::RefArg::OnUpdate(act) if !on_delete => Some(*act),
+                    _ => None,
+                })
+                .unwrap_or(RefAct::NoAction)
+        };
+        Ok(ForeignKey {
+            constraint_name: constraint.name.as_ref().map(|n| n.as_str().to_owned()),
+            parent_table: parent_table.to_string(),
+            parent_namespace,
+            parent_columns: clause
+                .columns
+                .iter()
+                .map(|c| normalize_ident(c.col_name.as_str()))
+                .try_collect()?,
+            on_delete: find_action(true),
+            on_update: find_action(false),
+            child_columns: Box::from([child_column.to_string()]),
+            deferred: defer_clause.as_ref().is_some_and(|d| {
+                d.deferrable && matches!(d.init_deferred, Some(InitDeferredPred::InitiallyDeferred))
+            }),
+            decl_order,
+        })
+    }
+
     pub fn child_key_assigned(&self, child: &BTreeTable, updated_cols: &ColumnMask) -> bool {
         self.child_columns.iter().any(|cname| {
             child

@@ -152,11 +152,8 @@ mod tests {
         {
             let db = TempDatabase::new_with_existent_with_opts(&path, opts);
             let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value)",
-            )
-            .unwrap();
+            conn.execute("CREATE TYPE rev BASE text ENCODE string_reverse(value)")
+                .unwrap();
             conn.execute(
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
             )
@@ -173,13 +170,13 @@ mod tests {
         let conn = db.connect_limbo();
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
-        // A new row goes to its place in the stored (reversed) text order:
-        // ananab < elppa < tocirpa < yrrehc. The scan has no ORDER BY, which
-        // would sort by the decoded value, so rows come out in index order.
+        // The type has no DECODE, so words read back as they are stored
+        // (reversed). A new row goes to its place in that order.
         conn.execute("INSERT INTO t VALUES (4,'apricot',0)")
             .unwrap();
-        let rows: Vec<(String,)> = conn.exec_rows("SELECT word FROM t INDEXED BY t_word");
-        let words = ["banana", "apple", "apricot", "cherry"];
+        let rows: Vec<(String,)> =
+            conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
+        let words = ["ananab", "elppa", "tocirpa", "yrrehc"];
         assert_eq!(rows, words.map(|w| (w.to_string(),)));
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
@@ -212,9 +209,8 @@ mod tests {
         let check = |conn: &Arc<turso_core::Connection>, words: &[&str], ids: &[i64]| {
             let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
             assert_eq!(integrity, vec![("ok".to_string(),)]);
-            // No ORDER BY, which would sort by the decoded value: rows come
-            // out in index order.
-            let rows: Vec<(String,)> = conn.exec_rows("SELECT word FROM t INDEXED BY t_word");
+            let rows: Vec<(String,)> =
+                conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
             let words: Vec<(String,)> = words.iter().map(|w| (w.to_string(),)).collect();
             assert_eq!(rows, words);
             let ids: Vec<(i64,)> = ids.iter().map(|id| (*id,)).collect();
@@ -230,11 +226,8 @@ mod tests {
         {
             let db = open();
             let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value)",
-            )
-            .unwrap();
+            conn.execute("CREATE TYPE rev BASE text ENCODE string_reverse(value)")
+                .unwrap();
             conn.execute(
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
             )
@@ -251,14 +244,14 @@ mod tests {
         let conn = db.connect_limbo();
         conn.execute("INSERT INTO t VALUES (3,'banana',100)")
             .unwrap();
-        // Stored (reversed) text order: ananab < elppa < yrrehc.
-        check(&conn, &["banana", "apple", "cherry"], &[2, 3]);
+        // Words read back as stored (reversed): ananab < elppa < yrrehc.
+        check(&conn, &["ananab", "elppa", "yrrehc"], &[2, 3]);
 
         // A passive checkpoint builds its own schema to write the index rows.
         conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
         conn.execute("INSERT INTO t VALUES (4,'apricot',50)")
             .unwrap();
-        check(&conn, &["banana", "apple", "apricot", "cherry"], &[2, 3, 4]);
+        check(&conn, &["ananab", "elppa", "tocirpa", "yrrehc"], &[2, 3, 4]);
     }
 
     /// Under MVCC, reopening replays the logical log; a domain's DEFAULT and
@@ -1016,7 +1009,7 @@ mod tests {
         "timestamp",
         "timestamptz",
         "bytea",
-        "cents",
+        "label",
         "positive",
     ];
 
@@ -1038,6 +1031,8 @@ mod tests {
         "SELECT nullif(c, d) FROM t",
         "SELECT CASE c WHEN d THEN 1 END FROM t",
         "SELECT coalesce(c, d) = d FROM t",
+        "SELECT coalesce(c, ARRAY[1] + 1) = 1 FROM t",
+        "SELECT c FROM t ORDER BY coalesce(ARRAY[1] + 1, c)",
         "SELECT count(*) FROM t GROUP BY c",
         "SELECT DISTINCT c FROM t",
         "SELECT count(DISTINCT c) FROM t",
@@ -1056,6 +1051,7 @@ mod tests {
         "SELECT count(*) FROM t a LEFT JOIN t b ON a.c = b.d",
         "CREATE INDEX i{n} ON t(c)",
         "CREATE INDEX i{n} ON t((c))",
+        "CREATE INDEX i{n} ON t((coalesce(c, d)))",
         "CREATE INDEX i{n} ON t(id) WHERE c = d",
         "CREATE TABLE u{n}(k {ty} PRIMARY KEY) STRICT",
         "CREATE TABLE u{n}(k {ty} UNIQUE) STRICT",
@@ -1064,6 +1060,16 @@ mod tests {
         "ALTER TABLE t ADD COLUMN k{n} {ty} REFERENCES t(id)",
         "SELECT ARRAY[c] FROM t",
         "SELECT array_agg(c) FROM t",
+        "SELECT array_append(NULL, c) FROM t",
+        "SELECT array_prepend(c, NULL) FROM t",
+        "SELECT ARRAY[1] || c FROM t",
+        "SELECT c || ARRAY[1] FROM t",
+        "SELECT array_position(ARRAY[1], c) FROM t",
+        "SELECT array_contains(ARRAY[1], c) FROM t",
+        "SELECT array_remove(ARRAY[1], c) FROM t",
+        "SELECT array_set_element(ARRAY[1], 1, c) FROM t",
+        "SELECT ARRAY[1] @> c FROM t",
+        "SELECT c && ARRAY[1] FROM t",
         "CREATE TABLE u{n}(k {ty}[]) STRICT",
     ];
 
@@ -1130,6 +1136,35 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+    /// CREATE INDEX refuses an index on a json expression, but a database that
+    /// already has one, made by an earlier version, must still open.
+    #[test]
+    fn test_open_file_with_index_on_json_expression() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("json_expression_index.db");
+        let sqlite = rusqlite::Connection::open(&path).unwrap();
+        sqlite
+            .execute_batch(
+                "CREATE TABLE t(j TEXT);
+                 CREATE INDEX x ON t(j);
+                 PRAGMA writable_schema = ON;
+                 UPDATE sqlite_schema SET sql = 'CREATE TABLE t(j json) STRICT'
+                  WHERE name = 't';
+                 UPDATE sqlite_schema SET sql = 'CREATE INDEX x ON t((j -> ''x''))'
+                  WHERE name = 'x';",
+            )
+            .unwrap();
+        drop(sqlite);
+
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.execute(r#"INSERT INTO t VALUES ('{"x":1}')"#).unwrap();
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT j FROM t");
+        assert_eq!(rows, vec![(r#"{"x":1}"#.to_string(),)]);
+        conn.execute("DROP INDEX x").unwrap();
+    }
+
     fn database_with_table_of_type(ty: &str) -> (TempDatabase, Arc<turso_core::Connection>) {
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
         let db = TempDatabase::builder().with_opts(opts).build();
@@ -1138,7 +1173,7 @@ mod tests {
             "CREATE DOMAIN doc AS json",
             "CREATE TYPE point AS STRUCT(x INT, y INT)",
             "CREATE TYPE number AS UNION(i INT, f REAL)",
-            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+            "CREATE TYPE label BASE text ENCODE lower(value) DECODE value",
             "CREATE DOMAIN positive AS integer CHECK (value > 0)",
         ] {
             conn.execute(sql).unwrap();
@@ -1163,8 +1198,7 @@ mod tests {
                 RowCopy::DropColumn,
                 RowCopy::OnUpdateCascade,
             ] {
-                // Array columns can't be keys, so they can't be cascaded.
-                if row_copy == RowCopy::OnUpdateCascade && copied_type.column_type.ends_with("[]") {
+                if row_copy == RowCopy::OnUpdateCascade && copied_type.new_key.is_none() {
                     continue;
                 }
                 let column_type = copied_type.column_type;
@@ -1191,33 +1225,36 @@ mod tests {
         "CREATE TYPE shout BASE text ENCODE upper(value) DECODE lower(value)",
     ];
 
+    // Arrays and types with a DECODE other than `value` can't be keys, so
+    // they have no ON UPDATE CASCADE copy.
     const COPIED_TYPES: &[CopiedType] = &[
-        CopiedType::new("plus1", "5", "9"),
-        CopiedType::new("x100", "1", "2"),
-        CopiedType::new("cents", "42", "43"),
-        CopiedType::new("shout", "'Hi'", "'Yo'"),
-        CopiedType::new("plus1[]", "ARRAY[1, 2]", "ARRAY[3]"),
-        CopiedType::new("shout[]", "ARRAY['a', 'B']", "ARRAY['c']"),
+        CopiedType::new("plus1", "5", Some("9")),
+        CopiedType::new("x100", "1", Some("2")),
+        CopiedType::new("cents", "42", None),
+        CopiedType::new("shout", "'Hi'", None),
+        CopiedType::new("plus1[]", "ARRAY[1, 2]", None),
+        CopiedType::new("shout[]", "ARRAY['a', 'B']", None),
     ];
 
-    /// A custom-type column and two values to write to it.
+    /// A custom-type column and the values to write to it.
     struct CopiedType {
         column_type: &'static str,
         value: &'static str,
-        /// The parent key's new value in the ON UPDATE CASCADE copy.
-        new_value: &'static str,
+        /// The parent key's new value in the ON UPDATE CASCADE copy, or
+        /// `None` if the type can't be a key.
+        new_key: Option<&'static str>,
     }
 
     impl CopiedType {
         const fn new(
             column_type: &'static str,
             value: &'static str,
-            new_value: &'static str,
+            new_key: Option<&'static str>,
         ) -> Self {
             Self {
                 column_type,
                 value,
-                new_value,
+                new_key,
             }
         }
     }
@@ -1248,7 +1285,7 @@ mod tests {
         let CopiedType {
             column_type,
             value,
-            new_value,
+            new_key,
         } = copied_type;
         match row_copy {
             RowCopy::Vacuum | RowCopy::VacuumInto => {
@@ -1288,7 +1325,8 @@ mod tests {
                 ))?;
                 conn.execute(format!("INSERT INTO parent VALUES ({value})"))?;
                 conn.execute(format!("INSERT INTO child VALUES (1, {value})"))?;
-                conn.execute(format!("UPDATE parent SET k = {new_value}"))?;
+                let new_key = new_key.expect("only key types are cascaded");
+                conn.execute(format!("UPDATE parent SET k = {new_key}"))?;
                 Ok((
                     first_value(&conn, "SELECT k FROM parent")?,
                     first_value(&conn, "SELECT k FROM child")?,

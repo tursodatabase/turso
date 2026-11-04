@@ -15,7 +15,7 @@ use crate::translate::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
     },
-    expr::expr_type::{type_of, type_ordering, type_without_comparison, TypeEnv},
+    expr::expr_type::{type_of, type_ordering, type_without_comparison, ExprType, TypeEnv},
     expr::{
         bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
         translate_expr, unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
@@ -223,10 +223,12 @@ pub fn translate_create_index(
         )
     })?;
 
-    // Block CREATE INDEX on STRUCT/UNION columns and on types that can't be compared
+    // Block CREATE INDEX on STRUCT/UNION columns, on types that can't be compared
+    // and on lossy types
     for col in &columns {
-        if col.expr.is_none() {
-            // Simple column reference (not expression index)
+        // A table column, including a virtual generated column. `col.expr` also
+        // holds a virtual generated column's expression, so it cannot tell.
+        if col.expression().is_none() {
             if let Some(column) = tbl.columns().get(col.pos_in_table) {
                 if let Some(type_def) = resolver
                     .schema()
@@ -242,7 +244,19 @@ pub fn translate_create_index(
                         .schema()
                         .check_key_column_has_comparison(column, tbl.is_strict)?;
                 }
+                resolver
+                    .schema()
+                    .check_column_can_be_key(column, tbl.is_strict)?;
             }
+        } else if let Some(expr) = col.expression() {
+            resolver.with_schema(database_id, |schema| {
+                check_index_expression_has_comparison(
+                    expr,
+                    &tbl,
+                    schema,
+                    resolver.catalog.symbol_table,
+                )
+            })?;
         }
     }
 
@@ -1144,13 +1158,35 @@ pub(crate) fn expression_type_ordering(
     schema: &Schema,
     syms: &SymbolTable,
 ) -> crate::Result<Option<TypeOrdering>> {
+    let ty = index_expression_type(expr, table, schema, syms)?;
+    Ok(type_ordering(&ty, schema))
+}
+
+/// Fails when an index expression over `table`'s columns has a type whose
+/// values can't be compared. CREATE INDEX and ALTER COLUMN check this, not
+/// loading the schema, so a database with such an index still opens.
+pub(crate) fn check_index_expression_has_comparison(
+    expr: &Expr,
+    table: &BTreeTable,
+    schema: &Schema,
+    syms: &SymbolTable,
+) -> crate::Result<()> {
+    let ty = index_expression_type(expr, table, schema, syms)?;
+    match type_without_comparison(&ty, schema) {
+        Some(type_def) => Err(no_comparison_error(&ty, type_def)),
+        None => Ok(()),
+    }
+}
+
+fn index_expression_type(
+    expr: &Expr,
+    table: &BTreeTable,
+    schema: &Schema,
+    syms: &SymbolTable,
+) -> crate::Result<ExprType> {
     let mut expr = expr.clone();
     crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
-    let ty = type_of(&expr, &TypeEnv::over_table(table, schema, syms));
-    if let Some(type_def) = type_without_comparison(&ty, schema) {
-        return Err(no_comparison_error(&ty, type_def));
-    }
-    Ok(type_ordering(&ty, schema))
+    Ok(type_of(&expr, &TypeEnv::over_table(table, schema, syms)))
 }
 
 /// Extracts collation sequence from an expression if it is a Collate expression.
