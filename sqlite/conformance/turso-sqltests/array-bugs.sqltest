@@ -201,6 +201,28 @@ expect {
     3|0|1
 }
 
+test array-cast-null-to-custom-type-array-is-null {
+    CREATE TYPE lower_text_cast BASE text ENCODE value DECODE lower(value);
+    SELECT CAST(NULL AS lower_text_cast[]) IS NULL;
+}
+expect {
+    1
+}
+
+test array-cast-null-in-expression-index-on-custom-type-array {
+    CREATE TYPE lower_text_ix BASE text ENCODE value DECODE lower(value);
+    CREATE TABLE ct(id INTEGER PRIMARY KEY, c lower_text_ix[]) STRICT;
+    INSERT INTO ct VALUES (1, NULL);
+    CREATE INDEX ct_ix ON ct(CAST(c AS lower_text_ix[]));
+    INSERT INTO ct VALUES (2, NULL), (3, '{A,b}');
+    SELECT id, c FROM ct ORDER BY id;
+}
+expect {
+    1|
+    2|
+    3|{a,b}
+}
+
 test array-generated-column-concat-joins-arrays {
     CREATE TABLE g(id INTEGER PRIMARY KEY, a integer[], b integer[], c integer[] GENERATED ALWAYS AS (a || b)) STRICT;
     INSERT INTO g(id, a, b) VALUES (1, '{1,2}', '{3}'), (2, '{5}', '{5}');
@@ -232,4 +254,69 @@ test array-agg-over-7-dimensions-rejected-in-subquery {
 }
 expect error {
     result column 1 is an array with 8 dimensions, but arrays have at most 7
+}
+
+test array-column-primary-key-is-not-rowid-alias {
+    CREATE TABLE apk1 (id INTEGER, c integer[] PRIMARY KEY) STRICT;
+    INSERT INTO apk1 VALUES (1, '{1,2}');
+    INSERT INTO apk1 VALUES (2, '{3}');
+    SELECT rowid, id, c FROM apk1 ORDER BY id;
+    SELECT name FROM sqlite_schema WHERE tbl_name = 'apk1' AND type = 'index';
+    SELECT id FROM apk1 WHERE c = '{1, 2}';
+}
+expect {
+    1|1|{1,2}
+    2|2|{3}
+    sqlite_autoindex_apk1_1
+    1
+}
+
+test array-table-primary-key-is-not-rowid-alias {
+    CREATE TABLE apk2 (id INTEGER, c integer[], PRIMARY KEY(c)) STRICT;
+    INSERT INTO apk2 VALUES (1, '{1,2}');
+    INSERT INTO apk2 VALUES (2, '{3}');
+    SELECT rowid, id, c FROM apk2 ORDER BY id;
+    SELECT name FROM sqlite_schema WHERE tbl_name = 'apk2' AND type = 'index';
+}
+expect {
+    1|1|{1,2}
+    2|2|{3}
+    sqlite_autoindex_apk2_1
+}
+
+test array-primary-key-rejects-duplicates {
+    CREATE TABLE apk3 (id INTEGER, c integer[] PRIMARY KEY) STRICT;
+    INSERT INTO apk3 VALUES (1, '{1,2}');
+    INSERT INTO apk3 VALUES (2, '{1,2}');
+}
+expect error {
+    UNIQUE constraint failed: apk3.c
+}
+
+@skip-if mvcc "rebuilding affected indexes is not supported in MVCC mode"
+test array-primary-key-alter-column-keeps-automatic-index {
+    CREATE TABLE apk5 (id INTEGER, c integer[], PRIMARY KEY(c)) STRICT;
+    ALTER TABLE apk5 ALTER COLUMN c TO d integer[];
+    INSERT INTO apk5 VALUES (1, '{1,2}');
+    SELECT rowid, id, d FROM apk5;
+}
+expect {
+    1|1|{1,2}
+}
+
+# The INTEGER key is a rowid alias and an INTEGER[] key is not, so the change
+# would need an automatic index that the table does not have.
+test integer-primary-key-alter-column-to-array-rejected {
+    CREATE TABLE apk6 (id INTEGER, c integer, PRIMARY KEY(c)) STRICT;
+    ALTER TABLE apk6 ALTER COLUMN c TO d integer[];
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test array-primary-key-autoincrement-rejected {
+    CREATE TABLE apk4 (c integer[] PRIMARY KEY AUTOINCREMENT) STRICT;
+}
+expect error {
+    AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY
 }
