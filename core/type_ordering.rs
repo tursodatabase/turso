@@ -136,25 +136,14 @@ impl Ord for ArrayElements {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0
             .iter()
-            .map(NullLast::of)
-            .cmp(other.0.iter().map(NullLast::of))
+            .map(null_last_key)
+            .cmp(other.0.iter().map(null_last_key))
     }
 }
 
-/// An array element ordered with NULL after every other value.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum NullLast<'a> {
-    Value(ValueRef<'a>),
-    Null,
-}
-
-impl<'a> NullLast<'a> {
-    fn of(value: &'a Value) -> Self {
-        match value.as_value_ref() {
-            ValueRef::Null => Self::Null,
-            value => Self::Value(value),
-        }
-    }
+/// Sort key of an array element that orders NULL after every other value.
+fn null_last_key(value: &Value) -> (bool, ValueRef<'_>) {
+    (matches!(value, Value::Null), value.as_value_ref())
 }
 
 /// Hashes a value so that values SQLite's comparison finds equal hash alike.
