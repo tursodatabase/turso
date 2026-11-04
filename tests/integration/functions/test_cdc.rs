@@ -1815,6 +1815,82 @@ fn test_cdc_mvcc_failed_insert_then_empty_commit(db: TempDatabase) {
     );
 }
 
+#[turso_macros::test(mvcc)]
+fn test_cdc_records_trigger_writes(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x)")
+        .unwrap();
+    conn.execute("CREATE TABLE audit (id INTEGER PRIMARY KEY, msg)")
+        .unwrap();
+    conn.execute(
+        "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit(msg) VALUES ('inserted ' || new.id); END",
+    )
+    .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b'), (3, 'c')")
+        .unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name, id FROM turso_cdc WHERE change_type != 2 ORDER BY change_id",
+    );
+    let insert = |table: &str, id: i64| {
+        vec![
+            Value::Integer(1),
+            Value::Text(table.to_string()),
+            Value::Integer(id),
+        ]
+    };
+    assert_eq!(
+        rows,
+        vec![
+            insert("audit", 1),
+            insert("t", 1),
+            insert("audit", 2),
+            insert("t", 2),
+            insert("audit", 3),
+            insert("t", 3),
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_cdc_records_foreign_key_cascade_writes(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT change_type, table_name, id FROM turso_cdc WHERE change_type != 2 ORDER BY table_name",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Integer(-1),
+                Value::Text("child".to_string()),
+                Value::Integer(1),
+            ],
+            vec![
+                Value::Integer(-1),
+                Value::Text("parent".to_string()),
+                Value::Integer(1),
+            ],
+        ]
+    );
+}
+
 /// Regression test for https://github.com/tursodatabase/turso/issues/7677.
 ///
 /// With CDC v2 enabled, an explicit COMMIT emits a CDC commit record. For a transaction that
