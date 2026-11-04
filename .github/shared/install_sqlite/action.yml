@@ -6,7 +6,7 @@ runs:
   steps:
     - name: Install SQLite
       # The version is pinned in scripts/install-sqlite3.sh; keep that in
-      # sync with SQLITE_VERSION in core/dialect/sqlite.rs.
+      # sync with SQLITE_VERSION in core/dialect/engine.rs.
       run: |
         "$GITHUB_WORKSPACE/scripts/install-sqlite3.sh"
         echo "$GITHUB_WORKSPACE/.sqlite3" >> "$GITHUB_PATH"

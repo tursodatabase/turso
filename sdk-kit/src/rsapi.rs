@@ -21,8 +21,9 @@ use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, ConnectOpts, Connection, Database,
     DatabaseOpts, DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
     OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
-    PageLocation, QueryMode, SqliteDialect, Statement, StepResult, IO,
+    PageLocation, QueryMode, Statement, StepResult, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 use crate::{
     assert_send, assert_sync,

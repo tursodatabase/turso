@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};

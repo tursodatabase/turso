@@ -58,7 +58,7 @@ def _get_sqlite_version() -> tuple[str, tuple[int, int, int]]:
         return version_str, parts[:3]
     except Exception:
         # Fallback to the SQLite version Turso tracks
-        # (SQLITE_VERSION in core/dialect/sqlite.rs)
+        # (SQLITE_VERSION in core/dialect/engine.rs)
         return "3.50.4", (3, 50, 4)
 
 

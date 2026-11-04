@@ -87,9 +87,9 @@ use std::sync::Arc;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenFlags, SqliteDialect,
-    Value, IO,
+    ConnectOpts, Connection, Database, DatabaseOpts, MemoryIO, Numeric, OpenFlags, Value, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 // ---------------------------------------------------------------------------
 // Types

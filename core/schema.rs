@@ -1266,7 +1266,7 @@ impl Schema {
     /// bug). Production code that opens user databases should prefer
     /// [`Schema::with_options`] which returns `Result`.
     pub fn new() -> Self {
-        Self::with_options(true, &crate::dialect::SqliteDialect)
+        Self::with_options(true, &crate::dialect::EngineDialect)
             .expect("built-in type definitions are malformed")
     }
 
@@ -9890,7 +9890,7 @@ mod tests {
                 &mut HashMap::default(),
                 &mut HashMap::default(),
                 &|_| None,
-                &crate::dialect::SqliteDialect,
+                &crate::EngineDialect,
             )
             .unwrap();
 
@@ -9915,7 +9915,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
-            &crate::dialect::SqliteDialect,
+            &crate::EngineDialect,
         );
         assert!(result
             .unwrap_err()
@@ -9943,7 +9943,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
-            &crate::dialect::SqliteDialect,
+            &crate::EngineDialect,
         );
         assert!(result.is_err());
         assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
@@ -9966,7 +9966,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
-            &crate::dialect::SqliteDialect,
+            &crate::EngineDialect,
         );
         assert!(result.is_err());
         assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
@@ -9992,7 +9992,7 @@ mod tests {
                 &mut HashMap::default(),
                 &mut HashMap::default(),
                 &|_| None,
-                &crate::dialect::SqliteDialect,
+                &crate::EngineDialect,
             )
             .unwrap();
         let table = schema.get_btree_table(NamespaceId::ROOT, "t1").unwrap();
@@ -10445,7 +10445,7 @@ mod tests {
                 &mut HashMap::default(),
                 &mut HashMap::default(),
                 &|_| None,
-                &crate::dialect::SqliteDialect,
+                &crate::EngineDialect,
             )
             .unwrap();
 

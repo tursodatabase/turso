@@ -25,7 +25,7 @@ use std::{
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 use turso_core::ConnectOpts;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 /// Shared ownership of a `turso_core::Statement` that can be explicitly finalized.
 ///

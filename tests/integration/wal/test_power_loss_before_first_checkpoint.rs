@@ -23,7 +23,8 @@
 use asserting::prelude::*;
 use std::sync::Arc;
 
-use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
+use turso_core::{ConnectOpts, Database, DatabaseOpts, OpenFlags, PlatformIO, IO};
+use turso_sqlite::SqliteDialect;
 
 use crate::common::limbo_exec_rows;
 use crate::unreliable_io::UnreliableIo;

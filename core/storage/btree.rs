@@ -10885,7 +10885,7 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 
 #[cfg(test)]
 mod tests {
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use rand::{rng, Rng};
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
@@ -11024,7 +11024,7 @@ mod tests {
                 .unwrap();
         }
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(SqliteDialect))
+        let db = Database::open_file(io.clone(), path.to_str().unwrap(), Arc::new(EngineDialect))
             .unwrap();
 
         (db, temp_dir)
@@ -11090,8 +11090,8 @@ mod tests {
             #[allow(clippy::arc_with_non_send_sync)]
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
             let db =
-                Database::open_file(io, "overflow-cell-fault.db", Arc::new(SqliteDialect)).unwrap();
-            let conn = db.connect().unwrap();
+                Database::open_file(io, "overflow-cell-fault.db", Arc::new(EngineDialect)).unwrap();
+            let conn = db.connect(crate::ConnectOpts::new()).unwrap();
 
             conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
                 .unwrap();
@@ -11236,7 +11236,7 @@ mod tests {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
-            Database::open_file(io, "freelist-stale-overflow.db", Arc::new(SqliteDialect)).unwrap();
+            Database::open_file(io, "freelist-stale-overflow.db", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("PRAGMA journal_mode = WAL").unwrap();
@@ -11359,7 +11359,7 @@ mod tests {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db =
-            Database::open_file(io, "resume-overflow-yield.db", Arc::new(SqliteDialect)).unwrap();
+            Database::open_file(io, "resume-overflow-yield.db", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
 
         conn.execute("PRAGMA journal_mode = WAL").unwrap();
@@ -11733,7 +11733,7 @@ mod tests {
     fn empty_btree() -> (Arc<Pager>, i64, Arc<Database>, Arc<Connection>) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         let pager = conn.pager.load().clone();
 
@@ -11888,7 +11888,7 @@ mod tests {
     fn btree_with_virtual_page_1() -> Result<()> {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         let pager = conn.pager.load().clone();
 

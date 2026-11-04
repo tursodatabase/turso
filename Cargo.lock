@@ -1218,6 +1218,7 @@ dependencies = [
  "turso_macros",
  "turso_parser",
  "turso_sdk_kit",
+ "turso_sqlite",
  "twox-hash",
  "zerocopy",
 ]
@@ -1763,6 +1764,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_parser",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -3546,6 +3548,7 @@ dependencies = [
  "turso_core",
  "turso_macros",
  "turso_parser",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -3778,6 +3781,7 @@ dependencies = [
  "turso",
  "turso_core",
  "turso_parser",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -7044,6 +7048,7 @@ dependencies = [
  "sha1",
  "tempfile",
  "turso_core",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -7053,6 +7058,7 @@ dependencies = [
  "jni",
  "thiserror 2.0.16",
  "turso_core",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -7063,6 +7069,7 @@ dependencies = [
  "clap",
  "serde_json",
  "turso_core",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -7074,6 +7081,24 @@ dependencies = [
  "rusqlite",
  "tokio",
  "turso",
+]
+
+[[package]]
+name = "turso_benches"
+version = "0.9.0-pre.2"
+dependencies = [
+ "asserting",
+ "codspeed-criterion-compat",
+ "codspeed-divan-compat",
+ "criterion",
+ "mimalloc",
+ "regex",
+ "rusqlite",
+ "rustc-hash 2.1.1",
+ "tempfile",
+ "turso_core",
+ "turso_macros",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -7115,6 +7140,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_parser",
+ "turso_sqlite",
  "turso_sync_engine",
  "validator",
  "windows-sys 0.61.2",
@@ -7140,11 +7166,8 @@ dependencies = [
  "cfg_aliases",
  "cfg_block",
  "chrono",
- "codspeed-criterion-compat",
- "codspeed-divan-compat",
  "crc32c",
  "crc32fast",
- "criterion",
  "crossbeam-epoch",
  "crossbeam-utils",
  "either",
@@ -7164,7 +7187,6 @@ dependencies = [
  "loom",
  "memory-stats",
  "miette",
- "mimalloc",
  "num-bigint 0.4.6",
  "num-traits",
  "pack1",
@@ -7251,6 +7273,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_parser",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -7289,6 +7312,7 @@ dependencies = [
  "turso_ext",
  "turso_parser",
  "turso_pg_parser",
+ "turso_sqlite",
  "uuid",
 ]
 
@@ -7399,6 +7423,7 @@ dependencies = [
  "turso_core",
  "turso_ext",
  "turso_sdk_kit_macros",
+ "turso_sqlite",
 ]
 
 [[package]]
@@ -7448,6 +7473,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso_sqlite"
+version = "0.9.0-pre.2"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+ "turso_core",
+ "turso_parser",
+]
+
+[[package]]
 name = "turso_sqlite3"
 version = "0.9.0-pre.2"
 dependencies = [
@@ -7461,6 +7496,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_ext",
+ "turso_sqlite",
  "vcpkg",
 ]
 
@@ -7510,6 +7546,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_parser",
+ "turso_sqlite",
  "uuid",
 ]
 
@@ -7563,6 +7600,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_parser",
+ "turso_sqlite",
  "twox-hash",
  "windows-sys 0.61.2",
 ]

@@ -551,7 +551,7 @@ pub fn check_differential(
 mod tests {
     use std::sync::Arc;
     use turso_core::ConnectOpts;
-    use turso_core::SqliteDialect;
+    use turso_sqlite::SqliteDialect;
 
     use core::f64;
 

@@ -2,9 +2,9 @@ use crate::common::ExecRows;
 use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
-use turso_core::SqliteDialect;
 use turso_core::{ConnectOpts, Database, OpenFlags};
 use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
+use turso_sqlite::SqliteDialect;
 
 /// Regression test: DATABASE_MANAGER registry returns stale Database after
 /// the underlying file is renamed.
@@ -534,7 +534,8 @@ fn test_do_open_skips_registry() {
 fn test_errors_on_zero_divisor_dialect() {
     use crate::common::TempDatabase;
     use std::sync::Arc;
-    use turso_core::{Dialect, LimboError, SqliteDialect};
+    use turso_core::{Dialect, LimboError};
+    use turso_sqlite::SqliteDialect;
 
     struct DivisionRaisesErrorDialect;
     impl Dialect for DivisionRaisesErrorDialect {

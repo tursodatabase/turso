@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
@@ -18,7 +18,7 @@ macro_rules! gq_query {
     ($name:literal) => {
         (
             $name,
-            include_str!(concat!("../../perf/graph-queries/queries/", $name, ".sql")),
+            include_str!(concat!("../perf/graph-queries/queries/", $name, ".sql")),
         )
     };
 }
