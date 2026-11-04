@@ -780,7 +780,17 @@ fn translate_cast_expr(
                 ColDef::default(),
             );
             column.set_array_dimensions(tn.array_dimensions);
-            super::arrays::emit_array_encode(program, target_register, &column, resolver, "")?;
+            // As in SQLite, a CAST to a name that is not a custom type, such
+            // as `double`, casts to a plain type with that name's affinity.
+            let resolved = resolver.schema().resolve_type_unchecked(cast_type_name)?;
+            super::arrays::emit_array_encode_as(
+                program,
+                target_register,
+                &column,
+                resolved.as_ref(),
+                resolver,
+                "",
+            )?;
             return Ok(target_register);
         }
         if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {

@@ -207,9 +207,22 @@ pub(super) fn emit_array_encode(
     resolver: &Resolver,
     table_name: &str,
 ) -> Result<()> {
+    let resolved = resolve_array_element_type(col, resolver)?;
+    emit_array_encode_as(program, reg, col, resolved.as_ref(), resolver, table_name)
+}
+
+/// [emit_array_encode] for elements of the custom type `resolved`, or of the
+/// plain type `col.ty_str` when it is None.
+pub(super) fn emit_array_encode_as(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    col: &Column,
+    resolved: Option<&crate::schema::ResolvedType>,
+    resolver: &Resolver,
+    table_name: &str,
+) -> Result<()> {
     let col_name = col.name.as_deref().unwrap_or("");
-    let resolved = resolver.schema().resolve_type_unchecked(&col.ty_str)?;
-    if let Some(resolved) = &resolved {
+    if let Some(resolved) = resolved {
         if resolved.chain.iter().any(|td| td.has_encode_or_coerce()) {
             emit_array_leaf_loop(
                 program,
@@ -232,9 +245,7 @@ pub(super) fn emit_array_encode(
     // Only 1-dimensional arrays validate elements against the declared base type.
     // A custom type's elements hold what its ENCODE returns, which is checked
     // against the type's BASE storage type, as for a column of the type.
-    let storage_type = resolved
-        .as_ref()
-        .map_or(col.ty_str.as_str(), |resolved| resolved.primitive.as_str());
+    let storage_type = resolved.map_or(col.ty_str.as_str(), |resolved| resolved.primitive.as_str());
     let is_any = storage_type.eq_ignore_ascii_case("ANY");
     let is_multidim = col.array_dimensions() > 1;
     let element_affinity = if is_any || is_multidim {
@@ -268,7 +279,7 @@ pub(crate) fn emit_array_decode(
     col: &Column,
     resolver: &Resolver,
 ) -> Result<()> {
-    let Some(resolved) = resolver.schema().resolve_type_unchecked(&col.ty_str)? else {
+    let Some(resolved) = resolve_array_element_type(col, resolver)? else {
         return Ok(());
     };
     if resolved
@@ -285,6 +296,24 @@ pub(crate) fn emit_array_decode(
         ArrayInput::Blob,
         |program, leaf_reg| emit_decode(program, &resolved.chain, leaf_reg, resolver),
     )
+}
+
+/// The custom type of the elements of array column `col`, or None when they
+/// are of a plain type such as INTEGER, which has no ENCODE or DECODE.
+/// Fails for an element type that is neither.
+fn resolve_array_element_type(
+    col: &Column,
+    resolver: &Resolver,
+) -> Result<Option<crate::schema::ResolvedType>> {
+    match resolver.schema().resolve_type_unchecked(&col.ty_str)? {
+        Some(resolved) => Ok(Some(resolved)),
+        None if crate::util::is_builtin_strict_type(&col.ty_str) => Ok(None),
+        None => crate::bail_parse_error!(
+            "unknown datatype for array column {}: \"{}\"",
+            col.name.as_deref().unwrap_or(""),
+            col.ty_str
+        ),
+    }
 }
 
 /// Emit bytecode that turns the array blob in `reg` into its text form, such
