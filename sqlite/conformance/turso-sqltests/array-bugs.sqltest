@@ -31,15 +31,15 @@ expect {
     {1.0,2.0}
 }
 
-test array-cast-to-type-missing-its-arguments-is-plain-cast {
-    -- CAST('Ab' AS p) is SQLite's CAST, since p takes an argument the CAST
-    -- doesn't give. An array CAST does the same to each element, as for a
-    -- name that is no type at all, and doesn't run p's ENCODE.
-    CREATE TYPE p_upper(value text, m integer) BASE text ENCODE upper(value) DECODE lower(value);
-    SELECT CAST('{Ab}' AS p_upper[]), CAST('{Ab}' AS no_such_type[]), CAST('{Ab}' AS p_upper(3)[]);
+test array-cast-to-type-missing-its-arguments-skips-encode {
+    -- upper_text takes an argument, so a CAST that doesn't give it runs no
+    -- ENCODE, for an array as for a scalar. The name has TEXT affinity, so
+    -- the text stays as it is. With the argument, ENCODE and DECODE run.
+    CREATE TYPE upper_text(value text, m integer) BASE text ENCODE upper(value) DECODE lower(value);
+    SELECT CAST('Ab' AS upper_text), CAST('{Ab}' AS upper_text[]), CAST('{Ab}' AS no_such_text[]), CAST('{Ab}' AS upper_text(3)[]);
 }
 expect {
-    {Ab}|{Ab}|{ab}
+    Ab|{Ab}|{Ab}|{ab}
 }
 
 test array-infinity-rejected {

@@ -777,10 +777,11 @@ fn translate_cast_expr(
                 ColDef::default(),
             );
             column.set_array_dimensions(tn.array_dimensions);
-            // This is SQLite's CAST on each element, as `custom_type_cast_chain`
-            // decided: the element type is not a custom type, such as `double`,
-            // or a custom type that takes arguments the CAST doesn't give.
-            // Each element gets that name's affinity.
+            // The element type is not a custom type, such as `double`, or a
+            // custom type that takes arguments the CAST doesn't give, so no
+            // ENCODE runs. Each element gets the affinity of the type name,
+            // which, unlike SQLite's CAST, leaves text that doesn't look like
+            // a number as text: `CAST('{abc}' AS double[])` is `{abc}`.
             super::arrays::emit_array_encode_as(
                 program,
                 target_register,
