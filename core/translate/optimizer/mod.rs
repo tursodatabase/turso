@@ -4324,6 +4324,9 @@ fn ephemeral_index_build(
         .map(|(i, c)| {
             let expr = match c.generated_type() {
                 GeneratedType::Virtual { .. } => c.generated_expr().cloned(),
+                GeneratedType::Stored { .. } => {
+                    unreachable!("STORED generated columns are not supported yet")
+                }
                 GeneratedType::NotGenerated => None,
             };
             IndexColumn {

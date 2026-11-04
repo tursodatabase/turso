@@ -883,6 +883,9 @@ fn emit_update_column_values<'a>(
                             ),
                             table: column_ctx.target_table.table.require_btree()?,
                         }),
+                        GeneratedType::Stored { .. } => {
+                            unreachable!("STORED generated columns are not supported yet")
+                        }
                         GeneratedType::NotGenerated => None,
                     };
 
@@ -1016,6 +1019,9 @@ fn emit_update_column_values<'a>(
                 }
                 GeneratedType::Virtual { .. } => {
                     // no-op
+                }
+                GeneratedType::Stored { .. } => {
+                    unreachable!("STORED generated columns are not supported yet")
                 }
             }
 

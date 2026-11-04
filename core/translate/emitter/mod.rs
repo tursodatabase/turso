@@ -2224,6 +2224,9 @@ fn emit_index_column_value_new_image(
                 )?;
                 program.emit_column_affinity(dest_reg, col_in_table.affinity());
             }
+            GeneratedType::Stored { .. } => {
+                unreachable!("STORED generated columns are not supported yet")
+            }
             GeneratedType::NotGenerated => {
                 let src_reg = if col_in_table.is_rowid_alias() {
                     rowid_reg

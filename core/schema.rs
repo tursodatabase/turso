@@ -7702,7 +7702,11 @@ pub enum GeneratedType {
         expr: Box<Expr>,
         original_sql: String,
     },
-    // Stored { resolved: Box<Expr>, original_sql: String },
+    /// Stored generated column: computed at write time and persisted on disk.
+    Stored {
+        expr: Box<Expr>,
+        original_sql: String,
+    },
     NotGenerated,
 }
 
@@ -7951,6 +7955,9 @@ impl Column {
     pub fn generated_expr(&self) -> Option<&Expr> {
         match &self.generated_type {
             GeneratedType::Virtual { expr, .. } => Some(expr.as_ref()),
+            GeneratedType::Stored { .. } => {
+                unreachable!("STORED generated columns are not supported yet")
+            }
             GeneratedType::NotGenerated => None,
         }
     }
@@ -7959,6 +7966,9 @@ impl Column {
     pub fn generated_expr_mut(&mut self) -> Option<&mut Expr> {
         match &mut self.generated_type {
             GeneratedType::Virtual { expr, .. } => Some(expr.as_mut()),
+            GeneratedType::Stored { .. } => {
+                unreachable!("STORED generated columns are not supported yet")
+            }
             GeneratedType::NotGenerated => None,
         }
     }
