@@ -251,7 +251,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         ast::Expr::Literal(literal) => literal_type(literal),
         #[expect(
             clippy::disallowed_methods,
-            reason = "UNREVIEWED fallback: a column that `column_reference_type` cannot find is typed by its SQLite affinity, which hides a custom-typed column behind a built-in type"
+            reason = "UNREVIEWED fallback (#11378): a column that `column_reference_type` cannot find is typed by its SQLite affinity, which hides a custom-typed column behind a built-in type"
         )]
         ast::Expr::Column { table, column, .. } => {
             column_reference_type(*table, *column, env).unwrap_or_else(|| affinity_type(expr, env))
@@ -259,7 +259,7 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
         ast::Expr::RowId { .. } => ExprType::Builtin(BuiltinType::Integer),
         #[expect(
             clippy::disallowed_methods,
-            reason = "UNREVIEWED fallback: a register missing from `register_columns`, or a parameter with no custom type, is typed by its SQLite affinity, which hides a custom-typed value in an untracked register"
+            reason = "UNREVIEWED fallback (#11378): a register missing from `register_columns`, or a parameter with no custom type, is typed by its SQLite affinity, which hides a custom-typed value in an untracked register"
         )]
         ast::Expr::Register { .. } | ast::Expr::Variable(_) => {
             match column_custom_type(expr, env) {
@@ -915,7 +915,7 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         ),
         #[expect(
             clippy::disallowed_methods,
-            reason = "the SQLite function resolver rejects `first_value`, `last_value` and `nth_value` with fewer than one argument, so `function_type` never gets here without one: core/dialect/engine.rs:328 (`resolve_builtin_function_name`)"
+            reason = "the built-in function resolver, which both the SQLite and PostgreSQL frontends use, rejects `first_value`, `last_value` and `nth_value` with fewer than one argument, so `function_type` never gets here without one: core/dialect/engine.rs:328 (`resolve_builtin_function_name`)"
         )]
         Func::Window(WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue) => args
             .first()
@@ -1192,7 +1192,7 @@ fn is_domain(ty: &ExprType) -> bool {
 /// returned unchanged.
 #[expect(
     clippy::disallowed_methods,
-    reason = "UNREVIEWED fallback: an error from `Schema::without_domains` (domain not registered, base type cycle, out of memory) is dropped and the domain is typed as the built-in type it is stored as"
+    reason = "UNREVIEWED fallback (#11370): an error from `Schema::without_domains` (domain not registered, base type cycle, out of memory) is dropped and the domain is typed as the built-in type it is stored as"
 )]
 fn without_domain(ty: ExprType, schema: &Schema) -> ExprType {
     let ExprType::Custom { type_def, .. } = &ty else {

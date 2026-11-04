@@ -1931,7 +1931,7 @@ impl Schema {
     /// the type it is based on.
     #[expect(
         clippy::disallowed_methods,
-        reason = "UNREVIEWED fallback: an Err from resolve_type_unchecked (a cycle in the type chain, or out of memory) is turned into 'this domain has no order'"
+        reason = "UNREVIEWED fallback (#11370): an Err from resolve_type_unchecked (a cycle in the type chain, or out of memory) is turned into 'this domain has no order'"
     )]
     pub fn type_ordering(&self, type_def: &TypeDef) -> Option<TypeOrdering> {
         if !type_def.is_domain {
@@ -1998,7 +1998,7 @@ impl Schema {
     /// than the stored one.
     #[expect(
         clippy::disallowed_methods,
-        reason = "UNREVIEWED fallback: an Err from resolve_type (a cycle in the type chain, or out of memory) is turned into 'this column has no DECODE'"
+        reason = "UNREVIEWED fallback (#11370): an Err from resolve_type (a cycle in the type chain, or out of memory) is turned into 'this column has no DECODE'"
     )]
     pub fn column_has_decode(&self, column: &Column, is_strict: bool) -> bool {
         self.resolve_type(&column.ty_str, is_strict)
@@ -2146,7 +2146,7 @@ impl Schema {
         }
         #[expect(
             clippy::disallowed_methods,
-            reason = "every caller passes a column of a table, and table columns always have a name (`BTreeTable::to_sql_as` panics on a column without one): core/schema.rs:5673 (`BTreeTable::propagate_domain_constraints`)"
+            reason = "UNREVIEWED fallback: a column without a name has `value` in its domain CHECKs replaced by the empty string; nothing makes callers pass a named column"
         )]
         let col_name = column.name.as_deref().unwrap_or("").to_string();
         for td in &resolved.chain {
@@ -3934,7 +3934,7 @@ impl Schema {
             {
                 #[expect(
                     clippy::disallowed_methods,
-                    reason = "the column name is only printed in the error message; the table's columns always have names (`BTreeTable::to_sql_as` panics on a column without one): core/schema.rs:5816 (`BTreeTable::to_sql_as`)"
+                    reason = "the column name is only printed in the error message, and the empty name stands for a column without one"
                 )]
                 return Err(LimboError::ParseError(format!(
                     "column {}.{} has a custom type, which requires --experimental-custom-types flag",
@@ -5334,7 +5334,7 @@ impl GeneratedColGraph {
             if direct.get(j) {
                 #[expect(
                     clippy::disallowed_methods,
-                    reason = "the column name is only printed in the error message; the table's columns always have names (`BTreeTable::to_sql_as` panics on a column without one): core/schema.rs:5816 (`BTreeTable::to_sql_as`)"
+                    reason = "the column name is only printed in the error message, and `?` stands for a column without one"
                 )]
                 {
                     bail_parse_error!(
@@ -5480,7 +5480,7 @@ impl BTreeTable {
             .and_then(|set| set.constraint_name.clone());
         #[expect(
             clippy::disallowed_methods,
-            reason = "`create_table` removes the PRIMARY KEY set of a rowid alias (INTEGER PRIMARY KEY), and tables built by hand (internal and ephemeral tables) have none; for those, the key counts as inline when it is one column that is declared PRIMARY KEY: core/schema.rs:6879 (`create_table`)"
+            reason = "UNREVIEWED fallback: a table built with `BTreeTable::new` and no PRIMARY KEY set guesses from its columns whether the key was written on the column or as a table constraint"
         )]
         let primary_key_is_inline = unique_sets
             .iter()
