@@ -385,6 +385,10 @@ test array-of-encoded-type-holds-element-values {
     SELECT 'cs-seek', id FROM s WHERE a = ARRAY[300,400];
     SELECT 'cs-seek-text', id FROM s WHERE a = '{100,200}';
     SELECT 'cs-seek-input', count(*) FROM s WHERE a = ARRAY[3,4];
+    -- In an array of arrays, ENCODE runs on each element of the inner arrays.
+    CREATE TABLE sm(id INTEGER PRIMARY KEY, m cs[][]) STRICT;
+    INSERT INTO sm VALUES (1, ARRAY[ARRAY[1,2],ARRAY[3]]);
+    SELECT 'cs-nested', m[1][2], m[2][1] FROM sm;
 }
 expect {
     cast|{1,2}
@@ -401,4 +405,5 @@ expect {
     cs-seek|2
     cs-seek-text|1
     cs-seek-input|0
+    cs-nested|200|300
 }
