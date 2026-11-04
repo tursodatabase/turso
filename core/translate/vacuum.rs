@@ -55,6 +55,7 @@ pub fn translate_vacuum(
                 &mut dest_expr,
                 resolver,
                 &connection,
+                true,
             )?;
             match &dest_expr {
                 Expr::SubqueryResult {

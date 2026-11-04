@@ -618,6 +618,7 @@ pub fn plan_subqueries_from_returning(
 /// Plan subqueries in an expression that has no FROM clause, such as a trigger
 /// WHEN clause or a VACUUM INTO path, so there are no outer query references.
 /// Trigger NEW/OLD references should already be rewritten to Expr::Register.
+/// `fold_and_or` is passed on to the planner (see [get_subquery_parser]).
 #[turso_macros::trace_stack]
 pub fn plan_subqueries_in_expr_without_from_clause(
     program: &mut ProgramBuilder,
@@ -625,6 +626,7 @@ pub fn plan_subqueries_in_expr_without_from_clause(
     expr: &mut ast::Expr,
     resolver: &Resolver,
     connection: &Arc<Connection>,
+    fold_and_or: bool,
 ) -> Result<()> {
     let mut table_references = TableReferences::new(vec![], vec![]);
     plan_subqueries_with_outer_query_access(
@@ -637,7 +639,7 @@ pub fn plan_subqueries_in_expr_without_from_clause(
         SubqueryPosition::Where,
         SubqueryOrigin::ExprWithoutFromClause,
         false,
-        true,
+        fold_and_or,
         &mut Vec::new(),
         &mut Vec::new(),
         &[],
