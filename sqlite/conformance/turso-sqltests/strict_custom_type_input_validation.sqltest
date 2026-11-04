@@ -300,6 +300,14 @@ expect {
     0|1
 }
 
+test cast-to-type-without-expressions-converts-as-sqlite-cast {
+    CREATE DOMAIN db AS bigint;
+    SELECT CAST(1.5 AS bigint), CAST('abc' AS bigint), CAST(1.5 AS db), typeof(CAST('ab' AS bytea));
+}
+expect {
+    1|0|1|blob
+}
+
 @requires strict "uses STRICT tables"
 test domain-over-type-stores-the-type-base {
     CREATE TYPE iv(value integer) BASE integer ENCODE CAST(value AS text) DECODE value;

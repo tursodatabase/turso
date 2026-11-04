@@ -496,34 +496,23 @@ fn strict_default_type_mismatch(column: &Column) -> Result<bool> {
     Ok(!ok)
 }
 
-fn emit_add_column_default_type_validation(
+/// Fails the ALTER with `message` when the table has rows.
+fn emit_halt_if_table_has_rows(
     program: &mut ProgramBuilder,
     original_btree: &Arc<BTreeTable>,
     database_id: usize,
+    message: &str,
 ) -> Result<()> {
-    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
-    program.emit_insn(Insn::OpenRead {
-        cursor_id: check_cursor_id,
-        root_page: original_btree.root_page,
-        db: database_id,
-    });
-
-    let skip_check_label = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: check_cursor_id,
-        pc_if_empty: skip_check_label,
-    });
-
-    program.emit_insn(Insn::Halt {
-        constraint_info: None,
-        err_code: 1,
-        description: "type mismatch on DEFAULT".to_string(),
-        on_error: None,
-        description_reg: None,
-    });
-
-    program.preassign_label_to_next_insn(skip_check_label);
-    Ok(())
+    emit_if_table_has_rows(program, original_btree, database_id, |program| {
+        program.emit_insn(Insn::Halt {
+            constraint_info: None,
+            err_code: 1,
+            description: message.to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        Ok(())
+    })
 }
 
 /// Existing rows read the DEFAULT of a column added with a custom type as the
@@ -546,36 +535,49 @@ fn emit_add_column_custom_type_default_check(
     {
         return Ok(());
     }
-    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    emit_if_table_has_rows(program, original_btree, database_id, |program| {
+        let default_reg = program.alloc_register();
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            default_expr,
+            default_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+        crate::translate::expr::emit_custom_type_encode_columns(
+            program,
+            resolver,
+            std::slice::from_ref(column),
+            default_reg,
+            None,
+            &original_btree.name,
+            &ColumnLayout::Identity { column_count: 1 },
+        )?;
+        Ok(())
+    })
+}
+
+/// Emits `body` so that it runs only when the table has at least one row.
+fn emit_if_table_has_rows(
+    program: &mut ProgramBuilder,
+    original_btree: &Arc<BTreeTable>,
+    database_id: usize,
+    body: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
+) -> Result<()> {
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
     program.emit_insn(Insn::OpenRead {
-        cursor_id: check_cursor_id,
+        cursor_id,
         root_page: original_btree.root_page,
         db: database_id,
     });
-    let skip_check_label = program.allocate_label();
+    let skip_label = program.allocate_label();
     program.emit_insn(Insn::Rewind {
-        cursor_id: check_cursor_id,
-        pc_if_empty: skip_check_label,
+        cursor_id,
+        pc_if_empty: skip_label,
     });
-    let default_reg = program.alloc_register();
-    translate_expr_no_constant_opt(
-        program,
-        None,
-        default_expr,
-        default_reg,
-        resolver,
-        NoConstantOptReason::RegisterReuse,
-    )?;
-    crate::translate::expr::emit_custom_type_encode_columns(
-        program,
-        resolver,
-        std::slice::from_ref(column),
-        default_reg,
-        None,
-        &original_btree.name,
-        &ColumnLayout::Identity { column_count: 1 },
-    )?;
-    program.preassign_label_to_next_insn(skip_check_label);
+    body(program)?;
+    program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }
 
@@ -1462,33 +1464,21 @@ pub fn translate_alter_table(
                 };
 
                 if needs_empty_table_check {
-                    let check_cursor_id =
-                        program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
-                    program.emit_insn(Insn::OpenRead {
-                        cursor_id: check_cursor_id,
-                        root_page: original_btree.root_page,
-                        db: database_id,
-                    });
-
-                    let skip_error_label = program.allocate_label();
-                    program.emit_insn(Insn::Rewind {
-                        cursor_id: check_cursor_id,
-                        pc_if_empty: skip_error_label,
-                    });
-
-                    program.emit_insn(Insn::Halt {
-                        constraint_info: None,
-                        err_code: 1,
-                        description: error_message.to_string(),
-                        on_error: None,
-                        description_reg: None,
-                    });
-
-                    program.preassign_label_to_next_insn(skip_error_label);
+                    emit_halt_if_table_has_rows(
+                        program,
+                        &original_btree,
+                        database_id,
+                        error_message,
+                    )?;
                 }
 
                 if default_type_mismatch {
-                    emit_add_column_default_type_validation(program, &original_btree, database_id)?;
+                    emit_halt_if_table_has_rows(
+                        program,
+                        &original_btree,
+                        database_id,
+                        "type mismatch on DEFAULT",
+                    )?;
                 }
                 if btree.is_strict && !computes_default_for_existing_rows {
                     emit_add_column_custom_type_default_check(

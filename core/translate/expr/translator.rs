@@ -785,17 +785,14 @@ fn translate_cast_expr(
             {
                 emit_integer_to_boolean_cast(program, target_register);
             }
-            // A domain whose types have no expression to convert the value holds
-            // it as its base SQL type, so the CAST converts it as a CAST to that
-            // type would: CAST('2' AS d) is the integer 2 for a domain d over
-            // integer.
+            // A type or domain with no expression to convert the value holds it
+            // as its base SQL type, so the CAST converts it as a CAST to that
+            // type would: CAST(1.5 AS bigint) is 1, as is CAST(1.5 AS d) for a
+            // domain d over integer or bigint.
             let converts_by_expression = chain
                 .iter()
                 .any(|td| td.has_encode_or_coerce() || td.decode().is_some());
-            if is_domain
-                && !converts_by_expression
-                && !resolved.primitive.eq_ignore_ascii_case("any")
-            {
+            if !converts_by_expression && !resolved.primitive.eq_ignore_ascii_case("any") {
                 program.emit_insn(Insn::Cast {
                     reg: target_register,
                     affinity: Affinity::of_written_type(&resolved.primitive),
