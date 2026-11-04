@@ -256,3 +256,5 @@ large_stack_frames = "deny"
 large_types_passed_by_value = "deny"
 redundant_clone = "deny"
 assigning_clones = "deny"
+# Enabled per file with `#![deny(clippy::disallowed_methods)]`; see core/clippy.toml.
+disallowed_methods = "allow"

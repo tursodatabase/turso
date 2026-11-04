@@ -1,0 +1,17 @@
+# These methods turn a missing value or an error into a default. The lint is
+# allowed in [workspace.lints.clippy] and denied with `#![deny(clippy::disallowed_methods)]`
+# at the top of each custom-type file, so only those files reject them.
+# See docs/agent-guides/code-quality.md.
+disallowed-methods = [
+    { path = "std::option::Option::unwrap_or", reason = "fail closed: return an error for the missing case, or #[expect] with a reason that points at the code that makes it impossible" },
+    { path = "std::option::Option::unwrap_or_else", reason = "fail closed: return an error for the missing case, or #[expect] with a reason that points at the code that makes it impossible" },
+    { path = "std::option::Option::unwrap_or_default", reason = "fail closed: return an error for the missing case, or #[expect] with a reason that points at the code that makes it impossible" },
+    { path = "std::option::Option::map_or", reason = "fail closed: return an error for the missing case, or #[expect] with a reason that points at the code that makes it impossible" },
+    { path = "std::option::Option::map_or_else", reason = "fail closed: return an error for the missing case, or #[expect] with a reason that points at the code that makes it impossible" },
+    { path = "std::result::Result::unwrap_or", reason = "fail closed: propagate the error, or #[expect] with a reason that points at the code that makes it harmless" },
+    { path = "std::result::Result::unwrap_or_else", reason = "fail closed: propagate the error, or #[expect] with a reason that points at the code that makes it harmless" },
+    { path = "std::result::Result::unwrap_or_default", reason = "fail closed: propagate the error, or #[expect] with a reason that points at the code that makes it harmless" },
+    { path = "std::result::Result::map_or", reason = "fail closed: propagate the error, or #[expect] with a reason that points at the code that makes it harmless" },
+    { path = "std::result::Result::map_or_else", reason = "fail closed: propagate the error, or #[expect] with a reason that points at the code that makes it harmless" },
+    { path = "std::result::Result::ok", reason = "fail closed: propagate the error, or #[expect] with a reason that points at the code that makes it harmless" },
+]

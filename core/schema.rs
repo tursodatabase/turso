@@ -1,3 +1,5 @@
+#![deny(clippy::disallowed_methods)]
+
 use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
 use crate::alloc::*;
@@ -86,6 +88,10 @@ pub struct Trigger {
 
 impl Trigger {
     #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a trigger with no BEFORE/AFTER/INSTEAD OF is BEFORE, as in SQLite; the parser leaves `time` as None in that case: sqlite/parser/src/ast.rs:157 (`Stmt::CreateTrigger`)"
+    )]
     pub fn new(
         name: String,
         sql: String,
@@ -438,6 +444,10 @@ impl ResolvedType {
     /// The SQL type the type takes as input: the `value` type of the type, or
     /// of the type a domain is based on, or the plain type a domain is based
     /// on.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "`base_type` is None only for a domain over a SQLite type, whose input type is that SQLite type in `primitive`: core/schema.rs:440 (`ResolvedType::base_type`)"
+    )]
     pub fn input_type(&self) -> &str {
         self.base_type()
             .map_or(self.primitive.as_str(), |type_def| {
@@ -817,6 +827,10 @@ impl TypeDef {
     pub fn value_input_type(&self) -> &str {
         for p in self.params() {
             if p.name.eq_ignore_ascii_case("value") {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a `value` parameter written without a type (`CREATE TYPE t(value) ...`) is allowed and takes the base type; the parser leaves `ty` as None for an untyped parameter: sqlite/parser/src/ast.rs:1498 (`TypeParam`)"
+                )]
                 return p.ty.as_deref().unwrap_or_else(|| self.base());
             }
         }
@@ -1058,19 +1072,35 @@ impl Sequence {
         max_value: Option<i64>,
         cycle: bool,
     ) -> crate::Result<Self> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an omitted INCREMENT BY is 1, as in PostgreSQL CREATE SEQUENCE; `translate_create_sequence` passes the clause values as written, None when omitted: core/translate/sequence.rs (`translate_create_sequence`)"
+        )]
         let increment_by = increment.unwrap_or(1);
         if increment_by == 0 {
             return Err(crate::LimboError::ParseError(
                 "INCREMENT must not be zero".to_string(),
             ));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an omitted MINVALUE is the smallest value of the sequence's direction, as in PostgreSQL CREATE SEQUENCE; `translate_create_sequence` passes None when omitted: core/translate/sequence.rs (`translate_create_sequence`)"
+        )]
         let min_val = min_value.unwrap_or(if increment_by > 0 { 1 } else { i64::MIN });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an omitted MAXVALUE is the largest value of the sequence's direction, as in PostgreSQL CREATE SEQUENCE; `translate_create_sequence` passes None when omitted: core/translate/sequence.rs (`translate_create_sequence`)"
+        )]
         let max_val = max_value.unwrap_or(if increment_by > 0 { i64::MAX } else { -1 });
         if min_val >= max_val {
             return Err(crate::LimboError::ParseError(format!(
                 "MINVALUE ({min_val}) must be less than MAXVALUE ({max_val})"
             )));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "an omitted START is the first value in the sequence's direction (MINVALUE going up, MAXVALUE going down), as in PostgreSQL CREATE SEQUENCE; `translate_create_sequence` passes None when omitted: core/translate/sequence.rs (`translate_create_sequence`)"
+        )]
         let start_val = start.unwrap_or(if increment_by > 0 { min_val } else { max_val });
         if start_val < min_val {
             return Err(crate::LimboError::ParseError(format!(
@@ -1424,6 +1454,10 @@ impl Schema {
     /// that a namespace or any object stored under a namespace has,
     /// so that an id whose objects are still stored is not given out again.
     pub fn next_namespace_id(&self) -> NamespaceId {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "with no namespace at all the largest id is 0, so the next id is 1: core/schema.rs:1456 (`Schema::next_namespace_id`) adds 1 to it"
+        )]
         let largest = self
             .namespaces
             .iter()
@@ -1457,6 +1491,10 @@ impl Schema {
             }
         }
         for (id, name) in rows {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "an id that does not fit in a u32 is turned into a Corrupt error by the `ok_or_else` right after, so no failure is hidden: core/schema.rs:1482 (`Schema::load_namespace_names`)"
+            )]
             let id = u32::try_from(*id)
                 .ok()
                 .filter(|id| *id != 0)
@@ -1582,6 +1620,10 @@ impl Schema {
         let name = self.normalize_table_lookup_name(name);
         let objects = self.namespace_mut(namespace);
         let table = objects.tables.get_mut(&name)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a table that has no indexes has no entry in `indexes`, so the empty iterator is the right answer: core/schema.rs:2910 (`Schema::add_index`) is the only place that creates an entry"
+        )]
         let indexes = objects
             .indexes
             .get_mut(&name)
@@ -1685,6 +1727,10 @@ impl Schema {
 
     /// The indexes stored for `table_name`, backing B-tree indexes included.
     /// `table_name` is the stored name; it is not normalized.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a table that has no indexes has no entry in `indexes`, so the empty iterator is the right answer: core/schema.rs:2910 (`Schema::add_index`) is the only place that creates an entry"
+    )]
     pub fn indices_including_backing(
         &self,
         namespace: NamespaceId,
@@ -1697,6 +1743,10 @@ impl Schema {
             .unwrap_or_default()
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a table that has no indexes has no entry in `indexes`, so the empty iterator is the right answer: core/schema.rs:2910 (`Schema::add_index`) is the only place that creates an entry"
+    )]
     pub fn indices_of_table_mut(
         &mut self,
         namespace: NamespaceId,
@@ -1879,6 +1929,10 @@ impl Schema {
 
     /// The order values of `type_def` compare in. A domain has the order of
     /// the type it is based on.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "UNREVIEWED fallback: an Err from resolve_type_unchecked (a cycle in the type chain, or out of memory) is turned into 'this domain has no order'"
+    )]
     pub fn type_ordering(&self, type_def: &TypeDef) -> Option<TypeOrdering> {
         if !type_def.is_domain {
             return type_def.ordering();
@@ -1900,6 +1954,10 @@ impl Schema {
             .ok_or_else(|| {
                 LimboError::InternalError(format!("type {} is not registered", type_def.name))
             })?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "no type in the chain says whether it takes a COLLATE only for a domain over a SQLite type, which takes one when that type is text, as the doc comment says: core/schema.rs:1945 (`Schema::type_accepts_collate`)"
+        )]
         Ok(resolved
             .chain
             .iter()
@@ -1938,6 +1996,10 @@ impl Schema {
 
     /// Whether reading the column runs a DECODE, so a read gives a value other
     /// than the stored one.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "UNREVIEWED fallback: an Err from resolve_type (a cycle in the type chain, or out of memory) is turned into 'this column has no DECODE'"
+    )]
     pub fn column_has_decode(&self, column: &Column, is_strict: bool) -> bool {
         self.resolve_type(&column.ty_str, is_strict)
             .ok()
@@ -1952,6 +2014,10 @@ impl Schema {
             return Ok(());
         }
         let brackets = "[]".repeat(column.array_dimensions() as usize);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the column name is only printed in the error message, and the empty name stands for a column without one"
+        )]
         let name = column.name.as_deref().unwrap_or_default();
         // A type that cannot be resolved counts as lossy and has no primitive,
         // so the hint falls back to the type's name.
@@ -2078,11 +2144,19 @@ impl Schema {
         if !resolved.is_domain() {
             return Ok((not_null, checks));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "every caller passes a column of a table, and table columns always have a name (`BTreeTable::to_sql_as` panics on a column without one): core/schema.rs:5673 (`BTreeTable::propagate_domain_constraints`)"
+        )]
         let col_name = column.name.as_deref().unwrap_or("").to_string();
         for td in &resolved.chain {
             not_null |= td.not_null;
             for (i, dc) in td.domain_checks.iter().enumerate() {
                 let rewritten = rewrite_value_to_column(&dc.check, &col_name);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a domain CHECK written without a CONSTRAINT name is named `<domain>_<index>`; the name only appears in the error message, and CAST uses the same naming: core/translate/expr/custom_types.rs:178 (`emit_domain_cast_constraints`) and sqlite/parser/src/ast.rs:1510 (`DomainConstraint`)"
+                )]
                 let name = dc
                     .name
                     .clone()
@@ -2465,6 +2539,10 @@ impl Schema {
     /// Get all materialized views that depend on a given table
     /// The keys of the materialized views that read `table_name` of
     /// `namespace`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a table that no materialized view reads has no entry in `table_to_materialized_views`, so no dependent views is the right answer: core/schema.rs:2519 (`Schema::add_materialized_view_dependency`) creates the entries"
+    )]
     pub fn get_dependent_materialized_views(
         &self,
         namespace: NamespaceId,
@@ -2497,6 +2575,10 @@ impl Schema {
         &self,
         initially_touched: Vec<String>,
     ) -> Result<Vec<String>> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a view that no materialized view reads has no entry in `table_to_materialized_views`, so no dependent views is the right answer: core/schema.rs:2519 (`Schema::add_materialized_view_dependency`) creates the entries"
+        )]
         let dependents_of = |view_key: &str| -> Vec<String> {
             let (namespace, view_name) = self.demangle_name(view_key);
             self.namespace(namespace)
@@ -2697,6 +2779,10 @@ impl Schema {
             .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a table that has no triggers has no entry in `triggers`, so the empty iterator is the right answer: core/schema.rs:2658 (`Schema::add_trigger`) is the only place that creates an entry"
+    )]
     pub fn get_triggers_for_table(
         &self,
         namespace: NamespaceId,
@@ -2841,6 +2927,10 @@ impl Schema {
             let first_replace = indexes_for_table
                 .iter()
                 .position(|idx| idx.on_conflict == Some(ResolveType::Replace));
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "when the table has no REPLACE index yet, the new REPLACE index goes after all the other indexes, which is what the comment above `is_replace` requires: core/schema.rs:2910 (`Schema::add_index`)"
+            )]
             let pos = first_replace.unwrap_or(indexes_for_table.len());
             indexes_for_table.insert(pos, index);
         } else {
@@ -2862,6 +2952,10 @@ impl Schema {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a table that has no indexes has no entry in `indexes`, so the empty iterator is the right answer: core/schema.rs:2910 (`Schema::add_index`) is the only place that creates an entry"
+    )]
     pub fn get_indices(
         &self,
         namespace: NamespaceId,
@@ -2876,6 +2970,10 @@ impl Schema {
             .filter(|i| !i.is_backing_btree_index())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a table that has no indexes has no entry in `indexes`, so the empty iterator is the right answer: core/schema.rs:2910 (`Schema::add_index`) is the only place that creates an entry"
+    )]
     pub fn get_unowned_backing_btrees(
         &self,
         namespace: NamespaceId,
@@ -3565,7 +3663,15 @@ impl Schema {
                 .cloned()
                 .try_collect()?;
             for key in state_keys {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "`key` comes from the keys of `dbsp_state_index_roots`, so this lookup always finds it: core/schema.rs:3660 (`Schema::populate_materialized_views`, `state_keys`)"
+                )]
                 let index_root = dbsp_state_index_roots.get(&key).copied().unwrap_or(0);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a state table with no root page reads as root page 0, and the `continue` right below skips it, as it does for a missing index root: core/schema.rs:3660 (`Schema::populate_materialized_views`)"
+                )]
                 let table_root = dbsp_state_roots.get(&key).copied().unwrap_or(0);
                 if index_root == 0 || table_root == 0 {
                     continue;
@@ -3826,6 +3932,10 @@ impl Schema {
                 .iter()
                 .find(|column| column.is_array() || !is_builtin_strict_type(&column.ty_str))
             {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the column name is only printed in the error message; the table's columns always have names (`BTreeTable::to_sql_as` panics on a column without one): core/schema.rs:5816 (`BTreeTable::to_sql_as`)"
+                )]
                 return Err(LimboError::ParseError(format!(
                     "column {}.{} has a custom type, which requires --experimental-custom-types flag",
                     btree.name,
@@ -4202,6 +4312,10 @@ impl Schema {
                 //     behaviour) would treat an unresolved attached name
                 //     the same as an unqualified reference, causing the
                 //     trigger to fire on every table with a matching name.
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "an attached database name that cannot be resolved becomes INVALID_DB_ID, which matches no real database, so the trigger never fires: core/schema.rs:85 (`Trigger::target_database_id`)"
+                )]
                 let target_database_id = tbl_name.namespace.as_ref().map(|db_name| {
                     let db = db_name.as_str();
                     if db.eq_ignore_ascii_case("main") {
@@ -5218,10 +5332,16 @@ impl GeneratedColGraph {
             let mut direct = BitSet::default();
             collect_column_dependencies_of_gencol(expr, columns, &mut direct);
             if direct.get(j) {
-                bail_parse_error!(
-                    "generated column \"{}\" cannot reference itself",
-                    col.name.as_deref().unwrap_or("?")
-                );
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the column name is only printed in the error message; the table's columns always have names (`BTreeTable::to_sql_as` panics on a column without one): core/schema.rs:5816 (`BTreeTable::to_sql_as`)"
+                )]
+                {
+                    bail_parse_error!(
+                        "generated column \"{}\" cannot reference itself",
+                        col.name.as_deref().unwrap_or("?")
+                    );
+                }
             }
             let direct_mask: ColumnMask = ColumnMask::try_from_iter(direct.iter())?;
             direct_deps[j].union_with(&direct_mask)?;
@@ -5358,6 +5478,10 @@ impl BTreeTable {
             .iter()
             .find(|set| set.is_primary_key)
             .and_then(|set| set.constraint_name.clone());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "`create_table` removes the PRIMARY KEY set of a rowid alias (INTEGER PRIMARY KEY), and tables built by hand (internal and ephemeral tables) have none; for those, the key counts as inline when it is one column that is declared PRIMARY KEY: core/schema.rs:6879 (`create_table`)"
+        )]
         let primary_key_is_inline = unique_sets
             .iter()
             .find(|set| set.is_primary_key)
@@ -5708,6 +5832,10 @@ impl BTreeTable {
             let column_name = column.name.as_ref().expect("column name is None");
             sql.push_str(&quote_ident(column_name));
 
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "`written_ty_str` is None when the type was written exactly as `ty_str`, so `ty_str` is the text to write: core/schema.rs:8052 (`Column::apply_written_type`) sets it only when the two differ"
+            )]
             let written_ty_str = column.written_ty_str.as_deref().unwrap_or(&column.ty_str);
             if !written_ty_str.is_empty() {
                 sql.push(' ');
@@ -5955,6 +6083,10 @@ impl BTreeTable {
             .and_then(|unique_set| unique_set.conflict_clause)
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a rowid alias has no PRIMARY KEY set, so its ON CONFLICT clause is the one saved in `rowid_alias_conflict_clause`: core/schema.rs:6879 (`create_table`) saves it before removing the rowid alias's set"
+    )]
     fn primary_key_conflict_clause(&self) -> Option<ResolveType> {
         self.unique_sets
             .iter()
@@ -6816,6 +6948,10 @@ pub fn create_table(
                                 bail_parse_error!("unsupported primary key expression: {}", expr)
                             }
                         };
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "a PRIMARY KEY column written without ASC or DESC sorts ascending, as in SQLite; the parser leaves `order` as None in that case: sqlite/parser/src/ast.rs:1887 (`SortedColumn`)"
+                        )]
                         let sort_order = column.order.unwrap_or(SortOrder::Asc);
                         pk_unique_set_columns.try_push(UniqueSetColumn {
                             name: col_name.clone(),
@@ -6851,6 +6987,10 @@ pub fn create_table(
                                 bail_parse_error!("unsupported unique key expression: {}", expr)
                             }
                         };
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "a UNIQUE column written without ASC or DESC sorts ascending, as in SQLite; the parser leaves `order` as None in that case: sqlite/parser/src/ast.rs:1887 (`SortedColumn`)"
+                        )]
                         unique_columns.try_push(UniqueSetColumn {
                             name: col_name,
                             sort_order: column.order.unwrap_or(SortOrder::Asc),
@@ -6907,6 +7047,10 @@ pub fn create_table(
                         }
                         None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
                     };
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a foreign key written without ON DELETE or ON UPDATE has the action NO ACTION, as in SQLite; the parser leaves out the matching `RefArg` in that case: sqlite/parser/src/ast.rs:1815 (`RefArg`)"
+                    )]
                     let fk = ForeignKey {
                         constraint_name: c.name.as_ref().map(|n| n.as_str().to_owned()),
                         parent_table,
@@ -6971,6 +7115,10 @@ pub fn create_table(
                 // A column defined as exactly INTEGER PRIMARY KEY is a rowid alias, meaning that the rowid
                 // and the value of this column are the same.
                 // https://www.sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a column written without a type has the empty declared type, as in SQLite; the parser leaves `col_type` as None in that case: sqlite/parser/src/ast.rs:1567 (`ColumnDefinition`)"
+                )]
                 let ty_str = col_type
                     .as_ref()
                     .map(|t| column_declared_type(&t.name))
@@ -7069,10 +7217,16 @@ pub fn create_table(
                             notnull_conflict_clause = *conflict_clause;
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
-                            default = Some(
-                                translate_ident_to_string_literal(expr)
-                                    .unwrap_or_else(|| expr.clone()),
-                            );
+                            #[expect(
+                                clippy::disallowed_methods,
+                                reason = "only a bare identifier DEFAULT is rewritten to a string literal; any other DEFAULT expression is kept as written: core/schema.rs:7512 (`translate_ident_to_string_literal`)"
+                            )]
+                            {
+                                default = Some(
+                                    translate_ident_to_string_literal(expr)
+                                        .unwrap_or_else(|| expr.clone()),
+                                );
+                            }
                         }
                         ast::ColumnConstraint::Unique(conflict) => {
                             unique = true;
@@ -7436,6 +7590,10 @@ impl ForeignKey {
         let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
         let (parent_namespace, parent_table) =
             demangle_name(supports_namespaces, &mangled_parent_table);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a foreign key written without ON DELETE or ON UPDATE has the action NO ACTION, as in SQLite; the parser leaves out the matching `RefArg` in that case: sqlite/parser/src/ast.rs:1815 (`RefArg`)"
+        )]
         let find_action = |on_delete: bool| {
             clause
                 .args
@@ -7782,7 +7940,13 @@ impl Column {
             match constraint {
                 ast::ColumnConstraint::PrimaryKey { order, .. } => {
                     coldef.flags.insert(ColDefFlags::PrimaryKey);
-                    primary_key_order = order.unwrap_or(SortOrder::Asc);
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a column PRIMARY KEY written without ASC or DESC sorts ascending, as in SQLite; the parser leaves `order` as None in that case: sqlite/parser/src/ast.rs:1596 (`ColumnConstraint::PrimaryKey`)"
+                    )]
+                    {
+                        primary_key_order = order.unwrap_or(SortOrder::Asc);
+                    }
                 }
                 ast::ColumnConstraint::NotNull {
                     nullable,
@@ -7797,6 +7961,10 @@ impl Column {
                 }
                 ast::ColumnConstraint::Unique(..) => coldef.flags.insert(ColDefFlags::Unique),
                 ast::ColumnConstraint::Default(expr) => {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "only a bare identifier DEFAULT is rewritten to a string literal; any other DEFAULT expression is kept as written: core/schema.rs:7512 (`translate_ident_to_string_literal`)"
+                    )]
                     default.replace(
                         translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone()),
                     );
@@ -7817,6 +7985,10 @@ impl Column {
             };
         }
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a column written without a type has the empty declared type, as in SQLite; the parser leaves `col_type` as None in that case: sqlite/parser/src/ast.rs:1567 (`ColumnDefinition`)"
+        )]
         let ty_str = value
             .col_type
             .as_ref()
@@ -7973,6 +8145,10 @@ impl Column {
     pub fn collation(&self) -> CollationSeq {
         match self.type_ordering {
             Some(ordering) => CollationSeq::Type(ordering),
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a column with no COLLATE clause compares with BINARY, as in SQLite; the doc comment of the `collation` field says None means BINARY: core/schema.rs:7772 (`Column::collation`)"
+            )]
             None => CollationSeq::Text(self.collation.unwrap_or(TextCollation::Binary)),
         }
     }
@@ -8078,6 +8254,10 @@ impl Column {
     }
     /// The type of a STRICT column declared INTEGER, INT, REAL, TEXT, BLOB or
     /// ANY. Callers handle arrays and custom types before asking.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the column name is only printed in the error message, and the empty name stands for a column without one"
+    )]
     pub fn strict_type(&self, table_name: &str) -> Result<StrictType> {
         StrictType::named(&self.ty_str).ok_or_else(|| {
             LimboError::InternalError(format!(
@@ -8231,6 +8411,10 @@ macro_rules! impl_effective_nulls_order {
                 }
             }
 
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a key column written without NULLS FIRST or NULLS LAST puts NULLs first when ascending and last when descending, as in SQLite: sqlite/parser/src/ast.rs:1791 (`NullsOrder::default_for`)"
+            )]
             pub fn effective_nulls_order(&self) -> turso_parser::ast::NullsOrder {
                 self.nulls_order
                     .unwrap_or_else(|| turso_parser::ast::NullsOrder::default_for(self.order))
@@ -8421,6 +8605,10 @@ impl Index {
                     order: *order,
                     nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a PRIMARY KEY column with no COLLATE in the constraint uses the column's own collation, as in SQLite; the constraint's collation is kept apart in `explicit_collation`: core/schema.rs:8389 (`IndexColumn::explicit_collation`)"
+                    )]
                     collation: explicit_collation
                         .map_or_else(|| column.collation(), CollationSeq::Text),
                     explicit_collation,
@@ -8477,6 +8665,10 @@ impl Index {
                     order: *sort_order,
                     nulls_order: constraint_columns.get(i).and_then(|c| c.nulls_order),
                     pos_in_table,
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a UNIQUE column with no COLLATE in the constraint uses the column's own collation, as in SQLite; the constraint's collation is kept apart in `explicit_collation`: core/schema.rs:8389 (`IndexColumn::explicit_collation`)"
+                    )]
                     collation: explicit_collation
                         .map_or_else(|| col.collation(), CollationSeq::Text),
                     explicit_collation,

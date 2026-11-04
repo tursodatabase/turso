@@ -5,6 +5,8 @@
 //! wire protocol should report for it asks here instead of matching on expression
 //! shapes itself.
 
+#![deny(clippy::disallowed_methods)]
+
 use turso_parser::ast;
 
 use super::custom_type_operators::find_operator_call;
@@ -247,10 +249,18 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
     let expr = without_wrappers(expr);
     match expr {
         ast::Expr::Literal(literal) => literal_type(literal),
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "UNREVIEWED fallback: a column that `column_reference_type` cannot find is typed by its SQLite affinity, which hides a custom-typed column behind a built-in type"
+        )]
         ast::Expr::Column { table, column, .. } => {
             column_reference_type(*table, *column, env).unwrap_or_else(|| affinity_type(expr, env))
         }
         ast::Expr::RowId { .. } => ExprType::Builtin(BuiltinType::Integer),
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "UNREVIEWED fallback: a register missing from `register_columns`, or a parameter with no custom type, is typed by its SQLite affinity, which hides a custom-typed value in an untracked register"
+        )]
         ast::Expr::Register { .. } | ast::Expr::Variable(_) => {
             match column_custom_type(expr, env) {
                 Some(ty) => ExprType::Custom {
@@ -264,6 +274,10 @@ pub(crate) fn type_of(expr: &ast::Expr, env: &TypeEnv) -> ExprType {
             type_name: Some(type_name),
             ..
         } => cast_type(type_name, env.schema()),
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "`custom_operator_type` returns None only when no custom type function runs the operator, so SQLite's own `~` (an integer) or `-` (`negated_type`) runs: core/translate/expr/expr_type.rs:802 (`custom_operator_type`)"
+        )]
         ast::Expr::Unary(op, inner) => match op {
             ast::UnaryOperator::Not => ExprType::Builtin(BuiltinType::Integer),
             ast::UnaryOperator::BitwiseNot => {
@@ -472,6 +486,10 @@ impl ColumnCustomType {
     /// type, so the type exists. Like the column, it may leave out the type's
     /// arguments, as `varchar` does for `varchar(maxlen)`, which a CAST can't.
     fn from_type_name(type_name: &ast::Type, schema: &Schema) -> Self {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the default is a panic, not a value: a register or parameter gets its custom type name only from `column_custom_type_names` and from the CAST in `emit_domain_cast_constraints`, and both name types found in the schema: core/translate/expr/expr_type.rs:449 (`column_custom_type_names`) and core/translate/expr/custom_types.rs:190 (`emit_domain_cast_constraints`)"
+        )]
         let type_def = schema
             .get_type_def_unchecked(&type_name.name)
             .unwrap_or_else(|| panic!("custom type {} must exist", type_name.name));
@@ -717,6 +735,10 @@ fn call_result_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "`custom_operator_type` returns None only when no custom type function runs the operator, so SQLite's own operator runs: arithmetic gives `arithmetic_type` and the bit operators give an integer: core/translate/expr/expr_type.rs:802 (`custom_operator_type`)"
+)]
 fn binary_type(
     lhs: &ast::Expr,
     op: &ast::Operator,
@@ -872,6 +894,10 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
         Func::Scalar(ScalarFunc::StringToArray) => {
             ExprType::array(ExprType::Builtin(BuiltinType::Text), 1)
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "`array_agg()` with no argument is rejected when the aggregate is translated, so the type of its missing argument never reaches a result: core/translate/aggregation.rs:747 (`translate_aggregation_step`)"
+        )]
         Func::Agg(AggFunc::ArrayAgg) => ExprType::array(
             args.first()
                 .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
@@ -887,6 +913,10 @@ fn function_type(name: &ast::Name, args: &[Box<ast::Expr>], env: &TypeEnv) -> Ex
                 .map(|(_, arg)| arg.as_ref()),
             env,
         ),
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the SQLite function resolver rejects `first_value`, `last_value` and `nth_value` with fewer than one argument, so `function_type` never gets here without one: core/dialect/engine.rs:328 (`resolve_builtin_function_name`)"
+        )]
         Func::Window(WindowFunc::FirstValue | WindowFunc::LastValue | WindowFunc::NthValue) => args
             .first()
             .map_or(ExprType::Builtin(BuiltinType::Any), |arg| type_of(arg, env)),
@@ -902,6 +932,10 @@ fn result_type(result_type: ResultType, args: &[Box<ast::Expr>], env: &TypeEnv) 
     let first_argument = || args.first().map(|arg| type_of(arg, env));
     match result_type {
         ResultType::Declared(return_type) => declared_return_type(return_type, args, env),
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "every function with this result type (nullif, likely, unlikely, likelihood, test_uint_decode) takes one or two arguments, and the SQLite function resolver rejects a call with none: core/function.rs:1515 (`ScalarFunc::arities`) and core/dialect/engine.rs:231 (`resolve_builtin_function`)"
+        )]
         ResultType::FirstArgument => first_argument().unwrap_or(any),
         ResultType::OneOfTheArguments => common_type(args.iter().map(|arg| arg.as_ref()), env),
         ResultType::OneOfTheIifValues => common_type(iif_values(args).map(|arg| arg.as_ref()), env),
@@ -985,6 +1019,10 @@ fn declared_return_type(
         // An array of the type of the array argument: array_prepend(element,
         // array) and array_cat(array1, array2) take it second when the first
         // is not one.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the function always returns an array, so when no argument is known to be one (a parameter, an untyped column) the result is an array of unknown elements: core/translate/expr/expr_type.rs:100 (`ExprType::is_array_of_unknown_elements`)"
+        )]
         ReturnType::Array => args
             .iter()
             .map(|arg| type_of(arg, env))
@@ -1012,6 +1050,10 @@ fn common_type<'e>(exprs: impl Iterator<Item = &'e ast::Expr>, env: &TypeEnv) ->
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "no expressions means no value, whose type is NULL; `ARRAY[]` is the case, and an array of NULL elements counts as an array of unknown elements: core/translate/expr/expr_type.rs:100 (`ExprType::is_array_of_unknown_elements`)"
+)]
 fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {
     let mut common: Option<ExprType> = None;
     for ty in types {
@@ -1148,6 +1190,10 @@ fn is_domain(ty: &ExprType) -> bool {
 /// The type a domain is based on, without parameters: the first custom type
 /// under the domain, or the built-in type it is stored as. Other types are
 /// returned unchanged.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "UNREVIEWED fallback: an error from `Schema::without_domains` (domain not registered, base type cycle, out of memory) is dropped and the domain is typed as the built-in type it is stored as"
+)]
 fn without_domain(ty: ExprType, schema: &Schema) -> ExprType {
     let ExprType::Custom { type_def, .. } = &ty else {
         return ty;

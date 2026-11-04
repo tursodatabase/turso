@@ -46,6 +46,22 @@ The choice depends on whether the None/Err case represents:
 - A bug in the code (use `expect` with descriptive message)
 - A valid runtime condition (use `let ... else` or `match`)
 
+### No silent defaults in custom-type code
+
+`unwrap_or`, `unwrap_or_else`, `unwrap_or_default`, `map_or`, `map_or_else`
+and `Result::ok` turn a missing value or an error into a default. In custom-type
+code a wrong default is a wrong answer, e.g. an unknown type that compares as
+text. Clippy rejects these methods in files that start with
+`#![deny(clippy::disallowed_methods)]` (list in `core/clippy.toml`), currently
+`core/schema.rs`, `core/translate/collate.rs`, `core/translate/expr/binding.rs`
+and `core/translate/expr/expr_type.rs`. Return an error for the missing case
+instead. If the default really is correct, put
+`#[expect(clippy::disallowed_methods, reason = "...")]` on the smallest
+statement or item, and make the reason point at the code that makes the missing
+case impossible or harmless (`path:line`). "Should never happen" is not a
+reason. Defaults nobody has justified yet say `UNREVIEWED fallback: <what the
+default hides>`.
+
 ## If-Statements
 
 Wrong:
