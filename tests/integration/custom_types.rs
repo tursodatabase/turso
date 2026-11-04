@@ -396,9 +396,46 @@ mod tests {
         );
     }
 
-    /// Creates type `r` and a table using it, replaces the stored SQL of `r`
-    /// with `type_sql`, and returns the error from opening the database again.
+    /// An earlier version could store a type whose ENCODE casts to itself.
+    /// Such a type still opens, and DROP TYPE removes it.
+    #[test]
+    fn test_drop_type_that_casts_to_itself_stored_by_an_earlier_version() {
+        let (_temp_dir, path) = database_with_stored_type_sql(
+            "CREATE TYPE r BASE integer ENCODE CAST(value AS r) DECODE value",
+        );
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.execute("DROP TABLE t").unwrap();
+        conn.execute("DROP TYPE r").unwrap();
+        let rows: Vec<(i64,)> =
+            conn.exec_rows("SELECT count(*) FROM sqlite_turso_types WHERE name = 'r'");
+        assert_eq!(rows, vec![(0,)]);
+    }
+
+    /// Returns the error from opening a database storing `type_sql` as the
+    /// SQL of type `r` (see database_with_stored_type_sql).
     fn reopen_after_storing_type_sql(type_sql: &str) -> String {
+        let (_temp_dir, path) = database_with_stored_type_sql(type_sql);
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        match turso_core::Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+            Arc::new(SqliteDialect),
+        ) {
+            Ok(_) => panic!("open must fail for stored type SQL {type_sql}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// Creates type `r` and a table `t(a r)` holding one row, then replaces
+    /// the stored SQL of `r` with `type_sql`, as an earlier version could
+    /// have stored it.
+    fn database_with_stored_type_sql(type_sql: &str) -> (TempDir, std::path::PathBuf) {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("custom_types_stored_type_sql.db");
         let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
@@ -423,19 +460,7 @@ mod tests {
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             conn.close().unwrap();
         }
-
-        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
-        match turso_core::Database::open_file_with_flags(
-            io,
-            path.to_str().unwrap(),
-            turso_core::OpenFlags::default(),
-            opts,
-            None,
-            Arc::new(SqliteDialect),
-        ) {
-            Ok(_) => panic!("open must fail for stored type SQL {type_sql}"),
-            Err(err) => err.to_string(),
-        }
+        (temp_dir, path)
     }
 
     #[test]
