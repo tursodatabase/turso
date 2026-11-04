@@ -407,6 +407,13 @@ expect error {
     malformed JSON
 }
 
+test and-or-with-a-long-hex-operand-runs-the-other-operand {
+    SELECT 0xffffffffffffffff OR json_extract('bare', '$.a');
+}
+expect error {
+    malformed JSON
+}
+
 test and-or-with-a-collated-operand-runs-the-other-operand {
     SELECT (0 COLLATE NOCASE) AND json_extract('bare', '$.a');
 }

@@ -124,7 +124,9 @@ pub fn literal_truth_value(expr: &ast::Expr) -> Option<bool> {
 /// `x AND 0` as soon as it reads it, before TRUE and FALSE are resolved, so a
 /// place that follows the parser must not accept the keywords. A literal with
 /// a digit separator, such as `0_0`, is not folded either: SQLite only reads
-/// the value of a plain digit string when it builds the literal.
+/// the value of a plain digit string when it builds the literal. The value
+/// has to be a 32-bit integer, and a hex literal that wraps around to a
+/// negative value, such as `0xffffffffffffffff`, is too long for that read.
 pub fn integer_literal_truth_value(expr: &ast::Expr) -> Option<bool> {
     match expr {
         ast::Expr::Literal(ast::Literal::Numeric(text)) => {
@@ -132,8 +134,10 @@ pub fn integer_literal_truth_value(expr: &ast::Expr) -> Option<bool> {
                 return None;
             }
             match crate::util::parse_numeric_literal(text) {
-                Ok(crate::Value::Numeric(crate::Numeric::Integer(value))) => {
-                    i32::try_from(value).ok().map(|value| value != 0)
+                Ok(crate::Value::Numeric(crate::Numeric::Integer(value)))
+                    if (0..=i64::from(i32::MAX)).contains(&value) =>
+                {
+                    Some(value != 0)
                 }
                 _ => None,
             }
