@@ -110,7 +110,8 @@ impl ExprType {
 
 /// The type's name for an error message, as a column declares it: `date`,
 /// `integer[]`. An array whose element type nothing declares is `anyarray`,
-/// as in PostgreSQL.
+/// as in PostgreSQL. A value whose type is only known when the statement
+/// runs, such as the result of json_extract(), is `value`.
 impl std::fmt::Display for ExprType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -126,11 +127,11 @@ impl std::fmt::Display for ExprType {
                 BuiltinType::Decimal | BuiltinType::Numeric => "numeric",
                 BuiltinType::Text => "text",
                 BuiltinType::Blob => "blob",
-                BuiltinType::Any => "any",
+                BuiltinType::Any => "value",
             }),
             Self::Untyped => f.write_str("text"),
             Self::Null => f.write_str("null"),
-            Self::Unknown => f.write_str("unknown"),
+            Self::Unknown => f.write_str("value"),
         }
     }
 }
