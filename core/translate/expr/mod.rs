@@ -123,8 +123,9 @@ pub(crate) use emission::{
 };
 pub use metadata::ConditionMetadata;
 pub(crate) use rewrite::{
-    apply_static_rewrites, replace_and_or_with_deciding_operand, AndWithIntegerZero,
-    BetweenToComparisons, BINDING_REWRITES,
+    apply_static_rewrites, reject_unknown_compared_collation_at,
+    replace_and_or_with_deciding_operand, AndWithIntegerZero, BetweenToComparisons,
+    BINDING_REWRITES,
 };
 pub(crate) use translator::is_sqlite_cast_to;
 pub use translator::{
@@ -143,6 +144,7 @@ pub(crate) use walk::{
 pub use walk::{
     expr_contains_function_that_changes_within_statement,
     expr_contains_nondeterministic_scalar_function, expr_contains_subquery,
-    expr_contains_unplanned_subquery, expr_references_any_subquery, expr_references_outer_query,
-    expr_references_subquery_id, walk_expr, walk_expr_mut, WalkControl,
+    expr_contains_unplanned_subquery, expr_contains_unresolved_column_name,
+    expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
+    walk_expr, walk_expr_mut, WalkControl,
 };
