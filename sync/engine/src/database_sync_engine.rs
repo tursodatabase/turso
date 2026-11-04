@@ -2040,14 +2040,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             let local_changes = precollected_local_changes
                 .into_iter()
                 .filter(|change| change.change_id > replay_floor)
-                .map(|mut change| {
-                    change.table_name = remote_apply_stats
-                        .renamed_tables
-                        .current_name(&change.table_name)
-                        .to_string();
-                    change
-                })
-                .collect::<Vec<_>>();
+                .map(|change| remote_apply_stats.renamed_tables.move_local_change(change))
+                .collect::<Result<Vec<_>>>()?;
             let mut skipped_internal_local_changes = 0usize;
             let local_changes = local_changes
                 .into_iter()
@@ -2722,13 +2716,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 precollected_local_changes
                     .into_iter()
                     .filter(|change| change.change_id > replay_floor)
-                    .map(|mut change| {
-                        change.table_name = followup_renamed_tables
-                            .current_name(&change.table_name)
-                            .to_string();
-                        change
-                    })
-                    .collect::<Vec<_>>()
+                    .map(|change| followup_renamed_tables.move_local_change(change))
+                    .collect::<Result<Vec<_>>>()?
             } else {
                 let iterate_opts = DatabaseChangesIteratorOpts {
                     first_change_id: Some(replay_floor + 1),

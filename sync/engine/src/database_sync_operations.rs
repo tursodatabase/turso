@@ -607,7 +607,36 @@ impl RenamedTables {
         self.old_and_current_names.is_empty()
     }
 
-    pub fn current_name<'a>(&'a self, old_name: &'a str) -> &'a str {
+    /// Moves an unpushed local change to the current name of its table. Local schema
+    /// changes keep their SQL, which names the old table, so they cannot be replayed
+    /// after the rename and fail the pull instead.
+    pub fn move_local_change(
+        &self,
+        mut change: DatabaseTapeRowChange,
+    ) -> Result<DatabaseTapeRowChange> {
+        if change.table_name == "sqlite_schema" {
+            let schema_rows = match &change.change {
+                DatabaseTapeRowChangeType::Delete { before, .. } => vec![before],
+                DatabaseTapeRowChangeType::Insert { after } => vec![after],
+                DatabaseTapeRowChangeType::Update { before, after, .. } => vec![before, after],
+            };
+            for row in schema_rows {
+                let Some(turso_core::Value::Text(table_name)) = row.get(2) else {
+                    continue;
+                };
+                let current_name = self.current_name(table_name.as_str());
+                if current_name != table_name.as_str() {
+                    return Err(Error::DatabaseSyncEngineError(format!(
+                        "unpushed local schema change to table {table_name} cannot be replayed: the remote renamed the table to {current_name}"
+                    )));
+                }
+            }
+        }
+        change.table_name = self.current_name(&change.table_name).to_string();
+        Ok(change)
+    }
+
+    fn current_name<'a>(&'a self, old_name: &'a str) -> &'a str {
         match self
             .old_and_current_names
             .iter()
