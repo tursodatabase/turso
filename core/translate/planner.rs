@@ -1310,6 +1310,7 @@ fn plan_cte(
             &outer_query_refs,
             QueryDestination::placeholder_for_subquery(),
             connection,
+            true,
         );
         program.pop_cte_being_defined();
         plan?
@@ -1446,6 +1447,7 @@ fn prepare_recursive_cte_plan(
         outer_query_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        true,
     )?;
 
     let explicit_columns = (!cte_definition.explicit_columns.is_empty())
@@ -1507,6 +1509,7 @@ fn prepare_recursive_cte_plan(
         &recursive_query_outer_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        true,
     )?;
 
     if initial_query.select_result_columns().len() != recursive_query.select_result_columns().len()
@@ -1706,6 +1709,7 @@ fn parse_from_clause_table(
                     &outer_query_refs_for_subquery,
                     QueryDestination::placeholder_for_subquery(),
                     connection,
+                    true,
                 )?
             };
             match &subplan {
@@ -1999,6 +2003,7 @@ fn prepare_lateral_subquery_plan(
         outer_query_refs,
         QueryDestination::placeholder_for_subquery(),
         connection,
+        true,
     );
     let aggregates_of_the_enclosing_query = resolver.take_aggregates_from_subqueries();
     let plan = plan?;
@@ -2113,6 +2118,7 @@ fn parse_table(
                     table_references.outer_query_refs(),
                     QueryDestination::placeholder_for_subquery(),
                     connection,
+                    true,
                 )?;
                 let explicit_columns = if cte_explicit_columns.is_empty() {
                     None
@@ -2262,6 +2268,7 @@ fn parse_table(
                     table_references.outer_query_refs(),
                     QueryDestination::placeholder_for_subquery(),
                     connection,
+                    true,
                 )
             })
         })?;

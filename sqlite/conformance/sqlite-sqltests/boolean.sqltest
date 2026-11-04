@@ -583,6 +583,141 @@ expect error {
     IN\(\.\.\.\) element has 3 terms - expected 2
 }
 
+# SQLite looks a collation up on the expression as written when it sorts,
+# groups or compares by it, so a collation name still fails in the operand
+# `x OR 1` drops there.
+
+test or-with-a-constant-operand-still-checks-a-collation-name {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT a FROM unknown_collation ORDER BY 1 OR a COLLATE nosuch;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-when-compared {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT (1 OR a COLLATE nosuch) = 1 FROM unknown_collation;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-under-distinct {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT DISTINCT 1 OR a COLLATE nosuch FROM unknown_collation;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-in-a-union {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT 1 OR a COLLATE nosuch FROM unknown_collation UNION SELECT 2;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+# A select that becomes a table, a view or a CTE gives each of its columns a
+# collation, as does the subquery of an IN, and a sort key that names a
+# result column by alias or number takes that column's collation.
+
+test or-with-a-constant-operand-still-checks-a-collation-name-in-a-subquery-in-from {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT c FROM (SELECT 1 OR a COLLATE nosuch AS c FROM unknown_collation);
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-in-a-cte {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    WITH c AS (SELECT 1 OR a COLLATE nosuch AS v FROM unknown_collation) SELECT v FROM c;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-in-an-in-subquery {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT a FROM unknown_collation WHERE a IN (SELECT 1 OR a COLLATE nosuch FROM unknown_collation);
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-in-in-values {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT a FROM unknown_collation WHERE a IN (VALUES (1 OR a COLLATE nosuch));
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-named-by-a-sort-key {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT 1 OR a COLLATE nosuch AS c FROM unknown_collation ORDER BY c;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-named-by-a-compound-sort-key {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT 1 OR a COLLATE nosuch FROM unknown_collation UNION ALL SELECT 2 ORDER BY 1;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+# The lookup walks through NOT, arithmetic and function arguments.
+
+test or-with-a-constant-operand-still-checks-a-collation-name-under-not-when-compared {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT (NOT (a COLLATE nosuch = 1 OR 1)) = 1 FROM unknown_collation;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test or-with-a-constant-operand-still-checks-a-collation-name-inside-a-compared-function {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT abs(1 OR a COLLATE nosuch) = 1 FROM unknown_collation;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+# Where nothing sorts or compares by the expression, the collation is never
+# looked up, so the operand `x OR 1` drops may name one that does not exist.
+
+test or-with-a-constant-operand-leaves-an-unused-collation-name-alone {
+    CREATE TABLE unknown_collation(a);
+    INSERT INTO unknown_collation VALUES (1);
+    SELECT 1 OR a COLLATE nosuch, abs(1 OR a COLLATE nosuch) FROM unknown_collation;
+    SELECT a FROM unknown_collation WHERE 1 OR a COLLATE nosuch = 1;
+    SELECT 1 OR a COLLATE nosuch FROM unknown_collation UNION ALL SELECT 2;
+}
+expect {
+    1|1
+    1
+    1
+    2
+}
+
 # A column name that is only resolved when the statement runs, as in a
 # trigger WHEN clause or an UPSERT DO UPDATE, is still checked.
 

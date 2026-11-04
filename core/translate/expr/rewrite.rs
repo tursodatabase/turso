@@ -11,6 +11,7 @@
 //! into AND terms, is passed to [apply_static_rewrites] by that caller.
 
 use super::*;
+use crate::function::AggFunc;
 
 pub(crate) trait StaticRewrite {
     /// Rewrites `expr` in place when its shape matches. Returns
@@ -142,6 +143,17 @@ impl StaticRewrite for AndOrConstantOperand {
         expr: &mut ast::Expr,
         resolver: Option<&Resolver<'_>>,
     ) -> Result<WalkControl> {
+        // SQLite looks the collation of a compared operand up on the operand
+        // as written, through NOT, arithmetic and function arguments, so a
+        // collation name in the part of `x OR 1` the fold drops is still
+        // checked there: `(1 OR a COLLATE nosuch) = 1` and
+        // `abs(1 OR a COLLATE nosuch) = 1` are errors, while
+        // `SELECT 1 OR a COLLATE nosuch` is 1.
+        if let Some(resolver) = resolver {
+            for operand in compared_operands(expr, resolver)? {
+                reject_unknown_collation(operand, resolver)?;
+            }
+        }
         // The operand that replaces the node can be an AND or OR of the same
         // shape: `(x AND 0) AND y` becomes `x AND 0`, which becomes `0`.
         while replace_and_or_with_deciding_operand(expr, resolver, &mut |dropped| {
@@ -149,6 +161,52 @@ impl StaticRewrite for AndOrConstantOperand {
         })? {}
         Ok(WalkControl::Continue)
     }
+}
+
+/// The operands of this node whose collating sequence SQLite looks up: the
+/// sides of a comparison, BETWEEN or IN, the base of a CASE, the arguments
+/// of min, max and nullif, and the PARTITION BY and ORDER BY keys of a
+/// window. (The keys of ORDER BY, GROUP BY and DISTINCT are whole
+/// expressions, which [bind_and_rewrite_sort_key] checks.)
+fn compared_operands<'e>(expr: &'e Expr, resolver: &Resolver<'_>) -> Result<Vec<&'e Expr>> {
+    use ast::Operator::*;
+    Ok(match expr {
+        Expr::Binary(
+            lhs,
+            Equals | NotEquals | Less | LessEquals | Greater | GreaterEquals | Is | IsNot,
+            rhs,
+        ) => vec![lhs.as_ref(), rhs.as_ref()],
+        Expr::Between {
+            lhs, start, end, ..
+        } => vec![lhs.as_ref(), start.as_ref(), end.as_ref()],
+        Expr::InList { lhs, .. } | Expr::InSelect { lhs, .. } => vec![lhs.as_ref()],
+        Expr::Case {
+            base: Some(base), ..
+        } => vec![base.as_ref()],
+        Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } => {
+            let compares = match resolver.resolve_function(name.as_str(), args.len())? {
+                Some(Func::Agg(AggFunc::Max | AggFunc::Min)) => true,
+                Some(func) => func.needs_collation(),
+                None => false,
+            };
+            let mut operands: Vec<&Expr> = if compares {
+                args.iter().map(|arg| arg.as_ref()).collect()
+            } else {
+                vec![]
+            };
+            if let Some(ast::Over::Window(window)) = filter_over.over_clause.as_deref() {
+                operands.extend(window.partition_by.iter().map(|key| key.as_ref()));
+                operands.extend(window.order_by.iter().map(|key| key.expr.as_ref()));
+            }
+            operands
+        }
+        _ => vec![],
+    })
 }
 
 /// Keeps the operand that decides the value of an AND or OR and drops the

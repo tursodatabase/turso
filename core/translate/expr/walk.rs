@@ -445,6 +445,21 @@ pub(crate) fn reject_unknown_function(expr: &ast::Expr, resolver: &Resolver<'_>)
     )
 }
 
+/// Fails with "no such collation sequence" when this expression names a
+/// collation that does not exist. SQLite looks a collation up when it needs
+/// one to sort or compare, on the expression as written, so an operand the
+/// AND/OR fold drops still gets this check. A COLLATE inside a subquery
+/// belongs to that subquery.
+pub(crate) fn reject_unknown_collation(expr: &ast::Expr, resolver: &Resolver<'_>) -> Result<()> {
+    walk_expr(expr, &mut |e| {
+        if let ast::Expr::Collate(_, name) = e {
+            resolver.resolve_collation(name.as_str())?;
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
 /// Which function calls [walk_function_calls] visits.
 #[derive(Clone, Copy)]
 pub(crate) enum FunctionCalls {

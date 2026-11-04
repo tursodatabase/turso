@@ -135,6 +135,30 @@ pub fn bind_and_rewrite_expr<'a>(
     apply_static_rewrites(top_level_expr, BINDING_REWRITES, Some(resolver))
 }
 
+/// [bind_and_rewrite_expr] for an expression whose collating sequence is
+/// looked up to sort, group or compare rows: an ORDER BY, GROUP BY, DISTINCT
+/// or window key. SQLite looks it up on the expression as written, so a
+/// collation name in the operand that `x OR 1` drops is still checked:
+/// `ORDER BY 1 OR a COLLATE nosuch` is an error.
+#[turso_macros::trace_stack]
+pub fn bind_and_rewrite_sort_key<'a>(
+    top_level_expr: &mut ast::Expr,
+    referenced_tables: Option<&'a mut TableReferences>,
+    result_columns: Option<&'a [ResultSetColumn]>,
+    resolver: &Resolver<'_>,
+    binding_behavior: BindingBehavior,
+) -> Result<()> {
+    bind_expr(
+        top_level_expr,
+        referenced_tables,
+        result_columns,
+        resolver,
+        binding_behavior,
+    )?;
+    reject_unknown_collation(top_level_expr, resolver)?;
+    apply_static_rewrites(top_level_expr, BINDING_REWRITES, Some(resolver))
+}
+
 /// [bind_and_rewrite_expr] without the [BINDING_REWRITES]. A HAVING clause
 /// binds its terms with this and applies the rewrites once it knows which
 /// terms move to WHERE (see select::process_having_clause).
