@@ -731,8 +731,9 @@ impl DatabaseReplayGenerator {
     /// Execute a DDL statement idempotently: CREATE TABLE for an existing table
     /// drops the generated columns that it removes or changes and adds the
     /// columns that are missing, named schema objects are skipped when already
-    /// present, and `ALTER TABLE ADD COLUMN` only adds missing columns. Falls
-    /// back to direct execution for other DDL.
+    /// present, `ALTER TABLE ADD COLUMN` only adds missing columns, and a table
+    /// or column rename is skipped when the old name is gone and the new name
+    /// exists. Falls back to direct execution for other DDL.
     pub async fn execute_ddl_idempotent<Ctx>(&self, coro: &Coro<Ctx>, ddl: &str) -> Result<()> {
         let mut parser = Parser::new(ddl.as_bytes());
         let Some(Ok(turso_parser::ast::Cmd::Stmt(mut stmt))) = parser.next() else {
@@ -829,6 +830,51 @@ impl DatabaseReplayGenerator {
                 if has_column(&local_columns, col_name) {
                     tracing::debug!(
                         "execute_ddl_idempotent: column {col_name} already exists in {table_name}, skipping"
+                    );
+                } else {
+                    self.execute_ddl(ddl)?;
+                }
+                Ok(())
+            }
+            turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+                name: tbl_name,
+                body: turso_parser::ast::AlterTableBody::RenameTo(new_name),
+            }) => {
+                let old_table_exists = self
+                    .local_column_definitions(coro, tbl_name.name.as_str())
+                    .await?
+                    .is_some();
+                let new_table_exists = self
+                    .local_column_definitions(coro, new_name.as_str())
+                    .await?
+                    .is_some();
+                if !old_table_exists && new_table_exists {
+                    tracing::debug!(
+                        "execute_ddl_idempotent: table {tbl_name} was already renamed to {new_name}, skipping"
+                    );
+                } else {
+                    self.execute_ddl(ddl)?;
+                }
+                Ok(())
+            }
+            turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+                name: tbl_name,
+                body:
+                    turso_parser::ast::AlterTableBody::RenameColumn { old, new }
+                    | turso_parser::ast::AlterTableBody::AlterColumn {
+                        old,
+                        new: turso_parser::ast::ColumnDefinition { col_name: new, .. },
+                    },
+            }) => {
+                let local_columns = self
+                    .local_column_definitions(coro, tbl_name.name.as_str())
+                    .await?
+                    .unwrap_or_default();
+                if !has_column(&local_columns, old.as_str())
+                    && has_column(&local_columns, new.as_str())
+                {
+                    tracing::debug!(
+                        "execute_ddl_idempotent: column {old} of {tbl_name} was already renamed to {new}, skipping"
                     );
                 } else {
                     self.execute_ddl(ddl)?;
