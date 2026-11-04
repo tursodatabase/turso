@@ -2116,6 +2116,20 @@ pub fn insn_to_row(
                 0,
                 "tell the dialect a relation changed".to_string(),
             ),
+            Insn::SetRowSecurity {
+                db,
+                namespace: _,
+                table_name,
+                enabled,
+            } => (
+                "SetRowSecurity",
+                *db as i64,
+                *enabled as i64,
+                0,
+                Value::build_text(table_name.clone()),
+                0,
+                format!("row security of {table_name} enabled={enabled}"),
+            ),
             Insn::DropView {
                 db,
                 namespace: _,

@@ -36,6 +36,7 @@ pub(crate) mod result_column_types;
 pub(crate) mod result_row;
 pub(crate) mod roles;
 pub(crate) mod rollback;
+pub(crate) mod row_security;
 pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod sequence;
