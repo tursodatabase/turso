@@ -416,7 +416,7 @@ pub(super) fn row_component_affinity_collation(
 /// row subquery's result, so each component compares with its own type. A
 /// subquery column does not bring its text collation. Any other expression
 /// stands for itself.
-fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
+pub(crate) fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
     match unwrap_parens(expr)? {
         Expr::Parenthesized(exprs) if exprs.len() > 1 => {
             Ok(exprs.get(idx).map_or(Cow::Borrowed(expr), |component| {
@@ -443,6 +443,53 @@ fn row_value_component_expr(expr: &Expr, idx: usize) -> Result<Cow<'_, Expr>> {
         })),
         _ => Ok(Cow::Borrowed(expr)),
     }
+}
+
+/// The number of components [row_value_component_expr] splits `expr` into.
+/// As in SQLite's `sqlite3ExprVectorSize`, only `(a, b)` and a planned row
+/// subquery have more than one; every other expression is one value.
+pub(crate) fn row_value_len(expr: &Expr) -> Result<usize> {
+    Ok(match unwrap_parens(expr)? {
+        Expr::Parenthesized(exprs) => exprs.len(),
+        Expr::SubqueryResult { query_type, .. } => match query_type {
+            ast::SubqueryType::RowValue { num_regs, .. } => *num_regs,
+            ast::SubqueryType::Exists { .. } | ast::SubqueryType::In { .. } => 1,
+        },
+        // Its width is known once it is planned, when the expression holding
+        // it is checked again.
+        Expr::Subquery(_) => 1,
+        Expr::Between { .. }
+        | Expr::Binary(..)
+        | Expr::Case { .. }
+        | Expr::Cast { .. }
+        | Expr::Collate(..)
+        | Expr::Column { .. }
+        | Expr::Default
+        | Expr::DoublyQualified(..)
+        | Expr::Exists(_)
+        | Expr::FieldAccess { .. }
+        | Expr::FunctionCall { .. }
+        | Expr::FunctionCallStar { .. }
+        | Expr::Id(_)
+        | Expr::InList { .. }
+        | Expr::InSelect { .. }
+        | Expr::InTable { .. }
+        | Expr::IsNull(_)
+        | Expr::Like { .. }
+        | Expr::Literal(_)
+        | Expr::MergedColumn(_)
+        | Expr::Name(_)
+        | Expr::NotNull(_)
+        | Expr::Qualified(..)
+        | Expr::Raise(..)
+        | Expr::Register { .. }
+        | Expr::RowId { .. }
+        | Expr::Unary(..)
+        | Expr::Variable(_) => 1,
+        Expr::Array { .. } | Expr::Subscript { .. } => {
+            unreachable!("Array and Subscript are desugared into function calls by the parser")
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

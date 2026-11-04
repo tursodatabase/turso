@@ -411,8 +411,11 @@ pub struct IvmSumFinalizeData {
 #[derive(Debug, Clone)]
 pub struct ArrayEncodeData {
     pub reg: usize,
-    pub element_affinity: Affinity,
+    /// The declared element type name, for error messages.
     pub element_type: Arc<str>,
+    pub element_kind: crate::types::StrictType,
+    /// The number of dimensions of the array: 2 for INTEGER[][].
+    pub dimensions: u32,
     pub target: ArrayEncodeTarget,
 }
 
@@ -1001,6 +1004,15 @@ pub enum Insn {
         /// Check generated columns after their values have been computed.
         check_generated: bool, // P3
         table_reference: Arc<BTreeTable>, // P4
+    },
+
+    /// Converts the value in `reg` as a STRICT column storing `storage_class`
+    /// does, and fails with "cannot store <kind> value <description>" when it
+    /// can't: '5' becomes 5 for INTEGER, 'abc' is an error. NULL is left as it is.
+    ConvertToType {
+        reg: usize,
+        storage_class: crate::types::StorageClass,
+        description: String,
     },
 
     /// Parse a JSON text array into a native record-format BLOB, validating
@@ -2492,6 +2504,7 @@ impl InsnVariants {
             InsnVariants::ColumnHasField => execute::op_column_has_field,
             InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
+            InsnVariants::ConvertToType => execute::op_convert_to_type,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
             InsnVariants::ArrayElement => execute::op_array_element,

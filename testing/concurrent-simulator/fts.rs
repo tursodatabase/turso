@@ -3,9 +3,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
-use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, SqliteDialect, Value,
-};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, OpenFlags, Value};
+use turso_sqlite::SqliteDialect;
 
 use crate::chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile};
 use crate::properties::{FtsResultComparisonProperty, IntegrityCheckProperty, Property};

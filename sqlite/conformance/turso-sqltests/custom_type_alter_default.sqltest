@@ -396,7 +396,7 @@ test create-table-refuses-array-of-unknown-type {
     CREATE TABLE t(id INTEGER PRIMARY KEY, b nosuch[]) STRICT;
 }
 expect error {
-    unknown datatype for t.b: "nosuch"
+    unknown datatype for array elements: "nosuch"
 }
 
 @requires strict "uses STRICT tables"
@@ -405,7 +405,7 @@ test add-column-refuses-array-of-unknown-type {
     ALTER TABLE t ADD COLUMN b nosuch[];
 }
 expect error {
-    unknown datatype for t.b: "nosuch"
+    unknown datatype for array elements: "nosuch"
 }
 
 @requires strict "uses STRICT tables"
@@ -415,7 +415,7 @@ test alter-column-refuses-array-of-unknown-type {
     ALTER TABLE t ALTER COLUMN a TO b nosuch[];
 }
 expect error {
-    unknown datatype for t.b: "nosuch"
+    unknown datatype for array elements: "nosuch"
 }
 
 @requires strict "uses STRICT tables"

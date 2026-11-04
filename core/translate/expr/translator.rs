@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::StrictType;
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
 #[derive(Debug)]
@@ -767,9 +768,19 @@ fn translate_cast_expr(
                 )?;
                 return Ok(target_register);
             }
+            // The element type is a STRICT type name such as `integer`, or a
+            // custom type that takes arguments the CAST doesn't give. No
+            // ENCODE runs then, and the elements are checked
+            // against the custom type's BASE: `CAST('{Ab}' AS upper_text[])`
+            // for an upper_text(n) over text is `{Ab}`.
+            let element_type_name =
+                match resolver.schema().resolve_type_unchecked(cast_type_name)? {
+                    Some(resolved) => resolved.primitive,
+                    None => cast_type_name.clone(),
+                };
             let mut column = Column::new(
                 None,
-                cast_type_name.clone(),
+                element_type_name,
                 None,
                 None,
                 Type::Null,
@@ -777,11 +788,6 @@ fn translate_cast_expr(
                 ColDef::default(),
             );
             column.set_array_dimensions(tn.array_dimensions);
-            // The element type is not a custom type, such as `double`, or a
-            // custom type that takes arguments the CAST doesn't give, so no
-            // ENCODE runs. Each element gets the affinity of the type name,
-            // which, unlike SQLite's CAST, leaves text that doesn't look like
-            // a number as text: `CAST('{abc}' AS double[])` is `{abc}`.
             super::arrays::emit_array_encode_as(
                 program,
                 target_register,
@@ -818,7 +824,7 @@ fn emit_custom_type_cast(
     reg: usize,
     resolver: &Resolver,
 ) -> Result<()> {
-    let chain = resolved.chain;
+    let chain = &resolved.chain;
     // Build ty_params from AST TypeSize so parametric types
     // (e.g. numeric(10,2)) get their parameters passed through.
     let ty_params: Vec<Box<ast::Expr>> = match &type_name.size {
@@ -840,25 +846,23 @@ fn emit_custom_type_cast(
     {
         emit_integer_to_boolean_cast(program, reg);
     }
-    // A domain whose types have no expression to convert the value holds
-    // it as its base SQL type, so the CAST converts it as a CAST to that
-    // type would: CAST('2' AS d) is the integer 2 for a domain d over
-    // integer.
-    let converts_by_expression = chain
-        .iter()
-        .any(|td| td.has_encode_or_coerce() || td.decode().is_some());
-    if is_domain && !converts_by_expression && !resolved.primitive.eq_ignore_ascii_case("any") {
-        program.emit_insn(Insn::Cast {
+    // The CAST first converts the value to the type's input type as a
+    // CAST to that type would, then stores it as a column of the type
+    // does: CAST(5.5 AS smallint) is 5, as are CAST(5.5 AS bigint) and
+    // CAST(5.5 AS d) for a domain d over integer.
+    match resolver.schema().plain_input_type(&resolved)? {
+        StrictType::Stores(storage_class) => program.emit_insn(Insn::Cast {
             reg,
-            affinity: Affinity::of_written_type(&resolved.primitive),
-        });
+            affinity: storage_class.affinity(),
+        }),
+        StrictType::Any => {}
     }
-    emit_store_value(program, &chain, reg, &ty_params, resolver)?;
-    emit_decode(program, &chain, reg, resolver)?;
+    emit_store_value(program, &resolved, reg, &ty_params, resolver)?;
+    emit_decode(program, chain, reg, resolver)?;
     // The domain's CHECKs see the value after DECODE, as they do on a
     // column of the domain.
     if is_domain {
-        emit_domain_cast_constraints(program, &chain, type_name, reg, resolver)?;
+        emit_domain_cast_constraints(program, chain, type_name, reg, resolver)?;
     }
     Ok(())
 }
@@ -948,9 +952,13 @@ fn translate_collate_expr(
         unreachable!("translate_collate_expr expects Expr::Collate");
     };
     // COLLATE does not change the value. Comparisons read the collation from
-    // the expression tree; resolving it here only rejects unknown names.
+    // the expression tree; resolving it here only rejects unknown names and
+    // types that take no collation, such as `d COLLATE nocase` for a date d.
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
     resolver.resolve_collation(collation.as_str())?;
+    // Binding checks this too, but an upsert's DO UPDATE binds its expressions
+    // with its own code, so they are checked here.
+    check_collate_operand(expr, &ExprContext::new(referenced_tables, resolver))?;
     Ok(target_register)
 }
 
@@ -3123,73 +3131,28 @@ fn translate_field_access_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
-    let ast::Expr::FieldAccess {
-        base,
-        field,
-        resolved,
-    } = expr
-    else {
+    let ast::Expr::FieldAccess { base, resolved, .. } = expr else {
         unreachable!("translate_field_access_expr expects Expr::FieldAccess");
     };
     let base_reg = program.alloc_register();
     translate_expr(program, referenced_tables, base, base_reg, resolver)?;
-
-    // Fast path: if the field was resolved during binding, emit directly.
-    if let Some(resolution) = resolved {
-        match resolution {
-            ast::FieldAccessResolution::StructField { field_index } => {
-                program.emit_insn(Insn::StructField {
-                    src_reg: base_reg,
-                    field_index: *field_index,
-                    dest: target_register,
-                });
-                return Ok(target_register);
-            }
-            ast::FieldAccessResolution::UnionVariant { tag_index } => {
-                program.emit_insn(Insn::UnionExtract {
-                    src_reg: base_reg,
-                    expected_tag: *tag_index,
-                    dest: target_register,
-                });
-                return Ok(target_register);
-            }
+    match resolved {
+        ast::FieldAccessResolution::StructField { field_index } => {
+            program.emit_insn(Insn::StructField {
+                src_reg: base_reg,
+                field_index: *field_index,
+                dest: target_register,
+            });
+        }
+        ast::FieldAccessResolution::UnionVariant { tag_index } => {
+            program.emit_insn(Insn::UnionExtract {
+                src_reg: base_reg,
+                expected_tag: *tag_index,
+                dest: target_register,
+            });
         }
     }
-
-    // Slow path: recursively resolve the base expression's output type,
-    // then look up the field/variant in that type.
-    let td = resolve_expr_output_type(base, referenced_tables, resolver)?;
-    let field_name = normalize_ident(field.as_str());
-
-    if let Some((idx, _)) = td.find_struct_field(&field_name) {
-        program.emit_insn(Insn::StructField {
-            src_reg: base_reg,
-            field_index: idx,
-            dest: target_register,
-        });
-        Ok(target_register)
-    } else if let Some(tag_index) = td.resolve_union_tag_index(&field_name) {
-        program.emit_insn(Insn::UnionExtract {
-            src_reg: base_reg,
-            expected_tag: tag_index,
-            dest: target_register,
-        });
-        Ok(target_register)
-    } else if td.is_struct() {
-        crate::bail_parse_error!(
-            "no such field '{}' in struct type '{}'",
-            field_name,
-            td.name
-        );
-    } else if td.is_union() {
-        crate::bail_parse_error!(
-            "no such variant '{}' in union type '{}'",
-            field_name,
-            td.name
-        );
-    } else {
-        crate::bail_parse_error!("type '{}' is not a struct or union type", td.name);
-    }
+    Ok(target_register)
 }
 
 #[inline(never)]

@@ -84,12 +84,10 @@ pub(super) fn encode_seek_keys_for_custom_types(
                 reg,
                 table_col.array_dimensions(),
                 crate::translate::expr::ArrayInput::TextIfArray,
-                |program, leaf_reg| {
-                    emit_seek_key_encode(program, &resolved.chain, leaf_reg, resolver)
-                },
+                |program, leaf_reg| emit_seek_key_encode(program, &resolved, leaf_reg, resolver),
             )?;
         } else {
-            emit_seek_key_encode(program, &resolved.chain, reg, resolver)?;
+            emit_seek_key_encode(program, &resolved, reg, resolver)?;
         }
     }
     Ok(())
@@ -99,7 +97,7 @@ pub(super) fn encode_seek_keys_for_custom_types(
 /// left as it is.
 fn emit_seek_key_encode(
     program: &mut ProgramBuilder,
-    chain: &[Arc<crate::schema::TypeDef>],
+    resolved: &crate::schema::ResolvedType,
     reg: usize,
     resolver: &Resolver<'_>,
 ) -> crate::Result<()> {
@@ -108,11 +106,13 @@ fn emit_seek_key_encode(
         reg,
         target_pc: skip_label,
     });
-    for td in chain {
-        if let Some(encode_expr) = td.encode() {
-            crate::translate::expr::emit_type_expr(program, encode_expr, reg, reg, resolver)?;
-        }
-    }
+    crate::translate::expr::emit_encode_for_comparison(
+        program,
+        &resolved.chain,
+        resolved.storage_class()?,
+        reg,
+        resolver,
+    )?;
     program.preassign_label_to_next_insn(skip_label);
     Ok(())
 }

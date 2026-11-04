@@ -25,7 +25,7 @@ expect error {
 }
 
 test array-cast-to-plain-type-name-uses-its-affinity {
-    SELECT CAST('{1,2}' AS double[]);
+    SELECT CAST('{1,2}' AS real[]);
 }
 expect {
     {1.0,2.0}
@@ -33,13 +33,14 @@ expect {
 
 test array-cast-to-type-missing-its-arguments-skips-encode {
     -- upper_text takes an argument, so a CAST that doesn't give it runs no
-    -- ENCODE, for an array as for a scalar. The name has TEXT affinity, so
-    -- the text stays as it is. With the argument, ENCODE and DECODE run.
+    -- ENCODE, for an array as for a scalar. The elements are checked against
+    -- its BASE, text, so they stay as they are. With the argument, ENCODE and
+    -- DECODE run.
     CREATE TYPE upper_text(value text, m integer) BASE text ENCODE upper(value) DECODE lower(value);
-    SELECT CAST('Ab' AS upper_text), CAST('{Ab}' AS upper_text[]), CAST('{Ab}' AS no_such_text[]), CAST('{Ab}' AS upper_text(3)[]);
+    SELECT CAST('Ab' AS upper_text), CAST('{Ab}' AS upper_text[]), CAST('{Ab}' AS upper_text(3)[]);
 }
 expect {
-    Ab|{Ab}|{Ab}|{ab}
+    Ab|{Ab}|{ab}
 }
 
 test array-infinity-rejected {

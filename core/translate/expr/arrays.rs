@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::StrictType;
 use crate::vdbe::insn::{ArrayEncodeData, ArrayEncodeTarget};
 
 /// Maximum number of array elements supported in the per-element transform loop.
@@ -147,8 +148,9 @@ pub(crate) fn emit_array_leaf_loop(
         program.emit_insn(Insn::ArrayEncode {
             data: Box::new(ArrayEncodeData {
                 reg,
-                element_affinity: Affinity::Blob,
                 element_type: "ANY".into(),
+                element_kind: StrictType::Any,
+                dimensions,
                 target,
             }),
         });
@@ -228,36 +230,31 @@ pub(super) fn emit_array_encode_as(
                 col.array_dimensions(),
                 ArrayInput::Text(&target),
                 |program, leaf_reg| {
-                    emit_store_value(program, &resolved.chain, leaf_reg, &col.ty_params, resolver)
+                    emit_store_value(program, resolved, leaf_reg, &col.ty_params, resolver)
                 },
             )?;
         }
     }
 
-    // ArrayEncode: parse JSON text → validate/coerce → serialize to record blob.
-    // For multi-dimensional arrays (e.g. INTEGER[][]), the outer array's elements
-    // are themselves arrays (blobs), so we use ANY/Blob for validation.
-    // Only 1-dimensional arrays validate elements against the declared base type.
+    // ArrayEncode: parse text → convert elements → serialize to record blob.
     // A custom type's elements hold what its ENCODE returns, which is checked
-    // against the type's BASE storage type, as for a column of the type.
-    let storage_type = resolved.map_or(col.ty_str.as_str(), |resolved| resolved.primitive.as_str());
-    let is_any = storage_type.eq_ignore_ascii_case("ANY");
-    let is_multidim = col.array_dimensions() > 1;
-    let element_affinity = if is_any || is_multidim {
-        Affinity::Blob
-    } else {
-        Affinity::affinity(storage_type)
-    };
-    let element_type = if is_any || is_multidim {
-        "ANY".into()
-    } else {
-        storage_type.to_uppercase().into()
-    };
+    // against the type's BASE, as for a column of the type.
+    let element_type: Arc<str> = resolved
+        .map_or(col.ty_str.as_str(), |resolved| resolved.primitive.as_str())
+        .to_uppercase()
+        .into();
+    // check_array_element_type refuses other names before code is emitted.
+    let element_kind = StrictType::named(&element_type).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "array elements of {target} have type {element_type}, which is not INTEGER, REAL, TEXT, BLOB or ANY"
+        ))
+    })?;
     program.emit_insn(Insn::ArrayEncode {
         data: Box::new(ArrayEncodeData {
             reg,
-            element_affinity,
             element_type,
+            element_kind,
+            dimensions: col.array_dimensions(),
             target,
         }),
     });
@@ -340,7 +337,8 @@ pub(crate) fn emit_custom_type_encode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
+        // A plain type has no ENCODE; TypeCheck checks its values.
+        let Some(resolved) = resolver.schema().resolve_type_unchecked(type_name)? else {
             continue;
         };
 
@@ -359,7 +357,7 @@ pub(crate) fn emit_custom_type_encode_columns(
             None
         };
 
-        emit_store_value(program, &resolved.chain, reg, &col.ty_params, resolver)?;
+        emit_store_value(program, &resolved, reg, &col.ty_params, resolver)?;
 
         if let Some(label) = skip_label {
             program.preassign_label_to_next_insn(label);

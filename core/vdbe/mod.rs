@@ -4520,7 +4520,7 @@ mod tests {
         for trace in [false, true] {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
-                crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+                crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();

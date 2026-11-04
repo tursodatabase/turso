@@ -754,6 +754,19 @@ pub fn insn_to_row(
                 0,
                 String::from(""),
             ),
+            Insn::ConvertToType {
+                reg,
+                storage_class,
+                description,
+            } => (
+                "ConvertToType",
+                *reg as i64,
+                0,
+                0,
+                Value::build_text(crate::types::StrictType::Stores(*storage_class).name()),
+                0,
+                description.clone(),
+            ),
             Insn::ArrayEncode { data } => (
                 "ArrayEncode",
                 data.reg as i64,

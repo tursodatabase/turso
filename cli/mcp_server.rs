@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, SqliteDialect,
-    Value as DbValue,
+    ConnectOpts, Connection, Database, DatabaseOpts, Numeric, OpenFlags, Value as DbValue,
 };
 use turso_parser::ast::{Cmd, Stmt};
 use turso_parser::parser::Parser;
+use turso_sqlite::SqliteDialect;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {

@@ -2,7 +2,8 @@
 
 use std::sync::Arc;
 
-use turso_core::{ConnectOpts, Database, MemoryYieldIO, SqliteDialect, StepResult, IO};
+use turso_core::{ConnectOpts, Database, MemoryYieldIO, StepResult, IO};
+use turso_sqlite::SqliteDialect;
 
 fn exec_sql(conn: &Arc<turso_core::Connection>, io: &dyn IO, sql: &str) -> turso_core::Result<()> {
     let mut stmt = conn.prepare(sql)?;

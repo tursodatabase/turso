@@ -59,7 +59,7 @@ fn group_commit_pragma_is_store_wide() {
 #[test]
 fn group_commit_pragma_needs_mvcc() {
     let io = Arc::new(crate::io::MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
 
     let err = conn
