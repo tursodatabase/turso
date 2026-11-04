@@ -10,7 +10,11 @@ When that issue is already open, the run is added to it as a comment instead.
 
 Usage: report-flaky-tests.py [--dry-run] <dir>
 <dir> holds one subdirectory per downloaded artifact (junit-Linux, ...), each
-with a junit.xml somewhere below it. Without --dry-run, GH_TOKEN must be set.
+with a junit.xml somewhere below it and a job-name.txt naming the CI job that
+wrote it. Without --dry-run, GH_TOKEN must be set.
+
+Not everyone who reads the issues can open CI logs, so the issue itself shows
+each attempt's result and the first failure's output.
 """
 
 import argparse
@@ -20,6 +24,7 @@ import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
@@ -30,19 +35,34 @@ ISSUE_LABEL = "flaky test"
 MAX_OUTPUT_CHARS = 30000
 
 
+@dataclass
+class FlakyRun:
+    """One job's attempts at a test that failed and then passed."""
+
+    platform: str
+    job: str
+    # The flakyFailure/flakyError elements, oldest first.
+    failures: list
+    # The testcase element; its timestamp and time are the passing attempt's.
+    case: ET.Element
+
+
 def flaky_tests(report_dir):
-    """Map "<binary> <test>" to its failed attempts: (platform, attempt XML element)."""
+    """Map "<binary> <test>" to its flaky runs, one per job."""
     tests = {}
     for path in sorted(Path(report_dir).rglob("junit.xml")):
-        artifact = path.relative_to(report_dir).parts[0]
-        platform = artifact.removeprefix("junit-")
+        artifact_dir = Path(report_dir) / path.relative_to(report_dir).parts[0]
+        platform = artifact_dir.name.removeprefix("junit-")
+        job_file = artifact_dir / "job-name.txt"
+        job = job_file.read_text().strip() if job_file.exists() else f"unknown {platform} job"
         for case in ET.parse(path).iter("testcase"):
             if case.find("failure") is not None or case.find("error") is not None:
                 continue
-            attempts = case.findall("flakyFailure") + case.findall("flakyError")
-            if attempts:
+            failures = case.findall("flakyFailure") + case.findall("flakyError")
+            if failures:
+                failures.sort(key=lambda f: f.get("timestamp", ""))
                 test = f"{case.get('classname')} {case.get('name')}"
-                tests.setdefault(test, []).extend((platform, a) for a in attempts)
+                tests.setdefault(test, []).append(FlakyRun(platform, job, failures, case))
     return tests
 
 
@@ -65,31 +85,45 @@ def code_block(text):
     return f"{fence}\n{text}\n{fence}"
 
 
-def occurrence(attempts):
-    """The run's facts and the first failed attempt's output, shared by issue and comment."""
+def occurrence(runs, job_urls):
+    """The run's facts, each job's attempts, and the first failed attempt's output.
+
+    Shared by the new issue and the comments on it.
+    """
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     run_url = f"{server}/{repo}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}"
     sha = os.environ.get("GITHUB_SHA", "")
-    counts = {}
-    for platform, _ in attempts:
-        counts[platform] = counts.get(platform, 0) + 1
-    platforms = ", ".join(f"{p} ({n} failed attempt{'s' if n > 1 else ''})" for p, n in sorted(counts.items()))
-    platform, first = attempts[0]
-    return f"""| | |
+    sections = [
+        f"""| | |
 |---|---|
 | Commit | {sha} |
-| Run | {run_url} |
-| Platforms | {platforms} |
+| Run | {run_url} |"""
+    ]
+    for run in runs:
+        job = f"[{run.job}]({job_urls[run.job]})" if run.job in job_urls else f"`{run.job}`"
+        sections.append(f"**{run.platform}**, job {job}:\n\n{attempts_table(run)}")
+    sections.append(
+        "In the job log, nextest prints each attempt as a `TRY <n> FAIL` or `TRY <n> PASS` line with the test name."
+    )
+    first = runs[0]
+    sections.append(f"""<details><summary>Output of the first failed attempt ({first.platform})</summary>
 
-<details><summary>Output of the first failed attempt ({platform})</summary>
+{code_block(attempt_output(first.failures[0]))}
 
-{code_block(attempt_output(first))}
+</details>""")
+    return "\n\n".join(sections)
 
-</details>"""
+
+def attempts_table(run):
+    rows = [(f, "FAIL") for f in run.failures] + [(run.case, "PASS")]
+    lines = ["| Attempt | Result | Started | Duration |", "|---|---|---|---|"]
+    for n, (element, result) in enumerate(rows, start=1):
+        lines.append(f"| {n} | {result} | {element.get('timestamp', '?')} | {element.get('time', '?')}s |")
+    return "\n".join(lines)
 
 
-def issue_body(test, attempts):
+def issue_body(test, runs, job_urls):
     binary, name = test.split(" ", 1)
     intro = (
         f"`{name}` in `{binary}` failed and then passed on a retry, in the same CI job on the same commit. "
@@ -102,7 +136,7 @@ def issue_body(test, attempts):
     )
     return f"""{intro}
 
-{occurrence(attempts)}
+{occurrence(runs, job_urls)}
 
 Run it locally:
 
@@ -139,6 +173,19 @@ def open_issues_by_title():
     return {i["title"]: i["number"] for i in issues}
 
 
+def job_urls_by_name():
+    run = os.environ["GITHUB_RUN_ID"]
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+    out = gh(
+        "--paginate",
+        "--jq",
+        ".jobs[] | {name, html_url}",
+        f"repos/{{owner}}/{{repo}}/actions/runs/{run}/attempts/{attempt}/jobs?per_page=100",
+    )
+    jobs = [json.loads(line) for line in out.splitlines() if line.strip()]
+    return {j["name"]: j["html_url"] for j in jobs}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("report_dir")
@@ -150,11 +197,12 @@ def main():
         print("No flaky tests.")
         return
     existing = {} if args.dry_run else open_issues_by_title()
-    for test, attempts in sorted(tests.items()):
+    job_urls = {} if args.dry_run else job_urls_by_name()
+    for test, runs in sorted(tests.items()):
         title = f"Flaky test: {test}"
         number = existing.get(title)
         if number is None:
-            body = issue_body(test, attempts)
+            body = issue_body(test, runs, job_urls)
             if args.dry_run:
                 print(f"=== new issue: {title}\n{body}\n")
             else:
@@ -163,7 +211,7 @@ def main():
                 url = json.loads(issue)["html_url"]
                 print(f"{title}: filed {url}")
         else:
-            body = f"Flaky again.\n\n{occurrence(attempts)}"
+            body = f"Flaky again.\n\n{occurrence(runs, job_urls)}"
             if args.dry_run:
                 print(f"=== comment on #{number}: {title}\n{body}\n")
             else:
