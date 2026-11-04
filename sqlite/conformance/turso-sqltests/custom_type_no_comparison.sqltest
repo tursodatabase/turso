@@ -395,6 +395,38 @@ expect error {
     arrays of type inet are not supported, because values of type inet cannot be compared
 }
 
+# An operator the type does not declare has no type, so the comparison check
+# lets it through; the statement still fails, because emitting the operator
+# fails the same way.
+@requires strict "uses STRICT tables"
+test no-comparison-undeclared-operator-compared {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j jsonb) STRICT;
+    INSERT INTO t VALUES (1, '{}');
+    SELECT j - 1 = 1 FROM t;
+}
+expect error {
+    operator does not exist: jsonb - integer
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-undeclared-operator-sorted {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, i inet) STRICT;
+    INSERT INTO t VALUES (1, '10.0.0.2'), (2, '9.0.0.1');
+    SELECT id FROM t ORDER BY -i;
+}
+expect error {
+    operator does not exist: - inet
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-undeclared-operator-indexed {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j jsonb) STRICT;
+    CREATE INDEX t_j ON t(j & 1);
+}
+expect error {
+    operator does not exist: jsonb & integer
+}
+
 # ============================================================================
 # What still works
 # ============================================================================

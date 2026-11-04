@@ -625,7 +625,9 @@ pub(crate) fn type_without_comparison<'a>(
         // of a type that can't be compared: it is a row value such as `(j, 1)`,
         // whose columns are compared one by one, the input `value` of a type's
         // ENCODE or DECODE, `CAST(x AS)` (a number), the number `ARRAY[1] + 1`,
-        // or an operator such as `json_column + 1` whose statement fails. Mixed
+        // or an operator the type does not declare, such as `json_column + 1`
+        // (see [custom_operator_type]). Emitting that operator runs the same
+        // lookup, so the statement fails with "operator does not exist". Mixed
         // with a type that can't be compared, it has that type (see
         // [common_scalar_type]).
         ExprType::Unknown => None,
