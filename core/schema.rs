@@ -8016,6 +8016,17 @@ impl Column {
     pub fn set_array_dimensions(&mut self, dims: u32) {
         self.info.set_array_dimensions(dims)
     }
+    /// The type of a STRICT column declared INTEGER, INT, REAL, TEXT, BLOB or
+    /// ANY. Callers handle arrays and custom types before asking.
+    pub fn strict_type(&self, table_name: &str) -> Result<StrictType> {
+        StrictType::named(&self.ty_str).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "STRICT column {table_name}.{} has type {}, which is not INTEGER, REAL, TEXT, BLOB or ANY",
+                self.name.as_deref().unwrap_or(""),
+                self.ty_str
+            ))
+        })
+    }
     /// Whether both columns declare the same type: name, type parameters
     /// (`varchar(10)` is not `varchar(3)`) and array dimensions.
     pub fn has_same_declared_type(&self, other: &Column) -> bool {

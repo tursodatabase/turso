@@ -20,7 +20,7 @@ use crate::{
     },
     HashSet,
 };
-use crate::{types::StrictType, LimboError, Result};
+use crate::{types::StrictType, Result};
 use turso_parser::ast::{self, TableInternalId};
 
 /// Maximum number of errors to report with integrity check. If we exceed this number we will
@@ -729,15 +729,9 @@ fn emit_strict_type_check(
     col_name: &str,
     col_reg: usize,
 ) -> Result<()> {
-    let value_type = match StrictType::named(&type_check_col.ty_str) {
-        Some(StrictType::Stores(storage_class)) => storage_class.value_type(),
-        Some(StrictType::Any) => return Ok(()),
-        None => {
-            return Err(LimboError::InternalError(format!(
-                "STRICT column {}.{} has type {}, which is not INTEGER, REAL, TEXT, BLOB or ANY",
-                btree_table.name, col_name, type_check_col.ty_str
-            )))
-        }
+    let value_type = match type_check_col.strict_type(&btree_table.name)? {
+        StrictType::Stores(storage_class) => storage_class.value_type(),
+        StrictType::Any => return Ok(()),
     };
 
     let type_ok = program.allocate_label();

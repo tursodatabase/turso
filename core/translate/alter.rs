@@ -611,20 +611,14 @@ fn emit_column_constraints_validation(
         let custom_type = resolver.with_schema(database_id, |schema| {
             schema.resolve_type(&column.ty_str, true)
         })?;
-        match (
-            column.is_array() || custom_type.is_some(),
-            StrictType::named(&column.ty_str),
-        ) {
-            (true, _) => Some(VirtualColumnCheck::Store),
-            (false, Some(StrictType::Stores(storage_class))) => {
-                Some(VirtualColumnCheck::Kind(storage_class.value_type()))
-            }
-            (false, Some(StrictType::Any)) => None,
-            (false, None) => {
-                return Err(LimboError::InternalError(format!(
-                    "STRICT table {} gets a column of type {}, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type",
-                    table.name, column.ty_str
-                )))
+        if column.is_array() || custom_type.is_some() {
+            Some(VirtualColumnCheck::Store)
+        } else {
+            match column.strict_type(&table.name)? {
+                StrictType::Stores(storage_class) => {
+                    Some(VirtualColumnCheck::Kind(storage_class.value_type()))
+                }
+                StrictType::Any => None,
             }
         }
     } else {

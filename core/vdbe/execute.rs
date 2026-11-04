@@ -2590,8 +2590,8 @@ pub fn op_type_check(
                 // An INTEGER PRIMARY KEY gets its rowid later.
                 return Ok(());
             }
-            match StrictType::named(&col.ty_str) {
-                Some(StrictType::Stores(expected_type)) => {
+            match col.strict_type(&table_reference.name)? {
+                StrictType::Stores(expected_type) => {
                     if let Err(value_type) = convert_to_strict_type(reg, expected_type) {
                         return Err(datatype_violation(format!(
                             "cannot store {} value in {} column {}.{}",
@@ -2602,15 +2602,7 @@ pub fn op_type_check(
                         )));
                     }
                 }
-                Some(StrictType::Any) => {}
-                None => {
-                    return Err(LimboError::InternalError(format!(
-                        "STRICT column {}.{} has type {}, which is not INTEGER, REAL, TEXT, BLOB or ANY",
-                        &table_reference.name,
-                        col.name.as_deref().unwrap_or(""),
-                        col.ty_str
-                    )));
-                }
+                StrictType::Any => {}
             }
             Ok(())
         },
