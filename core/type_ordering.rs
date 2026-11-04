@@ -1,6 +1,7 @@
 //! Orders of built-in types that SQLite's comparison of the stored value cannot
-//! express: numeric, which is stored as a blob, and arrays. Every other type
-//! sorts and compares by its stored value.
+//! express: numeric, which is stored as a blob, arrays, and uuid, whose text
+//! spellings must compare as the uuid they name. Every other type sorts and
+//! compares by its stored value.
 //!
 //! B-trees, sorters and hash tables use these orders, so each one is total and
 //! never fails: every value has a place, including NULL and values that are
@@ -10,7 +11,9 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
-use crate::numeric::decimal::{numeric_compare, numeric_compare_operands, numeric_hash};
+use crate::numeric::decimal::{
+    numeric_check_operand, numeric_compare, numeric_compare_operands, numeric_hash,
+};
 use crate::numeric::Numeric;
 use crate::types::AsValueRef;
 use crate::vdbe::array::{array_values_from_blob, parse_text_array, parse_text_array_of_texts};
@@ -25,10 +28,13 @@ pub enum TypeOrdering {
     /// Arrays whose elements are texts, such as `text[]`. An array in text
     /// form is read with texts for its elements, so `{1}` and `{1.0}` differ.
     TextArray,
+    /// 16-byte blobs and any text `uuid_blob` accepts (uppercase, braces, no
+    /// hyphens), by the uuid's bytes, so stored uuids sort as their blobs do.
+    Uuid,
 }
 
 impl TypeOrdering {
-    pub const ALL: [Self; 3] = [Self::Numeric, Self::Array, Self::TextArray];
+    pub const ALL: [Self; 4] = [Self::Numeric, Self::Array, Self::TextArray, Self::Uuid];
 
     /// The name EXPLAIN shows for the order.
     pub const fn name(self) -> &'static str {
@@ -36,6 +42,16 @@ impl TypeOrdering {
             Self::Numeric => "numeric",
             Self::Array => "array",
             Self::TextArray => "text_array",
+            Self::Uuid => "uuid",
+        }
+    }
+
+    /// Whether values stored in the type's encoded form sort in this order
+    /// under SQLite's comparison, so arrays of the type keep its order.
+    pub const fn sorts_stored_values(self) -> bool {
+        match self {
+            Self::Numeric | Self::Array | Self::TextArray => false,
+            Self::Uuid => true,
         }
     }
 
@@ -46,17 +62,35 @@ impl TypeOrdering {
                 .cmp(&ArraySortKey::of(right, parse_text_array)),
             Self::TextArray => ArraySortKey::of(left, parse_text_array_of_texts)
                 .cmp(&ArraySortKey::of(right, parse_text_array_of_texts)),
+            Self::Uuid => UuidSortKey::of(left).cmp(&UuidSortKey::of(right)),
         }
     }
 
     /// Orders the two sides of a comparison operator, such as `n = 'abc'`.
     /// Unlike [Self::compare], it fails when a numeric is compared with a
-    /// value that is not a number, as in PostgreSQL. The other orders never
-    /// fail.
+    /// value that is not a number, or a uuid with a value that is not a uuid,
+    /// as in PostgreSQL. The other orders never fail.
     pub fn compare_operands(self, left: ValueRef, right: ValueRef) -> crate::Result<Ordering> {
         match self {
             Self::Numeric => numeric_compare_operands(left, right),
+            Self::Uuid => {
+                let (left, right) = (UuidSortKey::of(left), UuidSortKey::of(right));
+                left.check_is_uuid()?;
+                right.check_is_uuid()?;
+                Ok(left.cmp(&right))
+            }
             _ => Ok(self.compare(left, right)),
+        }
+    }
+
+    /// Fails where [Self::compare_operands] would fail for `value` as either
+    /// side. A hash join checks its keys with it, because it compares them by
+    /// hash instead of with [Self::compare_operands].
+    pub fn check_operand(self, value: ValueRef) -> crate::Result<()> {
+        match self {
+            Self::Numeric => numeric_check_operand(value),
+            Self::Uuid => UuidSortKey::of(value).check_is_uuid(),
+            Self::Array | Self::TextArray => Ok(()),
         }
     }
 
@@ -65,6 +99,56 @@ impl TypeOrdering {
             Self::Numeric => numeric_hash(value, state),
             Self::Array => ArraySortKey::of(value, parse_text_array).hash(state),
             Self::TextArray => ArraySortKey::of(value, parse_text_array_of_texts).hash(state),
+            Self::Uuid => UuidSortKey::of(value).hash(state),
+        }
+    }
+}
+
+/// NULL first; then uuids, by their bytes; then any other value in SQLite's
+/// order.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum UuidSortKey<'a> {
+    Null,
+    Uuid(uuid::Uuid),
+    Other(ValueRef<'a>),
+}
+
+impl<'a> UuidSortKey<'a> {
+    fn of(value: ValueRef<'a>) -> Self {
+        let uuid = match value {
+            ValueRef::Null => return Self::Null,
+            ValueRef::Blob(blob) => uuid::Uuid::from_slice(blob).ok(),
+            ValueRef::Text(text) => uuid::Uuid::parse_str(text.as_str()).ok(),
+            ValueRef::Numeric(_) => None,
+        };
+        match uuid {
+            Some(uuid) => Self::Uuid(uuid),
+            None => Self::Other(value),
+        }
+    }
+
+    fn check_is_uuid(&self) -> crate::Result<()> {
+        match self {
+            Self::Other(_) => Err(crate::LimboError::Constraint(
+                "invalid UUID value".to_string(),
+            )),
+            Self::Null | Self::Uuid(_) => Ok(()),
+        }
+    }
+}
+
+impl Hash for UuidSortKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Null => 0u8.hash(state),
+            Self::Uuid(uuid) => {
+                1u8.hash(state);
+                uuid.hash(state);
+            }
+            Self::Other(value) => {
+                2u8.hash(state);
+                hash_sqlite_value(*value, state);
+            }
         }
     }
 }
@@ -176,6 +260,7 @@ fn hash_sqlite_value<H: Hasher>(value: ValueRef, state: &mut H) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::TursoSliceExt;
 
     /// Checks that `ordering` sorts `groups` in the order given, that values in
     /// one group are equal, and that equal values hash alike.
@@ -248,5 +333,37 @@ mod tests {
                 &[Value::from_text("abc")],
             ],
         );
+    }
+
+    #[test]
+    fn uuid_order_reads_every_uuid_spelling() {
+        let uuid = |hex: &str| {
+            Value::from_blob(
+                uuid::Uuid::parse_str(hex)
+                    .unwrap()
+                    .as_bytes()
+                    .try_to_vec()
+                    .unwrap(),
+            )
+        };
+        assert_order(
+            TypeOrdering::Uuid,
+            &[
+                &[Value::Null],
+                &[uuid("00000000-0000-0000-0000-000000000000")],
+                &[
+                    uuid("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+                    Value::from_text("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"),
+                    Value::from_text("{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}"),
+                    Value::from_text("a0eebc999c0b4ef8bb6d6bb9bd380a11"),
+                ],
+                &[int(5)],
+                &[Value::from_text("not a uuid")],
+                &[Value::from_blob(crate::alloc::vec![0xff, 0xff])],
+            ],
+        );
+        assert!(TypeOrdering::Uuid
+            .compare_operands(int(5).as_value_ref(), Value::Null.as_value_ref())
+            .is_err());
     }
 }

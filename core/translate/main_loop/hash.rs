@@ -556,6 +556,8 @@ pub(super) struct HashProbeSetupEmitter<'a, 'plan> {
     subqueries: &'a [NonFromClauseSubquery],
     predicates: &'a [WhereTerm],
     hash_join_op: &'a HashJoinOp,
+    /// Where-clause indices checked on each probe row before it probes.
+    prefilter_terms: &'a [usize],
     mode: &'a OperationMode,
     probe_cursor_id: CursorID,
     loop_start: BranchOffset,
@@ -573,6 +575,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
         subqueries: &'a [NonFromClauseSubquery],
         predicates: &'a [WhereTerm],
         hash_join_op: &'a HashJoinOp,
+        prefilter_terms: &'a [usize],
         mode: &'a OperationMode,
         probe_cursor_id: CursorID,
         loop_start: BranchOffset,
@@ -587,6 +590,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             subqueries,
             predicates,
             hash_join_op,
+            prefilter_terms,
             mode,
             probe_cursor_id,
             loop_start,
@@ -669,6 +673,16 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             pc_if_empty: self.loop_end,
         });
         self.program.preassign_label_to_next_insn(self.loop_start);
+
+        for &cond_idx in self.prefilter_terms {
+            super::conditions::emit_where_term(
+                self.program,
+                self.table_references,
+                &self.predicates[cond_idx],
+                self.next,
+                &self.t_ctx.resolver,
+            )?;
+        }
 
         let probe_key_start_reg = self.program.alloc_registers(num_keys);
         for (idx, join_key) in self.hash_join_op.join_keys.iter().enumerate() {
