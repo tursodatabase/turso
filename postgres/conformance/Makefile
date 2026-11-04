@@ -33,7 +33,7 @@ PG_TESTS := pg-sqltests
 # 2 * num_cpu (arbitrary multiplier)
 POSTGRES_JOBS ?= $(shell expr 2 \* $$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2))
 
-.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres run-sqlstate-fuzzer test-pgdump fuzz-pgdump build-dump-fuzzer run-upstream clean
+.PHONY: all build build-tursopg build-runner check run test run-one run-postgres run-one-postgres run-sqlstate-fuzzer pg-up pg-down test-pgdump fuzz-pgdump build-dump-fuzzer run-upstream clean
 
 # Build everything
 all: build
@@ -80,6 +80,18 @@ run-one-postgres: build-runner
 # set GEN_CASES=<n> for more statements.
 run-sqlstate-fuzzer:
 	./with-postgres.sh cargo test -p turso_pg_server --test sqlstate_differential -- --nocapture
+
+# Start a PostgreSQL container that stays up on 127.0.0.1:54329 and print the
+# PG_DSN to use with it. Run it from your own shell: a sandboxed coding agent
+# cannot reach the Docker socket, but it can connect to the published port.
+# With PG_DSN exported, with-postgres.sh uses that server instead of starting
+# a new container for each command.
+pg-up:
+	./pg-docker.sh up
+
+# Remove the container that pg-up started.
+pg-down:
+	./pg-docker.sh down
 
 build-dump-fuzzer:
 	cd $(ROOT_DIR) && cargo build $(FUZZER_CARGO_PROFILE) --package turso_pg_dump_fuzzer
