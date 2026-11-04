@@ -8,7 +8,7 @@ use super::plan::{
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
-use crate::translate::collate::CollationSeq;
+use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
     bind_and_rewrite_expr, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
@@ -1292,7 +1292,13 @@ fn resolve_compound_order_by_expr(
         ast::Expr::Collate(inner, collation_name) => {
             let (col_idx, _) =
                 resolve_compound_order_by_expr(inner, all_plans, resolver, term_number)?;
-            return Ok((col_idx, Some(CollationSeq::new(collation_name.as_str())?)));
+            let collation = compound_order_by_collation(
+                all_plans,
+                col_idx,
+                TextCollation::new(collation_name.as_str())?,
+                resolver,
+            )?;
+            return Ok((col_idx, Some(collation)));
         }
         // Case 1: Numeric column reference (e.g., ORDER BY 1). As in SQLite's
         // sqlite3ExprIsInteger, only literals that fit a 32-bit int count as

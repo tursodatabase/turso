@@ -1142,6 +1142,11 @@ mod tests {
             ("SELECT c COLLATE NOCASE FROM t", false, false),
             ("SELECT c FROM t ORDER BY c COLLATE NOCASE", true, false),
             (
+                "SELECT c FROM t UNION SELECT c FROM t ORDER BY c COLLATE NOCASE",
+                true,
+                false,
+            ),
+            (
                 "SELECT count(*) FROM t GROUP BY c COLLATE NOCASE",
                 true,
                 true,

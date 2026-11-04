@@ -634,6 +634,26 @@ pub fn compound_column_collation(
     first_collation(columns)
 }
 
+/// The collation of a compound SELECT's ORDER BY term `column COLLATE name`,
+/// where `arms` are its SELECTs. The COLLATE applies to the column of every
+/// SELECT, so it is an error when any of them has a type that takes none, as
+/// in a comparison.
+pub fn compound_order_by_collation(
+    arms: &[&SelectPlan],
+    column: usize,
+    explicit_collation: TextCollation,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let columns = arms.iter().map(|select| {
+        (
+            &select.result_columns[column].expr,
+            ExprContext::new(Some(&select.table_references), resolver),
+        )
+    });
+    common_ordering_of(columns, true)?;
+    Ok(CollationSeq::Text(explicit_collation))
+}
+
 /// The text collation of the first expression that has one, BINARY when none
 /// has.
 pub(crate) fn first_text_collation<'a, 'c, 's: 'c>(
@@ -661,6 +681,15 @@ fn common_type_ordering<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
         .clone()
         .into_iter()
         .any(|(expr, _)| has_collate_operator(expr));
+    common_ordering_of(exprs, has_collate)
+}
+
+/// The one order among the types of `exprs`, as [common_type_ordering]
+/// decides it. `has_collate` says whether a COLLATE applies to the values.
+fn common_ordering_of<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
+    exprs: impl IntoIterator<Item = (&'a Expr, C)>,
+    has_collate: bool,
+) -> Result<Option<TypeOrdering>> {
     // Most comparisons have two operands; keep their orders off the heap.
     let mut orders: SmallVec<[OperandOrder; 2]> = SmallVec::new();
     for (expr, context) in exprs {
