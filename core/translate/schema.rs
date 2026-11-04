@@ -3138,6 +3138,11 @@ pub fn translate_create_type(
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
         let type_def = TypeDef::from_create_type(&normalized_name, body, false, String::new())?;
+        // A CAST to the type from its own DECODE would run that DECODE again
+        // without end.
+        if type_def_uses_type(&type_def, &type_registry_key(&normalized_name))? {
+            bail_parse_error!("cannot create type {normalized_name}: it casts to itself");
+        }
         check_decode_type(&type_def, resolver)?;
     }
 
@@ -3335,6 +3340,18 @@ pub fn translate_create_domain(
     }
     if let Some(ref def) = default {
         validate_type_expr(def, "domain DEFAULT", &resolver.catalog)?;
+    }
+    // A CAST to the domain from its own CHECK or DEFAULT would run that
+    // expression again without end.
+    let registry_key = type_registry_key(&normalized_name);
+    for expr in constraints
+        .iter()
+        .map(|c| c.check.as_ref())
+        .chain(default.as_deref())
+    {
+        if expr_casts_to_type(expr, &registry_key)? {
+            bail_parse_error!("cannot create domain {normalized_name}: it casts to itself");
+        }
     }
 
     // Build the CREATE DOMAIN SQL for persistence

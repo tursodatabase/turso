@@ -165,3 +165,20 @@ test create-domain-refused-when-an-index-casts-to-its-name {
 expect error {
     cannot create domain b: index t_c already casts to it
 }
+
+@requires strict "uses STRICT tables"
+test create-type-refused-when-it-casts-to-itself {
+    -- Reading a column of a would run a's DECODE again without end.
+    CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS a);
+}
+expect error {
+    cannot create type a: it casts to itself
+}
+
+@requires strict "uses STRICT tables"
+test create-domain-refused-when-it-casts-to-itself {
+    CREATE DOMAIN d AS text CHECK (CAST(value AS d) IS NOT NULL);
+}
+expect error {
+    cannot create domain d: it casts to itself
+}
