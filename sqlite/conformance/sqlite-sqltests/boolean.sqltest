@@ -1017,3 +1017,33 @@ test partial-index-where-or-skips-the-operand-that-is-not-reached {
 expect {
     1
 }
+
+# An ORDER BY or GROUP BY term that names a result column through parentheses
+# or a leading `+` is still that column, so SQLite looks its collation up.
+
+test order-by-a-parenthesized-alias-looks-the-result-column-collation-up {
+    CREATE TABLE ob_collate(a);
+    INSERT INTO ob_collate VALUES (1);
+    SELECT 1 OR a COLLATE nosuch AS k FROM ob_collate ORDER BY (k);
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test order-by-a-signed-number-looks-the-result-column-collation-up {
+    CREATE TABLE ob_collate(a);
+    INSERT INTO ob_collate VALUES (1);
+    SELECT 1 OR a COLLATE nosuch AS k FROM ob_collate ORDER BY +1;
+}
+expect error {
+    no such collation sequence: nosuch
+}
+
+test order-by-a-parenthesized-number-looks-the-result-column-collation-up {
+    CREATE TABLE ob_collate(a);
+    INSERT INTO ob_collate VALUES (1);
+    SELECT 1 OR a COLLATE nosuch AS k FROM ob_collate ORDER BY (1);
+}
+expect error {
+    no such collation sequence: nosuch
+}
