@@ -2550,17 +2550,28 @@ pub fn fire_fk_update_actions(
             new_key_start,
         )?;
         // ON UPDATE CASCADE writes the parent's new key into the child as
-        // stored, so the child holds the same stored value as the parent.
-        let new_stored_key_start = program.alloc_registers(ncols);
-        copy_key_from_values(
-            program,
-            &parent_bt,
-            parent_cols,
-            new_values_start,
-            &new_image_layout,
-            new_rowid_reg,
-            new_stored_key_start,
-        )?;
+        // stored, so the child holds the same stored value as the parent. When
+        // no key column has a DECODE, the decoded key below is that value.
+        let key_has_decode = parent_cols.iter().any(|pcol| {
+            parent_bt
+                .get_column(pcol)
+                .is_some_and(|(_, col)| resolver.schema().column_has_decode(col, true))
+        });
+        let new_stored_key_start = if key_has_decode {
+            let start = program.alloc_registers(ncols);
+            copy_key_from_values(
+                program,
+                &parent_bt,
+                parent_cols,
+                new_values_start,
+                &new_image_layout,
+                new_rowid_reg,
+                start,
+            )?;
+            start
+        } else {
+            new_key_start
+        };
 
         // Decode encoded values so they match the subprogram's decoded column reads
         decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, old_key_start)?;
