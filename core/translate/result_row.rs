@@ -13,7 +13,7 @@ use turso_parser::ast;
 use super::{
     emitter::{LimitCtx, Resolver},
     expr::{
-        emit_array_decode,
+        emit_array_text,
         expr_type::{type_of, TypeEnv},
         translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
     },
@@ -516,20 +516,7 @@ pub(crate) fn emit_array_decode_for_results(
     let env = TypeEnv::new(Some(table_references), resolver);
     for (i, rc) in result_columns.iter().enumerate() {
         if type_of(&rc.expr, &env).is_array() {
-            // An array column's elements may have a custom type to decode.
-            let array_col = if let ast::Expr::Column { table, column, .. } = &rc.expr {
-                table_references
-                    .find_table_by_internal_id(*table)
-                    .and_then(|(_, t)| t.get_column_at(*column))
-            } else {
-                None
-            };
-            let reg = start_reg + i;
-            if let Some(col) = array_col {
-                emit_array_decode(program, reg, col, resolver)?;
-            } else if !program.flags.keep_array_results_as_blobs() {
-                program.emit_insn(Insn::ArrayDecode { reg });
-            }
+            emit_array_text(program, start_reg + i);
         }
     }
     Ok(())

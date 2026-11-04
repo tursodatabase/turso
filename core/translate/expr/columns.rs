@@ -131,18 +131,21 @@ pub fn emit_stored_column(
     resolver: &Resolver,
 ) -> Result<()> {
     let table = program.btree_table_from_cursor(cursor_id).map(Arc::clone);
+    // A row written before ADD COLUMN reads the column's default, which must be
+    // turned into what the column stores: an array is stored as a record blob,
+    // and a custom type stores what its ENCODE and COERCE return.
     let encoded_default = table.as_ref().and_then(|table| {
         let column = &table.columns()[column_index];
         let default_expr = column.default.as_ref()?;
-        let resolved = resolver
-            .schema()
-            .resolve_type(&column.ty_str, table.is_strict)
-            .ok()??;
-        resolved
-            .chain
-            .iter()
-            .any(|td| td.has_encode_or_coerce())
-            .then_some((table, column, default_expr))
+        let stores_another_form = column.is_array()
+            || resolver
+                .schema()
+                .resolve_type(&column.ty_str, table.is_strict)
+                .ok()??
+                .chain
+                .iter()
+                .any(|td| td.has_encode_or_coerce());
+        stores_another_form.then_some((table, column, default_expr))
     });
     let Some((table, column, default_expr)) = encoded_default else {
         program.emit_column_or_rowid(cursor_id, column_index, target_register);

@@ -320,3 +320,36 @@ test array-primary-key-autoincrement-rejected {
 expect error {
     AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY
 }
+
+@requires strict "uses STRICT tables"
+test array-of-encoded-type-holds-element-values {
+    -- An array holds the values of its elements, as a column of the element
+    -- type does. ENCODE runs on each element when the array is stored and
+    -- DECODE runs on each element when it is read, so the stored forms
+    -- (100, 200, ...) never show up in a query.
+    CREATE TYPE ci(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v ci, a ci[], m ci[][]) STRICT;
+    INSERT INTO t VALUES (1, 1, ARRAY[1,2], ARRAY[ARRAY[1,2],ARRAY[3,4]]);
+    INSERT INTO t VALUES (2, 3, '{3,4}', NULL);
+    SELECT 'cast', CAST('{1,2}' AS ci[]);
+    SELECT 'read', id, a, a[1] = v, a = ARRAY[1,2] OR a = ARRAY[3,4] FROM t ORDER BY id;
+    SELECT 'nested', m[1][2], m[2][1], m[2] = ARRAY[3,4] FROM t WHERE id = 1;
+    SELECT 'scan', id FROM t WHERE a = ARRAY[3,4];
+    SELECT 'scan-text', id FROM t WHERE a = '{1,2}';
+    CREATE INDEX ta ON t(a);
+    SELECT 'seek', id FROM t WHERE a = ARRAY[3,4];
+    SELECT 'seek-text', id FROM t WHERE a = '{1,2}';
+    UPDATE t SET a = array_append(a, 9) WHERE id = 1;
+    SELECT 'append', a FROM t WHERE id = 1;
+}
+expect {
+    cast|{1,2}
+    read|1|{1,2}|1|1
+    read|2|{3,4}|1|1
+    nested|2|3|1
+    scan|2
+    scan-text|1
+    seek|2
+    seek-text|1
+    append|{1,2,9}
+}

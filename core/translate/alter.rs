@@ -2834,6 +2834,17 @@ fn emit_strict_column_conversion(
         Some(&column_mask),
         layout,
     )?;
+    // An array converted to a column that is not an array becomes its text,
+    // such as `{1,2}`. A column added by ADD COLUMN is not in the original table.
+    let was_array = original_table
+        .columns()
+        .get(column_index)
+        .is_some_and(|column| column.is_array());
+    if was_array && !rewritten_table.columns()[column_index].is_array() {
+        program.emit_insn(Insn::ArrayDecode {
+            reg: layout.to_register(start_reg, column_index),
+        });
+    }
     program.emit_insn(Insn::TypeCheck {
         start_reg,
         count: layout.num_non_virtual_cols(),

@@ -749,6 +749,24 @@ fn translate_cast_expr(
     if let (Some(tn), Some(cast_type_name)) = (type_name, &cast_type_name) {
         if tn.array_dimensions > 0 {
             resolver.schema().check_array_element_type(cast_type_name)?;
+            // A CAST to an array of a custom type casts each leaf element as a
+            // CAST to the type would, so the array holds the elements' values.
+            let element_type = ast::Type {
+                array_dimensions: 0,
+                ..tn.clone()
+            };
+            if let Some(resolved) = custom_type_cast_chain(&element_type, resolver.schema())? {
+                emit_array_leaf_loop(
+                    program,
+                    target_register,
+                    tn.array_dimensions,
+                    Some(("", "")),
+                    |program, leaf_reg| {
+                        emit_custom_type_cast(program, resolved, &element_type, leaf_reg, resolver)
+                    },
+                )?;
+                return Ok(target_register);
+            }
             let mut column = Column::new(
                 None,
                 cast_type_name.clone(),
@@ -763,51 +781,7 @@ fn translate_cast_expr(
             return Ok(target_register);
         }
         if let Some(resolved) = custom_type_cast_chain(tn, resolver.schema())? {
-            let chain = resolved.chain;
-            // Build ty_params from AST TypeSize so parametric types
-            // (e.g. numeric(10,2)) get their parameters passed through.
-            let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
-                Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
-                Some(ast::TypeSize::TypeSize(e1, e2)) => {
-                    vec![e1.clone(), e2.clone()]
-                }
-                None => Vec::new(),
-            };
-
-            // A cast to a domain over boolean gives true for every nonzero
-            // integer in dialects whose integer-to-boolean cast does, before
-            // boolean's ENCODE sees the value.
-            let is_domain = chain[0].is_domain;
-            if is_domain
-                && chain
-                    .iter()
-                    .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
-            {
-                emit_integer_to_boolean_cast(program, target_register);
-            }
-            // A domain whose types have no expression to convert the value holds
-            // it as its base SQL type, so the CAST converts it as a CAST to that
-            // type would: CAST('2' AS d) is the integer 2 for a domain d over
-            // integer.
-            let converts_by_expression = chain
-                .iter()
-                .any(|td| td.has_encode_or_coerce() || td.decode().is_some());
-            if is_domain
-                && !converts_by_expression
-                && !resolved.primitive.eq_ignore_ascii_case("any")
-            {
-                program.emit_insn(Insn::Cast {
-                    reg: target_register,
-                    affinity: Affinity::of_written_type(&resolved.primitive),
-                });
-            }
-            emit_store_value(program, &chain, target_register, &ty_params, resolver)?;
-            emit_decode(program, &chain, target_register, resolver)?;
-            // The domain's CHECKs see the value after DECODE, as they do on a
-            // column of the domain.
-            if is_domain {
-                emit_domain_cast_constraints(program, &chain, tn, target_register, resolver)?;
-            }
+            emit_custom_type_cast(program, resolved, tn, target_register, resolver)?;
             return Ok(target_register);
         }
     }
@@ -821,6 +795,60 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// Emits a CAST of the value in `reg` to the custom type `type_name`, whose
+/// types are `resolved` (see `custom_type_cast_chain`).
+fn emit_custom_type_cast(
+    program: &mut ProgramBuilder,
+    resolved: crate::schema::ResolvedType,
+    type_name: &ast::Type,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let chain = resolved.chain;
+    // Build ty_params from AST TypeSize so parametric types
+    // (e.g. numeric(10,2)) get their parameters passed through.
+    let ty_params: Vec<Box<ast::Expr>> = match &type_name.size {
+        Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
+        Some(ast::TypeSize::TypeSize(e1, e2)) => {
+            vec![e1.clone(), e2.clone()]
+        }
+        None => Vec::new(),
+    };
+
+    // A cast to a domain over boolean gives true for every nonzero
+    // integer in dialects whose integer-to-boolean cast does, before
+    // boolean's ENCODE sees the value.
+    let is_domain = chain[0].is_domain;
+    if is_domain
+        && chain
+            .iter()
+            .any(|type_def| casts_nonzero_integer_to_true(type_def, resolver))
+    {
+        emit_integer_to_boolean_cast(program, reg);
+    }
+    // A domain whose types have no expression to convert the value holds
+    // it as its base SQL type, so the CAST converts it as a CAST to that
+    // type would: CAST('2' AS d) is the integer 2 for a domain d over
+    // integer.
+    let converts_by_expression = chain
+        .iter()
+        .any(|td| td.has_encode_or_coerce() || td.decode().is_some());
+    if is_domain && !converts_by_expression && !resolved.primitive.eq_ignore_ascii_case("any") {
+        program.emit_insn(Insn::Cast {
+            reg,
+            affinity: Affinity::of_written_type(&resolved.primitive),
+        });
+    }
+    emit_store_value(program, &chain, reg, &ty_params, resolver)?;
+    emit_decode(program, &chain, reg, resolver)?;
+    // The domain's CHECKs see the value after DECODE, as they do on a
+    // column of the domain.
+    if is_domain {
+        emit_domain_cast_constraints(program, &chain, type_name, reg, resolver)?;
+    }
+    Ok(())
 }
 
 /// The custom types a CAST to `type_name` stores its value as, the way a

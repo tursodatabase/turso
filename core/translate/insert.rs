@@ -1948,10 +1948,12 @@ fn emit_notnulls(
         // Determine which register to check: for custom type columns with
         // a DECODE expression, decode the encoded value into a temp register
         // and check the *decoded* value. This prevents "ghost NULLs" where
-        // ENCODE produces a non-NULL value but DECODE returns NULL.
-        let has_decode = resolver
-            .schema()
-            .column_has_decode(column_mapping.column, ctx.table.is_strict);
+        // ENCODE produces a non-NULL value but DECODE returns NULL. An array's
+        // DECODE runs on its elements, so it never makes the array NULL.
+        let has_decode = !column_mapping.column.is_array()
+            && resolver
+                .schema()
+                .column_has_decode(column_mapping.column, ctx.table.is_strict);
         let check_reg = if has_decode {
             let decoded_reg = program.alloc_register();
             crate::translate::expr::emit_user_facing_column_value(

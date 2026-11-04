@@ -119,11 +119,48 @@ pub(super) fn emit_array_element_loop(
     Ok(())
 }
 
-/// Emit bytecode to encode an array value: parse JSON text input, validate/coerce
-/// elements, and serialize to a native record-format BLOB.
-/// For custom element types with ENCODE or COERCE, a per-element bytecode loop
-/// normalizes input to blob, stores each element as a value of the type, then
-/// rebuilds the blob.
+/// Runs `transform_leaf` on the register holding each leaf element of the
+/// array in `reg`: each element of a one-dimensional array, and each element
+/// of each inner array of an array of arrays (`dimensions` > 1).
+/// `input_names`, the table and column names for errors, makes each level
+/// first turn text input such as `'{1,2}'` into an array blob.
+pub(crate) fn emit_array_leaf_loop(
+    program: &mut ProgramBuilder,
+    reg: usize,
+    dimensions: u32,
+    input_names: Option<(&str, &str)>,
+    transform_leaf: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
+) -> Result<()> {
+    if let Some((table_name, col_name)) = input_names {
+        program.emit_insn(Insn::ArrayEncode {
+            data: Box::new(ArrayEncodeData {
+                reg,
+                element_affinity: Affinity::Blob,
+                element_type: "ANY".into(),
+                table_name: table_name.into(),
+                col_name: col_name.into(),
+            }),
+        });
+    }
+    emit_array_element_loop(program, reg, |program, element_reg| {
+        if dimensions > 1 {
+            emit_array_leaf_loop(
+                program,
+                element_reg,
+                dimensions - 1,
+                input_names,
+                transform_leaf,
+            )
+        } else {
+            transform_leaf(program, element_reg)
+        }
+    })
+}
+
+/// Emit bytecode that turns the array value in `reg` into what an array column
+/// `col` stores: parse text input, run the element type's ENCODE and COERCE on
+/// each leaf element, check each element against the type's storage type, and
+/// serialize to a native record-format BLOB.
 pub(super) fn emit_array_encode(
     program: &mut ProgramBuilder,
     reg: usize,
@@ -131,28 +168,19 @@ pub(super) fn emit_array_encode(
     resolver: &Resolver,
     table_name: &str,
 ) -> Result<()> {
-    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if type_def.has_encode_or_coerce() {
-            // Normalize input (text or blob) to blob with ANY affinity first
-            program.emit_insn(Insn::ArrayEncode {
-                data: Box::new(ArrayEncodeData {
-                    reg,
-                    element_affinity: Affinity::Blob,
-                    element_type: "ANY".into(),
-                    table_name: table_name.into(),
-                    col_name: col.name.as_deref().unwrap_or("").into(),
-                }),
-            });
-
-            emit_array_element_loop(program, reg, |program, element_reg| {
-                emit_store_value(
-                    program,
-                    std::slice::from_ref(type_def),
-                    element_reg,
-                    &col.ty_params,
-                    resolver,
-                )
-            })?;
+    let col_name = col.name.as_deref().unwrap_or("");
+    let resolved = resolver.schema().resolve_type_unchecked(&col.ty_str)?;
+    if let Some(resolved) = &resolved {
+        if resolved.chain.iter().any(|td| td.has_encode_or_coerce()) {
+            emit_array_leaf_loop(
+                program,
+                reg,
+                col.array_dimensions(),
+                Some((table_name, col_name)),
+                |program, leaf_reg| {
+                    emit_store_value(program, &resolved.chain, leaf_reg, &col.ty_params, resolver)
+                },
+            )?;
         }
     }
 
@@ -160,18 +188,22 @@ pub(super) fn emit_array_encode(
     // For multi-dimensional arrays (e.g. INTEGER[][]), the outer array's elements
     // are themselves arrays (blobs), so we use ANY/Blob for validation.
     // Only 1-dimensional arrays validate elements against the declared base type.
-    let is_any = col.ty_str.eq_ignore_ascii_case("ANY");
+    // A custom type's elements hold what its ENCODE returns, which is checked
+    // against the type's BASE storage type, as for a column of the type.
+    let storage_type = resolved
+        .as_ref()
+        .map_or(col.ty_str.as_str(), |resolved| resolved.primitive.as_str());
+    let is_any = storage_type.eq_ignore_ascii_case("ANY");
     let is_multidim = col.array_dimensions() > 1;
-    let col_name = col.name.as_deref().unwrap_or("");
     let element_affinity = if is_any || is_multidim {
         Affinity::Blob
     } else {
-        Affinity::affinity(&col.ty_str)
+        Affinity::affinity(storage_type)
     };
     let element_type = if is_any || is_multidim {
         "ANY".into()
     } else {
-        col.ty_str.to_uppercase().into()
+        storage_type.to_uppercase().into()
     };
     program.emit_insn(Insn::ArrayEncode {
         data: Box::new(ArrayEncodeData {
@@ -185,30 +217,40 @@ pub(super) fn emit_array_encode(
     Ok(())
 }
 
-/// Emit bytecode to decode an array value: convert record-format BLOB to JSON text.
-/// For base element types, this is a single ArrayDecode instruction.
-/// For custom element types with decode expressions, a per-element loop
-/// extracts elements via ArrayElement, applies decode, then rebuilds the blob.
+/// Emit bytecode that turns the array an array column `col` stores, in `reg`,
+/// into the array it reads as: the element type's DECODE runs on each leaf
+/// element. The array stays a record-format BLOB.
 pub(crate) fn emit_array_decode(
     program: &mut ProgramBuilder,
     reg: usize,
     col: &Column,
     resolver: &Resolver,
 ) -> Result<()> {
-    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if let Some(decode_expr) = type_def.decode() {
-            emit_array_element_loop(program, reg, |program, element_reg| {
-                emit_type_expr(program, decode_expr, element_reg, element_reg, resolver)?;
-                Ok(())
-            })?;
-        }
+    let Some(resolved) = resolver.schema().resolve_type_unchecked(&col.ty_str)? else {
+        return Ok(());
+    };
+    if resolved
+        .chain
+        .iter()
+        .all(|td| td.decode_returns_value_unchanged())
+    {
+        return Ok(());
     }
+    emit_array_leaf_loop(
+        program,
+        reg,
+        col.array_dimensions(),
+        None,
+        |program, leaf_reg| emit_decode(program, &resolved.chain, leaf_reg, resolver),
+    )
+}
 
-    // Convert record blob to JSON text for display
+/// Emit bytecode that turns the array blob in `reg` into its text form, such
+/// as `{1,2}`, unless the program keeps array results as blobs.
+pub(crate) fn emit_array_text(program: &mut ProgramBuilder, reg: usize) {
     if !program.flags.keep_array_results_as_blobs() {
         program.emit_insn(Insn::ArrayDecode { reg });
     }
-    Ok(())
 }
 
 /// Emit ENCODE and COERCE for columns with custom types in a contiguous register range.
@@ -295,7 +337,6 @@ pub(crate) fn emit_custom_type_decode_columns(
 
         let reg = layout.to_register(start_reg, i);
 
-        // Handle array columns: decode record blob -> JSON text for display
         if col.is_array() {
             emit_array_decode(program, reg, col, resolver)?;
             continue;
