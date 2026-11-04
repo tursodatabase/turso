@@ -191,6 +191,27 @@ expect error {
     values of type inet cannot be compared
 }
 
+# `ARRAY[1] + 1` has no declared type. Mixed with it, a json value is still
+# json, so comparing the result is refused.
+@requires strict "uses STRICT tables"
+test no-comparison-coalesce-of-json-and-untyped-value {
+    CREATE TABLE t(j json, k json) STRICT;
+    INSERT INTO t VALUES ('{"a":1,"b":2}', '{"b":2,"a":1}');
+    SELECT coalesce(j, ARRAY[1] + 1) = coalesce(k, ARRAY[1] + 1) FROM t;
+}
+expect error {
+    values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-order-by-coalesce-of-json-and-untyped-value {
+    CREATE TABLE t(j json) STRICT;
+    SELECT j FROM t ORDER BY coalesce(ARRAY[1] + 1, j);
+}
+expect error {
+    values of type json cannot be compared
+}
+
 # `->` on jsonb gives json, as in PostgreSQL, so comparing it is refused.
 @requires strict "uses STRICT tables"
 test no-comparison-json-arrow-result {

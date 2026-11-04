@@ -776,7 +776,11 @@ fn operand_order(ty: &ExprType, schema: &Schema) -> Result<OperandOrder> {
 pub(crate) fn no_comparison_error(ty: &ExprType, type_def: &TypeDef) -> LimboError {
     let brackets = match ty {
         ExprType::Array { dimensions, .. } => "[]".repeat(*dimensions as usize),
-        _ => String::new(),
+        ExprType::Custom { .. }
+        | ExprType::Builtin(_)
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown => String::new(),
     };
     let instead = if type_def.is_struct() || type_def.is_union() {
         "compare their fields instead"

@@ -1031,6 +1031,8 @@ mod tests {
         "SELECT nullif(c, d) FROM t",
         "SELECT CASE c WHEN d THEN 1 END FROM t",
         "SELECT coalesce(c, d) = d FROM t",
+        "SELECT coalesce(c, ARRAY[1] + 1) = 1 FROM t",
+        "SELECT c FROM t ORDER BY coalesce(ARRAY[1] + 1, c)",
         "SELECT count(*) FROM t GROUP BY c",
         "SELECT DISTINCT c FROM t",
         "SELECT count(DISTINCT c) FROM t",

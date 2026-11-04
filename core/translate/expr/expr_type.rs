@@ -620,7 +620,12 @@ pub(crate) fn type_without_comparison<'a>(
             (!schema.type_has_comparison(type_def)).then_some(type_def)
         }
         ExprType::Array { element, .. } => type_without_comparison(element, schema),
-        ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null | ExprType::Unknown => None,
+        ExprType::Builtin(_) | ExprType::Untyped | ExprType::Null => None,
+        // Mixed with a type that can't be compared, an expression whose type
+        // nothing declares has that type (see [common_scalar_type]). On its own
+        // it is a new value, such as the number `ARRAY[1] + 1`, or its statement
+        // fails, as `json_column + 1` does.
+        ExprType::Unknown => None,
     }
 }
 
@@ -780,9 +785,13 @@ fn binary_type(
 /// as json or jsonb.
 fn json_extract_type(operand: &ExprType, schema: &Schema) -> Option<ExprType> {
     type_without_comparison(operand, schema)?;
-    Some(ExprType::Custom {
-        type_def: Arc::clone(schema.get_type_def_unchecked("json")?),
-        params: Vec::new(),
+    Some(match schema.get_type_def_unchecked("json") {
+        Some(json) => ExprType::Custom {
+            type_def: Arc::clone(json),
+            params: Vec::new(),
+        },
+        // The result then keeps the operand's type, which can't be compared either.
+        None => operand.clone(),
     })
 }
 
@@ -1055,6 +1064,12 @@ fn common_element_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
 fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
     use BuiltinType::{Decimal, Integer, Numeric, Real, Text};
     match (a, b) {
+        // A type whose values cannot be compared stays that type when mixed with
+        // any other one, even one nothing declares, so that comparing the result
+        // is refused instead of comparing stored text: coalesce(inet_column,
+        // cidr_column) is an inet, as in PostgreSQL.
+        (a, _) if type_without_comparison(&a, schema).is_some() => a,
+        (_, b) if type_without_comparison(&b, schema).is_some() => b,
         (ExprType::Unknown, _) | (_, ExprType::Unknown) => ExprType::Unknown,
         (ExprType::Untyped, ExprType::Untyped) => ExprType::Untyped,
         (
@@ -1097,15 +1112,6 @@ fn common_scalar_type(a: ExprType, b: ExprType, schema: &Schema) -> ExprType {
         // coalesce(money_column, 2) is a numeric.
         (a, b) if is_domain(&a) || is_domain(&b) => {
             common_scalar_type(without_domain(a, schema), without_domain(b, schema), schema)
-        }
-        // A type whose values cannot be compared stays that type when mixed with
-        // another one, so that comparing the result is refused instead of
-        // comparing stored text: coalesce(inet_column, cidr_column) is an inet,
-        // as in PostgreSQL.
-        (custom @ ExprType::Custom { .. }, _) | (_, custom @ ExprType::Custom { .. })
-            if type_without_comparison(&custom, schema).is_some() =>
-        {
-            custom
         }
         // A number mixed with a type that computes with exact numbers is a value
         // of that type without parameters: coalesce(numeric_column, 0) is a
@@ -1314,6 +1320,16 @@ mod tests {
                 "coalesce(CAST(1 AS cents), CAST(2 AS smallint))",
                 builtin(BuiltinType::Integer),
             ),
+            // A type whose values can't be compared stays that type, even mixed
+            // with a value whose type nothing declares (cents has no `+`).
+            (
+                "coalesce(CAST('{}' AS json), CAST(1 AS cents) + 1)",
+                custom("json", &[]),
+            ),
+            (
+                "coalesce(CAST(1 AS cents) + 1, CAST('{}' AS json))",
+                custom("json", &[]),
+            ),
             ("iif(1, NULL, 2)", builtin(BuiltinType::Integer)),
         ]);
     }
@@ -1360,6 +1376,29 @@ mod tests {
                 ExprType::array(builtin(BuiltinType::Integer), 1),
             ),
         ]);
+    }
+
+    #[test]
+    fn only_json_like_types_and_their_arrays_lack_a_comparison() {
+        let schema = test_schema();
+        let lacks_comparison = |ty: ExprType| {
+            type_without_comparison(&ty, &schema).map(|type_def| type_def.name.clone())
+        };
+        let json = Some("json".to_string());
+        assert_eq!(lacks_comparison(custom("json", &[])), json);
+        assert_eq!(
+            lacks_comparison(ExprType::array(custom("json", &[]), 1)),
+            json
+        );
+        assert_eq!(lacks_comparison(custom("cents", &[])), None);
+        assert_eq!(
+            lacks_comparison(ExprType::array(builtin(BuiltinType::Integer), 1)),
+            None
+        );
+        assert_eq!(lacks_comparison(builtin(BuiltinType::Text)), None);
+        assert_eq!(lacks_comparison(ExprType::Untyped), None);
+        assert_eq!(lacks_comparison(ExprType::Null), None);
+        assert_eq!(lacks_comparison(ExprType::Unknown), None);
     }
 
     fn check(cases: &[(&str, ExprType)]) {
