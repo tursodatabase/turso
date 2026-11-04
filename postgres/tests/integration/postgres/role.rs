@@ -231,13 +231,11 @@ fn statement_prepared_as_role_without_privileges_runs_after_reset_role() {
 }
 
 /// Foreign-key checks and actions need no privileges on the other table, as
-/// in PostgreSQL. The PostgreSQL frontend does not turn foreign keys on, so
-/// the test does.
+/// in PostgreSQL.
 #[test]
 fn foreign_key_checks_and_actions_need_no_privileges_on_the_other_table() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();
-    conn.inner().set_foreign_keys_enabled(true);
     conn.execute("CREATE ROLE alice").unwrap();
     conn.execute("CREATE TABLE parent (id int PRIMARY KEY)")
         .unwrap();

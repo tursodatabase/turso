@@ -395,6 +395,10 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    fn enforces_foreign_keys_by_default(&self) -> bool {
+        true
+    }
+
     fn generates_integer_primary_keys(&self) -> bool {
         false
     }

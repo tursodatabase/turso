@@ -23,7 +23,7 @@ setup t_id {
     CREATE TABLE t (id int);
 }
 
-# D-01 (S1): FK not enforced by default
+# D-01: FK not enforced by default
 # D-02 had the same SQL. This test covers it.
 @setup parent_id_child_id_pid_with_rows
 test gap-d-01-fk-not-enforced-by-default {
@@ -31,33 +31,24 @@ test gap-d-01-fk-not-enforced-by-default {
 }
 @sqlstate 23503
 expect error {}
-expect @tursopg {
-}
 
-# D-03 (S1): FK violation on update child
-# Fails while foreign keys are off, see D-01.
+# D-03: FK violation on update child
 @setup parent_id_child_id_pid_with_rows
 test gap-d-03-fk-violation-on-update-child {
     UPDATE child SET pid = 99 WHERE id = 1;
 }
 @sqlstate 23503
 expect error {}
-expect @tursopg {
-}
 
-# D-04 (S1): FK violation on delete parent
-# Fails while foreign keys are off, see D-01.
+# D-04: FK violation on delete parent
 @setup parent_id_child_id_pid_with_rows
 test gap-d-04-fk-violation-on-delete-parent {
     DELETE FROM parent WHERE id = 1;
 }
 @sqlstate 23503
 expect error {}
-expect @tursopg {
-}
 
-# D-05 (S1): ON DELETE CASCADE
-# Fails while foreign keys are off, see D-01.
+# D-05: ON DELETE CASCADE
 test gap-d-05-on-delete-cascade {
     CREATE TABLE parent (id int PRIMARY KEY);
     CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON DELETE CASCADE);
@@ -69,12 +60,8 @@ test gap-d-05-on-delete-cascade {
 expect {
     0
 }
-expect @tursopg {
-    1
-}
 
-# D-06 (S1): ON DELETE SET NULL
-# Fails while foreign keys are off, see D-01.
+# D-06: ON DELETE SET NULL
 test gap-d-06-on-delete-set-null {
     CREATE TABLE parent (id int PRIMARY KEY);
     CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON DELETE SET NULL);
@@ -86,12 +73,8 @@ test gap-d-06-on-delete-set-null {
 expect {
     1|
 }
-expect @tursopg {
-    1|1
-}
 
-# D-07 (S1): ON UPDATE CASCADE
-# Fails while foreign keys are off, see D-01.
+# D-07: ON UPDATE CASCADE
 test gap-d-07-on-update-cascade {
     CREATE TABLE parent (id int PRIMARY KEY);
     CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent(id) ON UPDATE CASCADE);
@@ -103,12 +86,8 @@ test gap-d-07-on-update-cascade {
 expect {
     2
 }
-expect @tursopg {
-    1
-}
 
-# D-08 (S1): FK to non-PK unique column
-# Fails while foreign keys are off, see D-01.
+# D-08: FK to non-PK unique column
 test gap-d-08-fk-to-non-pk-unique-column {
     CREATE TABLE parent (id int PRIMARY KEY, code text UNIQUE);
     CREATE TABLE child (id int PRIMARY KEY, code text REFERENCES parent(code));
@@ -117,8 +96,6 @@ test gap-d-08-fk-to-non-pk-unique-column {
 }
 @sqlstate 23503
 expect error {}
-expect @tursopg {
-}
 
 # D-09: PK duplicate
 test gap-d-09-pk-duplicate {

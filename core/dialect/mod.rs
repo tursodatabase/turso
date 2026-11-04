@@ -562,6 +562,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn generates_integer_primary_keys(&self) -> bool {
         true
     }
+
+    /// Whether new connections enforce foreign keys.
+    ///
+    /// PostgreSQL always enforces them. SQLite enforces them only after
+    /// `PRAGMA foreign_keys = ON`.
+    fn enforces_foreign_keys_by_default(&self) -> bool {
+        false
+    }
 }
 
 /// Refuses table SQL stored by the PostgreSQL frontend. The SQL comment that
