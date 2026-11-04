@@ -10,14 +10,14 @@
 //!  (e.g. the itertools library), since Python tends to be slow.
 use pyo3::{
     prelude::*,
-    types::{PyBytes, PyFloat, PyInt, PyMemoryView, PyTuple},
+    types::{PyBytes, PyFloat, PyInt, PyMemoryView, PyString, PyTuple},
 };
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value};
 pub use turso_sdk_kit::IoBackend;
 
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyOverflowError};
+use pyo3::exceptions::{PyException, PyOverflowError, PyTypeError};
 
 // support equality for status codes
 #[pyclass(eq, eq_int, skip_from_py_object)]
@@ -314,11 +314,14 @@ impl PyTursoStatement {
         Ok(())
     }
 
-    /// get statement parameter slot by name (e.g. :name, @name, $name, ?1)
-    pub fn named_position(&mut self, name: &str) -> PyResult<usize> {
-        self.statement
-            .named_position(name)
-            .map_err(turso_error_to_py_err)
+    /// number of parameter slots in the statement (the largest parameter index)
+    pub fn parameters_count(&self) -> usize {
+        self.statement.parameters_count()
+    }
+
+    /// name of the parameter at the 1-based index, with its prefix (e.g. :name), or None for a `?` parameter
+    pub fn parameter_name(&self, index: usize) -> Option<String> {
+        self.statement.parameter_name(index)
     }
 
     /// step one iteration of the statement execution
@@ -433,24 +436,18 @@ fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
         ))
     } else if let Ok(float) = obj.cast::<PyFloat>() {
         Ok(Value::from_f64(float.value()))
-    } else if let Ok(string) = obj.extract::<String>() {
-        Ok(Value::Text(string.into()))
+    } else if let Ok(string) = obj.cast::<PyString>() {
+        Ok(Value::Text(string.to_str()?.to_owned().into()))
     } else if let Ok(bytes) = obj.cast::<PyBytes>() {
         Ok(Value::Blob(bytes.as_bytes().to_vec()))
     } else if let Ok(view) = PyMemoryView::from(&obj) {
-        // Like sqlite3, bind any buffer object (bytearray, memoryview, array.array, ...)
-        // as a blob. PyBuffer needs Python 3.11+ under abi3, so copy the bytes through
-        // a memoryview. Like sqlite3, refuse a buffer that is not C-contiguous.
-        if view.getattr("c_contiguous")?.is_truthy()? {
-            let bytes = view.call_method0("tobytes")?.cast_into::<PyBytes>()?;
-            Ok(Value::Blob(bytes.as_bytes().to_vec()))
-        } else {
-            Err(Error::new_err("buffer parameter must be C-contiguous"))
-        }
+        // as in sqlite3, any object with the buffer protocol (bytearray, memoryview) binds as a BLOB
+        let bytes = view.call_method0("tobytes")?;
+        Ok(Value::Blob(bytes.cast::<PyBytes>()?.as_bytes().to_vec()))
     } else {
-        Err(Error::new_err(
-            "unexpected parameter value, only None, numbers, strings and bytes-like objects are supported"
-                .to_string(),
-        ))
+        Err(PyTypeError::new_err(format!(
+            "type '{}' is not supported",
+            obj.get_type().name()?
+        )))
     }
 }

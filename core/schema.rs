@@ -19,6 +19,7 @@ use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_co
 use crate::translate::planner::ROWID_STRS;
 use crate::type_ordering::TypeOrdering;
 use crate::types::IOResultOr;
+use crate::types::StrictType;
 use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef};
 use crate::util::{exprs_are_equivalent, is_builtin_strict_type, normalize_ident};
 use crate::vdbe::affinity::Affinity;
@@ -112,15 +113,15 @@ impl Trigger {
     }
 }
 
+use crate::security::roles::RoleCatalog;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
-use crate::translate::expr::expr_type::ExprType;
+use crate::translate::expr::expr_type::{column_type, ExprType};
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
-    column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
-    type_from_name, UnparsedFromSqlIndex,
+    column_declared_type, is_rowid_alias_type, type_from_name, UnparsedFromSqlIndex,
 };
 use crate::Result;
 use crate::{bail_parse_error, LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable};
@@ -434,6 +435,29 @@ impl ResolvedType {
         self.chain.iter().find(|type_def| !type_def.is_domain)
     }
 
+    /// The SQL type the type takes as input: the `value` type of the type, or
+    /// of the type a domain is based on, or the plain type a domain is based
+    /// on.
+    pub fn input_type(&self) -> &str {
+        self.base_type()
+            .map_or(self.primitive.as_str(), |type_def| {
+                type_def.value_input_type()
+            })
+    }
+
+    /// The storage class of the values the type stores: that of its BASE, or
+    /// of the plain type a domain is based on.
+    pub fn storage_class(&self) -> crate::Result<crate::types::StorageClass> {
+        match StrictType::named(&self.primitive) {
+            Some(StrictType::Stores(storage_class)) => Ok(storage_class),
+            Some(StrictType::Any) | None => Err(crate::LimboError::InternalError(format!(
+                "type {} is based on {}, which is not INTEGER, REAL, TEXT or BLOB",
+                self.leaf().name,
+                self.primitive
+            ))),
+        }
+    }
+
     pub fn reads_stored_values_unchanged(&self) -> bool {
         self.chain.iter().all(|td| {
             matches!(td.kind, TypeDefKind::Custom { .. }) && td.decode_returns_value_unchanged()
@@ -455,6 +479,9 @@ pub struct TypeDef {
     pub not_null: bool,
     /// Whether this is a domain (CREATE DOMAIN) vs a custom type (CREATE TYPE).
     pub is_domain: bool,
+    /// Whether values of the type take a COLLATE, as PostgreSQL's text types
+    /// do. None for a domain, which takes the answer of its base type.
+    pub accepts_collate: Option<bool>,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -640,9 +667,10 @@ impl TypeDef {
     pub fn from_create_type(
         type_name: &str,
         body: &ast::CreateTypeBody,
-        is_builtin: bool,
+        origin: TypeOrigin,
         sql: String,
     ) -> crate::Result<Self> {
+        let is_builtin = matches!(origin, TypeOrigin::Builtin { .. });
         Ok(match body {
             ast::CreateTypeBody::CustomType {
                 params,
@@ -666,6 +694,11 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    accepts_collate: Some(match origin {
+                        TypeOrigin::Builtin { accepts_collate } => accepts_collate,
+                        // A user type takes a COLLATE when its values are text.
+                        TypeOrigin::User => base.eq_ignore_ascii_case("text"),
+                    }),
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Custom {
@@ -698,6 +731,7 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    accepts_collate: Some(false),
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -730,6 +764,7 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    accepts_collate: Some(false),
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -758,6 +793,7 @@ impl TypeDef {
             is_builtin: false,
             not_null,
             is_domain: true,
+            accepts_collate: None,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
@@ -1103,6 +1139,9 @@ pub struct Schema {
     /// The materialized views met before the names of the namespaces were
     /// loaded, built once they are.
     pending_materialized_views: Option<PendingMaterializedViews>,
+
+    /// The roles of the database. Copies of the schema share them.
+    pub roles: Arc<RoleCatalog>,
 }
 
 /// Materialized views the loader read before the names of the namespaces,
@@ -1179,20 +1218,34 @@ impl Default for Schema {
     }
 }
 
+/// Whether a type is built into Turso or made by a user's CREATE TYPE.
+#[derive(Debug, Clone, Copy)]
+pub enum TypeOrigin {
+    /// `accepts_collate` says whether values of the type take a COLLATE.
+    Builtin {
+        accepts_collate: bool,
+    },
+    User,
+}
+
 fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
 
-    let type_sqls: &[&str] = &[
+    // Whether values of the type take a COLLATE. In PostgreSQL only text
+    // types do, so of the types below only varchar does.
+    const COLLATE: bool = true;
+    const NO_COLLATE: bool = false;
+    let types: &[(bool, &str)] = &[
         #[cfg(feature = "uuid")]
-        "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'",
-        "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+        (NO_COLLATE, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'"),
         #[cfg(feature = "json")]
-        "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
+        (NO_COLLATE, "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value"),
         #[cfg(feature = "json")]
-        "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
+        (NO_COLLATE, "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)"),
+        (COLLATE, "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'"),
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -1201,20 +1254,20 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         // the fraction outright, silently dropping precision on insert.
         // Caveat: Turso's `%f` directive is millisecond resolution, so PG's
         // microsecond inputs are clamped to 3 digits (`.123456` -> `.123`).
-        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'",
-        "CREATE TYPE bigint(value integer) BASE integer",
-        "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
-        "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
-        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)",
+        (NO_COLLATE, "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE bigint(value integer) BASE integer"),
+        (NO_COLLATE, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
+        (NO_COLLATE, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
     ];
 
-    for sql in type_sqls {
+    for &(accepts_collate, sql) in types {
         let mut parser = Parser::new(sql.as_bytes());
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
@@ -1225,7 +1278,12 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
             )));
         };
 
-        let type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string())?;
+        let type_def = TypeDef::from_create_type(
+            &type_name,
+            &body,
+            TypeOrigin::Builtin { accepts_collate },
+            sql.to_string(),
+        )?;
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
@@ -1262,7 +1320,7 @@ impl Schema {
     /// bug). Production code that opens user databases should prefer
     /// [`Schema::with_options`] which returns `Result`.
     pub fn new() -> Self {
-        Self::with_options(true, &crate::dialect::SqliteDialect)
+        Self::with_options(true, &crate::dialect::EngineDialect)
             .expect("built-in type definitions are malformed")
     }
 
@@ -1299,6 +1357,7 @@ impl Schema {
             default_namespaces: dialect.default_namespaces(),
             namespace_names_loaded: !dialect.supports_namespaces(),
             pending_materialized_views: None,
+            roles: Arc::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1829,12 +1888,37 @@ impl Schema {
             .ordering()
     }
 
-    /// Fails when `element_type` has its own order, as numeric does. Array
-    /// elements compare by their stored form, which does not sort in the
-    /// type's order.
+    /// Whether values of `type_def` take a COLLATE. A domain answers as its
+    /// base type does, and a domain over a SQLite type takes one when that
+    /// type is text.
+    pub fn type_accepts_collate(&self, type_def: &TypeDef) -> crate::Result<bool> {
+        if let Some(accepts_collate) = type_def.accepts_collate {
+            return Ok(accepts_collate);
+        }
+        let resolved = self
+            .resolve_type_unchecked(&type_def.name)?
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("type {} is not registered", type_def.name))
+            })?;
+        Ok(resolved
+            .chain
+            .iter()
+            .find_map(|type_def| type_def.accepts_collate)
+            .unwrap_or_else(|| resolved.primitive == "text"))
+    }
+
+    /// Fails when `element_type` is neither a STRICT type nor a custom type,
+    /// or when it has its own order, as numeric does. Array elements compare
+    /// by their stored form, which does not sort in the type's order.
     pub fn check_array_element_type(&self, element_type: &str) -> crate::Result<()> {
         let Some(type_def) = self.get_type_def_unchecked(element_type) else {
-            return Ok(());
+            return match StrictType::named(element_type) {
+                Some(StrictType::Stores(_) | StrictType::Any) => Ok(()),
+                None => crate::bail_parse_error!(
+                    "unknown datatype for array elements: \"{}\"",
+                    element_type
+                ),
+            };
         };
         if self.type_ordering(type_def).is_some() {
             crate::bail_parse_error!(
@@ -1859,6 +1943,43 @@ impl Schema {
             .ok()
             .flatten()
             .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()))
+    }
+
+    /// Fails when `column` is lossy, so it cannot be an index, UNIQUE, PRIMARY KEY
+    /// or FOREIGN KEY column. See [Self::column_is_lossy].
+    pub fn check_column_can_be_key(&self, column: &Column, is_strict: bool) -> crate::Result<()> {
+        if !self.column_is_lossy(column, is_strict) {
+            return Ok(());
+        }
+        let brackets = "[]".repeat(column.array_dimensions() as usize);
+        let name = column.name.as_deref().unwrap_or_default();
+        // A type that cannot be resolved counts as lossy and has no primitive,
+        // so the hint falls back to the type's name.
+        let primitive = match self.resolve_type_unchecked(&column.ty_str) {
+            Ok(Some(resolved)) => resolved.primitive,
+            _ => column.ty_str.clone(),
+        };
+        crate::bail_parse_error!(
+            "column '{name}' of type '{}{brackets}' cannot be a key: its type has a DECODE other than value, which might read different stored values back as the same value. Index CAST({name} AS {primitive}{brackets}) instead",
+            column.ty_str
+        );
+    }
+
+    /// Whether different stored values of the column might read back as the same
+    /// value, so a key on the column would tell apart values that queries
+    /// treat as equal. The column's type decides: built-in types, types
+    /// without a DECODE and types whose DECODE is `value` are not lossy, and a
+    /// domain or array follows the type it is based on. Everything else is
+    /// lossy, including a type that cannot be resolved.
+    pub fn column_is_lossy(&self, column: &Column, is_strict: bool) -> bool {
+        match self.resolve_type(&column.ty_str, is_strict) {
+            Ok(None) => false,
+            Ok(Some(resolved)) => !resolved
+                .chain
+                .iter()
+                .all(|td| td.is_builtin || td.decode_returns_value_unchanged()),
+            Err(_) => true,
+        }
     }
 
     /// Look up a custom type definition by name without a strictness check.
@@ -1891,6 +2012,41 @@ impl Schema {
         }
         let (primitive, chain) = self.resolve_base_type_chain(type_name)?;
         Ok(Some(ResolvedType { primitive, chain }))
+    }
+
+    /// The plain SQL type the type takes as input: its input type, followed
+    /// through custom types. A type declared `(value date)` takes text, as
+    /// date is declared `(value text)`. Fails for a name a STRICT column
+    /// can't be declared with, such as `(value float)`.
+    pub fn plain_input_type(&self, resolved: &ResolvedType) -> Result<StrictType> {
+        self.plain_value_type(&resolved.leaf().name, resolved.input_type())
+    }
+
+    /// The plain SQL type that `value_type`, the value type of type
+    /// `type_name`, leads to through custom types. `type_name` need not be in
+    /// the schema yet, so CREATE TYPE can check its own value type.
+    pub fn plain_value_type(&self, type_name: &str, value_type: &str) -> Result<StrictType> {
+        let mut input_type = value_type.to_string();
+        let mut seen = vec![type_name.to_lowercase()];
+        loop {
+            if seen.contains(&input_type.to_lowercase()) {
+                return Err(LimboError::ParseError(format!(
+                    "the value types of type {type_name} lead back to type {input_type}"
+                )));
+            }
+            match self.resolve_type_unchecked(&input_type)? {
+                Some(next) => {
+                    seen.push(input_type.to_lowercase());
+                    input_type = next.input_type().to_string();
+                }
+                None => break,
+            }
+        }
+        StrictType::named(&input_type).ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "type {type_name} takes values of type {input_type}, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type"
+            ))
+        })
     }
 
     /// `type_def` itself, or the type a domain is based on: a domain stores,
@@ -1988,8 +2144,12 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
             }))) => {
-                let type_def =
-                    TypeDef::from_create_type(&type_name, &body, false, sql.to_string())?;
+                let type_def = TypeDef::from_create_type(
+                    &type_name,
+                    &body,
+                    TypeOrigin::User,
+                    sql.to_string(),
+                )?;
                 self.type_registry
                     .insert(type_registry_key(&type_name), Arc::new(type_def));
             }
@@ -3792,14 +3952,14 @@ impl Schema {
                 // Classify on the root page before touching the SQL text so
                 // only the B-tree arm needs to parse the row's stored SQL.
                 if root_page == 0 {
-                    match Parser::new(sql.as_bytes()).next_cmd()? {
-                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(_))) => {}
+                    let create_vtab = match Parser::new(sql.as_bytes()).next_cmd()? {
+                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(create_vtab))) => create_vtab,
                         other => {
                             return Err(LimboError::Corrupt(format!(
                                 "sqlite_schema table row {name} with root page 0 has unexpected SQL {sql:?}: parsed as {other:?}"
                             )));
                         }
-                    }
+                    };
 
                     // a virtual table is found in the sqlite_schema, but it's no
                     // longer in the in-memory schema. We need to recreate it if
@@ -3807,11 +3967,17 @@ impl Schema {
                     let vtab = if let Some(vtab) = syms.vtabs.get(name) {
                         vtab.clone()
                     } else {
-                        let mod_name = module_name_from_sql(sql)?;
+                        // Like SQLite, the module receives the argument text exactly
+                        // as written, the same as when the table was created.
+                        let args = create_vtab
+                            .args
+                            .into_iter()
+                            .map(crate::Value::from_text)
+                            .collect();
                         crate::VirtualTable::table(
                             Some(name),
-                            mod_name,
-                            module_args_from_sql(sql)?,
+                            create_vtab.module_name.as_str(),
+                            args,
                             syms,
                         )?
                     };
@@ -4590,6 +4756,7 @@ impl TryClone for Schema {
             default_namespaces: self.default_namespaces,
             namespace_names_loaded: self.namespace_names_loaded,
             pending_materialized_views: self.pending_materialized_views.clone(),
+            roles: self.roles.clone(),
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             custom_types_enabled: self.custom_types_enabled,
@@ -5283,26 +5450,81 @@ impl BTreeTable {
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
                 col.override_affinity(Affinity::Blob);
-            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
-                col.ty_str = type_def.value_input_type().to_uppercase();
+            } else if let Some(resolved) = schema.resolve_type(&col.ty_str, table.is_strict)? {
+                col.ty_str = schema.plain_input_type(&resolved)?.name().to_string();
             }
         }
         Ok(Arc::new(modified))
     }
 
     /// Fails when a column or a key of a UNIQUE or PRIMARY KEY constraint has a
-    /// COLLATE and the column's type has its own order. Call this after
-    /// [Self::resolve_custom_types].
-    pub(crate) fn check_collates_are_allowed(&self) -> Result<()> {
+    /// COLLATE and the column's type takes none (see [key_collation]).
+    pub(crate) fn check_collates_are_allowed(&self, schema: &Schema) -> Result<()> {
         for column in &self.columns {
-            key_collation(column.text_collation(), column.type_ordering())?;
+            let ty = column_type(column, self.is_strict, schema);
+            key_collation(column.text_collation(), &ty, schema)?;
         }
         for key in self.unique_sets.iter().flat_map(|set| &set.columns) {
             if let Some((_, column)) = self.get_column(&key.name) {
-                key_collation(key.collation, column.type_ordering())?;
+                let ty = column_type(column, self.is_strict, schema);
+                key_collation(key.collation, &ty, schema)?;
             }
         }
         Ok(())
+    }
+
+    /// Fails when a column of a UNIQUE, PRIMARY KEY or FOREIGN KEY of the
+    /// table is lossy. See [Schema::check_column_can_be_key].
+    pub(crate) fn check_keys_are_not_lossy(&self, schema: &Schema) -> Result<()> {
+        for column in &self.columns {
+            if self.is_key_column(column) {
+                schema.check_column_can_be_key(column, self.is_strict)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `column` is part of a UNIQUE, PRIMARY KEY or FOREIGN KEY of the
+    /// table.
+    pub(crate) fn is_key_column(&self, column: &Column) -> bool {
+        let Some(name) = column.name.as_deref() else {
+            return false;
+        };
+        let unique_columns = self
+            .unique_sets
+            .iter()
+            .flat_map(|set| set.columns.iter().map(|key| key.name.as_str()));
+        let foreign_columns = self
+            .foreign_keys
+            .iter()
+            .flat_map(|fk| fk.child_columns.iter().map(String::as_str));
+        unique_columns
+            .chain(foreign_columns)
+            .any(|key| key.eq_ignore_ascii_case(name))
+    }
+
+    /// Renames a column inside the UNIQUE, PRIMARY KEY and FOREIGN KEY lists.
+    /// Does not touch the column itself.
+    pub(crate) fn rename_column_in_keys(&mut self, old_name: &str, new_name: &str) {
+        for key in self.unique_sets.iter_mut().flat_map(|set| &mut set.columns) {
+            if key.name.eq_ignore_ascii_case(old_name) {
+                key.name = new_name.to_string();
+            }
+        }
+        for foreign_key in &mut self.foreign_keys {
+            if foreign_key
+                .child_columns
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(old_name))
+            {
+                let foreign_key = Arc::make_mut(foreign_key);
+                for name in foreign_key.child_columns.iter_mut() {
+                    if name.eq_ignore_ascii_case(old_name) {
+                        *name = new_name.to_string();
+                    }
+                }
+            }
+        }
     }
 
     /// Fill in what custom type columns get from their type:
@@ -5364,7 +5586,7 @@ impl BTreeTable {
                     && definition
                         .col_type
                         .as_ref()
-                        .is_some_and(|ty| is_rowid_alias_type(&ty.name)),
+                        .is_some_and(is_rowid_alias_type),
             );
         }
         Ok(column)
@@ -5375,6 +5597,21 @@ impl BTreeTable {
             .iter()
             .enumerate()
             .find(|(_, column)| column.is_rowid_alias())
+    }
+
+    /// Whether `index` is the automatic index that enforces this table's
+    /// PRIMARY KEY. An INTEGER PRIMARY KEY is the rowid and has no such index.
+    pub fn is_primary_key_index(&self, index: &Index) -> bool {
+        self.get_rowid_alias_column().is_none()
+            && index
+                .name
+                .starts_with(crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+            && index.columns.len() == self.primary_key_columns.len()
+            && index
+                .columns
+                .iter()
+                .zip(&self.primary_key_columns)
+                .all(|(index_col, (pk_col, _))| index_col.name.eq_ignore_ascii_case(pk_col))
     }
 
     pub fn has_virtual_columns(&self) -> bool {
@@ -6754,7 +6991,7 @@ pub fn create_table(
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
                     Some(written_type) => {
-                        typename_exactly_integer = is_rowid_alias_type(&written_type.name);
+                        typename_exactly_integer = is_rowid_alias_type(written_type);
                         type_from_name(&ty_str).0
                     }
                     None => Type::Null,
@@ -6861,64 +7098,13 @@ pub fn create_table(
                             }
                             collation = Some(collation_seq);
                         }
-                        ast::ColumnConstraint::ForeignKey {
-                            clause,
-                            defer_clause,
-                        } => {
-                            if clause.columns.len() > 1 {
-                                crate::bail_parse_error!(
-                                    "foreign key on {} should reference only one column of table {}",
-                                    name,
-                                    clause.tbl_name.as_str()
-                                );
-                            }
-                            let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
-                            let (parent_namespace, parent_table) =
-                                demangle_name(supports_namespaces, &mangled_parent_table);
-                            let fk = ForeignKey {
-                                constraint_name: c_def.name.as_ref().map(|n| n.as_str().to_owned()),
-                                parent_table: parent_table.to_string(),
-                                parent_namespace,
-                                parent_columns: clause
-                                    .columns
-                                    .iter()
-                                    .map(|c| normalize_ident(c.col_name.as_str()))
-                                    .try_collect()?,
-                                on_delete: clause
-                                    .args
-                                    .iter()
-                                    .find_map(|arg| {
-                                        if let ast::RefArg::OnDelete(act) = arg {
-                                            Some(*act)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(RefAct::NoAction),
-                                on_update: clause
-                                    .args
-                                    .iter()
-                                    .find_map(|arg| {
-                                        if let ast::RefArg::OnUpdate(act) = arg {
-                                            Some(*act)
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .unwrap_or(RefAct::NoAction),
-                                child_columns: Box::from([name.clone()]),
-                                deferred: match defer_clause {
-                                    Some(d) => {
-                                        d.deferrable
-                                            && matches!(
-                                                d.init_deferred,
-                                                Some(InitDeferredPred::InitiallyDeferred)
-                                            )
-                                    }
-                                    None => false,
-                                },
-                                decl_order: column_fk_order,
-                            };
+                        ast::ColumnConstraint::ForeignKey { .. } => {
+                            let fk = ForeignKey::from_column_constraint(
+                                &name,
+                                c_def,
+                                column_fk_order,
+                                supports_namespaces,
+                            )?;
                             foreign_keys.try_push(Arc::new(fk))?;
                             column_fk_order += 1;
                         }
@@ -7224,6 +7410,62 @@ fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
 }
 
 impl ForeignKey {
+    /// Builds the foreign key of a column constraint such as
+    /// `c REFERENCES parent(p) ON DELETE CASCADE`. Used by CREATE TABLE,
+    /// ADD COLUMN and ALTER COLUMN.
+    pub fn from_column_constraint(
+        child_column: &str,
+        constraint: &ast::NamedColumnConstraint,
+        decl_order: usize,
+        supports_namespaces: bool,
+    ) -> Result<Self> {
+        let ast::ColumnConstraint::ForeignKey {
+            clause,
+            defer_clause,
+        } = &constraint.constraint
+        else {
+            unreachable!("from_column_constraint called with a constraint that is not REFERENCES");
+        };
+        if clause.columns.len() > 1 {
+            crate::bail_parse_error!(
+                "foreign key on {} should reference only one column of table {}",
+                child_column,
+                clause.tbl_name.as_str()
+            );
+        }
+        let mangled_parent_table = normalize_ident(clause.tbl_name.as_str());
+        let (parent_namespace, parent_table) =
+            demangle_name(supports_namespaces, &mangled_parent_table);
+        let find_action = |on_delete: bool| {
+            clause
+                .args
+                .iter()
+                .find_map(|arg| match arg {
+                    ast::RefArg::OnDelete(act) if on_delete => Some(*act),
+                    ast::RefArg::OnUpdate(act) if !on_delete => Some(*act),
+                    _ => None,
+                })
+                .unwrap_or(RefAct::NoAction)
+        };
+        Ok(ForeignKey {
+            constraint_name: constraint.name.as_ref().map(|n| n.as_str().to_owned()),
+            parent_table: parent_table.to_string(),
+            parent_namespace,
+            parent_columns: clause
+                .columns
+                .iter()
+                .map(|c| normalize_ident(c.col_name.as_str()))
+                .try_collect()?,
+            on_delete: find_action(true),
+            on_update: find_action(false),
+            child_columns: Box::from([child_column.to_string()]),
+            deferred: defer_clause.as_ref().is_some_and(|d| {
+                d.deferrable && matches!(d.init_deferred, Some(InitDeferredPred::InitiallyDeferred))
+            }),
+            decl_order,
+        })
+    }
+
     pub fn child_key_assigned(&self, child: &BTreeTable, updated_cols: &ColumnMask) -> bool {
         self.child_columns.iter().any(|cname| {
             child
@@ -7451,18 +7693,6 @@ impl Column {
         self.info.affinity()
     }
 
-    pub fn strict_value_type(&self) -> Option<crate::types::ValueType> {
-        use crate::types::ValueType;
-        turso_macros::match_ignore_ascii_case!(match self.ty_str.as_bytes() {
-            b"INTEGER" | b"INT" => Some(ValueType::Integer),
-            b"REAL" => Some(ValueType::Float),
-            b"BLOB" => Some(ValueType::Blob),
-            b"TEXT" => Some(ValueType::Text),
-            // ANY and custom types
-            _ => None,
-        })
-    }
-
     pub fn new_default_text(
         name: Option<String>,
         ty_str: String,
@@ -7594,10 +7824,9 @@ impl Column {
             .unwrap_or_default();
 
         let (ty, typename_exactly_integer) = match value.col_type {
-            Some(ref written_type) => (
-                type_from_name(&ty_str).0,
-                is_rowid_alias_type(&written_type.name),
-            ),
+            Some(ref written_type) => {
+                (type_from_name(&ty_str).0, is_rowid_alias_type(written_type))
+            }
             None => (Type::Null, false),
         };
 
@@ -7846,6 +8075,24 @@ impl Column {
     #[inline]
     pub fn set_array_dimensions(&mut self, dims: u32) {
         self.info.set_array_dimensions(dims)
+    }
+    /// The type of a STRICT column declared INTEGER, INT, REAL, TEXT, BLOB or
+    /// ANY. Callers handle arrays and custom types before asking.
+    pub fn strict_type(&self, table_name: &str) -> Result<StrictType> {
+        StrictType::named(&self.ty_str).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "STRICT column {table_name}.{} has type {}, which is not INTEGER, REAL, TEXT, BLOB or ANY",
+                self.name.as_deref().unwrap_or(""),
+                self.ty_str
+            ))
+        })
+    }
+    /// Whether both columns declare the same type: name, type parameters
+    /// (`varchar(10)` is not `varchar(3)`) and array dimensions.
+    pub fn has_same_declared_type(&self, other: &Column) -> bool {
+        self.ty_str.eq_ignore_ascii_case(&other.ty_str)
+            && self.ty_params == other.ty_params
+            && self.array_dimensions() == other.array_dimensions()
     }
 }
 
@@ -8737,6 +8984,15 @@ mod tests {
     }
 
     use crate::alloc::vec;
+
+    #[test]
+    fn schema_clones_share_the_role_catalog() {
+        let schema = Schema::new();
+
+        let clone = schema.try_clone().unwrap();
+
+        assert!(Arc::ptr_eq(&schema.roles, &clone.roles));
+    }
 
     #[test]
     fn test_column_definition_flag_conversion() {
@@ -9773,7 +10029,7 @@ mod tests {
                 &mut HashMap::default(),
                 &mut HashMap::default(),
                 &|_| None,
-                &crate::dialect::SqliteDialect,
+                &crate::EngineDialect,
             )
             .unwrap();
 
@@ -9798,7 +10054,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
-            &crate::dialect::SqliteDialect,
+            &crate::EngineDialect,
         );
         assert!(result
             .unwrap_err()
@@ -9826,7 +10082,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
-            &crate::dialect::SqliteDialect,
+            &crate::EngineDialect,
         );
         assert!(result.is_err());
         assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
@@ -9849,7 +10105,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
-            &crate::dialect::SqliteDialect,
+            &crate::EngineDialect,
         );
         assert!(result.is_err());
         assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
@@ -9875,7 +10131,7 @@ mod tests {
                 &mut HashMap::default(),
                 &mut HashMap::default(),
                 &|_| None,
-                &crate::dialect::SqliteDialect,
+                &crate::EngineDialect,
             )
             .unwrap();
         let table = schema.get_btree_table(NamespaceId::ROOT, "t1").unwrap();
@@ -10328,7 +10584,7 @@ mod tests {
                 &mut HashMap::default(),
                 &mut HashMap::default(),
                 &|_| None,
-                &crate::dialect::SqliteDialect,
+                &crate::EngineDialect,
             )
             .unwrap();
 

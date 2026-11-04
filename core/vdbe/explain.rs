@@ -754,6 +754,19 @@ pub fn insn_to_row(
                 0,
                 String::from(""),
             ),
+            Insn::ConvertToType {
+                reg,
+                storage_class,
+                description,
+            } => (
+                "ConvertToType",
+                *reg as i64,
+                0,
+                0,
+                Value::build_text(crate::types::StrictType::Stores(*storage_class).name()),
+                0,
+                description.clone(),
+            ),
             Insn::ArrayEncode { data } => (
                 "ArrayEncode",
                 data.reg as i64,
@@ -2104,6 +2117,20 @@ pub fn insn_to_row(
                 Value::build_text(sql.clone()),
                 0,
                 "ADD TYPE".to_string(),
+            ),
+            Insn::AddRole {
+                db,
+                id_reg,
+                name,
+                superuser,
+            } => (
+                "AddRole",
+                *db as i64,
+                *id_reg as i64,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("add role {name} id=r[{id_reg}] superuser={superuser}"),
             ),
             Insn::DropView {
                 db,

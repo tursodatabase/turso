@@ -5,6 +5,7 @@
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
+use crate::security::roles::ROLES_TABLE_NAME;
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -55,6 +56,7 @@ use crate::{
     PageRef, Pager, PlatformIO, Result, SymbolTable, SyncMode, SyscallIO, TempStore,
     TransactionState, VirtualTable, Wal, WalAutoActions, WalFile, WalFileShared, IO,
 };
+use crate::{Statement, Value};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::any::Any;
@@ -337,7 +339,7 @@ fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
 }
 
 /// Phase tracking for async database opening
-#[derive(Default, Debug)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub enum OpenDbAsyncPhase {
     #[default]
     Init,
@@ -347,6 +349,10 @@ pub enum OpenDbAsyncPhase {
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
+    /// Reads the roles table into the role catalog. Runs after MVCC
+    /// bootstrap, because before it an MVCC database has no table roots and
+    /// has not replayed its logical log.
+    LoadingRoles,
     Done,
 }
 
@@ -569,6 +575,10 @@ pub struct OpenDbAsyncState {
     /// The `PRAGMA journal_mode = 'mvcc'` statement that converts the database
     /// when `DatabaseOpts::with_mvcc` is set, held across yields.
     mvcc_convert_stmt: Option<crate::Statement>,
+    /// The roles table scan of `LoadingRoles` and the rows read so far, held
+    /// across yields.
+    roles_stmt: Option<Box<Statement>>,
+    role_rows: Vec<Vec<Value>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -593,6 +603,8 @@ impl OpenDbAsyncState {
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
             mvcc_convert_stmt: None,
+            roles_stmt: None,
+            role_rows: Vec::new(),
         }
     }
 }
@@ -1804,6 +1816,44 @@ impl Database {
                         db.with_schema_mut(|schema| schema.load_namespace_names(&namespace_rows))?;
                     }
 
+                    state.phase = OpenDbAsyncPhase::LoadingRoles;
+                }
+
+                OpenDbAsyncPhase::LoadingRoles => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    if state.roles_stmt.is_none() {
+                        let schema = db.schema.lock().clone();
+                        let has_roles_table = db.dialect().supports_roles()
+                            && schema
+                                .get_btree_table(NamespaceId::ROOT, ROLES_TABLE_NAME)
+                                .is_some();
+                        *conn.schema.write() = schema;
+                        if has_roles_table {
+                            state.roles_stmt = Some(Box::new(conn.prepare_roles_read()?));
+                        }
+                    }
+                    if let Some(stmt) = state.roles_stmt.as_mut() {
+                        let rows = &mut state.role_rows;
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            rows.push(row.get_values().cloned().collect());
+                            Ok(())
+                        }));
+                        state.roles_stmt = None;
+                        let roles =
+                            Arc::new(crate::security::roles::RoleCatalog::new(&state.role_rows)?);
+                        db.with_schema_mut(|schema| {
+                            schema.roles = roles;
+                            Ok(())
+                        })?;
+                    }
+
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state
@@ -2742,6 +2792,7 @@ impl Database {
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             triggers_enabled: AtomicBool::new(true),
+            writes_stored_values: AtomicBool::new(false),
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
             n_active_blob_statements: AtomicI32::new(0),
@@ -2755,6 +2806,8 @@ impl Database {
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
+            session_role: crate::security::roles::RoleId::SUPERUSER,
+            current_role: RwLock::new(crate::security::roles::RoleId::SUPERUSER),
             sequence_currvals: RwLock::new(HashMap::default()),
         });
         self.n_connections
@@ -3697,8 +3750,8 @@ mod database_tests {
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
     use crate::{
         storage::database::DatabaseFile, CompletionError, ConnectOpts, Connection, DatabaseOpts,
-        DatabaseStorage, EncryptionOpts, IOResult, LimboError, OpenDbAsyncState, OpenFlags,
-        OpenOptions, PlatformIO, SqliteDialect, IO,
+        DatabaseStorage, EncryptionOpts, EngineDialect, IOResult, LimboError, OpenDbAsyncState,
+        OpenFlags, OpenOptions, PlatformIO, IO,
     };
 
     #[test]
@@ -4317,7 +4370,7 @@ mod database_tests {
         let file = io.open_file(path, OpenFlags::Create, true).unwrap();
         let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
         let mut state = OpenDbAsyncState::new();
-        let options = OpenOptions::new(Arc::new(SqliteDialect))
+        let options = OpenOptions::new(Arc::new(EngineDialect))
             .storage(db_file)
             .flags(OpenFlags::Create)
             .db_opts(opts)
@@ -4404,9 +4457,9 @@ mod database_tests {
         let path = path.to_str().unwrap();
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
 
-        let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
         let file_key = DatabaseKey::File(crate::io::get_file_id(path).unwrap());
-        let reopened = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
+        let reopened = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
         assert!(Arc::ptr_eq(&db, &reopened));
         drop(reopened);
         assert!(DATABASE_MANAGER.lock().contains_key(&file_key));
@@ -4415,7 +4468,7 @@ mod database_tests {
 
         let name = "registry-entry-is-removed-when-last-database-reference-drops";
         let memory_key = DatabaseKey::SharedMemory(name.to_string());
-        let db = Database::open_shared_memory(name, Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_shared_memory(name, Arc::new(EngineDialect)).unwrap();
         assert!(DATABASE_MANAGER.lock().contains_key(&memory_key));
         drop(db);
         assert!(!DATABASE_MANAGER.lock().contains_key(&memory_key));
@@ -4466,7 +4519,7 @@ mod database_tests {
         let err = Database::open(
             io,
             path,
-            OpenOptions::new(Arc::new(SqliteDialect))
+            OpenOptions::new(Arc::new(EngineDialect))
                 .flags(OpenFlags::Create)
                 .encryption(EncryptionOpts {
                     cipher: "aes256gcm".to_string(),
@@ -4491,7 +4544,7 @@ mod database_tests {
         let err = Database::open(
             io,
             path_str,
-            OpenOptions::new(Arc::new(SqliteDialect))
+            OpenOptions::new(Arc::new(EngineDialect))
                 .flags(OpenFlags::Create)
                 .db_opts(DatabaseOpts::new().with_multiprocess_wal(true))
                 .page_codec(Arc::new(IdentityPageCodec) as Arc<dyn PageCodec>),
@@ -4518,7 +4571,7 @@ mod database_tests {
         let db_file: Arc<dyn DatabaseStorage> = Arc::new(DatabaseFile::new(file));
         let mut state = OpenDbAsyncState::new();
 
-        let options = OpenOptions::new(Arc::new(SqliteDialect))
+        let options = OpenOptions::new(Arc::new(EngineDialect))
             .storage(db_file)
             .flags(OpenFlags::Create)
             .db_opts(DatabaseOpts::new().with_multiprocess_wal(true))
@@ -4563,7 +4616,7 @@ mod database_tests {
                 OpenFlags::Create,
                 DatabaseOpts::new(),
                 None,
-                Arc::new(SqliteDialect),
+                Arc::new(EngineDialect),
             )
             .is_err(),
             "opening without the codec must not reuse a codec-required database"
@@ -5039,7 +5092,7 @@ mod database_tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
 
@@ -5521,7 +5574,7 @@ mod database_tests {
         let db = Database::open(
             io,
             path_str,
-            OpenOptions::new(Arc::new(SqliteDialect))
+            OpenOptions::new(Arc::new(EngineDialect))
                 .flags(OpenFlags::ReadOnly)
                 .page_codec(codec.clone()),
         )
@@ -5550,7 +5603,7 @@ mod database_tests {
                 OpenFlags::Create,
                 DatabaseOpts::new(),
                 None,
-                Arc::new(SqliteDialect),
+                Arc::new(EngineDialect),
             )
             .unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -5578,7 +5631,7 @@ mod database_tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         db.connect(ConnectOpts::new()).unwrap();

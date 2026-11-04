@@ -8,7 +8,7 @@ use crate::translate::emitter::{
 };
 use crate::turso_debug_assert;
 use crate::{
-    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
     schema::{
         self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
         SQLITE_SEQUENCE_TABLE_NAME,
@@ -768,21 +768,23 @@ pub fn translate_insert(
         })?;
     }
     if let Some(type_check_table) = &maybe_type_check_table {
-        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
-        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
-        program.emit_insn(Insn::TypeCheck {
-            start_reg: insertion.first_col_register(),
-            count: insertion.num_non_virtual_cols,
-            check_generated: false,
-            table_reference: BTreeTable::input_type_check_table_ref(
-                ctx.table,
-                resolver.schema(),
-                None,
-            )?,
-        });
+        if !program.flags.writes_stored_values() {
+            // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
+            // to catch things like a TEXT value inserted into an INTEGER-based custom type.
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: insertion.first_col_register(),
+                count: insertion.num_non_virtual_cols,
+                check_generated: false,
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    ctx.table,
+                    resolver.schema(),
+                    None,
+                )?,
+            });
 
-        // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+            // Encode values for columns with custom types.
+            emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+        }
 
         // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
         // We don't check generated columns in this initial pass because their dependencies could
@@ -2070,7 +2072,7 @@ struct BoundInsertResult {
 /// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
 /// This is used to detect when single-row VALUES should be routed through the
 /// multi-row path which has proper subquery handling.
-fn expr_contains_subquery(expr: &Expr) -> bool {
+pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
     let mut found_subquery = false;
     let _ = walk_expr(expr, &mut |e| {
         if matches!(
@@ -3318,16 +3320,17 @@ fn emit_unique_index_check(
         }
         // No matching UPSERT handler so we emit constraint error
         // (if conflict clause matched - VM will jump to later instructions and skip halt)
-        let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+        let raw_desc = format_unique_violation_desc(ctx.table, index);
         let mut constraint_info = ConstraintInfo::unique_index(
-            ctx.table.name.as_str(),
+            ctx.table,
             index,
             (0..num_cols).map(|i| idx_start_reg + i).collect(),
         );
         emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
+        let err_code = constraint_info.kind.sqlite_extended_result_code();
         program.emit_insn(Insn::Halt {
             constraint_info: Some(Box::new(constraint_info)),
-            err_code: SQLITE_CONSTRAINT_UNIQUE,
+            err_code,
             description: raw_desc,
             on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
             description_reg: None,
@@ -3365,16 +3368,17 @@ fn emit_unique_index_check(
             });
         } else {
             // ABORT/FAIL/ROLLBACK: halt on conflict.
-            let raw_desc = format_unique_violation_desc(ctx.table.name.as_str(), index);
+            let raw_desc = format_unique_violation_desc(ctx.table, index);
             let mut constraint_info = ConstraintInfo::unique_index(
-                ctx.table.name.as_str(),
+                ctx.table,
                 index,
                 (0..num_cols).map(|i| idx_start_reg + i).collect(),
             );
             emit_constraint_values_decode(program, resolver, ctx.table, &mut constraint_info)?;
+            let err_code = constraint_info.kind.sqlite_extended_result_code();
             program.emit_insn(Insn::Halt {
                 constraint_info: Some(Box::new(constraint_info)),
-                err_code: SQLITE_CONSTRAINT_UNIQUE,
+                err_code,
                 description: raw_desc,
                 on_error: program.constraint_halt_on_error(preflight.effective_on_conflict),
                 description_reg: None,
@@ -3564,30 +3568,24 @@ fn translate_virtual_table_insert(
 }
 
 /// Build the UNIQUE constraint error description to match sqlite
-/// single column: `t.c1`
-/// multi-column:  `t.(k, c1)`
-pub fn format_unique_violation_desc(table_name: &str, index: &Index) -> String {
-    if index.columns.len() == 1 {
-        let mut s = String::with_capacity(table_name.len() + 1 + index.columns[0].name.len());
-        s.push_str(table_name);
-        s.push('.');
-        s.push_str(&index.columns[0].name);
-        s
-    } else {
-        let mut s = String::with_capacity(table_name.len() + 3 + 4 * index.columns.len());
-        s.push_str(table_name);
-        s.push_str(".(");
-        s.push_str(
-            &index
-                .columns
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        s.push(')');
-        s
+/// columns:     `t.c1` or `t.k, t.c1`
+/// expressions: `index 'i'`
+pub fn format_unique_violation_desc(table: &BTreeTable, index: &Index) -> String {
+    if index.columns.iter().any(|c| c.expression().is_some()) {
+        return format!("index '{}'", index.name);
     }
+    index
+        .columns
+        .iter()
+        .map(|c| {
+            let column = table.columns()[c.pos_in_table]
+                .name
+                .as_deref()
+                .expect("index column must name a table column");
+            format!("{}.{column}", table.name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn emit_index_column_value_for_insert(

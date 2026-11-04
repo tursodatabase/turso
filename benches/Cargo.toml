@@ -1,0 +1,186 @@
+[package]
+name = "turso_benches"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Benchmarks for the Turso engine"
+publish = false
+autobenches = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+turso_core = { workspace = true }
+turso_sqlite = { workspace = true }
+turso_macros = { workspace = true }
+criterion = { workspace = true, features = [
+    "html_reports",
+    "async",
+    "async_futures",
+] }
+codspeed-criterion-compat = { workspace = true, features = [
+    "html_reports",
+    "async",
+    "async_futures",
+] }
+divan.workspace = true
+mimalloc = { workspace = true, default-features = false }
+rusqlite = { workspace = true, features = ["series"] }
+tempfile = { workspace = true }
+asserting = { workspace = true }
+regex = { workspace = true }
+rustc-hash = "2.0"
+
+[features]
+default = ["fts"]
+bench = ["turso_core/bench"]
+nanosecond-bench = ["bench", "turso_core/nanosecond-bench"]
+codspeed = ["bench", "turso_core/codspeed"]
+fts = ["turso_core/fts"]
+test_helper = ["turso_core/test_helper"]
+
+[[bench]]
+name = "benchmark"
+path = "benchmark.rs"
+harness = false
+
+[[bench]]
+name = "count_benchmark"
+path = "count_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "mvcc_benchmark"
+path = "mvcc_benchmark.rs"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "mvcc_recovery_benchmark"
+path = "mvcc_recovery_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "checkpoint_n_rows"
+path = "checkpoint_n_rows.rs"
+harness = false
+
+[[bench]]
+name = "logical_log_serialization"
+path = "logical_log_serialization.rs"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "json_benchmark"
+path = "json_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "tpc_h_benchmark"
+path = "tpc_h_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "sql_functions"
+path = "sql_functions/main.rs"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "alloc_collections"
+path = "alloc_collections.rs"
+harness = false
+
+[[bench]]
+name = "hash_spill_benchmark"
+path = "hash_spill_benchmark.rs"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "write_perf_benchmark"
+path = "write_perf_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "create_index_benchmark"
+path = "create_index_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "fts_benchmark"
+path = "fts_benchmark.rs"
+harness = false
+required-features = ["fts"]
+
+[[bench]]
+name = "fts_comparison_benchmark"
+path = "fts_comparison_benchmark.rs"
+harness = false
+required-features = ["fts"]
+
+[[bench]]
+name = "graph_queries_benchmark"
+path = "graph_queries_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "triggers"
+path = "triggers.rs"
+harness = false
+
+[[bench]]
+name = "struct_union_benchmark"
+path = "struct_union_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "struct_union_profile"
+path = "struct_union_profile.rs"
+harness = false
+
+[[bench]]
+name = "prepare_params_benchmark"
+path = "prepare_params_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "prepare_benchmark"
+path = "prepare_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "record_recycling"
+path = "record_recycling.rs"
+harness = false
+
+[[bench]]
+name = "select_star_benchmark"
+path = "select_star_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "scan_loop_benchmark"
+path = "scan_loop_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "overflow_scan_benchmark"
+path = "overflow_scan_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "text_validate_benchmark"
+path = "text_validate_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "string_expr_benchmark"
+path = "string_expr_benchmark.rs"
+harness = false
+[lints]
+workspace = true

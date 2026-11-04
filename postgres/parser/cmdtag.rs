@@ -370,6 +370,7 @@ mod tests {
             ("START TRANSACTION", CommandTag::StartTransaction),
             ("ROLLBACK TO SAVEPOINT sp", CommandTag::Rollback),
             ("RESET ALL", CommandTag::Reset),
+            ("RESET ROLE", CommandTag::Reset),
             ("DISCARD PLANS", CommandTag::DiscardPlans),
             (
                 "REFRESH MATERIALIZED VIEW mv",

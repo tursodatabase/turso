@@ -2,9 +2,8 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use turso_core::{
-    ConnectOpts, Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags, SqliteDialect,
-};
+use turso_core::{ConnectOpts, Connection, Database, DatabaseOpts, IO, LimboError, OpenFlags};
+use turso_sqlite::SqliteDialect;
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};
 use turso_whopper::multiprocess_platform_io;
 

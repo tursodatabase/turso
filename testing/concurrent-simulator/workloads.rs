@@ -985,7 +985,8 @@ mod tests {
         generation::Opts,
         model::table::{Column, ColumnType, Table},
     };
-    use turso_core::{ConnectOpts, Database, MemoryIO, SqliteDialect};
+    use turso_core::{ConnectOpts, Database, MemoryIO};
+    use turso_sqlite::SqliteDialect;
 
     use super::*;
 

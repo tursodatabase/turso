@@ -1106,7 +1106,7 @@ mod allocation_failures {
         let db = crate::Database::open(
             Arc::new(crate::MemoryIO::new()),
             ":memory:",
-            crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+            crate::OpenOptions::new(Arc::new(crate::EngineDialect))
                 .db_opts(crate::DatabaseOpts::default().with_index_method(true))
                 .allocators(DatabaseAllocators {
                     fts: DynAllocator::new(allocator.clone()),
@@ -1195,7 +1195,7 @@ fn documents_in_categories() -> Arc<Connection> {
     let db = crate::Database::open(
         Arc::new(crate::MemoryIO::new()),
         ":memory:",
-        crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect))
             .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
     )
     .unwrap();
@@ -1253,7 +1253,7 @@ fn scored_documents() -> Arc<Connection> {
     let db = crate::Database::open(
         Arc::new(crate::MemoryIO::new()),
         ":memory:",
-        crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+        crate::OpenOptions::new(Arc::new(crate::EngineDialect))
             .db_opts(crate::DatabaseOpts::default().with_index_method(true)),
     )
     .unwrap();

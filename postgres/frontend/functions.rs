@@ -4,6 +4,7 @@ use crate::settings::{find_parameter, Parameter, SettingScope};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction, ScalarReturn};
+use turso_core::security::roles::{RoleCatalog, RoleId};
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, Numeric, OpenOptions, Register, Result, Value,
@@ -12,7 +13,8 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -42,9 +44,9 @@ macro_rules! scalar_functions {
 
 pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
     scalar_functions!(options, |connection, args| {
-        "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(args)?,
-        "pg_get_userbyid"(FunctionArity::Exact(1), true) => {
-            oid_arg(args, 0)?.map(exec_pg_get_user_by_id)
+        "acldefault"(FunctionArity::Exact(2), true) => exec_acl_default(connection, args)?,
+        "pg_get_userbyid"(FunctionArity::Exact(1), false) => {
+            oid_arg(args, 0)?.map(|oid| exec_pg_get_user_by_id(connection, oid))
         },
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible"(
             FunctionArity::Exact(1), true
@@ -62,6 +64,9 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         },
         "quote_literal"(FunctionArity::Exact(1), true) => {
             exec_quote_literal(args[0].get_value())
+        },
+        "json_strip_nulls"(FunctionArity::Exact(1), true) => {
+            exec_json_strip_nulls(args[0].get_value())?
         },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| exec_pg_format_type(type_oid, int_arg(args, 1, -1))),
@@ -98,6 +103,12 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         },
         "current_schemas"(FunctionArity::Exact(1), false) => {
             exec_current_schemas(connection, args[0].get_value())?
+        },
+        "current_user" | "current_role" | "user"(FunctionArity::Exact(0), false) => {
+            role_name(connection, connection.current_role())?
+        },
+        "session_user"(FunctionArity::Exact(0), false) => {
+            role_name(connection, connection.session_role())?
         },
         "pg_backend_pid"(FunctionArity::Exact(0), true) => std::process::id() as i64,
         // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -257,7 +268,7 @@ fn exec_current_schemas(conn: &Connection, argument: &Value) -> Result<Option<St
     Ok(Some(result))
 }
 
-fn exec_acl_default(args: &[Register]) -> Result<Option<String>> {
+fn exec_acl_default(conn: &Connection, args: &[Register]) -> Result<Option<String>> {
     if matches!(args[0].get_value(), Value::Null) || matches!(args[1].get_value(), Value::Null) {
         return Ok(None);
     }
@@ -287,15 +298,7 @@ fn exec_acl_default(args: &[Register]) -> Result<Option<String>> {
         })?;
     let (public_privileges, owner_privileges) = kind.default_privileges();
 
-    // TODO: This hardcoded role mapping is temporary pg_dump compatibility.
-    // Replace it with a real role OID-to-name lookup later. Keep the numeric fallback for unknown OIDs.
-    let role = if owner == 10 {
-        "turso".to_string()
-    } else if owner == PG_DATABASE_OWNER_OID {
-        "pg_database_owner".to_string()
-    } else {
-        owner.to_string()
-    };
+    let role = acl_role_name(&role_name_by_oid(conn, owner).unwrap_or_else(|| owner.to_string()));
     let mut entries = Vec::with_capacity(2);
     if !public_privileges.is_empty() {
         entries.push(format!("={public_privileges}/{role}"));
@@ -304,7 +307,16 @@ fn exec_acl_default(args: &[Register]) -> Result<Option<String>> {
         let grantee = if owner == 0 { "" } else { &role };
         entries.push(format!("{grantee}={owner_privileges}/{role}"));
     }
-    Ok(Some(format!("{{{}}}", entries.join(","))))
+    Ok(Some(turso_core::text_array_literal(
+        entries.iter().map(String::as_str),
+    )))
+}
+
+fn acl_role_name(name: &str) -> String {
+    if name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return name.to_string();
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[derive(strum::EnumString)]
@@ -628,12 +640,33 @@ fn exec_pg_limit_value(args: &[Register]) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
-fn exec_pg_get_user_by_id(oid: i64) -> &'static str {
-    if oid == PG_DATABASE_OWNER_OID {
-        "pg_database_owner"
-    } else {
-        "turso"
+fn role_name(conn: &Connection, role: RoleId) -> Result<String> {
+    role_name_in(&conn.role_catalog(), role)
+}
+
+/// The role of a connection is normally in the catalog, but it may have been
+/// dropped by another connection since the connection was opened.
+fn role_name_in(roles: &RoleCatalog, role: RoleId) -> Result<String> {
+    match crate::catalog::postgres_roles(roles).find(|found| found.id == role) {
+        Some(role) => Ok(role.name),
+        None => Err(sqlstate_error(
+            SQLSTATE_UNDEFINED_OBJECT,
+            format!("invalid role OID: {}", crate::catalog::role_oid(role)),
+        )),
     }
+}
+
+fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> String {
+    role_name_by_oid(conn, oid).unwrap_or_else(|| format!("unknown (OID={oid})"))
+}
+
+fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
+    if oid == PG_DATABASE_OWNER_OID {
+        return Some("pg_database_owner".to_string());
+    }
+    crate::catalog::postgres_roles(&conn.role_catalog())
+        .find(|role| crate::catalog::role_oid(role.id) == oid)
+        .map(|role| role.name)
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Boolean {
@@ -672,6 +705,184 @@ fn exec_quote_literal(value: &Value) -> Option<String> {
         format!("'{}'", text.replace('\'', "''"))
     };
     Some(quoted)
+}
+
+/// PostgreSQL's json_strip_nulls(json): drops object fields whose value is null,
+/// keeping number text and duplicate keys as the json type does.
+fn exec_json_strip_nulls(value: &Value) -> Result<Option<String>> {
+    let json = match value {
+        Value::Null => return Ok(None),
+        Value::Text(text) => text.as_str(),
+        other => {
+            return Err(undefined_function(
+                "json_strip_nulls",
+                &[pg_type_name(other)],
+            ))
+        }
+    };
+    // Validate first, so the walk below can assume well-formed input.
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let mut stripped = String::with_capacity(json.len());
+    copy_without_null_fields(json, &mut 0, 0, &mut stripped)?;
+    Ok(Some(stripped))
+}
+
+/// The nesting limit of the walk below, the same as core's jsonb parser. Past
+/// it PostgreSQL also errors, at a depth that depends on max_stack_depth.
+const MAX_JSON_DEPTH: usize = 1000;
+
+pub(crate) fn invalid_json() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_INVALID_TEXT_REPRESENTATION,
+        "invalid input syntax for type json",
+    )
+}
+
+pub(crate) fn unsupported_unicode_escape() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_UNTRANSLATABLE_CHARACTER,
+        "unsupported Unicode escape sequence",
+    )
+}
+
+/// Copies the JSON value at `pos` into `out`, leaving out object fields whose
+/// value is null. `depth` is the number of objects and arrays around it.
+fn copy_without_null_fields(
+    json: &str,
+    pos: &mut usize,
+    depth: usize,
+    out: &mut String,
+) -> Result<()> {
+    let bytes = json.as_bytes();
+    skip_json_whitespace(bytes, pos);
+    if matches!(bytes[*pos], b'{' | b'[') && depth == MAX_JSON_DEPTH {
+        return Err(sqlstate_error(
+            SQLSTATE_STATEMENT_TOO_COMPLEX,
+            "stack depth limit exceeded",
+        ));
+    }
+    match bytes[*pos] {
+        b'{' => {
+            *pos += 1;
+            out.push('{');
+            let mut first = true;
+            loop {
+                skip_json_whitespace(bytes, pos);
+                match bytes[*pos] {
+                    b'}' => break,
+                    b',' => {
+                        *pos += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                // Decoded even when the field is dropped, so a bad escape in
+                // its key errors as in PostgreSQL.
+                let key = decode_json_string(json, pos)?;
+                skip_json_whitespace(bytes, pos);
+                *pos += 1; // ':'
+                skip_json_whitespace(bytes, pos);
+                if bytes[*pos..].starts_with(b"null") {
+                    *pos += 4;
+                    continue;
+                }
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                push_json_string(&key, out);
+                out.push(':');
+                copy_without_null_fields(json, pos, depth + 1, out)?;
+            }
+            *pos += 1;
+            out.push('}');
+        }
+        b'[' => {
+            *pos += 1;
+            out.push('[');
+            let mut first = true;
+            loop {
+                skip_json_whitespace(bytes, pos);
+                match bytes[*pos] {
+                    b']' => break,
+                    b',' => {
+                        *pos += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                copy_without_null_fields(json, pos, depth + 1, out)?;
+            }
+            *pos += 1;
+            out.push(']');
+        }
+        b'"' => {
+            let string = decode_json_string(json, pos)?;
+            push_json_string(&string, out);
+        }
+        // A number, true, false or null: copied as written.
+        _ => {
+            let start = *pos;
+            while !matches!(
+                bytes.get(*pos),
+                None | Some(b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r')
+            ) {
+                *pos += 1;
+            }
+            out.push_str(&json[start..*pos]);
+        }
+    }
+    Ok(())
+}
+
+fn skip_json_whitespace(bytes: &[u8], pos: &mut usize) {
+    while matches!(bytes.get(*pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        *pos += 1;
+    }
+}
+
+/// Decodes the string literal at `pos` and moves `pos` past its closing quote.
+fn decode_json_string(json: &str, pos: &mut usize) -> Result<String> {
+    let bytes = json.as_bytes();
+    let start = *pos;
+    *pos += 1;
+    loop {
+        match bytes[*pos] {
+            b'\\' => *pos += 2,
+            b'"' => break,
+            _ => *pos += 1,
+        }
+    }
+    *pos += 1;
+    let decoded: String = serde_json::from_str(&json[start..*pos]).map_err(|_| invalid_json())?;
+    if decoded.contains('\0') {
+        return Err(unsupported_unicode_escape());
+    }
+    Ok(decoded)
+}
+
+/// Writes a string the way PostgreSQL's escape_json() does: only quotes,
+/// backslashes and control characters are escaped.
+fn push_json_string(string: &str, out: &mut String) {
+    out.push('"');
+    for c in string.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 fn exec_textlike(args: &[Register]) -> Result<Option<Boolean>> {
@@ -1541,4 +1752,29 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_name_of_a_role_that_is_not_in_the_catalog_is_an_error() {
+        let with_alice = RoleCatalog::new(&[vec![
+            Value::from_i64(1),
+            Value::build_text("alice"),
+            Value::from_i64(0),
+        ]])
+        .unwrap();
+        let without_alice = RoleCatalog::new(&[]).unwrap();
+        let alice = with_alice.get_by_name("alice").unwrap().id;
+        assert_eq!(role_name_in(&with_alice, alice).unwrap(), "alice");
+
+        let error = role_name_in(&without_alice, alice).unwrap_err();
+        assert_eq!(error.to_string(), "invalid role OID: 16385");
+        assert_eq!(
+            role_name_in(&without_alice, RoleId::SUPERUSER).unwrap(),
+            "postgres"
+        );
+    }
 }

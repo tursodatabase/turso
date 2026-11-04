@@ -7,7 +7,7 @@
 mod encoder;
 
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use sha1::{Digest, Sha1};
 use std::num::NonZero;

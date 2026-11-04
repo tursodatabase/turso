@@ -15,7 +15,7 @@ use crate::translate::{
         emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary,
         OperationMode, Resolver,
     },
-    expr::expr_type::{type_of, type_ordering, TypeEnv},
+    expr::expr_type::{column_type, type_of, type_ordering, ExprType, TypeEnv},
     expr::{
         bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_condition_expr,
         translate_expr, unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
@@ -223,10 +223,12 @@ pub fn translate_create_index(
         )
     })?;
 
-    // Block CREATE INDEX on STRUCT/UNION columns and on types that can't be sorted
+    // Block CREATE INDEX on STRUCT/UNION columns, on types that can't be sorted
+    // and on lossy types
     for col in &columns {
-        if col.expr.is_none() {
-            // Simple column reference (not expression index)
+        // A table column, including a virtual generated column. `col.expr` also
+        // holds a virtual generated column's expression, so it cannot tell.
+        if col.expression().is_none() {
             if let Some(column) = tbl.columns().get(col.pos_in_table) {
                 if let Some(type_def) = resolver
                     .schema()
@@ -246,6 +248,9 @@ pub fn translate_create_index(
                         );
                     }
                 }
+                resolver
+                    .schema()
+                    .check_column_can_be_key(column, tbl.is_strict)?;
             }
         }
     }
@@ -450,7 +455,7 @@ pub(crate) fn emit_refill_index(
             }),
             unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
+            identifier: tbl_name,
             has_alias: false,
             internal_id: table_ref,
             join_info: None,
@@ -689,7 +694,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::Halt {
                 constraint_info: None,
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description: format_unique_violation_desc(tbl_name.as_str(), idx),
+                description: format_unique_violation_desc(tbl, idx),
                 on_error: None,
                 description_reg: None,
             });
@@ -1067,7 +1072,8 @@ fn resolve_sorted_columns_with_catalog(
         let index_column = if let Some((pos, column_name, column)) =
             resolve_index_column(unwrapped_expr, table)
         {
-            let collation = key_collation(explicit_collation, column.type_ordering())?
+            let ty = column_type(column, table.is_strict, schema);
+            let collation = key_collation(explicit_collation, &ty, schema)?
                 .unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
@@ -1087,8 +1093,8 @@ fn resolve_sorted_columns_with_catalog(
             if !validate_index_expression(unwrapped_expr, table) {
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
-            let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;
-            let collation = key_collation(explicit_collation, ordering)?;
+            let ty = expression_type(unwrapped_expr, table, schema, syms)?;
+            let collation = key_collation(explicit_collation, &ty, schema)?;
             IndexColumn {
                 name: sc.expr.to_string(),
                 order,
@@ -1148,10 +1154,20 @@ pub(crate) fn expression_type_ordering(
     schema: &Schema,
     syms: &SymbolTable,
 ) -> crate::Result<Option<TypeOrdering>> {
+    let ty = expression_type(expr, table, schema, syms)?;
+    Ok(type_ordering(&ty, schema))
+}
+
+/// The type of an index expression over `table`'s columns.
+fn expression_type(
+    expr: &Expr,
+    table: &BTreeTable,
+    schema: &Schema,
+    syms: &SymbolTable,
+) -> crate::Result<ExprType> {
     let mut expr = expr.clone();
     crate::schema::resolve_gencol_expr_columns(&mut expr, table.columns())?;
-    let ty = type_of(&expr, &TypeEnv::over_table(table, schema, syms));
-    Ok(type_ordering(&ty, schema))
+    Ok(type_of(&expr, &TypeEnv::over_table(table, schema, syms)))
 }
 
 /// Extracts collation sequence from an expression if it is a Collate expression.

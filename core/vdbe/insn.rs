@@ -411,8 +411,11 @@ pub struct IvmSumFinalizeData {
 #[derive(Debug, Clone)]
 pub struct ArrayEncodeData {
     pub reg: usize,
-    pub element_affinity: Affinity,
+    /// The declared element type name, for error messages.
     pub element_type: Arc<str>,
+    pub element_kind: crate::types::StrictType,
+    /// The number of dimensions the column declares: 2 for INTEGER[][].
+    pub dimensions: u32,
     pub table_name: Arc<str>,
     pub col_name: Arc<str>,
 }
@@ -465,12 +468,17 @@ impl ConstraintInfo {
         }
     }
 
-    pub fn unique_index(table: &str, index: &Index, regs: Vec<usize>) -> Self {
+    pub fn unique_index(table: &BTreeTable, index: &Index, regs: Vec<usize>) -> Self {
+        let kind = if table.is_primary_key_index(index) {
+            crate::ConstraintKind::PrimaryKey
+        } else {
+            crate::ConstraintKind::Unique
+        };
         Self {
-            kind: crate::ConstraintKind::Unique,
+            kind,
             constraint_name: index.constraint_name.clone(),
             index_name: Some(index.name.clone()),
-            table_name: table.to_string(),
+            table_name: table.name.clone(),
             column_names: index.columns.iter().map(|col| col.name.clone()).collect(),
             violation_regs: regs,
             row_col_names: vec![],
@@ -969,6 +977,15 @@ pub enum Insn {
         /// Check generated columns after their values have been computed.
         check_generated: bool, // P3
         table_reference: Arc<BTreeTable>, // P4
+    },
+
+    /// Converts the value in `reg` as a STRICT column storing `storage_class`
+    /// does, and fails with "cannot store <kind> value <description>" when it
+    /// can't: '5' becomes 5 for INTEGER, 'abc' is an error. NULL is left as it is.
+    ConvertToType {
+        reg: usize,
+        storage_class: crate::types::StorageClass,
+        description: String,
     },
 
     /// Parse a JSON text array into a native record-format BLOB, validating
@@ -1908,6 +1925,14 @@ pub enum Insn {
         /// The full CREATE TYPE SQL string
         sql: String,
     },
+    /// Add a role to the in-memory role catalog after its row was inserted
+    AddRole {
+        db: usize,
+        /// Register holding the rowid of the role in the roles table
+        id_reg: usize,
+        name: String,
+        superuser: bool,
+    },
 
     /// Close a cursor.
     Close {
@@ -2452,6 +2477,7 @@ impl InsnVariants {
             InsnVariants::ColumnHasField => execute::op_column_has_field,
             InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
+            InsnVariants::ConvertToType => execute::op_convert_to_type,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
             InsnVariants::ArrayElement => execute::op_array_element,
@@ -2562,6 +2588,7 @@ impl InsnVariants {
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
+            InsnVariants::AddRole => execute::op_add_role,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2708,6 +2735,7 @@ impl Insn {
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
+            | Self::AddRole { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

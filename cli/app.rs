@@ -37,8 +37,9 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
     io_error, ConnectOpts, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags,
-    QueryMode, SqliteDialect, Statement, Value,
+    QueryMode, Statement, Value,
 };
+use turso_sqlite::SqliteDialect;
 
 #[derive(Parser, Debug)]
 #[command(name = "Turso")]

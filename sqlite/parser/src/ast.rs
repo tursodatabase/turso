@@ -202,6 +202,11 @@ pub enum Stmt {
         /// type body
         body: CreateTypeBody,
     },
+    /// `CREATE ROLE`
+    CreateRole {
+        /// role name
+        role_name: String,
+    },
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`
@@ -495,8 +500,8 @@ pub enum Expr {
         base: Box<Expr>,
         /// field or variant name
         field: Name,
-        /// pre-resolved field/variant index (populated during binding)
-        resolved: Option<FieldAccessResolution>,
+        /// the field or variant, found when the expression is bound
+        resolved: FieldAccessResolution,
     },
     /// call to a built-in function
     FunctionCall {

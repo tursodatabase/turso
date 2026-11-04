@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::StrictType;
 use crate::vdbe::insn::ArrayEncodeData;
 
 /// Maximum number of array elements supported in the per-element transform loop.
@@ -9,11 +10,18 @@ const MAX_ARRAY_LOOP_ELEMENTS: usize = 1024;
 /// Extracts each element, applies `transform_element` to the register holding
 /// it, stores results into contiguous registers, then rebuilds the blob with
 /// MakeArrayDynamic. O(N) instead of O(N²) ArraySetElement per iteration.
+/// A NULL array stays NULL.
 pub(super) fn emit_array_element_loop(
     program: &mut ProgramBuilder,
     reg: usize,
     transform_element: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
 ) -> Result<()> {
+    let null_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: null_label,
+    });
+
     let reg_len = program.alloc_register();
     let reg_idx = program.alloc_register();
     let reg_elem = program.alloc_register();
@@ -108,6 +116,7 @@ pub(super) fn emit_array_element_loop(
         dest: reg,
     });
 
+    program.preassign_label_to_next_insn(null_label);
     Ok(())
 }
 
@@ -123,53 +132,47 @@ pub(super) fn emit_array_encode(
     resolver: &Resolver,
     table_name: &str,
 ) -> Result<()> {
-    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if type_def.has_encode_or_coerce() {
+    let resolved = resolver.schema().resolve_type_unchecked(&col.ty_str)?;
+    if let Some(resolved) = &resolved {
+        if resolved.chain.iter().any(|td| td.has_encode_or_coerce()) {
             // Normalize input (text or blob) to blob with ANY affinity first
             program.emit_insn(Insn::ArrayEncode {
                 data: Box::new(ArrayEncodeData {
                     reg,
-                    element_affinity: Affinity::Blob,
                     element_type: "ANY".into(),
+                    element_kind: StrictType::Any,
+                    dimensions: col.array_dimensions(),
                     table_name: table_name.into(),
                     col_name: col.name.as_deref().unwrap_or("").into(),
                 }),
             });
 
             emit_array_element_loop(program, reg, |program, element_reg| {
-                emit_store_value(
-                    program,
-                    std::slice::from_ref(type_def),
-                    element_reg,
-                    &col.ty_params,
-                    resolver,
-                )
+                emit_store_value(program, resolved, element_reg, &col.ty_params, resolver)
             })?;
         }
     }
 
-    // ArrayEncode: parse JSON text → validate/coerce → serialize to record blob.
-    // For multi-dimensional arrays (e.g. INTEGER[][]), the outer array's elements
-    // are themselves arrays (blobs), so we use ANY/Blob for validation.
-    // Only 1-dimensional arrays validate elements against the declared base type.
-    let is_any = col.ty_str.eq_ignore_ascii_case("ANY");
-    let is_multidim = col.array_dimensions() > 1;
+    // ArrayEncode: parse text → convert elements → serialize to record blob.
+    // Elements of a custom type are checked against the type's BASE.
     let col_name = col.name.as_deref().unwrap_or("");
-    let element_affinity = if is_any || is_multidim {
-        Affinity::Blob
-    } else {
-        Affinity::affinity(&col.ty_str)
-    };
-    let element_type = if is_any || is_multidim {
-        "ANY".into()
+    let element_type: Arc<str> = if let Some(resolved) = &resolved {
+        resolved.primitive.to_uppercase().into()
     } else {
         col.ty_str.to_uppercase().into()
     };
+    // check_array_element_type refuses other names before code is emitted.
+    let element_kind = StrictType::named(&element_type).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "array elements of {table_name}.{col_name} have type {element_type}, which is not INTEGER, REAL, TEXT, BLOB or ANY"
+        ))
+    })?;
     program.emit_insn(Insn::ArrayEncode {
         data: Box::new(ArrayEncodeData {
             reg,
-            element_affinity,
             element_type,
+            element_kind,
+            dimensions: col.array_dimensions(),
             table_name: table_name.into(),
             col_name: col_name.into(),
         }),
@@ -197,9 +200,7 @@ pub(crate) fn emit_array_decode(
     }
 
     // Convert record blob to JSON text for display
-    if !program.flags.keep_array_results_as_blobs() {
-        program.emit_insn(Insn::ArrayDecode { reg });
-    }
+    program.emit_insn(Insn::ArrayDecode { reg });
     Ok(())
 }
 
@@ -229,13 +230,7 @@ pub(crate) fn emit_custom_type_encode_columns(
 
         // Handle array columns: encode input (text or blob) -> record blob for storage
         if col.is_array() {
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: skip_label,
-            });
             emit_array_encode(program, reg, col, resolver, table_name)?;
-            program.preassign_label_to_next_insn(skip_label);
             continue;
         }
 
@@ -243,7 +238,8 @@ pub(crate) fn emit_custom_type_encode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
+        // A plain type has no ENCODE; TypeCheck checks its values.
+        let Some(resolved) = resolver.schema().resolve_type_unchecked(type_name)? else {
             continue;
         };
 
@@ -262,7 +258,7 @@ pub(crate) fn emit_custom_type_encode_columns(
             None
         };
 
-        emit_store_value(program, &resolved.chain, reg, &col.ty_params, resolver)?;
+        emit_store_value(program, &resolved, reg, &col.ty_params, resolver)?;
 
         if let Some(label) = skip_label {
             program.preassign_label_to_next_insn(label);
@@ -295,13 +291,7 @@ pub(crate) fn emit_custom_type_decode_columns(
 
         // Handle array columns: decode record blob -> JSON text for display
         if col.is_array() {
-            let skip_label = program.allocate_label();
-            program.emit_insn(Insn::IsNull {
-                reg,
-                target_pc: skip_label,
-            });
             emit_array_decode(program, reg, col, resolver)?;
-            program.preassign_label_to_next_insn(skip_label);
             continue;
         }
 

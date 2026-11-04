@@ -10,7 +10,7 @@ use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
     ast, emit_explain,
-    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY},
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Index,
         EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
@@ -38,6 +38,7 @@ use crate::{
             fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
             ParentKeyNewProbeMode,
         },
+        insert::format_unique_violation_desc,
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             EvalAt, IterationDirection, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
@@ -516,9 +517,9 @@ struct UpdateColumnCtx<'a> {
     cdc_updates_register: Option<usize>,
     layout: &'a ColumnLayout,
     affected_columns: &'a ColumnMask,
-    /// The SET columns. Until ENCODE runs, their registers hold the user's
-    /// values and the other columns hold stored values.
-    updated_columns: &'a ColumnMask,
+    /// The columns whose registers hold the user's values until ENCODE runs;
+    /// the other columns hold stored values.
+    user_value_columns: &'a ColumnMask,
 }
 
 impl UpdateColumnCtx<'_> {
@@ -876,7 +877,9 @@ fn emit_update_column_values<'a>(
                                 column_ctx.start,
                                 column_ctx.rowid_reg,
                                 column_ctx.layout.clone(),
-                                DmlRowForm::StoredExceptUpdated(column_ctx.updated_columns.clone()),
+                                DmlRowForm::StoredExceptUpdated(
+                                    column_ctx.user_value_columns.clone(),
+                                ),
                             ),
                             table: column_ctx.target_table.table.require_btree()?,
                         }),
@@ -1242,6 +1245,13 @@ fn emit_update_insns<'a>(
         .iter()
         .map(|set_clause| set_clause.column_index)
         .try_collect()?;
+    // The SET values hold the user's values and get ENCODEd, unless the
+    // statement writes stored values, as an ON UPDATE CASCADE action does.
+    let user_value_columns = if program.flags.writes_stored_values() {
+        ColumnMask::default()
+    } else {
+        updated_column_indices.clone()
+    };
     let updated_column_names: Vec<_> = set_clauses
         .iter()
         .flat_map(|set_clause| set_clause.column_names.iter().cloned())
@@ -1363,7 +1373,7 @@ fn emit_update_insns<'a>(
         cdc_updates_register,
         layout: &layout,
         affected_columns: &affected_columns,
-        updated_columns: &updated_column_indices,
+        user_value_columns: &user_value_columns,
     };
     let skip_set_clauses = false;
 
@@ -1481,7 +1491,7 @@ fn emit_update_insns<'a>(
                         &btree_table,
                         start,
                         &layout,
-                        &updated_column_indices,
+                        &user_value_columns,
                         &t_ctx.resolver,
                     )?;
                 }
@@ -1498,7 +1508,7 @@ fn emit_update_insns<'a>(
                         start,
                         new_rowid_reg,
                         layout.clone(),
-                        DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+                        DmlRowForm::StoredExceptUpdated(user_value_columns.clone()),
                     );
                     compute_virtual_columns(
                         program,
@@ -1522,7 +1532,7 @@ fn emit_update_insns<'a>(
                     program,
                     &btree_table,
                     Some(new_registers),
-                    DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+                    DmlRowForm::StoredExceptUpdated(user_value_columns.clone()),
                     Some(old_registers.clone()),
                     or_conflict,
                 );
@@ -1666,7 +1676,7 @@ fn emit_update_insns<'a>(
                 btree,
                 start,
                 &layout,
-                &updated_column_indices,
+                &user_value_columns,
                 &t_ctx.resolver,
             )?;
         }
@@ -1721,7 +1731,7 @@ fn emit_update_insns<'a>(
                 start,
                 effective_rowid_reg,
                 layout.clone(),
-                DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+                DmlRowForm::StoredExceptUpdated(user_value_columns.clone()),
             );
             compute_virtual_columns(
                 program,
@@ -1846,7 +1856,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 btree_table.columns(),
                 start,
-                Some(&updated_column_indices),
+                Some(&user_value_columns),
                 table_name,
                 &layout,
             )?;
@@ -2158,35 +2168,23 @@ fn emit_update_insns<'a>(
                 }
                 _ => {
                     // ABORT/FAIL/ROLLBACK behavior
-                    let column_names = index.columns.iter().enumerate().fold(
-                        String::with_capacity(50),
-                        |mut accum, (idx, col)| {
-                            if idx > 0 {
-                                accum.push_str(", ");
-                            }
-                            accum.push_str(table_name);
-                            accum.push('.');
-                            accum.push_str(&col.name);
-                            accum
-                        },
-                    );
+                    let btree_table = target_table.table.require_btree()?;
                     let mut constraint_info = ConstraintInfo::unique_index(
-                        table_name,
+                        &btree_table,
                         index,
                         (idx_start_reg..idx_start_reg + num_cols).collect(),
                     );
-                    if let Some(btree_table) = target_table.table.btree() {
-                        emit_constraint_values_decode(
-                            program,
-                            &t_ctx.resolver,
-                            &btree_table,
-                            &mut constraint_info,
-                        )?;
-                    }
+                    emit_constraint_values_decode(
+                        program,
+                        &t_ctx.resolver,
+                        &btree_table,
+                        &mut constraint_info,
+                    )?;
+                    let err_code = constraint_info.kind.sqlite_extended_result_code();
                     program.emit_insn(Insn::Halt {
                         constraint_info: Some(Box::new(constraint_info)),
-                        err_code: SQLITE_CONSTRAINT_UNIQUE,
-                        description: column_names,
+                        err_code,
+                        description: format_unique_violation_desc(&btree_table, index),
                         on_error: program.constraint_halt_on_error(idx_conflict),
                         description_reg: None,
                     });

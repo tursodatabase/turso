@@ -24,9 +24,10 @@ required-features = ["fts"]
 
 [features]
 stacker = ["turso/stacker"]
-fts = ["turso/fts", "dep:tempfile", "dep:turso_core"]
+fts = ["turso/fts", "dep:tempfile", "dep:turso_core", "dep:turso_sqlite"]
 
 [dependencies]
+turso_sqlite = { path = "../../sqlite/frontend", optional = true }
 turso = { path = "../../bindings/rust", default-features = false }
 turso_core = { path = "../../core", optional = true, default-features = false, features = ["fs", "fts", "test_helper"] }
 turso_parser = { workspace = true }
