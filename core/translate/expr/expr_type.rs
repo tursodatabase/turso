@@ -16,6 +16,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr_context::TableMetadata;
 use crate::translate::plan::{Plan, SelectPlan, TableReferences};
 use crate::type_ordering::TypeOrdering;
+use crate::types::{StorageClass, StrictType};
 use crate::vdbe::affinity::Affinity;
 use crate::{Result, SymbolTable};
 
@@ -182,10 +183,9 @@ pub(crate) enum TypeEnv<'a> {
         syms: &'a SymbolTable,
     },
     /// The DECODE of a custom type. `value` is the stored value, a value of
-    /// the type's BASE, and the type's parameters have their declared types.
+    /// the type's BASE.
     TypeBody {
         value: ExprType,
-        params: &'a [ast::TypeParam],
         schema: &'a Schema,
         syms: &'a SymbolTable,
     },
@@ -247,22 +247,15 @@ impl<'a> TypeEnv<'a> {
     /// The type of a name in a CREATE TYPE body: `value` or a parameter.
     /// Anywhere else a name is not bound yet.
     fn name_type(&self, name: &str) -> ExprType {
-        let Self::TypeBody { value, params, .. } = self else {
+        let Self::TypeBody { value, .. } = self else {
             return ExprType::NotKnownYet;
         };
         if name.eq_ignore_ascii_case("value") {
             return value.clone();
         }
-        match params
-            .iter()
-            .find(|param| param.name.eq_ignore_ascii_case(name))
-        {
-            Some(ast::TypeParam { ty: Some(ty), .. }) => {
-                ExprType::Builtin(builtin_type_of_affinity(Affinity::of_written_type(ty)))
-            }
-            Some(ast::TypeParam { ty: None, .. }) => ExprType::Builtin(BuiltinType::Any),
-            None => ExprType::Unknown,
-        }
+        // A type parameter holds the argument written in the column's type,
+        // such as numeric(10, 2), unconverted, so its kind is not known.
+        ExprType::Unknown
     }
 
     fn self_table_column_type(&self, column: usize) -> Option<ExprType> {
@@ -943,7 +936,6 @@ pub(crate) fn decode_type(
         decode,
         &TypeEnv::TypeBody {
             value: ExprType::Builtin(base),
-            params: type_def.params(),
             schema,
             syms,
         },
@@ -967,20 +959,17 @@ pub(crate) fn stored_value_type(type_def: &TypeDef, schema: &Schema) -> Option<B
     }
 }
 
-/// The kind of value a SQLite type such as `integer` holds. None for ANY.
+/// The kind of value a BASE such as `integer` holds. A BASE is stored like a
+/// STRICT column, so None for ANY and for a name a STRICT column can't be
+/// declared with.
 pub(crate) fn primitive_value_type(primitive: &str) -> Option<BuiltinType> {
-    if primitive.eq_ignore_ascii_case("any") {
-        return None;
+    match StrictType::named(primitive)? {
+        StrictType::Stores(StorageClass::Integer) => Some(BuiltinType::Integer),
+        StrictType::Stores(StorageClass::Real) => Some(BuiltinType::Real),
+        StrictType::Stores(StorageClass::Text) => Some(BuiltinType::Text),
+        StrictType::Stores(StorageClass::Blob) => Some(BuiltinType::Blob),
+        StrictType::Any => None,
     }
-    let affinity = Affinity::affinity(primitive);
-    Some(match affinity {
-        // A BASE is stored like a STRICT column, so a `blob` BASE holds only
-        // blobs, while a blob column in a plain table holds any kind.
-        Affinity::Blob | Affinity::None => BuiltinType::Blob,
-        Affinity::Integer | Affinity::Real | Affinity::Numeric | Affinity::Text => {
-            builtin_type_of_affinity(affinity)
-        }
-    })
 }
 
 /// The kind of value an expression of type `ty` gives, for a DECODE. None

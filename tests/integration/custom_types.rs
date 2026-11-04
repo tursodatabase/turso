@@ -396,6 +396,33 @@ mod tests {
         );
     }
 
+    /// CREATE DOMAIN refuses a base type that is neither a STRICT column type
+    /// nor a registered type, so a stored one must not open as a guessed kind.
+    #[test]
+    fn test_reopen_fails_when_stored_domain_is_based_on_an_unknown_name() {
+        let err = reopen_after_storing_type_sql("CREATE DOMAIN r AS foo");
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell what kind of value type r stores"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// An earlier version could store a DECODE that reads a type parameter.
+    /// A parameter holds the argument written in the column's type, which
+    /// is not converted to the parameter's type, so its kind is not known.
+    #[test]
+    fn test_reopen_fails_when_stored_decode_reads_a_type_parameter() {
+        let err = reopen_after_storing_type_sql(
+            "CREATE TYPE r(value any, p integer) BASE text ENCODE value DECODE p",
+        );
+        assert!(
+            err.contains("malformed database schema")
+                && err.contains("cannot tell what kind of value DECODE of type r returns"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// An earlier version could store a type whose ENCODE casts to itself.
     /// Its kinds would depend on themselves, so the database does not open.
     #[test]

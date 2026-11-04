@@ -2395,7 +2395,7 @@ impl Schema {
         {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
-            modified.resolve_custom_types(self);
+            modified.resolve_custom_types(self)?;
             modified.propagate_domain_constraints(self)?;
             tables.push((
                 namespace,
@@ -4205,7 +4205,7 @@ impl Schema {
                         }
                     }
 
-                    table.resolve_custom_types(self);
+                    table.resolve_custom_types(self)?;
                     table.propagate_domain_constraints(self)?;
                     let has_autoinc = table.has_autoincrement;
                     let tbl_name = name.to_string();
@@ -5708,13 +5708,14 @@ impl BTreeTable {
     ///   the custom type name (e.g. "doubled" contains "DOUB" which would
     ///   incorrectly map to REAL instead of INTEGER).
     /// - Keys on the column use the order of its type, when it has one.
-    pub fn resolve_custom_types(&mut self, schema: &Schema) {
+    pub fn resolve_custom_types(&mut self, schema: &Schema) -> Result<()> {
         if !self.is_strict {
-            return;
+            return Ok(());
         }
         for col in &mut self.columns {
-            col.resolve_custom_type(schema);
+            col.resolve_custom_type(schema)?;
         }
+        Ok(())
     }
 
     /// Propagate domain NOT NULL and CHECK constraints to table columns.
@@ -7793,8 +7794,8 @@ pub struct Column {
     /// types by `BTreeTable::resolve_custom_types`, never stored in the SQL.
     type_ordering: Option<TypeOrdering>,
     /// The affinity of the values a custom-type column reads as, which
-    /// comparisons use. `affinity()` is that of the stored form. None for a
-    /// column whose values compare in its type's own order, or as stored.
+    /// comparisons use. `affinity()` is that of the stored form. None only
+    /// for a column without a custom type.
     value_affinity: Option<Affinity>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
@@ -8172,7 +8173,7 @@ impl Column {
     /// type, affinity and key order of the type it is stored as. Every path
     /// that adds a column to a STRICT table calls this, so a column added by
     /// ALTER TABLE matches the same column read back from the schema.
-    pub fn resolve_custom_type(&mut self, schema: &Schema) {
+    pub fn resolve_custom_type(&mut self, schema: &Schema) -> Result<()> {
         if self.is_array() {
             // Arrays are stored as record-format blobs regardless of element type.
             self.set_ty(Type::Blob);
@@ -8181,25 +8182,36 @@ impl Column {
                 &crate::translate::expr::expr_type::column_type(self, true, schema),
                 schema,
             );
-            return;
+            return Ok(());
         }
-        if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&self.ty_str) {
-            let (base_ty, _) = type_from_name(&resolved.primitive);
-            self.set_ty(base_ty);
-            self.override_affinity(Affinity::affinity(&resolved.primitive));
-            self.type_ordering = resolved.ordering();
-            self.value_affinity = match self.type_ordering {
-                Some(_) => None,
-                None => Some(resolved.leaf().value_type().affinity()),
-            };
+        match schema.resolve_type_unchecked(&self.ty_str)? {
+            Some(resolved) => {
+                let (base_ty, _) = type_from_name(&resolved.primitive);
+                self.set_ty(base_ty);
+                let stored_affinity = Affinity::affinity(&resolved.primitive);
+                self.override_affinity(stored_affinity);
+                self.type_ordering = resolved.ordering();
+                self.value_affinity = Some(match self.type_ordering {
+                    // Its values compare in the type's own order, by how
+                    // they are stored.
+                    Some(_) => stored_affinity,
+                    None => resolved.leaf().value_type().affinity(),
+                });
+            }
+            None => self.value_affinity = None,
         }
+        Ok(())
     }
     /// The affinity comparisons with the column's values use: that of the
     /// values a custom type reads as, which may differ from what it stores
-    /// (`BASE text DECODE CAST(value AS real)` compares as REAL).
+    /// (`BASE text DECODE CAST(value AS real)` compares as REAL). A column
+    /// without a custom type compares by its own affinity, as in SQLite.
     #[inline]
     pub fn comparison_affinity(&self) -> Affinity {
-        self.value_affinity.unwrap_or_else(|| self.affinity())
+        match self.value_affinity {
+            Some(affinity) => affinity,
+            None => self.affinity(),
+        }
     }
     /// Set the key order of a derived table's column, which takes it from the
     /// type of the expression the column comes from.

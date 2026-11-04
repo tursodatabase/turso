@@ -127,6 +127,27 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+test decode-kind-math-of-text-is-real {
+    -- These functions convert a text argument to a real, so each DECODE is
+    -- accepted and reads as a real.
+    CREATE TYPE f_exp(value any) BASE text ENCODE value DECODE exp(value);
+    CREATE TYPE f_ln(value any) BASE text ENCODE value DECODE ln(value);
+    CREATE TYPE f_log(value any) BASE text ENCODE value DECODE log(value);
+    CREATE TYPE f_log2(value any) BASE text ENCODE value DECODE log(value, 2);
+    CREATE TYPE f_log10(value any) BASE text ENCODE value DECODE log10(value);
+    CREATE TYPE f_mod(value any) BASE text ENCODE value DECODE mod(value, 3);
+    CREATE TYPE f_pow(value any) BASE text ENCODE value DECODE pow(value, 2);
+    CREATE TYPE f_power(value any) BASE text ENCODE value DECODE power(value, 2);
+    CREATE TYPE f_sqrt(value any) BASE text ENCODE value DECODE sqrt(value);
+    CREATE TABLE t(a f_exp, b f_ln, c f_log, d f_log2, e f_log10, f f_mod, g f_pow, h f_power, i f_sqrt) STRICT;
+    INSERT INTO t VALUES ('4', '4', '4', '4', '4', '4', '4', '4', '4');
+    SELECT typeof(a), typeof(b), typeof(c), typeof(d), typeof(e), typeof(f), typeof(g), typeof(h), typeof(i) FROM t;
+}
+expect {
+    real|real|real|real|real|real|real|real|real
+}
+
+@requires strict "uses STRICT tables"
 test decode-kind-refuses-round-of-integer {
     -- In PostgreSQL, round() of an exact number gives an exact number, so
     -- the kind of round() of an integer is not known.
