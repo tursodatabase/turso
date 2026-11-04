@@ -1,57 +1,54 @@
 use super::*;
 
-/// Fails when a comparison, BETWEEN or IN list of this expression puts row
-/// values of different sizes side by side, as SQLite's resolver does before
-/// anything is folded: `1 OR (1, 2) = (1, 2, 3)` is "row value misused".
-/// A row value in any other place, like `(1, 2) + 1`, is only reported when
-/// it is compiled, so it is left alone here.
-pub fn reject_row_value_misuse(expr: &Expr) -> Result<()> {
-    walk_expr(expr, &mut |e| {
-        match e {
-            Expr::Binary(lhs, op, rhs) if is_comparison(op) => {
-                if let (Some(left), Some(right)) = (row_value_width(lhs), row_value_width(rhs)) {
-                    if left != right {
-                        crate::bail_parse_error!("row value misused");
-                    }
+/// Fails when this comparison, BETWEEN or IN list puts row values of
+/// different sizes side by side, as SQLite's resolver does before anything
+/// is folded: `1 OR (1, 2) = (1, 2, 3)` is "row value misused". A row value
+/// in any other place, like `(1, 2) + 1`, is only reported when it is
+/// compiled, so it is left alone here.
+pub fn reject_row_value_misuse_at(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::Binary(lhs, op, rhs) if is_comparison(op) => {
+            if let (Some(left), Some(right)) = (row_value_width(lhs), row_value_width(rhs)) {
+                if left != right {
+                    crate::bail_parse_error!("row value misused");
                 }
             }
-            Expr::Between {
-                lhs, start, end, ..
-            } => {
-                if let (Some(left), Some(start), Some(end)) = (
-                    row_value_width(lhs),
-                    row_value_width(start),
-                    row_value_width(end),
-                ) {
-                    if left != start || left != end {
-                        crate::bail_parse_error!("row value misused");
-                    }
-                }
-            }
-            Expr::InList { lhs, rhs, .. } => {
-                let Some(left) = row_value_width(lhs) else {
-                    return Ok(WalkControl::Continue);
-                };
-                for element in rhs.iter() {
-                    let Some(width) = row_value_width(element) else {
-                        continue;
-                    };
-                    if width == left {
-                        continue;
-                    }
-                    if left == 1 {
-                        crate::bail_parse_error!("row value misused");
-                    }
-                    crate::bail_parse_error!(
-                        "IN(...) element has {width} term{} - expected {left}",
-                        if width == 1 { "" } else { "s" }
-                    );
-                }
-            }
-            _ => {}
         }
-        Ok(WalkControl::Continue)
-    })?;
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            if let (Some(left), Some(start), Some(end)) = (
+                row_value_width(lhs),
+                row_value_width(start),
+                row_value_width(end),
+            ) {
+                if left != start || left != end {
+                    crate::bail_parse_error!("row value misused");
+                }
+            }
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            let Some(left) = row_value_width(lhs) else {
+                return Ok(());
+            };
+            for element in rhs.iter() {
+                let Some(width) = row_value_width(element) else {
+                    continue;
+                };
+                if width == left {
+                    continue;
+                }
+                if left == 1 {
+                    crate::bail_parse_error!("row value misused");
+                }
+                crate::bail_parse_error!(
+                    "IN(...) element has {width} term{} - expected {left}",
+                    if width == 1 { "" } else { "s" }
+                );
+            }
+        }
+        _ => {}
+    }
     Ok(())
 }
 

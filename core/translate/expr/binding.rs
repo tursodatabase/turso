@@ -132,7 +132,7 @@ pub fn bind_and_rewrite_expr<'a>(
         resolver,
         binding_behavior,
     )?;
-    apply_static_rewrites(top_level_expr, BINDING_REWRITES, Some(resolver))
+    apply_binding_rewrites(top_level_expr, resolver)
 }
 
 /// [bind_and_rewrite_expr] for an expression whose collating sequence is
@@ -156,7 +156,19 @@ pub fn bind_and_rewrite_sort_key<'a>(
         binding_behavior,
     )?;
     reject_unknown_collation(top_level_expr, resolver)?;
-    apply_static_rewrites(top_level_expr, BINDING_REWRITES, Some(resolver))
+    apply_binding_rewrites(top_level_expr, resolver)
+}
+
+/// Applies the [BINDING_REWRITES] to a bound expression. An expression with
+/// a subquery still to plan waits for the subquery planner: [check_bound_expr]
+/// stopped at that subquery, so an operand past it is not checked yet, and
+/// the planner folds the expression once it is (see
+/// subquery::get_subquery_parser).
+pub(crate) fn apply_binding_rewrites(expr: &mut ast::Expr, resolver: &Resolver<'_>) -> Result<()> {
+    if expr_contains_unplanned_subquery(expr) {
+        return Ok(());
+    }
+    apply_static_rewrites(expr, BINDING_REWRITES, Some(resolver))
 }
 
 /// [bind_and_rewrite_expr] without the [BINDING_REWRITES]. A HAVING clause
@@ -657,7 +669,67 @@ pub fn bind_expr<'a>(
             Ok(WalkControl::Continue)
         },
     )?;
-    check_custom_types(top_level_expr, referenced_tables.as_deref(), resolver)
+    check_bound_expr(top_level_expr, referenced_tables.as_deref(), resolver)
+}
+
+/// Checks what SQLite's name resolver checks once the names of an expression
+/// are bound (sqlite3ResolveExprNames), so a fold that runs later can drop an
+/// operand without losing its errors: `SELECT 1 OR nosuchfunc(1)` and
+/// `WHERE 0 AND (1, 2) = (1, 2, 3)` fail here, and the operand never runs.
+/// Every function name must resolve and a likelihood() argument must be
+/// valid, compared row values must have the same width, and a custom type
+/// must take the operators used on it. (A collation name is looked up when
+/// a comparison is compiled, not here: see [AndOrConstantOperand].)
+///
+/// A subquery is bound when the subquery planner plans it, later than this,
+/// and SQLite reports the errors inside it before those after it in the
+/// expression. So this walk stops at the first subquery still to plan, and
+/// the subquery planner checks the whole expression again once its
+/// subqueries are planned (see subquery::plan_subqueries_with_outer_query_access).
+pub(crate) fn check_bound_expr(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+    resolver: &Resolver<'_>,
+) -> Result<()> {
+    check_bound_expr_up_to_a_subquery(expr, resolver)?;
+    check_custom_types(expr, tables, resolver)
+}
+
+fn check_bound_expr_up_to_a_subquery(expr: &ast::Expr, resolver: &Resolver<'_>) -> Result<()> {
+    let mut reached_a_subquery = false;
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        if reached_a_subquery {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            Expr::Subquery(_) | Expr::Exists(_) => {
+                reached_a_subquery = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            // SQLite resolves the left side of IN before the subquery.
+            Expr::InSelect { lhs, .. } => {
+                check_bound_expr_up_to_a_subquery(lhs, resolver)?;
+                reached_a_subquery = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            Expr::FunctionCall { name, args, .. } => {
+                match resolver.resolve_function(name.as_str(), args.len())? {
+                    None => crate::bail_parse_error!("no such function: {}", name.as_str()),
+                    Some(Func::Scalar(ScalarFunc::Likelihood)) => check_likelihood_arguments(args)?,
+                    Some(_) => {}
+                }
+            }
+            Expr::FunctionCallStar { name, .. } => {
+                if resolver.resolve_function(name.as_str(), 0)?.is_none() {
+                    crate::bail_parse_error!("no such function: {}", name.as_str());
+                }
+            }
+            _ => {}
+        }
+        reject_row_value_misuse_at(e)?;
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
 }
 
 /// Fails when `expr` uses an operator that no function of its operands' types
