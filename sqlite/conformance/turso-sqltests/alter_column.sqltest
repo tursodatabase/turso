@@ -974,10 +974,9 @@ expect {
     ok
 }
 
-# ALTER COLUMN replaces the whole column definition. A PRIMARY KEY or UNIQUE written in
-# the old column would disappear from the stored CREATE TABLE while its automatic index
-# stays, so the statement is rejected. An INTEGER PRIMARY KEY has no automatic index and
-# can be changed (see autoinc-alter-column-clears-sequence-row).
+# ALTER COLUMN replaces the whole column definition, and the new definition cannot have
+# a PRIMARY KEY or UNIQUE. So a PRIMARY KEY or UNIQUE written in the old column would be
+# lost, and the statement is rejected.
 test fail-alter-column-removes-column-primary-key {
     CREATE TABLE t (a text primary key, b text);
     ALTER TABLE t ALTER COLUMN a TO integer;
@@ -1047,25 +1046,32 @@ expect {
     ok
 }
 
-# An INTEGER PRIMARY KEY is the rowid and is stored as NULL in the record, so the rows
-# are rewritten when the column becomes an ordinary column, even if its type is unchanged.
-@cross-check-integrity
-@skip-if mvcc "rebuilding affected indexes is not supported in MVCC mode"
-test alter-column-removes-integer-primary-key-and-keeps-values {
+# An INTEGER PRIMARY KEY is a PRIMARY KEY written in the column too, even though it has
+# no automatic index.
+test fail-alter-column-removes-integer-primary-key {
     CREATE TABLE t (a INTEGER PRIMARY KEY, b);
-    CREATE INDEX i ON t (a);
-    INSERT INTO t VALUES (5, 1);
     ALTER TABLE t ALTER COLUMN a TO a2 INTEGER;
-    INSERT INTO t (b) VALUES (2);
-    SELECT rowid, a2, b FROM t ORDER BY rowid;
-    SELECT rowid FROM t WHERE a2 = 5;
-    PRAGMA integrity_check;
 }
-expect {
-    5|5|1
-    6||2
-    5
-    ok
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test fail-alter-column-changes-type-of-integer-primary-key {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, c text) STRICT;
+    INSERT INTO t VALUES (1, 'a');
+    ALTER TABLE t ALTER COLUMN id TO k text;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
+}
+
+test fail-alter-column-removes-integer-primary-key-autoincrement {
+    CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b);
+    INSERT INTO t (b) VALUES ('x');
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT;
+}
+expect error {
+    PRIMARY KEY constraint cannot be altered
 }
 
 # With a table-level PRIMARY KEY, an INTEGER column stays the rowid while its type stays INTEGER.
@@ -1124,10 +1130,11 @@ expect error {
     PRIMARY KEY constraint cannot be altered
 }
 
-# NOT NULL and CHECK of the new definition see the rowid value of a column that stops being the rowid.
+# NOT NULL and CHECK of the new definition see the rowid value of a rowid alias column,
+# which is stored as NULL in the record.
 @cross-check-integrity
-test alter-column-checks-not-null-of-former-integer-primary-key {
-    CREATE TABLE t (a INTEGER PRIMARY KEY, b);
+test alter-column-checks-not-null-of-integer-primary-key {
+    CREATE TABLE t (a INTEGER, b, PRIMARY KEY (a));
     INSERT INTO t VALUES (5, 1);
     ALTER TABLE t ALTER COLUMN a TO a2 INTEGER NOT NULL CHECK (a2 > 0);
     SELECT rowid, a2, b FROM t;
@@ -1138,8 +1145,8 @@ expect {
     ok
 }
 
-test fail-alter-column-checks-check-of-former-integer-primary-key {
-    CREATE TABLE t (a INTEGER PRIMARY KEY, b);
+test fail-alter-column-checks-check-of-integer-primary-key {
+    CREATE TABLE t (a INTEGER, b, PRIMARY KEY (a));
     INSERT INTO t VALUES (5, 1);
     ALTER TABLE t ALTER COLUMN a TO a2 INTEGER CHECK (a2 < 0);
 }

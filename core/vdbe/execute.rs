@@ -18251,13 +18251,6 @@ pub fn op_alter_column(
             panic!("only btree tables can be altered");
         };
         let btree = Arc::make_mut(btree_arc);
-        let clears_autoincrement_sequence = !*rename
-            && btree.has_autoincrement
-            && btree
-                .columns()
-                .get(*column_index)
-                .is_some_and(|column| column.is_rowid_alias())
-            && !new_column.is_rowid_alias();
 
         // Rename the key column before columns_mut(), whose drop rebuilds the
         // WITHOUT ROWID key order from primary_key_columns by name.
@@ -18351,9 +18344,6 @@ pub fn op_alter_column(
         if !*rename {
             // recompute alias from `new_column`
             btree.columns_mut()[*column_index].set_rowid_alias(new_column.is_rowid_alias());
-            if clears_autoincrement_sequence {
-                btree.has_autoincrement = false;
-            }
 
             btree
                 .check_constraints

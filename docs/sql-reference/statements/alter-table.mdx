@@ -1,6 +1,6 @@
 ---
 title: ALTER TABLE
-description: Modify the structure of an existing table by renaming, adding, or dropping columns
+description: Modify the structure of an existing table by renaming, adding, dropping, or altering columns
 sidebarTitle: ALTER TABLE
 ---
 
@@ -15,11 +15,12 @@ ALTER TABLE [schema-name.]table-name RENAME TO new-table-name;
 ALTER TABLE [schema-name.]table-name RENAME COLUMN old-column-name TO new-column-name;
 ALTER TABLE [schema-name.]table-name ADD COLUMN column-def;
 ALTER TABLE [schema-name.]table-name DROP COLUMN column-name;
+ALTER TABLE [schema-name.]table-name ALTER COLUMN column-name TO column-def;
 ```
 
 ## Description
 
-`ALTER TABLE` modifies the structure of an existing table without requiring you to recreate the table and copy its data. Turso supports four forms of ALTER TABLE: renaming the table, renaming a column, adding a new column, and dropping an existing column.
+`ALTER TABLE` modifies the structure of an existing table without requiring you to recreate the table and copy its data. Turso supports five forms of ALTER TABLE: renaming the table, renaming a column, adding a new column, dropping an existing column, and replacing a column's definition. `ALTER COLUMN` is a Turso extension that SQLite does not have.
 
 ### Parameters
 
@@ -234,6 +235,36 @@ PRAGMA table_info(example);
 -- 0   | id     | INTEGER | 0       | NULL       | 1
 -- 1   | name   | TEXT    | 1       | NULL       | 0
 -- 2   | active | INTEGER | 0       | 1          | 0
+```
+
+## ALTER COLUMN
+
+Replace the definition of an existing column: its name, type and constraints.
+
+```sql
+ALTER TABLE table-name ALTER COLUMN column-name TO column-def;
+```
+
+The new definition replaces the old one completely. A `NOT NULL`, `DEFAULT`, `CHECK`, `COLLATE` or `REFERENCES` that the column should keep must be written again in the new definition. Existing rows are converted to the new type and checked against the new `NOT NULL` and `CHECK` constraints.
+
+### Restrictions
+
+The new definition cannot have a `PRIMARY KEY` or `UNIQUE` constraint. For the same reason, a column whose own definition has a `PRIMARY KEY` or `UNIQUE` constraint cannot be altered, because the constraint would be lost. This includes an `INTEGER PRIMARY KEY` column:
+
+```sql
+CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT);
+ALTER TABLE t ALTER COLUMN id TO k TEXT;
+-- Parse error: PRIMARY KEY constraint cannot be altered
+```
+
+Use `RENAME COLUMN` to rename such a column. A `PRIMARY KEY` or `UNIQUE` constraint written after the columns, such as `PRIMARY KEY (a)`, is kept, but a column in a table-level `PRIMARY KEY` cannot change between `INTEGER` and another type.
+
+### Example
+
+```sql
+CREATE TABLE orders (id INTEGER PRIMARY KEY, total TEXT NOT NULL);
+
+ALTER TABLE orders ALTER COLUMN total TO amount REAL NOT NULL CHECK (amount >= 0);
 ```
 
 ## Examples
