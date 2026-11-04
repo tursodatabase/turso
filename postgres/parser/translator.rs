@@ -6,7 +6,7 @@
 use crate::sqlstate::{
     SQLSTATE_FEATURE_NOT_SUPPORTED, SQLSTATE_INVALID_COLUMN_REFERENCE,
     SQLSTATE_INVALID_ESCAPE_SEQUENCE, SQLSTATE_INVALID_SCHEMA_DEFINITION,
-    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER,
+    SQLSTATE_INVALID_SCHEMA_NAME, SQLSTATE_INVALID_USE_OF_ESCAPE_CHARACTER, SQLSTATE_SYNTAX_ERROR,
     SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_TABLE,
 };
 use crate::ParseError;
@@ -1665,6 +1665,8 @@ impl PostgreSQLTranslator {
     ) -> Result<(Vec<Vec<Box<ast::Expr>>>, Vec<bool>), ParseError> {
         use pg_query::protobuf::node::Node;
 
+        reject_values_lists_of_different_lengths(values_lists)?;
+
         // First pass: compute the default mask across ALL rows.
         // A column is "all defaults" only if every row has DEFAULT for that position.
         let mut default_mask: Vec<bool> = Vec::new();
@@ -1860,6 +1862,7 @@ impl PostgreSQLTranslator {
 
         // VALUES clause: standalone VALUES (1,'a'), (2,'b') ...
         if !select.values_lists.is_empty() && select.target_list.is_empty() {
+            reject_values_lists_of_different_lengths(&select.values_lists)?;
             let mut rows = Vec::new();
             for row_node in &select.values_lists {
                 let Some(pg_query::protobuf::node::Node::List(list)) = &row_node.node else {
@@ -5122,6 +5125,27 @@ impl PostgreSQLTranslator {
             constraints,
         })
     }
+}
+
+fn reject_values_lists_of_different_lengths(
+    values_lists: &[pg_query::protobuf::Node],
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::node::Node;
+
+    let mut lengths = values_lists.iter().map(|row| match &row.node {
+        Some(Node::List(list)) => list.items.len(),
+        _ => 0,
+    });
+    let Some(first) = lengths.next() else {
+        return Ok(());
+    };
+    if lengths.all(|len| len == first) {
+        return Ok(());
+    }
+    Err(ParseError::Sqlstate {
+        sqlstate: SQLSTATE_SYNTAX_ERROR,
+        message: "VALUES lists must all be the same length".to_string(),
+    })
 }
 
 #[allow(clippy::vec_box)]
