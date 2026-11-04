@@ -4,7 +4,8 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
-use turso_core::{ConnectOpts, Database, PlatformIO, SqliteDialect};
+use turso_core::{ConnectOpts, Database, PlatformIO};
+use turso_sqlite::SqliteDialect;
 
 // Title: JSONB Function Benchmarking
 

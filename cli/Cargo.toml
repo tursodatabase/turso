@@ -18,6 +18,7 @@ name = "tursodb"
 path = "main.rs"
 
 [dependencies]
+turso_sqlite = { workspace = true }
 anyhow.workspace = true
 cfg-if = { workspace = true }
 clap = { workspace = true, features = ["derive"] }

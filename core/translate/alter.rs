@@ -27,8 +27,8 @@ use crate::{
         collate::key_collation,
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{
-            emit_stored_column, translate_expr_no_constant_opt, walk_expr, walk_expr_mut,
-            NoConstantOptReason, WalkControl,
+            emit_stored_column, expr_type::column_type, translate_expr_no_constant_opt, walk_expr,
+            walk_expr_mut, NoConstantOptReason, WalkControl,
         },
         index::{check_index_expression_has_comparison, expression_type_ordering},
         plan::{
@@ -1224,7 +1224,8 @@ pub fn translate_alter_table(
             }
             if btree.is_strict {
                 column.resolve_custom_type(resolver.schema());
-                key_collation(column.text_collation(), column.type_ordering())?;
+                let ty = column_type(&column, true, resolver.schema());
+                key_collation(column.text_collation(), &ty, resolver.schema())?;
             }
 
             // If a column has no explicit DEFAULT but its custom type defines
@@ -1926,7 +1927,8 @@ pub fn translate_alter_table(
                 }
                 table.resolve_custom_types(resolver.schema());
                 let column = &table.columns()[column_index];
-                key_collation(column.text_collation(), column.type_ordering())?;
+                let ty = column_type(column, table.is_strict, resolver.schema());
+                key_collation(column.text_collation(), &ty, resolver.schema())?;
                 table.prepare_generated_columns()?;
                 let column_names: Vec<&str> = table
                     .columns()
@@ -2029,7 +2031,6 @@ pub fn translate_alter_table(
                             }
                         }
                         Err(LimboError::ParseError(message)) => {
-                            let message = message.strip_prefix("Parse error: ").unwrap_or(&message);
                             let error =
                                 if let Some(column) = message.strip_prefix("no such column: ") {
                                     format!(

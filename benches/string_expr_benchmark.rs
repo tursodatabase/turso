@@ -5,9 +5,8 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use std::sync::Arc;
 use std::time::Duration;
-use turso_core::{
-    ConnectOpts, Connection, Database, MemoryIO, SqliteDialect, Statement, StepResult,
-};
+use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Statement, StepResult};
+use turso_sqlite::SqliteDialect;
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]

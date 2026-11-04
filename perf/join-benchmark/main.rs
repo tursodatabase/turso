@@ -8,9 +8,8 @@ use std::{
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde_json::{json, Value as JsonValue};
-use turso_core::{
-    ConnectOpts, Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, StepResult, Value,
-};
+use turso_core::{ConnectOpts, Database, OpenFlags, OpenOptions, PlatformIO, StepResult, Value};
+use turso_sqlite::SqliteDialect;
 
 #[derive(Parser)]
 #[command(name = "turso-join-benchmark")]

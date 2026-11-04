@@ -2838,7 +2838,7 @@ impl Program {
                 // its own rows, so roll back the whole transaction while
                 // returning the real preparation error to the caller.
                 let rollback_error =
-                    LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
+                    LimboError::Raise(ResolveType::Rollback, prepare_error.clone());
                 if let Err(abort_err) = self.abort(pager, Some(&rollback_error), state, true) {
                     tracing::error!(
                         "Abort also failed after FAIL index-method preparation: \
@@ -4520,7 +4520,7 @@ mod tests {
         for trace in [false, true] {
             let io = Arc::new(crate::MemoryIO::new());
             let db =
-                crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+                crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.set_vdbe_trace(trace);
             let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();

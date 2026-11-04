@@ -1282,7 +1282,8 @@ fn test_parameters_count_includes_parameters_without_bytecode(tmp_db: TempDataba
 fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
     use crate::queued_io::QueuedIo;
     use std::sync::Arc;
-    use turso_core::{Database, DatabaseOpts, SqliteDialect};
+    use turso_core::{Database, DatabaseOpts};
+    use turso_sqlite::SqliteDialect;
 
     const ROWS: i64 = 4;
     // ~100KB of TEXT per row spans dozens of overflow pages, so reading one
@@ -1373,7 +1374,8 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
 fn test_columns_before_overflow_value_do_not_read_overflow_pages() -> anyhow::Result<()> {
     use crate::queued_io::{QueuedIo, QueuedIoOpKind};
     use std::sync::Arc;
-    use turso_core::{Database, DatabaseOpts, SqliteDialect};
+    use turso_core::{Database, DatabaseOpts};
+    use turso_sqlite::SqliteDialect;
 
     const ROWS: i64 = 8;
     // A 100KB value fills about 25 overflow pages of 4096 bytes.

@@ -956,7 +956,7 @@ fn quote_ident(name: &str) -> String {
 mod tests {
     use std::sync::Arc;
     use turso_core::ConnectOpts;
-    use turso_core::SqliteDialect;
+    use turso_sqlite::SqliteDialect;
 
     use tempfile::NamedTempFile;
 
@@ -4163,7 +4163,7 @@ mod tests {
         };
         assert!(
             message.contains(
-                "failed to execute DDL `ALTER TABLE core ADD COLUMN note TEXT`: Parse error: no such table: core"
+                "failed to execute DDL `ALTER TABLE core ADD COLUMN note TEXT`: no such table: core"
             ),
             "{message}"
         );

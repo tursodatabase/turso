@@ -68,7 +68,11 @@ fn expression_type(ty: &ExprType, schema: &Schema) -> Option<ColumnTypeInfo> {
                 kind,
             });
         }
-        ExprType::Null | ExprType::Unknown | ExprType::Array { .. } => return None,
+        ExprType::Null
+        | ExprType::Unknown
+        | ExprType::NotKnownYet
+        | ExprType::RowValue
+        | ExprType::Array { .. } => return None,
     };
     Some(ColumnTypeInfo {
         declared_name,

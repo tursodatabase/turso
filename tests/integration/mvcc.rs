@@ -7,8 +7,9 @@ use std::sync::Arc;
 use turso_core::{
     mvcc::persistent_storage::logical_log::LogTxFrameInfo, Clock, Completion, ConnectOpts,
     Database, DatabaseOpts, EncryptionKey, EncryptionOpts, File, MonotonicInstant, OpenFlags,
-    OpenOptions, SqliteDialect, StepResult, WallClockInstant, IO,
+    OpenOptions, StepResult, WallClockInstant, IO,
 };
+use turso_sqlite::SqliteDialect;
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
 /// This is needed because ATTACH requires the attached DB's journal mode

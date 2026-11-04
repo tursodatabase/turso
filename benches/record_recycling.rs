@@ -8,9 +8,8 @@
 use divan::{black_box, AllocProfiler, Bencher};
 use mimalloc::MiMalloc;
 use std::sync::Arc;
-use turso_core::{
-    ConnectOpts, Connection, Database, MemoryIO, SqliteDialect, Statement, StepResult, Value,
-};
+use turso_core::{ConnectOpts, Connection, Database, MemoryIO, Statement, StepResult, Value};
+use turso_sqlite::SqliteDialect;
 
 #[global_allocator]
 static ALLOC: AllocProfiler<MiMalloc> = AllocProfiler::new(MiMalloc);

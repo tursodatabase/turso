@@ -57,7 +57,9 @@ the focused SQL regression.
 ```
 limbo/
 ├── core/           # Database engine (translate/, storage/, vdbe/, io/, mvcc/)
+├── benches/        # Engine benchmarks (criterion, divan)
 ├── sqlite/
+│   ├── frontend/   # SQLite dialect (turso_sqlite crate)
 │   └── parser/     # SQL parser (lexer, AST, grammar)
 ├── cli/            # tursodb CLI (REPL, MCP server, sync server)
 ├── bindings/       # Python, JS, Java, .NET, Go, Rust

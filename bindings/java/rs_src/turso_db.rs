@@ -5,8 +5,8 @@ use jni::objects::{JByteArray, JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use std::sync::Arc;
-use turso_core::SqliteDialect;
 use turso_core::{ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags};
+use turso_sqlite::SqliteDialect;
 
 struct TursoDB {
     db: Arc<Database>,
