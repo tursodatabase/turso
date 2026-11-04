@@ -1092,6 +1092,7 @@ mod tests {
         "SELECT c FROM t UNION ALL SELECT d FROM t",
         "SELECT * FROM (SELECT c FROM t UNION ALL SELECT d FROM t)",
         "INSERT INTO t(c, d) SELECT c, d FROM t UNION ALL SELECT d, c FROM t",
+        "SELECT c, 2 FROM t UNION ALL SELECT d, 1 FROM t ORDER BY 2",
         "UPDATE t SET c = d",
         "DELETE FROM t WHERE c IS NULL RETURNING c",
     ];

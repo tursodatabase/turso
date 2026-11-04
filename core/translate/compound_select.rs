@@ -138,7 +138,7 @@ pub fn emit_program_for_compound_select(
 
     let real_query_destination = right_most.query_destination.clone();
     let num_result_cols = right_most.result_columns.len();
-    let collations = compound_collations(left, right_most, has_order_by, resolver)?;
+    let collations = compound_collations(left, right_most, order_by.as_deref(), resolver)?;
 
     // When ORDER BY is present, redirect compound output to a collection index,
     // then sort and emit to the real destination afterwards.
@@ -817,27 +817,33 @@ fn create_collection_index(
 /// compound, including those of nested arms, uses it, as SQLite's
 /// multiSelectCollSeq does.
 ///
-/// UNION ALL without ORDER BY keeps every row and compares none, so its columns
-/// need no collation. That keeps it working for types whose values can't be
-/// compared.
+/// UNION ALL keeps every row, so it compares only the ORDER BY columns. The other
+/// columns get BINARY, which only decides the unspecified order of rows with
+/// equal ORDER BY keys. That keeps UNION ALL working for types whose values
+/// can't be compared.
 fn compound_collations(
     left: &[(SelectPlan, CompoundOperator)],
     right_most: &SelectPlan,
-    has_order_by: bool,
+    order_by: Option<&[CompoundOrderByKey]>,
     resolver: &Resolver,
 ) -> crate::Result<Vec<CollationSeq>> {
-    let compares_rows =
-        has_order_by || left.iter().any(|(_, op)| *op != CompoundOperator::UnionAll);
-    if !compares_rows {
-        return Ok(vec![CollationSeq::BINARY; right_most.result_columns.len()]);
-    }
+    let only_union_all = left.iter().all(|(_, op)| *op == CompoundOperator::UnionAll);
+    let is_compared = |column: usize| {
+        !only_union_all || order_by.is_some_and(|keys| keys.iter().any(|(key, ..)| *key == column))
+    };
     let arms: Vec<&SelectPlan> = left
         .iter()
         .map(|(select, _)| select)
         .chain([right_most])
         .collect();
     (0..right_most.result_columns.len())
-        .map(|column| compound_column_collation(&arms, column, resolver))
+        .map(|column| {
+            if is_compared(column) {
+                compound_column_collation(&arms, column, resolver)
+            } else {
+                Ok(CollationSeq::BINARY)
+            }
+        })
         .collect()
 }
 
