@@ -1,8 +1,8 @@
 use crate::alloc::TursoSliceExt;
 use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
 use crate::namespace::NamespaceRef;
-use crate::schema::RangeOffsets;
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
+use crate::schema::{RangeOffsets, TypeDef};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::CollationSeq;
@@ -988,7 +988,7 @@ fn emit_frame_offset(
             let context = ExprContext::new(Some(&plan.table_references), resolver);
             check_range_offset_type(order_expr, expr, &context.type_env())?
         }
-        _ => true,
+        turso_parser::ast::FrameMode::Rows | turso_parser::ast::FrameMode::Groups => true,
     };
     emit_window_check_offset(program, reg, integer_only, pos);
     Ok(())
@@ -2707,61 +2707,112 @@ fn emit_window_range_test(
 fn check_range_offset_type(order_expr: &Expr, offset: &Expr, env: &TypeEnv) -> Result<bool> {
     let schema = env.schema();
     let order_type = without_domain(type_of(order_expr, env), schema);
-    // The offsets the column takes. None for values that sort with SQLite's
-    // comparison.
-    let column = match &order_type {
-        ExprType::Custom { .. } | ExprType::Array { .. } => Some(range_offset_kind(&order_type)),
-        _ => None,
-    };
-    if column == Some(RangeOffsets::None) {
-        crate::bail_parse_error!(
-            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {order_type}"
-        );
-    }
     let offset_type = without_domain(type_of(offset, env), schema);
-    let offset_kind = range_offset_kind(&offset_type);
-    match column {
-        // A NULL offset fails when the statement runs, as any other NULL
-        // offset. numeric's `+` and `-` read a string or parameter exactly,
-        // and fail on one that isn't a number.
-        _ if matches!(
-            offset_type,
-            ExprType::Null | ExprType::Untyped | ExprType::Builtin(BuiltinType::Any)
-        ) => {}
-        Some(offsets) if !offsets.takes(offset_kind) => crate::bail_parse_error!(
-            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
-             {order_type} and offset type {offset_type}; cast the offset to integer"
+    let column = range_column(&order_type);
+    match (column, range_offset(&offset_type)) {
+        (RangeColumn::Custom(RangeOffsets::None), _) => crate::bail_parse_error!(
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {order_type}"
         ),
-        None if matches!(
-            offset_type,
-            ExprType::Custom { .. } | ExprType::Array { .. }
-        ) && offset_kind != RangeOffsets::Integer =>
-        {
+        (
+            RangeColumn::Sqlite,
+            RangeOffset::ReadWhenRun
+            | RangeOffset::Plain(RangeOffsets::None | RangeOffsets::Integer | RangeOffsets::Numeric)
+            | RangeOffset::Custom(RangeOffsets::Integer),
+        ) => {}
+        (RangeColumn::Sqlite, RangeOffset::Custom(RangeOffsets::None | RangeOffsets::Numeric)) => {
             crate::bail_parse_error!(
                 "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type \
                  {offset_type} over a value without a custom type; cast the offset to \
                  integer or real"
             )
         }
-        _ => {}
+        (
+            RangeColumn::Custom(RangeOffsets::Integer | RangeOffsets::Numeric),
+            RangeOffset::ReadWhenRun,
+        ) => {}
+        (
+            RangeColumn::Custom(offsets @ (RangeOffsets::Integer | RangeOffsets::Numeric)),
+            RangeOffset::Plain(kind) | RangeOffset::Custom(kind),
+        ) => {
+            if !offsets.takes(kind) {
+                crate::bail_parse_error!(
+                    "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
+                     {order_type} and offset type {offset_type}; cast the offset to integer"
+                );
+            }
+        }
     }
-    Ok(column == Some(RangeOffsets::Integer))
+    Ok(column == RangeColumn::Custom(RangeOffsets::Integer))
 }
 
-/// What kind of number a value of type `ty` is in a RANGE frame, as an
-/// ORDER BY value or an offset. `ty` is not a domain. An integer written in
-/// the statement is an integer and a decimal such as 1.5 is a numeric, as in
-/// PostgreSQL. A custom type is the kind it declares. A real takes no part in
-/// PostgreSQL's custom-type frames, and an array is not a number.
-fn range_offset_kind(ty: &ExprType) -> RangeOffsets {
+/// How a RANGE frame checks its offsets, given its ORDER BY value's type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeColumn {
+    /// The value sorts with SQLite's comparison, so the frame takes any number,
+    /// checked when the statement runs, as in SQLite.
+    Sqlite,
+    /// A custom type or an array, which takes the offsets of this kind.
+    Custom(RangeOffsets),
+}
+
+/// `ty` is not a domain.
+fn range_column(ty: &ExprType) -> RangeColumn {
     match ty {
-        ExprType::Builtin(BuiltinType::Integer) => RangeOffsets::Integer,
-        ExprType::Builtin(BuiltinType::Decimal) => RangeOffsets::Numeric,
-        ExprType::Custom { type_def, .. } => type_def
-            .range_offsets
-            .expect("a type that is not a domain declares its RANGE offsets"),
-        _ => RangeOffsets::None,
+        ExprType::Custom { type_def, .. } => RangeColumn::Custom(declared_range_offsets(type_def)),
+        ExprType::Array { .. } => RangeColumn::Custom(RangeOffsets::None),
+        ExprType::Builtin(
+            BuiltinType::Integer
+            | BuiltinType::Real
+            | BuiltinType::Decimal
+            | BuiltinType::Numeric
+            | BuiltinType::Text
+            | BuiltinType::Blob
+            | BuiltinType::Any,
+        )
+        | ExprType::Untyped
+        | ExprType::Null
+        | ExprType::Unknown => RangeColumn::Sqlite,
     }
+}
+
+/// A RANGE offset's type, as the frame check sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeOffset {
+    /// NULL, a string or a parameter. Over a custom type its value is read as
+    /// that type when the statement runs, as PostgreSQL does, and a NULL
+    /// fails there as any other NULL offset.
+    ReadWhenRun,
+    /// A value of a SQLite type, which is this kind of number.
+    Plain(RangeOffsets),
+    /// A custom type or an array, which is this kind of number.
+    Custom(RangeOffsets),
+}
+
+/// `ty` is not a domain. An integer written in the statement is an integer
+/// and a decimal such as 1.5 is a numeric, as in PostgreSQL. A real is
+/// inexact, and SQLite's `CAST(x AS numeric)` may give one. A value whose type
+/// is only known when the statement runs, such as a subquery's, is refused
+/// over a custom type, since it may not be a number.
+fn range_offset(ty: &ExprType) -> RangeOffset {
+    match ty {
+        ExprType::Null | ExprType::Untyped | ExprType::Builtin(BuiltinType::Any) => {
+            RangeOffset::ReadWhenRun
+        }
+        ExprType::Builtin(BuiltinType::Integer) => RangeOffset::Plain(RangeOffsets::Integer),
+        ExprType::Builtin(BuiltinType::Decimal) => RangeOffset::Plain(RangeOffsets::Numeric),
+        ExprType::Builtin(
+            BuiltinType::Real | BuiltinType::Numeric | BuiltinType::Text | BuiltinType::Blob,
+        )
+        | ExprType::Unknown => RangeOffset::Plain(RangeOffsets::None),
+        ExprType::Custom { type_def, .. } => RangeOffset::Custom(declared_range_offsets(type_def)),
+        ExprType::Array { .. } => RangeOffset::Custom(RangeOffsets::None),
+    }
+}
+
+fn declared_range_offsets(type_def: &TypeDef) -> RangeOffsets {
+    type_def
+        .range_offsets
+        .expect("a type that is not a domain declares its RANGE offsets")
 }
 
 /// The `N` of the frame's `N PRECEDING` or `N FOLLOWING` bound.

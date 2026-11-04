@@ -1032,6 +1032,8 @@ mod tests {
         struct Kind {
             ty: &'static str,
             strict: bool,
+            /// The window's ORDER BY value, written over the column `c`.
+            order: &'static str,
             /// Three distinct values, inserted for kinds that take offsets.
             values: [&'static str; 3],
             offsets: Offsets,
@@ -1039,8 +1041,17 @@ mod tests {
         let kind = |ty, values, offsets| Kind {
             ty,
             strict: true,
+            order: "c",
             values,
             offsets,
+        };
+        // An ORDER BY value that isn't a column, over an integer column.
+        let sqlite_order = |order| Kind {
+            ty: "integer",
+            strict: true,
+            order,
+            values: ["1", "2", "4"],
+            offsets: Offsets::Sqlite,
         };
         let takes_kind = |name, number| Offsets::Takes { name, number };
         let none = |name| takes_kind(name, Number::None);
@@ -1050,13 +1061,23 @@ mod tests {
             kind("real", ["1.0", "2.5", "4.0"], Offsets::Sqlite),
             kind("text", ["'a'", "'b'", "'c'"], Offsets::Sqlite),
             kind("any", ["1", "'x'", "4"], Offsets::Sqlite),
+            kind("blob", ["x'01'", "x'02'", "x'04'"], Offsets::Sqlite),
             kind("pos", ["1", "2", "4"], Offsets::Sqlite),
             Kind {
                 ty: "date",
                 strict: false,
+                order: "c",
                 values: ["1", "2", "4"],
                 offsets: Offsets::Sqlite,
             },
+            // SQLite's CAST to numeric, a decimal, a string, NULL, and a CAST
+            // without a type name, whose type is only known when the
+            // statement runs.
+            sqlite_order("CAST(c AS numeric)"),
+            sqlite_order("0.5"),
+            sqlite_order("'a'"),
+            sqlite_order("NULL"),
+            sqlite_order("CAST(c AS)"),
             kind(
                 "smallint",
                 ["1", "2", "4"],
@@ -1111,6 +1132,18 @@ mod tests {
             /// when the statement runs.
             Null,
         }
+        /// What a window over a kind with an offset does.
+        enum Expected {
+            /// Fails when prepared, with this error.
+            Refused(String),
+            /// Anything but a refusal, as SQLite's rules decide.
+            SqliteRules,
+            /// Fails when the statement runs, with this error.
+            FailsWhenRun(&'static str),
+            /// Counts the same rows as a subquery that applies the offset with
+            /// `+` and `-`.
+            SameAsSubquery,
+        }
         let known = |name, number| OffsetType::Known {
             name,
             custom: false,
@@ -1129,6 +1162,15 @@ mod tests {
             ("1.5", known("numeric", Number::Numeric), None),
             ("CAST(1.5 AS REAL)", known("real", Number::None), None),
             ("x'01'", known("blob", Number::None), None),
+            ("CAST(1 AS TEXT)", known("text", Number::None), None),
+            // A CAST without a type name, whose type is only known when the
+            // statement runs.
+            ("CAST(1 AS)", known("value", Number::None), None),
+            (
+                "CAST('{1}' AS integer[])",
+                custom("integer[]", Number::None),
+                None,
+            ),
             ("CAST(1 AS numeric)", known("numeric", Number::None), None),
             ("'1'", OffsetType::ColumnType { integer: true }, None),
             ("'1.5'", OffsetType::ColumnType { integer: false }, None),
@@ -1239,89 +1281,132 @@ mod tests {
                 for (frame, asc_rows, desc_rows) in frames {
                     for (order, rows) in [("ASC", asc_rows), ("DESC", desc_rows)] {
                         let window = format!(
-                            "SELECT count(*) OVER (ORDER BY c {order} RANGE BETWEEN {frame}) \
-                             FROM {table} t ORDER BY id"
+                            "SELECT count(*) OVER (ORDER BY {} {order} RANGE BETWEEN {frame}) \
+                             FROM {table} t ORDER BY id",
+                            kind.order
                         )
                         .replace("{k}", offset);
                         let context =
                             format!("type {} (strict={}): {window}", kind.ty, kind.strict);
-                        let result = counts(&conn, &window, param);
-                        let refused = |refusal: String| {
-                            let error = match conn.prepare(&window) {
-                                Ok(_) => panic!("{context}: expected an error"),
-                                Err(error) => error.to_string(),
-                            };
-                            assert!(error.contains(&refusal), "{context}: {error}");
-                        };
-                        match &kind.offsets {
-                            // An offset of a custom type other than smallint and
-                            // bigint is refused: adding it gives a value of that
-                            // type, which doesn't compare with SQLite's numbers.
-                            // Others keep SQLite's rules.
-                            Offsets::Sqlite => match offset_type {
+                        let expected = match (&kind.offsets, offset_type) {
+                            // Over a SQLite value, an offset of a custom type
+                            // other than smallint and bigint is refused: adding
+                            // it gives a value of that type, which doesn't
+                            // compare with SQLite's numbers.
+                            (
+                                Offsets::Sqlite,
                                 OffsetType::Known {
                                     name,
                                     custom: true,
-                                    number,
-                                } if *number != Number::Integer => {
-                                    refused(format!(
-                                        "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type {name} over a value without a custom type"
-                                    ))
+                                    number: Number::None | Number::Numeric,
+                                },
+                            ) => Expected::Refused(format!(
+                                "RANGE with offset PRECEDING/FOLLOWING is not supported for offset type {name} over a value without a custom type"
+                            )),
+                            (
+                                Offsets::Sqlite,
+                                OffsetType::Known {
+                                    custom: true,
+                                    number: Number::Integer,
+                                    ..
                                 }
-                                _ => {
-                                    if let Err(error) = result {
-                                        assert!(
-                                            !error.to_string().contains("is not supported for"),
-                                            "{context}: {error}"
-                                        );
-                                    }
+                                | OffsetType::Known {
+                                    custom: false,
+                                    number: Number::None | Number::Integer | Number::Numeric,
+                                    ..
                                 }
-                            },
-                            Offsets::Takes {
-                                name,
-                                number: Number::None,
-                            } => {
-                                refused(format!(
-                                    "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name}"
-                                ))
-                            }
-                            Offsets::Takes { name, number } => match offset_type {
+                                | OffsetType::ColumnType { .. }
+                                | OffsetType::Null,
+                            ) => Expected::SqliteRules,
+                            (
+                                Offsets::Takes {
+                                    name,
+                                    number: Number::None,
+                                },
+                                _,
+                            ) => Expected::Refused(format!(
+                                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name}"
+                            )),
+                            (
+                                Offsets::Takes {
+                                    name,
+                                    number: number @ (Number::Integer | Number::Numeric),
+                                },
                                 OffsetType::Known {
                                     name: offset_type,
                                     number: offset_number,
                                     ..
-                                } if !takes(*number, *offset_number) => refused(format!(
-                                    "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name} and offset type {offset_type}"
-                                )),
-                                OffsetType::Null => {
-                                    let error = result.expect_err(&context).to_string();
+                                },
+                            ) => {
+                                if takes(*number, *offset_number) {
+                                    Expected::SameAsSubquery
+                                } else {
+                                    Expected::Refused(format!(
+                                        "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name} and offset type {offset_type}"
+                                    ))
+                                }
+                            }
+                            (
+                                Offsets::Takes {
+                                    number: Number::Integer | Number::Numeric,
+                                    ..
+                                },
+                                OffsetType::Null,
+                            ) => Expected::FailsWhenRun("offset must be a non-negative"),
+                            (
+                                Offsets::Takes {
+                                    number: Number::Integer,
+                                    ..
+                                },
+                                OffsetType::ColumnType { integer: false },
+                            ) => Expected::FailsWhenRun("offset must be a non-negative integer"),
+                            (
+                                Offsets::Takes {
+                                    number: Number::Numeric,
+                                    ..
+                                },
+                                OffsetType::ColumnType { integer: false },
+                            )
+                            | (
+                                Offsets::Takes {
+                                    number: Number::Integer | Number::Numeric,
+                                    ..
+                                },
+                                OffsetType::ColumnType { integer: true },
+                            ) => Expected::SameAsSubquery,
+                        };
+                        let result = counts(&conn, &window, param);
+                        match expected {
+                            Expected::Refused(refusal) => {
+                                let error = match conn.prepare(&window) {
+                                    Ok(_) => panic!("{context}: expected an error"),
+                                    Err(error) => error.to_string(),
+                                };
+                                assert!(error.contains(&refusal), "{context}: {error}");
+                            }
+                            Expected::SqliteRules => {
+                                if let Err(error) = result {
                                     assert!(
-                                        error.contains("offset must be a non-negative"),
+                                        !error.to_string().contains("is not supported for"),
                                         "{context}: {error}"
                                     );
                                 }
-                                OffsetType::ColumnType { integer: false }
-                                    if *number != Number::Numeric =>
-                                {
-                                    let error = result.expect_err(&context).to_string();
-                                    assert!(
-                                        error.contains("offset must be a non-negative integer"),
-                                        "{context}: {error}"
-                                    );
-                                }
-                                _ => {
-                                    let expected_sql = format!(
-                                        "SELECT (SELECT count(*) FROM {table} u WHERE {rows}) \
-                                         FROM {table} t ORDER BY id"
-                                    )
-                                    .replace("{k}", offset);
-                                    let expected = counts(&conn, &expected_sql, param)
-                                        .unwrap_or_else(|e| panic!("{expected_sql}: {e}"));
-                                    let actual =
-                                        result.unwrap_or_else(|e| panic!("{context}: {e}"));
-                                    assert_eq!(actual, expected, "{context}");
-                                }
-                            },
+                            }
+                            Expected::FailsWhenRun(message) => {
+                                let error = result.expect_err(&context).to_string();
+                                assert!(error.contains(message), "{context}: {error}");
+                            }
+                            Expected::SameAsSubquery => {
+                                let expected_sql = format!(
+                                    "SELECT (SELECT count(*) FROM {table} u WHERE {rows}) \
+                                     FROM {table} t ORDER BY id"
+                                )
+                                .replace("{k}", offset);
+                                let expected = counts(&conn, &expected_sql, param)
+                                    .unwrap_or_else(|e| panic!("{expected_sql}: {e}"));
+                                let actual = result.unwrap_or_else(|e| panic!("{context}: {e}"));
+                                assert_eq!(actual, expected, "{context}");
+                            }
                         }
                     }
                 }
