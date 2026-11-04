@@ -118,7 +118,7 @@ expect error {
 }
 
 # UNION ALL keeps every row without comparing them, so it works. With ORDER BY
-# it compares.
+# it compares only the ORDER BY columns.
 @requires strict "uses STRICT tables"
 test no-comparison-json-union-all-keeps-rows {
     CREATE TABLE t(j json) STRICT;
@@ -137,6 +137,17 @@ test no-comparison-json-union-all-order-by {
 }
 expect error {
     values of type json cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-json-union-all-order-by-other-column {
+    CREATE TABLE t(j json) STRICT;
+    INSERT INTO t VALUES ('{"a":1}');
+    SELECT j, 2 FROM t UNION ALL SELECT j, 1 FROM t ORDER BY 2;
+}
+expect {
+    {"a":1}|1
+    {"a":1}|2
 }
 
 @requires strict "uses STRICT tables"

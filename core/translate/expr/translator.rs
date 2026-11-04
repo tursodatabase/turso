@@ -276,7 +276,7 @@ fn copy_cached_expr_reg(
     });
     // Hash join payloads store raw encoded values; apply DECODE for custom
     // type columns so the result set contains human-readable text.
-    if needs_decode {
+    if needs_decode && program.flags.decodes_custom_type_columns() {
         if let ast::Expr::Column {
             table: table_ref_id,
             column,
@@ -2685,14 +2685,17 @@ fn translate_column_expr(
                     maybe_apply_affinity(column.ty(), target_register, program);
                 }
 
-                emit_user_facing_column_value(
-                    program,
-                    target_register,
-                    target_register,
-                    column,
-                    table.is_strict(),
-                    resolver,
-                )?;
+                // Decode custom type columns, except in statements that read stored values
+                if program.flags.decodes_custom_type_columns() {
+                    emit_user_facing_column_value(
+                        program,
+                        target_register,
+                        target_register,
+                        column,
+                        table.is_strict(),
+                        resolver,
+                    )?;
+                }
             }
             Ok(target_register)
         }

@@ -516,9 +516,9 @@ struct UpdateColumnCtx<'a> {
     cdc_updates_register: Option<usize>,
     layout: &'a ColumnLayout,
     affected_columns: &'a ColumnMask,
-    /// The SET columns. Until ENCODE runs, their registers hold the user's
-    /// values and the other columns hold stored values.
-    updated_columns: &'a ColumnMask,
+    /// The columns whose registers hold the user's values until ENCODE runs;
+    /// the other columns hold stored values.
+    user_value_columns: &'a ColumnMask,
 }
 
 impl UpdateColumnCtx<'_> {
@@ -876,7 +876,9 @@ fn emit_update_column_values<'a>(
                                 column_ctx.start,
                                 column_ctx.rowid_reg,
                                 column_ctx.layout.clone(),
-                                DmlRowForm::StoredExceptUpdated(column_ctx.updated_columns.clone()),
+                                DmlRowForm::StoredExceptUpdated(
+                                    column_ctx.user_value_columns.clone(),
+                                ),
                             ),
                             table: column_ctx.target_table.table.require_btree()?,
                         }),
@@ -1242,6 +1244,13 @@ fn emit_update_insns<'a>(
         .iter()
         .map(|set_clause| set_clause.column_index)
         .try_collect()?;
+    // The SET values hold the user's values and get ENCODEd, unless the
+    // statement writes stored values, as an ON UPDATE CASCADE action does.
+    let user_value_columns = if program.flags.writes_stored_values() {
+        ColumnMask::default()
+    } else {
+        updated_column_indices.clone()
+    };
     let updated_column_names: Vec<_> = set_clauses
         .iter()
         .flat_map(|set_clause| set_clause.column_names.iter().cloned())
@@ -1363,7 +1372,7 @@ fn emit_update_insns<'a>(
         cdc_updates_register,
         layout: &layout,
         affected_columns: &affected_columns,
-        updated_columns: &updated_column_indices,
+        user_value_columns: &user_value_columns,
     };
     let skip_set_clauses = false;
 
@@ -1481,7 +1490,7 @@ fn emit_update_insns<'a>(
                         &btree_table,
                         start,
                         &layout,
-                        &updated_column_indices,
+                        &user_value_columns,
                         &t_ctx.resolver,
                     )?;
                 }
@@ -1498,7 +1507,7 @@ fn emit_update_insns<'a>(
                         start,
                         new_rowid_reg,
                         layout.clone(),
-                        DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+                        DmlRowForm::StoredExceptUpdated(user_value_columns.clone()),
                     );
                     compute_virtual_columns(
                         program,
@@ -1522,7 +1531,7 @@ fn emit_update_insns<'a>(
                     program,
                     &btree_table,
                     Some(new_registers),
-                    DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+                    DmlRowForm::StoredExceptUpdated(user_value_columns.clone()),
                     Some(old_registers.clone()),
                     or_conflict,
                 );
@@ -1666,7 +1675,7 @@ fn emit_update_insns<'a>(
                 btree,
                 start,
                 &layout,
-                &updated_column_indices,
+                &user_value_columns,
                 &t_ctx.resolver,
             )?;
         }
@@ -1721,7 +1730,7 @@ fn emit_update_insns<'a>(
                 start,
                 effective_rowid_reg,
                 layout.clone(),
-                DmlRowForm::StoredExceptUpdated(updated_column_indices.clone()),
+                DmlRowForm::StoredExceptUpdated(user_value_columns.clone()),
             );
             compute_virtual_columns(
                 program,
@@ -1846,7 +1855,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 btree_table.columns(),
                 start,
-                Some(&updated_column_indices),
+                Some(&user_value_columns),
                 table_name,
                 &layout,
             )?;
