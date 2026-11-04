@@ -125,7 +125,7 @@ The built-in `numeric` type uses both clauses: `ENCODE numeric_encode(value)` tu
 
 ### Sorting and comparing
 
-Comparison operators, ORDER BY, GROUP BY, DISTINCT, window `PARTITION BY` and `ORDER BY`, MIN and MAX use the value DECODE returns. Indexes sort a custom type by its stored value, using SQLite's comparison for the base type. The two orders agree only when ENCODE keeps the order of its input, so a type with a DECODE must declare `OPERATOR '<'` to say that it does. Without it, ORDER BY and CREATE INDEX on a column of the type fail with `type does not declare OPERATOR '<'`. ORDER BY sorts by the value even when ENCODE does not keep the order:
+Comparison operators, ORDER BY, GROUP BY, DISTINCT, window `PARTITION BY` and `ORDER BY`, MIN and MAX use the value DECODE returns. Indexes sort a custom type by its stored value, using SQLite's comparison for the base type. The two orders agree only when ENCODE keeps the order of its input. ORDER BY and CREATE INDEX on a column of a type with a DECODE still require the type to declare `OPERATOR '<'`, and fail with `type does not declare OPERATOR '<'` without it. ORDER BY sorts by the value either way, even when ENCODE does not keep the order:
 
 ```sql
 CREATE TYPE reversed_text BASE text
