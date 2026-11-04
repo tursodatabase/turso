@@ -131,15 +131,21 @@ pub fn emit_stored_column(
     resolver: &Resolver,
 ) -> Result<()> {
     let table = program.btree_table_from_cursor(cursor_id).map(Arc::clone);
-    let encoded_default = table.as_ref().and_then(|table| {
-        let column = &table.columns()[column_index];
-        let default_expr = column.default.as_ref()?;
-        resolver
-            .schema()
-            .resolve_type(&column.ty_str, table.is_strict)
-            .ok()??;
-        Some((table, column, default_expr))
-    });
+    let encoded_default = match table.as_ref() {
+        Some(table) => {
+            let column = &table.columns()[column_index];
+            let custom_type = resolver
+                .schema()
+                .resolve_type(&column.ty_str, table.is_strict)?;
+            match (column.default.as_ref(), custom_type) {
+                (Some(default_expr), Some(_)) => Some((table, column, default_expr)),
+                // A plain column's default is stored as written; without a
+                // DEFAULT, a row written before ADD COLUMN reads NULL.
+                (Some(_), None) | (None, _) => None,
+            }
+        }
+        None => None,
+    };
     let Some((table, column, default_expr)) = encoded_default else {
         program.emit_column_or_rowid(cursor_id, column_index, target_register);
         return Ok(());

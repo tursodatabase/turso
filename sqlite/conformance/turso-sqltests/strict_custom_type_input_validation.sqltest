@@ -369,6 +369,44 @@ expect error {
     type outer_t takes values of type inner_t, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type
 }
 
+test add-virtual-column-refuses-rows-its-custom-type-refuses {
+    CREATE TYPE iv BASE integer ENCODE value DECODE value;
+    CREATE TABLE t(a TEXT) STRICT;
+    INSERT INTO t VALUES ('abc');
+    ALTER TABLE t ADD COLUMN b iv AS (a) VIRTUAL;
+}
+expect error {
+    cannot store TEXT value as type iv
+}
+
+test add-virtual-column-of-a-custom-type-converts-existing-rows {
+    CREATE TYPE iv BASE integer ENCODE value DECODE value;
+    CREATE TABLE t(a TEXT) STRICT;
+    INSERT INTO t VALUES ('7');
+    ALTER TABLE t ADD COLUMN b iv AS (a) VIRTUAL;
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    7|integer
+}
+
+# A key that doesn't convert to the BASE is compared as it is, as for a
+# STRICT INTEGER column: integers sort before text.
+test index-and-scan-agree-on-a-key-that-does-not-convert {
+    CREATE TYPE iv BASE integer ENCODE value DECODE value OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c iv) STRICT;
+    INSERT INTO t VALUES (1, 5), (2, 10);
+    CREATE INDEX i ON t(c);
+    SELECT 'eq', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c = 'abc'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c = 'abc');
+    SELECT 'lt', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c < 'abc'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c < 'abc');
+    SELECT 'gt', (SELECT group_concat(id) FROM t INDEXED BY i WHERE c > 'abc'), (SELECT group_concat(id) FROM t NOT INDEXED WHERE c > 'abc');
+}
+expect {
+    eq||
+    lt|1,2|1,2
+    gt||
+}
+
 test cast-refuses-a-value-type-that-was-dropped {
     CREATE TYPE inner_t(value text) BASE text;
     CREATE TYPE outer_t(value inner_t) BASE text;

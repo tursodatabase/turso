@@ -241,7 +241,8 @@ pub(crate) fn emit_custom_type_encode_columns(
         if type_name.is_empty() {
             continue;
         }
-        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) else {
+        // A plain type has no ENCODE; TypeCheck checks its values.
+        let Some(resolved) = resolver.schema().resolve_type_unchecked(type_name)? else {
             continue;
         };
 

@@ -607,19 +607,20 @@ fn emit_column_constraints_validation(
         check_constraints.extend(domain_checks);
     }
 
-    let strict_virtual_type = if table.is_strict && column.is_virtual_generated() {
-        match StrictType::named(&column.ty_str) {
-            Some(StrictType::Stores(value_type)) => Some(value_type),
-            Some(StrictType::Any) => None,
-            // A custom type's ENCODE converts and checks the value when
-            // compute_virtual_columns computes it below.
-            None if resolver.with_schema(database_id, |schema| {
-                schema.get_type_def(&column.ty_str, true).is_some()
-            }) =>
-            {
-                None
+    let virtual_column_check = if table.is_strict && column.is_virtual_generated() {
+        let custom_type = resolver.with_schema(database_id, |schema| {
+            schema.resolve_type(&column.ty_str, true)
+        })?;
+        match (
+            column.is_array() || custom_type.is_some(),
+            StrictType::named(&column.ty_str),
+        ) {
+            (true, _) => Some(VirtualColumnCheck::Store),
+            (false, Some(StrictType::Stores(value_type))) => {
+                Some(VirtualColumnCheck::Kind(value_type))
             }
-            None => {
+            (false, Some(StrictType::Any)) => None,
+            (false, None) => {
                 return Err(LimboError::InternalError(format!(
                     "STRICT table {} gets a column of type {}, which is not INTEGER, REAL, TEXT, BLOB, ANY or a custom type",
                     table.name, column.ty_str
@@ -630,7 +631,7 @@ fn emit_column_constraints_validation(
         None
     };
 
-    if !has_notnull && check_constraints.is_empty() && strict_virtual_type.is_none() {
+    if !has_notnull && check_constraints.is_empty() && virtual_column_check.is_none() {
         return Ok(());
     }
 
@@ -700,21 +701,43 @@ fn emit_column_constraints_validation(
     )?;
     let result_reg = dml_ctx.to_column_reg(new_column_idx);
 
-    if let Some(value_type) = strict_virtual_type {
-        let type_passed = program.allocate_label();
-        program.emit_insn(Insn::IsType {
-            reg: result_reg,
-            target_pc: type_passed,
-            value_type,
-        });
-        program.emit_insn(Insn::Halt {
-            constraint_info: None,
-            err_code: 1,
-            description: "type mismatch on DEFAULT".to_string(),
-            on_error: None,
-            description_reg: None,
-        });
-        program.preassign_label_to_next_insn(type_passed);
+    match virtual_column_check {
+        Some(VirtualColumnCheck::Kind(value_type)) => {
+            let type_passed = program.allocate_label();
+            program.emit_insn(Insn::IsType {
+                reg: result_reg,
+                target_pc: type_passed,
+                value_type,
+            });
+            program.emit_insn(Insn::Halt {
+                constraint_info: None,
+                err_code: 1,
+                description: "type mismatch on DEFAULT".to_string(),
+                on_error: None,
+                description_reg: None,
+            });
+            program.preassign_label_to_next_insn(type_passed);
+        }
+        Some(VirtualColumnCheck::Store) => {
+            // Store a copy, so the CHECK constraints below see the computed
+            // value as reads of the column do.
+            let store_reg = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg: result_reg,
+                dst_reg: store_reg,
+                extra_amount: 0,
+            });
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                resolver,
+                std::slice::from_ref(column),
+                store_reg,
+                None,
+                &table.name,
+                &ColumnLayout::Identity { column_count: 1 },
+            )?;
+        }
+        None => {}
     }
 
     if !check_constraints.is_empty() {
@@ -784,6 +807,15 @@ fn emit_column_constraints_validation(
 
     program.preassign_label_to_next_insn(skip_label);
     Ok(())
+}
+
+/// How ADD COLUMN checks a new virtual column of a STRICT table against the
+/// rows already in the table.
+enum VirtualColumnCheck {
+    /// The value must have this kind, as in a STRICT column of a plain type.
+    Kind(crate::types::ValueType),
+    /// The value must store as the column's custom or array type does.
+    Store,
 }
 
 pub fn translate_alter_table(

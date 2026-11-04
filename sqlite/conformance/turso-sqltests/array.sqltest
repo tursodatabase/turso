@@ -1935,6 +1935,25 @@ expect error {
     unknown datatype for array elements: "FLOAT"
 }
 
+test array-add-virtual-column-checks-existing-elements {
+    CREATE TABLE t(a INTEGER[]) STRICT;
+    INSERT INTO t VALUES ('{1}');
+    ALTER TABLE t ADD COLUMN v INTEGER[] AS (a) VIRTUAL;
+    SELECT v FROM t;
+}
+expect {
+    {1}
+}
+
+test array-add-virtual-column-refuses-elements-of-another-type {
+    CREATE TABLE t(a TEXT[]) STRICT;
+    INSERT INTO t VALUES ('{x}');
+    ALTER TABLE t ADD COLUMN v INTEGER[] AS (a) VIRTUAL;
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
 test array-cast-refuses-unknown-element-type {
     SELECT CAST('{1}' AS nosuchtype[]);
 }
