@@ -916,6 +916,7 @@ fn derive_ctas_schema(
         &[],
         QueryDestination::ResultRows,
         connection,
+        true,
     )?;
 
     // For compound selects, use the leftmost select's columns for naming (matching SQLite).

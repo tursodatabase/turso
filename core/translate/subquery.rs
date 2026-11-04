@@ -861,6 +861,7 @@ fn get_subquery_parser<'a>(
                     &outer_query_refs,
                     QueryDestination::ExistsSubqueryResult { result_reg },
                     connection,
+                    false,
                 )?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
@@ -953,6 +954,7 @@ fn get_subquery_parser<'a>(
                     &outer_query_refs,
                     QueryDestination::Unset,
                     connection,
+                    false,
                 )?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
@@ -1100,6 +1102,7 @@ fn get_subquery_parser<'a>(
                     &outer_query_refs,
                     QueryDestination::Unset,
                     connection,
+                    true,
                 )?;
                 let mut plan = plan;
                 let correlated = plan_has_outer_scope_dependency(&plan);
@@ -1272,6 +1275,7 @@ fn resolve_names_in_dropped_operand(
             &outer_query_refs,
             QueryDestination::ExistsSubqueryResult { result_reg },
             connection,
+            false,
         )?;
     }
     Ok(())
