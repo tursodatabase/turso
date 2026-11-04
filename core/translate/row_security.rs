@@ -212,7 +212,7 @@ pub fn reject_change_of_policy_column(
 /// policies with OR and those of the restrictive policies with AND, as
 /// PostgreSQL does: a row must pass at least one permissive policy and every
 /// restrictive one. Without a permissive policy no row passes. For the right
-/// side of an outer join the filter is part of the join condition, so the
+/// side of a LEFT JOIN the filter is part of the join condition, so the
 /// hidden rows produce NULLs like rows that do not exist. The filters go before the query's own
 /// conditions, so no expression of the query sees a hidden row. The tables
 /// are recorded so the optimizer does not choose access methods that
@@ -232,16 +232,7 @@ pub fn add_select_row_security_filters(
         if !row_security_applies(&btree.declared_name, table.namespace, resolver)? {
             continue;
         }
-        if table_references
-            .joined_tables()
-            .iter()
-            .any(|table| table.join_info.as_ref().is_some_and(|j| j.is_full_outer()))
-        {
-            bail_parse_error!(
-                "FULL JOIN with table \"{}\" that has row-level security is not supported",
-                btree.declared_name
-            );
-        }
+        reject_joins_that_keep_right_rows(table_references, &btree.declared_name)?;
         let role = resolver
             .row_security_role
             .as_deref()
@@ -294,6 +285,32 @@ pub fn add_select_row_security_filters(
         table_references.mark_column_used(internal_id, column);
     }
     where_clause.splice(0..0, filters);
+    Ok(())
+}
+
+/// A FULL or RIGHT JOIN emits unmatched rows of its right side after the
+/// join loop, without the filters of the tables on its left. A filter on
+/// either side would then hide too many rows or too few.
+fn reject_joins_that_keep_right_rows(
+    table_references: &TableReferences,
+    table_name: &str,
+) -> Result<()> {
+    for join_info in table_references
+        .joined_tables()
+        .iter()
+        .filter_map(|table| table.join_info.as_ref())
+    {
+        if join_info.is_full_outer() {
+            bail_parse_error!(
+                "FULL JOIN with table \"{table_name}\" that has row-level security is not supported"
+            );
+        }
+        if join_info.keeps_right_rows() {
+            bail_parse_error!(
+                "RIGHT JOIN with table \"{table_name}\" that has row-level security is not supported"
+            );
+        }
+    }
     Ok(())
 }
 

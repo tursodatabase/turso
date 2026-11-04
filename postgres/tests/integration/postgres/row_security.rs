@@ -74,6 +74,23 @@ fn hidden_rows_are_null_on_right_side_of_left_join() {
 }
 
 #[test]
+fn right_join_with_table_with_row_security_is_rejected() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+    create_docs_with_row_security(&conn);
+
+    conn.execute("SET ROLE alice").unwrap();
+
+    for sql in [
+        "SELECT docs.id FROM ids RIGHT JOIN docs ON docs.id = ids.id",
+        "SELECT ids.id FROM docs RIGHT JOIN ids ON docs.id = ids.id",
+        "SELECT ids.id FROM ids JOIN ids AS other ON true RIGHT JOIN docs ON true",
+    ] {
+        assert_error_contains(&conn, sql, "RIGHT JOIN");
+    }
+}
+
+#[test]
 fn role_cannot_write_to_table_with_row_security() {
     let db = TempDatabase::builder().build();
     let conn = db.connect_postgres();

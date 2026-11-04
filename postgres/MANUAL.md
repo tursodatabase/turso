@@ -32,8 +32,8 @@ Only a superuser can change a table's row-level security.
 Rows are hidden in every query that reads the table, including joins,
 subqueries, CTEs and views. Views are checked as the role running the query,
 not as the view's owner. On the right side of a `LEFT JOIN`, a hidden row
-reads as NULLs like a row that does not exist. `FULL JOIN` with such a table
-is not supported.
+reads as NULLs like a row that does not exist. `RIGHT JOIN` and `FULL JOIN`
+with such a table are not supported.
 
 A role cannot insert, update or delete rows of a table with row-level
 security yet. Renaming such a table is not supported. `DROP TABLE` removes

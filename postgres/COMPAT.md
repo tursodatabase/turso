@@ -423,7 +423,7 @@ Upgrade is not supported.
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
 | ROLES | 🟡 Partial | `CREATE ROLE name` (no options), `SET [LOCAL] ROLE`, `RESET ROLE`, `SHOW role`; roles that are not superusers may read rows but not write them, use sequences, or change the schema, and `GRANT` is ignored; `pg_roles` lists the built-in `postgres` superuser, `pg_database_owner`, and created roles |
-| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY`, and `CREATE/DROP POLICY` with `TO` roles, `AS RESTRICTIVE`, and `USING`/`WITH CHECK` conditions without subqueries other than `(SELECT <expr>)`; roles cannot write to tables with row-level security yet, so `FOR INSERT/UPDATE/DELETE` policies and `WITH CHECK` are kept but have no effect; role membership is not considered; FULL JOIN with such tables is rejected; views are checked as the querying role; `pg_policy` is empty |
+| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY`, and `CREATE/DROP POLICY` with `TO` roles, `AS RESTRICTIVE`, and `USING`/`WITH CHECK` conditions without subqueries other than `(SELECT <expr>)`; roles cannot write to tables with row-level security yet, so `FOR INSERT/UPDATE/DELETE` policies and `WITH CHECK` are kept but have no effect; role membership is not considered; RIGHT JOIN and FULL JOIN with such tables are rejected; views are checked as the querying role; `pg_policy` is empty |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
 | security_barrier option on views | ❌ Not supported | |
