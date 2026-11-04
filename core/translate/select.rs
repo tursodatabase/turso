@@ -12,9 +12,9 @@ use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    apply_static_rewrites, bind_and_rewrite_expr, bind_expr, expr_vector_size,
-    integer_literal_truth_value, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
-    BINDING_REWRITES,
+    apply_static_rewrites, bind_and_rewrite_expr, bind_and_rewrite_sort_key, bind_expr,
+    expr_vector_size, integer_literal_truth_value, walk_expr, walk_expr_mut, BindingBehavior,
+    WalkControl, BINDING_REWRITES,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -56,6 +56,7 @@ pub fn translate_select(
         &[],
         query_destination,
         connection,
+        false,
     )?;
     if program.trigger.is_some() {
         if let Some(virtual_table) = plan_first_virtual_table_name(&plan) {
@@ -167,6 +168,11 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     None
 }
 
+/// `column_collations_looked_up` says that the collation of every result
+/// column is looked up, as SQLite does for a select that becomes a table (a
+/// subquery in FROM, a view, a CTE, CREATE TABLE AS) and for the columns of
+/// an IN subquery. A collation name in the operand that the AND/OR fold
+/// drops is checked then and left alone otherwise.
 pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,
@@ -174,6 +180,7 @@ pub fn prepare_select_plan(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    column_collations_looked_up: bool,
 ) -> Result<Plan> {
     prepare_select_plan_from_arms(
         select.body.select,
@@ -186,6 +193,7 @@ pub fn prepare_select_plan(
         outer_query_refs,
         query_destination,
         connection,
+        column_collations_looked_up,
     )
 }
 
@@ -206,6 +214,7 @@ pub(crate) fn prepare_select_plan_from_arms(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    column_collations_looked_up: bool,
 ) -> Result<Plan> {
     let mut compound_arms = compound_arms.into_iter().peekable();
     if compound_arms.peek().is_none() {
@@ -219,8 +228,18 @@ pub(crate) fn prepare_select_plan_from_arms(
             outer_query_refs,
             query_destination,
             connection,
+            column_collations_looked_up,
+            &[],
         )?)));
     }
+
+    // UNION, INTERSECT and EXCEPT compare the rows of every arm by the
+    // collation of each result column; UNION ALL compares nothing.
+    let compound_arms: Vec<CompoundSelect> = compound_arms.collect();
+    let rows_are_compared = column_collations_looked_up
+        || compound_arms
+            .iter()
+            .any(|arm| arm.operator != ast::CompoundOperator::UnionAll);
 
     // The WITH clause applies to every arm, so each arm needs its own copy
     // while names are resolved.
@@ -234,9 +253,11 @@ pub(crate) fn prepare_select_plan_from_arms(
         outer_query_refs,
         query_destination.clone(),
         connection,
+        rows_are_compared,
+        &order_by,
     )?;
 
-    let mut left = Vec::with_capacity(compound_arms.size_hint().0);
+    let mut left = Vec::with_capacity(compound_arms.len());
     for CompoundSelect {
         select: compound_select,
         operator,
@@ -253,6 +274,8 @@ pub(crate) fn prepare_select_plan_from_arms(
             outer_query_refs,
             query_destination.clone(),
             connection,
+            rows_are_compared,
+            &order_by,
         )?;
     }
 
@@ -298,6 +321,11 @@ pub(crate) fn prepare_select_plan_from_arms(
     })
 }
 
+/// `column_collations_looked_up` says that the collation of every result
+/// column is looked up (see [prepare_select_plan]); an arm of a UNION,
+/// INTERSECT or EXCEPT counts, as DISTINCT does. `compound_sort_keys` is
+/// the ORDER BY of the compound this select is an arm of: a key that names
+/// a result column by number or alias looks that column's collation up.
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 fn prepare_one_select_plan(
@@ -310,6 +338,8 @@ fn prepare_one_select_plan(
     outer_query_refs: &[OuterQueryReference],
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
+    column_collations_looked_up: bool,
+    compound_sort_keys: &[ast::SortedColumn],
 ) -> Result<SelectPlan> {
     match select {
         ast::OneSelect::Select {
@@ -450,7 +480,7 @@ fn prepare_one_select_plan(
                         })
                         .collect();
                     for expr in partition_by.iter_mut() {
-                        bind_and_rewrite_expr(
+                        bind_and_rewrite_sort_key(
                             expr,
                             Some(&mut plan.table_references),
                             None,
@@ -459,7 +489,7 @@ fn prepare_one_select_plan(
                         )?;
                     }
                     for (expr, _, _) in order_by.iter_mut() {
-                        bind_and_rewrite_expr(
+                        bind_and_rewrite_sort_key(
                             expr,
                             Some(&mut plan.table_references),
                             None,
@@ -545,7 +575,29 @@ fn prepare_one_select_plan(
                             )?;
                         }
                         ResultColumn::Expr(mut expr, maybe_alias) => {
-                            bind_and_rewrite_expr(
+                            // DISTINCT, UNION, INTERSECT and EXCEPT compare
+                            // the rows by the collation of each result
+                            // column, and a sort key names it by alias or
+                            // number.
+                            let bind = if plan.distinctness.is_distinct()
+                                || column_collations_looked_up
+                                || result_column_is_a_sort_key(
+                                    plan.result_columns.len(),
+                                    maybe_alias.as_ref(),
+                                    &order_by,
+                                    group_by.as_ref(),
+                                )
+                                || result_column_is_a_sort_key(
+                                    plan.result_columns.len(),
+                                    maybe_alias.as_ref(),
+                                    compound_sort_keys,
+                                    None,
+                                ) {
+                                bind_and_rewrite_sort_key
+                            } else {
+                                bind_and_rewrite_expr
+                            };
+                            bind(
                                 &mut expr,
                                 Some(&mut plan.table_references),
                                 None,
@@ -627,7 +679,7 @@ fn prepare_one_select_plan(
                                 &plan.result_columns,
                                 "GROUP BY",
                             )?;
-                            bind_and_rewrite_expr(
+                            bind_and_rewrite_sort_key(
                                 expr,
                                 Some(&mut plan.table_references),
                                 Some(&plan.result_columns),
@@ -720,7 +772,7 @@ fn prepare_one_select_plan(
                     "ORDER BY",
                 )?;
 
-                bind_and_rewrite_expr(
+                bind_and_rewrite_sort_key(
                     &mut o.expr,
                     Some(&mut plan.table_references),
                     Some(&plan.result_columns),
@@ -909,10 +961,15 @@ fn prepare_one_select_plan(
                 connection,
             )?;
 
+            let bind = if column_collations_looked_up {
+                bind_and_rewrite_sort_key
+            } else {
+                bind_and_rewrite_expr
+            };
             for value_row in values.iter_mut() {
                 for value in value_row.iter_mut() {
                     // Before binding, we check for unquoted literals. Sqlite throws an error in this case
-                    bind_and_rewrite_expr(
+                    bind(
                         value,
                         Some(&mut table_references),
                         None,
@@ -978,6 +1035,29 @@ fn result_columns_contain_aggregate(
         }
     }
     Ok(false)
+}
+
+/// True when ORDER BY or GROUP BY names this result column by its alias or
+/// its number, so the column is a sort key and its collation is looked up.
+fn result_column_is_a_sort_key(
+    output_index: usize,
+    alias: Option<&ast::As>,
+    order_by: &[ast::SortedColumn],
+    group_by: Option<&ast::GroupBy>,
+) -> bool {
+    let names_column = |key: &ast::Expr| match key {
+        ast::Expr::Literal(ast::Literal::Numeric(number)) => {
+            number.parse::<usize>().ok() == Some(output_index + 1)
+        }
+        ast::Expr::Id(name) => matches!(
+            alias,
+            Some(ast::As::As(alias) | ast::As::Elided(alias))
+                if alias.as_str().eq_ignore_ascii_case(name.as_str())
+        ),
+        _ => false,
+    };
+    order_by.iter().any(|key| names_column(&key.expr))
+        || group_by.is_some_and(|group_by| group_by.exprs.iter().any(|key| names_column(key)))
 }
 
 fn first_aggregate_without_over_clause<'a>(

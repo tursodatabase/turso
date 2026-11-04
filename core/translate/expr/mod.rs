@@ -99,7 +99,7 @@ pub(crate) use arrays::{
 };
 pub(crate) use binary::{row_value_component_expr, row_value_len};
 pub(crate) use binding::check_custom_types;
-pub use binding::{bind_and_rewrite_expr, bind_expr, BindingBehavior};
+pub use binding::{bind_and_rewrite_expr, bind_and_rewrite_sort_key, bind_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub(crate) use columns::emit_encoded_default;
 pub use columns::{emit_stored_column, emit_table_column, emit_table_column_for_dml};
@@ -142,6 +142,6 @@ pub use walk::{
     walk_expr, walk_expr_mut, WalkControl,
 };
 pub(crate) use walk::{
-    expression_can_fail_on_input, is_aggregate_or_window_function, reject_unknown_function,
-    walk_function_calls, FunctionCalls,
+    expression_can_fail_on_input, is_aggregate_or_window_function, reject_unknown_collation,
+    reject_unknown_function, walk_function_calls, FunctionCalls,
 };
