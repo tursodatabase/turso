@@ -1063,6 +1063,10 @@ mod tests {
         "ALTER TABLE t ADD COLUMN k{n} {ty} REFERENCES t(id)",
         "SELECT ARRAY[c] FROM t",
         "SELECT array_agg(c) FROM t",
+        "SELECT array_append(NULL, c) FROM t",
+        "SELECT array_prepend(c, NULL) FROM t",
+        "SELECT ARRAY[1] || c FROM t",
+        "SELECT c || ARRAY[1] FROM t",
         "CREATE TABLE u{n}(k {ty}[]) STRICT",
     ];
 

@@ -324,6 +324,27 @@ expect error {
     arrays of type inet are not supported, because values of type inet cannot be compared
 }
 
+# PostgreSQL: true. Comparing the text of '::1' and '0:0:0:0:0:0:0:1' gives false.
+@requires strict "uses STRICT tables"
+test no-comparison-array-append {
+    CREATE TABLE n(a inet, b inet) STRICT;
+    INSERT INTO n VALUES ('::1', '0:0:0:0:0:0:0:1');
+    SELECT array_append(NULL, a) @> array_append(NULL, b) FROM n;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
+@requires strict "uses STRICT tables"
+test no-comparison-array-concat {
+    CREATE TABLE n(a inet, b inet) STRICT;
+    INSERT INTO n VALUES ('::1', '0:0:0:0:0:0:0:1');
+    SELECT array_position(ARRAY[1] || a, b) FROM n;
+}
+expect error {
+    arrays of type inet are not supported, because values of type inet cannot be compared
+}
+
 # ============================================================================
 # What still works
 # ============================================================================

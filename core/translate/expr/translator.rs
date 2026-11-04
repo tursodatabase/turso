@@ -1995,10 +1995,24 @@ fn translate_function_call_expr(
                     target_register,
                     func_ctx,
                 ),
+                ScalarFunc::ArrayAppend | ScalarFunc::ArrayPrepend | ScalarFunc::ArrayCat => {
+                    let context = ExprContext::new(referenced_tables, resolver);
+                    for arg in args {
+                        check_array_element_compares(
+                            &type_of(arg, &context.type_env()),
+                            resolver.schema(),
+                        )?;
+                    }
+                    translate_function(
+                        program,
+                        args,
+                        referenced_tables,
+                        resolver,
+                        target_register,
+                        func_ctx,
+                    )
+                }
                 ScalarFunc::ArrayLength
-                | ScalarFunc::ArrayAppend
-                | ScalarFunc::ArrayPrepend
-                | ScalarFunc::ArrayCat
                 | ScalarFunc::ArrayRemove
                 | ScalarFunc::ArrayContains
                 | ScalarFunc::ArrayPosition

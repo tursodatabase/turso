@@ -174,7 +174,7 @@ Values of `json`, `jsonb`, `inet`, `cidr`, `macaddr` and `macaddr8` are stored a
 - `GROUP BY`, `DISTINCT`, `ORDER BY`, `PARTITION BY`, `min` and `max`
 - joins on these columns, and `UNION`, `INTERSECT` and `EXCEPT`. `UNION ALL` works, since it keeps every row without comparing them; only an `ORDER BY` on one of these columns is refused.
 - `PRIMARY KEY`, `UNIQUE`, `REFERENCES` and indexes on these columns
-- arrays of these types (`json[]`, `ARRAY[inet_column]`, `array_agg(json_column)`), because array functions compare elements
+- arrays of these types (`json[]`, `ARRAY[inet_column]`, `array_agg(json_column)`, `array_append(arr, inet_column)`, `arr || inet_column`), because array functions compare elements
 
 `IS NULL` and `IS NOT NULL` still work. To compare the stored text, cast it:
 
