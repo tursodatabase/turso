@@ -228,25 +228,11 @@ impl StaticRewrite for BetweenToComparisons {
             return Ok(WalkControl::Continue);
         };
         if is_literal_between_bound(start) && is_literal_between_bound(end) {
-            let mut lhs_has_subquery = false;
-            walk_expr(lhs, &mut |expr| {
-                if matches!(
-                    expr,
-                    Expr::Subquery(_)
-                        | Expr::Exists(_)
-                        | Expr::InSelect { .. }
-                        | Expr::SubqueryResult { .. }
-                ) {
-                    lhs_has_subquery = true;
-                    return Ok(WalkControl::SkipChildren);
-                }
-                Ok(WalkControl::Continue)
-            })?;
             let lhs_is_nondeterministic = match resolver {
                 Some(resolver) => expr_contains_nondeterministic_scalar_function(lhs, resolver)?,
                 None => false,
             };
-            if lhs_has_subquery || lhs_is_nondeterministic {
+            if expr_contains_subquery(lhs) || lhs_is_nondeterministic {
                 return Ok(WalkControl::Continue);
             }
         }

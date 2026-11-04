@@ -355,28 +355,28 @@ pub fn expr_contains_aggregate_or_window_function(
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
     let mut found = false;
-    walk_expr(expr, &mut |e| {
-        let func = match e {
-            ast::Expr::FunctionCall { name, args, .. } => {
-                resolver.resolve_function(name.as_str(), args.len())?
+    walk_function_calls(
+        expr,
+        resolver,
+        FunctionCalls::OfThisQuery,
+        &mut |_, func| {
+            if func.is_some_and(is_aggregate_or_window_function) {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
             }
-            ast::Expr::FunctionCallStar { name, .. } => {
-                resolver.resolve_function(name.as_str(), 0)?
-            }
-            _ => None,
-        };
-        let is_aggregate_or_window = match func {
-            Some(Func::Agg(_) | Func::Window(_)) => true,
-            Some(Func::External(external)) => external.func.is_aggregate(),
-            _ => false,
-        };
-        if is_aggregate_or_window {
-            found = true;
-            return Ok(WalkControl::SkipChildren);
-        }
-        Ok(WalkControl::Continue)
-    })?;
+            Ok(WalkControl::Continue)
+        },
+    )?;
     Ok(found)
+}
+
+/// True for an aggregate or window function, built in or from an extension.
+pub(crate) fn is_aggregate_or_window_function(func: &Func) -> bool {
+    match func {
+        Func::Agg(_) | Func::Window(_) => true,
+        Func::External(external) => external.func.is_aggregate(),
+        _ => false,
+    }
 }
 
 fn is_nondeterministic_scalar_like_function(func: &Func) -> bool {
@@ -407,11 +407,41 @@ fn expr_contains_function(
     matches_function: impl Fn(&Func) -> bool,
 ) -> Result<bool> {
     let mut found = false;
-    crate::util::walk_expr_with_subqueries(expr, &mut |e| -> Result<WalkControl> {
-        if found {
-            return Ok(WalkControl::SkipChildren);
-        }
+    walk_function_calls(
+        expr,
+        resolver,
+        FunctionCalls::WithSubqueries,
+        &mut |_, func| {
+            // If the name is unknown here, leave the error to the normal resolver.
+            if func.is_some_and(&matches_function) {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            Ok(WalkControl::Continue)
+        },
+    )?;
+    Ok(found)
+}
 
+/// Which function calls [walk_function_calls] visits.
+#[derive(Clone, Copy)]
+pub(crate) enum FunctionCalls {
+    /// The calls of this query only: a call inside a subquery belongs to
+    /// that subquery.
+    OfThisQuery,
+    /// The calls of this query and of every subquery in it.
+    WithSubqueries,
+}
+
+/// Gives `visit` every function call of this expression together with the
+/// function it names, or None when no function has that name.
+pub(crate) fn walk_function_calls(
+    expr: &ast::Expr,
+    resolver: &Resolver<'_>,
+    calls: FunctionCalls,
+    visit: &mut dyn FnMut(&ast::Expr, Option<&Func>) -> Result<WalkControl>,
+) -> Result<()> {
+    let mut visit_call = |e: &ast::Expr| -> Result<WalkControl> {
         let func = match e {
             ast::Expr::FunctionCall { name, args, .. } => {
                 resolver.resolve_function(name.as_str(), args.len())?
@@ -419,19 +449,19 @@ fn expr_contains_function(
             ast::Expr::FunctionCallStar { name, .. } => {
                 resolver.resolve_function(name.as_str(), 0)?
             }
-            _ => None,
+            _ => return Ok(WalkControl::Continue),
         };
-
-        // If the name is unknown here, leave the error to the normal resolver.
-        if func.as_ref().is_some_and(&matches_function) {
-            found = true;
-            return Ok(WalkControl::SkipChildren);
+        visit(e, func.as_ref())
+    };
+    match calls {
+        FunctionCalls::OfThisQuery => {
+            walk_expr(expr, &mut visit_call)?;
         }
-
-        Ok(WalkControl::Continue)
-    })?;
-
-    Ok(found)
+        FunctionCalls::WithSubqueries => {
+            crate::util::walk_expr_with_subqueries(expr, &mut visit_call)?;
+        }
+    }
+    Ok(())
 }
 
 /// Walks a mutable expression, applying a function to each sub-expression.
