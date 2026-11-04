@@ -8,7 +8,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use super::emitter::gencol::compute_virtual_columns;
 use crate::alloc::TursoIteratorExt;
-use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR};
+use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_ERROR};
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, emit_make_record, UpdateRowSource};
@@ -1279,42 +1279,12 @@ pub fn emit_upsert(
                     flags: CmpInsFlags::default(),
                     collation: CollationSeq::for_internal_values(),
                 });
-                let description = format_unique_violation_desc(table.get_name(), &idx_meta);
+                let bt = table.require_btree()?;
+                let description = format_unique_violation_desc(&bt, &idx_meta);
                 let regs: Vec<usize> = (0..k).map(|i| ins + i).collect();
-                let idx_col_names: Vec<&str> =
-                    idx_meta.columns.iter().map(|c| c.name.as_str()).collect();
-                let (pk_col_names, pk_constraint_name) = table
-                    .btree()
-                    .map(|bt| {
-                        let cols: Vec<String> = bt
-                            .primary_key_columns
-                            .iter()
-                            .map(|(n, _)| n.clone())
-                            .collect();
-                        (cols, bt.primary_key_constraint_name.clone())
-                    })
-                    .unwrap_or_default();
-                let is_pk = !pk_col_names.is_empty()
-                    && idx_col_names == pk_col_names.iter().map(String::as_str).collect::<Vec<_>>();
-                let (mut constraint_info, err_code) = if is_pk {
-                    (
-                        ConstraintInfo::primary_key(
-                            table.get_name(),
-                            pk_constraint_name,
-                            pk_col_names,
-                            regs,
-                        ),
-                        SQLITE_CONSTRAINT_PRIMARYKEY,
-                    )
-                } else {
-                    (
-                        ConstraintInfo::unique_index(table.get_name(), &idx_meta, regs),
-                        SQLITE_CONSTRAINT_UNIQUE,
-                    )
-                };
-                if let Some(bt) = table.btree() {
-                    emit_constraint_values_decode(program, resolver, &bt, &mut constraint_info)?;
-                }
+                let mut constraint_info = ConstraintInfo::unique_index(&bt, &idx_meta, regs);
+                emit_constraint_values_decode(program, resolver, &bt, &mut constraint_info)?;
+                let err_code = constraint_info.kind.sqlite_extended_result_code();
                 program.emit_insn(Insn::Halt {
                     constraint_info: Some(Box::new(constraint_info)),
                     err_code,

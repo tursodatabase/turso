@@ -12,6 +12,21 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+# Turso accepts a FOREIGN KEY that names a column the table does not have
+# (SQLite refuses it), so databases with such tables exist. ALTER TABLE must
+# keep working on them.
+test alter-table-with-foreign-key-on-missing-column {
+    CREATE TABLE p (id INTEGER PRIMARY KEY);
+    CREATE TABLE t (a INTEGER, FOREIGN KEY (zz) REFERENCES p (id));
+    ALTER TABLE t ADD COLUMN b INTEGER;
+    ALTER TABLE t ALTER COLUMN a TO a2 TEXT;
+    INSERT INTO t VALUES ('x', 1);
+    SELECT * FROM t;
+}
+expect {
+    x|1
+}
+
 test fail-alter-column-primary-key {
     CREATE TABLE t (a);
     ALTER TABLE t ALTER COLUMN a TO a PRIMARY KEY;
@@ -346,7 +361,7 @@ test alter-column-only-to-generated-error {
     ALTER TABLE t ALTER COLUMN a TO b AS (123);
 }
 expect error {
-    Parse error: must have at least one non-generated column
+    must have at least one non-generated column
 }
 
 test alter-column-all-to-generated-error {
@@ -355,7 +370,7 @@ test alter-column-all-to-generated-error {
     ALTER TABLE t ALTER COLUMN b TO d AS (123);
 }
 expect error {
-    Parse error: must have at least one non-generated column
+    must have at least one non-generated column
 }
 
 test alter-column-to-generated-with-other-columns {
@@ -753,7 +768,7 @@ test alter-column-rejects-index-rewrite-mvcc {
     ALTER TABLE t ALTER COLUMN x TO y TEXT;
 }
 expect error {
-    Parse error: cannot ALTER COLUMN "x": rebuilding affected indexes is not supported in MVCC mode
+    cannot ALTER COLUMN "x": rebuilding affected indexes is not supported in MVCC mode
 }
 
 test alter-column-rejects-index-only-rewrite-mvcc {
@@ -764,7 +779,7 @@ test alter-column-rejects-index-only-rewrite-mvcc {
     ALTER TABLE t ALTER COLUMN g TO h TEXT GENERATED ALWAYS AS ('new:' || a) VIRTUAL;
 }
 expect error {
-    Parse error: cannot ALTER COLUMN "g": rebuilding affected indexes is not supported in MVCC mode
+    cannot ALTER COLUMN "g": rebuilding affected indexes is not supported in MVCC mode
 }
 
 test alter-column-text-to-integer-coerces-existing-rows {

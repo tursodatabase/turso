@@ -223,10 +223,12 @@ pub fn translate_create_index(
         )
     })?;
 
-    // Block CREATE INDEX on STRUCT/UNION columns and on types that can't be sorted
+    // Block CREATE INDEX on STRUCT/UNION columns, on types that can't be sorted
+    // and on lossy types
     for col in &columns {
-        if col.expr.is_none() {
-            // Simple column reference (not expression index)
+        // A table column, including a virtual generated column. `col.expr` also
+        // holds a virtual generated column's expression, so it cannot tell.
+        if col.expression().is_none() {
             if let Some(column) = tbl.columns().get(col.pos_in_table) {
                 if let Some(type_def) = resolver
                     .schema()
@@ -246,6 +248,9 @@ pub fn translate_create_index(
                         );
                     }
                 }
+                resolver
+                    .schema()
+                    .check_column_can_be_key(column, tbl.is_strict)?;
             }
         }
     }
@@ -450,7 +455,7 @@ pub(crate) fn emit_refill_index(
             }),
             unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
+            identifier: tbl_name,
             has_alias: false,
             internal_id: table_ref,
             join_info: None,
@@ -689,7 +694,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::Halt {
                 constraint_info: None,
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description: format_unique_violation_desc(tbl_name.as_str(), idx),
+                description: format_unique_violation_desc(tbl, idx),
                 on_error: None,
                 description_reg: None,
             });

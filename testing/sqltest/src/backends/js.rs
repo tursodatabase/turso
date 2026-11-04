@@ -267,19 +267,9 @@ impl DatabaseInstance for JsDatabaseInstance {
 }
 
 /// Normalize the JS runner's error output to the message the rust backend
-/// surfaces. The runner prints `Error: <js error>`, and the JS binding wraps
-/// the engine message in an operation context, e.g. `step failed: UNIQUE
-/// constraint failed: u.a`. Strip both layers so one error expectation works
-/// on every backend.
+/// surfaces: the runner prints `Error: <js error message>`.
 fn normalize_js_error(raw: &str) -> String {
-    const BINDING_CONTEXTS: &[&str] = &["step failed: ", "prepare failed: ", "reset failed: "];
-    let message = raw.strip_prefix("Error: ").unwrap_or(raw);
-    for context in BINDING_CONTEXTS {
-        if let Some(message) = message.strip_prefix(context) {
-            return message.to_string();
-        }
-    }
-    message.to_string()
+    raw.strip_prefix("Error: ").unwrap_or(raw).to_string()
 }
 
 #[cfg(test)]
@@ -294,18 +284,10 @@ mod tests {
     }
 
     #[test]
-    fn normalize_js_error_strips_runner_and_binding_wrappers() {
+    fn normalize_js_error_strips_runner_prefix() {
         assert_eq!(
-            normalize_js_error("Error: step failed: CHECK constraint failed: x<5"),
+            normalize_js_error("Error: CHECK constraint failed: x<5"),
             "CHECK constraint failed: x<5"
-        );
-    }
-
-    #[test]
-    fn normalize_js_error_keeps_parse_errors_intact() {
-        assert_eq!(
-            normalize_js_error("Error: prepare failed: Parse error: no such table: t"),
-            "Parse error: no such table: t"
         );
     }
 

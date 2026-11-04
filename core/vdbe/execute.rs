@@ -81,7 +81,7 @@ use crate::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
+        LimboError, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR, SQLITE_FULL,
     },
@@ -194,7 +194,10 @@ use super::{Program, ProgramState, Register};
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
 use crate::vdbe::builder::CursorTypeExt;
-use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+use crate::{
+    bail_constraint_error, must_be_btree_cursor, ConstraintKind, ConstraintViolation, MvStore,
+    Pager, Result,
+};
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
@@ -2590,14 +2593,13 @@ pub fn op_type_check(
             match StrictType::named(&col.ty_str) {
                 Some(StrictType::Stores(expected_type)) => {
                     if let Err(value_type) = convert_to_strict_type(reg, expected_type) {
-                        bail_constraint_error!(
-                            "cannot store {} value in {} column {}.{} ({})",
+                        return Err(datatype_violation(format!(
+                            "cannot store {} value in {} column {}.{}",
                             value_type,
                             col.ty_str,
                             &table_reference.name,
-                            col.name.as_deref().unwrap_or(""),
-                            SQLITE_CONSTRAINT
-                        );
+                            col.name.as_deref().unwrap_or("")
+                        )));
                     }
                 }
                 Some(StrictType::Any) => {}
@@ -2635,11 +2637,8 @@ pub fn op_convert_to_type(
     let reg = &mut state.registers[*reg];
     if !matches!(reg.get_value(), Value::Null) {
         if let Err(actual) = convert_to_strict_type(reg, *value_type) {
-            bail_constraint_error!(
-                "cannot store {} value {} ({})",
-                actual,
-                description,
-                SQLITE_CONSTRAINT
+            return Err(
+                datatype_violation(format!("cannot store {actual} value {description}")).into(),
             );
         }
     }
@@ -2711,13 +2710,10 @@ pub fn op_array_encode(
                     .map(|iter| iter.into_iter().all(|r| r.is_ok()))
                     .unwrap_or(false);
             if !valid {
-                bail_constraint_error!(
-                    "cannot store non-array value in {} column {}.{} ({})",
-                    element_type,
-                    table_name,
-                    col_name,
-                    SQLITE_CONSTRAINT
-                );
+                return Err(datatype_violation(format!(
+                    "cannot store non-array value in {element_type} column {table_name}.{col_name}"
+                ))
+                .into());
             }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -2731,19 +2727,16 @@ pub fn op_array_encode(
         _ => None,
     };
     let Some(raw_elements) = raw_elements else {
-        bail_constraint_error!(
-            "cannot store non-array value in {} column {}.{} ({})",
-            element_type,
-            table_name,
-            col_name,
-            SQLITE_CONSTRAINT
-        );
+        return Err(datatype_violation(format!(
+            "cannot store non-array value in {element_type} column {table_name}.{col_name}"
+        ))
+        .into());
     };
 
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
-            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name}"
         );
     }
 
@@ -2759,12 +2752,10 @@ pub fn op_array_encode(
         match *element_kind {
             StrictType::Stores(expected_type) => {
                 if let Err(value_type) = convert_to_strict_type(&mut reg_tmp, expected_type) {
-                    bail_constraint_error!(
-                        "cannot store {} value in {} ({})",
-                        value_type,
-                        element_type,
-                        SQLITE_CONSTRAINT
-                    );
+                    return Err(datatype_violation(format!(
+                        "cannot store {value_type} value in {element_type}"
+                    ))
+                    .into());
                 }
             }
             StrictType::Any => {}
@@ -2801,6 +2792,14 @@ fn convert_to_strict_type(reg: &mut Register, value_type: ValueType) -> Result<(
     } else {
         Err(actual)
     }
+}
+
+/// A value whose type does not match its column's type.
+fn datatype_violation(message: String) -> LimboError {
+    LimboError::ConstraintViolation(Box::new(ConstraintViolation::new(
+        ConstraintKind::Datatype,
+        message,
+    )))
 }
 
 /// Convert a native record-format array BLOB to PG text representation for display.
@@ -3754,7 +3753,7 @@ pub fn halt(
         // CONFLICT clause, or a trigger step's OR clause) is embedded in the
         // error, so whichever program aborts applies it instead of its own.
         if let Some(resolve_type) = on_error {
-            return Err(LimboError::Raise(resolve_type, error.to_string()).into());
+            return Err(LimboError::Raise(resolve_type, Box::new(error)).into());
         }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
@@ -3956,7 +3955,6 @@ fn build_constraint_violation_error(
     err_code: usize,
     description: &str,
 ) -> LimboError {
-    use crate::{ConstraintKind, ConstraintViolation};
     let (kind, message) = match err_code {
         SQLITE_CONSTRAINT_PRIMARYKEY => (
             ConstraintKind::PrimaryKey,
@@ -3975,6 +3973,7 @@ fn build_constraint_violation_error(
             format!("NOT NULL constraint failed: {description}"),
         ),
         SQLITE_CONSTRAINT_FOREIGNKEY => (ConstraintKind::ForeignKey, description.to_string()),
+        SQLITE_CONSTRAINT_TRIGGER => (ConstraintKind::Trigger, description.to_string()),
         _ => (ConstraintKind::Other, description.to_string()),
     };
     let mut violation = ConstraintViolation::new(kind, message);
@@ -10229,7 +10228,10 @@ pub fn op_function(
             }
             JsonFunc::JsonReplace => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_replace() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_replace() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = json_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10239,7 +10241,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbReplace => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_replace() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_replace() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = jsonb_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10249,7 +10254,10 @@ pub fn op_function(
             }
             JsonFunc::JsonInsert => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_insert() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_insert() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = json_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10259,7 +10267,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbInsert => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_insert() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_insert() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10296,7 +10307,10 @@ pub fn op_function(
             }
             JsonFunc::JsonSet => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_set() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_set() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let reg_values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
@@ -10310,7 +10324,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbSet => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_set() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_set() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let reg_values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
@@ -10454,7 +10471,7 @@ pub fn op_function(
                                 let mut chars = escape_cow.chars();
                                 let c = chars.next();
                                 if c.is_none() || chars.next().is_some() {
-                                    return Err(LimboError::Constraint(
+                                    return Err(LimboError::SqlError(
                                         "ESCAPE expression must be a single character".to_string(),
                                     )
                                     .into());
@@ -18367,14 +18384,8 @@ pub fn op_alter_column(
             }
         }
 
-        // Update unique_sets to reflect the renamed column
-        for unique_set in &mut btree.unique_sets {
-            for unique_column in &mut unique_set.columns {
-                if unique_column.name.eq_ignore_ascii_case(&old_column_name) {
-                    unique_column.name.clone_from(&new_name);
-                }
-            }
-        }
+        // Update the UNIQUE/PRIMARY KEY lists and this table's FOREIGN KEY child columns
+        btree.rename_column_in_keys(&old_column_name, &new_name);
 
         // Update CHECK constraint expressions to reference the new column name
         let old_col_normalized = normalize_ident(&old_column_name);
@@ -18416,23 +18427,18 @@ pub fn op_alter_column(
             }
         }
 
-        // Update this table's OWN foreign keys
+        // Update this table's OWN foreign keys: if self-referencing, rename the
+        // parent column too (child columns were renamed above)
         for fk_arc in &mut btree.foreign_keys {
-            let fk = Arc::make_mut(fk_arc);
-            // child side: rename child column if it matches
-            for cc in &mut fk.child_columns {
-                if cc.eq_ignore_ascii_case(&old_column_name) {
-                    cc.clone_from(&new_name);
-                }
-            }
-            // parent side: if self-referencing, rename parent column too
-            if fk.parent_namespace == *namespace
-                && normalize_ident(&fk.parent_table) == normalized_table_name
+            if fk_arc.parent_namespace != *namespace
+                || normalize_ident(&fk_arc.parent_table) != normalized_table_name
             {
-                for pc in &mut fk.parent_columns {
-                    if pc.eq_ignore_ascii_case(&old_column_name) {
-                        pc.clone_from(&new_name);
-                    }
+                continue;
+            }
+            let fk = Arc::make_mut(fk_arc);
+            for pc in &mut fk.parent_columns {
+                if pc.eq_ignore_ascii_case(&old_column_name) {
+                    pc.clone_from(&new_name);
                 }
             }
         }
