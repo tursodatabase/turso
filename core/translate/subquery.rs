@@ -30,9 +30,10 @@ use crate::{
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
         expr::{
-            check_bound_expr, expr_contains_unplanned_subquery, get_expr_affinity,
-            replace_and_or_with_deciding_operand, unwrap_parens, walk_expr, walk_expr_mut,
-            WalkControl,
+            check_bound_expr, expr_contains_unplanned_subquery,
+            expr_contains_unresolved_column_name, get_expr_affinity,
+            reject_unknown_compared_collation_at, replace_and_or_with_deciding_operand,
+            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
         },
         optimizer::optimize_select_plan,
         plan::{
@@ -695,9 +696,13 @@ fn plan_subqueries_with_outer_query_access<'a>(
     // Binding checked these only up to their first subquery, whose names and
     // types were not known yet (see check_bound_expr). Check them whole now
     // that every subquery is planned, as compiling them would, in case the
-    // planner drops them, as in `WHERE 0 AND (SELECT d) COLLATE nocase`.
+    // planner drops them, as in `WHERE 0 AND (SELECT d) COLLATE nocase`. A
+    // column name still to resolve, as a trigger WHEN clause has, is reported
+    // first when the expression is compiled, so such an expression waits.
     for expr in with_subqueries {
-        check_bound_expr(expr, Some(referenced_tables), resolver)?;
+        if !expr_contains_unresolved_column_name(expr) {
+            check_bound_expr(expr, Some(referenced_tables), resolver)?;
+        }
     }
     Ok(())
 }
@@ -814,6 +819,12 @@ fn get_subquery_parser<'a>(
         };
 
     Box::new(move |expr: &mut ast::Expr| -> Result<WalkControl> {
+        // An expression with a subquery skipped the binding fold, so the
+        // collation lookups that go with it happen here, on each node before
+        // the fold below it drops anything (see reject_unknown_compared_collation_at).
+        if fold_and_or {
+            reject_unknown_compared_collation_at(expr, resolver)?;
+        }
         match expr {
             // SQLite resolves every name before sqlite3ExprSimplifiedAndOr
             // drops an operand, so the operand that goes is checked with its
