@@ -2,6 +2,8 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
+import time
 
 import pytest
 import turso
@@ -9,11 +11,11 @@ import turso
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
 
-def connect(provider, database):
+def connect(provider, database, **kwargs):
     if provider == "turso":
-        return turso.connect(database)
+        return turso.connect(database, **kwargs)
     if provider == "sqlite3":
-        return sqlite3.connect(database)
+        return sqlite3.connect(database, **kwargs)
     raise Exception(f"Provider `{provider}` is not supported")
 
 
@@ -207,6 +209,86 @@ def test_first_rollback(provider, tmp_path):
 
     assert users == []
     conn.close()
+
+
+@pytest.mark.parametrize("timeout_kwargs", [{}, {"timeout": 5.0}])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_writer_waits_for_lock_held_by_another_connection(provider, timeout_kwargs, tmp_path):
+    db_file = str(tmp_path / "busy.db")
+    holder = connect(provider, db_file, isolation_level=None)
+    holder.execute("CREATE TABLE t (x)")
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("INSERT INTO t VALUES (1)")
+
+    errors = []
+
+    def write():
+        writer = connect(provider, db_file, isolation_level=None, **timeout_kwargs)
+        try:
+            writer.execute("INSERT INTO t VALUES (2)")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+        writer.close()
+
+    writer_thread = threading.Thread(target=write)
+    writer_thread.start()
+    time.sleep(0.3)
+    holder.execute("COMMIT")
+    writer_thread.join()
+
+    assert errors == []
+    assert holder.execute("SELECT x FROM t ORDER BY x").fetchall() == [(1,), (2,)]
+    holder.close()
+
+
+@pytest.mark.parametrize(
+    "timeout, busy_timeout",
+    [
+        (10.0, 10000),
+        (0.0015, 1),
+        (-1, 0),
+        (float("nan"), 0),
+        (float("-inf"), 0),
+        (float("inf"), 2147483647),
+        (2e16, 2147483647),
+        (1e30, 2147483647),
+    ],
+)
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_timeout_sets_busy_timeout_in_milliseconds(provider, timeout, busy_timeout):
+    conn = connect(provider, ":memory:", timeout=timeout)
+    assert conn.execute("PRAGMA busy_timeout").fetchall() == [(busy_timeout,)]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_timeout_is_second_positional_parameter(provider):
+    module = turso if provider == "turso" else sqlite3
+    conn = module.connect(":memory:", 10.0)
+    assert conn.execute("PRAGMA busy_timeout").fetchall() == [(10000,)]
+    conn.close()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 0.2])
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_writer_gives_up_after_timeout(provider, timeout, tmp_path):
+    db_file = str(tmp_path / "busy.db")
+    holder = connect(provider, db_file, isolation_level=None)
+    holder.execute("CREATE TABLE t (x)")
+    writer = connect(provider, db_file, isolation_level=None, timeout=timeout)
+
+    module = turso if provider == "turso" else sqlite3
+    holder.execute("BEGIN IMMEDIATE")
+    start = time.monotonic()
+    with pytest.raises(module.OperationalError, match="database is locked"):
+        writer.execute("INSERT INTO t VALUES (1)")
+    elapsed = time.monotonic() - start
+
+    assert elapsed >= timeout
+    assert elapsed < 3
+    holder.execute("ROLLBACK")
+    writer.close()
+    holder.close()
 
 
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
