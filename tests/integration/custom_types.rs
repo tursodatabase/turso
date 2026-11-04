@@ -1199,6 +1199,13 @@ mod tests {
                 custom("value", Number::None),
                 None,
             ),
+            // A CASE that mixes SQLite types has SQLite's type ANY, and here
+            // holds a real.
+            (
+                "CASE WHEN 1 THEN CAST(0.5 AS REAL) ELSE 'a' END",
+                known("any", Number::None),
+                None,
+            ),
             // An offset that is not a constant is NULL, as in SQLite.
             ("(SELECT 1)", OffsetType::Null, None),
             (

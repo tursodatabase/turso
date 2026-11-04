@@ -7,7 +7,9 @@ use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{Resolver, TranslateCtx};
-use crate::translate::expr::expr_type::{type_of, without_domain, BuiltinType, ExprType, TypeEnv};
+use crate::translate::expr::expr_type::{
+    type_of, without_domain, without_wrappers, BuiltinType, ExprType, TypeEnv,
+};
 use crate::translate::expr::{
     custom_operator_call, emit_operator_call_on_registers,
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
@@ -2694,10 +2696,10 @@ fn emit_window_range_test(
 /// over a bigint, but not over a date, a uuid or a type made with CREATE
 /// TYPE. Arrays take none, and neither do values whose type nothing declares,
 /// since they may be custom-type values. Other values sort with SQLite's
-/// comparison, so they take any number, checked when the statement runs, as in SQLite, and smallint and bigint values,
-/// which are plain integers. Other custom types are refused there: `x +
-/// CAST(1 AS numeric(5,2))` is a numeric, which doesn't compare with x's
-/// numbers.
+/// comparison. They take any offset of a SQLite type, checked when the
+/// statement runs as in SQLite, and smallint and bigint offsets, which are
+/// plain integers. Other custom types are refused there: `x + CAST(1 AS
+/// numeric(5,2))` is a numeric, which doesn't compare with x's numbers.
 ///
 /// A domain is checked as the type it is based on, on either side.
 ///
@@ -2715,7 +2717,10 @@ fn check_range_offset_type(
 ) -> Result<bool> {
     let schema = env.schema();
     let order_type = without_domain(type_of(order_expr, env), schema);
-    let offset_type = match offset {
+    let offset_type = match offset.map(without_wrappers) {
+        // A parameter's type comes from where it is used, as a string's does,
+        // though `type_of` gives it SQLite's ANY.
+        Some(Expr::Variable(variable)) if variable.custom_type.is_none() => ExprType::Untyped,
         Some(offset) => without_domain(type_of(offset, env), schema),
         None => ExprType::Null,
     };
@@ -2741,17 +2746,19 @@ fn check_range_offset_type(
             RangeColumn::Custom(RangeOffsets::Integer | RangeOffsets::Numeric),
             RangeOffset::ReadWhenRun,
         ) => {}
-        // SQLite's types are named as SQLite writes them, so that SQLite's
-        // NUMERIC, whose values are integers or reals, isn't mistaken for the
-        // custom numeric type.
         (
             RangeColumn::Custom(RangeOffsets::Integer | RangeOffsets::Numeric),
             RangeOffset::Plain(RangeOffsets::None),
-        ) => crate::bail_parse_error!(
-            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
-             {order_type} and an offset of SQLite type {}; cast the offset to integer",
-            offset_type.to_string().to_ascii_uppercase()
-        ),
+        ) => {
+            let ExprType::Builtin(builtin) = offset_type else {
+                unreachable!("an offset of a SQLite type has a built-in type")
+            };
+            crate::bail_parse_error!(
+                "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
+                 {order_type} and an offset of SQLite type {}; cast the offset to integer",
+                sqlite_type_name(builtin)
+            )
+        }
         (
             RangeColumn::Custom(offsets @ (RangeOffsets::Integer | RangeOffsets::Numeric)),
             RangeOffset::Plain(kind @ (RangeOffsets::Integer | RangeOffsets::Numeric))
@@ -2802,11 +2809,9 @@ fn range_column(ty: &ExprType) -> RangeColumn {
 /// A RANGE offset's type, as the frame check sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RangeOffset {
-    /// NULL, a string, a parameter, or a SQLite value whose type is known only
-    /// when it runs, such as `json_extract(..)` or a CASE that mixes SQLite
-    /// types. Over a custom type its value is read as that type when the
-    /// statement runs, as PostgreSQL does, and a NULL fails there as any other
-    /// NULL offset.
+    /// NULL, a string or a parameter. Over a custom type its value is read as
+    /// that type when the statement runs, as PostgreSQL does, and a NULL
+    /// fails there as any other NULL offset.
     ReadWhenRun,
     /// A value of a SQLite type, which is this kind of number.
     Plain(RangeOffsets),
@@ -2816,17 +2821,20 @@ enum RangeOffset {
 
 /// `ty` is not a domain. An integer written in the statement is an integer
 /// and a decimal such as 1.5 is a numeric, as in PostgreSQL. A real is
-/// inexact, and SQLite's `CAST(x AS numeric)` may give one. A value whose type
+/// inexact, and SQLite's `CAST(x AS numeric)` may give one. SQLite's ANY, such
+/// as a CASE that mixes SQLite types, may hold a real too. A value whose type
 /// nothing declares may be a custom type's value, so it is refused everywhere.
 fn range_offset(ty: &ExprType) -> RangeOffset {
     match ty {
-        ExprType::Null | ExprType::Untyped | ExprType::Builtin(BuiltinType::Any) => {
-            RangeOffset::ReadWhenRun
-        }
+        ExprType::Null | ExprType::Untyped => RangeOffset::ReadWhenRun,
         ExprType::Builtin(BuiltinType::Integer) => RangeOffset::Plain(RangeOffsets::Integer),
         ExprType::Builtin(BuiltinType::Decimal) => RangeOffset::Plain(RangeOffsets::Numeric),
         ExprType::Builtin(
-            BuiltinType::Real | BuiltinType::Numeric | BuiltinType::Text | BuiltinType::Blob,
+            BuiltinType::Real
+            | BuiltinType::Numeric
+            | BuiltinType::Text
+            | BuiltinType::Blob
+            | BuiltinType::Any,
         ) => RangeOffset::Plain(RangeOffsets::None),
         ExprType::Custom { type_def, .. } => RangeOffset::Custom(declared_range_offsets(type_def)),
         ExprType::Array { .. } | ExprType::Unknown => RangeOffset::Custom(RangeOffsets::None),
@@ -2837,6 +2845,20 @@ fn declared_range_offsets(type_def: &TypeDef) -> RangeOffsets {
     type_def
         .range_offsets
         .expect("a type that is not a domain declares its RANGE offsets")
+}
+
+/// The name SQLite gives the type, so that SQLite's NUMERIC, whose values are
+/// integers or reals, isn't mistaken for the custom numeric type. A decimal
+/// written in the statement is a REAL to SQLite.
+fn sqlite_type_name(ty: BuiltinType) -> &'static str {
+    match ty {
+        BuiltinType::Integer => "INTEGER",
+        BuiltinType::Real | BuiltinType::Decimal => "REAL",
+        BuiltinType::Numeric => "NUMERIC",
+        BuiltinType::Text => "TEXT",
+        BuiltinType::Blob => "BLOB",
+        BuiltinType::Any => "ANY",
+    }
 }
 
 /// The `N` of the frame's `N PRECEDING` or `N FOLLOWING` bound.

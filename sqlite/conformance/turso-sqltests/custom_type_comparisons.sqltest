@@ -607,6 +607,16 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
+test cmp-numeric-window-range-mixed-case-offset-is-an-error {
+    -- A CASE that mixes SQLite types may hold a REAL, as this one does.
+    CREATE TABLE t(n numeric(10,2)) STRICT;
+    SELECT count(*) OVER (ORDER BY n RANGE BETWEEN CASE WHEN 1 THEN CAST(0.1 AS REAL) ELSE 'a' END PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type numeric and an offset of SQLite type ANY; cast the offset to integer
+}
+
+@requires strict "uses STRICT tables"
 test cmp-window-range-string-offset-read-as-column-type {
     -- A string offset is read as the column's type when the statement runs,
     -- as in PostgreSQL: '1' is the integer 1 over a bigint, and '1.5' is an
