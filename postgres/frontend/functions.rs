@@ -13,7 +13,8 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_INTERNAL_ERROR, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE, SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE,
     SQLSTATE_INVALID_TEXT_REPRESENTATION, SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -63,6 +64,9 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
         },
         "quote_literal"(FunctionArity::Exact(1), true) => {
             exec_quote_literal(args[0].get_value())
+        },
+        "json_strip_nulls"(FunctionArity::Exact(1), true) => {
+            exec_json_strip_nulls(args[0].get_value())?
         },
         "format_type"(FunctionArity::OneOf(&[1, 2]), true) => oid_arg(args, 0)?
             .map(|type_oid| exec_pg_format_type(type_oid, int_arg(args, 1, -1))),
@@ -701,6 +705,184 @@ fn exec_quote_literal(value: &Value) -> Option<String> {
         format!("'{}'", text.replace('\'', "''"))
     };
     Some(quoted)
+}
+
+/// PostgreSQL's json_strip_nulls(json): drops object fields whose value is null,
+/// keeping number text and duplicate keys as the json type does.
+fn exec_json_strip_nulls(value: &Value) -> Result<Option<String>> {
+    let json = match value {
+        Value::Null => return Ok(None),
+        Value::Text(text) => text.as_str(),
+        other => {
+            return Err(undefined_function(
+                "json_strip_nulls",
+                &[pg_type_name(other)],
+            ))
+        }
+    };
+    // Validate first, so the walk below can assume well-formed input.
+    serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|_| invalid_json())?;
+    let mut stripped = String::with_capacity(json.len());
+    copy_without_null_fields(json, &mut 0, 0, &mut stripped)?;
+    Ok(Some(stripped))
+}
+
+/// The nesting limit of the walk below, the same as core's jsonb parser. Past
+/// it PostgreSQL also errors, at a depth that depends on max_stack_depth.
+const MAX_JSON_DEPTH: usize = 1000;
+
+pub(crate) fn invalid_json() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_INVALID_TEXT_REPRESENTATION,
+        "invalid input syntax for type json",
+    )
+}
+
+pub(crate) fn unsupported_unicode_escape() -> LimboError {
+    sqlstate_error(
+        SQLSTATE_UNTRANSLATABLE_CHARACTER,
+        "unsupported Unicode escape sequence",
+    )
+}
+
+/// Copies the JSON value at `pos` into `out`, leaving out object fields whose
+/// value is null. `depth` is the number of objects and arrays around it.
+fn copy_without_null_fields(
+    json: &str,
+    pos: &mut usize,
+    depth: usize,
+    out: &mut String,
+) -> Result<()> {
+    let bytes = json.as_bytes();
+    skip_json_whitespace(bytes, pos);
+    if matches!(bytes[*pos], b'{' | b'[') && depth == MAX_JSON_DEPTH {
+        return Err(sqlstate_error(
+            SQLSTATE_STATEMENT_TOO_COMPLEX,
+            "stack depth limit exceeded",
+        ));
+    }
+    match bytes[*pos] {
+        b'{' => {
+            *pos += 1;
+            out.push('{');
+            let mut first = true;
+            loop {
+                skip_json_whitespace(bytes, pos);
+                match bytes[*pos] {
+                    b'}' => break,
+                    b',' => {
+                        *pos += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                // Decoded even when the field is dropped, so a bad escape in
+                // its key errors as in PostgreSQL.
+                let key = decode_json_string(json, pos)?;
+                skip_json_whitespace(bytes, pos);
+                *pos += 1; // ':'
+                skip_json_whitespace(bytes, pos);
+                if bytes[*pos..].starts_with(b"null") {
+                    *pos += 4;
+                    continue;
+                }
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                push_json_string(&key, out);
+                out.push(':');
+                copy_without_null_fields(json, pos, depth + 1, out)?;
+            }
+            *pos += 1;
+            out.push('}');
+        }
+        b'[' => {
+            *pos += 1;
+            out.push('[');
+            let mut first = true;
+            loop {
+                skip_json_whitespace(bytes, pos);
+                match bytes[*pos] {
+                    b']' => break,
+                    b',' => {
+                        *pos += 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if !first {
+                    out.push(',');
+                }
+                first = false;
+                copy_without_null_fields(json, pos, depth + 1, out)?;
+            }
+            *pos += 1;
+            out.push(']');
+        }
+        b'"' => {
+            let string = decode_json_string(json, pos)?;
+            push_json_string(&string, out);
+        }
+        // A number, true, false or null: copied as written.
+        _ => {
+            let start = *pos;
+            while !matches!(
+                bytes.get(*pos),
+                None | Some(b',' | b']' | b'}' | b' ' | b'\t' | b'\n' | b'\r')
+            ) {
+                *pos += 1;
+            }
+            out.push_str(&json[start..*pos]);
+        }
+    }
+    Ok(())
+}
+
+fn skip_json_whitespace(bytes: &[u8], pos: &mut usize) {
+    while matches!(bytes.get(*pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        *pos += 1;
+    }
+}
+
+/// Decodes the string literal at `pos` and moves `pos` past its closing quote.
+fn decode_json_string(json: &str, pos: &mut usize) -> Result<String> {
+    let bytes = json.as_bytes();
+    let start = *pos;
+    *pos += 1;
+    loop {
+        match bytes[*pos] {
+            b'\\' => *pos += 2,
+            b'"' => break,
+            _ => *pos += 1,
+        }
+    }
+    *pos += 1;
+    let decoded: String = serde_json::from_str(&json[start..*pos]).map_err(|_| invalid_json())?;
+    if decoded.contains('\0') {
+        return Err(unsupported_unicode_escape());
+    }
+    Ok(decoded)
+}
+
+/// Writes a string the way PostgreSQL's escape_json() does: only quotes,
+/// backslashes and control characters are escaped.
+fn push_json_string(string: &str, out: &mut String) {
+    out.push('"');
+    for c in string.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 fn exec_textlike(args: &[Register]) -> Result<Option<Boolean>> {

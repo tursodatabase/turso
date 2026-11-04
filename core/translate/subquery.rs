@@ -29,7 +29,11 @@ use crate::{
             eqp_detail_for_rowid_search, eqp_detail_for_table_op, eqp_details_for_right_join,
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
-        expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
+        expr::{
+            check_custom_types, get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut,
+            WalkControl,
+        },
+        insert::expr_contains_subquery,
         optimizer::optimize_select_plan,
         plan::{
             plan_has_outer_scope_dependency, plan_is_correlated,
@@ -373,34 +377,17 @@ pub fn plan_subqueries_from_select_plan(
         )?;
     }
 
-    // LIMIT and OFFSET cannot reference columns from the outer query
-    let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
-    {
-        let mut subquery_parser = get_subquery_parser(
-            program,
-            &mut plan.non_from_clause_subqueries,
-            &mut plan.table_references,
-            resolver,
-            connection,
-            &get_outer_query_refs,
-            SubqueryPosition::LimitOffset,
-            SubqueryOrigin::SelectLimitOffset,
-            false,
-            &mut cse_map,
-            &mut same_query_map,
-            &[],
-        );
-        // Limit
-        if let Some(limit) = &mut plan.limit {
-            crate::stack::trace_stack!("select_limit");
-            walk_expr_mut(limit, &mut subquery_parser)?;
-        }
-        // Offset
-        if let Some(offset) = &mut plan.offset {
-            crate::stack::trace_stack!("select_offset");
-            walk_expr_mut(offset, &mut subquery_parser)?;
-        }
-    }
+    plan_limit_offset_subqueries(
+        program,
+        &mut plan.non_from_clause_subqueries,
+        &mut plan.table_references,
+        resolver,
+        connection,
+        plan.limit.as_deref_mut(),
+        plan.offset.as_deref_mut(),
+        &mut cse_map,
+        &mut same_query_map,
+    )?;
 
     // Recollect aggregates after all subquery planning.
     // This is necessary because:
@@ -424,6 +411,53 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
     )?;
+    Ok(())
+}
+
+/// Compute query plans for subqueries in a LIMIT/OFFSET pair.
+///
+/// A compound SELECT's LIMIT/OFFSET applies to the compound as a whole instead of to any single
+/// arm, so it is planned by [crate::translate::select::prepare_select_plan_from_arms] rather than
+/// by [plan_subqueries_from_select_plan].
+#[allow(clippy::too_many_arguments)]
+#[turso_macros::trace_stack]
+pub(crate) fn plan_limit_offset_subqueries(
+    program: &mut ProgramBuilder,
+    out_subqueries: &mut Vec<NonFromClauseSubquery>,
+    referenced_tables: &mut TableReferences,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    limit: Option<&mut ast::Expr>,
+    offset: Option<&mut ast::Expr>,
+    cse_map: &mut Vec<(ast::Expr, ast::Expr)>,
+    same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
+) -> Result<()> {
+    // LIMIT and OFFSET cannot reference columns from the outer query
+    let get_outer_query_refs = |_: &TableReferences| Ok(crate::alloc::try_vec![]?);
+    let mut subquery_parser = get_subquery_parser(
+        program,
+        out_subqueries,
+        referenced_tables,
+        resolver,
+        connection,
+        &get_outer_query_refs,
+        SubqueryPosition::LimitOffset,
+        SubqueryOrigin::SelectLimitOffset,
+        false,
+        cse_map,
+        same_query_map,
+        &[],
+    );
+    // Limit
+    if let Some(limit) = limit {
+        crate::stack::trace_stack!("select_limit");
+        walk_expr_mut(limit, &mut subquery_parser)?;
+    }
+    // Offset
+    if let Some(offset) = offset {
+        crate::stack::trace_stack!("select_offset");
+        walk_expr_mut(offset, &mut subquery_parser)?;
+    }
     Ok(())
 }
 
@@ -602,24 +636,40 @@ fn plan_subqueries_with_outer_query_access<'a>(
     same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
 ) -> Result<()> {
-    let mut subquery_parser = get_subquery_parser(
-        program,
-        out_subqueries,
-        referenced_tables,
-        resolver,
-        connection,
-        &outer_query_refs_for_correlated_subquery,
-        position,
-        origin,
-        allow_correlated,
-        cse_map,
-        same_query_map,
-        shared,
-    );
-    for expr in exprs {
-        walk_expr_mut(expr, &mut subquery_parser)?;
+    // Only custom types and arrays fail the checks below, and without custom
+    // types enabled there are neither.
+    let custom_types_enabled = !resolver.schema().type_registry.is_empty();
+    let mut with_subqueries = Vec::new();
+    {
+        let mut subquery_parser = get_subquery_parser(
+            program,
+            out_subqueries,
+            referenced_tables,
+            resolver,
+            connection,
+            &outer_query_refs_for_correlated_subquery,
+            position,
+            origin,
+            allow_correlated,
+            cse_map,
+            same_query_map,
+            shared,
+        );
+        for expr in exprs {
+            let has_subquery = custom_types_enabled && expr_contains_subquery(expr);
+            walk_expr_mut(expr, &mut subquery_parser)?;
+            if has_subquery {
+                let expr: &ast::Expr = expr;
+                with_subqueries.push(expr);
+            }
+        }
     }
-
+    // Binding checked these with the types of their subqueries not known yet.
+    // Check them again with those types, as compiling them would, in case
+    // the planner drops them, as in `WHERE 0 AND (SELECT d) COLLATE nocase`.
+    for expr in with_subqueries {
+        check_custom_types(expr, Some(referenced_tables), resolver)?;
+    }
     Ok(())
 }
 

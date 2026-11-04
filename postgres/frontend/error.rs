@@ -137,7 +137,10 @@ fn constraint_name(violation: &ConstraintViolation, table: &str) -> Option<Strin
             violation.column_names.join("_")
         )),
         ConstraintKind::Check => Some(format!("{table}_check")),
-        ConstraintKind::NotNull | ConstraintKind::Other => None,
+        ConstraintKind::NotNull
+        | ConstraintKind::Trigger
+        | ConstraintKind::Datatype
+        | ConstraintKind::Other => None,
     }
 }
 
@@ -158,7 +161,9 @@ fn constraint_message(violation: &ConstraintViolation, report: &ErrorReport) -> 
         ConstraintKind::Check => {
             format!("new row for relation \"{table}\" violates check constraint \"{constraint}\"")
         }
-        ConstraintKind::Other => violation.message.clone(),
+        ConstraintKind::Trigger | ConstraintKind::Datatype | ConstraintKind::Other => {
+            violation.message.clone()
+        }
     }
 }
 
@@ -219,7 +224,9 @@ fn sqlstate(error: &LimboError) -> &'static str {
             ConstraintKind::ForeignKey => SQLSTATE_FK_VIOLATION,
             ConstraintKind::NotNull => SQLSTATE_NOT_NULL_VIOLATION,
             ConstraintKind::Check => SQLSTATE_CHECK_VIOLATION,
-            ConstraintKind::Other => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
+            ConstraintKind::Trigger | ConstraintKind::Datatype | ConstraintKind::Other => {
+                SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION
+            }
         },
         LimboError::ForeignKeyConstraint(_) => SQLSTATE_FK_VIOLATION,
         LimboError::Constraint(_) => SQLSTATE_INTEGRITY_CONSTRAINT_VIOLATION,
@@ -261,7 +268,7 @@ fn sqlstate(error: &LimboError) -> &'static str {
         LimboError::OutOfMemory => SQLSTATE_OUT_OF_MEMORY,
         LimboError::TableLocked | LimboError::Busy => SQLSTATE_LOCK_NOT_AVAILABLE,
         LimboError::Interrupt => SQLSTATE_QUERY_CANCELED,
-        LimboError::Raise(_, msg) => raise_sqlstate(msg),
+        LimboError::Raise(_, error) => raise_sqlstate(&error.to_string()),
         LimboError::RaiseIgnore => SQLSTATE_ASSERT_FAILURE,
         LimboError::Corrupt(_) | LimboError::NotADB => SQLSTATE_DATA_CORRUPTED,
         LimboError::Dialect(error) => error.code,

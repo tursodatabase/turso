@@ -4,6 +4,7 @@ mod tests {
     use asserting::prelude::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+    use turso_sqlite::SqliteDialect;
 
     #[test]
     fn test_uuid_invalid_update_and_upsert_preserve_rows() {
@@ -193,11 +194,8 @@ mod tests {
         {
             let db = TempDatabase::new_with_existent_with_opts(&path, opts);
             let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<'",
-            )
-            .unwrap();
+            conn.execute("CREATE TYPE rev BASE text ENCODE string_reverse(value) OPERATOR '<'")
+                .unwrap();
             conn.execute(
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
             )
@@ -214,13 +212,13 @@ mod tests {
         let conn = db.connect_limbo();
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
-        // A new row goes to its place in the stored (reversed) text order:
-        // ananab < elppa < tocirpa < yrrehc.
+        // The type has no DECODE, so words read back as they are stored
+        // (reversed). A new row goes to its place in that order.
         conn.execute("INSERT INTO t VALUES (4,'apricot',0)")
             .unwrap();
         let rows: Vec<(String,)> =
             conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
-        let words = ["banana", "apple", "apricot", "cherry"];
+        let words = ["ananab", "elppa", "tocirpa", "yrrehc"];
         assert_eq!(rows, words.map(|w| (w.to_string(),)));
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
@@ -270,11 +268,8 @@ mod tests {
         {
             let db = open();
             let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<'",
-            )
-            .unwrap();
+            conn.execute("CREATE TYPE rev BASE text ENCODE string_reverse(value) OPERATOR '<'")
+                .unwrap();
             conn.execute(
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
             )
@@ -291,14 +286,14 @@ mod tests {
         let conn = db.connect_limbo();
         conn.execute("INSERT INTO t VALUES (3,'banana',100)")
             .unwrap();
-        // Stored (reversed) text order: ananab < elppa < yrrehc.
-        check(&conn, &["banana", "apple", "cherry"], &[2, 3]);
+        // Words read back as stored (reversed): ananab < elppa < yrrehc.
+        check(&conn, &["ananab", "elppa", "yrrehc"], &[2, 3]);
 
         // A passive checkpoint builds its own schema to write the index rows.
         conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
         conn.execute("INSERT INTO t VALUES (4,'apricot',50)")
             .unwrap();
-        check(&conn, &["banana", "apple", "apricot", "cherry"], &[2, 3, 4]);
+        check(&conn, &["ananab", "elppa", "tocirpa", "yrrehc"], &[2, 3, 4]);
     }
 
     /// Under MVCC, reopening replays the logical log; a domain's DEFAULT and
@@ -405,7 +400,7 @@ mod tests {
             turso_core::OpenFlags::default(),
             opts,
             None,
-            Arc::new(turso_core::SqliteDialect),
+            Arc::new(SqliteDialect),
         );
         let Err(err) = result else {
             panic!("open must fail when a stored type does not parse");
@@ -611,7 +606,7 @@ mod tests {
             let error = turso_core::Database::open_file(
                 io,
                 path.to_str().unwrap(),
-                Arc::new(turso_core::SqliteDialect),
+                Arc::new(SqliteDialect),
             )
             .and_then(|db| db.connect(turso_core::ConnectOpts::new()))
             .and_then(|conn| conn.execute("SELECT 1"))
@@ -1036,6 +1031,396 @@ mod tests {
         }
     }
 
+    /// Every way of storing a value of a custom type stores what a STRICT column
+    /// of the type's BASE stores when given the ENCODE result: the same kind and
+    /// value, or an error naming the same kind. CAST gives that value too.
+    #[test]
+    fn test_stored_value_has_the_kind_of_the_base() {
+        // ENCODE results for the input 7, one per kind a value can have.
+        let encodes = [
+            "value",
+            "value + 0.0",
+            "value + 0.5",
+            "value / 3.0",
+            "value + 9007199254740986",
+            "CAST(value AS text)",
+            "CAST(value AS text) || '.0'",
+            "'x' || value",
+            "CAST(value AS blob)",
+        ];
+        let bases = ["integer", "real", "text", "blob"];
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+
+        let mut mismatches = vec![];
+        for (e, encode) in encodes.iter().enumerate() {
+            for base in bases {
+                let ty = format!("t_{e}_{base}");
+                conn.execute(format!(
+                    "CREATE TYPE {ty}(value any) BASE {base} ENCODE {encode} DECODE value"
+                ))
+                .unwrap();
+                let plain_value = encode.replace("value", "7");
+                let expected = stored_kind_and_value(
+                    &conn,
+                    &[
+                        &format!("CREATE TABLE plain_{ty}(c {base}) STRICT"),
+                        &format!("INSERT INTO plain_{ty} VALUES ({plain_value})"),
+                    ],
+                    &format!("SELECT typeof(c), quote(c) FROM plain_{ty}"),
+                );
+                let table_with_c = |prefix: &str, column: &str| {
+                    format!("CREATE TABLE {prefix}_{ty}(id INTEGER PRIMARY KEY, {column}) STRICT")
+                };
+                let select =
+                    |prefix: &str| format!("SELECT typeof(c), quote(c) FROM {prefix}_{ty}");
+                let paths: Vec<(&str, Vec<String>, String)> = vec![
+                    (
+                        "INSERT",
+                        vec![
+                            table_with_c("ins", &format!("c {ty}")),
+                            format!("INSERT INTO ins_{ty} VALUES (1, 7)"),
+                        ],
+                        select("ins"),
+                    ),
+                    (
+                        "UPDATE",
+                        vec![
+                            table_with_c("upd", &format!("c {ty}")),
+                            format!("INSERT INTO upd_{ty} VALUES (1, NULL)"),
+                            format!("UPDATE upd_{ty} SET c = 7"),
+                        ],
+                        select("upd"),
+                    ),
+                    (
+                        "UPSERT",
+                        vec![
+                            table_with_c("ups", &format!("c {ty}")),
+                            format!("INSERT INTO ups_{ty} VALUES (1, NULL)"),
+                            format!(
+                                "INSERT INTO ups_{ty} VALUES (1, NULL) \
+                                 ON CONFLICT(id) DO UPDATE SET c = 7"
+                            ),
+                        ],
+                        select("ups"),
+                    ),
+                    (
+                        "DEFAULT",
+                        vec![
+                            table_with_c("def", &format!("c {ty} DEFAULT 7")),
+                            format!("INSERT INTO def_{ty}(id) VALUES (1)"),
+                        ],
+                        select("def"),
+                    ),
+                    (
+                        "ADD COLUMN DEFAULT",
+                        vec![
+                            format!("CREATE TABLE add_{ty}(id INTEGER PRIMARY KEY) STRICT"),
+                            format!("INSERT INTO add_{ty} VALUES (1)"),
+                            format!("ALTER TABLE add_{ty} ADD COLUMN c {ty} DEFAULT 7"),
+                        ],
+                        select("add"),
+                    ),
+                    (
+                        "ALTER COLUMN",
+                        vec![
+                            table_with_c("alt", "c integer"),
+                            format!("INSERT INTO alt_{ty} VALUES (1, 7)"),
+                            format!("ALTER TABLE alt_{ty} ALTER COLUMN c TO d {ty}"),
+                        ],
+                        format!("SELECT typeof(d), quote(d) FROM alt_{ty}"),
+                    ),
+                    (
+                        "virtual generated column",
+                        vec![
+                            table_with_c("gen", &format!("a integer, c {ty} AS (a)")),
+                            format!("INSERT INTO gen_{ty}(id, a) VALUES (1, 7)"),
+                        ],
+                        select("gen"),
+                    ),
+                    (
+                        "domain",
+                        vec![
+                            format!("CREATE DOMAIN dom_{ty} AS {ty}"),
+                            table_with_c("dom", &format!("c dom_{ty}")),
+                            format!("INSERT INTO dom_{ty} VALUES (1, 7)"),
+                        ],
+                        select("dom"),
+                    ),
+                    (
+                        "CAST",
+                        vec![],
+                        format!("SELECT typeof(CAST(7 AS {ty})), quote(CAST(7 AS {ty}))"),
+                    ),
+                ];
+                for (path, setup, select) in paths {
+                    let setup: Vec<&str> = setup.iter().map(String::as_str).collect();
+                    let actual = stored_kind_and_value(&conn, &setup, &select);
+                    if actual != expected {
+                        mismatches.push(format!(
+                            "ENCODE {encode}, BASE {base}, {path}: expected {expected:?}, got {actual:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// Runs `setup`, then `select`, which returns the stored kind and value. An
+    /// error is reduced to the "cannot store KIND value" part of its message, so
+    /// errors about the same kind compare equal whatever column or type they name.
+    fn stored_kind_and_value(
+        conn: &Arc<turso_core::Connection>,
+        setup: &[&str],
+        select: &str,
+    ) -> Result<(String, String), String> {
+        let run = || -> turso_core::Result<(String, String)> {
+            for sql in setup {
+                conn.execute(sql)?;
+            }
+            let mut stmt = conn.prepare(select)?;
+            let mut rows = vec![];
+            stmt.run_with_row_callback(|row| {
+                rows.push((row.get::<String>(0)?, row.get::<String>(1)?));
+                Ok(())
+            })?;
+            assert_eq!(rows.len(), 1, "{select}");
+            Ok(rows.remove(0))
+        };
+        run().map_err(|err| {
+            let message = err.to_string();
+            match message.find("cannot store ") {
+                Some(start) => message[start..]
+                    .split(" value")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                None => message,
+            }
+        })
+    }
+
+    /// Only text types take a COLLATE, as in PostgreSQL. Tries every kind of
+    /// column type in every place a COLLATE can be written: an array or a
+    /// custom type that isn't text refuses it, and every other type behaves
+    /// as before.
+    #[test]
+    fn test_collate_only_on_text_types() {
+        enum Collate {
+            Accepted,
+            /// Refused with an error that names this type.
+            Refused(&'static str),
+        }
+        struct Kind {
+            ty: &'static str,
+            strict: bool,
+            stored: &'static str,
+            /// A value that equals `stored` under NOCASE.
+            probe: &'static str,
+            collate: Collate,
+        }
+        let kinds = [
+            Kind {
+                ty: "text",
+                strict: true,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "integer",
+                strict: true,
+                stored: "1",
+                probe: "1",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "date",
+                strict: false,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "varchar(10)",
+                strict: true,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "label",
+                strict: true,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "short_text",
+                strict: true,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "plain_text",
+                strict: true,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "date",
+                strict: true,
+                stored: "'2024-01-02'",
+                probe: "'2024-01-02'",
+                collate: Collate::Refused("date"),
+            },
+            Kind {
+                ty: "uuid",
+                strict: true,
+                stored: "'01945ca0-3189-76c0-9a8f-caf310fc8b8e'",
+                probe: "'01945ca0-3189-76c0-9a8f-caf310fc8b8e'",
+                collate: Collate::Refused("uuid"),
+            },
+            Kind {
+                ty: "cents",
+                strict: true,
+                stored: "1",
+                probe: "1",
+                collate: Collate::Refused("cents"),
+            },
+            Kind {
+                ty: "day",
+                strict: true,
+                stored: "'2024-01-02'",
+                probe: "'2024-01-02'",
+                collate: Collate::Refused("day"),
+            },
+            Kind {
+                ty: "integer[]",
+                strict: true,
+                stored: "ARRAY[1]",
+                probe: "ARRAY[1]",
+                collate: Collate::Refused("integer[]"),
+            },
+            Kind {
+                ty: "text[]",
+                strict: true,
+                stored: "ARRAY['ABC']",
+                probe: "ARRAY['abc']",
+                collate: Collate::Refused("text[]"),
+            },
+            Kind {
+                ty: "date[]",
+                strict: true,
+                stored: "ARRAY['2024-01-02']",
+                // A bare ARRAY['2024-01-02'] is a text[].
+                probe: "CAST(ARRAY['2024-01-02'] AS date[])",
+                collate: Collate::Refused("date[]"),
+            },
+        ];
+        // (statement, whether it returns the count 1 when accepted). `{n}`
+        // keeps the names of created objects apart.
+        let places = [
+            (
+                "SELECT count(*) FROM t WHERE c = {probe} COLLATE NOCASE",
+                true,
+            ),
+            (
+                "SELECT count(*) FROM t WHERE c COLLATE NOCASE = {probe}",
+                true,
+            ),
+            (
+                "SELECT count(*) FROM t WHERE c COLLATE NOCASE IN ({probe})",
+                true,
+            ),
+            // An IN list compares with the collation of its left side only.
+            (
+                "SELECT count(*) FROM t WHERE c IN ({probe} COLLATE NOCASE)",
+                false,
+            ),
+            (
+                "SELECT count(*) FROM t WHERE c IN (SELECT {probe} COLLATE NOCASE)",
+                true,
+            ),
+            ("SELECT c COLLATE NOCASE FROM t", false),
+            ("SELECT c FROM t ORDER BY c COLLATE NOCASE", false),
+            (
+                "SELECT c FROM t UNION SELECT c FROM t ORDER BY c COLLATE NOCASE",
+                false,
+            ),
+            ("SELECT count(*) FROM t GROUP BY c COLLATE NOCASE", true),
+            ("SELECT DISTINCT c COLLATE NOCASE FROM t", false),
+            ("CREATE TABLE t{n}(c {ty} COLLATE NOCASE){strict}", false),
+            (
+                "CREATE TABLE t{n}(c {ty}, UNIQUE(c COLLATE NOCASE)){strict}",
+                false,
+            ),
+            // Two key columns, because a key of only an integer[] column is
+            // taken for a rowid alias (#11315).
+            (
+                "CREATE TABLE t{n}(c {ty}, k integer, PRIMARY KEY(c COLLATE NOCASE, k)){strict}",
+                false,
+            ),
+            ("CREATE INDEX i{n} ON t(c COLLATE NOCASE)", false),
+            ("ALTER TABLE t ADD COLUMN c{n} {ty} COLLATE NOCASE", false),
+        ];
+        for kind in &kinds {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::builder().with_opts(opts).build();
+            let conn = db.connect_limbo();
+            let strict = if kind.strict { " STRICT" } else { "" };
+            conn.execute(
+                "CREATE TYPE label(value text) BASE text ENCODE value DECODE value OPERATOR '<';
+                 CREATE TYPE cents(value integer) BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+                 CREATE DOMAIN short_text AS varchar;
+                 CREATE DOMAIN plain_text AS text;
+                 CREATE DOMAIN day AS date;",
+            )
+            .unwrap();
+            conn.execute(format!("CREATE TABLE t(c {}){strict}", kind.ty))
+                .unwrap();
+            conn.execute(format!("INSERT INTO t VALUES ({})", kind.stored))
+                .unwrap();
+            for (n, (place, counts_rows)) in places.iter().enumerate() {
+                let sql = place
+                    .replace("{n}", &n.to_string())
+                    .replace("{ty}", kind.ty)
+                    .replace("{probe}", kind.probe)
+                    .replace("{strict}", strict);
+                let context = format!("type {} (strict={}): {sql}", kind.ty, kind.strict);
+                let refused_by = match kind.collate {
+                    Collate::Accepted => None,
+                    Collate::Refused(name) => Some(name),
+                };
+                match refused_by {
+                    Some(name) => {
+                        let error = match conn.prepare(&sql) {
+                            Ok(_) => panic!("{context}: expected an error"),
+                            Err(error) => error.to_string(),
+                        };
+                        assert!(
+                            error.contains(&format!("collations are not supported by type {name}")),
+                            "{context}: {error}"
+                        );
+                    }
+                    None if *counts_rows => {
+                        let rows: Vec<(i64,)> = conn.exec_rows(&sql);
+                        assert_eq!(rows, vec![(1,)], "{context}");
+                    }
+                    None => {
+                        if let Err(error) = conn.execute(&sql) {
+                            panic!("{context}: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Every statement that copies a row must copy custom-type values as
     /// stored. Running DECODE and then ENCODE again changes the value of a
     /// type whose DECODE does not undo its ENCODE, like `plus1` and `x100`.
@@ -1049,8 +1434,7 @@ mod tests {
                 RowCopy::DropColumn,
                 RowCopy::OnUpdateCascade,
             ] {
-                // Array columns can't be keys, so they can't be cascaded.
-                if row_copy == RowCopy::OnUpdateCascade && copied_type.column_type.ends_with("[]") {
+                if row_copy == RowCopy::OnUpdateCascade && copied_type.new_key.is_none() {
                     continue;
                 }
                 let column_type = copied_type.column_type;
@@ -1077,33 +1461,36 @@ mod tests {
         "CREATE TYPE shout BASE text ENCODE upper(value) DECODE lower(value)",
     ];
 
+    // Arrays and types with a DECODE other than `value` can't be keys, so
+    // they have no ON UPDATE CASCADE copy.
     const COPIED_TYPES: &[CopiedType] = &[
-        CopiedType::new("plus1", "5", "9"),
-        CopiedType::new("x100", "1", "2"),
-        CopiedType::new("cents", "42", "43"),
-        CopiedType::new("shout", "'Hi'", "'Yo'"),
-        CopiedType::new("plus1[]", "ARRAY[1, 2]", "ARRAY[3]"),
-        CopiedType::new("shout[]", "ARRAY['a', 'B']", "ARRAY['c']"),
+        CopiedType::new("plus1", "5", Some("9")),
+        CopiedType::new("x100", "1", Some("2")),
+        CopiedType::new("cents", "42", None),
+        CopiedType::new("shout", "'Hi'", None),
+        CopiedType::new("plus1[]", "ARRAY[1, 2]", None),
+        CopiedType::new("shout[]", "ARRAY['a', 'B']", None),
     ];
 
-    /// A custom-type column and two values to write to it.
+    /// A custom-type column and the values to write to it.
     struct CopiedType {
         column_type: &'static str,
         value: &'static str,
-        /// The parent key's new value in the ON UPDATE CASCADE copy.
-        new_value: &'static str,
+        /// The parent key's new value in the ON UPDATE CASCADE copy, or
+        /// `None` if the type can't be a key.
+        new_key: Option<&'static str>,
     }
 
     impl CopiedType {
         const fn new(
             column_type: &'static str,
             value: &'static str,
-            new_value: &'static str,
+            new_key: Option<&'static str>,
         ) -> Self {
             Self {
                 column_type,
                 value,
-                new_value,
+                new_key,
             }
         }
     }
@@ -1134,7 +1521,7 @@ mod tests {
         let CopiedType {
             column_type,
             value,
-            new_value,
+            new_key,
         } = copied_type;
         match row_copy {
             RowCopy::Vacuum | RowCopy::VacuumInto => {
@@ -1174,7 +1561,8 @@ mod tests {
                 ))?;
                 conn.execute(format!("INSERT INTO parent VALUES ({value})"))?;
                 conn.execute(format!("INSERT INTO child VALUES (1, {value})"))?;
-                conn.execute(format!("UPDATE parent SET k = {new_value}"))?;
+                let new_key = new_key.expect("only key types are cascaded");
+                conn.execute(format!("UPDATE parent SET k = {new_key}"))?;
                 Ok((
                     first_value(&conn, "SELECT k FROM parent")?,
                     first_value(&conn, "SELECT k FROM child")?,

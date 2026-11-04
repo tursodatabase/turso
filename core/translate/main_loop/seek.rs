@@ -81,11 +81,13 @@ pub(super) fn encode_seek_keys_for_custom_types(
             reg,
             target_pc: skip_label,
         });
-        for td in &resolved.chain {
-            if let Some(encode_expr) = td.encode() {
-                crate::translate::expr::emit_type_expr(program, encode_expr, reg, reg, resolver)?;
-            }
-        }
+        crate::translate::expr::emit_encode_for_comparison(
+            program,
+            &resolved.chain,
+            resolved.storage_class()?,
+            reg,
+            resolver,
+        )?;
         program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())

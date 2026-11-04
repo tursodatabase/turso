@@ -408,6 +408,16 @@ expect {
     3|1|1
 }
 
+test array-custom-null-elements-preserve-base-storage-kind {
+    CREATE TYPE text_named(value any) BASE integer ENCODE value DECODE value;
+    CREATE TABLE t(v text_named[]) STRICT;
+    INSERT INTO t VALUES(ARRAY[NULL,'5',6.0]);
+    SELECT v, typeof(v[2]), typeof(v[3]) FROM t;
+}
+expect {
+    {NULL,5,6}|integer|integer
+}
+
 test array-custom-encode-preserves-null-like-scalar {
     CREATE TYPE null_fallback BASE integer ENCODE coalesce(value, 99) DECODE value;
     CREATE TABLE null_fallback_arrays (s null_fallback, v null_fallback[]) STRICT;
@@ -1977,4 +1987,99 @@ expect {
     {1,2}|1
     {1,NULL}|2
     {NULL,0}|1
+}
+
+test array-cast-to-real-array-converts-elements-to-real {
+    SELECT CAST('{5,1.5}' AS REAL[]), typeof(CAST('{5}' AS REAL[])[1]);
+}
+expect {
+    {5.0,1.5}|real
+}
+
+# Array element types follow STRICT columns: FLOAT is not a STRICT type.
+test array-cast-refuses-float-elements {
+    SELECT CAST('{5}' AS FLOAT[]);
+}
+expect error {
+    unknown datatype for array elements: "FLOAT"
+}
+
+test array-add-virtual-column-checks-existing-elements {
+    CREATE TABLE t(a INTEGER[]) STRICT;
+    INSERT INTO t VALUES ('{1}');
+    ALTER TABLE t ADD COLUMN v INTEGER[] AS (a) VIRTUAL;
+    SELECT v FROM t;
+}
+expect {
+    {1}
+}
+
+test array-add-virtual-column-refuses-elements-of-another-type {
+    CREATE TABLE t(a TEXT[]) STRICT;
+    INSERT INTO t VALUES ('{x}');
+    ALTER TABLE t ADD COLUMN v INTEGER[] AS (a) VIRTUAL;
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+test array-cast-refuses-unknown-element-type {
+    SELECT CAST('{1}' AS nosuchtype[]);
+}
+expect error {
+    unknown datatype for array elements: "nosuchtype"
+}
+
+# Every element of an INTEGER[][] is an array, and every element of those is
+# an INTEGER.
+test array-2d-converts-inner-elements {
+    CREATE TABLE m(id INTEGER PRIMARY KEY, a INTEGER[][]) STRICT;
+    INSERT INTO m VALUES (1, ARRAY[ARRAY[1,2],ARRAY['3',NULL]]), (2, ARRAY[NULL]);
+    SELECT id, a[1][2], a[2][1], typeof(a[2][1]), a[2][2] IS NULL, a[1] IS NULL FROM m ORDER BY id;
+}
+expect {
+    1|2|3|integer|1|0
+    2|||null|1|1
+}
+
+test array-2d-refuses-inner-element-of-another-type {
+    CREATE TABLE m(a INTEGER[][]) STRICT;
+    INSERT INTO m VALUES (ARRAY[ARRAY['abc']]);
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+test array-3d-refuses-innermost-element-of-another-type {
+    CREATE TABLE m(a INTEGER[][][]) STRICT;
+    INSERT INTO m VALUES (ARRAY[ARRAY[ARRAY['abc']]]);
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+test array-2d-refuses-a-one-dimensional-array {
+    CREATE TABLE m(a INTEGER[][]) STRICT;
+    INSERT INTO m VALUES (ARRAY[1,2]);
+}
+expect error {
+    cannot store non-array value in INTEGER column m.a
+}
+
+# Text input has no nested arrays, so '{ {abc} }' is an array of the text
+# '{abc}'. (The spaces keep the sqltest parser from reading the braces.)
+test array-2d-refuses-nested-text-input {
+    CREATE TABLE m(a INTEGER[][]) STRICT;
+    INSERT INTO m VALUES ('{ {abc} }');
+}
+expect error {
+    cannot store non-array value in INTEGER column m.a
+}
+
+test array-2d-refuses-nested-text-input-of-integers {
+    CREATE TABLE m(a INTEGER[][]) STRICT;
+    INSERT INTO m VALUES ('{ {1,2},{3,4} }');
+}
+expect error {
+    cannot store non-array value in INTEGER column m.a
 }

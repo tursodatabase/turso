@@ -31,6 +31,7 @@ use turso_core::{
 };
 
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, ExecRows, TempDatabase};
+use turso_sqlite::SqliteDialect;
 
 fn run<T>(db: &TempDatabase, mut f: impl FnMut() -> turso_core::types::IOResultOr<T>) -> Result<T> {
     loop {
@@ -3135,7 +3136,7 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         flags,
         opts,
         None,
-        std::sync::Arc::new(turso_core::SqliteDialect),
+        std::sync::Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -3161,7 +3162,7 @@ fn test_fts_mvcc_recovery(tmp_db: TempDatabase) {
         flags,
         opts,
         None,
-        std::sync::Arc::new(turso_core::SqliteDialect),
+        std::sync::Arc::new(SqliteDialect),
     )
     .unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -6781,7 +6782,8 @@ fn fts_dump_backing_rows_tool() {
 #[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
 #[test]
 fn multiprocess_shared_cache_serves_snapshot_consistent_pages() {
-    use turso_core::{Database, DatabaseOpts, OpenFlags, SqliteDialect};
+    use turso_core::{Database, DatabaseOpts, OpenFlags};
+    use turso_sqlite::SqliteDialect;
     // Multiprocess WAL needs an IO backend with shared-memory coordination.
     // The default platform IO has it on unix but not on Windows (only the
     // IOCP backend does there), and the open below refuses without it.

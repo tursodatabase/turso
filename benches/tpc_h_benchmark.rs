@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
@@ -17,7 +17,7 @@ macro_rules! tpc_query {
     ($num:literal) => {
         (
             $num,
-            include_str!(concat!("../../perf/tpc-h/queries/", $num, ".sql")),
+            include_str!(concat!("../perf/tpc-h/queries/", $num, ".sql")),
         )
     };
 }
@@ -60,7 +60,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
         // overflow cell with divider cell was not found
         // tpc_query!(13),
         tpc_query!(14),
-        // thread 'main' panicked at core/benches/tpc_h_benchmark.rs:71:62:
+        // thread 'main' panicked at benches/tpc_h_benchmark.rs:71:62:
         // called `Result::unwrap()` on an `Err` value: ParseError("CREATE VIEW not supported yet")
         // tpc_query!(15),
 

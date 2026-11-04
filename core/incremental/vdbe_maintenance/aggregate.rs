@@ -179,7 +179,7 @@ fn emit_group_aggregate_rows(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        Arc::new(crate::dialect::SqliteDialect),
+        Arc::new(crate::dialect::EngineDialect),
         None,
     );
 

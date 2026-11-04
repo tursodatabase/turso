@@ -134,7 +134,7 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     let db = crate::Database::open(
         io,
         "open-with-allocator.db",
-        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
+        crate::OpenOptions::new(StdArc::new(crate::EngineDialect))
             .storage(db_file)
             .allocators(DatabaseAllocators {
                 mv_store: alloc,
@@ -164,7 +164,7 @@ fn database_fts_build_and_merge_use_only_the_fts_allocator() {
     let db = crate::Database::open(
         StdArc::new(crate::MemoryIO::new()),
         ":memory:",
-        crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
+        crate::OpenOptions::new(StdArc::new(crate::EngineDialect))
             .db_opts(crate::DatabaseOpts::default().with_index_method(true))
             .allocators(DatabaseAllocators {
                 mv_store: DynAllocator::new(CountingAlloc {

@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use genawaiter::GeneratorState;
 use tempfile::TempDir;
-use turso_core::{Database, DatabaseOpts, OpenOptions, PlatformIO, SqliteDialect, IO};
+use turso_core::{Database, DatabaseOpts, OpenOptions, PlatformIO, IO};
+use turso_sqlite::SqliteDialect;
 use turso_sync_engine::database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts};
 use turso_sync_engine::database_sync_operations::SyncEngineIoStats;
 use turso_sync_engine::types::{Coro, DatabaseSyncEngineProtocolVersion};

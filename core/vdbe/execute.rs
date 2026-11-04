@@ -36,6 +36,7 @@ use crate::types::{
     compare_immutable, compare_record, AsValueRef, Extendable, IOCompletions, IOResult,
     ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
+use crate::types::{StorageClass, StrictType};
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
@@ -80,7 +81,7 @@ use crate::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
+        LimboError, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR, SQLITE_FULL,
     },
@@ -193,7 +194,10 @@ use super::{Program, ProgramState, Register};
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
 use crate::vdbe::builder::CursorTypeExt;
-use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+use crate::{
+    bail_constraint_error, must_be_btree_cursor, ConstraintKind, ConstraintViolation, MvStore,
+    Pager, Result,
+};
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
@@ -2586,24 +2590,50 @@ pub fn op_type_check(
                 // An INTEGER PRIMARY KEY gets its rowid later.
                 return Ok(());
             }
-            if let Some(expected_type) = col.strict_value_type() {
-                let _applied = apply_affinity_char(reg, col.affinity());
-                let value_type = reg.get_value().value_type();
-                if value_type != expected_type {
-                    bail_constraint_error!(
-                        "cannot store {} value in {} column {}.{} ({})",
-                        value_type,
-                        col.ty_str,
-                        &table_reference.name,
-                        col.name.as_deref().unwrap_or(""),
-                        SQLITE_CONSTRAINT
-                    );
+            match col.strict_type(&table_reference.name)? {
+                StrictType::Stores(expected_type) => {
+                    if let Err(value_type) = convert_to_strict_type(reg, expected_type) {
+                        return Err(datatype_violation(format!(
+                            "cannot store {} value in {} column {}.{}",
+                            value_type,
+                            col.ty_str,
+                            &table_reference.name,
+                            col.name.as_deref().unwrap_or("")
+                        )));
+                    }
                 }
+                StrictType::Any => {}
             }
             Ok(())
         },
     )?;
 
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_convert_to_type(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        ConvertToType {
+            reg,
+            storage_class,
+            description
+        },
+        insn
+    );
+    let reg = &mut state.registers[*reg];
+    if !matches!(reg.get_value(), Value::Null) {
+        if let Err(actual) = convert_to_strict_type(reg, *storage_class) {
+            return Err(
+                datatype_violation(format!("cannot store {actual} value {description}")).into(),
+            );
+        }
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2647,10 +2677,10 @@ pub fn op_array_encode(
     load_insn!(ArrayEncode { data }, insn);
     let ArrayEncodeData {
         reg,
-        element_affinity,
         element_type,
+        element_kind,
         not_null_domain,
-        array_dimensions,
+        dimensions,
         table_name,
         col_name,
     } = data.as_ref();
@@ -2661,12 +2691,13 @@ pub fn op_array_encode(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    // Fast path: blob input with ANY type — validate it is a well-formed record
-    // before accepting. This avoids the redundant extract→reserialize when MakeArray
-    // output feeds directly into ArrayEncode with ANY affinity, but rejects raw blobs
-    // (e.g. zeroblob, X'DEADBEEF') that would crash on read.
+    // Fast path: blob input to a one-dimensional ANY array — validate it is a
+    // well-formed record before accepting. This avoids the redundant
+    // extract→reserialize when MakeArray output feeds directly into ArrayEncode
+    // with ANY affinity, but rejects raw blobs (e.g. zeroblob, X'DEADBEEF') that
+    // would crash on read.
     if let Value::Blob(b) = val {
-        if element_type.eq_ignore_ascii_case("ANY") {
+        if *element_kind == StrictType::Any && *dimensions == 1 {
             // Validate blob is a well-formed record using streaming iterator
             // (no Vec<Value> allocation). Rejects empty blobs and invalid records.
             let valid = !b.is_empty()
@@ -2674,16 +2705,13 @@ pub fn op_array_encode(
                     .map(|iter| iter.into_iter().all(|r| r.is_ok()))
                     .unwrap_or(false);
             if !valid {
-                bail_constraint_error!(
-                    "cannot store non-array value in {} column {}.{} ({})",
-                    element_type,
-                    table_name,
-                    col_name,
-                    SQLITE_CONSTRAINT
-                );
+                return Err(datatype_violation(format!(
+                    "cannot store non-array value in {element_type} column {table_name}.{col_name}"
+                ))
+                .into());
             }
             if let Some(domain) = not_null_domain {
-                check_array_domain_not_null(b, *array_dimensions, domain)?;
+                check_array_domain_not_null(b, *dimensions, domain)?;
             }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -2697,63 +2725,25 @@ pub fn op_array_encode(
         _ => None,
     };
     let Some(raw_elements) = raw_elements else {
-        bail_constraint_error!(
-            "cannot store non-array value in {} column {}.{} ({})",
-            element_type,
-            table_name,
-            col_name,
-            SQLITE_CONSTRAINT
-        );
+        return Err(datatype_violation(format!(
+            "cannot store non-array value in {element_type} column {table_name}.{col_name}"
+        ))
+        .into());
     };
 
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
-            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name}"
         );
     }
 
-    let mut coerced_elements: Vec<Value> = Vec::with_capacity(raw_elements.len());
-    for elem in raw_elements {
-        // NULL elements are allowed — same as STRICT allows NULL in columns
-        if matches!(elem, Value::Null) {
-            coerced_elements.push(elem);
-            continue;
-        }
-
-        // Apply affinity coercion — same as STRICT's TypeCheck
-        let mut reg_tmp = Register::Value(elem);
-        apply_affinity_char(&mut reg_tmp, *element_affinity);
-        let coerced = reg_tmp.get_value().clone();
-
-        // Check value type matches the declared element type — same as STRICT's TypeCheck
-        let value_type = coerced.value_type();
-        let ty_bytes = element_type.as_bytes();
-        let type_ok = turso_macros::match_ignore_ascii_case!(match ty_bytes {
-            b"ANY" => true,
-            b"INTEGER" | b"INT" => value_type == ValueType::Integer,
-            b"REAL" => value_type == ValueType::Float,
-            b"TEXT" => value_type == ValueType::Text,
-            b"BLOB" => value_type == ValueType::Blob,
-            _ => true, // custom types validated by their own encode
-        });
-
-        if !type_ok {
-            bail_constraint_error!(
-                "cannot store {} value in {} ({})",
-                value_type,
-                element_type,
-                SQLITE_CONSTRAINT
-            );
-        }
-
-        coerced_elements.push(coerced);
-    }
+    let coerced_elements = convert_array_elements(raw_elements, *dimensions, data)?;
 
     // Serialize coerced elements as a native record-format BLOB
     let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len())?;
     if let Some(domain) = not_null_domain {
-        check_array_domain_not_null(record.get_payload(), *array_dimensions, domain)?;
+        check_array_domain_not_null(record.get_payload(), *dimensions, domain)?;
     }
     state.registers[*reg].set_blob(record.into_payload())?;
 
@@ -2783,6 +2773,88 @@ fn check_array_domain_not_null(blob: &[u8], dimensions: u32, domain: &str) -> Re
         }
     }
     Ok(())
+}
+
+/// Converts the elements of an array with `dimensions` levels: in INTEGER[][]
+/// every element of the outer array must be an array, and every element of
+/// those is converted as a STRICT INTEGER column converts a value. NULL is
+/// allowed at every level, as STRICT allows NULL in a column.
+fn convert_array_elements(
+    elements: Vec<Value>,
+    dimensions: u32,
+    data: &ArrayEncodeData,
+) -> Result<Vec<Value>> {
+    let ArrayEncodeData {
+        element_type,
+        element_kind,
+        table_name,
+        col_name,
+        ..
+    } = data;
+    let not_an_array = || {
+        datatype_violation(format!(
+            "cannot store non-array value in {element_type} column {table_name}.{col_name}"
+        ))
+    };
+    let mut converted = Vec::with_capacity(elements.len());
+    for element in elements {
+        let value = match (dimensions, element) {
+            (0, _) => {
+                return Err(LimboError::InternalError(format!(
+                    "array column {table_name}.{col_name} has no dimensions"
+                )))
+            }
+            (_, Value::Null) => Value::Null,
+            (2.., Value::Blob(sub_array)) => {
+                let sub_elements =
+                    array_values_from_blob(&sub_array).map_err(|_| not_an_array())?;
+                let sub_elements = convert_array_elements(sub_elements, dimensions - 1, data)?;
+                values_to_record_blob(&sub_elements)?
+            }
+            (2.., Value::Numeric(_) | Value::Text(_)) => return Err(not_an_array()),
+            (1, element @ (Value::Numeric(_) | Value::Text(_) | Value::Blob(_))) => {
+                let mut reg = Register::Value(element);
+                match *element_kind {
+                    StrictType::Stores(storage_class) => {
+                        if let Err(value_type) = convert_to_strict_type(&mut reg, storage_class) {
+                            return Err(datatype_violation(format!(
+                                "cannot store {value_type} value in {element_type}"
+                            )));
+                        }
+                    }
+                    StrictType::Any => {}
+                }
+                reg.get_value().clone()
+            }
+        };
+        converted.push(value);
+    }
+    Ok(converted)
+}
+
+/// Converts the non-NULL value in `reg` as a STRICT column storing
+/// `storage_class` does: applies that column's affinity, so '5' becomes 5 for
+/// INTEGER and 5 becomes 5.0 for REAL. Returns the value's kind when it still
+/// isn't of `storage_class`.
+fn convert_to_strict_type(
+    reg: &mut Register,
+    storage_class: StorageClass,
+) -> Result<(), ValueType> {
+    apply_affinity_char(reg, storage_class.affinity());
+    let actual = reg.get_value().value_type();
+    if actual == storage_class.value_type() {
+        Ok(())
+    } else {
+        Err(actual)
+    }
+}
+
+/// A value whose type does not match its column's type.
+fn datatype_violation(message: String) -> LimboError {
+    LimboError::ConstraintViolation(Box::new(ConstraintViolation::new(
+        ConstraintKind::Datatype,
+        message,
+    )))
 }
 
 /// Convert a native record-format array BLOB to PG text representation for display.
@@ -3736,7 +3808,7 @@ pub fn halt(
         // CONFLICT clause, or a trigger step's OR clause) is embedded in the
         // error, so whichever program aborts applies it instead of its own.
         if let Some(resolve_type) = on_error {
-            return Err(LimboError::Raise(resolve_type, error.to_string()).into());
+            return Err(LimboError::Raise(resolve_type, Box::new(error)).into());
         }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
@@ -3938,7 +4010,6 @@ fn build_constraint_violation_error(
     err_code: usize,
     description: &str,
 ) -> LimboError {
-    use crate::{ConstraintKind, ConstraintViolation};
     let (kind, message) = match err_code {
         SQLITE_CONSTRAINT_PRIMARYKEY => (
             ConstraintKind::PrimaryKey,
@@ -3957,6 +4028,7 @@ fn build_constraint_violation_error(
             format!("NOT NULL constraint failed: {description}"),
         ),
         SQLITE_CONSTRAINT_FOREIGNKEY => (ConstraintKind::ForeignKey, description.to_string()),
+        SQLITE_CONSTRAINT_TRIGGER => (ConstraintKind::Trigger, description.to_string()),
         _ => (ConstraintKind::Other, description.to_string()),
     };
     let mut violation = ConstraintViolation::new(kind, message);
@@ -10211,7 +10283,10 @@ pub fn op_function(
             }
             JsonFunc::JsonReplace => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_replace() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_replace() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = json_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10221,7 +10296,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbReplace => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_replace() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_replace() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = jsonb_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10231,7 +10309,10 @@ pub fn op_function(
             }
             JsonFunc::JsonInsert => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_insert() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_insert() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = json_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10241,7 +10322,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbInsert => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_insert() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_insert() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let json = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
@@ -10278,7 +10362,10 @@ pub fn op_function(
             }
             JsonFunc::JsonSet => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_set() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_set() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let reg_values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
@@ -10292,7 +10379,10 @@ pub fn op_function(
             }
             JsonFunc::JsonbSet => {
                 if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_set() needs an odd number of arguments")
+                    return Err(LimboError::SqlError(
+                        "json_set() needs an odd number of arguments".to_string(),
+                    )
+                    .into());
                 }
                 let reg_values =
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
@@ -10436,7 +10526,7 @@ pub fn op_function(
                                 let mut chars = escape_cow.chars();
                                 let c = chars.next();
                                 if c.is_none() || chars.next().is_some() {
-                                    return Err(LimboError::Constraint(
+                                    return Err(LimboError::SqlError(
                                         "ESCAPE expression must be a single character".to_string(),
                                     )
                                     .into());
@@ -12497,7 +12587,7 @@ impl Clock for StatementClock<'_> {
     }
 }
 
-pub(crate) type OpAttachState = crate::dialect::sqlite::attach::AttachDatabaseState;
+pub(crate) type OpAttachState = crate::attach::AttachDatabaseState;
 
 /// LIKE with an operand that is not TEXT: both are converted to TEXT first.
 #[inline(never)]
@@ -18349,14 +18439,8 @@ pub fn op_alter_column(
             }
         }
 
-        // Update unique_sets to reflect the renamed column
-        for unique_set in &mut btree.unique_sets {
-            for unique_column in &mut unique_set.columns {
-                if unique_column.name.eq_ignore_ascii_case(&old_column_name) {
-                    unique_column.name.clone_from(&new_name);
-                }
-            }
-        }
+        // Update the UNIQUE/PRIMARY KEY lists and this table's FOREIGN KEY child columns
+        btree.rename_column_in_keys(&old_column_name, &new_name);
 
         // Update CHECK constraint expressions to reference the new column name
         let old_col_normalized = normalize_ident(&old_column_name);
@@ -18398,23 +18482,18 @@ pub fn op_alter_column(
             }
         }
 
-        // Update this table's OWN foreign keys
+        // Update this table's OWN foreign keys: if self-referencing, rename the
+        // parent column too (child columns were renamed above)
         for fk_arc in &mut btree.foreign_keys {
-            let fk = Arc::make_mut(fk_arc);
-            // child side: rename child column if it matches
-            for cc in &mut fk.child_columns {
-                if cc.eq_ignore_ascii_case(&old_column_name) {
-                    cc.clone_from(&new_name);
-                }
-            }
-            // parent side: if self-referencing, rename parent column too
-            if fk.parent_namespace == *namespace
-                && normalize_ident(&fk.parent_table) == normalized_table_name
+            if fk_arc.parent_namespace != *namespace
+                || normalize_ident(&fk_arc.parent_table) != normalized_table_name
             {
-                for pc in &mut fk.parent_columns {
-                    if pc.eq_ignore_ascii_case(&old_column_name) {
-                        pc.clone_from(&new_name);
-                    }
+                continue;
+            }
+            let fk = Arc::make_mut(fk_arc);
+            for pc in &mut fk.parent_columns {
+                if pc.eq_ignore_ascii_case(&old_column_name) {
+                    pc.clone_from(&new_name);
                 }
             }
         }
@@ -19674,7 +19753,7 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
 
 // Compat for applications that test for SQLite.
 fn execute_sqlite_version() -> String {
-    crate::dialect::sqlite::SQLITE_VERSION.to_string()
+    crate::dialect::engine::SQLITE_VERSION.to_string()
 }
 
 fn execute_turso_version(version_integer: i64) -> String {
@@ -20767,7 +20846,7 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
-    use crate::SqliteDialect;
+    use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
 
     /// A weighted step must leave the same exact total as the weighted sum
@@ -20842,7 +20921,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -20903,7 +20982,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -20968,7 +21047,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -21030,7 +21109,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -21055,7 +21134,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -21100,7 +21179,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_vacuum(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -21303,7 +21382,7 @@ mod tests {
     fn test_execute_sqlite_version() {
         assert_eq!(
             execute_sqlite_version(),
-            crate::dialect::sqlite::SQLITE_VERSION
+            crate::dialect::engine::SQLITE_VERSION
         );
     }
 
@@ -21771,7 +21850,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();

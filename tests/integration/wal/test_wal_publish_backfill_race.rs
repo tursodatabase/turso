@@ -1,8 +1,8 @@
 use crate::queued_io::QueuedIo;
 use std::sync::Arc;
 use turso_core::vdbe::StepResult;
-use turso_core::SqliteDialect;
 use turso_core::{ConnectOpts, Connection, Database, Result};
+use turso_sqlite::SqliteDialect;
 
 fn step_blocking(stmt: &mut turso_core::Statement) -> Result<StepResult> {
     loop {

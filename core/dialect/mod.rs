@@ -5,14 +5,17 @@
 //! B-trees, the `sqlite_schema` table itself, bytecode — and consults the
 //! dialect wherever the meaning of SQL text is dialect-specific: parsing
 //! statements into the engine AST and interpreting persisted schema text.
-//! The [`sqlite`] module owns [`SqliteDialect`], the SQLite
-//! implementation, and the catalog tables that ship with every Turso
-//! build (`pragma_*`, `json_each`/`json_tree`, `sqlite_dbpage`,
-//! `btree_dump`, `sqlite_turso_types`).
+//! The frontends live in their own crates: the SQLite dialect in
+//! `turso_sqlite` and the PostgreSQL dialect in `turso_pg`. The [`engine`]
+//! module has what they share: the parser entry points, the built-in
+//! functions, the catalog tables that ship with every Turso build
+//! (`pragma_*`, `json_each`/`json_tree`, `sqlite_dbpage`, `btree_dump`,
+//! `sqlite_turso_types`), and the dialect of the statements the engine
+//! runs for itself.
 
-pub mod sqlite;
+pub mod engine;
 
-pub use sqlite::SqliteDialect;
+pub(crate) use engine::EngineDialect;
 
 /// Prefix the PostgreSQL frontend puts before the `CREATE TABLE` text it
 /// stores in `sqlite_schema`.
@@ -22,7 +25,7 @@ pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
 /// every open path and fixed for the lifetime of the database;
-/// SQLite-compatible callers pass [`SqliteDialect`]. Initial statement
+/// SQLite-compatible callers pass `turso_sqlite::SqliteDialect`. Initial statement
 /// preparation, re-preparation, and every schema load go through this
 /// interface.
 pub trait Dialect: Send + Sync + 'static {
@@ -119,7 +122,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// structurally instead of being re-registered by hand. The SQLite
     /// dialect registers the standard built-in catalog here; other
     /// dialects typically compose with it via
-    /// [`sqlite::register_builtin_catalog`] and then add their own tables
+    /// [`engine::register_builtin_catalog`] and then add their own tables
     /// (constructed with [`crate::VirtualTable::new_internal`], which
     /// requires no connection).
     fn register_catalog(
@@ -137,7 +140,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// The dialect owns its scalar function surface: the SQLite dialect
     /// resolves the built-in set, another dialect resolves its own —
     /// mapping names onto engine primitives where it wants them (usually
-    /// by composing with [`sqlite::resolve_builtin_function`]) and onto
+    /// by composing with [`engine::resolve_builtin_function`]) and onto
     /// [`crate::Func::Dialect`] for functions it executes
     /// itself via [`Dialect::exec_scalar_function`]. Consulted
     /// before extension functions; engine-generated helper statements
@@ -294,7 +297,7 @@ mod tests {
     use crate::schema::BTreeTable;
     use crate::storage::database::DatabaseFile;
     use crate::sync::atomic::{AtomicUsize, Ordering};
-    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+    use crate::{ConnectOpts, Database, DatabaseOpts, EngineDialect, MemoryIO, OpenFlags, IO};
     use std::sync::Arc;
 
     /// A dialect that counts schema-row parses and strips a `/* test */ `
@@ -315,10 +318,10 @@ mod tests {
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             self.statement_parse_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(sql) = sql.strip_prefix("test: ") {
-                let (cmd, offset) = sqlite::parse(sql)?;
+                let (cmd, offset) = engine::parse(sql)?;
                 Ok((cmd, "test: ".len() + offset))
             } else {
-                sqlite::parse(sql)
+                engine::parse(sql)
             }
         }
 
@@ -330,12 +333,12 @@ mod tests {
 
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
-            sqlite::parse_table_sql_ast(sql)
+            engine::parse_table_sql_ast(sql)
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
             let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
-            sqlite::table_sql_for_replay(sql)
+            engine::table_sql_for_replay(sql)
         }
 
         fn format_table_sql(
@@ -353,14 +356,14 @@ mod tests {
             arg_count: usize,
         ) -> crate::Result<Option<crate::function::Func>> {
             if name.eq_ignore_ascii_case("nvl") {
-                return sqlite::resolve_builtin_function("coalesce", arg_count);
+                return engine::resolve_builtin_function("coalesce", arg_count);
             }
             if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
                 return Ok(Some(crate::function::Func::Dialect(
                     "test_add_one".to_string(),
                 )));
             }
-            sqlite::resolve_builtin_function(name, arg_count)
+            engine::resolve_builtin_function(name, arg_count)
         }
 
         fn exec_scalar_function(
@@ -385,7 +388,7 @@ mod tests {
             schema: &mut crate::schema::Schema,
             enable_custom_types: bool,
         ) -> crate::Result<()> {
-            sqlite::register_builtin_catalog(schema, enable_custom_types)
+            engine::register_builtin_catalog(schema, enable_custom_types)
         }
 
         fn register_native_extensions(&self, options: crate::OpenOptions) -> crate::OpenOptions {
@@ -411,7 +414,7 @@ mod tests {
         }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
-            sqlite::parse(sql)
+            engine::parse(sql)
         }
 
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
@@ -421,12 +424,12 @@ mod tests {
 
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
-            sqlite::parse_table_sql_ast(sql)
+            engine::parse_table_sql_ast(sql)
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
             let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
-            sqlite::table_sql_for_replay(sql)
+            engine::table_sql_for_replay(sql)
         }
 
         fn format_table_sql(
@@ -443,7 +446,7 @@ mod tests {
             schema: &mut crate::schema::Schema,
             enable_custom_types: bool,
         ) -> crate::Result<()> {
-            sqlite::register_builtin_catalog(schema, enable_custom_types)
+            engine::register_builtin_catalog(schema, enable_custom_types)
         }
 
         fn resolve_function(
@@ -451,7 +454,7 @@ mod tests {
             name: &str,
             arg_count: usize,
         ) -> crate::Result<Option<crate::function::Func>> {
-            sqlite::resolve_builtin_function(name, arg_count)
+            engine::resolve_builtin_function(name, arg_count)
         }
     }
 
@@ -551,7 +554,7 @@ mod tests {
     fn schema_load_routes_through_dialect() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         {
-            let db = open_db(&io, "dialect-load.db", Arc::new(SqliteDialect)).unwrap();
+            let db = open_db(&io, "dialect-load.db", Arc::new(EngineDialect)).unwrap();
             let conn = db.connect(ConnectOpts::new()).unwrap();
             conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
             conn.close().unwrap();
@@ -599,7 +602,7 @@ mod tests {
     #[test]
     fn consume_stmt_reports_parse_error() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = open_db(&io, "consume-stmt-parse-error.db", Arc::new(SqliteDialect)).unwrap();
+        let db = open_db(&io, "consume-stmt-parse-error.db", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
 
         assert!(conn.consume_stmt("SELECT * FROM").is_err());
@@ -792,7 +795,7 @@ mod tests {
         }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
-            sqlite::parse(sql)
+            engine::parse(sql)
         }
 
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
@@ -800,11 +803,11 @@ mod tests {
         }
 
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
-            sqlite::parse_table_sql_ast(sql)
+            engine::parse_table_sql_ast(sql)
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-            sqlite::table_sql_for_replay(sql)
+            engine::table_sql_for_replay(sql)
         }
 
         fn format_table_sql(
@@ -825,7 +828,7 @@ mod tests {
             schema: &mut crate::schema::Schema,
             enable_custom_types: bool,
         ) -> crate::Result<()> {
-            sqlite::register_builtin_catalog(schema, enable_custom_types)
+            engine::register_builtin_catalog(schema, enable_custom_types)
         }
 
         fn resolve_function(
@@ -1021,7 +1024,7 @@ mod tests {
     #[test]
     fn registry_rejects_dialect_mismatch() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let _db = open_db(&io, "dialect-mismatch.db", Arc::new(SqliteDialect)).unwrap();
+        let _db = open_db(&io, "dialect-mismatch.db", Arc::new(EngineDialect)).unwrap();
 
         let err =
             open_db(&io, "dialect-mismatch.db", Arc::new(TestDialect::default())).unwrap_err();
@@ -1041,7 +1044,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = open_db(&io, "dialect-mismatch-reverse.db", Arc::new(SqliteDialect)).unwrap_err();
+        let err = open_db(&io, "dialect-mismatch-reverse.db", Arc::new(EngineDialect)).unwrap_err();
         assert!(
             err.to_string().contains("already open with dialect"),
             "unexpected error: {err}"
@@ -1052,7 +1055,7 @@ mod tests {
     #[test]
     fn shared_memory_registry_rejects_dialect_mismatch() {
         let name = "dialect-shared-memory-mismatch";
-        let _db = Database::open_shared_memory(name, Arc::new(SqliteDialect)).unwrap();
+        let _db = Database::open_shared_memory(name, Arc::new(EngineDialect)).unwrap();
 
         let err = Database::open_shared_memory(name, Arc::new(TestDialect::default())).unwrap_err();
         assert!(

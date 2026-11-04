@@ -11,10 +11,12 @@ from typing import Any, Callable, Optional, TypeVar
 
 from ._turso import (
     Busy,
+    BusySnapshot,
     Constraint,
     Corrupt,
     DatabaseFull,
     Interrupt,
+    IoError,
     Misuse,
     NotAdb,
     PyTursoConnection,
@@ -26,6 +28,7 @@ from ._turso import (
     PyTursoSetupConfig,
     PyTursoStatement,
     PyTursoStatusCode,
+    Readonly,
     py_turso_database_open,
     py_turso_setup,
 )
@@ -58,7 +61,7 @@ def _get_sqlite_version() -> tuple[str, tuple[int, int, int]]:
         return version_str, parts[:3]
     except Exception:
         # Fallback to the SQLite version Turso tracks
-        # (SQLITE_VERSION in core/dialect/sqlite.rs)
+        # (SQLITE_VERSION in core/dialect/engine.rs)
         return "3.50.4", (3, 50, 4)
 
 
@@ -108,7 +111,7 @@ class NotSupportedError(DatabaseError):
 
 def _map_turso_exception(exc: Exception) -> Exception:
     """Maps Turso-specific exceptions to DB-API 2.0 exception hierarchy"""
-    if isinstance(exc, Busy):
+    if isinstance(exc, (Busy, BusySnapshot, Readonly, IoError)):
         return OperationalError(str(exc))
     if isinstance(exc, Interrupt):
         return OperationalError(str(exc))
@@ -117,8 +120,8 @@ def _map_turso_exception(exc: Exception) -> Exception:
     if isinstance(exc, Constraint):
         return IntegrityError(str(exc))
     if isinstance(exc, TursoError):
-        # Generic Turso error -> DatabaseError
-        return DatabaseError(str(exc))
+        # SQLITE_ERROR -> OperationalError, as in CPython's sqlite3
+        return OperationalError(str(exc))
     if isinstance(exc, DatabaseFull):
         return OperationalError(str(exc))
     if isinstance(exc, NotAdb):
@@ -383,7 +386,7 @@ class Connection:
         isolation_level: Optional[str] = "DEFERRED",
         extra_io: Optional[Callable[[], None]] = None,
     ) -> None:
-        self._conn: PyTursoConnection = conn
+        self._open_conn: Optional[PyTursoConnection] = conn
         # autocommit behavior:
         # - True: SQLite autocommit mode; commit/rollback are no-ops.
         # - False: PEP 249 compliant: ensure a transaction is always open.
@@ -399,6 +402,15 @@ class Connection:
         # If autocommit is False, ensure a transaction is open
         if self._autocommit_mode is False:
             self._ensure_transaction_open()
+
+    @property
+    def _conn(self) -> PyTursoConnection:
+        return self._ensure_open()
+
+    def _ensure_open(self) -> PyTursoConnection:
+        if self._open_conn is None:
+            raise ProgrammingError("Cannot operate on a closed database.")
+        return self._open_conn
 
     def _ensure_transaction_open(self) -> None:
         """
@@ -479,6 +491,7 @@ class Connection:
 
     @property
     def isolation_level(self) -> Optional[str]:
+        self._ensure_open()
         return self._isolation_level
 
     @isolation_level.setter
@@ -499,10 +512,12 @@ class Connection:
     # Provide autocommit property for sqlite3-like API (optional)
     @property
     def autocommit(self) -> object | bool:
+        self._ensure_open()
         return self._autocommit_mode
 
     @autocommit.setter
     def autocommit(self, val: object | bool) -> None:
+        self._ensure_open()
         # Accept True, False, or "LEGACY"
         if val not in (True, False, "LEGACY"):
             raise ProgrammingError("autocommit must be True, False, or 'LEGACY'")
@@ -514,6 +529,8 @@ class Connection:
             self._ensure_transaction_open()
 
     def close(self) -> None:
+        if self._open_conn is None:
+            return
         # In sqlite3: If autocommit is False, pending transaction is implicitly rolled back.
         try:
             if self._autocommit_mode is False and self.in_transaction:
@@ -525,6 +542,8 @@ class Connection:
             self._conn.close()
         except Exception as exc:  # noqa: BLE001
             raise _map_turso_exception(exc)
+        finally:
+            self._open_conn = None
 
     def commit(self) -> None:
         try:
@@ -620,6 +639,7 @@ class Connection:
                 self._exec_ddl_only(f"BEGIN {level}")
 
     def cursor(self, factory: Optional[Callable[[Connection], _DBCursorT]] = None) -> _DBCursorT | Cursor:
+        self._ensure_open()
         if factory is None:
             return Cursor(self)
         return factory(self)
@@ -713,7 +733,7 @@ class Connection:
                             raise ValueError(
                                 "infinite float values cannot be sent over the protocol"
                             )
-                        validator.bind_positional(1, value)
+                        Cursor._bind_params(validator, (value,))
                 except Exception as exc:  # noqa: BLE001
                     raise _batch_statement_error(index, _map_turso_exception(exc)) from exc
                 validated.append((sql, copied_parameters))
@@ -791,6 +811,7 @@ class Connection:
             raise _map_turso_exception(exc)
 
     def __enter__(self) -> "Connection":
+        self._ensure_open()
         return self
 
     def __exit__(
@@ -837,6 +858,7 @@ class Cursor:
         return self._connection
 
     def close(self) -> None:
+        self._connection._ensure_open()
         if self._closed:
             return
         try:
@@ -854,6 +876,7 @@ class Cursor:
     def _ensure_open(self) -> None:
         if self._closed:
             raise ProgrammingError("Cannot operate on a closed cursor")
+        self._connection._ensure_open()
 
     @property
     def description(self) -> tuple[tuple[str, None, None, None, None, None, None], ...] | None:
@@ -887,81 +910,52 @@ class Cursor:
         if isinstance(parameters, Mapping):
             # Named placeholders are not supported
             raise ProgrammingError("Named parameters are not supported; use positional parameters with '?'")
-        if parameters is None:
-            return ()
         if isinstance(parameters, tuple):
             return parameters
-        # Convert arbitrary sequences to tuple efficiently
+        # sqlite3 accepts any object with __getitem__ (lists, strings, ...), but not sets or iterators
+        if not hasattr(type(parameters), "__getitem__"):
+            raise ProgrammingError("parameters are of unsupported type")
         return tuple(parameters)
 
     @staticmethod
     def _bind_named_params(stmt: PyTursoStatement, parameters: Mapping[str, Any]) -> None:
         """
-        Bind mapping-style parameters to a prepared SQLite statement, emulating
-        the behavior of Python's ``sqlite3`` module for named parameters.
-
-        SQLite supports the following parameter syntaxes:
-
-            :name
-            @name
-            $name
-            ?NNN
-
-        When a mapping (dict-like object) is supplied:
-
-        1. Keys are interpreted as parameter names without the prefix.
-           For example:
-
-                {"name": "Alice"}
-
-           can bind to any of:
-
-                :name
-                @name
-                $name
-
-        2. Extra keys in the mapping that do not correspond to parameters in
-           the SQL statement are ignored.
-
-        3. Missing keys for parameters present in the SQL statement result in
-           an error raised by the underlying SQLite engine.
-
-        4. Positional parameters using '?' are NOT supported with mappings and
-           must be bound using positional sequences (tuple/list).
-
-        5. Numeric parameters of the form '?NNN' may be bound using a mapping
-           key of the numeric portion as a string:
-
-                {"1": value}  -> binds to ?1
-
-           This mirrors Python's sqlite3 behavior where numeric parameters can
-           be addressed via their 1-based index.
-
-        6. Keys that already include a prefix (e.g. ":name") are not required
-           and are not relied upon for matching; plain names are preferred.
+        Bind a mapping to the statement's parameters, as Python's ``sqlite3`` does:
+        each parameter (``:name``, ``@name``, ``$name`` or ``?NNN``) takes the value
+        of the key without its prefix (``"name"`` or ``"NNN"``). Keys that match no
+        parameter are ignored.
         """
-        for key, value in parameters.items():
-            if not isinstance(key, str):
-                continue
-            candidates = [f":{key}", f"@{key}", f"${key}"]
-            if key.isdigit():
-                candidates.append(f"?{key}")
-            for candidate in candidates:
-                try:
-                    index = stmt.named_position(candidate)
-                except TursoError:
-                    continue
-                stmt.bind_positional(index, value)
-                break
+        for index in range(1, stmt.parameters_count() + 1):
+            name = stmt.parameter_name(index)
+            if name is None:
+                raise ProgrammingError(
+                    f"Binding {index} has no name, but you supplied a dictionary (which has only names)."
+                )
+            key = name[1:]
+            try:
+                value = parameters[key]
+            except KeyError:
+                raise ProgrammingError(f"You did not supply a value for binding parameter :{key}.") from None
+            stmt.bind_positional(index, value)
 
     @staticmethod
     def _bind_params(stmt: PyTursoStatement, parameters: Sequence[Any] | Mapping[str, Any]) -> None:
-        if isinstance(parameters, Mapping):
-            Cursor._bind_named_params(stmt, parameters)
-            return
-        params = Cursor._to_positional_params(parameters)
-        if params:
-            stmt.bind(params)
+        # sqlite3 raises ProgrammingError for parameters of an unsupported type
+        try:
+            if isinstance(parameters, Mapping):
+                Cursor._bind_named_params(stmt, parameters)
+                return
+            params = Cursor._to_positional_params(parameters)
+            expected = stmt.parameters_count()
+            if len(params) != expected:
+                raise ProgrammingError(
+                    "Incorrect number of bindings supplied. "
+                    f"The current statement uses {expected}, and there are {len(params)} supplied."
+                )
+            if params:
+                stmt.bind(params)
+        except TypeError as exc:
+            raise ProgrammingError(f"Error binding parameter: {exc}") from exc
 
     def _maybe_implicit_begin(self, sql: str) -> None:
         self._connection._maybe_implicit_begin(sql)
