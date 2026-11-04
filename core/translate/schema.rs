@@ -858,7 +858,7 @@ fn validate(
                 }
             }
             table.resolve_custom_types(resolver.schema());
-            table.check_collates_are_allowed()?;
+            table.check_collates_are_allowed(resolver.schema())?;
         }
     }
     Ok(())

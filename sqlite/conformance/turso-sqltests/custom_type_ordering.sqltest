@@ -508,7 +508,7 @@ test create-table-rejects-collate-on-domain-over-numeric {
     CREATE TABLE t(x money_amount COLLATE NOCASE) STRICT;
 }
 expect error {
-    collations are not supported by type numeric
+    collations are not supported by type money_amount
 }
 
 @requires strict "uses STRICT tables"
@@ -566,6 +566,131 @@ test collate-allowed-on-numeric-column-of-non-strict-table {
     ALTER TABLE t ADD COLUMN y numeric(10,2) COLLATE NOCASE;
     INSERT INTO t VALUES ('a', 'b');
     SELECT count(*) FROM t WHERE x = 'A' AND y = 'B';
+}
+expect {
+    1
+}
+
+# Only text types take a COLLATE, as in PostgreSQL: varchar, a type with a
+# text base and a domain over one of them. date is stored as text but is not a
+# text type, so a COLLATE on a date value fails wherever it appears.
+@requires strict "uses STRICT tables"
+test comparison-rejects-collate-next-to-date-column {
+    CREATE TABLE t(d date) STRICT;
+    INSERT INTO t VALUES ('2024-01-02');
+    SELECT count(*) FROM t WHERE d = '2024-01-02' COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test select-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT d COLLATE NOCASE FROM t;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test order-by-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT d FROM t ORDER BY d COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test group-by-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT count(*) FROM t GROUP BY d COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test distinct-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    SELECT DISTINCT d COLLATE NOCASE FROM t;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-date-column {
+    CREATE TABLE t(d date COLLATE NOCASE) STRICT;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-in-unique-key-on-date-column {
+    CREATE TABLE t(d date, UNIQUE(d COLLATE NOCASE)) STRICT;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test create-index-rejects-collate-on-date-column {
+    CREATE TABLE t(d date) STRICT;
+    CREATE INDEX i ON t(d COLLATE NOCASE);
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test add-column-rejects-collate-on-date-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    ALTER TABLE t ADD COLUMN d date COLLATE NOCASE;
+}
+expect error {
+    collations are not supported by type date
+}
+
+@requires strict "uses STRICT tables"
+test create-table-rejects-collate-on-domain-over-date {
+    CREATE DOMAIN day AS date;
+    CREATE TABLE t(d day COLLATE NOCASE) STRICT;
+}
+expect error {
+    collations are not supported by type day
+}
+
+@requires strict "uses STRICT tables"
+test comparison-rejects-collate-on-type-with-integer-base {
+    CREATE TYPE cents(value integer) BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(c cents) STRICT;
+    SELECT count(*) FROM t WHERE c COLLATE NOCASE = 1;
+}
+expect error {
+    collations are not supported by type cents
+}
+
+@requires strict "uses STRICT tables"
+test collate-allowed-on-text-types {
+    CREATE TYPE label(value text) BASE text ENCODE value DECODE value;
+    CREATE DOMAIN short_text AS varchar;
+    CREATE DOMAIN plain_text AS text;
+    CREATE TABLE t(v varchar(10) COLLATE NOCASE, l label, s short_text, p plain_text, UNIQUE(l COLLATE NOCASE)) STRICT;
+    CREATE INDEX i ON t(s COLLATE NOCASE);
+    INSERT INTO t VALUES ('ABC', 'ABC', 'ABC', 'ABC');
+    SELECT count(*) FROM t WHERE v = 'abc' AND l = 'abc' COLLATE NOCASE AND s COLLATE NOCASE = 'abc' AND p = 'abc' COLLATE NOCASE;
+}
+expect {
+    1
+}
+
+test collate-allowed-on-date-column-of-non-strict-table {
+    CREATE TABLE t(d date COLLATE NOCASE);
+    INSERT INTO t VALUES ('abc');
+    SELECT count(*) FROM t WHERE d = 'ABC' AND d COLLATE NOCASE = 'ABC';
 }
 expect {
     1

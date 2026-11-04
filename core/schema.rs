@@ -117,7 +117,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
-use crate::translate::expr::expr_type::ExprType;
+use crate::translate::expr::expr_type::{column_type, ExprType};
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
     column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
@@ -456,6 +456,9 @@ pub struct TypeDef {
     pub not_null: bool,
     /// Whether this is a domain (CREATE DOMAIN) vs a custom type (CREATE TYPE).
     pub is_domain: bool,
+    /// Whether values of the type take a COLLATE, as PostgreSQL's text types
+    /// do. None for a domain, which takes the answer of its base type.
+    pub accepts_collate: Option<bool>,
     /// Original SQL for round-trip persistence. Stored verbatim from creation.
     pub sql: String,
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
@@ -667,6 +670,7 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    accepts_collate: Some(base.eq_ignore_ascii_case("text")),
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Custom {
@@ -699,6 +703,7 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    accepts_collate: Some(false),
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
@@ -731,6 +736,7 @@ impl TypeDef {
                     is_builtin,
                     not_null: false,
                     is_domain: false,
+                    accepts_collate: Some(false),
                     sql,
                     domain_checks: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
@@ -759,6 +765,7 @@ impl TypeDef {
             is_builtin: false,
             not_null,
             is_domain: true,
+            accepts_collate: None,
             sql,
             domain_checks: constraints.to_vec(),
             kind: TypeDefKind::Custom {
@@ -1187,16 +1194,20 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
 
-    let type_sqls: &[&str] = &[
+    // Whether values of the type take a COLLATE. In PostgreSQL only text
+    // types do, so of the types below only varchar does.
+    const COLLATE: bool = true;
+    const NO_COLLATE: bool = false;
+    let types: &[(bool, &str)] = &[
         #[cfg(feature = "uuid")]
-        "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'",
-        "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'",
+        (NO_COLLATE, "CREATE TYPE uuid(value any) BASE blob ENCODE CASE WHEN value IS NULL THEN NULL WHEN typeof(value) = 'blob' AND length(value) = 16 THEN value ELSE coalesce(uuid_blob(value), RAISE(ABORT, 'invalid UUID value')) END DECODE uuid_str(value) OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE boolean(value any) BASE integer ENCODE boolean_to_int(value) DECODE CASE WHEN value THEN 1 ELSE 0 END OPERATOR '<'"),
         #[cfg(feature = "json")]
-        "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
+        (NO_COLLATE, "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value"),
         #[cfg(feature = "json")]
-        "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
+        (NO_COLLATE, "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)"),
+        (COLLATE, "CREATE TYPE varchar(value text, maxlen integer) BASE text COERCE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'"),
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing
@@ -1205,20 +1216,20 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         // the fraction outright, silently dropping precision on insert.
         // Caveat: Turso's `%f` directive is millisecond resolution, so PG's
         // microsecond inputs are clamped to 3 digits (`.123456` -> `.123`).
-        "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'",
-        "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'",
-        "CREATE TYPE bigint(value integer) BASE integer",
-        "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
-        "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
-        "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
-        "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)",
+        (NO_COLLATE, "CREATE TYPE time(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN time(value) IS NULL THEN RAISE(ABORT, 'invalid time value') ELSE rtrim(rtrim(strftime('%H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE timestamp(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE timestamptz(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN datetime(value) IS NULL THEN RAISE(ABORT, 'invalid timestamp value') ELSE rtrim(rtrim(strftime('%Y-%m-%d %H:%M:%f', value), '0'), '.') END DECODE value OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE smallint(value integer) BASE integer COERCE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE bigint(value integer) BASE integer"),
+        (NO_COLLATE, "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value"),
+        (NO_COLLATE, "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value"),
+        (NO_COLLATE, "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'"),
+        (NO_COLLATE, "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value) COERCE numeric_fit(value, precision, scale) DECODE numeric_decode(value)"),
     ];
 
-    for sql in type_sqls {
+    for &(accepts_collate, sql) in types {
         let mut parser = Parser::new(sql.as_bytes());
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
@@ -1229,7 +1240,8 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
             )));
         };
 
-        let type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string())?;
+        let mut type_def = TypeDef::from_create_type(&type_name, &body, true, sql.to_string())?;
+        type_def.accepts_collate = Some(accepts_collate);
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
@@ -1832,6 +1844,25 @@ impl Schema {
         self.resolve_type_unchecked(&type_def.name)
             .ok()??
             .ordering()
+    }
+
+    /// Whether values of `type_def` take a COLLATE. A domain answers as its
+    /// base type does, and a domain over a SQLite type takes one when that
+    /// type is text.
+    pub fn type_accepts_collate(&self, type_def: &TypeDef) -> crate::Result<bool> {
+        if let Some(accepts_collate) = type_def.accepts_collate {
+            return Ok(accepts_collate);
+        }
+        let resolved = self
+            .resolve_type_unchecked(&type_def.name)?
+            .ok_or_else(|| {
+                LimboError::InternalError(format!("type {} is not registered", type_def.name))
+            })?;
+        Ok(resolved
+            .chain
+            .iter()
+            .find_map(|type_def| type_def.accepts_collate)
+            .unwrap_or_else(|| resolved.primitive == "text"))
     }
 
     /// Fails when `element_type` has its own order, as numeric does. Array
@@ -5297,15 +5328,16 @@ impl BTreeTable {
     }
 
     /// Fails when a column or a key of a UNIQUE or PRIMARY KEY constraint has a
-    /// COLLATE and the column's type has its own order. Call this after
-    /// [Self::resolve_custom_types].
-    pub(crate) fn check_collates_are_allowed(&self) -> Result<()> {
+    /// COLLATE and the column's type takes none (see [key_collation]).
+    pub(crate) fn check_collates_are_allowed(&self, schema: &Schema) -> Result<()> {
         for column in &self.columns {
-            key_collation(column.text_collation(), column.type_ordering())?;
+            let ty = column_type(column, self.is_strict, schema);
+            key_collation(column.text_collation(), &ty, schema)?;
         }
         for key in self.unique_sets.iter().flat_map(|set| &set.columns) {
             if let Some((_, column)) = self.get_column(&key.name) {
-                key_collation(key.collation, column.type_ordering())?;
+                let ty = column_type(column, self.is_strict, schema);
+                key_collation(key.collation, &ty, schema)?;
             }
         }
         Ok(())

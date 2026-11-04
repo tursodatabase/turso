@@ -908,9 +908,15 @@ fn translate_collate_expr(
         unreachable!("translate_collate_expr expects Expr::Collate");
     };
     // COLLATE does not change the value. Comparisons read the collation from
-    // the expression tree; resolving it here only rejects unknown names.
+    // the expression tree; resolving it here only rejects unknown names and
+    // types that take no collation, such as `d COLLATE nocase` for a date d.
     translate_expr(program, referenced_tables, expr, target_register, resolver)?;
     resolver.resolve_collation(collation.as_str())?;
+    let ty = type_of(
+        expr,
+        &ExprContext::new(referenced_tables, resolver).type_env(),
+    );
+    check_type_accepts_collate(&ty, resolver.schema())?;
     Ok(target_register)
 }
 

@@ -539,13 +539,19 @@ pub fn in_subquery_collation(
     let rhs = &query.select_result_columns()[column].expr;
     let lhs_context = ExprContext::new(lhs_tables, resolver);
     let rhs_context = ExprContext::new(Some(query.select_table_references()), resolver);
-    let rhs_order = operand_order(
-        &query_column_type(query, column, resolver),
-        resolver.schema(),
-    );
-    let lhs_order = expr_operand_order(lhs, &lhs_context);
+    let schema = resolver.schema();
+    let rhs_type = query_column_type(query, column, resolver);
+    let lhs_type = type_of(lhs, &lhs_context.type_env());
     let has_collate = has_collate_operator(lhs) || has_collate_operator(rhs);
-    if let Some(ordering) = common_ordering([lhs_order, rhs_order], has_collate)? {
+    if has_collate {
+        check_type_accepts_collate(&lhs_type, schema)?;
+        check_type_accepts_collate(&rhs_type, schema)?;
+    }
+    let orders = [
+        operand_order(&lhs_type, schema),
+        operand_order(&rhs_type, schema),
+    ];
+    if let Some(ordering) = common_ordering(orders, has_collate)? {
         return Ok(CollationSeq::Type(ordering));
     }
     comparison_collation_across_queries(lhs, &lhs_context, rhs, &rhs_context)
@@ -644,19 +650,27 @@ pub(crate) fn first_text_collation<'a, 'c, 's: 'c>(
 /// The order that values compared with each other use when one of them has a
 /// type with an order. Text collations do not apply to such types, so an
 /// explicit COLLATE among them is an error, and so are two different orders:
-/// PostgreSQL has no operator that compares numeric with an array.
-fn common_type_ordering<'a, 'c, 's: 'c>(
-    exprs: impl IntoIterator<Item = (&'a Expr, impl Borrow<ExprContext<'c, 's>>)>,
+/// PostgreSQL has no operator that compares numeric with an array. An
+/// explicit COLLATE is also an error when any of the values has a custom type
+/// that takes no COLLATE, such as `d = '2024-01-02' COLLATE nocase` for a
+/// date column d.
+fn common_type_ordering<'a, 'c, 's: 'c, C: Borrow<ExprContext<'c, 's>>>(
+    exprs: impl IntoIterator<Item = (&'a Expr, C)> + Clone,
 ) -> Result<Option<TypeOrdering>> {
-    let mut has_collate = false;
-    // Most comparisons have two operands; keep their orders off the heap.
-    let orders: SmallVec<[OperandOrder; 2]> = exprs
+    let has_collate = exprs
+        .clone()
         .into_iter()
-        .map(|(expr, context)| {
-            has_collate |= has_collate_operator(expr);
-            expr_operand_order(expr, context.borrow())
-        })
-        .collect();
+        .any(|(expr, _)| has_collate_operator(expr));
+    // Most comparisons have two operands; keep their orders off the heap.
+    let mut orders: SmallVec<[OperandOrder; 2]> = SmallVec::new();
+    for (expr, context) in exprs {
+        let context = context.borrow();
+        let ty = type_of(expr, &context.type_env());
+        if has_collate {
+            check_type_accepts_collate(&ty, context.schema())?;
+        }
+        orders.push(operand_order(&ty, context.schema()));
+    }
     common_ordering(orders, has_collate)
 }
 
@@ -698,14 +712,19 @@ fn common_ordering(
     Ok(found)
 }
 
-/// How the values of a table or index column compare: the order of its type
-/// when it has one, otherwise the explicit COLLATE, if any. A type with its own
-/// order doesn't accept a COLLATE.
+/// How the values of a table or index column of type `ty` compare: the order
+/// of its type when it has one, otherwise the explicit COLLATE, if any. A type
+/// with its own order doesn't accept a COLLATE, and neither does a custom type
+/// that isn't text.
 pub(crate) fn key_collation(
     explicit_collation: Option<TextCollation>,
-    ordering: Option<TypeOrdering>,
+    ty: &ExprType,
+    schema: &Schema,
 ) -> Result<Option<CollationSeq>> {
-    match (ordering, explicit_collation) {
+    if explicit_collation.is_some() {
+        check_type_accepts_collate(ty, schema)?;
+    }
+    match (type_ordering(ty, schema), explicit_collation) {
         (Some(ordering), Some(_)) => Err(LimboError::ParseError(format!(
             "collations are not supported by type {}",
             ordering.name()
@@ -713,6 +732,23 @@ pub(crate) fn key_collation(
         (Some(ordering), None) => Ok(Some(CollationSeq::Type(ordering))),
         (None, explicit_collation) => Ok(explicit_collation.map(CollationSeq::Text)),
     }
+}
+
+/// Fails when `ty` is a custom type whose values take no COLLATE, as in
+/// PostgreSQL, where only text types take one: `date`, `uuid` and a type with
+/// an integer base don't, `varchar` and a type with a text base do. Arrays
+/// and SQLite's own types are left to the rules for their order.
+pub(crate) fn check_type_accepts_collate(ty: &ExprType, schema: &Schema) -> Result<()> {
+    let ExprType::Custom { type_def, .. } = ty else {
+        return Ok(());
+    };
+    if schema.type_accepts_collate(type_def)? {
+        return Ok(());
+    }
+    Err(LimboError::ParseError(format!(
+        "collations are not supported by type {}",
+        type_def.name
+    )))
 }
 
 fn cannot_compare(a: TypeOrdering, b: TypeOrdering) -> LimboError {
@@ -733,11 +769,6 @@ enum OperandOrder {
     /// column without a type. It compares with the order of the other values'
     /// array type, or as an array of numbers when there is none.
     ArrayOfUnknownElements,
-}
-
-fn expr_operand_order(expr: &Expr, context: &ExprContext<'_, '_>) -> OperandOrder {
-    let ty = type_of(expr, &context.type_env());
-    operand_order(&ty, context.schema())
 }
 
 fn operand_order(ty: &ExprType, schema: &Schema) -> OperandOrder {

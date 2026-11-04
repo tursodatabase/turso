@@ -994,4 +994,234 @@ mod tests {
             conn.close().unwrap();
         }
     }
+
+    /// Only text types take a COLLATE, as in PostgreSQL. Tries every kind of
+    /// column type in every place a COLLATE can be written: a custom type
+    /// that isn't text refuses it, and every other type behaves as before.
+    #[test]
+    fn test_collate_only_on_text_types() {
+        enum Collate {
+            Accepted,
+            /// Refused with an error that names this type.
+            Refused(&'static str),
+            /// An array: refused, naming this order, wherever its values are
+            /// compared, and accepted elsewhere.
+            Array(&'static str),
+        }
+        struct Kind {
+            ty: &'static str,
+            strict: bool,
+            stored: &'static str,
+            /// A value that equals `stored` under NOCASE.
+            probe: &'static str,
+            collate: Collate,
+        }
+        let kinds = [
+            Kind {
+                ty: "text",
+                strict: true,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "integer",
+                strict: true,
+                stored: "1",
+                probe: "1",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "date",
+                strict: false,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "varchar(10)",
+                strict: true,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "label",
+                strict: true,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "short_text",
+                strict: true,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "plain_text",
+                strict: true,
+                stored: "'ABC'",
+                probe: "'abc'",
+                collate: Collate::Accepted,
+            },
+            Kind {
+                ty: "date",
+                strict: true,
+                stored: "'2024-01-02'",
+                probe: "'2024-01-02'",
+                collate: Collate::Refused("date"),
+            },
+            Kind {
+                ty: "uuid",
+                strict: true,
+                stored: "'01945ca0-3189-76c0-9a8f-caf310fc8b8e'",
+                probe: "'01945ca0-3189-76c0-9a8f-caf310fc8b8e'",
+                collate: Collate::Refused("uuid"),
+            },
+            Kind {
+                ty: "cents",
+                strict: true,
+                stored: "1",
+                probe: "1",
+                collate: Collate::Refused("cents"),
+            },
+            Kind {
+                ty: "day",
+                strict: true,
+                stored: "'2024-01-02'",
+                probe: "'2024-01-02'",
+                collate: Collate::Refused("day"),
+            },
+            Kind {
+                ty: "integer[]",
+                strict: true,
+                stored: "ARRAY[1]",
+                probe: "ARRAY[1]",
+                collate: Collate::Array("array"),
+            },
+            Kind {
+                ty: "text[]",
+                strict: true,
+                stored: "ARRAY['ABC']",
+                probe: "ARRAY['abc']",
+                collate: Collate::Array("text_array"),
+            },
+        ];
+        // (statement, whether it compares values of the column, whether it
+        // returns the count 1 when accepted). `{n}` keeps the names of
+        // created objects apart.
+        let places = [
+            (
+                "SELECT count(*) FROM t WHERE c = {probe} COLLATE NOCASE",
+                true,
+                true,
+            ),
+            (
+                "SELECT count(*) FROM t WHERE c COLLATE NOCASE = {probe}",
+                true,
+                true,
+            ),
+            (
+                "SELECT count(*) FROM t WHERE c COLLATE NOCASE IN ({probe})",
+                true,
+                true,
+            ),
+            // An IN list compares with the collation of its left side only.
+            (
+                "SELECT count(*) FROM t WHERE c IN ({probe} COLLATE NOCASE)",
+                true,
+                false,
+            ),
+            (
+                "SELECT count(*) FROM t WHERE c IN (SELECT {probe} COLLATE NOCASE)",
+                true,
+                true,
+            ),
+            ("SELECT c COLLATE NOCASE FROM t", false, false),
+            ("SELECT c FROM t ORDER BY c COLLATE NOCASE", true, false),
+            (
+                "SELECT count(*) FROM t GROUP BY c COLLATE NOCASE",
+                true,
+                true,
+            ),
+            ("SELECT DISTINCT c COLLATE NOCASE FROM t", true, false),
+            (
+                "CREATE TABLE t{n}(c {ty} COLLATE NOCASE){strict}",
+                true,
+                false,
+            ),
+            (
+                "CREATE TABLE t{n}(c {ty}, UNIQUE(c COLLATE NOCASE)){strict}",
+                true,
+                false,
+            ),
+            // Two key columns, because a key of only an integer[] column is
+            // taken for a rowid alias (#11315).
+            (
+                "CREATE TABLE t{n}(c {ty}, k integer, PRIMARY KEY(c COLLATE NOCASE, k)){strict}",
+                true,
+                false,
+            ),
+            ("CREATE INDEX i{n} ON t(c COLLATE NOCASE)", true, false),
+            (
+                "ALTER TABLE t ADD COLUMN c{n} {ty} COLLATE NOCASE",
+                true,
+                false,
+            ),
+        ];
+        for kind in &kinds {
+            let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+            let db = TempDatabase::builder().with_opts(opts).build();
+            let conn = db.connect_limbo();
+            let strict = if kind.strict { " STRICT" } else { "" };
+            conn.execute(
+                "CREATE TYPE label(value text) BASE text ENCODE value DECODE value OPERATOR '<';
+                 CREATE TYPE cents(value integer) BASE integer ENCODE value * 100 DECODE value / 100 OPERATOR '<';
+                 CREATE DOMAIN short_text AS varchar;
+                 CREATE DOMAIN plain_text AS text;
+                 CREATE DOMAIN day AS date;",
+            )
+            .unwrap();
+            conn.execute(format!("CREATE TABLE t(c {}){strict}", kind.ty))
+                .unwrap();
+            conn.execute(format!("INSERT INTO t VALUES ({})", kind.stored))
+                .unwrap();
+            for (n, (place, compares, counts_rows)) in places.iter().enumerate() {
+                let sql = place
+                    .replace("{n}", &n.to_string())
+                    .replace("{ty}", kind.ty)
+                    .replace("{probe}", kind.probe)
+                    .replace("{strict}", strict);
+                let context = format!("type {} (strict={}): {sql}", kind.ty, kind.strict);
+                let refused_by = match kind.collate {
+                    Collate::Accepted => None,
+                    Collate::Refused(name) => Some(name),
+                    Collate::Array(order) => compares.then_some(order),
+                };
+                match refused_by {
+                    Some(name) => {
+                        let error = match conn.prepare(&sql) {
+                            Ok(_) => panic!("{context}: expected an error"),
+                            Err(error) => error.to_string(),
+                        };
+                        assert!(
+                            error.contains(&format!("collations are not supported by type {name}")),
+                            "{context}: {error}"
+                        );
+                    }
+                    None if *counts_rows => {
+                        let rows: Vec<(i64,)> = conn.exec_rows(&sql);
+                        assert_eq!(rows, vec![(1,)], "{context}");
+                    }
+                    None => {
+                        if let Err(error) = conn.execute(&sql) {
+                            panic!("{context}: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
