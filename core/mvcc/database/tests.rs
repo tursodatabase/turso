@@ -1,5 +1,5 @@
 use crate::namespace::NamespaceId;
-use crate::SqliteDialect;
+use crate::EngineDialect;
 use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
@@ -86,7 +86,7 @@ impl YieldInjector for FixedYieldInjector {
 }
 
 fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) {
-    let mut state = crate::dialect::sqlite::attach::AttachDatabaseState::default();
+    let mut state = crate::attach::AttachDatabaseState::default();
     loop {
         match conn.attach_database(path, alias, &mut state).unwrap() {
             crate::IOResult::Done(()) => return,
@@ -544,7 +544,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         // Enable MVCC via PRAGMA
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -1651,7 +1651,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         // Enable MVCC via PRAGMA
@@ -1695,7 +1695,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         // Enable MVCC via PRAGMA
@@ -1727,7 +1727,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             Some(enc_opts.clone()),
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
@@ -1787,7 +1787,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             opts,
             Some(enc_opts.clone()),
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let encryption_key = EncryptionKey::from_hex_string(hex_key).unwrap();
@@ -1820,7 +1820,7 @@ impl MvccTestDbNoConn {
             OpenFlags::default(),
             self.opts,
             self.enc_opts.clone(),
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )?;
         self.db.replace(db);
         Ok(())
@@ -2841,7 +2841,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
 
     {
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io, &db_path_str, Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
             .unwrap();
@@ -2854,7 +2854,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
     remove_file_from_database_registry(&db_path_str);
     {
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(io, &db_path_str, Arc::new(EngineDialect)).unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
@@ -2862,7 +2862,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
 
     remove_file_from_database_registry(&db_path_str);
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, &db_path_str, Arc::new(EngineDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
     let meta = get_rows(
         &conn,
@@ -3246,7 +3246,7 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
         OpenFlags::default(),
         DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .expect("open should recover, not fail closed");
     let conn = db
@@ -3277,7 +3277,7 @@ fn test_full_checkpoint_reopen_recovers_truncate_mode() {
     remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))
+    let db = Database::open_file(io, &db_path, Arc::new(EngineDialect))
         .expect("FULL checkpoint reopen should recover");
     let conn = db
         .connect(ConnectOpts::new())
@@ -3377,7 +3377,7 @@ fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
     remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
+    match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
         Ok(db) => match db.connect(ConnectOpts::new()) {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
@@ -3415,7 +3415,7 @@ fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
     remove_file_from_database_registry(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
+    match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
         Ok(db) => match db.connect(ConnectOpts::new()) {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
@@ -3483,7 +3483,7 @@ fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     let db2 =
-        Database::open_file(io, &db_path, Arc::new(SqliteDialect)).expect("open should succeed");
+        Database::open_file(io, &db_path, Arc::new(EngineDialect)).expect("open should succeed");
     let conn2 = db2
         .connect(ConnectOpts::new())
         .expect("connect should succeed");
@@ -3947,7 +3947,7 @@ fn test_begin_concurrent_on_readonly_connection_reads() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     {
@@ -3967,7 +3967,7 @@ fn test_begin_concurrent_on_readonly_connection_reads() {
         OpenFlags::default() | OpenFlags::ReadOnly,
         DatabaseOpts::new(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -4152,7 +4152,7 @@ fn test_meta_recovery_case_3_no_wal_log_frames_without_valid_metadata_fails_clos
     // Ensure cold open after artifact tamper.
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
+    match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
         Ok(db2) => match db2.connect(ConnectOpts::new()) {
             Ok(_) => panic!("expected connect to fail with Corrupt"),
             Err(err) => assert!(
@@ -4234,7 +4234,7 @@ fn test_meta_recovery_case_5_committed_wal_missing_metadata_fails_closed() {
 
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
+    match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
         Ok(db2) => match db2.connect(ConnectOpts::new()) {
             Ok(_) => panic!("expected connect to fail closed"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
@@ -4270,7 +4270,7 @@ fn test_meta_recovery_case_6_committed_wal_corrupt_metadata_fails_closed() {
     // Ensure cold open after artifact tamper.
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    if Database::open_file(io, &db_path, Arc::new(SqliteDialect))
+    if Database::open_file(io, &db_path, Arc::new(EngineDialect))
         .is_ok_and(|db2| db2.connect(ConnectOpts::new()).is_ok())
     {
         panic!("expected connect to fail closed")
@@ -4300,7 +4300,7 @@ fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
     // Ensure cold open after artifact tamper.
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    if Database::open_file(io, &db_path, Arc::new(SqliteDialect))
+    if Database::open_file(io, &db_path, Arc::new(EngineDialect))
         .is_ok_and(|db2| db2.connect(ConnectOpts::new()).is_ok())
     {
         panic!("expected connect to fail closed")
@@ -4334,7 +4334,7 @@ fn test_meta_recovery_case_9_metadata_row_deleted_fails_closed() {
 
     remove_file_from_database_registry(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
-    match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
+    match Database::open_file(io, &db_path, Arc::new(EngineDialect)) {
         Ok(db2) => match db2.connect(ConnectOpts::new()) {
             Ok(_) => panic!("expected connect to fail closed"),
             Err(err) => assert!(matches!(err, LimboError::Corrupt(_))),
@@ -11030,7 +11030,7 @@ fn test_integrity_check_after_drop_autoincrement_table_before_checkpoint() {
 fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:interrupted-drop-table-schema-rollback";
-    let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
 
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -11076,7 +11076,7 @@ fn test_interrupted_drop_table_rolls_back_schema_table_and_indexes() {
 
     // Reopening used to fail here because the same-connection SELECT could
     // commit the interrupted DROP TABLE's partial sqlite_schema delete.
-    let db = Database::open_file(io, path, Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, path, Arc::new(EngineDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
     let target_schema_rows = get_rows(
         &conn,
@@ -15748,7 +15748,7 @@ fn test_abandoned_journal_mode_mvcc_bootstrap_restores_connection() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -16886,7 +16886,7 @@ fn test_abandoned_drop() {
     let _ = tracing_subscriber::fmt::try_init();
     let io = Arc::new(MemoryIO::new());
     let path = ":memory:";
-    let db = Database::open_file(io.clone(), path, Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io.clone(), path, Arc::new(EngineDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
 
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
@@ -16920,7 +16920,7 @@ fn test_abandoned_drop() {
     drop(conn);
     drop(db);
 
-    let db = Database::open_file(io, path, Arc::new(SqliteDialect)).expect(
+    let db = Database::open_file(io, path, Arc::new(EngineDialect)).expect(
         "reopen should not fail; abandoned DROP must not have committed its partial Delete",
     );
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -17261,7 +17261,7 @@ fn test_autoincrement_insert_works_for_preexisting_table() {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -17283,7 +17283,7 @@ fn test_autoincrement_insert_works_for_preexisting_table() {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -18056,7 +18056,7 @@ fn test_mvcc_late_encryption_setup_keeps_metadata_bootstrapped() {
         OpenFlags::default(),
         opts,
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -18551,7 +18551,7 @@ fn test_mvcc_portable_changes_encoder_matches_metadata_wire_golden() {
 #[test]
 fn test_mvcc_portable_changes_disabled_by_default() {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, portable_changes TEXT)")
@@ -18689,7 +18689,7 @@ fn test_mvcc_portable_changes_resolve_rows_through_object_map_in_same_txn() {
 #[test]
 fn test_mvcc_mode_supports_cdc_for_client_push() {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.execute("PRAGMA capture_data_changes_conn('full,turso_cdc')")
@@ -18887,7 +18887,7 @@ fn test_mvcc_portable_changes_use_checkpointed_schema_after_restart() {
 #[test]
 fn test_mvcc_portable_changes_resolve_user_table_after_cross_connection_checkpoint() {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
     let creator = db.connect(ConnectOpts::new()).unwrap();
     creator.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     creator.set_portable_logical_changes_enabled(true);
@@ -19175,7 +19175,7 @@ fn test_mvcc_portable_changes_mark_internal_only_commits_explicitly() {
 #[test]
 fn test_mvcc_portable_changes_metadata_does_not_auto_enable_or_get_consumed() {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
     let conn = db.connect(ConnectOpts::new()).unwrap();
     conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     conn.set_mvcc_log_meta("client".to_string(), Some("client-a".to_string()));
@@ -20861,7 +20861,7 @@ fn test_open_with_mvcc_option_converts_fresh_database() {
         OpenFlags::default(),
         DatabaseOpts::new().with_mvcc(true),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     assert!(
@@ -20887,7 +20887,7 @@ fn test_open_with_mvcc_option_converts_fresh_database() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     assert!(db.mvcc_enabled());
@@ -20907,7 +20907,7 @@ fn test_open_with_mvcc_option_converts_existing_wal_database() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     assert!(!db.mvcc_enabled());
@@ -20926,7 +20926,7 @@ fn test_open_with_mvcc_option_converts_existing_wal_database() {
         OpenFlags::default(),
         DatabaseOpts::new().with_mvcc(true),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     assert!(db.mvcc_enabled(), "open must convert the WAL database");
@@ -20953,7 +20953,7 @@ fn test_open_with_mvcc_option_readonly_keeps_current_mode() {
         OpenFlags::default(),
         DatabaseOpts::new(),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     {
@@ -20970,7 +20970,7 @@ fn test_open_with_mvcc_option_readonly_keeps_current_mode() {
         OpenFlags::default() | OpenFlags::ReadOnly,
         DatabaseOpts::new().with_mvcc(true),
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     assert!(
@@ -21751,7 +21751,7 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -21775,7 +21775,7 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
     let db = Database::open(
         io,
         &path_str,
-        crate::OpenOptions::new(Arc::new(SqliteDialect))
+        crate::OpenOptions::new(Arc::new(EngineDialect))
             .durable_storage(busy_storage.clone() as Arc<dyn DurableStorage>),
     )
     .unwrap();
@@ -21962,7 +21962,7 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         Database::open(
             io,
             path,
-            crate::OpenOptions::new(Arc::new(SqliteDialect))
+            crate::OpenOptions::new(Arc::new(EngineDialect))
                 .durable_storage(storage.clone() as Arc<dyn DurableStorage>),
         )
         .unwrap()
@@ -22012,7 +22012,7 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -24401,7 +24401,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
             OpenFlags::default(),
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -24424,7 +24424,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
     let db = Database::open(
         io,
         &path_str,
-        crate::OpenOptions::new(Arc::new(SqliteDialect))
+        crate::OpenOptions::new(Arc::new(EngineDialect))
             .durable_storage(observe.clone() as Arc<dyn DurableStorage>),
     )
     .unwrap();
@@ -25121,7 +25121,7 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
         let db = Database::open(
             io,
             &path,
-            crate::OpenOptions::new(Arc::new(SqliteDialect))
+            crate::OpenOptions::new(Arc::new(EngineDialect))
                 .db_opts(opts)
                 .allocators(crate::DatabaseAllocators {
                     mv_store: crate::alloc::DynAllocator::new(OneShotFaultAlloc(fault.clone())),
@@ -25256,7 +25256,7 @@ fn update_survives_restart_when_prune_cannot_mark_its_key_again() {
         OpenFlags::default(),
         opts,
         None,
-        Arc::new(SqliteDialect),
+        Arc::new(EngineDialect),
     )
     .unwrap();
     let rows = get_rows(

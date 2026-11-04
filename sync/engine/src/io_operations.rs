@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use turso_core::{Completion, LimboError, OpenFlags};
 

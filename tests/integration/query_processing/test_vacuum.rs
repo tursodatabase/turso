@@ -9,11 +9,11 @@ use asserting::prelude::*;
 use rusqlite::Connection as SqliteConnection;
 use std::{path::Path, sync::Arc};
 use tempfile::TempDir;
-use turso_core::SqliteDialect;
 use turso_core::{
     ConnectOpts, Connection, Database, DatabaseOpts, EncryptionOpts, LimboError, StepResult, Value,
 };
 use turso_parser::{ast::Cmd, parser::Parser};
+use turso_sqlite::SqliteDialect;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedSchemaRow {

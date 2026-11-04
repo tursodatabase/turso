@@ -5331,10 +5331,10 @@ impl SymbolTable {
 #[cfg(all(test, feature = "fs"))]
 mod tests {
     use super::*;
-    use crate::dialect::sqlite::attach::AttachDatabaseState;
+    use crate::attach::AttachDatabaseState;
     use crate::ConnectOpts;
+    use crate::EngineDialect;
     use crate::IOResult;
-    use crate::SqliteDialect;
     use tempfile::TempDir;
 
     fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
@@ -5345,7 +5345,7 @@ mod tests {
             OpenFlags::default(),
             opts,
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         db.connect(ConnectOpts::new()).unwrap()
@@ -5416,9 +5416,9 @@ mod tests {
     fn test_named_memory_databases_on_same_io_are_distinct() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let draft_db =
-            Database::open_file(io.clone(), ":memory:sync-draft", Arc::new(SqliteDialect)).unwrap();
+            Database::open_file(io.clone(), ":memory:sync-draft", Arc::new(EngineDialect)).unwrap();
         let synced_db =
-            Database::open_file(io, ":memory:sync-synced", Arc::new(SqliteDialect)).unwrap();
+            Database::open_file(io, ":memory:sync-synced", Arc::new(EngineDialect)).unwrap();
         assert!(!Arc::ptr_eq(&draft_db, &synced_db));
 
         let draft = draft_db.connect(ConnectOpts::new()).unwrap();
@@ -5448,13 +5448,13 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
 
         let first_db =
-            Database::open_file(io.clone(), ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
+            Database::open_file(io.clone(), ":memory:reopen", Arc::new(EngineDialect)).unwrap();
         let first = first_db.connect(ConnectOpts::new()).unwrap();
         first
             .execute("CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(99)")
             .unwrap();
 
-        let second_db = Database::open_file(io, ":memory:reopen", Arc::new(SqliteDialect)).unwrap();
+        let second_db = Database::open_file(io, ":memory:reopen", Arc::new(EngineDialect)).unwrap();
         let second = second_db.connect(ConnectOpts::new()).unwrap();
         assert_eq!(query_single_i64(&second, "SELECT x FROM t"), 99);
     }
@@ -5549,7 +5549,7 @@ mod tests {
             OpenFlags::default(),
             DatabaseOpts::new().with_attach(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();

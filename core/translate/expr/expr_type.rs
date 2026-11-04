@@ -183,7 +183,7 @@ impl<'a> TypeEnv<'a> {
             // The schema is read without the connection's dialect. Both
             // dialects resolve built-in functions the same way.
             Self::Table { syms, .. } | Self::TypeBody { syms, .. } => {
-                match crate::dialect::sqlite::resolve_builtin_function(name, arg_count)? {
+                match crate::dialect::engine::resolve_builtin_function(name, arg_count)? {
                     Some(func) => Ok(Some(func)),
                     None => Ok(syms.resolve_function(name, arg_count).map(Func::External)),
                 }
@@ -1485,7 +1485,7 @@ mod tests {
             &syms,
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(crate::dialect::SqliteDialect),
+            Arc::new(crate::EngineDialect),
             None,
         );
         let env = TypeEnv::new(None, &resolver);

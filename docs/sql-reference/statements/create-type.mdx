@@ -154,7 +154,7 @@ A user-defined type has no arithmetic operators. `+`, `-`, `*`, `/`, `%`, `&`, `
 CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
 CREATE TABLE t(c cents) STRICT;
 SELECT c + 1 FROM t;
--- Parse error: operator does not exist: cents + integer
+-- operator does not exist: cents + integer
 ```
 
 The built-in types `date`, `numeric`, `smallint` and `bigint` have arithmetic operators. The operator is chosen once, when the statement is compiled:

@@ -455,7 +455,7 @@ pub(crate) fn emit_refill_index(
             }),
             unmatched_right_rows_plan: None,
             table: Table::BTree(tbl.clone()),
-            identifier: tbl_name.clone(),
+            identifier: tbl_name,
             has_alias: false,
             internal_id: table_ref,
             join_info: None,
@@ -694,7 +694,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::Halt {
                 constraint_info: None,
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
-                description: format_unique_violation_desc(tbl_name.as_str(), idx),
+                description: format_unique_violation_desc(tbl, idx),
                 on_error: None,
                 description_reg: None,
             });

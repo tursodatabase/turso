@@ -120,8 +120,7 @@ use crate::translate::collate::{key_collation, CollationSeq, TextCollation};
 use crate::translate::expr::expr_type::{value_type, BuiltinType, ExprType};
 use crate::translate::plan::{BitSet, ColumnMask, Plan, TableReferences};
 use crate::util::{
-    column_declared_type, is_rowid_alias_type, module_args_from_sql, module_name_from_sql,
-    type_from_name, UnparsedFromSqlIndex,
+    column_declared_type, is_rowid_alias_type, type_from_name, UnparsedFromSqlIndex,
 };
 use crate::Result;
 use crate::{bail_parse_error, LimboError, MvCursor, Pager, SymbolTable, ValueRef, VirtualTable};
@@ -1311,7 +1310,7 @@ impl Schema {
     /// bug). Production code that opens user databases should prefer
     /// [`Schema::with_options`] which returns `Result`.
     pub fn new() -> Self {
-        Self::with_options(true, &crate::dialect::SqliteDialect)
+        Self::with_options(true, &crate::dialect::EngineDialect)
             .expect("built-in type definitions are malformed")
     }
 
@@ -3925,14 +3924,14 @@ impl Schema {
                 // Classify on the root page before touching the SQL text so
                 // only the B-tree arm needs to parse the row's stored SQL.
                 if root_page == 0 {
-                    match Parser::new(sql.as_bytes()).next_cmd()? {
-                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(_))) => {}
+                    let create_vtab = match Parser::new(sql.as_bytes()).next_cmd()? {
+                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(create_vtab))) => create_vtab,
                         other => {
                             return Err(LimboError::Corrupt(format!(
                                 "sqlite_schema table row {name} with root page 0 has unexpected SQL {sql:?}: parsed as {other:?}"
                             )));
                         }
-                    }
+                    };
 
                     // a virtual table is found in the sqlite_schema, but it's no
                     // longer in the in-memory schema. We need to recreate it if
@@ -3940,11 +3939,17 @@ impl Schema {
                     let vtab = if let Some(vtab) = syms.vtabs.get(name) {
                         vtab.clone()
                     } else {
-                        let mod_name = module_name_from_sql(sql)?;
+                        // Like SQLite, the module receives the argument text exactly
+                        // as written, the same as when the table was created.
+                        let args = create_vtab
+                            .args
+                            .into_iter()
+                            .map(crate::Value::from_text)
+                            .collect();
                         crate::VirtualTable::table(
                             Some(name),
-                            mod_name,
-                            module_args_from_sql(sql)?,
+                            create_vtab.module_name.as_str(),
+                            args,
                             syms,
                         )?
                     };
@@ -5563,6 +5568,21 @@ impl BTreeTable {
             .iter()
             .enumerate()
             .find(|(_, column)| column.is_rowid_alias())
+    }
+
+    /// Whether `index` is the automatic index that enforces this table's
+    /// PRIMARY KEY. An INTEGER PRIMARY KEY is the rowid and has no such index.
+    pub fn is_primary_key_index(&self, index: &Index) -> bool {
+        self.get_rowid_alias_column().is_none()
+            && index
+                .name
+                .starts_with(crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+            && index.columns.len() == self.primary_key_columns.len()
+            && index
+                .columns
+                .iter()
+                .zip(&self.primary_key_columns)
+                .all(|(index_col, (pk_col, _))| index_col.name.eq_ignore_ascii_case(pk_col))
     }
 
     pub fn has_virtual_columns(&self) -> bool {
@@ -8672,8 +8692,8 @@ mod tests {
     #[test]
     fn builtin_types_read_as_the_kind_their_decode_gives() {
         use crate::{
-            translate::expr::expr_type::value_type, ConnectOpts, Database, DatabaseOpts, MemoryIO,
-            OpenFlags, SqliteDialect, IO, MAIN_DB_ID,
+            translate::expr::expr_type::value_type, ConnectOpts, Database, DatabaseOpts,
+            EngineDialect, MemoryIO, OpenFlags, IO, MAIN_DB_ID,
         };
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file_with_flags(
@@ -8682,7 +8702,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new().with_custom_types(true),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(EngineDialect),
         )
         .unwrap();
         let conn = db.connect(ConnectOpts::new()).unwrap();
@@ -10027,7 +10047,7 @@ mod tests {
                 &mut HashMap::default(),
                 &mut HashMap::default(),
                 &|_| None,
-                &crate::dialect::SqliteDialect,
+                &crate::EngineDialect,
             )
             .unwrap();
 
@@ -10052,7 +10072,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
-            &crate::dialect::SqliteDialect,
+            &crate::EngineDialect,
         );
         assert!(result
             .unwrap_err()
@@ -10080,7 +10100,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
-            &crate::dialect::SqliteDialect,
+            &crate::EngineDialect,
         );
         assert!(result.is_err());
         assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
@@ -10103,7 +10123,7 @@ mod tests {
             &mut HashMap::default(),
             &mut HashMap::default(),
             &|_| None,
-            &crate::dialect::SqliteDialect,
+            &crate::EngineDialect,
         );
         assert!(result.is_err());
         assert!(schema.get_table(NamespaceId::ROOT, "v1").is_none());
@@ -10129,7 +10149,7 @@ mod tests {
                 &mut HashMap::default(),
                 &mut HashMap::default(),
                 &|_| None,
-                &crate::dialect::SqliteDialect,
+                &crate::EngineDialect,
             )
             .unwrap();
         let table = schema.get_btree_table(NamespaceId::ROOT, "t1").unwrap();
@@ -10582,7 +10602,7 @@ mod tests {
                 &mut HashMap::default(),
                 &mut HashMap::default(),
                 &|_| None,
-                &crate::dialect::SqliteDialect,
+                &crate::EngineDialect,
             )
             .unwrap();
 

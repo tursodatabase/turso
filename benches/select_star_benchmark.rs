@@ -18,9 +18,8 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use turso_core::{
-    ConnectOpts, Connection, Database, PlatformIO, SqliteDialect, Statement, StepResult, Value,
-};
+use turso_core::{ConnectOpts, Connection, Database, PlatformIO, Statement, StepResult, Value};
+use turso_sqlite::SqliteDialect;
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]

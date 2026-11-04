@@ -7,7 +7,7 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use turso_core::SqliteDialect;
+use turso_sqlite::SqliteDialect;
 
 use indexmap::IndexSet;
 use itertools::Itertools;

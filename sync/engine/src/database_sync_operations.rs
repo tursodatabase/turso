@@ -4005,7 +4005,7 @@ mod tests {
         collections::BTreeMap,
         sync::{Arc, Mutex},
     };
-    use turso_core::SqliteDialect;
+    use turso_sqlite::SqliteDialect;
 
     use bytes::{Bytes, BytesMut};
     use prost::Message;

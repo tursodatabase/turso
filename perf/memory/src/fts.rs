@@ -10,6 +10,7 @@ use turso_core::ConnectOpts;
 use turso_core::IO;
 
 use crate::workload::JournalMode;
+use turso_sqlite::SqliteDialect;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -381,7 +382,7 @@ impl FtsFixture {
         let db = turso_core::Database::open(
             io.clone(),
             self.directory.path().join("fts.db").to_str().unwrap(),
-            turso_core::OpenOptions::new(Arc::new(turso_core::SqliteDialect))
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
                 .db_opts(turso_core::DatabaseOpts::new().with_index_method(true)),
         )?;
         let conn = db.connect(ConnectOpts::new())?;

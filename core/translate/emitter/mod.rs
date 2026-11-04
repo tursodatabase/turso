@@ -359,7 +359,7 @@ impl Resolver<'static> {
             Box::leak(Box::new(SymbolTable::new())),
             true,
             DoubleQuotedDml::Enabled,
-            Arc::new(crate::dialect::SqliteDialect),
+            Arc::new(crate::EngineDialect),
             None,
         )
     }
