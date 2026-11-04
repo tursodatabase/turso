@@ -47,6 +47,20 @@ pub enum ValueType {
     Error,
 }
 
+impl ValueType {
+    /// The kind of value a STRICT column declared `type_name` stores: INTEGER,
+    /// INT, REAL, TEXT or BLOB. None for ANY and every other name.
+    pub fn stored_by_strict_column(type_name: &str) -> Option<Self> {
+        turso_macros::match_ignore_ascii_case!(match type_name.as_bytes() {
+            b"INTEGER" | b"INT" => Some(Self::Integer),
+            b"REAL" => Some(Self::Float),
+            b"BLOB" => Some(Self::Blob),
+            b"TEXT" => Some(Self::Text),
+            _ => None,
+        })
+    }
+}
+
 impl Display for ValueType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {

@@ -435,6 +435,18 @@ impl ResolvedType {
         self.chain.iter().find(|type_def| !type_def.is_domain)
     }
 
+    /// The kind of value the type stores: the kind of its BASE, or of the
+    /// plain type a domain is based on.
+    pub fn stored_value_type(&self) -> crate::Result<crate::types::ValueType> {
+        crate::types::ValueType::stored_by_strict_column(&self.primitive).ok_or_else(|| {
+            crate::LimboError::InternalError(format!(
+                "type {} is based on {}, which is not a STRICT column type",
+                self.leaf().name,
+                self.primitive
+            ))
+        })
+    }
+
     pub fn reads_stored_values_unchanged(&self) -> bool {
         self.chain.iter().all(|td| {
             matches!(td.kind, TypeDefKind::Custom { .. }) && td.decode_returns_value_unchanged()
@@ -7458,15 +7470,7 @@ impl Column {
     }
 
     pub fn strict_value_type(&self) -> Option<crate::types::ValueType> {
-        use crate::types::ValueType;
-        turso_macros::match_ignore_ascii_case!(match self.ty_str.as_bytes() {
-            b"INTEGER" | b"INT" => Some(ValueType::Integer),
-            b"REAL" => Some(ValueType::Float),
-            b"BLOB" => Some(ValueType::Blob),
-            b"TEXT" => Some(ValueType::Text),
-            // ANY and custom types
-            _ => None,
-        })
+        crate::types::ValueType::stored_by_strict_column(&self.ty_str)
     }
 
     pub fn new_default_text(

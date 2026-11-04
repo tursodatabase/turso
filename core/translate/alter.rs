@@ -526,6 +526,59 @@ fn emit_add_column_default_type_validation(
     Ok(())
 }
 
+/// Existing rows read the DEFAULT of a column added with a custom type as the
+/// type stores it, so when the table has rows, store the default once here: a
+/// default the type can't store fails the ALTER instead of every later read.
+fn emit_add_column_custom_type_default_check(
+    program: &mut ProgramBuilder,
+    original_btree: &Arc<BTreeTable>,
+    database_id: usize,
+    column: &Column,
+    resolver: &Resolver,
+) -> Result<()> {
+    let Some(default_expr) = column.default.as_ref() else {
+        return Ok(());
+    };
+    if resolver
+        .schema()
+        .resolve_type(&column.ty_str, original_btree.is_strict)?
+        .is_none()
+    {
+        return Ok(());
+    }
+    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: check_cursor_id,
+        root_page: original_btree.root_page,
+        db: database_id,
+    });
+    let skip_check_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: check_cursor_id,
+        pc_if_empty: skip_check_label,
+    });
+    let default_reg = program.alloc_register();
+    translate_expr_no_constant_opt(
+        program,
+        None,
+        default_expr,
+        default_reg,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    )?;
+    crate::translate::expr::emit_custom_type_encode_columns(
+        program,
+        resolver,
+        std::slice::from_ref(column),
+        default_reg,
+        None,
+        &original_btree.name,
+        &ColumnLayout::Identity { column_count: 1 },
+    )?;
+    program.preassign_label_to_next_insn(skip_check_label);
+    Ok(())
+}
+
 /// Validate NOT NULL and CHECK constraints for a new or altered column by
 /// scanning each existing row, computing virtual generated columns as needed.
 #[allow(clippy::too_many_arguments)]
@@ -1436,6 +1489,15 @@ pub fn translate_alter_table(
 
                 if default_type_mismatch {
                     emit_add_column_default_type_validation(program, &original_btree, database_id)?;
+                }
+                if btree.is_strict && !computes_default_for_existing_rows {
+                    emit_add_column_custom_type_default_check(
+                        program,
+                        &original_btree,
+                        database_id,
+                        &column,
+                        resolver,
+                    )?;
                 }
             }
 

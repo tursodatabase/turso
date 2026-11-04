@@ -131,13 +131,13 @@ pub(super) fn emit_array_encode(
     resolver: &Resolver,
     table_name: &str,
 ) -> Result<()> {
-    if let Some(type_def) = resolver.schema().get_type_def_unchecked(&col.ty_str) {
-        if type_def.has_encode_or_coerce() {
+    let resolved = resolver.schema().resolve_type_unchecked(&col.ty_str)?;
+    if let Some(resolved) = &resolved {
+        if resolved.chain.iter().any(|td| td.has_encode_or_coerce()) {
             // Normalize input (text or blob) to blob with ANY affinity first
             program.emit_insn(Insn::ArrayEncode {
                 data: Box::new(ArrayEncodeData {
                     reg,
-                    element_affinity: Affinity::Blob,
                     element_type: "ANY".into(),
                     table_name: table_name.into(),
                     col_name: col.name.as_deref().unwrap_or("").into(),
@@ -145,38 +145,27 @@ pub(super) fn emit_array_encode(
             });
 
             emit_array_element_loop(program, reg, |program, element_reg| {
-                emit_store_value(
-                    program,
-                    std::slice::from_ref(type_def),
-                    element_reg,
-                    &col.ty_params,
-                    resolver,
-                )
+                emit_store_value(program, resolved, element_reg, &col.ty_params, resolver)
             })?;
         }
     }
 
     // ArrayEncode: parse JSON text → validate/coerce → serialize to record blob.
     // For multi-dimensional arrays (e.g. INTEGER[][]), the outer array's elements
-    // are themselves arrays (blobs), so we use ANY/Blob for validation.
-    // Only 1-dimensional arrays validate elements against the declared base type.
-    let is_any = col.ty_str.eq_ignore_ascii_case("ANY");
-    let is_multidim = col.array_dimensions() > 1;
+    // are themselves arrays (blobs), so we use ANY for validation.
+    // Only 1-dimensional arrays validate elements against the declared type,
+    // and elements of a custom type against the type's BASE.
     let col_name = col.name.as_deref().unwrap_or("");
-    let element_affinity = if is_any || is_multidim {
-        Affinity::Blob
-    } else {
-        Affinity::affinity(&col.ty_str)
-    };
-    let element_type = if is_any || is_multidim {
+    let element_type = if col.array_dimensions() > 1 {
         "ANY".into()
+    } else if let Some(resolved) = &resolved {
+        resolved.primitive.to_uppercase().into()
     } else {
         col.ty_str.to_uppercase().into()
     };
     program.emit_insn(Insn::ArrayEncode {
         data: Box::new(ArrayEncodeData {
             reg,
-            element_affinity,
             element_type,
             table_name: table_name.into(),
             col_name: col_name.into(),
@@ -264,7 +253,7 @@ pub(crate) fn emit_custom_type_encode_columns(
             None
         };
 
-        emit_store_value(program, &resolved.chain, reg, &col.ty_params, resolver)?;
+        emit_store_value(program, &resolved, reg, &col.ty_params, resolver)?;
 
         if let Some(label) = skip_label {
             program.preassign_label_to_next_insn(label);

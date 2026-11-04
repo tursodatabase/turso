@@ -193,3 +193,202 @@ expect {
     1|1
     2|0
 }
+
+# ============================================================================
+# The value a type stores has the kind of its BASE: the ENCODE (and COERCE)
+# result is converted as a STRICT column of the BASE converts it, or refused.
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test encode-result-is-stored-as-base {
+    CREATE TYPE iv(value integer) BASE integer ENCODE CAST(value AS text) DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c iv) STRICT;
+    INSERT INTO t VALUES (1, 5);
+    SELECT typeof(c), c FROM t;
+}
+expect {
+    integer|5
+}
+
+test cast-converts-encode-result-to-base {
+    CREATE TYPE iv(value integer) BASE integer ENCODE CAST(value AS text) DECODE value;
+    SELECT typeof(CAST(5 AS iv)), CAST(5 AS iv);
+}
+expect {
+    integer|5
+}
+
+@requires strict "uses STRICT tables"
+test encode-result-that-base-cannot-store-is-refused {
+    CREATE TYPE xv(value integer) BASE integer ENCODE 'x' || value DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c xv) STRICT;
+    INSERT INTO t VALUES (1, 5);
+}
+expect error {
+    cannot store TEXT value as type xv
+}
+
+test cast-refuses-encode-result-that-base-cannot-store {
+    CREATE TYPE xv(value integer) BASE integer ENCODE 'x' || value DECODE value;
+    SELECT CAST(5 AS xv);
+}
+expect error {
+    cannot store TEXT value as type xv
+}
+
+@requires strict "uses STRICT tables"
+test integer-encode-result-is-stored-as-real {
+    CREATE TYPE rv(value real) BASE real ENCODE CAST(value AS integer) DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c rv) STRICT;
+    INSERT INTO t VALUES (1, 5.0);
+    SELECT typeof(c), c FROM t;
+}
+expect {
+    real|5.0
+}
+
+@requires strict "uses STRICT tables"
+test integer-that-real-cannot-hold-exactly-is-refused {
+    CREATE TYPE big(value any) BASE real ENCODE value DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c big) STRICT;
+    INSERT INTO t VALUES (1, 9007199254740993);
+}
+expect error {
+    cannot store 9007199254740993 as type big .BASE REAL.: converting it changes it
+}
+
+@requires strict "uses STRICT tables"
+test coerce-sees-the-converted-value {
+    CREATE TYPE capped(value any) BASE integer COERCE CASE WHEN value > 100 THEN 100 ELSE value END;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c capped) STRICT;
+    INSERT INTO t VALUES (1, '5'), (2, 500);
+    SELECT id, typeof(c), c FROM t ORDER BY id;
+}
+expect {
+    1|integer|5
+    2|integer|100
+}
+
+test cast-to-smallint-converts-before-coerce {
+    SELECT typeof(CAST('5' AS smallint)), CAST('5' AS smallint);
+}
+expect {
+    integer|5
+}
+
+test cast-to-smallint-refuses-a-fraction {
+    SELECT CAST(5.5 AS smallint);
+}
+expect error {
+    cannot store REAL value as type smallint
+}
+
+test cast-to-domain-converts-as-its-base {
+    CREATE DOMAIN d AS integer;
+    SELECT typeof(CAST('7' AS d)), CAST('7' AS d);
+}
+expect {
+    integer|7
+}
+
+test cast-to-domain-refuses-what-its-base-cannot-store {
+    CREATE DOMAIN d AS integer;
+    SELECT CAST('abc' AS d);
+}
+expect error {
+    cannot store TEXT value as type d
+}
+
+@requires strict "uses STRICT tables"
+test domain-over-type-stores-the-type-base {
+    CREATE TYPE iv(value integer) BASE integer ENCODE CAST(value AS text) DECODE value;
+    CREATE DOMAIN div AS iv;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c div) STRICT;
+    INSERT INTO t VALUES (1, 5);
+    SELECT typeof(c), c FROM t;
+}
+expect {
+    integer|5
+}
+
+# The input is checked against the type's `value` type, not its BASE.
+@requires strict "uses STRICT tables"
+test input-is-checked-against-value-type {
+    CREATE TYPE tv(value integer) BASE text ENCODE value DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c tv) STRICT;
+    INSERT INTO t VALUES (1, 5);
+    SELECT typeof(c), c FROM t;
+}
+expect {
+    text|5
+}
+
+@requires strict "uses STRICT tables"
+test text-input-is-stored-as-integer-base {
+    CREATE TYPE xi(value text) BASE integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c xi) STRICT;
+    INSERT INTO t VALUES (1, '5');
+    SELECT typeof(c), c FROM t;
+}
+expect {
+    integer|5
+}
+
+# An index seek encodes its key and converts it to the BASE, as stored values are.
+@requires strict "uses STRICT tables"
+test index-seek-finds-converted-values {
+    CREATE TYPE tx(value integer) BASE integer ENCODE CAST(value AS text) DECODE value OPERATOR '<';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c tx) STRICT;
+    CREATE INDEX tc ON t(c);
+    INSERT INTO t VALUES (1, 5), (2, 6);
+    SELECT id FROM t WHERE c = 5;
+    SELECT id FROM t WHERE c IN (6, 7);
+}
+expect {
+    1
+    2
+}
+
+@requires strict "uses STRICT tables"
+test array-elements-are-stored-as-the-base {
+    CREATE TYPE ip(value text) BASE integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a ip[]) STRICT;
+    INSERT INTO t VALUES (1, '{5}');
+    SELECT typeof(a[1]), a[1] FROM t;
+}
+expect {
+    integer|5
+}
+
+@requires strict "uses STRICT tables"
+test array-elements-the-base-cannot-store-are-refused {
+    CREATE TYPE ip(value text) BASE integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a ip[]) STRICT;
+    INSERT INTO t VALUES (1, '{abc}');
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+@requires strict "uses STRICT tables"
+test added-column-default-is-stored-as-base {
+    CREATE TYPE ai(value any) BASE integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN a ai DEFAULT '5';
+    SELECT typeof(a), a FROM t;
+}
+expect {
+    integer|5
+}
+
+@requires strict "uses STRICT tables"
+test added-column-default-the-type-cannot-store-is-refused {
+    CREATE TYPE ai(value any) BASE integer;
+    CREATE TABLE t(id INTEGER PRIMARY KEY) STRICT;
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN a ai DEFAULT 'abc';
+}
+expect error {
+    cannot store TEXT value as type ai
+}

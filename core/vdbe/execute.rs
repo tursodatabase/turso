@@ -2587,9 +2587,7 @@ pub fn op_type_check(
                 return Ok(());
             }
             if let Some(expected_type) = col.strict_value_type() {
-                let _applied = apply_affinity_char(reg, col.affinity());
-                let value_type = reg.get_value().value_type();
-                if value_type != expected_type {
+                if let Err(value_type) = convert_to_strict_type(reg, expected_type) {
                     bail_constraint_error!(
                         "cannot store {} value in {} column {}.{} ({})",
                         value_type,
@@ -2606,6 +2604,67 @@ pub fn op_type_check(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_convert_to_type(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        ConvertToType {
+            reg,
+            value_type,
+            description
+        },
+        insn
+    );
+    let reg = &mut state.registers[*reg];
+    let number_before = match reg.get_value() {
+        Value::Null => {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        Value::Numeric(number) => Some(*number),
+        Value::Text(_) | Value::Blob(_) => None,
+    };
+    if let Err(actual) = convert_to_strict_type(reg, *value_type) {
+        bail_constraint_error!(
+            "cannot store {} value {} ({})",
+            actual,
+            description,
+            SQLITE_CONSTRAINT
+        );
+    }
+    if let Some(number) = number_before {
+        if !is_same_number(number, reg.get_value()) {
+            bail_constraint_error!(
+                "cannot store {} {}: converting it changes it to {} ({})",
+                Value::Numeric(number),
+                description,
+                reg.get_value(),
+                SQLITE_CONSTRAINT
+            );
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Whether `converted` still is `number`. Converting an integer to REAL loses
+/// digits beyond 2^53, and converting a REAL to TEXT can keep fewer digits
+/// than the number needs.
+fn is_same_number(number: Numeric, converted: &Value) -> bool {
+    match (number, converted) {
+        (Numeric::Integer(i), Value::Numeric(Numeric::Float(f))) => {
+            f64::from(*f) as i128 == i128::from(i)
+        }
+        (Numeric::Float(f), Value::Text(text)) => {
+            text.as_str().parse::<f64>().ok() == Some(f64::from(f))
+        }
+        _ => true,
+    }
 }
 
 pub fn op_is_type(
@@ -2647,7 +2706,6 @@ pub fn op_array_encode(
     load_insn!(ArrayEncode { data }, insn);
     let ArrayEncodeData {
         reg,
-        element_affinity,
         element_type,
         table_name,
         col_name,
@@ -2716,33 +2774,18 @@ pub fn op_array_encode(
             continue;
         }
 
-        // Apply affinity coercion — same as STRICT's TypeCheck
         let mut reg_tmp = Register::Value(elem);
-        apply_affinity_char(&mut reg_tmp, *element_affinity);
-        let coerced = reg_tmp.get_value().clone();
-
-        // Check value type matches the declared element type — same as STRICT's TypeCheck
-        let value_type = coerced.value_type();
-        let ty_bytes = element_type.as_bytes();
-        let type_ok = turso_macros::match_ignore_ascii_case!(match ty_bytes {
-            b"ANY" => true,
-            b"INTEGER" | b"INT" => value_type == ValueType::Integer,
-            b"REAL" => value_type == ValueType::Float,
-            b"TEXT" => value_type == ValueType::Text,
-            b"BLOB" => value_type == ValueType::Blob,
-            _ => true, // custom types validated by their own encode
-        });
-
-        if !type_ok {
-            bail_constraint_error!(
-                "cannot store {} value in {} ({})",
-                value_type,
-                element_type,
-                SQLITE_CONSTRAINT
-            );
+        if let Some(expected_type) = ValueType::stored_by_strict_column(element_type) {
+            if let Err(value_type) = convert_to_strict_type(&mut reg_tmp, expected_type) {
+                bail_constraint_error!(
+                    "cannot store {} value in {} ({})",
+                    value_type,
+                    element_type,
+                    SQLITE_CONSTRAINT
+                );
+            }
         }
-
-        coerced_elements.push(coerced);
+        coerced_elements.push(reg_tmp.get_value().clone());
     }
 
     // Serialize coerced elements as a native record-format BLOB
@@ -2751,6 +2794,27 @@ pub fn op_array_encode(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Converts the non-NULL value in `reg` as a STRICT column storing
+/// `value_type` does: applies that column's affinity, so '5' becomes 5 for
+/// INTEGER and 5 becomes 5.0 for REAL. Returns the value's kind when it still
+/// isn't `value_type`.
+fn convert_to_strict_type(reg: &mut Register, value_type: ValueType) -> Result<(), ValueType> {
+    let affinity = match value_type {
+        ValueType::Integer => Affinity::Integer,
+        ValueType::Float => Affinity::Real,
+        ValueType::Text => Affinity::Text,
+        ValueType::Blob => Affinity::Blob,
+        ValueType::Null | ValueType::Error => {
+            unreachable!("no STRICT column stores {value_type} values")
+        }
+    };
+    apply_affinity_char(reg, affinity);
+    match reg.get_value().value_type() {
+        actual if actual == value_type => Ok(()),
+        actual => Err(actual),
+    }
 }
 
 /// Convert a native record-format array BLOB to PG text representation for display.

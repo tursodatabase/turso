@@ -754,6 +754,19 @@ pub fn insn_to_row(
                 0,
                 String::from(""),
             ),
+            Insn::ConvertToType {
+                reg,
+                value_type,
+                description,
+            } => (
+                "ConvertToType",
+                *reg as i64,
+                0,
+                0,
+                Value::build_text(value_type.to_string()),
+                0,
+                description.clone(),
+            ),
             Insn::ArrayEncode { data } => (
                 "ArrayEncode",
                 data.reg as i64,

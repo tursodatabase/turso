@@ -57,6 +57,24 @@ CREATE TYPE cents BASE integer
     DECODE value / 100;
 ```
 
+The stored value always has the BASE's kind. The result of ENCODE, and of COERCE, is converted as a STRICT column of the BASE converts a value: `'5'` becomes `5` in an `integer` base, and `5` becomes `'5'` in a `text` base. A value the conversion cannot keep is refused instead of stored, such as text that is not a number in an `integer` base, or an integer too large for a `real` base to hold exactly. INSERT, UPDATE, column defaults and CAST all convert the same way, and COERCE sees the converted value.
+
+```sql
+CREATE TYPE iv(value integer) BASE integer
+    ENCODE CAST(value AS text)
+    DECODE value;
+
+SELECT typeof(CAST(5 AS iv));
+-- integer
+
+CREATE TYPE big(value integer) BASE real;
+
+SELECT CAST(9007199254740993 AS big);
+-- Error: cannot store 9007199254740993 as type big (BASE REAL): converting it changes it to 9.00719925474099e+15
+```
+
+A domain stores the BASE of the type it is defined on, or its plain SQL type when it is defined on one.
+
 ### ENCODE / DECODE
 
 The ENCODE expression is evaluated whenever a value is written to a column of this type. The DECODE expression is evaluated whenever a value is read. Both expressions use the identifier `value` to refer to the input.
@@ -219,8 +237,8 @@ CREATE TYPE cents BASE integer
     ENCODE value * 100
     DECODE value / 100;
 
-SELECT CAST(42.5 AS cents);
--- 42.5 (ENCODE gives 4250.0, DECODE gives back 42.5)
+SELECT CAST(42 AS cents);
+-- 42 (ENCODE gives 4200, DECODE gives back 42)
 
 SELECT -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1;
 -- -1.50|2.50
@@ -531,7 +549,7 @@ SELECT data[1][0] FROM matrices;
 -- 3
 ```
 
-Element types are validated on insert — an `INTEGER[]` column rejects values that cannot be stored as integers. Arrays are stored internally as compact record-format BLOBs and displayed as JSON arrays on output.
+Element types are validated on insert — an `INTEGER[]` column rejects values that cannot be stored as integers. Elements of an array of a custom type are stored as the type's BASE, as in a column of the type. Arrays are stored internally as compact record-format BLOBs and displayed as JSON arrays on output.
 
 For the full set of array functions (`array_agg`, `array_append`, `array_contains`, `array_slice`, etc.), operators (`@>`, `&&`, `||`), and subscript syntax, see [Array Functions](/docs/sql-reference/functions/array).
 

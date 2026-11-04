@@ -413,13 +413,27 @@ fn emit_function(program: &mut ProgramBuilder, call: &OperatorCall, start_reg: u
 /// with 3.50.
 fn emit_encode(
     program: &mut ProgramBuilder,
-    to: &TypeDef,
+    to: &Arc<TypeDef>,
     value_reg: usize,
     dest_reg: usize,
     resolver: &Resolver,
-) -> Result<usize> {
-    let encode = to
-        .encode()
-        .ok_or_else(|| LimboError::InternalError(format!("type {} has no ENCODE", to.name)))?;
-    emit_type_expr(program, encode, value_reg, dest_reg, resolver)
+) -> Result<()> {
+    if to.encode().is_none() {
+        return Err(LimboError::InternalError(format!(
+            "type {} has no ENCODE",
+            to.name
+        )));
+    }
+    program.emit_insn(Insn::Copy {
+        src_reg: value_reg,
+        dst_reg: dest_reg,
+        extra_amount: 0,
+    });
+    emit_encode_for_comparison(
+        program,
+        std::slice::from_ref(to),
+        to.base(),
+        dest_reg,
+        resolver,
+    )
 }
