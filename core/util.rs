@@ -174,11 +174,7 @@ pub fn strip_type_name_quotes(type_name: &str) -> Option<&str> {
 /// custom type. Like SQLite, quotes are only removed when they wrap the whole
 /// name, so `"INT"` is built in but `"INT" X` is not.
 pub fn is_builtin_strict_type(written_type_name: &str) -> bool {
-    let name = strip_type_name_quotes(written_type_name).unwrap_or(written_type_name);
-    turso_macros::match_ignore_ascii_case!(match name.as_bytes() {
-        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-        _ => false,
-    })
+    crate::types::StrictType::named(written_type_name).is_some()
 }
 
 /// Removes the quotes around the start of `source` the way SQLite's
