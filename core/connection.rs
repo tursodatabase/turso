@@ -1516,10 +1516,7 @@ impl Connection {
         // to execute it, it first checks the schema cookie to see if it needs to reprepare the statement.
         // But in this occasion it will always reprepare, and we get an error. So we trick the statement by swapping our schema
         // with a new clean schema that has the same header cookie.
-        self.with_schema_mut(|schema| {
-            *schema = fresh.try_clone()?;
-            Ok::<_, crate::alloc::TryReserveError>(())
-        })??;
+        self.install_schema_keeping_catalogs(&fresh)?;
 
         let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
 
@@ -1574,10 +1571,7 @@ impl Connection {
                         )
                     {
                         // Install the schema so the namespaces table can be read.
-                        self.with_schema_mut(|schema| {
-                            *schema = inner.fresh.try_clone()?;
-                            Ok::<_, crate::alloc::TryReserveError>(())
-                        })??;
+                        self.install_schema_keeping_catalogs(&inner.fresh)?;
                         let stmt = self.prepare_internal(format!(
                             "SELECT id, name FROM {}",
                             crate::schema::TURSO_NAMESPACES_TABLE_NAME
@@ -1620,10 +1614,7 @@ impl Connection {
                         } else {
                             let work = inner.fresh.sequence_backing_table_names();
                             if !work.is_empty() {
-                                self.with_schema_mut(|schema| {
-                                    *schema = inner.fresh.try_clone()?;
-                                    Ok::<_, crate::alloc::TryReserveError>(())
-                                })??;
+                                self.install_schema_keeping_catalogs(&inner.fresh)?;
                             }
                             *pending = Some(work);
                         }
@@ -1702,10 +1693,7 @@ impl Connection {
                             .has_table(NamespaceId::ROOT, crate::schema::TURSO_TYPES_TABLE_NAME)
                     {
                         // Temporarily install the schema so we can query against it.
-                        self.with_schema_mut(|schema| {
-                            *schema = inner.fresh.try_clone()?;
-                            Ok::<_, crate::alloc::TryReserveError>(())
-                        })??;
+                        self.install_schema_keeping_catalogs(&inner.fresh)?;
                         let stmt = self.prepare_internal(format!(
                             "SELECT name, sql FROM {}",
                             crate::schema::TURSO_TYPES_TABLE_NAME
@@ -1807,10 +1795,7 @@ impl Connection {
         if !fresh.has_table(NamespaceId::ROOT, ROLES_TABLE_NAME) {
             return self.load_dialect_schema_phase(fresh, false);
         }
-        self.with_schema_mut(|schema| {
-            *schema = fresh.try_clone()?;
-            Ok::<_, crate::alloc::TryReserveError>(())
-        })??;
+        self.install_schema_keeping_catalogs(fresh)?;
         let stmt = self.prepare_engine_metadata_read(SELECT_ROLES_SQL)?;
         Ok(ReparsePhase::LoadRoles {
             stmt: Box::new(stmt),
@@ -1831,10 +1816,7 @@ impl Connection {
             return self.load_row_security_phase(fresh);
         };
         if !schema_installed {
-            self.with_schema_mut(|schema| {
-                *schema = fresh.try_clone()?;
-                Ok::<_, crate::alloc::TryReserveError>(())
-            })??;
+            self.install_schema_keeping_catalogs(fresh)?;
         }
         let stmt = self.prepare_engine_metadata_read(&sql)?;
         Ok(ReparsePhase::LoadDialectSchema {
@@ -1905,10 +1887,7 @@ impl Connection {
                 stats: Default::default(),
             });
         }
-        self.with_schema_mut(|schema| {
-            *schema = fresh.try_clone()?;
-            Ok::<_, crate::alloc::TryReserveError>(())
-        })??;
+        self.install_schema_keeping_catalogs(fresh)?;
         let stmt = self.prepare_row_security_read()?;
         Ok(ReparsePhase::LoadRowSecurity {
             stmt: Box::new(stmt),
@@ -1920,6 +1899,22 @@ impl Connection {
     /// [`Self::prepare_roles_read`].
     pub(crate) fn prepare_row_security_read(self: &Arc<Connection>) -> Result<Statement> {
         self.prepare_with_origin(SELECT_ROW_SECURITY_SQL, StatementOrigin::EngineMetadataRead)
+    }
+
+    /// Installs a copy of `fresh` as the connection's schema while the schema
+    /// is still being read, keeping the roles and the row-level security
+    /// policies loaded before. The catalogs of `fresh` are empty until their
+    /// tables are read, and a statement compiled in between must not see
+    /// empty ones: an empty policy catalog lets every role read every row.
+    fn install_schema_keeping_catalogs(&self, fresh: &Schema) -> Result<()> {
+        self.with_schema_mut(|schema| {
+            let mut installed = fresh.try_clone()?;
+            installed.roles = schema.roles.clone();
+            installed.policies = schema.policies.clone();
+            *schema = installed;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        Ok(())
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -5940,5 +5935,33 @@ mod tests {
             "setval(13, false) committed: next nextval must return 13"
         );
         Ok(())
+    }
+
+    /// The reparse of the schema installs a fresh schema before its
+    /// roles and policies are read, and a statement compiled meanwhile must
+    /// not see empty catalogs.
+    #[test]
+    fn schema_installed_while_being_read_keeps_the_loaded_policies() {
+        let db = Database::open_file(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            Arc::new(EngineDialect),
+        )
+        .unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        conn.with_schema_mut(|schema| {
+            Arc::make_mut(&mut schema.policies).enable(NamespaceId::ROOT, "t");
+        })
+        .unwrap();
+        let fresh = Schema::with_options(false, &EngineDialect).unwrap();
+        assert!(!fresh.policies.is_enabled(NamespaceId::ROOT, "t"));
+
+        conn.install_schema_keeping_catalogs(&fresh).unwrap();
+
+        assert!(conn
+            .schema
+            .read()
+            .policies
+            .is_enabled(NamespaceId::ROOT, "t"));
     }
 }
