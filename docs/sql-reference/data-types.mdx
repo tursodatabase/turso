@@ -213,7 +213,11 @@ CREATE TABLE matrices (
     id INTEGER PRIMARY KEY,
     data INTEGER[][]
 ) STRICT;
+
+INSERT INTO matrices VALUES (1, ARRAY[ARRAY[1, 2], ARRAY[3, 4]]);
 ```
+
+Every element of an `INTEGER[][]` must be an array (or NULL), and the elements of those are checked as an `INTEGER[]` checks its elements, so `ARRAY[1, 2]` and `ARRAY[ARRAY['abc']]` are errors. Text input has no nested arrays, so build arrays of more than one dimension with `ARRAY[...]`.
 
 Arrays can be inserted using the `ARRAY[...]` constructor or as JSON text:
 
