@@ -141,6 +141,6 @@ pub use walk::{
     walk_expr, walk_expr_mut, WalkControl,
 };
 pub(crate) use walk::{
-    expression_can_fail_on_input, is_aggregate_or_window_function, walk_function_calls,
-    FunctionCalls,
+    expression_can_fail_on_input, is_aggregate_or_window_function, reject_unknown_function,
+    walk_function_calls, FunctionCalls,
 };

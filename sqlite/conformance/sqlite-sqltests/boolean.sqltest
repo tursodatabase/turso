@@ -513,10 +513,49 @@ test and-with-integer-zero-drops-an-unknown-column-name-like-the-parser {
     SELECT 0 AND nosuchcol, a FROM unknown_name;
     UPDATE unknown_name SET a = 2 WHERE 0 AND nosuchcol;
     SELECT a FROM unknown_name;
+    SELECT 0 AND (SELECT nosuchfunc(1));
 }
 expect {
     0|1
     1
+    0
+}
+
+# A function call keeps `x AND 0` out of the parser's fold, and the code
+# generator resolves every name before it folds, so a function that does not
+# exist is an error in the operand that `x AND 0` or `x OR 1` drops, in a
+# subquery of that operand too.
+
+test and-or-with-a-constant-operand-still-checks-a-function-name {
+    SELECT 1 OR nosuchfunc(1);
+}
+expect error {
+    no such function: nosuchfunc
+}
+
+test and-with-integer-zero-still-checks-a-function-name-in-where {
+    CREATE TABLE unknown_function(a);
+    INSERT INTO unknown_function VALUES (1);
+    SELECT a FROM unknown_function WHERE 0 AND nosuchfunc(a);
+}
+expect error {
+    no such function: nosuchfunc
+}
+
+test or-with-a-constant-operand-still-checks-a-function-name-inside-a-dropped-subquery {
+    SELECT 1 OR (SELECT nosuchfunc(1));
+}
+expect error {
+    no such function: nosuchfunc
+}
+
+test and-with-integer-zero-still-checks-a-function-name-in-an-outer-join-on {
+    CREATE TABLE unknown_function(a);
+    INSERT INTO unknown_function VALUES (1);
+    SELECT l.a FROM unknown_function AS l LEFT JOIN unknown_function AS r ON 0 AND nosuchfunc(r.a);
+}
+expect error {
+    no such function: nosuchfunc
 }
 
 # A column name that is only resolved when the statement runs, as in a

@@ -20,8 +20,9 @@ use crate::translate::{
     expr::{
         apply_static_rewrites, expr_contains_function_that_changes_within_statement,
         expr_contains_nondeterministic_scalar_function, expr_vector_size,
-        is_aggregate_or_window_function, unwrap_parens, walk_function_calls, AndWithIntegerZero,
-        BetweenToComparisons, BindingBehavior, FunctionCalls, WalkControl,
+        is_aggregate_or_window_function, reject_unknown_function, unwrap_parens,
+        walk_function_calls, AndWithIntegerZero, BetweenToComparisons, BindingBehavior,
+        FunctionCalls, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
     subquery::outer_query_refs_for_correlated_subquery,
@@ -2622,6 +2623,10 @@ pub fn parse_where(
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
             reject_aggregate_in_predicate(&expr.expr, resolver)?;
+            // SQLite resolves every name of a term before the planner skips
+            // the terms after a constant false one, so `WHERE 0 AND
+            // nosuchfunc(a)` fails here too.
+            reject_unknown_function(&expr.expr, resolver)?;
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
         // considered independently by constraint extraction and range planning.
@@ -3063,6 +3068,7 @@ fn parse_join(
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
                     reject_aggregate_in_predicate(&predicate.expr, resolver)?;
+                    reject_unknown_function(&predicate.expr, resolver)?;
                 }
             }
             ast::JoinConstraint::Using(distinct_names) => {
