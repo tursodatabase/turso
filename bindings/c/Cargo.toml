@@ -27,6 +27,7 @@ env_logger = { workspace = true, default-features = false }
 libc = "0.2.169"
 turso_core = { workspace = true, features = ["conn_raw_api"] }
 turso_ext.workspace = true
+turso_parser.workspace = true
 limbo_csv = { workspace = true, features = ["static"], optional = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

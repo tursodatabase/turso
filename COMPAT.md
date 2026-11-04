@@ -792,7 +792,7 @@ Modifiers:
 | sqlite3_libversion_number | ✅ Yes  | Returns 3050004 |
 | sqlite3_sourceid       | ❌ No      |         |
 | sqlite3_threadsafe     | ✅ Yes     | Returns 1 |
-| sqlite3_complete       | ❌ No      | Stub    |
+| sqlite3_complete       | ✅ Yes     |         |
 | sqlite3_interrupt      | ✅ Yes     |         |
 | sqlite3_sleep          | ❌ No      | Stub    |
 | sqlite3_randomness     | ❌ No      |         |

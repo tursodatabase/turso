@@ -13,7 +13,6 @@ use crate::{
     },
     manual,
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
-    read_state_machine::ReadState,
     HISTORY_FILE,
 };
 use anyhow::{anyhow, Context};
@@ -39,6 +38,7 @@ use turso_core::{
     io_error, ConnectOpts, Connection, Database, EqpFormat, LimboError, Numeric, OpenFlags,
     QueryMode, SqliteDialect, Statement, Value,
 };
+use turso_parser::complete::CompletionScanner;
 
 #[derive(Parser, Debug)]
 #[command(name = "Turso")]
@@ -142,7 +142,7 @@ pub struct Limbo {
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
     pub(crate) db_opts: turso_core::DatabaseOpts,
-    read_state: ReadState,
+    read_state: CompletionScanner,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
     had_query_error: bool,
@@ -312,7 +312,7 @@ impl Limbo {
             conn,
             interrupt_count,
             input_buff: ManuallyDrop::new(sql.unwrap_or_default()),
-            read_state: ReadState::default(),
+            read_state: CompletionScanner::default(),
             opts: Settings::from(opts),
             db_opts,
             rl: None,
@@ -441,7 +441,7 @@ impl Limbo {
     pub fn reset_input(&mut self) {
         self.prompt = PROMPT.to_string();
         self.input_buff.clear();
-        self.read_state = ReadState::default();
+        self.read_state = CompletionScanner::default();
     }
 
     pub fn close_conn(&mut self) -> Result<(), LimboError> {
@@ -1815,22 +1815,22 @@ impl Limbo {
     pub fn readline(&mut self) -> Result<(), ReadlineError> {
         use std::fmt::Write;
 
+        let prev_len = self.input_buff.len();
         if let Some(rl) = &mut self.rl {
             let result = rl.readline(&self.prompt)?;
-            self.read_state.process(&result);
             let _ = self.input_buff.write_str(result.as_str());
         } else {
             let mut reader = std::io::stdin().lock();
-            let prev_len = self.input_buff.len();
             if reader.read_line(&mut self.input_buff)? == 0 {
                 return Err(ReadlineError::Eof);
             }
-            self.read_state.process(&self.input_buff[prev_len..]);
         }
 
         if !self.input_buff.ends_with(char::is_whitespace) {
             let _ = self.input_buff.write_char('\n');
         }
+        self.read_state
+            .feed(&self.input_buff.as_bytes()[prev_len..]);
         Ok(())
     }
 
@@ -2070,7 +2070,7 @@ impl Limbo {
         let reader = BufReader::new(file);
 
         let mut query_buffer = String::new();
-        let mut state = ReadState::default();
+        let mut state = CompletionScanner::default();
 
         for line in reader.lines() {
             let line = line
@@ -2078,15 +2078,15 @@ impl Limbo {
 
             if !query_buffer.is_empty() {
                 query_buffer.push('\n');
+                state.feed(b"\n");
             }
             query_buffer.push_str(&line);
-
-            state.process(&line);
+            state.feed(line.as_bytes());
 
             if state.is_complete() {
                 self.run_query(&query_buffer);
                 query_buffer.clear();
-                state = ReadState::default();
+                state = CompletionScanner::default();
             }
         }
 
