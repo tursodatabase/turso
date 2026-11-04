@@ -1721,11 +1721,9 @@ pub struct FkActionContext {
     pub old_key_registers: Vec<usize>,
     /// Registers containing NEW parent key values (for UPDATE only)
     pub new_key_registers: Option<Vec<usize>>,
-    /// Whether the key registers hold the parent's stored keys. The action
-    /// then compares them with the child's stored keys (no DECODE) and writes
-    /// them into the child as they are (no ENCODE). Otherwise they hold
-    /// decoded keys.
-    pub keys_are_stored: bool,
+    /// Whether the NEW key registers hold the parent's stored key, which the
+    /// action writes into the child without ENCODE.
+    pub new_key_is_stored: bool,
 }
 
 impl FkActionContext {
@@ -1733,19 +1731,19 @@ impl FkActionContext {
         Self {
             old_key_registers,
             new_key_registers: None,
-            keys_are_stored: false,
+            new_key_is_stored: false,
         }
     }
 
     pub fn new_for_update(
         old_key_registers: Vec<usize>,
         new_key_registers: Vec<usize>,
-        keys_are_stored: bool,
+        new_key_is_stored: bool,
     ) -> Self {
         Self {
             old_key_registers,
             new_key_registers: Some(new_key_registers),
-            keys_are_stored,
+            new_key_is_stored,
         }
     }
 
@@ -1923,10 +1921,7 @@ fn emit_fk_action_subprogram(
         );
         subprogram_builder
             .flags
-            .set_reads_stored_values(ctx.keys_are_stored);
-        subprogram_builder
-            .flags
-            .set_writes_stored_values(ctx.keys_are_stored);
+            .set_writes_stored_values(ctx.new_key_is_stored);
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
         translate_inner(
@@ -2553,21 +2548,41 @@ pub fn fire_fk_update_actions(
             new_rowid_reg,
             new_key_start,
         )?;
-        // When every child key column has its parent column's type, ON UPDATE
-        // CASCADE works on stored keys: it finds the child rows whose stored
-        // key equals the parent's old one, as the foreign key check does, and
-        // copies the parent's new stored key into them, as PostgreSQL copies a
-        // value assigned to a column of its own type. Otherwise the keys are
-        // decoded and a child column of another type runs its own ENCODE.
-        let keys_are_stored = matches!(fk_ref.fk.on_update, RefAct::Cascade)
+        // ON UPDATE CASCADE copies the parent's stored key into a child column
+        // of the same type, as PostgreSQL copies a value assigned to a column
+        // of its own type. A child column of another type gets the parent's
+        // value and runs its own ENCODE. When no key column has a DECODE, the
+        // decoded key below is the stored key.
+        let new_key_is_stored = matches!(fk_ref.fk.on_update, RefAct::Cascade)
             && child_key_has_parent_types(resolver, &parent_bt, fk_ref);
-        if !keys_are_stored {
-            decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, old_key_start)?;
-            decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, new_key_start)?;
-        }
+        let key_has_decode = parent_cols.iter().any(|pcol| {
+            parent_bt
+                .get_column(pcol)
+                .is_some_and(|(_, col)| resolver.schema().column_has_decode(col, true))
+        });
+        let new_stored_key_start = if new_key_is_stored && key_has_decode {
+            let start = program.alloc_registers(ncols);
+            copy_key_from_values(
+                program,
+                &parent_bt,
+                parent_cols,
+                new_values_start,
+                &new_image_layout,
+                new_rowid_reg,
+                start,
+            )?;
+            start
+        } else {
+            new_key_start
+        };
+
+        // Decode encoded values so they match the subprogram's decoded column reads
+        decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, old_key_start)?;
+        decode_fk_key_registers(program, resolver, &parent_bt, parent_cols, new_key_start)?;
 
         let old_key_registers: Vec<usize> = (old_key_start..old_key_start + ncols).collect();
-        let new_key_registers: Vec<usize> = (new_key_start..new_key_start + ncols).collect();
+        let new_key_registers: Vec<usize> =
+            (new_stored_key_start..new_stored_key_start + ncols).collect();
 
         // Check if parent key changed - skip action if all values are equal
         let skip_action = program.allocate_label();
@@ -2583,8 +2598,11 @@ pub fn fire_fk_update_actions(
 
         program.preassign_label_to_next_insn(key_changed);
 
-        let ctx =
-            FkActionContext::new_for_update(old_key_registers, new_key_registers, keys_are_stored);
+        let ctx = FkActionContext::new_for_update(
+            old_key_registers,
+            new_key_registers,
+            new_key_is_stored,
+        );
 
         match fk_ref.fk.on_update {
             RefAct::Cascade => {
