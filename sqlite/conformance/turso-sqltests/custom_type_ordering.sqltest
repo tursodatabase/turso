@@ -634,7 +634,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-on-date-column {
     CREATE TABLE t(d date) STRICT;
-    SELECT 1 FROM t WHERE 0 AND d COLLATE NOCASE = 'x';
+    SELECT 1 FROM t WHERE FALSE AND d COLLATE NOCASE = 'x';
 }
 expect error {
     collations are not supported by type date
@@ -643,7 +643,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test update-false-where-term-rejects-collate-on-date-column {
     CREATE TABLE t(d date) STRICT;
-    UPDATE t SET d = d WHERE 0 AND d COLLATE NOCASE = 'x';
+    UPDATE t SET d = d WHERE FALSE AND d COLLATE NOCASE = 'x';
 }
 expect error {
     collations are not supported by type date
@@ -663,7 +663,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-on-compared-value {
     CREATE TABLE t(d date) STRICT;
-    SELECT 1 FROM t WHERE 0 AND d = 'x' COLLATE NOCASE;
+    SELECT 1 FROM t WHERE FALSE AND d = 'x' COLLATE NOCASE;
 }
 expect error {
     collations are not supported by type date
@@ -672,7 +672,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-in-between {
     CREATE TABLE t(d date) STRICT;
-    SELECT 1 FROM t WHERE 0 AND d BETWEEN 'a' COLLATE NOCASE AND 'z';
+    SELECT 1 FROM t WHERE FALSE AND d BETWEEN 'a' COLLATE NOCASE AND 'z';
 }
 expect error {
     collations are not supported by type date
@@ -681,7 +681,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-in-in-list {
     CREATE TABLE t(d date) STRICT;
-    SELECT 1 FROM t WHERE 0 AND d IN ('x' COLLATE NOCASE);
+    SELECT 1 FROM t WHERE FALSE AND d IN ('x' COLLATE NOCASE);
 }
 expect error {
     collations are not supported by type date
@@ -690,7 +690,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-in-case-when {
     CREATE TABLE t(d date) STRICT;
-    SELECT 1 FROM t WHERE 0 AND CASE d WHEN 'x' COLLATE NOCASE THEN 1 END;
+    SELECT 1 FROM t WHERE FALSE AND CASE d WHEN 'x' COLLATE NOCASE THEN 1 END;
 }
 expect error {
     collations are not supported by type date
@@ -699,7 +699,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-in-max {
     CREATE TABLE t(d date) STRICT;
-    SELECT 1 FROM t WHERE 0 AND max(d, 'x' COLLATE NOCASE) IS NULL;
+    SELECT 1 FROM t WHERE FALSE AND max(d, 'x' COLLATE NOCASE) IS NULL;
 }
 expect error {
     collations are not supported by type date
@@ -708,7 +708,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-in-row-value {
     CREATE TABLE t(d date) STRICT;
-    SELECT 1 FROM t WHERE 0 AND (d, 1) = ('x' COLLATE NOCASE, 1);
+    SELECT 1 FROM t WHERE FALSE AND (d, 1) = ('x' COLLATE NOCASE, 1);
 }
 expect error {
     collations are not supported by type date
@@ -717,7 +717,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-numeric-compared-with-array {
     CREATE TABLE t(n numeric(10, 2), a integer[]) STRICT;
-    SELECT 1 FROM t WHERE 0 AND n = a;
+    SELECT 1 FROM t WHERE FALSE AND n = a;
 }
 expect error {
     cannot compare type numeric with type integer\[\]
@@ -728,7 +728,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-on-missing-operator {
     CREATE TABLE t(d date) STRICT;
-    SELECT 1 FROM t WHERE 0 AND (d * 2) COLLATE NOCASE = 'x';
+    SELECT 1 FROM t WHERE FALSE AND (d * 2) COLLATE NOCASE = 'x';
 }
 expect error {
     operator does not exist: date \* integer
@@ -737,7 +737,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-missing-operator {
     CREATE TABLE t(d date) STRICT;
-    SELECT 1 FROM t WHERE 0 AND d * 2 = 1;
+    SELECT 1 FROM t WHERE FALSE AND d * 2 = 1;
 }
 expect error {
     operator does not exist: date \* integer
@@ -759,7 +759,7 @@ expect {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-on-date-subquery {
     CREATE TABLE t(d date) STRICT;
-    SELECT count(*) FROM t WHERE 0 AND (SELECT d FROM t) COLLATE NOCASE = 'x';
+    SELECT count(*) FROM t WHERE FALSE AND (SELECT d FROM t) COLLATE NOCASE = 'x';
 }
 expect error {
     collations are not supported by type date
@@ -768,7 +768,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-missing-operator-on-subquery {
     CREATE TABLE t(d date) STRICT;
-    SELECT count(*) FROM t WHERE 0 AND (SELECT d FROM t) * 2 = 1;
+    SELECT count(*) FROM t WHERE FALSE AND (SELECT d FROM t) * 2 = 1;
 }
 expect error {
     operator does not exist: date \* integer
@@ -791,7 +791,7 @@ expect {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-on-value-of-unknown-type {
     CREATE TABLE t(a integer[]) STRICT;
-    SELECT count(*) FROM t WHERE 0 AND (a + 1) COLLATE NOCASE = 'x';
+    SELECT count(*) FROM t WHERE FALSE AND (a + 1) COLLATE NOCASE = 'x';
 }
 expect error {
     collations are not supported by type unknown
@@ -811,7 +811,7 @@ expect {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-on-date-inside-row-value {
     CREATE TABLE t(d date) STRICT;
-    SELECT count(*) FROM t WHERE 0 AND (1, d COLLATE NOCASE) = (SELECT 1, 'x');
+    SELECT count(*) FROM t WHERE FALSE AND (1, d COLLATE NOCASE) = (SELECT 1, 'x');
 }
 expect error {
     collations are not supported by type date
@@ -820,7 +820,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-collate-compared-with-date-in-row-subquery {
     CREATE TABLE t(d date) STRICT;
-    SELECT count(*) FROM t WHERE 0 AND (SELECT d, 1) = ('x' COLLATE NOCASE, 1);
+    SELECT count(*) FROM t WHERE FALSE AND (SELECT d, 1) = ('x' COLLATE NOCASE, 1);
 }
 expect error {
     collations are not supported by type date
@@ -850,7 +850,7 @@ test false-where-term-rejects-collate-on-date-in-nested-struct {
     CREATE TYPE inner_t AS STRUCT(d date, s text);
     CREATE TYPE outer_t AS STRUCT(i inner_t, n integer);
     CREATE TABLE t(o outer_t) STRICT;
-    SELECT count(*) FROM t WHERE 0 AND o.i.d COLLATE NOCASE = 'x';
+    SELECT count(*) FROM t WHERE FALSE AND o.i.d COLLATE NOCASE = 'x';
 }
 expect error {
     collations are not supported by type date
@@ -872,7 +872,7 @@ expect {
 test upsert-false-where-term-rejects-collate-on-excluded-date {
     CREATE TABLE t(id integer PRIMARY KEY, d date) STRICT;
     INSERT INTO t VALUES (1, '2024-01-02');
-    INSERT INTO t VALUES (1, '2024-01-03') ON CONFLICT(id) DO UPDATE SET d = excluded.d WHERE 0 AND excluded.d COLLATE NOCASE = 'x';
+    INSERT INTO t VALUES (1, '2024-01-03') ON CONFLICT(id) DO UPDATE SET d = excluded.d WHERE FALSE AND excluded.d COLLATE NOCASE = 'x';
 }
 expect error {
     collations are not supported by type date
@@ -891,7 +891,7 @@ expect error {
 @requires strict "uses STRICT tables"
 test false-where-term-rejects-default {
     CREATE TABLE t(d date) STRICT;
-    SELECT count(*) FROM t WHERE 0 AND DEFAULT COLLATE NOCASE = 'x';
+    SELECT count(*) FROM t WHERE FALSE AND DEFAULT COLLATE NOCASE = 'x';
 }
 expect error {
     DEFAULT is only valid in INSERT VALUES
