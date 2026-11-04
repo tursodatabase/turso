@@ -18,8 +18,7 @@ use crate::translate::plan::BitSet;
 use crate::translate::{
     emitter::Resolver,
     expr::{
-        apply_static_rewrites, check_function_calls,
-        expr_contains_function_that_changes_within_statement,
+        apply_static_rewrites, expr_contains_function_that_changes_within_statement,
         expr_contains_nondeterministic_scalar_function, expr_vector_size,
         is_aggregate_or_window_function, select_column_count, unwrap_parens, walk_function_calls,
         AndWithIntegerZero, BetweenToComparisons, BindingBehavior, FunctionCalls, WalkControl,
@@ -2630,10 +2629,6 @@ pub fn parse_where(
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
             reject_aggregate_in_predicate(&expr.expr, resolver)?;
-            // SQLite resolves every name of a term before the planner skips
-            // the terms after a constant false one, so `WHERE 0 AND
-            // nosuchfunc(a)` fails here too.
-            check_function_calls(&expr.expr, resolver)?;
             reject_in_subquery_column_mismatch(&expr.expr)?;
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
@@ -3076,7 +3071,6 @@ fn parse_join(
                         BindingBehavior::TryResultColumnsFirst,
                     )?;
                     reject_aggregate_in_predicate(&predicate.expr, resolver)?;
-                    check_function_calls(&predicate.expr, resolver)?;
                     reject_in_subquery_column_mismatch(&predicate.expr)?;
                 }
             }

@@ -98,7 +98,7 @@ pub(crate) use arrays::{
     emit_custom_type_encode_columns, ArrayInput,
 };
 pub(crate) use binary::{row_value_component_expr, row_value_len};
-pub(crate) use binding::check_custom_types;
+pub(crate) use binding::{apply_binding_rewrites, check_bound_expr, check_custom_types};
 pub use binding::{bind_and_rewrite_expr, bind_and_rewrite_sort_key, bind_expr, BindingBehavior};
 pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub(crate) use columns::emit_encoded_default;
@@ -134,7 +134,7 @@ pub use utils::{
     truth_test_rhs, unwrap_parens, unwrap_parens_owned,
 };
 pub(crate) use vectors::select_column_count;
-pub use vectors::{expr_vector_size, reject_row_value_misuse};
+pub use vectors::{expr_vector_size, reject_row_value_misuse_at};
 pub(crate) use walk::{
     check_function_calls, check_likelihood_arguments, expression_can_fail_on_input,
     is_aggregate_or_window_function, reject_unknown_collation, walk_function_calls, FunctionCalls,
@@ -142,6 +142,6 @@ pub(crate) use walk::{
 pub use walk::{
     expr_contains_function_that_changes_within_statement,
     expr_contains_nondeterministic_scalar_function, expr_contains_subquery,
-    expr_references_any_subquery, expr_references_outer_query, expr_references_subquery_id,
-    walk_expr, walk_expr_mut, WalkControl,
+    expr_contains_unplanned_subquery, expr_references_any_subquery, expr_references_outer_query,
+    expr_references_subquery_id, walk_expr, walk_expr_mut, WalkControl,
 };

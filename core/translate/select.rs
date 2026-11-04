@@ -11,9 +11,9 @@ use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    apply_static_rewrites, bind_and_rewrite_expr, bind_and_rewrite_sort_key, bind_expr,
+    apply_binding_rewrites, bind_and_rewrite_expr, bind_and_rewrite_sort_key, bind_expr,
     expr_vector_size, integer_literal_truth_value, walk_expr, walk_expr_mut, BindingBehavior,
-    WalkControl, BINDING_REWRITES,
+    WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -707,7 +707,7 @@ fn prepare_one_select_plan(
                         let having = match having_predicates {
                             Some(mut terms) => {
                                 for term in terms.iter_mut() {
-                                    apply_static_rewrites(term, BINDING_REWRITES, Some(resolver))?;
+                                    apply_binding_rewrites(term, resolver)?;
                                 }
                                 Some(terms)
                             }
@@ -1942,7 +1942,7 @@ fn move_group_by_only_having_terms_to_where(
                 table_references,
                 resolver,
             )?;
-        apply_static_rewrites(&mut term, BINDING_REWRITES, Some(resolver))?;
+        apply_binding_rewrites(&mut term, resolver)?;
         if moves {
             where_clause.push(term.into());
         } else {

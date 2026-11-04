@@ -30,7 +30,7 @@ use crate::{
             EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec,
         },
         expr::{
-            check_custom_types, expr_contains_subquery, get_expr_affinity,
+            check_bound_expr, expr_contains_unplanned_subquery, get_expr_affinity,
             replace_and_or_with_deciding_operand, unwrap_parens, walk_expr, walk_expr_mut,
             WalkControl,
         },
@@ -457,6 +457,7 @@ pub(crate) fn plan_limit_offset_subqueries(
         SubqueryOrigin::SelectLimitOffset,
         false,
         true,
+        false,
         cse_map,
         same_query_map,
         &[],
@@ -664,9 +665,6 @@ fn plan_subqueries_with_outer_query_access<'a>(
     same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
 ) -> Result<()> {
-    // Only custom types and arrays fail the checks below, and without custom
-    // types enabled there are neither.
-    let custom_types_enabled = !resolver.schema().type_registry.is_empty();
     let mut with_subqueries = Vec::new();
     {
         let mut subquery_parser = get_subquery_parser(
@@ -680,12 +678,13 @@ fn plan_subqueries_with_outer_query_access<'a>(
             origin,
             allow_correlated,
             fold_and_or,
+            false,
             cse_map,
             same_query_map,
             shared,
         );
         for expr in exprs {
-            let has_subquery = custom_types_enabled && expr_contains_subquery(expr);
+            let has_subquery = expr_contains_unplanned_subquery(expr);
             walk_expr_mut(expr, &mut subquery_parser)?;
             if has_subquery {
                 let expr: &ast::Expr = expr;
@@ -693,11 +692,12 @@ fn plan_subqueries_with_outer_query_access<'a>(
             }
         }
     }
-    // Binding checked these with the types of their subqueries not known yet.
-    // Check them again with those types, as compiling them would, in case
-    // the planner drops them, as in `WHERE 0 AND (SELECT d) COLLATE nocase`.
+    // Binding checked these only up to their first subquery, whose names and
+    // types were not known yet (see check_bound_expr). Check them whole now
+    // that every subquery is planned, as compiling them would, in case the
+    // planner drops them, as in `WHERE 0 AND (SELECT d) COLLATE nocase`.
     for expr in with_subqueries {
-        check_custom_types(expr, Some(referenced_tables), resolver)?;
+        check_bound_expr(expr, Some(referenced_tables), resolver)?;
     }
     Ok(())
 }
@@ -797,6 +797,7 @@ fn get_subquery_parser<'a>(
     origin: SubqueryOrigin,
     allow_correlated: bool,
     fold_and_or: bool,
+    operand_is_dropped: bool,
     cse_map: &'a mut Vec<(ast::Expr, ast::Expr)>,
     same_query_map: &'a mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &'a [ast::Expr],
@@ -815,18 +816,22 @@ fn get_subquery_parser<'a>(
     Box::new(move |expr: &mut ast::Expr| -> Result<WalkControl> {
         match expr {
             // SQLite resolves every name before sqlite3ExprSimplifiedAndOr
-            // drops an operand, so the subqueries of the operand that goes
-            // are planned for their names and the plans thrown away. The
-            // operand that stays is planned below like any other.
+            // drops an operand, so the operand that goes is checked with its
+            // subqueries planned and the plans thrown away. The operand that
+            // stays is planned below like any other.
             ast::Expr::Binary(_, ast::Operator::And | ast::Operator::Or, _) if fold_and_or => {
                 while replace_and_or_with_deciding_operand(expr, Some(resolver), &mut |dropped| {
-                    resolve_names_in_dropped_operand(
+                    check_dropped_operand(
                         dropped,
                         program,
-                        resolver,
                         referenced_tables,
-                        get_outer_query_refs,
+                        resolver,
                         connection,
+                        get_outer_query_refs,
+                        position,
+                        origin,
+                        allow_correlated,
+                        shared,
                     )?;
                     Ok(true)
                 })? {}
@@ -1090,6 +1095,7 @@ fn get_subquery_parser<'a>(
                         origin,
                         allow_correlated,
                         fold_and_or,
+                        operand_is_dropped,
                         &mut *cse_map,
                         &mut *same_query_map,
                         shared,
@@ -1135,6 +1141,14 @@ fn get_subquery_parser<'a>(
                 };
                 let lhs_column_count = lhs_columns.len();
                 if lhs_column_count != result_columns.len() {
+                    // SQLite checks the column count when it compiles the IN,
+                    // or in its WHERE analysis (see
+                    // planner::reject_in_subquery_column_mismatch), and an
+                    // operand the AND/OR fold drops is never compiled: its
+                    // names are resolved now, which is all it needed.
+                    if operand_is_dropped {
+                        return Ok(WalkControl::SkipChildren);
+                    }
                     crate::bail_parse_error!(
                         "sub-select returns {} columns - expected {lhs_column_count}",
                         result_columns.len()
@@ -1241,44 +1255,49 @@ fn get_subquery_parser<'a>(
     })
 }
 
-/// Plans each subquery of `operand` and throws the plan away: the names
-/// inside it are resolved, so a wrong column name is still an error, and
-/// nothing of it is emitted.
-fn resolve_names_in_dropped_operand(
+/// Checks an operand the AND/OR fold is about to drop as SQLite's resolver
+/// would, with its subqueries planned: a wrong column name inside one of
+/// them is still an error, and so is a COLLATE on a custom type a subquery
+/// returns. The plans go to a list that is thrown away, so nothing of the
+/// operand is emitted.
+#[allow(clippy::too_many_arguments)]
+fn check_dropped_operand(
     operand: &ast::Expr,
     program: &mut ProgramBuilder,
+    referenced_tables: &mut TableReferences,
     resolver: &Resolver,
-    referenced_tables: &TableReferences,
+    connection: &Arc<Connection>,
     get_outer_query_refs: &dyn Fn(
         &TableReferences,
     ) -> Result<crate::alloc::Vec<OuterQueryReference>>,
-    connection: &Arc<Connection>,
+    position: SubqueryPosition,
+    origin: SubqueryOrigin,
+    allow_correlated: bool,
+    shared: &[ast::Expr],
 ) -> Result<()> {
-    let mut selects = Vec::new();
-    walk_expr(operand, &mut |e: &ast::Expr| -> Result<WalkControl> {
-        match e {
-            ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
-                selects.push(select.as_ref().clone())
-            }
-            ast::Expr::InSelect { rhs, .. } => selects.push(rhs.as_ref().clone()),
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    })?;
-    for select in selects {
-        let outer_query_refs = get_outer_query_refs(referenced_tables)?;
-        let result_reg = program.alloc_register();
-        prepare_select_plan(
-            select,
-            resolver,
-            program,
-            &outer_query_refs,
-            QueryDestination::ExistsSubqueryResult { result_reg },
-            connection,
-            false,
-        )?;
-    }
-    Ok(())
+    let mut planned = operand.clone();
+    let mut thrown_away = Vec::new();
+    let mut cse_map = Vec::new();
+    let mut same_query_map = Vec::new();
+    let mut subquery_parser = get_subquery_parser(
+        program,
+        &mut thrown_away,
+        referenced_tables,
+        resolver,
+        connection,
+        get_outer_query_refs,
+        position,
+        origin,
+        allow_correlated,
+        false,
+        true,
+        &mut cse_map,
+        &mut same_query_map,
+        shared,
+    );
+    walk_expr_mut(&mut planned, &mut subquery_parser)?;
+    drop(subquery_parser);
+    check_bound_expr(&planned, Some(referenced_tables), resolver)
 }
 
 /// Recollect all aggregates after subquery planning.

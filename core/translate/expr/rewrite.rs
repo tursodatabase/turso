@@ -126,12 +126,15 @@ fn expr_calls_function(expr: &Expr) -> bool {
 /// (sqlite3ExprSimplifiedAndOr), so the other operand never runs:
 /// `SELECT 1 OR json_extract('bare', '$.a')` is 1 and
 /// `(SELECT abs(-9223372036854775807 - 1)) OR 1` does not run the subquery.
-/// In [BINDING_REWRITES] it runs after binding, so names in the dropped
-/// operand are still checked. An operand with a subquery waits for the
-/// subquery planner, which resolves the names inside the subquery first and
-/// then drops the operand, so the subquery is never emitted (see
-/// subquery::get_subquery_parser). A HAVING clause applies it after its
-/// terms have moved to WHERE or not, because SQLite decides that before
+/// SQLite resolves every name of the expression before this fold, and
+/// [check_bound_expr] does the same here: it runs on every bound
+/// expression before the [BINDING_REWRITES], so the dropped operand still
+/// fails for a function that does not exist or for `(1, 2) = (1, 2, 3)`.
+/// An expression with a subquery waits for the subquery planner, which
+/// checks an operand once the names inside its subqueries are resolved and
+/// then drops it, so the subquery is never emitted (see
+/// subquery::get_subquery_parser). A HAVING clause applies the fold after
+/// its terms have moved to WHERE or not, because SQLite decides that before
 /// this fold. An expression that is translated without binding, like a
 /// column DEFAULT, gets the same fold when its bytecode is emitted (see
 /// [and_or_truth_value]).
@@ -143,12 +146,15 @@ impl StaticRewrite for AndOrConstantOperand {
         expr: &mut ast::Expr,
         resolver: Option<&Resolver<'_>>,
     ) -> Result<WalkControl> {
-        // SQLite looks the collation of a compared operand up on the operand
-        // as written, through NOT, arithmetic and function arguments, so a
-        // collation name in the part of `x OR 1` the fold drops is still
-        // checked there: `(1 OR a COLLATE nosuch) = 1` and
+        // SQLite looks a collation up when it compiles a comparison, on the
+        // compared operand as written, through NOT, arithmetic and function
+        // arguments. So a collation name inside the part of `x OR 1` that
+        // the fold drops is checked when the comparison around it is kept,
+        // and not otherwise: `(1 OR a COLLATE nosuch) = 1` and
         // `abs(1 OR a COLLATE nosuch) = 1` are errors, while
-        // `SELECT 1 OR a COLLATE nosuch` is 1.
+        // `SELECT 1 OR a COLLATE nosuch` and `WHERE 1 OR a COLLATE nosuch = 1`
+        // are 1. The walk visits a node before its children, so this runs
+        // on each kept comparison before a fold below it drops anything.
         if let Some(resolver) = resolver {
             for operand in compared_operands(expr, resolver)? {
                 reject_unknown_collation(operand, resolver)?;
@@ -180,6 +186,7 @@ fn compared_operands<'e>(expr: &'e Expr, resolver: &Resolver<'_>) -> Result<Vec<
             lhs, start, end, ..
         } => vec![lhs.as_ref(), start.as_ref(), end.as_ref()],
         Expr::InList { lhs, .. } | Expr::InSelect { lhs, .. } => vec![lhs.as_ref()],
+        Expr::SubqueryResult { lhs: Some(lhs), .. } => vec![lhs.as_ref()],
         Expr::Case {
             base: Some(base), ..
         } => vec![base.as_ref()],
@@ -232,17 +239,10 @@ pub(crate) fn replace_and_or_with_deciding_operand(
     } else {
         return Ok(false);
     };
-    // SQLite resolves every name and checks every row value before this
-    // fold, so the dropped operand still fails for a function that does not
-    // exist and for `(1, 2) = (1, 2, 3)`.
-    reject_row_value_misuse(dropped)?;
     // An aggregate in the dropped operand still makes the query an aggregate
     // query: `SELECT count(*) OR 1 FROM t` gives one row, not one per row.
     let dropped_has_aggregate = match resolver {
-        Some(resolver) => {
-            check_function_calls(dropped, resolver)?;
-            expr_contains_aggregate_or_window_function(dropped, resolver)?
-        }
+        Some(resolver) => expr_contains_aggregate_or_window_function(dropped, resolver)?,
         None => true,
     };
     if dropped_has_aggregate {
