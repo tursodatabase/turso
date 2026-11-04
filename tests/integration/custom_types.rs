@@ -1369,12 +1369,19 @@ mod tests {
                                 },
                                 OffsetType::Known {
                                     name: offset_type,
+                                    custom,
                                     number: offset_number,
-                                    ..
                                 },
                             ) => {
                                 if takes(*number, *offset_number) {
                                     Expected::SameAsSubquery
+                                } else if !*custom && *offset_number == Number::None {
+                                    // SQLite's own types, such as REAL and
+                                    // SQLite's NUMERIC.
+                                    Expected::Refused(format!(
+                                        "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name} and an offset of SQLite type {}",
+                                        offset_type.to_ascii_uppercase()
+                                    ))
                                 } else {
                                     Expected::Refused(format!(
                                         "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {name} and offset type {offset_type}"

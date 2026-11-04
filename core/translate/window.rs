@@ -2741,9 +2741,21 @@ fn check_range_offset_type(
             RangeColumn::Custom(RangeOffsets::Integer | RangeOffsets::Numeric),
             RangeOffset::ReadWhenRun,
         ) => {}
+        // SQLite's types are named as SQLite writes them, so that SQLite's
+        // NUMERIC, whose values are integers or reals, isn't mistaken for the
+        // custom numeric type.
+        (
+            RangeColumn::Custom(RangeOffsets::Integer | RangeOffsets::Numeric),
+            RangeOffset::Plain(RangeOffsets::None),
+        ) => crate::bail_parse_error!(
+            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type \
+             {order_type} and an offset of SQLite type {}; cast the offset to integer",
+            offset_type.to_string().to_ascii_uppercase()
+        ),
         (
             RangeColumn::Custom(offsets @ (RangeOffsets::Integer | RangeOffsets::Numeric)),
-            RangeOffset::Plain(kind) | RangeOffset::Custom(kind),
+            RangeOffset::Plain(kind @ (RangeOffsets::Integer | RangeOffsets::Numeric))
+            | RangeOffset::Custom(kind),
         ) => {
             if !offsets.takes(kind) {
                 crate::bail_parse_error!(
@@ -2790,9 +2802,11 @@ fn range_column(ty: &ExprType) -> RangeColumn {
 /// A RANGE offset's type, as the frame check sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RangeOffset {
-    /// NULL, a string or a parameter. Over a custom type its value is read as
-    /// that type when the statement runs, as PostgreSQL does, and a NULL
-    /// fails there as any other NULL offset.
+    /// NULL, a string, a parameter, or a SQLite value whose type is known only
+    /// when it runs, such as `json_extract(..)` or a CASE that mixes SQLite
+    /// types. Over a custom type its value is read as that type when the
+    /// statement runs, as PostgreSQL does, and a NULL fails there as any other
+    /// NULL offset.
     ReadWhenRun,
     /// A value of a SQLite type, which is this kind of number.
     Plain(RangeOffsets),

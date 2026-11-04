@@ -603,7 +603,7 @@ test cmp-numeric-window-range-real-offset-is-an-error {
     SELECT count(*) OVER (ORDER BY n RANGE BETWEEN CAST(1.5 AS REAL) PRECEDING AND CURRENT ROW) FROM t;
 }
 expect error {
-    RANGE with offset PRECEDING/FOLLOWING is not supported for column type numeric and offset type real; cast the offset to integer
+    RANGE with offset PRECEDING/FOLLOWING is not supported for column type numeric and an offset of SQLite type REAL; cast the offset to integer
 }
 
 @requires strict "uses STRICT tables"
