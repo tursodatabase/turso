@@ -906,3 +906,71 @@ test and-or-with-a-constant-operand-gives-0-or-1 {
 expect {
     1|1|0|0|0|1|integer|integer
 }
+
+# With two operands that depend on the row, SQLite decides an AND or OR
+# with jumps where the expression is a condition (sqlite3ExprIfFalse): a
+# CASE WHEN without a base, iif(), an aggregate's FILTER clause and WHERE.
+# The other operand is skipped once the first has decided the result.
+
+test case-when-condition-skips-the-operand-the-other-decides {
+    CREATE TABLE row_cond(a, b);
+    INSERT INTO row_cond VALUES (1, 'bare');
+    SELECT CASE WHEN a = 0 AND json_extract(b, '$.a') THEN 'y' ELSE 'n' END FROM row_cond;
+    SELECT CASE WHEN a = 1 OR json_extract(b, '$.a') THEN 'y' ELSE 'n' END FROM row_cond;
+    SELECT CASE WHEN a = 0 AND json_extract(b, '$.a') AND a = 5 THEN 'y' ELSE 'n' END FROM row_cond;
+    SELECT CASE WHEN (a = 1 OR json_extract(b, '$.a')) AND a = 1 THEN 'y' ELSE 'n' END FROM row_cond;
+    SELECT CASE WHEN a = 1 THEN 'first' WHEN a = 0 AND json_extract(b, '$.a') THEN 'y' ELSE 'n' END FROM row_cond;
+}
+expect {
+    n
+    y
+    n
+    y
+    first
+}
+
+test iif-condition-skips-the-operand-the-other-decides {
+    CREATE TABLE row_cond(a, b);
+    INSERT INTO row_cond VALUES (1, 'bare');
+    SELECT iif(a = 0 AND json_extract(b, '$.a'), 'y', 'n'), iif(a = 1 OR json_extract(b, '$.a'), 'y', 'n') FROM row_cond;
+    SELECT iif(a = 0 AND json_extract(b, '$.a'), 'y', a = 1 OR json_extract(b, '$.a'), 'z', 'n') FROM row_cond;
+}
+expect {
+    n|y
+    z
+}
+
+test filter-condition-skips-the-operand-the-other-decides {
+    CREATE TABLE row_cond(a, b);
+    INSERT INTO row_cond VALUES (1, 'bare'), (2, 'bare');
+    SELECT count(*) FILTER (WHERE a = 0 AND json_extract(b, '$.a')) FROM row_cond;
+    SELECT count(*) FILTER (WHERE a = 1 OR json_extract(b, '$.a')) FROM row_cond WHERE a = 1;
+    SELECT a, count(*) FILTER (WHERE a = 0 AND json_extract(b, '$.a')) FROM row_cond GROUP BY a;
+}
+expect {
+    0
+    1
+    1|0
+    2|0
+}
+
+# As a value, an AND or OR of two such operands still evaluates both, as
+# SQLite's OP_And and OP_Or do.
+
+test and-or-as-a-value-still-runs-both-row-operands {
+    CREATE TABLE row_cond(a, b);
+    INSERT INTO row_cond VALUES (1, 'bare');
+    SELECT a = 0 AND json_extract(b, '$.a') FROM row_cond;
+}
+expect error {
+    malformed JSON
+}
+
+test case-with-a-base-still-runs-both-row-operands {
+    CREATE TABLE row_cond(a, b);
+    INSERT INTO row_cond VALUES (1, 'bare');
+    SELECT CASE a = 0 AND json_extract(b, '$.a') WHEN 0 THEN 'z' ELSE 'e' END FROM row_cond;
+}
+expect error {
+    malformed JSON
+}

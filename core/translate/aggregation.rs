@@ -10,6 +10,7 @@ use crate::{
     vdbe::{
         builder::ProgramBuilder,
         insn::{AggStepData, HashDistinctData, Insn},
+        BranchOffset,
     },
     LimboError, Result,
 };
@@ -17,8 +18,8 @@ use crate::{
 use super::{
     emitter::{OperationMode, Resolver, TranslateCtx},
     expr::{
-        resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        resolve_expr, translate_and_or_condition_jump, translate_condition_expr, translate_expr,
+        translate_expr_no_constant_opt, ConditionMetadata, NoConstantOptReason,
     },
     plan::{
         Aggregate, Distinctness, EvalAt, NonFromClauseSubquery, SelectPlan, SubqueryEvalPhase,
@@ -329,6 +330,42 @@ impl<'a> AggArgumentSource<'a> {
             }
         }
     }
+}
+
+/// Jumps to `skip_label` for a row the aggregate's FILTER clause rejects.
+/// An AND or OR is compiled with jumps, as SQLite's sqlite3ExprIfFalse
+/// compiles it, so `count(*) FILTER (WHERE a = 0 AND json_extract(b, '$.a'))`
+/// never runs the function for a row with `a = 1`.
+pub fn emit_aggregate_filter_jump(
+    program: &mut ProgramBuilder,
+    plan: &SelectPlan,
+    filter_expr: &ast::Expr,
+    skip_label: BranchOffset,
+    resolver: &Resolver,
+) -> Result<()> {
+    if translate_and_or_condition_jump(
+        program,
+        Some(&plan.table_references),
+        filter_expr,
+        skip_label,
+        resolver,
+    )? {
+        return Ok(());
+    }
+    let filter_reg = program.alloc_register();
+    translate_expr(
+        program,
+        Some(&plan.table_references),
+        filter_expr,
+        filter_reg,
+        resolver,
+    )?;
+    program.emit_insn(Insn::IfNot {
+        reg: filter_reg,
+        target_pc: skip_label,
+        jump_if_null: true,
+    });
+    Ok(())
 }
 
 pub fn emit_aggregate_step(
