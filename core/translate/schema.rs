@@ -8,7 +8,7 @@ use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
-    BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, Table, Type, TypeDef,
+    BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, Table, Type, TypeDef, TypeOrigin,
     SQLITE_SEQUENCE_TABLE_NAME, TURSO_NAMESPACES_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
@@ -860,7 +860,7 @@ fn validate(
                 }
             }
             table.resolve_custom_types(resolver.schema());
-            table.check_collates_are_allowed()?;
+            table.check_collates_are_allowed(resolver.schema())?;
         }
         table.check_keys_are_not_lossy(resolver.schema())?;
     }
@@ -3137,7 +3137,8 @@ pub fn translate_create_type(
             validate_type_expr(decode, "DECODE", &resolver.catalog)?;
         }
         crate::schema::check_type_param_use(params, encode, decode)?;
-        let type_def = TypeDef::from_create_type(&normalized_name, body, false, String::new())?;
+        let type_def =
+            TypeDef::from_create_type(&normalized_name, body, TypeOrigin::User, String::new())?;
         // A CAST to the type from its own DECODE would run that DECODE again
         // without end.
         if type_def_uses_type(&type_def, &type_registry_key(&normalized_name))? {

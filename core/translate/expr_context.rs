@@ -59,7 +59,7 @@ impl<'a, 'schema> ExprContext<'a, 'schema> {
         &self.resolver.catalog
     }
 
-    pub(crate) fn schema(&self) -> &Schema {
+    pub(crate) fn schema(&self) -> &'a Schema {
         self.resolver.schema()
     }
 }

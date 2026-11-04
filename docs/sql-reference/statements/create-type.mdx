@@ -144,7 +144,17 @@ SELECT w FROM t ORDER BY w;
 
 `ORDER BY CAST(x AS reversed_text)` sorts by the decoded value instead (apple, banana, cherry), because a CAST gives the decoded value. An index on the CAST holds the decoded value too.
 
-The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with `collations are not supported by type numeric`, and so does a COLLATE on a column of such a type in a STRICT table, in `CREATE TABLE` (also in a `UNIQUE` or `PRIMARY KEY` constraint), `ALTER TABLE ADD COLUMN`, `ALTER TABLE ALTER COLUMN` or `CREATE INDEX`. Comparing two types with different orders fails with `cannot compare type x with type y`.
+The built-in `numeric` type and arrays have their own order, and every comparison of a value of such a type uses it: `=`, `<` and the other comparison operators, IN, BETWEEN, `CASE x WHEN`, `nullif`, `IS`, `min`/`max`, ORDER BY, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, window `PARTITION BY`, joins, and indexes. So a query returns the same rows with and without an index, and `numeric` values compare by value: `9 < 10` and `1.5 = 1.50` are true, and DISTINCT and UNION keep one of them. This holds for expressions of the type too: `n + i`, `n * 2`, `-n` and `coalesce(n, 0)` are numerics, and an index on `n * 2` can serve `n * 2 > 10`. A constant is not rounded to the column's scale first: for a `numeric(10,2)` column holding `3.50`, `n = 3.504` is false. A COLLATE on a value of such a type fails with an error that names the type as a column declares it, such as `collations are not supported by type numeric` or `... by type integer[]`, and so does a COLLATE on a column of such a type in a STRICT table, in `CREATE TABLE` (also in a `UNIQUE` or `PRIMARY KEY` constraint), `ALTER TABLE ADD COLUMN`, `ALTER TABLE ALTER COLUMN` or `CREATE INDEX`. Comparing two types with different orders fails with `cannot compare type x with type y`.
+
+As in PostgreSQL, only text types take a COLLATE: `varchar`, a user type with `BASE text`, and a domain over one of them. A COLLATE on a value of any other custom type, such as `date`, `uuid` or a user type with `BASE integer`, fails with `collations are not supported by type <name>`, in the same places as above. For a domain the error names the domain. A comparison fails too when the COLLATE is on the other operand:
+
+```sql
+CREATE TABLE t(d date) STRICT;
+SELECT * FROM t WHERE d = '2024-01-02' COLLATE nocase;
+-- Parse error: collations are not supported by type date
+```
+
+Columns of SQLite's own types, and all columns of a table that is not STRICT, take any COLLATE as in SQLite. A value whose type nothing declares, such as `a + 1` for an array `a`, takes none: it fails with `collations are not supported by type unknown`.
 
 ### Arithmetic
 
