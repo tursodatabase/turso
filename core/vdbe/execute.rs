@@ -2687,6 +2687,7 @@ pub fn op_array_encode(
         reg,
         element_type,
         element_kind,
+        dimensions,
         table_name,
         col_name,
     } = data.as_ref();
@@ -2697,12 +2698,13 @@ pub fn op_array_encode(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    // Fast path: blob input with ANY type — validate it is a well-formed record
-    // before accepting. This avoids the redundant extract→reserialize when MakeArray
-    // output feeds directly into ArrayEncode with ANY affinity, but rejects raw blobs
-    // (e.g. zeroblob, X'DEADBEEF') that would crash on read.
+    // Fast path: blob input to a one-dimensional ANY array — validate it is a
+    // well-formed record before accepting. This avoids the redundant
+    // extract→reserialize when MakeArray output feeds directly into ArrayEncode
+    // with ANY affinity, but rejects raw blobs (e.g. zeroblob, X'DEADBEEF') that
+    // would crash on read.
     if let Value::Blob(b) = val {
-        if *element_kind == StrictType::Any {
+        if *element_kind == StrictType::Any && *dimensions == 1 {
             // Validate blob is a well-formed record using streaming iterator
             // (no Vec<Value> allocation). Rejects empty blobs and invalid records.
             let valid = !b.is_empty()
@@ -2740,28 +2742,7 @@ pub fn op_array_encode(
         );
     }
 
-    let mut coerced_elements: Vec<Value> = Vec::with_capacity(raw_elements.len());
-    for elem in raw_elements {
-        // NULL elements are allowed — same as STRICT allows NULL in columns
-        if matches!(elem, Value::Null) {
-            coerced_elements.push(elem);
-            continue;
-        }
-
-        let mut reg_tmp = Register::Value(elem);
-        match *element_kind {
-            StrictType::Stores(expected_type) => {
-                if let Err(value_type) = convert_to_strict_type(&mut reg_tmp, expected_type) {
-                    return Err(datatype_violation(format!(
-                        "cannot store {value_type} value in {element_type}"
-                    ))
-                    .into());
-                }
-            }
-            StrictType::Any => {}
-        }
-        coerced_elements.push(reg_tmp.get_value().clone());
-    }
+    let coerced_elements = convert_array_elements(raw_elements, *dimensions, data)?;
 
     // Serialize coerced elements as a native record-format BLOB
     let record = ImmutableRecord::from_values(&coerced_elements, coerced_elements.len())?;
@@ -2769,6 +2750,63 @@ pub fn op_array_encode(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Converts the elements of an array with `dimensions` levels: in INTEGER[][]
+/// every element of the outer array must be an array, and every element of
+/// those is converted as a STRICT INTEGER column converts a value. NULL is
+/// allowed at every level, as STRICT allows NULL in a column.
+fn convert_array_elements(
+    elements: Vec<Value>,
+    dimensions: u32,
+    data: &ArrayEncodeData,
+) -> Result<Vec<Value>> {
+    let ArrayEncodeData {
+        element_type,
+        element_kind,
+        table_name,
+        col_name,
+        ..
+    } = data;
+    let not_an_array = || {
+        datatype_violation(format!(
+            "cannot store non-array value in {element_type} column {table_name}.{col_name}"
+        ))
+    };
+    let mut converted = Vec::with_capacity(elements.len());
+    for element in elements {
+        let value = match (dimensions, element) {
+            (0, _) => {
+                return Err(LimboError::InternalError(format!(
+                    "array column {table_name}.{col_name} has no dimensions"
+                )))
+            }
+            (_, Value::Null) => Value::Null,
+            (2.., Value::Blob(sub_array)) => {
+                let sub_elements =
+                    array_values_from_blob(&sub_array).map_err(|_| not_an_array())?;
+                let sub_elements = convert_array_elements(sub_elements, dimensions - 1, data)?;
+                values_to_record_blob(&sub_elements)?
+            }
+            (2.., Value::Numeric(_) | Value::Text(_)) => return Err(not_an_array()),
+            (1, element @ (Value::Numeric(_) | Value::Text(_) | Value::Blob(_))) => {
+                let mut reg = Register::Value(element);
+                match *element_kind {
+                    StrictType::Stores(storage_class) => {
+                        if let Err(value_type) = convert_to_strict_type(&mut reg, storage_class) {
+                            return Err(datatype_violation(format!(
+                                "cannot store {value_type} value in {element_type}"
+                            )));
+                        }
+                    }
+                    StrictType::Any => {}
+                }
+                reg.get_value().clone()
+            }
+        };
+        converted.push(value);
+    }
+    Ok(converted)
 }
 
 /// Converts the non-NULL value in `reg` as a STRICT column storing

@@ -414,6 +414,8 @@ pub struct ArrayEncodeData {
     /// The declared element type name, for error messages.
     pub element_type: Arc<str>,
     pub element_kind: crate::types::StrictType,
+    /// The number of dimensions the column declares: 2 for INTEGER[][].
+    pub dimensions: u32,
     pub table_name: Arc<str>,
     pub col_name: Arc<str>,
 }

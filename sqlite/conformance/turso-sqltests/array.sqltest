@@ -1960,3 +1960,57 @@ test array-cast-refuses-unknown-element-type {
 expect error {
     unknown datatype for array elements: "nosuchtype"
 }
+
+# Every element of an INTEGER[][] is an array, and every element of those is
+# an INTEGER.
+test array-2d-converts-inner-elements {
+    CREATE TABLE m(id INTEGER PRIMARY KEY, a INTEGER[][]) STRICT;
+    INSERT INTO m VALUES (1, ARRAY[ARRAY[1,2],ARRAY['3',NULL]]), (2, ARRAY[NULL]);
+    SELECT id, a[1][2], a[2][1], typeof(a[2][1]), a[2][2] IS NULL, a[1] IS NULL FROM m ORDER BY id;
+}
+expect {
+    1|2|3|integer|1|0
+    2|||null|1|1
+}
+
+test array-2d-refuses-inner-element-of-another-type {
+    CREATE TABLE m(a INTEGER[][]) STRICT;
+    INSERT INTO m VALUES (ARRAY[ARRAY['abc']]);
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+test array-3d-refuses-innermost-element-of-another-type {
+    CREATE TABLE m(a INTEGER[][][]) STRICT;
+    INSERT INTO m VALUES (ARRAY[ARRAY[ARRAY['abc']]]);
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+test array-2d-refuses-a-one-dimensional-array {
+    CREATE TABLE m(a INTEGER[][]) STRICT;
+    INSERT INTO m VALUES (ARRAY[1,2]);
+}
+expect error {
+    cannot store non-array value in INTEGER column m.a
+}
+
+# Text input has no nested arrays, so '{ {abc} }' is an array of the text
+# '{abc}'. (The spaces keep the sqltest parser from reading the braces.)
+test array-2d-refuses-nested-text-input {
+    CREATE TABLE m(a INTEGER[][]) STRICT;
+    INSERT INTO m VALUES ('{ {abc} }');
+}
+expect error {
+    cannot store non-array value in INTEGER column m.a
+}
+
+test array-2d-refuses-nested-text-input-of-integers {
+    CREATE TABLE m(a INTEGER[][]) STRICT;
+    INSERT INTO m VALUES ('{ {1,2},{3,4} }');
+}
+expect error {
+    cannot store non-array value in INTEGER column m.a
+}

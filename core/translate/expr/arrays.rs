@@ -141,6 +141,7 @@ pub(super) fn emit_array_encode(
                     reg,
                     element_type: "ANY".into(),
                     element_kind: StrictType::Any,
+                    dimensions: col.array_dimensions(),
                     table_name: table_name.into(),
                     col_name: col.name.as_deref().unwrap_or("").into(),
                 }),
@@ -152,15 +153,10 @@ pub(super) fn emit_array_encode(
         }
     }
 
-    // ArrayEncode: parse JSON text → validate/coerce → serialize to record blob.
-    // For multi-dimensional arrays (e.g. INTEGER[][]), the outer array's elements
-    // are themselves arrays (blobs), so we use ANY for validation.
-    // Only 1-dimensional arrays validate elements against the declared type,
-    // and elements of a custom type against the type's BASE.
+    // ArrayEncode: parse text → convert elements → serialize to record blob.
+    // Elements of a custom type are checked against the type's BASE.
     let col_name = col.name.as_deref().unwrap_or("");
-    let element_type: Arc<str> = if col.array_dimensions() > 1 {
-        "ANY".into()
-    } else if let Some(resolved) = &resolved {
+    let element_type: Arc<str> = if let Some(resolved) = &resolved {
         resolved.primitive.to_uppercase().into()
     } else {
         col.ty_str.to_uppercase().into()
@@ -176,6 +172,7 @@ pub(super) fn emit_array_encode(
             reg,
             element_type,
             element_kind,
+            dimensions: col.array_dimensions(),
             table_name: table_name.into(),
             col_name: col_name.into(),
         }),
