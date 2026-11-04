@@ -246,7 +246,7 @@ SELECT -CAST(1.5 AS numeric(10,2)), CAST(1.5 AS numeric(10,2)) + 1;
 -- -1.50|2.50
 ```
 
-A CAST first converts the value to the type's `value` type as SQLite's CAST does, then runs ENCODE and COERCE. `CAST(5.5 AS smallint)` and `CAST(5.5 AS bigint)` are `5`, `CAST('ab' AS bytea)` is a blob, and `CAST(40000.5 AS smallint)` fails smallint's range check. A type without a `value` type takes its BASE as input type; `value any` converts nothing. A `value` of another custom type converts to that type's own `value` type, so `value date` converts to text.
+A CAST first converts the value to the type's `value` type as SQLite's CAST does, then runs ENCODE and COERCE. `CAST(5.5 AS smallint)` and `CAST(5.5 AS bigint)` are `5`, `CAST('ab' AS bytea)` is a blob, and `CAST(40000.5 AS smallint)` fails smallint's range check. A type without a `value` type takes its BASE as input type; `value any` converts nothing. A `value` of another custom type converts to that type's own `value` type, so `value date` converts to text. A `value` type must be INTEGER, REAL, TEXT, BLOB, ANY or a custom type; CAST and INSERT fail for a type declared `(value float)`.
 
 A comparison in a WHERE clause does not encode the other operand. With a type whose DECODE returns the stored value unchanged, such as `ENCODE upper(value) DECODE value`, `WHERE x = 'hello'` does not match a stored `'HELLO'`, with or without an index on `x`. Write `WHERE x = CAST('hello' AS upper_text)` to compare with the value as the column holds it.
 
