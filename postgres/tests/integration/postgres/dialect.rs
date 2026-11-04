@@ -763,10 +763,7 @@ fn create_schema_rolls_back_with_its_transaction_and_creates_no_files(db: TempDa
     conn.execute("ROLLBACK").unwrap();
 
     let error = conn.execute("CREATE TABLE app.u (x int)").unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "Parse error: schema \"app\" does not exist"
-    );
+    assert_eq!(error.to_string(), "schema \"app\" does not exist");
     let files: Vec<String> = std::fs::read_dir(db.path.parent().unwrap())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
@@ -912,7 +909,7 @@ fn a_user_cannot_name_an_object_like_a_schema_stores_its_objects(db: TempDatabas
         conn.execute("CREATE TABLE __turso_ns1_t (x int)")
             .unwrap_err()
             .to_string(),
-        "Parse error: Object name reserved for internal use: __turso_ns1_t"
+        "Object name reserved for internal use: __turso_ns1_t"
     );
     conn.execute("INSERT INTO app.t VALUES (1)").unwrap();
     let mut rows = conn.query("SELECT x FROM app.t").unwrap().unwrap();

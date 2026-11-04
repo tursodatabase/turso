@@ -4163,7 +4163,7 @@ mod tests {
         };
         assert!(
             message.contains(
-                "failed to execute DDL `ALTER TABLE core ADD COLUMN note TEXT`: Parse error: no such table: core"
+                "failed to execute DDL `ALTER TABLE core ADD COLUMN note TEXT`: no such table: core"
             ),
             "{message}"
         );

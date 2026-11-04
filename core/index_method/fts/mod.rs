@@ -1376,10 +1376,12 @@ impl FtsCursor {
                     // entries.
                     return Err(LimboError::Raise(
                         turso_parser::ast::ResolveType::Abort,
-                        "statement already has an open writer on this FTS index; \
-                         a trigger cannot write the FTS-indexed table its firing \
-                         statement is writing"
-                            .to_string(),
+                        Box::new(LimboError::Constraint(
+                            "statement already has an open writer on this FTS index; \
+                             a trigger cannot write the FTS-indexed table its firing \
+                             statement is writing"
+                                .to_string(),
+                        )),
                     ));
                 }
                 // A claim from another (or dead) connection: cross-connection

@@ -4133,7 +4133,7 @@ mod tests {
         let error = PostgresDialect.parse_table_sql(sql, 2).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Parse error: PostgreSQL does not support WITHOUT ROWID table 't'"
+            "PostgreSQL does not support WITHOUT ROWID table 't'"
         );
         assert!(PostgresDialect
             .parse_table_sql("CREATE TABLE t(a TEXT PRIMARY KEY, b)", 2)

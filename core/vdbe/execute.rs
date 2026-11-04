@@ -80,7 +80,7 @@ use crate::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
+        LimboError, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR, SQLITE_FULL,
     },
@@ -193,7 +193,10 @@ use super::{Program, ProgramState, Register};
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
 use crate::vdbe::builder::CursorTypeExt;
-use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
+use crate::{
+    bail_constraint_error, must_be_btree_cursor, ConstraintKind, ConstraintViolation, MvStore,
+    Pager, Result,
+};
 
 type MvccCheckpointStateMachine = CheckpointStateMachine<MvccClock, DynAllocator>;
 
@@ -2590,14 +2593,13 @@ pub fn op_type_check(
                 let _applied = apply_affinity_char(reg, col.affinity());
                 let value_type = reg.get_value().value_type();
                 if value_type != expected_type {
-                    bail_constraint_error!(
-                        "cannot store {} value in {} column {}.{} ({})",
+                    return Err(datatype_violation(format!(
+                        "cannot store {} value in {} column {}.{}",
                         value_type,
                         col.ty_str,
                         &table_reference.name,
-                        col.name.as_deref().unwrap_or(""),
-                        SQLITE_CONSTRAINT
-                    );
+                        col.name.as_deref().unwrap_or("")
+                    )));
                 }
             }
             Ok(())
@@ -2672,13 +2674,10 @@ pub fn op_array_encode(
                     .map(|iter| iter.into_iter().all(|r| r.is_ok()))
                     .unwrap_or(false);
             if !valid {
-                bail_constraint_error!(
-                    "cannot store non-array value in {} column {}.{} ({})",
-                    element_type,
-                    table_name,
-                    col_name,
-                    SQLITE_CONSTRAINT
-                );
+                return Err(datatype_violation(format!(
+                    "cannot store non-array value in {element_type} column {table_name}.{col_name}"
+                ))
+                .into());
             }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
@@ -2692,19 +2691,16 @@ pub fn op_array_encode(
         _ => None,
     };
     let Some(raw_elements) = raw_elements else {
-        bail_constraint_error!(
-            "cannot store non-array value in {} column {}.{} ({})",
-            element_type,
-            table_name,
-            col_name,
-            SQLITE_CONSTRAINT
-        );
+        return Err(datatype_violation(format!(
+            "cannot store non-array value in {element_type} column {table_name}.{col_name}"
+        ))
+        .into());
     };
 
     const MAX_ARRAY_ELEMENTS: usize = 100_000;
     if raw_elements.len() > MAX_ARRAY_ELEMENTS {
         bail_constraint_error!(
-            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name} ({SQLITE_CONSTRAINT})"
+            "array exceeds maximum element count ({MAX_ARRAY_ELEMENTS}) for column {table_name}.{col_name}"
         );
     }
 
@@ -2734,12 +2730,10 @@ pub fn op_array_encode(
         });
 
         if !type_ok {
-            bail_constraint_error!(
-                "cannot store {} value in {} ({})",
-                value_type,
-                element_type,
-                SQLITE_CONSTRAINT
-            );
+            return Err(datatype_violation(format!(
+                "cannot store {value_type} value in {element_type}"
+            ))
+            .into());
         }
 
         coerced_elements.push(coerced);
@@ -2751,6 +2745,14 @@ pub fn op_array_encode(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// A value whose type does not match its column's type.
+fn datatype_violation(message: String) -> LimboError {
+    LimboError::ConstraintViolation(Box::new(ConstraintViolation::new(
+        ConstraintKind::Datatype,
+        message,
+    )))
 }
 
 /// Convert a native record-format array BLOB to PG text representation for display.
@@ -3704,7 +3706,7 @@ pub fn halt(
         // CONFLICT clause, or a trigger step's OR clause) is embedded in the
         // error, so whichever program aborts applies it instead of its own.
         if let Some(resolve_type) = on_error {
-            return Err(LimboError::Raise(resolve_type, error.to_string()).into());
+            return Err(LimboError::Raise(resolve_type, Box::new(error)).into());
         }
         // For FAIL mode with autocommit, commit partial changes before returning error.
         // This matches SQLite behavior where FAIL keeps changes made before the error.
@@ -3906,7 +3908,6 @@ fn build_constraint_violation_error(
     err_code: usize,
     description: &str,
 ) -> LimboError {
-    use crate::{ConstraintKind, ConstraintViolation};
     let (kind, message) = match err_code {
         SQLITE_CONSTRAINT_PRIMARYKEY => (
             ConstraintKind::PrimaryKey,
@@ -3925,6 +3926,7 @@ fn build_constraint_violation_error(
             format!("NOT NULL constraint failed: {description}"),
         ),
         SQLITE_CONSTRAINT_FOREIGNKEY => (ConstraintKind::ForeignKey, description.to_string()),
+        SQLITE_CONSTRAINT_TRIGGER => (ConstraintKind::Trigger, description.to_string()),
         _ => (ConstraintKind::Other, description.to_string()),
     };
     let mut violation = ConstraintViolation::new(kind, message);

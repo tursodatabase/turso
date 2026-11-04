@@ -5474,6 +5474,21 @@ impl BTreeTable {
             .find(|(_, column)| column.is_rowid_alias())
     }
 
+    /// Whether `index` is the automatic index that enforces this table's
+    /// PRIMARY KEY. An INTEGER PRIMARY KEY is the rowid and has no such index.
+    pub fn is_primary_key_index(&self, index: &Index) -> bool {
+        self.get_rowid_alias_column().is_none()
+            && index
+                .name
+                .starts_with(crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
+            && index.columns.len() == self.primary_key_columns.len()
+            && index
+                .columns
+                .iter()
+                .zip(&self.primary_key_columns)
+                .all(|(index_col, (pk_col, _))| index_col.name.eq_ignore_ascii_case(pk_col))
+    }
+
     pub fn has_virtual_columns(&self) -> bool {
         self.has_virtual_columns
     }
