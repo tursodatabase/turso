@@ -2664,9 +2664,7 @@ fn strict_column_type_changed(old: &Column, new: &Column, schema: &Schema) -> bo
         schema.get_type_def(&new.ty_str, true),
     ) {
         (None, None) => old.strict_value_type() != new.strict_value_type(),
-        (Some(_), Some(_)) => {
-            !old.ty_str.eq_ignore_ascii_case(&new.ty_str) || old.ty_params != new.ty_params
-        }
+        (Some(_), Some(_)) => !old.has_same_declared_type(new),
         _ => true,
     }
 }

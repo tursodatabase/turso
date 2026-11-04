@@ -2550,11 +2550,12 @@ pub fn fire_fk_update_actions(
         )?;
         // ON UPDATE CASCADE copies the parent's stored key into a child column
         // of the same type, as PostgreSQL copies a value assigned to a column
-        // of its own type. A child column of another type gets the parent's
-        // value and runs its own ENCODE. When no key column has a DECODE, the
-        // decoded key below is the stored key.
+        // of its own type. A child column of another type, or of a type whose
+        // DECODE changes values, gets the parent's value and runs its own
+        // ENCODE. When no key column has a DECODE, the decoded key below is
+        // the stored key.
         let new_key_is_stored = matches!(fk_ref.fk.on_update, RefAct::Cascade)
-            && child_key_has_parent_types(resolver, &parent_bt, fk_ref);
+            && child_key_takes_parent_stored_key(resolver, &parent_bt, fk_ref)?;
         let key_has_decode = parent_cols.iter().any(|pcol| {
             parent_bt
                 .get_column(pcol)
@@ -2625,37 +2626,47 @@ pub fn fire_fk_update_actions(
     Ok(())
 }
 
-/// Whether every child key column has the type of its parent key column, so a
-/// parent's stored key is also a stored key for the child. Columns without a
-/// custom type always qualify: their stored form is their value.
-fn child_key_has_parent_types(
+/// Whether the parent's stored key is also the child's stored key, so ON UPDATE
+/// CASCADE can copy it. Holds when every child key column has the type of its
+/// parent key column and that type's DECODE returns the stored value
+/// unchanged. Columns without a custom type always qualify: their stored form
+/// is their value.
+///
+/// The cascade finds child rows by decoded key. A DECODE that changes values
+/// could read two stored keys back as one value (`DECODE lower(value)` reads
+/// 'A' and 'a' as 'a'), and copying the stored key would then move the child
+/// of another parent.
+fn child_key_takes_parent_stored_key(
     resolver: &Resolver,
     parent_bt: &BTreeTable,
     fk_ref: &ResolvedFkRef,
-) -> bool {
+) -> Result<bool> {
     let schema = resolver.schema();
     let child_bt = &fk_ref.child_table;
-    fk_ref
-        .parent_cols
-        .iter()
-        .zip(fk_ref.child_pos.iter())
-        .all(|(pcol, &cpos)| {
-            let child_col = &child_bt.columns()[cpos];
-            let parent_col = parent_bt.get_column(pcol).map(|(_, col)| col);
-            let child_has_custom_type =
-                schema.column_has_custom_type(child_col, child_bt.is_strict);
-            let parent_has_custom_type = parent_col
-                .is_some_and(|col| schema.column_has_custom_type(col, parent_bt.is_strict));
-            if !child_has_custom_type && !parent_has_custom_type {
-                return true;
-            }
-            // Type parameters count too: a varchar(10) key is not a valid
-            // stored varchar(3) key.
-            parent_col.is_some_and(|col| {
-                col.ty_str.eq_ignore_ascii_case(&child_col.ty_str)
-                    && col.ty_params == child_col.ty_params
-            })
-        })
+    for (pcol, &cpos) in fk_ref.parent_cols.iter().zip(fk_ref.child_pos.iter()) {
+        let child_col = &child_bt.columns()[cpos];
+        let (_, parent_col) = parent_bt
+            .get_column(pcol)
+            .ok_or_else(|| LimboError::InternalError(format!("parent col {pcol} missing")))?;
+        let child_has_custom_type = schema.column_has_custom_type(child_col, child_bt.is_strict);
+        let parent_has_custom_type = schema.column_has_custom_type(parent_col, parent_bt.is_strict);
+        if !child_has_custom_type && !parent_has_custom_type {
+            continue;
+        }
+        if !(child_has_custom_type
+            && parent_has_custom_type
+            && parent_col.has_same_declared_type(child_col))
+        {
+            return Ok(false);
+        }
+        let decode_changes_values = schema
+            .resolve_type(&parent_col.ty_str, parent_bt.is_strict)?
+            .is_some_and(|resolved| !resolved.reads_stored_values_unchanged());
+        if decode_changes_values {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Emit pre-DROP FK checks and actions for a table.
