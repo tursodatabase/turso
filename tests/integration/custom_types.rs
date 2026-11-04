@@ -174,11 +174,11 @@ mod tests {
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
         // A new row goes to its place in the stored (reversed) text order:
-        // ananab < elppa < tocirpa < yrrehc.
+        // ananab < elppa < tocirpa < yrrehc. The scan has no ORDER BY, which
+        // would sort by the decoded value, so rows come out in index order.
         conn.execute("INSERT INTO t VALUES (4,'apricot',0)")
             .unwrap();
-        let rows: Vec<(String,)> =
-            conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
+        let rows: Vec<(String,)> = conn.exec_rows("SELECT word FROM t INDEXED BY t_word");
         let words = ["banana", "apple", "apricot", "cherry"];
         assert_eq!(rows, words.map(|w| (w.to_string(),)));
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
@@ -212,8 +212,9 @@ mod tests {
         let check = |conn: &Arc<turso_core::Connection>, words: &[&str], ids: &[i64]| {
             let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
             assert_eq!(integrity, vec![("ok".to_string(),)]);
-            let rows: Vec<(String,)> =
-                conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
+            // No ORDER BY, which would sort by the decoded value: rows come
+            // out in index order.
+            let rows: Vec<(String,)> = conn.exec_rows("SELECT word FROM t INDEXED BY t_word");
             let words: Vec<(String,)> = words.iter().map(|w| (w.to_string(),)).collect();
             assert_eq!(rows, words);
             let ids: Vec<(i64,)> = ids.iter().map(|id| (*id,)).collect();

@@ -244,9 +244,10 @@ fn assert_custom_type_ordering_fixture(conn: &Arc<Connection>) {
     );
 
     // The index sorts the stored (reversed) text: ananab < elppa < yrrehc.
-    let ordered: Vec<(i64, String)> = conn.exec_rows(
-        "SELECT id, word FROM words INDEXED BY words_word_idx ORDER BY word ASC, id ASC",
-    );
+    // The scan has no ORDER BY, which would sort by the decoded value, so rows
+    // come out in index order.
+    let ordered: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, word FROM words INDEXED BY words_word_idx");
     assert_eq!(
         ordered,
         vec![
@@ -265,11 +266,11 @@ fn assert_custom_type_ordering_fixture(conn: &Arc<Connection>) {
         desc,
         vec![
             (1, "cherry".to_string()),
-            (2, "apple".to_string()),
             (4, "banana".to_string()),
             (3, "banana".to_string()),
+            (2, "apple".to_string()),
         ],
-        "descending scans over the custom-type index should use the stored-value order",
+        "ORDER BY should sort by the decoded value even when the scan uses the custom-type index",
     );
 }
 
@@ -286,9 +287,8 @@ fn assert_custom_type_reusable_for_new_schema(conn: &Arc<Connection>) -> anyhow:
     conn.execute("INSERT INTO extra_words(id, word) VALUES (3, 'pear')")?;
 
     // Stored (reversed) text: iwik < raep < tocirpa.
-    let rows: Vec<(i64, String)> = conn.exec_rows(
-        "SELECT id, word FROM extra_words INDEXED BY extra_words_word_idx ORDER BY word ASC, id ASC",
-    );
+    let rows: Vec<(i64, String)> =
+        conn.exec_rows("SELECT id, word FROM extra_words INDEXED BY extra_words_word_idx");
     assert_eq!(
         rows,
         vec![
