@@ -174,8 +174,10 @@ pub(crate) fn replace_and_or_with_deciding_operand(
     } else {
         return Ok(false);
     };
-    // SQLite resolves every name before this fold, so a function the
-    // dropped operand calls must exist: `1 OR nosuchfunc(1)` is an error.
+    // SQLite resolves every name and checks every row value before this
+    // fold, so the dropped operand still fails for a function that does not
+    // exist and for `(1, 2) = (1, 2, 3)`.
+    reject_row_value_misuse(dropped)?;
     // An aggregate in the dropped operand still makes the query an aggregate
     // query: `SELECT count(*) OR 1 FROM t` gives one row, not one per row.
     let dropped_has_aggregate = match resolver {

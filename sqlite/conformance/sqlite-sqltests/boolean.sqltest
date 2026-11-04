@@ -558,6 +558,31 @@ expect error {
     no such function: nosuchfunc
 }
 
+# SQLite checks the sizes of compared row values when it resolves names,
+# so they still fail in the operand `x OR 1` drops.
+
+test or-with-a-constant-operand-still-checks-compared-row-value-sizes {
+    SELECT 1 OR (1, 2) = (1, 2, 3);
+}
+expect error {
+    row value misused
+}
+
+test or-with-a-constant-operand-still-checks-the-row-value-size-of-a-subquery {
+    CREATE TABLE row_value_sub(a);
+    SELECT 1 OR a = (SELECT 1, 2) FROM row_value_sub;
+}
+expect error {
+    row value misused
+}
+
+test or-with-a-constant-operand-still-checks-in-list-element-sizes {
+    SELECT 1 OR (1, 2) IN ((1, 2, 3));
+}
+expect error {
+    IN\(\.\.\.\) element has 3 terms - expected 2
+}
+
 # A column name that is only resolved when the statement runs, as in a
 # trigger WHEN clause or an UPSERT DO UPDATE, is still checked.
 
