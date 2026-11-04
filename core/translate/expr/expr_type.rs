@@ -883,6 +883,9 @@ fn operand_type(ty: ExprType, custom_type: impl FnOnce(&TypeDef) -> ExprType) ->
 
 /// The built-in type of the values a custom type reads as.
 fn read_type(type_def: &TypeDef) -> ExprType {
+    // The kind is unknown only while Schema::update_value_types is still
+    // working out kinds, where ANY keeps a type that depends on this one
+    // unknown until a later pass. Types left unknown are refused there.
     ExprType::Builtin(type_def.value_type().unwrap_or(BuiltinType::Any))
 }
 
@@ -907,6 +910,8 @@ fn negated_type(ty: ExprType) -> ExprType {
 
 /// The built-in type a custom type's values are stored as.
 fn stored_type(type_def: &TypeDef) -> ExprType {
+    // As in read_type, the kind is unknown only while kinds are being
+    // worked out.
     ExprType::Builtin(type_def.stored_type().unwrap_or(BuiltinType::Any))
 }
 
