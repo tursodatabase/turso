@@ -540,6 +540,48 @@ expect error {
     no such function: nosuchfunc
 }
 
+test and-or-with-a-constant-operand-still-checks-the-likelihood-argument {
+    CREATE TABLE likely(a);
+    SELECT 0 AND likelihood(a, 2) FROM likely;
+}
+expect error {
+    second argument to likelihood\(\) must be a constant between 0\.0 and 1\.0
+}
+
+# A generated column and a CHECK constraint are resolved when the table is
+# created, before anything folds them.
+
+test a-generated-column-checks-the-likelihood-argument-when-the-table-is-created {
+    CREATE TABLE likely(a, c AS (likelihood(a, 2) AND 0));
+}
+expect error {
+    second argument to likelihood\(\) must be a constant between 0\.0 and 1\.0
+}
+
+test a-check-constraint-checks-the-likelihood-argument-when-the-table-is-created {
+    CREATE TABLE likely(a CHECK (1 OR likelihood(a, 2)));
+}
+expect error {
+    second argument to likelihood\(\) must be a constant between 0\.0 and 1\.0
+}
+
+# The likelihood argument is checked once the names are resolved, so a
+# subquery in the same expression is reported first.
+
+test a-check-constraint-reports-a-subquery-before-the-likelihood-argument {
+    CREATE TABLE likely(a CHECK (likelihood(a, 2) AND (SELECT 1)));
+}
+expect error {
+    subqueries prohibited in CHECK constraints
+}
+
+test a-generated-column-reports-a-subquery-before-the-likelihood-argument {
+    CREATE TABLE likely(a, c AS (likelihood(a, 2) AND (SELECT 1)));
+}
+expect error {
+    subqueries prohibited in generated columns
+}
+
 test and-with-integer-zero-still-checks-a-function-name-in-where {
     CREATE TABLE unknown_function(a);
     INSERT INTO unknown_function VALUES (1);

@@ -423,26 +423,59 @@ fn expr_contains_function(
     Ok(found)
 }
 
-/// Fails with "no such function" when this expression, or a subquery in it,
-/// calls a function no name resolves to. SQLite resolves every name of an
-/// expression before it folds or drops any part of it.
-pub(crate) fn reject_unknown_function(expr: &ast::Expr, resolver: &Resolver<'_>) -> Result<()> {
+/// Fails for a function call of this expression, or of a subquery in it,
+/// that SQLite's resolver rejects: a name no function resolves to, or a
+/// likelihood() whose second argument is not a constant between 0.0 and
+/// 1.0. SQLite resolves every name of an expression before it folds or
+/// drops any part of it.
+pub(crate) fn check_function_calls(expr: &ast::Expr, resolver: &Resolver<'_>) -> Result<()> {
     walk_function_calls(
         expr,
         resolver,
         FunctionCalls::WithSubqueries,
         &mut |call, func| {
-            if func.is_some() {
-                return Ok(WalkControl::Continue);
-            }
-            let (ast::Expr::FunctionCall { name, .. } | ast::Expr::FunctionCallStar { name, .. }) =
-                call
-            else {
-                unreachable!("walk_function_calls visits function calls only");
+            let (name, args) = match call {
+                ast::Expr::FunctionCall { name, args, .. } => (name, args.as_slice()),
+                ast::Expr::FunctionCallStar { name, .. } => (name, &[][..]),
+                _ => unreachable!("walk_function_calls visits function calls only"),
             };
-            crate::bail_parse_error!("no such function: {}", name.as_str())
+            match func {
+                None => crate::bail_parse_error!("no such function: {}", name.as_str()),
+                Some(Func::Scalar(ScalarFunc::Likelihood)) => check_likelihood_arguments(args)?,
+                Some(_) => {}
+            }
+            Ok(WalkControl::Continue)
         },
     )
+}
+
+/// likelihood(x, p) takes a floating point constant p between 0.0 and 1.0,
+/// which SQLite checks when it resolves the call.
+pub(crate) fn check_likelihood_arguments(args: &[Box<ast::Expr>]) -> Result<()> {
+    if args.len() != 2 {
+        crate::bail_parse_error!("likelihood() function must have exactly 2 arguments");
+    }
+    let ast::Expr::Literal(ast::Literal::Numeric(value)) = args[1].as_ref() else {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a constant between 0.0 and 1.0"
+        );
+    };
+    let Ok(probability) = value.parse::<f64>() else {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a floating point constant"
+        );
+    };
+    if !(0.0..=1.0).contains(&probability) {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a constant between 0.0 and 1.0"
+        );
+    }
+    if !value.contains('.') {
+        crate::bail_parse_error!(
+            "second argument to likelihood() must be a floating point number with decimal point"
+        );
+    }
+    Ok(())
 }
 
 /// Fails with "no such collation sequence" when this expression names a
