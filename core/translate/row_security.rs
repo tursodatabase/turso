@@ -142,23 +142,26 @@ pub(crate) fn check_blob_open(
     }
 }
 
+/// Which rows of table `table_name` of `namespace` the role may access for
+/// `command`. The policies are those of the table's own database, so a table
+/// of an attached database with row-level security is limited too. The roles
+/// are those of the main database, which the role was set from.
 fn policy(
     resolver: &Resolver,
     namespace: NamespaceRef,
     table_name: &str,
     command: Command,
 ) -> Policy {
-    if namespace.database_id != MAIN_DB_ID {
-        return Policy::Allow;
-    }
-    let schema = resolver.schema();
-    schema.policies.policy_for(
-        &schema.roles,
-        resolver.row_security_role,
-        namespace.id,
-        table_name,
-        command,
-    )
+    let roles = resolver.schema().roles.clone();
+    resolver.with_schema(namespace.database_id, |schema| {
+        schema.policies.policy_for(
+            &roles,
+            resolver.row_security_role,
+            namespace.id,
+            table_name,
+            command,
+        )
+    })
 }
 
 /// A RIGHT or FULL JOIN emits the unmatched rows of its right side after the
@@ -401,10 +404,63 @@ impl RowSecurityRows {
 mod tests {
     use std::sync::Arc;
 
+    use rustc_hash::FxHashMap;
     use turso_parser::ast;
 
+    use super::{policy, Command, Policy};
     use crate::dialect::EngineDialect;
-    use crate::{Database, MemoryIO};
+    use crate::namespace::{NamespaceId, NamespaceRef};
+    use crate::schema::Schema;
+    use crate::security::roles::RoleCatalog;
+    use crate::translate::emitter::{DoubleQuotedDml, Resolver};
+    use crate::{Database, DatabaseCatalog, MemoryIO, Qualifiers, RwLock, SymbolTable, Value};
+
+    /// The policies of a table of an attached database are those of the
+    /// attached database, not of the main database.
+    #[test]
+    fn table_of_an_attached_database_with_row_security_denies_a_role() {
+        let roles = RoleCatalog::new(&[vec![
+            Value::from_i64(1),
+            Value::build_text("alice"),
+            Value::from_i64(0),
+        ]])
+        .unwrap();
+        let alice = roles.get_by_name("alice").unwrap().id;
+        let mut main = Schema::default();
+        main.roles = Arc::new(roles);
+        let mut attached = Schema::default();
+        Arc::make_mut(&mut attached.policies).enable(NamespaceId::ROOT, "t");
+        let attached_database_id = 2;
+        let mut database_schemas = FxHashMap::default();
+        database_schemas.insert(attached_database_id, Arc::new(attached));
+        let database_schemas = RwLock::new(database_schemas);
+        let temp_database = RwLock::new(None);
+        let attached_databases = RwLock::new(DatabaseCatalog::new());
+        let qualifiers = Qualifiers::default();
+        let syms = SymbolTable::new();
+        let resolver = Resolver::new(
+            &main,
+            &database_schemas,
+            &temp_database,
+            &attached_databases,
+            &qualifiers,
+            &syms,
+            true,
+            DoubleQuotedDml::Enabled,
+            Arc::new(EngineDialect),
+            None,
+            alice,
+        );
+
+        let policy = policy(
+            &resolver,
+            NamespaceRef::root_of(attached_database_id),
+            "t",
+            Command::Select,
+        );
+
+        assert_eq!(policy, Policy::Deny);
+    }
 
     #[test]
     fn enabling_row_security_fails_under_a_dialect_without_roles() {
