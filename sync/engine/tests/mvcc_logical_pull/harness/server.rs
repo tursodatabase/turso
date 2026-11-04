@@ -26,8 +26,10 @@ pub struct InProcessServer {
     replace_once: AtomicBool,
     empty_base: bool,
     pub metadata_write_failure: Arc<AtomicU8>,
-    pub host_files: Option<Arc<Mutex<HashMap<String, Vec<u8>>>>>,
+    pub host_files: Option<SharedHostFiles>,
 }
+
+type SharedHostFiles = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
 impl InProcessServer {
     pub fn new(remote: Arc<Remote>) -> Self {

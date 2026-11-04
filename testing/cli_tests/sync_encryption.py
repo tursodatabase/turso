@@ -9,7 +9,6 @@ Run:
 import base64
 import json
 import os
-from pathlib import Path
 import signal
 import socket
 import subprocess
@@ -18,7 +17,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CLI = Path(os.environ.get("TURSO_CLI", ROOT / "target/debug/tursodb"))
@@ -68,25 +67,7 @@ class EncryptedSync(unittest.TestCase):
             def start():
                 nonlocal process
                 process = subprocess.Popen(args, stdout=log, stderr=log)
-                for _ in range(100):
-                    if process.poll() is not None:
-                        log.seek(0)
-                        self.fail(log.read())
-                    try:
-                        with socket.create_connection(("127.0.0.1", port), timeout=.1):
-                            return
-                    except OSError:
-                        time.sleep(.05)
-                self.fail("sample server did not start")
-
-            def stop():
-                if process and process.poll() is None:
-                    process.send_signal(signal.SIGINT)
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+                self.wait_for_server(process, log, port)
 
             try:
                 start()
@@ -108,7 +89,7 @@ class EncryptedSync(unittest.TestCase):
                 self.assertEqual(run("scalar", "SELECT count(*) FROM items")["value"], 2)
                 run("checkpoint")
                 self.assertEqual(run("scalar", "SELECT count(*) FROM items", remote="-")["value"], 2)
-                stop()
+                stop_server(process)
                 start()
                 pipeline("INSERT INTO items VALUES (3, 'after restart')")
                 run("pull")
@@ -120,7 +101,9 @@ class EncryptedSync(unittest.TestCase):
                 plain_env = {**env, "SYNC_E2E_LOCAL_KEY": "none"}
                 plain = tmp / "plain.db"
                 run("bootstrap", path=plain, environment=plain_env)
-                self.assertEqual(run("scalar", "SELECT count(*) FROM items", path=plain, environment=plain_env)["value"], 3)
+                self.assertEqual(
+                    run("scalar", "SELECT count(*) FROM items", path=plain, environment=plain_env)["value"], 3
+                )
                 source = dbs / "example/data" if directory else tmp / "source.db"
                 for path in [source, Path(str(source) + "-wal"), source.with_suffix(".db-log"), replica,
                              Path(str(replica) + "-info")]:
@@ -149,8 +132,20 @@ class EncryptedSync(unittest.TestCase):
                     finally:
                         source_log.write_bytes(original)
             finally:
-                stop()
+                stop_server(process)
                 log.close()
+
+    def wait_for_server(self, process, log, port):
+        for _ in range(100):
+            if process.poll() is not None:
+                log.seek(0)
+                self.fail(log.read())
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=.1):
+                    return
+            except OSError:
+                time.sleep(.05)
+        self.fail("sample server did not start")
 
     def test_mvcc(self):
         for cipher in ["aes256gcm", "aegis256"]:
@@ -162,6 +157,16 @@ class EncryptedSync(unittest.TestCase):
         for directory in [False, True]:
             with self.subTest(directory=directory):
                 self.scenario("aes256gcm", directory, mvcc=False)
+
+
+def stop_server(process):
+    if process and process.poll() is None:
+        process.send_signal(signal.SIGINT)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
 
 if __name__ == "__main__":

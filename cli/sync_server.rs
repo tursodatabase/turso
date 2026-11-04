@@ -291,13 +291,13 @@ impl TursoSyncServer {
         let (method, path, body) = parse_http_request(request_data)?;
         info!("Request: {} {}", method, path);
         let route = parse_route(&method, &path);
-        if matches!(route, Route::Pipeline { .. } | Route::PullUpdates { .. }) {
-            if validate_encryption_headers(request_data, self.encryption.as_ref()).is_err() {
-                return Ok(text_response(
-                    400,
-                    "Invalid or missing sync encryption credentials",
-                ));
-            }
+        if matches!(route, Route::Pipeline { .. } | Route::PullUpdates { .. })
+            && validate_encryption_headers(request_data, self.encryption.as_ref()).is_err()
+        {
+            return Ok(text_response(
+                400,
+                "Invalid or missing sync encryption credentials",
+            ));
         }
         match route {
             Route::Options => Ok(text_response(204, "")),

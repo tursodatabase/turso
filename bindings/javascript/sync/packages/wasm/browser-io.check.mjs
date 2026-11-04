@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test, beforeEach } from "node:test";
-import { BrowserIO } from "./dist/browser-io.js";
+import { BrowserIO } from "./browser-io.ts";
 
 const values = new Map();
 globalThis.localStorage = {

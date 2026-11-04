@@ -703,9 +703,9 @@ async fn replay_logical_transaction<Ctx>(
     stats: &mut LogicalReplayApplyStats,
 ) -> Result<()> {
     let mut decoded_table_map = table_map.clone();
-    let operations = logical_txn_to_tape_operations_with_table_map(&txn, &mut decoded_table_map)?;
+    let operations = logical_txn_to_tape_operations_with_table_map(txn, &mut decoded_table_map)?;
     if let Some(excluded_client_id) = excluded_client_id {
-        if logical_txn_acknowledges_client(&txn, excluded_client_id)? {
+        if logical_txn_acknowledges_client(txn, excluded_client_id)? {
             return Ok(());
         }
     }
