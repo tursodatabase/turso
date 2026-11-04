@@ -152,11 +152,8 @@ mod tests {
         {
             let db = TempDatabase::new_with_existent_with_opts(&path, opts);
             let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<'",
-            )
-            .unwrap();
+            conn.execute("CREATE TYPE rev BASE text ENCODE string_reverse(value) OPERATOR '<'")
+                .unwrap();
             conn.execute(
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
             )
@@ -173,13 +170,13 @@ mod tests {
         let conn = db.connect_limbo();
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
-        // A new row goes to its place in the stored (reversed) text order:
-        // ananab < elppa < tocirpa < yrrehc.
+        // The type has no DECODE, so words read back as they are stored
+        // (reversed). A new row goes to its place in that order.
         conn.execute("INSERT INTO t VALUES (4,'apricot',0)")
             .unwrap();
         let rows: Vec<(String,)> =
             conn.exec_rows("SELECT word FROM t INDEXED BY t_word ORDER BY word");
-        let words = ["banana", "apple", "apricot", "cherry"];
+        let words = ["ananab", "elppa", "tocirpa", "yrrehc"];
         assert_eq!(rows, words.map(|w| (w.to_string(),)));
         let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
         assert_eq!(integrity, vec![("ok".to_string(),)]);
@@ -229,11 +226,8 @@ mod tests {
         {
             let db = open();
             let conn = db.connect_limbo();
-            conn.execute(
-                "CREATE TYPE rev BASE text ENCODE string_reverse(value) \
-                 DECODE string_reverse(value) OPERATOR '<'",
-            )
-            .unwrap();
+            conn.execute("CREATE TYPE rev BASE text ENCODE string_reverse(value) OPERATOR '<'")
+                .unwrap();
             conn.execute(
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, word rev, n numeric(10,2)) STRICT",
             )
@@ -250,14 +244,14 @@ mod tests {
         let conn = db.connect_limbo();
         conn.execute("INSERT INTO t VALUES (3,'banana',100)")
             .unwrap();
-        // Stored (reversed) text order: ananab < elppa < yrrehc.
-        check(&conn, &["banana", "apple", "cherry"], &[2, 3]);
+        // Words read back as stored (reversed): ananab < elppa < yrrehc.
+        check(&conn, &["ananab", "elppa", "yrrehc"], &[2, 3]);
 
         // A passive checkpoint builds its own schema to write the index rows.
         conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
         conn.execute("INSERT INTO t VALUES (4,'apricot',50)")
             .unwrap();
-        check(&conn, &["banana", "apple", "apricot", "cherry"], &[2, 3, 4]);
+        check(&conn, &["ananab", "elppa", "tocirpa", "yrrehc"], &[2, 3, 4]);
     }
 
     /// Under MVCC, reopening replays the logical log; a domain's DEFAULT and
@@ -993,6 +987,166 @@ mod tests {
             );
             conn.close().unwrap();
         }
+    }
+
+    /// Every statement that copies a row must copy custom-type values as
+    /// stored. Running DECODE and then ENCODE again changes the value of a
+    /// type whose DECODE does not undo its ENCODE, like `plus1` and `x100`.
+    #[test]
+    fn test_row_copies_keep_custom_type_values() {
+        let mut changed = Vec::new();
+        for copied_type in COPIED_TYPES {
+            for row_copy in [
+                RowCopy::Vacuum,
+                RowCopy::VacuumInto,
+                RowCopy::DropColumn,
+                RowCopy::OnUpdateCascade,
+            ] {
+                if row_copy == RowCopy::OnUpdateCascade && copied_type.new_key.is_none() {
+                    continue;
+                }
+                let column_type = copied_type.column_type;
+                match copy_custom_type_value(copied_type, row_copy) {
+                    Ok((before, after)) if before == after => {}
+                    Ok((before, after)) => {
+                        changed.push(format!("{row_copy:?} {column_type}: {before} -> {after}"))
+                    }
+                    Err(e) => changed.push(format!("{row_copy:?} {column_type}: {e}")),
+                }
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "row copies changed values:\n{}",
+            changed.join("\n")
+        );
+    }
+
+    const CREATE_COPIED_TYPES: &[&str] = &[
+        "CREATE TYPE plus1 BASE integer ENCODE value + 1 DECODE value",
+        "CREATE TYPE x100 BASE integer ENCODE value * 100 DECODE value",
+        "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+        "CREATE TYPE shout BASE text ENCODE upper(value) DECODE lower(value)",
+    ];
+
+    // Arrays and types with a DECODE other than `value` can't be keys, so
+    // they have no ON UPDATE CASCADE copy.
+    const COPIED_TYPES: &[CopiedType] = &[
+        CopiedType::new("plus1", "5", Some("9")),
+        CopiedType::new("x100", "1", Some("2")),
+        CopiedType::new("cents", "42", None),
+        CopiedType::new("shout", "'Hi'", None),
+        CopiedType::new("plus1[]", "ARRAY[1, 2]", None),
+        CopiedType::new("shout[]", "ARRAY['a', 'B']", None),
+    ];
+
+    /// A custom-type column and the values to write to it.
+    struct CopiedType {
+        column_type: &'static str,
+        value: &'static str,
+        /// The parent key's new value in the ON UPDATE CASCADE copy, or
+        /// `None` if the type can't be a key.
+        new_key: Option<&'static str>,
+    }
+
+    impl CopiedType {
+        const fn new(
+            column_type: &'static str,
+            value: &'static str,
+            new_key: Option<&'static str>,
+        ) -> Self {
+            Self {
+                column_type,
+                value,
+                new_key,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RowCopy {
+        Vacuum,
+        VacuumInto,
+        DropColumn,
+        OnUpdateCascade,
+    }
+
+    /// Writes a value of `copied_type`, copies it with `row_copy` and returns
+    /// the value read before and after the copy. For ON UPDATE CASCADE these
+    /// are the parent's new key and the child's copy of it.
+    fn copy_custom_type_value(
+        copied_type: &CopiedType,
+        row_copy: RowCopy,
+    ) -> turso_core::Result<(String, String)> {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_vacuum(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        for sql in CREATE_COPIED_TYPES {
+            conn.execute(sql)?;
+        }
+        let CopiedType {
+            column_type,
+            value,
+            new_key,
+        } = copied_type;
+        match row_copy {
+            RowCopy::Vacuum | RowCopy::VacuumInto => {
+                conn.execute(format!(
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, v {column_type}) STRICT"
+                ))?;
+                conn.execute(format!("INSERT INTO t VALUES (1, {value})"))?;
+                let before = first_value(&conn, "SELECT v FROM t")?;
+                if row_copy == RowCopy::Vacuum {
+                    conn.execute("VACUUM")?;
+                    return Ok((before, first_value(&conn, "SELECT v FROM t")?));
+                }
+                let dest_dir = TempDir::new().unwrap();
+                let dest_path = dest_dir.path().join("copy.db");
+                conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
+                let dest_db = TempDatabase::new_with_existent_with_opts(&dest_path, opts);
+                let dest_conn = dest_db.connect_limbo();
+                Ok((before, first_value(&dest_conn, "SELECT v FROM t")?))
+            }
+            RowCopy::DropColumn => {
+                conn.execute(format!(
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, dropped INTEGER, v {column_type}) STRICT"
+                ))?;
+                conn.execute(format!("INSERT INTO t VALUES (1, 0, {value})"))?;
+                let before = first_value(&conn, "SELECT v FROM t")?;
+                conn.execute("ALTER TABLE t DROP COLUMN dropped")?;
+                Ok((before, first_value(&conn, "SELECT v FROM t")?))
+            }
+            RowCopy::OnUpdateCascade => {
+                conn.execute("PRAGMA foreign_keys = ON")?;
+                conn.execute(format!(
+                    "CREATE TABLE parent(k {column_type} PRIMARY KEY) STRICT"
+                ))?;
+                conn.execute(format!(
+                    "CREATE TABLE child(id INTEGER PRIMARY KEY, \
+                     k {column_type} REFERENCES parent(k) ON UPDATE CASCADE) STRICT"
+                ))?;
+                conn.execute(format!("INSERT INTO parent VALUES ({value})"))?;
+                conn.execute(format!("INSERT INTO child VALUES (1, {value})"))?;
+                let new_key = new_key.expect("only key types are cascaded");
+                conn.execute(format!("UPDATE parent SET k = {new_key}"))?;
+                Ok((
+                    first_value(&conn, "SELECT k FROM parent")?,
+                    first_value(&conn, "SELECT k FROM child")?,
+                ))
+            }
+        }
+    }
+
+    fn first_value(conn: &Arc<turso_core::Connection>, query: &str) -> turso_core::Result<String> {
+        let mut stmt = conn.prepare(query)?;
+        let mut value = None;
+        stmt.run_with_row_callback(|row| {
+            value.get_or_insert(row.get::<&turso_core::Value>(0)?.to_string());
+            Ok(())
+        })?;
+        Ok(value.unwrap_or_else(|| panic!("{query} returned no row")))
     }
 
     /// Arrays compare as in PostgreSQL's `array_cmp`: element by element, a

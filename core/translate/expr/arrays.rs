@@ -317,11 +317,9 @@ fn resolve_array_element_type(
 }
 
 /// Emit bytecode that turns the array blob in `reg` into its text form, such
-/// as `{1,2}`, unless the program keeps array results as blobs.
+/// as `{1,2}`.
 pub(crate) fn emit_array_text(program: &mut ProgramBuilder, reg: usize) {
-    if !program.flags.keep_array_results_as_blobs() {
-        program.emit_insn(Insn::ArrayDecode { reg });
-    }
+    program.emit_insn(Insn::ArrayDecode { reg });
 }
 
 /// Emit ENCODE and COERCE for columns with custom types in a contiguous register range.
