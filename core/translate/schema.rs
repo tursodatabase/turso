@@ -3390,7 +3390,9 @@ pub fn translate_create_domain(
 /// values it gives, such as those stored in an index.
 fn check_name_not_cast_to(kind: &str, normalized_name: &str, resolver: &Resolver) -> Result<()> {
     let registry_key = type_registry_key(normalized_name);
-    if let Some(name) = find_type_using(resolver.schema(), &registry_key)? {
+    if let Some(name) =
+        find_in_any_database(resolver, |schema| find_type_using(schema, &registry_key))?
+    {
         bail_parse_error!(
             "cannot create {kind} {normalized_name}: type {name} already casts to it; \
              create {normalized_name} before {name}"
@@ -3448,7 +3450,9 @@ pub fn translate_drop_type(
     }
 
     // Check if any other type/domain depends on this type
-    if let Some(name) = find_type_using(resolver.schema(), &registry_key)? {
+    if let Some(name) =
+        find_in_any_database(resolver, |schema| find_type_using(schema, &registry_key))?
+    {
         bail_parse_error!("cannot drop type {normalized_name}: type {name} depends on it");
     }
 

@@ -475,6 +475,54 @@ mod tests {
         assert_eq!(rows, vec![(1,)]);
     }
 
+    /// A type in an attached database counts when creating or dropping a type
+    /// it casts to, as it does in main: creating b would change what a's
+    /// CAST(value AS b) gives, and dropping b would leave a casting to nothing.
+    #[test]
+    fn test_type_in_attached_database_that_casts_to_a_type_of_main() {
+        let temp_dir = TempDir::new().unwrap();
+        let aux_path = temp_dir.path().join("aux.db");
+        let main_path = temp_dir.path().join("main.db");
+        let custom_types = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&aux_path, custom_types);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE a(value any) BASE text ENCODE CAST(value AS text) DECODE CAST(value AS b)",
+            )
+            .unwrap();
+            conn.close().unwrap();
+        }
+        let opts = custom_types.with_attach(true);
+        let db = TempDatabase::new_with_existent_with_opts(&main_path, opts);
+        let conn = db.connect_limbo();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        let err = conn
+            .execute(
+                "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value)",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cannot create type b: type a already casts to it"),
+            "unexpected error: {err}"
+        );
+
+        conn.execute("DETACH aux").unwrap();
+        conn.execute(
+            "CREATE TYPE b(value any) BASE text ENCODE CAST(value AS text) DECODE lower(value)",
+        )
+        .unwrap();
+        conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+            .unwrap();
+        let err = conn.execute("DROP TYPE b").unwrap_err().to_string();
+        assert!(
+            err.contains("cannot drop type b: type a depends on it"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// Returns the error from opening a database storing `type_sql` as the
     /// SQL of type `r` (see database_with_stored_type_sql).
     fn reopen_after_storing_type_sql(type_sql: &str) -> String {
