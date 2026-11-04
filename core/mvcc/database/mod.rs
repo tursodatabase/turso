@@ -4906,10 +4906,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.blocking_checkpoint_lock.unlock();
     }
 
-    /// VACUUM copies the physical DB image, so any MVCC logical-log bytes must
-    /// be checkpointed first.
-    pub(crate) fn has_uncheckpointed_log(&self) -> Result<bool> {
-        Ok(self.get_logical_log_file().size()? != 0)
+    /// VACUUM copies the physical DB image, so any transaction frames in the
+    /// MVCC logical log must be checkpointed first.
+    ///
+    /// This reads the log's write offset, not its file size: the offset ends
+    /// after the last frame written or found by recovery. Bytes past it are a
+    /// torn tail that recovery skips and the next commit overwrites.
+    pub(crate) fn has_uncheckpointed_log(&self) -> bool {
+        self.logical_log_offset() > LOG_HDR_SIZE as u64
     }
 
     /// Rebuild MVCC's physical root-page metadata after in-place VACUUM

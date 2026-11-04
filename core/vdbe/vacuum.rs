@@ -1920,7 +1920,7 @@ fn vacuum_in_place_step(
                     })?;
                     // acquire the exclusive lock on the mvcc
                     let mut guard = MvccVacuumGuard::acquire(connection.clone(), mv_store.clone())?;
-                    if mv_store.has_uncheckpointed_log()? {
+                    if mv_store.has_uncheckpointed_log() {
                         return Err(LimboError::TxError(
                             "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first".to_string(),
                         ).into());
